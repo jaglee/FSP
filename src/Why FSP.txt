@@ -1,0 +1,34 @@
+1.Security in mind
+ -- header MAC independent of IPv4 address or IPv6 subnet prefix provide inherent mobility and inherent multi-home support
+ -- channel binding, with inherent Authenticated Encryption with Associated Data (AEAD) support through GCM-AES
+    A SASL-friendly security architecture
+
+2.Inherent mobility support
+ -- A reliabe message delivery protocol for mobile agents
+
+
+3.A new programmer-friendly API set
+ -- mordern event-driven asychronous programming interface
+ -- simple QoS proposal (FSP over IPv6 only)
+ -- integrated name resolution (DNS integration for IPv4/gateway mode for IPv6)
+
+
+4.Cloud-ready
+ -- Support asymmetric transport
+    FSP follows Asymmetric Transport Protocol. It is yet another alternative of TCP.
+ -- Split of packet layer and message layer
+    Virtualization friendly
+ -- More than Akamai NetSession Interface
+ 
+
+5.Low latency and high performance
+ -- achieved through connection-reuse (multiplexing and resurrecting)
+ -- for host: lead to possibility of millions connection per second
+ -- avoid performance degrade due to the uncompetive congestion avoidance policy in the situation of much higher load of video content delivery, yet friendly to ECN (FSP over IPv6 only)
+ -- easily to implement direct-data-placement
+
+
+6.Another IPv4 to IPv6 transition mechanism
+  FSP over UDP/IPv4 from/to FSP over IPv6 session layer gateway
+
+7.Extensible to reliable multi-cast by utilizing NACK-based retransmission

@@ -1,0 +1,142 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|Win32">
+      <Configuration>Debug</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|Win32">
+      <Configuration>Release</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCTargetsPath Condition="'$(VCTargetsPath11)' != '' and '$(VSVersion)' == '' and '$(VisualStudioVersion)' == ''">$(VCTargetsPath11)</VCTargetsPath>
+  </PropertyGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{DC63E2B4-BA8D-4540-936A-63106FFCB999}</ProjectGuid>
+    <RootNamespace>FSP_DLL</RootNamespace>
+    <Keyword>Win32Proj</Keyword>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <PlatformToolset>v110</PlatformToolset>
+    <CharacterSet>MultiByte</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <PlatformToolset>v110</PlatformToolset>
+    <CharacterSet>MultiByte</CharacterSet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings">
+  </ImportGroup>
+  <ImportGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'" Label="PropertySheets">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="PropertySheets">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <PropertyGroup>
+    <_ProjectFileVersion>11.0.50214.1</_ProjectFileVersion>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
+    <OutDir>$(SolutionDir)$(Configuration)\</OutDir>
+    <IntDir>$(SolutionDir)$(ProjectName)_$(Configuration)\</IntDir>
+    <TargetName>FSP_DLL</TargetName>
+    <TargetExt>.dll</TargetExt>
+    <LinkIncremental>true</LinkIncremental>
+    <IncludePath>C:\MinGW\msys\1.0\local\include;$(IncludePath)</IncludePath>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
+    <OutDir>$(SolutionDir)$(Configuration)\</OutDir>
+    <IntDir>$(SolutionDir)$(ProjectName)_$(Configuration)\</IntDir>
+    <TargetName>FSP_DLL</TargetName>
+    <TargetExt>.dll</TargetExt>
+    <LinkIncremental>false</LinkIncremental>
+    <IncludePath>C:\MinGW\msys\1.0\local\include;$(IncludePath)</IncludePath>
+  </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
+    <ClCompile>
+      <Optimization>Disabled</Optimization>
+      <PreprocessorDefinitions>WIN32;TRACE;_DEBUG;_WINDOWS;_USRDLL;FSP_DLL_EXPORTS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <MinimalRebuild>true</MinimalRebuild>
+      <BasicRuntimeChecks>EnableFastChecks</BasicRuntimeChecks>
+      <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
+      <PrecompiledHeader />
+      <WarningLevel>Level3</WarningLevel>
+      <DebugInformationFormat>EditAndContinue</DebugInformationFormat>
+    </ClCompile>
+    <Link>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <ProgramDatabaseFile>$(OutDir)FSP_DLL.pdb</ProgramDatabaseFile>
+      <SubSystem>Windows</SubSystem>
+      <ImportLibrary>
+      </ImportLibrary>
+      <TargetMachine>MachineX86</TargetMachine>
+      <AdditionalDependencies>C:\MinGW\msys\1.0\local\lib\libgmp.a;C:\MinGW\lib\gcc\mingw32\4.7.2\libgcc.a;%(AdditionalDependencies)</AdditionalDependencies>
+      <ImageHasSafeExceptionHandlers>false</ImageHasSafeExceptionHandlers>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
+    <ClCompile>
+      <PreprocessorDefinitions>WIN32;NDEBUG;_WINDOWS;_USRDLL;FSP_DLL_EXPORTS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+      <PrecompiledHeader />
+      <WarningLevel>Level3</WarningLevel>
+      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
+    </ClCompile>
+    <Link>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <SubSystem>Windows</SubSystem>
+      <OptimizeReferences>true</OptimizeReferences>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <ImportLibrary>
+      </ImportLibrary>
+      <TargetMachine>MachineX86</TargetMachine>
+      <AdditionalDependencies>C:\MinGW\msys\1.0\local\lib\libgmp.a;C:\MinGW\lib\gcc\mingw32\4.7.2\libgcc.a;%(AdditionalDependencies)</AdditionalDependencies>
+      <ImageHasSafeExceptionHandlers>false</ImageHasSafeExceptionHandlers>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="..\gcm-aes.c" />
+    <ClCompile Include="..\KeccakReferenceAndOptimized\Sources\KeccakDuplex.c" />
+    <ClCompile Include="..\KeccakReferenceAndOptimized\Sources\KeccakF-1600-opt32.c" />
+    <ClCompile Include="..\KeccakReferenceAndOptimized\Sources\KeccakNISTInterface.c" />
+    <ClCompile Include="..\KeccakReferenceAndOptimized\Sources\KeccakSponge.c" />
+    <ClCompile Include="..\ControlBlock.cpp" />
+    <ClCompile Include="..\rijndael-alg-fst.c" />
+    <ClCompile Include="..\vmac.c" />
+    <ClCompile Include="Disconnect.cpp" />
+    <ClCompile Include="DllEntry.cpp" />
+    <ClCompile Include="Establish.cpp" />
+    <ClCompile Include="IOControl.cpp" />
+    <ClCompile Include="minilzo.c" />
+    <ClCompile Include="Multiplex.cpp" />
+    <ClCompile Include="Receive.cpp" />
+    <ClCompile Include="rsa-gmp.cpp" />
+    <ClCompile Include="rsassa-pss.cpp" />
+    <ClCompile Include="Send.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="..\FSP.h" />
+    <ClInclude Include="..\FSP_API.h" />
+    <ClInclude Include="..\gcm-aes.h" />
+    <ClInclude Include="..\KeccakReferenceAndOptimized\Sources\brg_endian.h" />
+    <ClInclude Include="..\KeccakReferenceAndOptimized\Sources\KeccakDuplex.h" />
+    <ClInclude Include="..\KeccakReferenceAndOptimized\Sources\KeccakF-1600-opt32-settings.h" />
+    <ClInclude Include="..\KeccakReferenceAndOptimized\Sources\KeccakNISTInterface.h" />
+    <ClInclude Include="..\KeccakReferenceAndOptimized\Sources\KeccakSponge.h" />
+    <ClInclude Include="..\vmac.h" />
+    <ClInclude Include="FSP_DLL.h" />
+    <ClInclude Include="..\FSP_Impl.h" />
+    <ClInclude Include="minilzo.h" />
+    <ClInclude Include="rsa-gmp.hpp" />
+    <ClInclude Include="rsassa-pss.h" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets">
+  </ImportGroup>
+</Project>
