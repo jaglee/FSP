@@ -32,12 +32,14 @@
 #include <assert.h>
 #include <stdarg.h>
 
+#pragma intrinsic(_InterlockedCompareExchange16)
+
 #ifdef TRACE
 #define TRACE_SOCKET()	\
 	printf_s("%s session#%u in state %s\n"	\
 		"\tSend head - tail = %d - %d, recv head - tail = %d - %d\n"	\
 		, __FUNCTION__	\
-		, sessionID		\
+		, pairSessionID.source		\
 		, stateNames[lowState]				\
 		, pControlBlock->sendWindowHeadPos	\
 		, pControlBlock->sendBufferNextPos	\
@@ -87,17 +89,6 @@ bool LOCALAPI CSocketItemEx::IsValidSequence(ControlBlock::seq_t seq1)
 }
 
 
-template<FSPOperationCode c>
-inline
-bool LOCALAPI CSocketItemEx::IsValidSequence(ControlBlock::seq_t seq1)
-{
-	// MUST calculate sentWidth before d or else may render erraneous result on a multi-thread platfrom
-	int d = int(seq1 - pControlBlock->recvWindowFirstSN);
-	// somewhat 'be free to accept' as we didnot enforce 'announced receive window size'
-	return (c == PERSIST || c == ADJOURN) && (-1 <= d) && (d < pControlBlock->recvBufferBlockN);
-}
-
-
 
 inline
 bool CSocketItemEx::Notify(FSP_ServiceCode n)
@@ -107,7 +98,7 @@ bool CSocketItemEx::Notify(FSP_ServiceCode n)
 	{
 		SignalEvent();
 #ifdef TRACE
-		printf_s("\nSession #%u raise soft interrupt %d\n", sessionID, n);
+		printf_s("\nSession #%u raise soft interrupt %d\n", pairSessionID.source, n);
 #endif
 	}
 	return (r >= 0);
@@ -135,19 +126,28 @@ void LOCALAPI CLowerInterface::OnGetInitConnect()
 
 	// control structure, specified the local address (the Application Layer Thread ID part)
 	// echo back the message at the same interface of receiving, only ALT_ID changed
-	CtrlMsgHdr hdrInfo(sinkInfo.Control);
+
+	ALT_ID_T	idSession;
+	CtrlMsgHdr	hdrInfo;
+	memset(&hdrInfo, 0, sizeof(CtrlMsgHdr));
+	memcpy(&hdrInfo, sinkInfo.Control.buf, min(sinkInfo.Control.len, sizeof(hdrInfo)));
+	if (hdrInfo.IsIPv6())
+	{
+		idSession = CLowerInterface::Singleton()->RandALT_ID((PIN6_ADDR) & hdrInfo.u);
+	}
+	else
+	{
+		idSession = CLowerInterface::Singleton()->RandALT_ID();
+		hdrInfo.u.idALT = idSession;
+	}
 
 	// TODO: there should be some connection initiation throttle control in RandALT_ID
 	// TODO: UNRESOLVED! admission-control here?
-	ALT_ID_T idSession = IsIPv6MSGHDR(hdrInfo)
-		? CLowerInterface::Singleton()->RandALT_ID((PIN6_ADDR) & hdrInfo.u)
-		: CLowerInterface::Singleton()->RandALT_ID();
 	if(idSession == 0)
 	{
 		SendPrematureReset(ENOENT);
 		return;
 	}
-	MSGHDR_ALT_ID(hdrInfo) = idSession;
 
 	// To make the FSP challenge of the responder	
 	FSP_InitiateRequest & initRequest = *FSP_OperationHeader<FSP_InitiateRequest>();
@@ -197,9 +197,9 @@ void LOCALAPI CLowerInterface::OnInitConnectAck()
 	// TODO: UNRESOLVED!? get resource reservation requirement from IPv6 extension header
 	pSocket->SetRemoteSessionID(initState.idRemote = GetRemoteSessionID());
 	//^ set to new peer session ID: to support multihome it is necessary even for IPv6
-	initState.delay.p2p = ntohl(response.timeDelta);
+	initState.timeDelta = ntohl(response.timeDelta);
 	initState.cookie = response.cookie;
-	EnumEffectiveAddresses(initState.allowedPrefixes, MAX_PHY_INTERFACES);
+	EnumEffectiveAddresses(initState.allowedPrefixes);
 
 	pSocket->AffirmConnect(initState, idListener);
 
@@ -220,13 +220,12 @@ void LOCALAPI CLowerInterface::OnGetConnectRequest()
 	TRACE_HERE("called");
 
 	FSP_ConnectRequest & request = *FSP_OperationHeader<FSP_ConnectRequest>();
-	BackLogItem backlogItem(sinkInfo.Control);
 	CSocketItemEx *pSocket = MapSocket();
 
 	// Check whether it is a collision
 	if(pSocket != NULL && pSocket->IsInUse())
 	{
-		if(pSocket->GetRemoteSessionID() == this->GetRemoteSessionID()
+		if(pSocket->pairSessionID.peer == this->GetRemoteSessionID()
 		&& pSocket->pControlBlock->u.connectParams.cookie == request.cookie)
 		{
 			// retransmit ACK_CONNECT_REQUEST at the head of the send queue
@@ -262,9 +261,25 @@ void LOCALAPI CLowerInterface::OnGetConnectRequest()
 	}
 
 	// secondly, fill in the backlog item if it is new
-	MSGHDR_ALT_ID(backlogItem.acceptAddr) = idSession;
-	//^ only needed for FSP over UDP/IPv4. however, it is unnecessary to make a branch 
+	CtrlMsgHdr * const pHdr = (CtrlMsgHdr *)sinkInfo.Control.buf;
+	BackLogItem backlogItem;
+	if (pHdr->IsIPv6())
+	{
+		memcpy(&backlogItem.acceptAddr, &pHdr->u, sizeof(FSP_PKTINFO));
+	}
+	else
+	{	// FSP over UDP/IPv4
+		register PFSP_IN6_ADDR fspAddr = (PFSP_IN6_ADDR) & backlogItem.acceptAddr;
+		fspAddr->u.st.prefix = PREFIX_FSP_IP6to4;
+		fspAddr->u.st.ipv4 = pHdr->u.ipi_addr;
+		fspAddr->u.st.port = DEFAULT_FSP_UDPPORT;
+		fspAddr->idHost = 0;	// no for IPv4 no virtual host might be specified
+		fspAddr->idALT = idSession;
+		backlogItem.acceptAddr.ipi6_ifindex = pHdr->u.ipi_ifindex;
+	}
 	backlogItem.salt = request.salt;
+	backlogItem.remoteHostID = nearInfo.IsIPv6() ? SOCKADDR_HOST_ID(sinkInfo.name) : 0;
+	//^See also GetRemoteSessionID()
 	backlogItem.idRemote = GetRemoteSessionID();
 	backlogItem.idParent = 0;
 	backlogItem.cookie = request.cookie;
@@ -276,13 +291,11 @@ void LOCALAPI CLowerInterface::OnGetConnectRequest()
 	// Thought the field will be overwritten
 	memcpy(backlogItem.bootKey, request.public_n, FSP_PUBLIC_KEY_LEN);
 	rand_w32(& backlogItem.initialSN, 1);
-	backlogItem.delay.limit = ntohl(request.params.delayLimit);
+	backlogItem.delayLimit = ntohl(request.params.delayLimit);
 	backlogItem.expectedSN = ntohl(request.params.initialSN);	// CONNECT_REQUEST does NOT consume a sequence number
 
-	// and multi-home/care-of-address & home-address support
-	memset(backlogItem.allowedPrefixes, 0, sizeof(backlogItem.allowedPrefixes));
-	// assert(sizeof(backlogItem.allowedPrefixes) >= sizeof(request.params.subnets))
-	memcpy(backlogItem.allowedPrefixes, request.params.subnets, sizeof(request.params.subnets));
+	assert(sizeof(backlogItem.allowedPrefixes) == sizeof(request.params.subnets));
+	memcpy(backlogItem.allowedPrefixes, request.params.subnets, sizeof(UINT64) * MAX_PHY_INTERFACES);
 
 	// lastly, put it into the backlog
 	pSocket->pControlBlock->PushBacklog(& backlogItem);
@@ -377,7 +390,7 @@ void LOCALAPI CLowerInterface::SendPrematureReset(UINT32 reasons, CSocketItemEx 
 	}
 	else
 	{
-		BYTE *p = IsIPv6MSGHDR(nearInfo) ?  HeaderFSP().headerContent :  HeaderFSPoverUDP().headerContent;
+		BYTE *p = nearInfo.IsIPv6() ? HeaderFSP().headerContent : HeaderFSPoverUDP().headerContent;
 		memcpy(& reject, p, sizeof(reject.u) + sizeof(reject.u2));
 		SendBack((char *) & reject, sizeof(reject));
 	}
@@ -433,29 +446,28 @@ void LOCALAPI CSocketItemEx::OnConnectRequestAck(FSP_AckConnectRequest & respons
 	if(lenData > 0)
 		memcpy(ubuf, (BYTE *) & response + sizeof(response), lenData);
 	memcpy(ubuf + lenData, response.encrypted, sizeof(response.encrypted));
-	skb->SetFlag<IS_COMPLETED>();
 
 	SignalEvent();
 	TRACE_HERE("Trigger soft interrupt");
 
 	// For calculating of RTT it is safely assume that internal processing takes orders of magnitude less time than network transmission
-	tRoundTrip_us = uint32_t(min(UINT32_MAX, (tRoundTrip_us + (tSessionBegin - tRecentSend) + 1) >> 1));
-	InitiateKeepAlive();
+	tRoundTrip_us = (uint32_t)min(UINT32_MAX, (tRoundTrip_us + (tSessionBegin - tRecentSend) + 1) >> 1);
+	RemoveTimer();
+	//^initiate the timer again only when PERSIST to be sent
 }
 
 
 
-// PERSIST might be out-of-band, and may carry some special optional headers
+// PERSIST is the acknowledgement to ACK_CONNECT_REQUEST, RESTORE or MULTIPLY
 void CSocketItemEx::OnGetPersist()
 {
 	TRACE_SOCKET();
 	FSP_Header_Manager hdrManager(& headPacket->pkt);
 
-	if(! InStates(5, CHALLENGING, ESTABLISHED, PAUSING, RESUMING, QUASI_ACTIVE))
+	if(! InStates(3, CHALLENGING, RESUMING, QUASI_ACTIVE))
 		return;
 
-	// UNRESOLVED!? Taking the risk of DoS attack by replayed PERSIST...
-	if (!IsValidSequence<PERSIST>(headPacket->pktSeqNo))
+	if (!IsValidSequence(headPacket->pktSeqNo))
 	{
 #ifdef TRACE
 		printf_s("Invalid sequence number: %u, expected: %u - %u\n"
@@ -468,7 +480,7 @@ void CSocketItemEx::OnGetPersist()
 	if (headPacket->lenData < 0 || headPacket->lenData > MAX_BLOCK_SIZE)
 	{
 #ifdef TRACE
-		printf_s("Invalid payload lenngth: %d\n", headPacket->lenData);
+		printf_s("Invalid payload length: %d\n", headPacket->lenData);
 #endif
 		return;
 	}
@@ -508,25 +520,91 @@ void CSocketItemEx::OnGetPersist()
 		// the synchronization option header...
 	}
 
-	// State transition signaled to DLL CSocketItemDl::WaitEventToDispatch()
-	if(InStates(3, CHALLENGING, RESUMING, QUASI_ACTIVE))
+#ifdef TRACE
+	printf_s("To let ULA migrate from state %s to ESTABLISHED\n", stateNames[lowState]);
+#endif
+	tRoundTrip_us = (uint32_t)min(UINT32_MAX, NowUTC() - tRecentSend);
+	if (InState(CHALLENGING))
+		tSessionBegin = tRecentSend;
+	//^ session of a responsing socket start at the time ACK_CONNECT_REQUEST was sent
+	// while the start time a resuming or resurrecting session remain the original (for sake of key life-cycle management)
+	InitiateKeepAlive();
+	if(countPlaced > 0)
 	{
 #ifdef TRACE
-		printf_s("To let ULA migrate from state %s to ESTABLISHED\n", stateNames[lowState]);
+		printf_s("There is optional payload in the PERSIST packet, payload length = %d\n", countPlaced);
 #endif
-		tRoundTrip_us = uint32_t(min(UINT32_MAX, NowUTC() - tRecentSend));
-		if(InState(CHALLENGING))
-			tSessionBegin = tRecentSend;
-		//^ session of a responsing socket start at the time ACK_CONNECT_REQUEST was sent
-		// while the start time a resuming or resurrecting session remain the original (for sake of key life-cycle management)
-		InitiateKeepAlive();
-		SignalEvent();
+		pControlBlock->PushNotice(FSP_NotifyDataReady);
+	}
+	SignalEvent();
+	return;
+}
+
+
+
+// KEEP_ALIVE is usually out-of-band and carrying some special optional headers
+void CSocketItemEx::OnGetKeepAlive()
+{
+	TRACE_SOCKET();
+	FSP_Header_Manager hdrManager(& headPacket->pkt);
+
+	if(lowState != ESTABLISHED && lowState != PAUSING)
+		return;
+
+	// UNRESOLVED!? Taking the risk of DoS attack by replayed KEEP_ALIVE...
+	if (!IsValidSequence(headPacket->pktSeqNo))
+	{
+#ifdef TRACE
+		printf_s("Invalid sequence number: %u, expected: %u - %u\n"
+			, headPacket->pktSeqNo
+			, pControlBlock->recvWindowFirstSN
+			, pControlBlock->recvWindowFirstSN + pControlBlock->recvBufferBlockN - 1);
+#endif
+		return;
+	}
+	if (headPacket->lenData < 0 || headPacket->lenData > MAX_BLOCK_SIZE)
+	{
+#ifdef TRACE
+		printf_s("Invalid payload length: %d\n", headPacket->lenData);
+#endif
 		return;
 	}
 
-	TRACE_HERE("To process heartbeat PERSIST...");
+	if (!ValidateICC())
+	{
+#ifdef TRACE
+		printf_s("Invalid intergrity check code!?\n");
+#endif
+		return;
+	}
 
-	// MERGE with // pSocket->Retransmit();	// Queue, not necessarily do real retransmission
+	// UNRESOLVED! TODO: split ResizeSendWindow? Merge it with 'Acknowledgement'?
+	ControlBlock::seq_t ackSeqNo = ntohl(headPacket->pkt->expectedSN);
+	if (! ResizeSendWindow(ackSeqNo, headPacket->pkt->GetRecvWS()))
+	{
+#ifdef TRACE
+		printf_s("Acknowledged sequence number: %u (expected: %u), should be in range %u - %u\n"
+			, ackSeqNo
+			, pControlBlock->sendWindowExpectedSN
+			, pControlBlock->sendWindowFirstSN
+			, pControlBlock->sendWindowNextSN);
+#endif
+		return;
+	}
+
+	int countPlaced = PlacePayload();
+	if(countPlaced == -ENOMEM && headPacket->lenData > 0 || countPlaced == -EFAULT)
+		return;
+
+	// connection parameter may determine whether the payload is encrypted, however, let ULA handle it...
+	PFSP_HeaderSignature optHdr = hdrManager.PopExtHeader<FSP_HeaderSignature>();
+
+	//TODO: synchronization of ULA-triggered session key installation
+	if(optHdr != NULL && optHdr->opCode == CONNECT_PARAM)
+	{
+		// the synchronization option header...
+	}
+
 	// UNRESOLVED!? TODO: check expected SN BEFORE Validate ICC??
 	// TODO: testability: output the SNACK structure
 	if(optHdr != NULL && optHdr->opCode == SELECTIVE_NACK)
@@ -554,9 +632,14 @@ void CSocketItemEx::OnGetPersist()
 		RespondSNACK(ackSeqNo, NULL, 0);	// in this case it is idempotent
 	}
 
-	// TODO: testability: output the SNACK structure
 	if(countPlaced > 0)
+	{
+#ifdef TRACE
+		printf_s("There is optional payload in the KEEP_ALIVE packet, payload length = %d\n", countPlaced);
+#endif
 		pControlBlock->PushNotice(FSP_NotifyDataReady);
+	}
+	//UNRESOLVED! TODO! only if there're really some
 	Notify(FSP_NotifyBufferReady);
 
 	EmitQ();
@@ -749,7 +832,7 @@ void CSocketItemEx::OnGetRestore()
 		// the synchronization option header...
 	}
 	// UNRESOLVED! Should send window to be recalibrated?
-
+	// TODO: UNRESOLVED! if it return -EEXIST, should ULA be re-alerted?
 	if(PlacePayload() < 0)
 		return;
 
@@ -818,7 +901,8 @@ void CSocketItemEx::OnGetMultiply()
 	// pSocket->pControlBlock->sendWindowSize
 	//	= min(pSocket->pControlBlock->sendBufferBlockN, ntohs(pkt.recvWS));
 	// See also OnConnectRequest()
-	if(PlacePayload() < 0)
+	// TODO: UNRESOLVED! if it return -EEXIST, should ULA be re-alerted?
+	if (PlacePayload() < 0)
 		return;
 
 	// it is possible that new local session ID collided with some other session, but it does not matter (?)

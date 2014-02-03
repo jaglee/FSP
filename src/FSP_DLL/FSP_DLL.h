@@ -170,6 +170,7 @@ protected:
 	int LOCALAPI BufferData(int);
 	int LOCALAPI DeliverData(void *, int);
 	void FinalizeRead();
+
 	// MUST be LOCALAPI to be compatible with fpDeliverData_t:
 	static int LOCALAPI Deliver(void * c, void * s, int L) { return ((CSocketItemDl *)c)->DeliverData(s, L); } 
 
@@ -205,7 +206,6 @@ public:
 	}
 
 
-
 	bool StateEqual(FSP_Session_State s) const { return pControlBlock->state == s; }
 	void SetState(FSP_Session_State s) { pControlBlock->state = s; }
 	// For _MSC_ only, as long is considered compatible with enum
@@ -231,17 +231,34 @@ public:
 	uint8_t	DecreaseDepth() { return --recurDepth; }
 
 	void LOCALAPI InstallBootKey(const BYTE key[], size_t len) { keyTransferer.ImportPublicKey(key, len); }
-	void LOCALAPI InstallSessionKey(BYTE sessionKey[]) { vmac_set_key(sessionKey, & pControlBlock->mac_ctx); }
+	void LOCALAPI InstallSessionKey(BYTE sessionKey[])
+	{
+#ifndef NDEBUG
+		pControlBlock->_mac_ctx_protect_prolog[0]
+			= pControlBlock->_mac_ctx_protect_prolog[1]
+			= pControlBlock->_mac_ctx_protect_epilog[0]
+			= pControlBlock->_mac_ctx_protect_epilog[1]
+			= MAC_CTX_PROTECT_SIGN;
+#endif
+		vmac_set_key(sessionKey, & pControlBlock->mac_ctx); 
+	}
 	void LOCALAPI InstallSessionKey(const BYTE * encrypted, int len)
 	{
 		keyTransferer.Decrypt(encrypted, len, pControlBlock->u.sessionKey);
-		vmac_set_key(pControlBlock->u.sessionKey, & pControlBlock->mac_ctx);
+#ifndef NDEBUG
+		pControlBlock->_mac_ctx_protect_prolog[0]
+			= pControlBlock->_mac_ctx_protect_prolog[1]
+			= pControlBlock->_mac_ctx_protect_epilog[0]
+			= pControlBlock->_mac_ctx_protect_epilog[1]
+			= MAC_CTX_PROTECT_SIGN;
+#endif
+		vmac_set_key(pControlBlock->u.sessionKey, &pControlBlock->mac_ctx);
 	}
 
 	void SetPeerName(const char *cName, size_t len)
 	{
-		size_t n = min(len, sizeof(pControlBlock->peerName));
-		memcpy(pControlBlock->peerName, cName, n);	// assume memory space has been zeroed
+		size_t n = min(len, sizeof(pControlBlock->peerAddr.name));
+		memcpy(pControlBlock->peerAddr.name, cName, n);	// assume memory space has been zeroed
 	}
 
 	void SetListenContext(PFSP_Context p) { waitingRecvBuf = (BYTE *)p; }
@@ -253,18 +270,18 @@ public:
 
 	template<FSP_ServiceCode cmd> void InitCommand(CommandToLLS & objCommand)
 	{
+		objCommand.idSession = pairSessionID.source;
 		objCommand.idProcess = ::idThisProcess;
-		objCommand.idSession = sessionID;
 		objCommand.opCode = cmd;
 	}
-	bool LOCALAPI Call(const CommandToLLS &, int, int returned = 0);
+	bool LOCALAPI Call(const CommandToLLS &, int);
 	// TODO: for heavy-load network application, polling is not only more efficient but more responsive as well
 	// Signal LLS that the send buffer is not null
-	template<FSP_ServiceCode c> bool Call(int returned = 0)
+	template<FSP_ServiceCode c> bool Call()
 	{
 		ALIGN(8) CommandToLLS cmd;
 		InitCommand<c>(cmd);
-		return Call(cmd, sizeof(cmd), returned);
+		return Call(cmd, sizeof(cmd));
 	}
 	CSocketItemDl * LOCALAPI CallCreate(CommandNewSession &, FSP_ServiceCode);
 
@@ -278,7 +295,7 @@ public:
 		return (NotifyOrReturn)InterlockedExchangePointer((PVOID volatile *)& fpSent, NULL);
 	}
 	ControlBlock::PFSP_SocketBuf GetSendBuf() { return pControlBlock->GetSendBuf(); }
-	ControlBlock::PFSP_SocketBuf PeekNextToSend() const { return pControlBlock->PeekNextToSend(); }
+	ControlBlock::PFSP_SocketBuf PeekNextToSend() const { return pControlBlock->GetNextToSend(); }
 	//
 	int LOCALAPI AcquireSendBuf(void * &, int);
 	int LOCALAPI PrepareToSend(void *, int, bool);
@@ -317,7 +334,6 @@ public:
 
 	// defined in DllEntry.cpp:
 	static CSocketItemDl * LOCALAPI CreateControlBlock(const PFSP_IN6_ADDR, PFSP_Context, CommandNewSession &);
-	static CSocketItemDl * LOCALAPI CreateControlBlock(PFSP_Context, const PFSP_IN6_ADDR, CommandNewSession &);
 };
 
 

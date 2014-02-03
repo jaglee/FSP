@@ -61,7 +61,6 @@ FSPHANDLE FSPAPI ListenAt(const PFSP_IN6_ADDR listenOn, PFSP_Context psp1)
 	if(socketItem == NULL)
 		return NULL;
 
-	socketItem->sessionID = ((PFSP_IN6_ADDR)listenOn)->idALT;
 	socketItem->SetState(LISTENING);
 	// MUST set the state before calling LLS so that event-driven state transition may work properly
 
@@ -143,6 +142,7 @@ void CSocketItemDl::InitiateConnect()
 
 // Fetch each of the backlog item in the listening socket, create new socket, prepare the acknowledgement
 // and call LLS to send the acknowledgement to the connnection request or multiplication request
+//	RESET, Timestamp echo, Initial SN echo, Expected SN echo, Reason
 void CSocketItemDl::ProcessBacklog()
 {
 	// TODO: set the default interface to non-zero?
@@ -188,21 +188,10 @@ void CSocketItemDl::ProcessBacklog()
 //	The pointer to the socket created for the new connection requested
 CSocketItemDl * LOCALAPI CSocketItemDl::PrepareToAccept(BackLogItem & backLog, CommandNewSession & cmd)
 {
-	// UNRESOLVED! TODO: FSP over UDP/IPv4 compatibility test?
-
-	ALT_ID_T idH = ((PFSP_IN6_ADDR) & pControlBlock->sockAddrTo[0].Ipv6.sin6_addr)->idHost;
-	// Host ID is only meaningful for IPv6, however.
-	FSP_IN6_ADDR addrTo[MAX_PHY_INTERFACES];
-	for(register int i = 0; i < MAX_PHY_INTERFACES; i++)
-	{
-		*(UINT64 *) & addrTo[i] = backLog.allowedPrefixes[i];
-		addrTo[i].idHost = idH;
-		addrTo[i].idALT = backLog.idRemote;
-	}
-
+	PFSP_IN6_ADDR pListenIP = (PFSP_IN6_ADDR) & backLog.acceptAddr;
 	FSP_SocketParameter context;
 	memset(& context, 0, sizeof(context));
-	context.ifDefault = backLog.acceptAddr.u.ipi6_ifindex;
+	context.ifDefault = backLog.acceptAddr.ipi6_ifindex;
 	// a new socket created by accepting remote requested might be multiplied
 	context.beforeAccept = fpRequested;
 	context.afterAccept = fpAccepted;
@@ -218,17 +207,18 @@ CSocketItemDl * LOCALAPI CSocketItemDl::PrepareToAccept(BackLogItem & backLog, C
 		context.len = pendingSendSize;
 	}
 
-	CSocketItemDl *pSocket = CreateControlBlock(& context, addrTo, cmd);
+	CSocketItemDl *pSocket = CreateControlBlock(pListenIP, &context, cmd);
 	if(pSocket == NULL)
 		return NULL;
 
-	pSocket->pControlBlock->idParent = this->sessionID;
-	pSocket->sessionID = backLog.acceptAddr.u.idALT;
-	// Session ID of the nearEnd would be set by LLS on mapping the control block (to enforce consistency)
-	pSocket->pControlBlock->nearEnd[0].u = backLog.acceptAddr.u;
+	pSocket->pControlBlock->idParent = this->pairSessionID.source;
+	// IP address, including Session ID stored in nearEnd[0] would be set by CreateControlBlock
+	// Cached session ID in the DLL SocketItem stub is set by CreateControlBlock as well
 
-	pSocket->pControlBlock->GetVeryFirstSendBuf(backLog.initialSN);
-	//
+	memcpy(pSocket->pControlBlock->peerAddr.ipFSP.allowedPrefixes, backLog.allowedPrefixes, sizeof(UINT64)* MAX_PHY_INTERFACES);
+	pSocket->pControlBlock->peerAddr.ipFSP.hostID = backLog.remoteHostID;
+	pSocket->pControlBlock->peerAddr.ipFSP.sessionID = backLog.idRemote;
+
 	pSocket->pControlBlock->recvWindowFirstSN = backLog.expectedSN;
 	pSocket->pControlBlock->receiveMaxExpected = backLog.expectedSN;
 	
@@ -244,16 +234,16 @@ CSocketItemDl * LOCALAPI CSocketItemDl::PrepareToAccept(BackLogItem & backLog, C
 //	Session key generated and encrypted
 bool LOCALAPI CSocketItemDl::ToWelcomeConnect(BackLogItem & backLog)
 {
-	// Ask the upper layer whether to accept the connection
-	//	RESET, Timestamp echo, Initial SN echo, Expected SN echo, Reason
-	if(fpRequested != NULL
-	&& fpRequested(this, & backLog.acceptAddr, (PFSP_IN6_ADDR) & pControlBlock->sockAddrTo[0].Ipv6.sin6_addr) < 0)
+	// Ask the upper layer whether to accept the connection...fpRequested CANNOT read or write anything!
+	PFSP_IN6_ADDR p = (PFSP_IN6_ADDR) & pControlBlock->peerAddr.ipFSP.allowedPrefixes[MAX_PHY_INTERFACES - 1];
+	SetState(CHALLENGING);
+	if(fpRequested != NULL && fpRequested(this, & backLog.acceptAddr, p) < 0)
 	{
 		// UNRESOLVED! report that the upper layer application reject it?
 		return false;
 	}
 
-	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend();	// See PrepareToAccept()
+	ControlBlock::PFSP_SocketBuf skb = pControlBlock->GetVeryFirstSendBuf(backLog.initialSN);
 	FSP_AckConnectKey *pKey = (FSP_AckConnectKey *)GetSendPtr(skb);
 	FSP_ConnectParam *params = (FSP_ConnectParam *)((BYTE *)pKey + sizeof(FSP_AckConnectKey));
 	//
@@ -287,7 +277,6 @@ bool LOCALAPI CSocketItemDl::ToWelcomeConnect(BackLogItem & backLog)
 	// else let ProcessPendingSend eventually transmit the welcome message, if any
 	skb->SetFlag<IS_COMPLETED>();
 
-	SetState(CHALLENGING);
 #ifdef TRACE
 	printf_s("Connect request accepted, it is in CHALLENGING\n");
 #endif
@@ -301,18 +290,12 @@ bool LOCALAPI CSocketItemDl::ToWelcomeConnect(BackLogItem & backLog)
 //	CHALLENGING-->ACTIVE
 void CSocketItemDl::ToConcludeAccept()
 {
+	TRACE_HERE("Connection has been accepted");
 	SetState(ESTABLISHED);		// make it legal to chain ReadFrom()/RecvInline()
+	pControlBlock->SkipPurePersist();
+	SetMutexFree();
 	if(fpAccepted != NULL)
-	{
-		struct in6_pktinfo acceptAddr;
-		PFSP_IN6_ADDR p = pControlBlock->nearEnd[0].ExportAddr(& acceptAddr);
-		SetMutexFree();
-		fpAccepted(this, GetAndResetContext(), p);
-	}
-	else
-	{
-		SetMutexFree();
-	}
+		fpAccepted(this, GetAndResetContext());
 }
 
 
@@ -325,8 +308,29 @@ void CSocketItemDl::ToConcludeAccept()
 void CSocketItemDl::ToConcludeConnect()
 {
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadRecv();
-	InstallSessionKey(GetRecvPtr(skb) + skb->len, FSP_PUBLIC_KEY_LEN);
-	this->sessionID = pControlBlock->GetSessionID();
+	BYTE *payload = GetRecvPtr(skb);
+	InstallSessionKey(payload + skb->len, FSP_PUBLIC_KEY_LEN);
+
+	// See also FSP_LLS$$CSocketItemEx::Connect()
+	pairSessionID.source = pControlBlock->nearEnd[0].u.idALT;
+	//^As by default Connect2 set the cached session ID in the DLL SocketItem to 0
+
+	// Deliver the optional payload and skip the ACK_CONNECT_REQUEST packet
+	// See also ControlBlock::InquireRecvBuf()
+	// UNRESOLVED! Could welcome message be compressed?
+	// TODO: Provide convient compress/decompress help routines
+	// TODO: provide extensibility of customized compression/decompression method?
+	PFSP_Context pContext = GetAndResetContext();
+	if(pContext != NULL)
+	{
+		pContext->welcome = payload;
+		pContext->len = skb->len;
+		pContext->u.st.compressing = skb->GetFlag<IS_COMPRESSED>();
+	}
+	pControlBlock->recvWindowHeadPos++;
+	pControlBlock->recvWindowFirstSN++;
+
+	TRACE_HERE("connection request has been accepted");
 	SetState(ESTABLISHED);
 
 	// Overlay CONNECT_REQUEST, and yes, it is queued and might be followed by payload packet
@@ -337,22 +341,13 @@ void CSocketItemDl::ToConcludeConnect()
 	skb->len = 0;
 	skb->ZeroFlags();	// As it overlay CONNECT_REQUEST and the packet must have been sent
 
+	SetMutexFree();
+	if(fpAccepted != NULL)
+		fpAccepted(this, pContext);
+
 #ifdef TRACE
 	printf_s("Acknowledgement of connection request received, to PERSIST the connection.\n");
 #endif
-
-	if(fpAccepted != NULL)
-	{
-		struct in6_pktinfo acceptAddr;
-		PFSP_IN6_ADDR p = pControlBlock->nearEnd[0].ExportAddr(& acceptAddr);
-		SetMutexFree();
-		fpAccepted(this, GetAndResetContext(), p);
-	}
-	else
-	{
-		SetMutexFree();
-	}
-
 	// it might be redundant if WriteTo() was chained in fpAccepted, but it does little harm
 	skb->SetFlag<IS_COMPLETED>();
 	Call<FSP_Send>();
@@ -370,7 +365,7 @@ void CSocketItemDl::ToConcludeConnect()
 DllSpec
 UINT32 * TranslateFSPoverIPv4(PFSP_IN6_ADDR p, UINT32 dwIPv4, UINT32 sessionID)
 {
-	p->u.st.prefix = IPv6PREFIX_MARK_FSP;
+	p->u.st.prefix = PREFIX_FSP_IP6to4;
 	p->u.st.ipv4 = dwIPv4;
 	p->u.st.port = DEFAULT_FSP_UDPPORT;
 	p->idALT = htobe32(sessionID);

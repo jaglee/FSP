@@ -52,9 +52,9 @@
 #pragma intrinsic(memset, memcpy)
 
 #if (_MSC_VER >= 1600)
-#pragma intrinsic(_InterlockedCompareExchange8)
+#pragma intrinsic(_InterlockedCompareExchange8, _InterlockedExchange8)
 #else
-FORCEINLINE UINT8 _InterlockedCompareExchange8(volatile char *dest, char newval, char oldval)
+FORCEINLINE char _InterlockedCompareExchange8(volatile char *dest, char newval, char oldval)
 {
     __asm
     {
@@ -63,6 +63,13 @@ FORCEINLINE UINT8 _InterlockedCompareExchange8(volatile char *dest, char newval,
         mov     cl,	newval
         lock cmpxchg byte ptr [edx], cl
     }
+}
+
+FORCEINLINE char _InterlockedExchange8(volatile char * a, char b)
+{
+	__asm mov	ecx, a;
+	__asm mov	AL, b;
+	__asm xchg	AL, byte ptr[ecx];
 }
 #endif
 
@@ -84,10 +91,35 @@ void TraceLastError(char * fileName, int lineNo, char *funcName, char *s1);
 # define REPORT_ERRMSG_ON_TRACE(s) (s)
 #endif
 
-// Reflexing string representation of FSP_Session_State and FSP_ServiceCode, for debug purpose
-extern	char * stateNames[FSP_Session_State::CLOSED + 1];
-extern	char * noticeNames[FSP_ServiceCode::FSP_NotifyUnspecifiedFault + 1];
+// Reflexing string representation of operation code, for debug purpose
+class CStringizeOpCode
+{
+	static const char * names[LARGEST_OP_CODE + 1];
+public:
+	const char * operator[](int);
+};
 
+
+// Reflexing string representation of FSP_Session_State and FSP_ServiceCode, for debug purpose
+class CStringizeState
+{
+	static const char * names[CLOSED + 1];
+public:
+	const char * operator[](int);
+};
+
+class CStringizeNotice
+{
+	static const char * names[LARGEST_FSP_NOTICE + 1];
+public:
+	const char * operator[](int);
+};
+
+extern CStringizeOpCode opCodeStrings;
+
+extern CStringizeState stateNames;
+
+extern CStringizeNotice noticeNames;
 
 /**
  * Backward compatibility support
@@ -249,7 +281,7 @@ struct FSP_Challenge
 // To make life easier we support at most two load-balanced IP interfaces
 struct FSP_ConnectParam
 {
-	uint64_t	subnets[2];
+	uint64_t	subnets[MAX_PHY_INTERFACES];
 	uint32_t	initialSN;		// initial sequence number, I->R, for this session segment
 	ALT_ID_T	listenerID;
 	uint32_t	delayLimit;		// In microseconds, 0 for no limit
@@ -362,7 +394,6 @@ struct CommandNewSession: CommandToLLS
 };
 
 
-
 class ConnectRequestQueue
 {
 	CommandNewSession q[CONNECT_BACKLOG_SIZE];
@@ -377,8 +408,9 @@ public:
 };
 
 
-// packet information on local address and interface number
-// for IPv6, local session ID is derived from local address
+/**
+ * It requires Advanced IPv6 API support to get the application layer thread ID from the IP packet control structure
+ */
 typedef struct _CMSGHDR
 {
 #if _WIN32_WINNT >= 0x0600
@@ -388,11 +420,6 @@ typedef struct _CMSGHDR
 #endif
 	FSP_PKTINFO	u;
 } *PFSP_MSGHDR;
-
-
-#define IsIPv6MSGHDR(h) (((struct _CMSGHDR *) & (h))->pktHdr.cmsg_level == IPPROTO_IPV6)
-#define MSGHDR_ALT_ID(h) (((PFSP_MSGHDR) & (h))->u.idALT)
-
 
 
 // packet information on local address and interface number
@@ -415,14 +442,7 @@ struct CtrlMsgHdr: _CMSGHDR
 		memset(& u, 0, sizeof(u));		// in6addr_any;
 		u.ipi6_ifindex = if1;
 	}
-	//
-	CtrlMsgHdr() {}
-	// implemented in DLL only
-	CtrlMsgHdr(const PFSP_IN6_ADDR);
-	// implemneted in LLS only
-	CtrlMsgHdr(WSABUF &);
-	//
-	PFSP_IN6_ADDR ExportAddr(struct in6_pktinfo *);
+	bool IsIPv6() const { return (pktHdr.cmsg_level == IPPROTO_IPV6); }
 };
 
 
@@ -433,27 +453,22 @@ struct SConnectParam	// MUST be aligned on 64-bit words!
 	UINT32		salt;
 	UINT32		initialSN;	// the initial sequence number of the packet to send
 	ALT_ID_T	idRemote;	// ID of the listener or the new forked, depending on context
-	union
-	{
-		UINT32	limit;		// in microseconds, for milky payload
-		int		p2p;		// peer to peer delay, before challenging
-	} delay;
+	UINT32		remoteHostID;
+	UINT32		delayLimit;		// in microseconds, for milky payload
+	INT32		timeDelta;		// delay of peer to peer timestamp, delta of clock 
 	timestamp_t timeStamp;
 	UINT64		allowedPrefixes[MAX_PHY_INTERFACES];
-};
+};	// totally 48 bytes
 
 
 
 struct BackLogItem: SConnectParam
 {
 	BYTE		bootKey[FSP_PUBLIC_KEY_LEN];
-	CtrlMsgHdr	acceptAddr;	// including the interface number AND the local session ID
+	FSP_PKTINFO	acceptAddr;	// including the interface number AND the local session ID
 	ALT_ID_T	idParent;
 	//^ 0 if it is the 'root' acceptor, otherwise the local session ID of the cloned connection
 	UINT32		expectedSN;	// the expected sequence number of the packet to receive by order
-	//
-	BackLogItem() {}
-	BackLogItem(WSABUF & control): acceptAddr(control) { }
 };
 
 
@@ -466,14 +481,14 @@ template<typename TLogItem> class TSingleProviderMultipleConsumerQ
 	int tailQ;
 	char mutex;
 	volatile int count;
-	volatile unsigned int nProvider;
+	volatile LONG nProvider;
 	//
 	TLogItem q[MIN_QUEUED_INTR];
 	//
 	void InitSize() { MAX_BACKLOG_SIZE = MIN_QUEUED_INTR; }	// assume memory has been zeroized
 	int InitSize(int);
 
-	friend class ControlBlock;
+	friend struct ControlBlock;
 public:
 	int LOCALAPI Push(const TLogItem *p);
 	int LOCALAPI Pop(TLogItem *p);
@@ -493,44 +508,57 @@ enum SocketBufFlagBitPosition
 	IS_ACKNOWLEDGED = 1,
 	IS_COMPLETED = 2,
 	IS_DELIVERED = 3,
-	IS_IN_USE = 4,
-	// 5, 6: reserved
+	// 4, 5: reserved
+	IS_COMPRESSED = 6,
 	TO_BE_CONTINUED = 7
 };
 
 
-class ControlBlock
+volatile struct ControlBlock
 {
-protected:
-	friend class CSocketItem;
-	volatile LONG returned;
-public:
 	bool	furtherToSend;	// by default each WriteTo() terminates a message automatically
 	bool	eomRecv;		// end of receiving message, notify EndOfMessage in ReadFrom() in out-of-band manner
 
+	ALIGN(4)	// sizeof(LONG)
 	FSP_Session_State state;
-	bool	IsPassive() const { return state == LISTENING; }
 
+	ALIGN(4)	// sizeof(LONG)
 	UINT32			allowedDelay;	// 0 if it is wine-alike payload, non-zero if milky; in microseconds
 	ALT_ID_T		idParent;
-	char			peerName[INET6_ADDRSTRLEN + 7];	// 72 bytes
+	union
+	{
+		char		name[INET6_ADDRSTRLEN + 7];	// 72 bytes
+		struct
+		{
+			UINT64	allowedPrefixes[MAX_PHY_INTERFACES];
+			UINT32	hostID;
+			ALT_ID_T sessionID;
+		} ipFSP;
+	} peerAddr;
+
+	FSP_NormalPacketHeader tmpHeader;	// for sending; assume sending is single-threaded for a single session
 
 	// 1, 2.
+	// Used to be the matched list of local and remote addresses.
+	// for security reason the remote addresses were moved to LLS
 	// TODO: UNRESOLVED!? limit multi-home capability to physical interfaces, not logical interfaces?
 	CtrlMsgHdr		nearEnd[MAX_PHY_INTERFACES];
-	SOCKADDR_INET	sockAddrTo[MAX_PHY_INTERFACES];
-	ALT_ID_T GetSessionID() const { return MSGHDR_ALT_ID(nearEnd[0]); }	// a property, actually
 
-	typedef uint32_t seq_t;
+	// 3 The (very short, roll-out) queue of returned notices
+	FSP_ServiceCode notices[FSP_MAX_NUM_NOTICE];
+	// Backlog for listening/connected socket [for client it could be an alternate of Web Socket]
+	TSingleProviderMultipleConsumerQ<BackLogItem>	backLog;
 
 	// 5, 6: Send window and receive window descriptor
-	volatile seq_t		sendWindowFirstSN;	// left-border of the send window
-	volatile seq_t		sendWindowNextSN;	// the sequence number of the next packet to send
+	typedef uint32_t seq_t;
+
+	seq_t		sendWindowFirstSN;	// left-border of the send window
+	seq_t		sendWindowNextSN;	// the sequence number of the next packet to send
 	// it means that the send queue is empty when sendWindowFirstSN == sendWindowSN2Recv
-	volatile int32_t	sendWindowSize;		// in blocks, width of the send window
+	int32_t		sendWindowSize;		// in blocks, width of the send window
 	// (next position, send buffer next sn) (head position, send window first sn)
 	// are managed independently for maximum parallism in DLL and LLS
-	volatile int32_t	sendWindowHeadPos;	// the index number of the block with sendWindowFirstSN
+	int32_t		sendWindowHeadPos;	// the index number of the block with sendWindowFirstSN
 	seq_t		sendBufferNextSN;
 	int32_t		sendBufferNextPos;	// the index number of the block with sendBufferNextSN
 	seq_t		sendWindowExpectedSN;
@@ -539,8 +567,8 @@ public:
 	uint32_t	sendBuffer;			// relative to start of the control block
 	uint32_t	sendBufDescriptors;	// relative to start of the control block,
 
-	volatile seq_t		receiveMaxExpected;	// the next to the right-border of the received area
-	volatile int32_t	recvWindowNextPos;	// the index number of the block with receiveMaxExpected
+	seq_t		receiveMaxExpected;	// the next to the right-border of the received area
+	int32_t	recvWindowNextPos;	// the index number of the block with receiveMaxExpected
 	seq_t		recvWindowFirstSN;	// left-border of the receive window (receive queue), may be empty or may be filled but not delivered
 	// it means that the receive queue is empty when recvWindowFirstSN == receiveMaxExpected
 	// (next position, receive buffer maximum sn) (head position, receive window first sn)
@@ -568,7 +596,7 @@ public:
 				flags &= ~(uint16_t)(1 << i); 
 		}
 		template<SocketBufFlagBitPosition i>
-		bool GetFlag() { return (flags & (1 << i)) != 0; }
+		bool GetFlag() const { return (flags & (1 << i)) != 0; }
 		//
 		bool MarkInSending();
 		void MarkUnsent() { flags &= ~(uint16_t)(1 << BIT_IN_SENDING); }
@@ -589,21 +617,23 @@ public:
 	}
 
 	/**
-	 * The negotiated connection parameter, deliberately placed just before the send/receive buffer control block
-	 * somewhat works as a sentinel: if sessionKey is destroyed, the connection would eventually abort
-	 */
+	* The negotiated connection parameter, deliberately placed just before the send/receive buffer control block
+	* somewhat works as a sentinel: if sessionKey is destroyed, the connection would eventually abort
+	*/
 	union
 	{
 		SConnectParam connectParams;
 		BYTE sessionKey[FSP_SESSION_KEY_LEN];	// overlay with 'initCheckCode' and 'cookie'
 	} u;
+#ifndef NDEBUG
+#define MAC_CTX_PROTECT_SIGN	0xA5A5C3C3A5C3A5C3ULL
+	ALIGN(MAC_ALIGNMENT)
+	uint64_t	_mac_ctx_protect_prolog[2];
+#endif
 	vmac_ctx_t	mac_ctx;
-
-	// 3 The (very short, roll-out) queue of returned notices
-	volatile FSP_ServiceCode notices[FSP_MAX_NUM_NOTICE];
-	// Backlog for listening/connected socket [for client it could be an alternate of Web Socket]
-	TSingleProviderMultipleConsumerQ<BackLogItem>	backLog;
-
+#ifndef NDEBUG
+	uint64_t	_mac_ctx_protect_epilog[2];
+#endif
 	// 7, 8 Send buffer and Receive buffer
 	// See ControlBlock::Init()
 
@@ -613,6 +643,7 @@ public:
 		PFSP_SocketBuf skb = HeadSend();
 		skb->version = THIS_FSP_VERSION;
 		skb->ZeroFlags();
+		sendWindowHeadPos = 0;
 		sendWindowExpectedSN = sendWindowNextSN = sendWindowFirstSN = initialSN;
 		sendBufferNextSN = initialSN + 1;
 		sendBufferNextPos = 1;
@@ -620,19 +651,20 @@ public:
 		return skb;
 	}
 	PFSP_SocketBuf GetLastBufferedSend();
-	int CountSendBuffered() { return int(sendBufferNextSN - sendWindowFirstSN); }
+	int CountSendBuffered() const { return int(sendBufferNextSN - sendWindowFirstSN); }
 
 	PFSP_SocketBuf	GetSendBuf();
 	// Return
-	//	The send buffer block descriptor of the packet to send
+	//	The send buffer block descriptor of the packet to send next
 	// Remark
 	//	It is assumed that the caller knew there exists at least one packet in the queue
 	//	Implement in a way different with that in LLS to maximize parallelism and avoid locking 
-	PFSP_SocketBuf	PeekNextToSend()
+	PFSP_SocketBuf	GetNextToSend() const
 	{
 		register int i = sendBufferNextPos - int(sendBufferNextSN - sendWindowNextSN);
 		return HeadSend() + (i < 0 ? i + sendBufferBlockN : i - sendBufferBlockN >= 0 ? i - sendBufferBlockN : i);
 	}
+	PFSP_SocketBuf	PeekNextToSend() const;	// An LLS version of GetNextToSend()
 	void * LOCALAPI InquireSendBuf(int &);
 	int LOCALAPI	MarkSendQueue(void *, int, bool);
 
@@ -641,6 +673,7 @@ public:
 	int LOCALAPI FetchReceived(void *, fpDeliverData_t);
 	int LOCALAPI GetSelectiveNACK(seq_t &, FSP_SelectiveNACK::GapDescriptor *, int) const;
 	void * LOCALAPI InquireRecvBuf(int &, bool &);
+	void SkipPurePersist();
 
 	bool IsClosable();
 	// Slide send window to skip all of the acknowledged. The caller should make sure it is legitimate
@@ -674,18 +707,14 @@ public:
 
 class CSocketItem
 {
-public:
-	// Property access of session state shared between DLL and LLS
-	void SetReturned(LONG value = 0xA5A5C3C3) { pControlBlock->returned = value; }	// a 'magic' number for testability
-	bool IsNotReturned() const { return (pControlBlock->returned == 0); }
-	LONG ReturnedValue() const { return pControlBlock->returned; }
-	//
 protected:
+	PairSessionID	pairSessionID;
+	HANDLE	hEvent;
 	HANDLE	hMemoryMap;
 	DWORD	dwMemorySize;	// size of the shared memory, in the mapped view
-	HANDLE	hEvent;
-	ALT_ID_T sessionID;
 	ControlBlock *pControlBlock;
+
+	void SetReturned() { pControlBlock->notices[0] = NullCommand; }	// clear the 'NOT-returned' notice
 
 	~CSocketItem() { Destroy(); }
 	void Destroy()

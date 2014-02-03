@@ -163,17 +163,30 @@ void CSocketItemEx::TimeOut()
 
 
 // Send heartbeart signal to the remote end, may trigger retransmission of the remote end
-//如果SNACK内容不为空，心跳信号被认为是一个带外控制报文，它不能带载荷，并且在被发送时，总是借用最后一个已发送报文的序列号。
-//如果SNACK为空，则PERSIST可以借用发送窗口中下一个待发送的数据报文。如果发送窗口为空（下一个待发送数据报文未准备好），则即使SNACK为空，当需要发送心跳信号时，心跳信号都必须以带外控制报文的形式发送。
-//即心跳信号不能背载在一个不完整数据报文上。考虑到绝大多数应用的非对称性，由此造成的浪费不大。
-//连接发起方针对ACK_CONNECT_REQUEST回应的第一个PERSIST报文不是心跳信号，它应该被视为PURE_DATA的特殊形态，鼓励带载荷。
+// If the first packet in the send queue is PERSIST or ADJOURN (and it is unacknowledged)
+// the packet is resent, or else either an out-of-band KEEP_ALIVE whose sequence number is
+// of the next to send is sent 
 void CSocketItemEx::KeepAlive()
 {
+	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend()+ pControlBlock->sendWindowHeadPos;
+	if(skb->opCode == PERSIST || skb->opCode == ADJOURN)
+	{
 #ifdef TRACE
-	printf_s("Keep-alive session#%u, SKB opcode = %d\n"
+		printf_s("Keep-alive session#%u, head packet in the queue is happened to be %s\n"
+			, pairSessionID.source
+			, opCodeStrings[skb->opCode]);
+#endif
+		// UNRESOLVED! Could sendWindowHeadPos and sendWindowFirstSN update in an atomic manner?
+		// it is waste of time if the packet is already acknowledged however it do little harm
+		// and it doesn't worth the trouble to handle low-possibility situation
+		Retransmit1();
+		return;
+	}
+
+#ifdef TRACE
+	printf_s("Keep-alive session#%u\n"
 		"\tSend head - tail = %d - %d, recv head - tail = %d - %d\n"
-		, sessionID
-		, PERSIST
+		, pairSessionID.source
 		, pControlBlock->sendWindowHeadPos
 		, pControlBlock->sendBufferNextPos
 		, pControlBlock->recvWindowHeadPos
@@ -182,79 +195,52 @@ void CSocketItemEx::KeepAlive()
 
 	BYTE buf[sizeof(FSP_NormalPacketHeader) + MAX_BLOCK_SIZE];
 	ControlBlock::seq_t seqI;
+	ControlBlock::seq_t seq0 = pControlBlock->sendWindowNextSN;
 	int spFull = GenerateSNACK(buf, seqI);
+
 	if(spFull < 0)
+	{
+#ifdef TRACE
+		printf_s("Fatal error %d encountered when generate SNACK\n", spFull);
+#endif
 		return;
+	}
 	if(spFull - sizeof(FSP_NormalPacketHeader) < 0)
 	{
 		HandleMemoryCorruption();
 		return;
 	}
 
-	FSP_NormalPacketHeader *pHdr = (FSP_NormalPacketHeader *)buf;
-	if(seqI == pControlBlock->receiveMaxExpected)
+	if( spFull - sizeof(FSP_NormalPacketHeader) == 0
+	&& (skb = pControlBlock->PeekNextToSend()) != NULL
+	&& (skb->opCode == PURE_DATA && skb->GetFlag<IS_COMPLETED>() && skb->MarkInSending()
+		|| skb->opCode == KEEP_ALIVE)
+	)
 	{
-		spFull = sizeof(FSP_NormalPacketHeader);
-		if(pControlBlock->IsClosable())
-		{
 #ifdef TRACE
-			printf_s("\nDuring keep-alive it is found that the session is CLOSABLE");
+		printf_s("\tTo send back an accumulative acknowledgement.\n");
 #endif
-			SendPacket<ACK_FLUSH>();
-			return;
+		// UNRESOLVED! If it is yet out of send window, send an out-of-band packet with null payload instead
+		skb->opCode = KEEP_ALIVE;
+		if(! Emit(skb, seq0))
+		{
+			skb->opCode = PURE_DATA;
+			skb->MarkUnsent();
 		}
-	}
-	pHdr->hs.Set<PERSIST>(spFull);
-
-	// Try to piggyback on the next data packet to send. If it is yet out of send window, send an out-of-band packet
-	ControlBlock::seq_t seq0 = pControlBlock->sendWindowNextSN;
-	ControlBlock::PFSP_SocketBuf skb = PeekNextToSend();
-	if( skb != NULL 
-	&& (skb->opCode != PURE_DATA && skb->opCode != PERSIST
-		|| skb->GetFlag<IS_ACKNOWLEDGED>()
-		|| skb->len + spFull > MAX_BLOCK_SIZE + sizeof(FSP_NormalPacketHeader) ) )
-	{
-		skb = NULL;
+		return;
 	}
 
-	// skb could still be NULL. in this case a command packet without piggybacked payload is sent
+	register FSP_NormalPacketHeader *pHdr = (FSP_NormalPacketHeader *)buf;
+	pHdr->hs.Set<KEEP_ALIVE>(spFull);
+	pHdr->sequenceNo = htonl(seq0);
 	pHdr->expectedSN = htonl(seqI);
 	pHdr->ClearFlags();	// pHdr->u.flags = 0;
-	if(skb != NULL)
-	{
-		if(skb->GetFlag<TO_BE_CONTINUED>())
-			pHdr->SetFlag<ToBeContinued>();
-		else
-			pHdr->ClearFlag<ToBeContinued>();
-		// UNRESOLVED! compressed? ECN?
-	}
-	else
-	{
-		--seq0;
-	}
-	pHdr->sequenceNo = htonl(seq0);
 	// here we needn't check memory corruption as mishavior only harms himself
 	pHdr->SetRecvWS(pControlBlock->RecvWindowSize());
-
 	SetIntegrityCheckCode(*pHdr);
 	wsaBuf[1].buf = (CHAR *)pHdr;
 	wsaBuf[1].len = spFull;
-	// Command packet such as PERSIST or ADJOURN may carry additional control information
-	if(skb == NULL)
-	{
-		// This is a out-of-band PERSIST, the receiver should not slide the receive window
-		SendPacket(1);
-	}
-	else
-	{
-		if( (wsaBuf[2].buf = (CHAR *)GetSendPtr(skb)) == NULL )
-		{
-			CLowerInterface::Singleton()->FreeItem(this);
-			return;	// memory corruption found!
-		}
-		wsaBuf[2].len = skb->len;
-		SendPacket(2);
-	}
+	SendPacket(1);
 }
 
 
@@ -264,10 +250,9 @@ void CSocketItemEx::KeepAlive()
 void CSocketItemEx::Flush()
 {
 #ifdef TRACE
-	printf("Flushing session#%u, SKB opcode = %d\n"
+	printf("Flushing session#%u\n"
 		"\tSend head - tail = %d - %d, recv head - tail = %d - %d\n"
-		, sessionID
-		, ADJOURN
+		, pairSessionID.source
 		, pControlBlock->sendWindowHeadPos
 		, pControlBlock->sendBufferNextPos
 		, pControlBlock->recvWindowHeadPos
@@ -401,14 +386,7 @@ int LOCALAPI CSocketItemEx::RespondSNACK(ControlBlock::seq_t expectedSN, const F
 		k++;
 	} while(int(seqTail - seqHead) > 0);
 
-	if(lowState == CHALLENGING)
-	{
-		tRoundTrip_us = uint32_t(NowUTC() - tRecentSend);
-#ifdef TRACE
-		printf_s("\nCalibrated round trip time in CHALLENGING state: %dus\n\n", tRoundTrip_us);
-#endif
-	}
-	else if(acknowledged)
+	if(acknowledged)
 	{
 		uint32_t	rtt_us = uint32_t(NowUTC() - tEarliestSend);
 		tRoundTrip_us = (tRoundTrip_us >> 2) + (tRoundTrip_us >> 1) + ((rtt_us + 3) >> 2);

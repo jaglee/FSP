@@ -30,50 +30,12 @@
 
 #include "fsp_srv.h"
 
-ALT_ID_T CLowerInterface::GetLocalSessionID() const
-{
-	return IsIPv6MSGHDR(nearInfo)
-		? MSGHDR_ALT_ID(nearInfo)
-		: HeaderFSPoverUDP().dstSessionID;
-}
-
-
 ALT_ID_T CLowerInterface::SetLocalSessionID(ALT_ID_T value)
 {
-	register volatile ALT_ID_T *p = IsIPv6MSGHDR(nearInfo)
-		? & MSGHDR_ALT_ID(nearInfo)
-		: & HeaderFSPoverUDP().dstSessionID;
+	register volatile ALT_ID_T *p = nearInfo.IsIPv6()
+		? & nearInfo.u.idALT
+		: & HeaderFSPoverUDP().peer;
 	return InterlockedExchange((volatile LONG *)p, value);
-}
-
-// only valid for received message
-ALT_ID_T CLowerInterface::GetRemoteSessionID() const
-{
-	return IsIPv6MSGHDR(nearInfo)
-		? SOCKADDR_ALT_ID(sinkInfo.name)
-		: HeaderFSPoverUDP().srcSessionID;
-}
-
-
-// Given
-//	PairSessionID &		placeholder to receive the resulted session ID association
-// Do
-//	Store the local(near end) session ID as the source, the remote end session ID as
-//	the destination session ID in the given session ID association
-// Remark
-//	Only valid for received message
-void CLowerInterface::GetEchoingPairSession(PairSessionID & sidPair) const
-{
-	if(IsIPv6MSGHDR(nearInfo))
-	{
-		sidPair.dstSessionID = SOCKADDR_ALT_ID(sinkInfo.name);
-		sidPair.srcSessionID = MSGHDR_ALT_ID(nearInfo);
-	}
-	else
-	{
-		sidPair.dstSessionID = HeaderFSPoverUDP().srcSessionID;
-		sidPair.srcSessionID = HeaderFSPoverUDP().dstSessionID;
-	}
 }
 
 
@@ -99,7 +61,7 @@ ALT_ID_T LOCALAPI CLowerInterface::RandALT_ID(PIN6_ADDR addrList)
 		{
 			if(*(long long *)s == *(long long *)addresses[j].sin6_addr.u.Byte)
 			{
-				memcpy(s + 12, & p->sessionID, 4);
+				*(ALT_ID_T *)(s + 12) = p->pairSessionID.source;
 				ifIndex = interfaces[j];
 				isEffective = true;
 				break;
@@ -115,8 +77,8 @@ ALT_ID_T LOCALAPI CLowerInterface::RandALT_ID(PIN6_ADDR addrList)
 	else
 	{
 		// by default exploit the first interface configured
+		*(ALT_ID_T *)(s + 12) = p->pairSessionID.source;
 		memcpy(s, addresses[0].sin6_addr.u.Byte, 12);
-		memcpy(s + 12, & p->sessionID, 4);
 		ifIndex = interfaces[0];
 	}
 	// circle the entry
@@ -126,7 +88,7 @@ ALT_ID_T LOCALAPI CLowerInterface::RandALT_ID(PIN6_ADDR addrList)
 	if(headFreeSID == p)
 		p->next = NULL;
 	// just take use of sessionID portion of the new entry
-	return p->sessionID;
+	return p->pairSessionID.source;
 }
 
 
@@ -147,7 +109,7 @@ ALT_ID_T LOCALAPI CLowerInterface::RandALT_ID()
 	else
 		p->next = NULL;
 	// just take use of sessionID portion of the new entry
-	return p->sessionID;
+	return p->pairSessionID.source;
 }
 
 
@@ -165,13 +127,13 @@ UINT64 LOCALAPI CalculateCookie(BYTE *header, int sizeHdr, timestamp_t t0)
 	ALIGN(MAC_ALIGNMENT) BYTE m[VMAC_KEY_LEN >> 3];
 	timestamp_t t1 = NowUTC();
 
-#ifdef TRACE
-	printf("\n**** Cookie Context timestamp ****\n");
-	printf("Previous = 0x%016I64X\n", prevCookieContext.timeStamp);
-	printf("Current  = 0x%016I64X\n", cookieContext.timeStamp);
-	printf("Packet   = 0x%016I64X\n", t0);
-	printf("JustNow  = 0x%016I64X\n", t1);
-#endif
+//#ifdef TRACE
+//	printf("\n**** Cookie Context timestamp ****\n");
+//	printf("Previous = 0x%016I64X\n", prevCookieContext.timeStamp);
+//	printf("Current  = 0x%016I64X\n", cookieContext.timeStamp);
+//	printf("Packet   = 0x%016I64X\n", t0);
+//	printf("JustNow  = 0x%016I64X\n", t1);
+//#endif
 
 	// public information included in cookie calculation should be as little as possible
 	if(sizeHdr < 0 || sizeHdr > sizeof(m))
@@ -199,61 +161,6 @@ UINT64 LOCALAPI CalculateCookie(BYTE *header, int sizeHdr, timestamp_t t0)
 			, (unsigned char * ) & prevCookieContext.timeStamp
 			, & (prevCookieContext.timeSign = t0)
 			, & prevCookieContext.ctx);
-}
-
-
-
-// Given
-//	char *	pointer the data buffer to send back.
-//	int		length of the data to send back, in bytes. must be positive
-// Do
-//	Send back to the remote address where the most recent received packet was sent
-// Return
-//	Number of bytes actually sent (0 means error)
-// Remark
-//	It is safely assume that remote and near address are of the same address family
-int LOCALAPI CLowerInterface::SendBack(char * buf, int len)
-{
-	// the final WSAMSG structure
-	PairSessionID sidPair;
-	WSABUF wsaData[2];
-	WSABUF *pToSend;
-	int nToSend;
-
-	wsaData[1].buf = buf;
-	wsaData[1].len = len;
-	if(IsIPv6MSGHDR(nearInfo))
-	{
-		pToSend = & wsaData[1];
-		nToSend = 1;
-	}
-	else
-	{
-		GetEchoingPairSession(sidPair);
-		wsaData[0].buf = (char *) & sidPair;
-		wsaData[0].len = sizeof(PairSessionID);
-		//
-		pToSend = wsaData;
-		nToSend = 2;
-	}
-	//
-	DWORD n = 0;
-	int r = WSASendTo(sdSend
-			, pToSend, nToSend,	& n
-			, 0
-			, (const sockaddr *) & addrFrom, sinkInfo.namelen
-			, NULL, NULL);
-	if(r != 0)
-	{
-		REPORT_ERROR_ON_TRACE();
-		return 0;
-	}
-#ifdef TRACE
-	printf("%s, line %d, %d bytes sent back.\n", __FILE__, __LINE__, n);
-	printf("Peer name length = %d, socket address:\n", sinkInfo.namelen);
-	DumpNetworkUInt16((UINT16 *) & addrFrom, sizeof(SOCKADDR_IN6) / 2);
-#endif
-	return n;
 }
 
 
@@ -311,22 +218,46 @@ void LOCALAPI CSocketItemEx::SetIntegrityCheckCode(FSP_NormalPacketHeader *p1)
 //  due to larger stack memory requirement
 void LOCALAPI CSocketItemEx::SetIntegrityCheckCode(FSP_NormalPacketHeader *p1)
 {
-#define FSP_MAC_IV_SIZE (sizeof(p1->sequenceNo) + sizeof(p1->expectedSN))	
-	unsigned char *m = (BYTE *) & p1->integrity.id;	// the message
-	uint64_t tag;
+//#ifdef TRACE
+//	printf_s("First 16 bytes to including in calculate ICC:\n");
+//	DumpNetworkUInt16((UINT16 *)p1, 16);
+//#endif
+	// prepare vmac memory alignment and initialize the padding
 	ALIGN(MAC_ALIGNMENT) unsigned char nonce[16];	// see vmac()
+	int & mbytes = *((int *)nonce);
 	ALIGN(MAC_ALIGNMENT) unsigned char padded[MAX_BLOCK_SIZE];
+
+	mbytes = ntohs(p1->hs.hsp) - FSP_MAC_IV_SIZE;
+	if (mbytes > sizeof(padded) || mbytes <= 0)
+		return;
+	memcpy_s(padded, sizeof(padded), (BYTE *) & p1->integrity.id, mbytes);
+	if (mbytes < sizeof(padded))
+		memset(padded + mbytes, 0, min(mbytes + MAC_ALIGNMENT, sizeof(padded)));
+
 	// "An i byte nonce, is made as the first 16-i bytes of n being zero, and the final i the nonce."
 	// here it is (p1->sequenceNo, p1->expectedSN) of 8 bytes
 	memset(nonce, 0, sizeof(nonce) - FSP_MAC_IV_SIZE);
 	memcpy(nonce + sizeof(nonce) - FSP_MAC_IV_SIZE, p1, FSP_MAC_IV_SIZE);
 	//
-	// prepare vmac memory alignment and initialize the padding
-	unsigned int mbytes = ntohs(p1->hs.hsp) - FSP_MAC_IV_SIZE;
-	memcpy(padded, m, mbytes);
-	memset(padded + mbytes, 0, (MAC_ALIGNMENT - (int)(mbytes & (MAC_ALIGNMENT - 1))) & (MAC_ALIGNMENT - 1));
-	tag = vmac(padded, mbytes, nonce, NULL, & pControlBlock->mac_ctx);
-	p1->integrity.code = tag;
+//#ifdef TRACE
+//	printf_s("Nonce:\n");
+//	DumpNetworkUInt16((UINT16 *)nonce, 8);
+//	printf_s("Padded data of %d bytes (original: %d):\n", ((mbytes + MAC_ALIGNMENT - 1) & ~(MAC_ALIGNMENT - 1)) / 2, mbytes);
+//	DumpNetworkUInt16((UINT16 *)padded, ((mbytes + MAC_ALIGNMENT - 1) & ~(MAC_ALIGNMENT - 1)) / 2);
+//	printf_s("VMAC Context: \n");
+//	DumpNetworkUInt16((UINT16 *)& pControlBlock->mac_ctx, sizeof(pControlBlock->mac_ctx) / 2);
+//#endif
+#ifndef NDEBUG
+	if (pControlBlock->_mac_ctx_protect_prolog[0] != MAC_CTX_PROTECT_SIGN
+		|| pControlBlock->_mac_ctx_protect_prolog[1] != MAC_CTX_PROTECT_SIGN
+		|| pControlBlock->_mac_ctx_protect_epilog[0] != MAC_CTX_PROTECT_SIGN
+		|| pControlBlock->_mac_ctx_protect_epilog[1] != MAC_CTX_PROTECT_SIGN)
+	{
+		printf_s("Fatal! VMAC context is destroyed! Session ID = 0x%X\n", this->pairSessionID.source);
+		return;
+	}
+#endif
+	p1->integrity.code = vmac(padded, mbytes, nonce, NULL, &pControlBlock->mac_ctx);
 #undef FSP_MAC_IV_SIZE
 }
 
@@ -395,68 +326,43 @@ bool LOCALAPI CSocketItemEx::Emit(ControlBlock::PFSP_SocketBuf skb, ControlBlock
 		return false;
 	}
 
-	FSP_NormalPacketHeader hdr;
-	int result;
-	wsaBuf[1].buf = (CHAR *) & hdr;
-	wsaBuf[1].len = (ULONG)(sizeof(hdr));
+	register FSP_NormalPacketHeader * const pHdr = & pControlBlock->tmpHeader;
+	wsaBuf[1].buf = (CHAR *)pHdr;
+	wsaBuf[1].len = (ULONG)(sizeof(FSP_NormalPacketHeader));
 	wsaBuf[2].buf = (CHAR *)payload;
 	wsaBuf[2].len = (ULONG)skb->len;
 
 	// wsaBuf[0] is reserved for session ID
 	// ICC, if required, is always set just before being sent
-	switch(skb->opCode)
+	int result;
+	switch (skb->opCode)
 	{
 	case ACK_CONNECT_REQUEST:
-		SetSequenceFlags(& hdr);
-		hdr.integrity.code = htonll(NowUTC());
-		CLowerInterface::Singleton()->EnumEffectiveAddresses
-			( (UINT64 *)((BYTE *)payload + sizeof(FSP_AckConnectKey))
-			, sizeof(((FSP_ConnectParam *)payload)->subnets) / sizeof(UINT64) );
-		hdr.hs.Set<FSP_AckConnectRequest, ACK_CONNECT_REQUEST>();
+		SetSequenceFlags(pHdr);
+		pHdr->integrity.code = htonll(NowUTC());
+		CLowerInterface::Singleton()->EnumEffectiveAddresses(
+			(UINT64 *)((BYTE *)payload + sizeof(FSP_AckConnectKey))
+			);
+		pHdr->hs.Set<FSP_AckConnectRequest, ACK_CONNECT_REQUEST>();
 		//
 		result = this->SendPacket(2);
 		break;
-	/*
-	case MULTIPLY:
-		SetSequenceFlags(pHdr);
-		pAllowedPrefix = (UINT64 *)((BYTE *)pHdr + sizeof(FSP_NormalPacketHeader));
-		//^We're confident that the 'allowed prefixes' field of the half-connection
-		// parameter header is following the fixed header / Built-in rule
-		CLowerInterface::Singleton()->EnumEffectiveAddresses(pAllowedPrefix, 2);
-		// bool LOCALAPI PiggyBack(WSABUF &, ControlBlock::PFSP_SocketBuf);
-		SetIntegrityCheckCode(*pHdr);
-		result = this->SendPacket(1);
-		if(timer != NULL)
+	case PERSIST:	// PERSIST is an in-band control packet with optional payload that initiate a half-connection
+		if (timer != NULL)
 		{
-			TRACE_HERE ("\nInternal panic! Unclean multiplied connection reuse?\n"
-						"Timer to acknowledge connect request is not cleared beforehand.");
-			break;
+			TRACE_HERE("\nInternal panic! Unclean multiplied connection reuse?\n"
+				"\tTimer to acknowledge connect request ackowledgement is not cleared beforehand.\n");
+			// this is a recovery error, however
 		}
-		//
-		tKeepAlive = CONNECT_INITIATION_TIMEOUT_ms;
-		AddTimer();
+	case MULTIPLY:	// MULTIPLY is an out-of-band control packet that try to incarnate an new clone of the connection
+	case RESTORE:	// RESTORE is an in-band control packet that try re-established a broken/paused connection
+		tRoundTrip_us = CONNECT_INITIATION_TIMEOUT_ms << 2;	// So to tweak InitiateKeepAlive()
+		InitiateKeepAlive();
+		result = EmitSetICC(skb, seq);
 		break;
-	*/
-	case RESTORE:
-	case ADJOURN:	// ADJOURN is always in-the-queue
-	case PERSIST:	// PERSIST is either out-of-band with optional header or as a keep-alive packet
+	case ADJOURN:	// ADJOURN is always in the queue
 	case PURE_DATA:
-		if(skb->GetFlag<TO_BE_CONTINUED>() && skb->len != MAX_BLOCK_SIZE)
-		{
-			// TODO: debug log failure of segmented and/or online-compressed send
-#ifdef 	TRACE
-			printf_s("\nIncomplete packet to send, opCode = %d\n", skb->opCode);
-#endif
-			return false;
-		}
-		// Which is the norm. Dynanically generate the fixed header.
-		SetSequenceFlags(& hdr, skb, seq);
-		hdr.hs.opCode = skb->opCode;
-		hdr.hs.version = THIS_FSP_VERSION;
-		hdr.hs.hsp = htons(sizeof(FSP_NormalPacketHeader));
-		// Only when the first acknowledgement is received may the faster Keep-Alive timer started. See also OnGetFullICC()
-		SetIntegrityCheckCode(hdr);
-		result = this->SendPacket(skb->len > 0 ? 2 : 1);
+		result = EmitSetICC(skb, seq);
 		break;
 	// Only possible for retransmission
 	case INIT_CONNECT:
@@ -472,13 +378,36 @@ bool LOCALAPI CSocketItemEx::Emit(ControlBlock::PFSP_SocketBuf skb, ControlBlock
 	tRecentSend = NowUTC();
 
 #ifdef TRACE
-	printf_s("Session#%u emit opcode %d, sequence = %u, result = %d, time : 0x%016llX\n"
-		, sessionID, skb->opCode, seq, result, tRecentSend);
+	printf_s("Session#%u emit %s, sequence = %u, result = %d, time : 0x%016llX\n"
+		, pairSessionID.source
+		, opCodeStrings[skb->opCode], seq, result, tRecentSend);
 #endif
 
 	return (result > 0);
 }
 
+
+
+int LOCALAPI CSocketItemEx::EmitSetICC(ControlBlock::PFSP_SocketBuf skb, ControlBlock::seq_t seq)
+{
+	register FSP_NormalPacketHeader * const pHdr = &pControlBlock->tmpHeader;
+	if (skb->GetFlag<TO_BE_CONTINUED>() && skb->len != MAX_BLOCK_SIZE)
+	{
+		// TODO: debug log failure of segmented and/or online-compressed send
+#ifdef 	TRACE
+		printf_s("\nIncomplete packet to send, opCode = %d\n", skb->opCode);
+#endif
+		return 0;
+	}
+	// Which is the norm. Dynanically generate the fixed header.
+	SetSequenceFlags(pHdr, skb, seq);
+	pHdr->hs.opCode = skb->opCode;
+	pHdr->hs.version = THIS_FSP_VERSION;
+	pHdr->hs.hsp = htons(sizeof(FSP_NormalPacketHeader));
+	// Only when the first acknowledgement is received may the faster Keep-Alive timer started. See also OnGetFullICC()
+	SetIntegrityCheckCode(*pHdr);
+	return SendPacket(skb->len > 0 ? 2 : 1);
+}
 
 
 // Emit packet in the send queue, by default transmission of new packets takes precedence
@@ -495,7 +424,7 @@ void CSocketItemEx::EmitQ()
 #ifdef TRACE
 	printf_s("\n%s, session #%u meant to send = %d, allowed to send = %d\n"
 		, __FUNCTION__
-		, sessionID
+		, pairSessionID.source
 		, nAvailable
 		, nAllowedToSend
 		);
@@ -504,12 +433,12 @@ void CSocketItemEx::EmitQ()
 		return;
 
 	ControlBlock::PFSP_SocketBuf skb;
-	while((skb = PeekNextToSend()) != NULL)
+	while((skb = pControlBlock->PeekNextToSend()) != NULL)
 	{
 #ifdef TRACE
-		printf_s("\nIn session#%u, to emit opcode %d, sequence = %u, len = %d\n"
-			, sessionID
-			, skb->opCode
+		printf_s("\nIn session#%u, to emit opcode %s, sequence = %u, len = %d\n"
+			, pairSessionID.source
+			, opCodeStrings[skb->opCode]
 			, pControlBlock->sendWindowNextSN
 			, skb->len);
 #endif
@@ -521,8 +450,11 @@ void CSocketItemEx::EmitQ()
 		}
 		if(! skb->MarkInSending())
 		{
-			TRACE_HERE("Cannot gain exclusive sending lock on the last packet");
-			break;
+#ifdef TRACE
+			printf_s("Cannot gain exclusive sending lock on the packet to send."
+				" it might be piggybacked already on KEEP_ALIVE\n");
+#endif
+			continue;
 		}
 		if(! Emit(skb, pControlBlock->sendWindowNextSN))
 		{
@@ -538,80 +470,24 @@ void CSocketItemEx::EmitQ()
 }
 
 
-
-// UNRESOLVED! TODO: enforce rate-limit (and rate-limit based congestion avoidance/control)
-// TODO: UNRESOLVED! is it multi-home awared?
-int LOCALAPI CSocketItemEx::SendPacket(ULONG n1)
-{
-	WSAMSG m = pWSAMsg[usingPrimary ? 0 : 1];
-	if(IsIPv6MSGHDR(*m.Control.buf))
-	{
-		m.lpBuffers = & wsaBuf[1];
-	}
-	else
-	{
-		// assume sidPair is maintained properly
-		wsaBuf[0].buf = (CHAR *) & pairSessionID;
-		wsaBuf[0].len = sizeof(pairSessionID);
-		m.lpBuffers = & wsaBuf[0];
-		n1++;
-	}
-	//
-	m.dwBufferCount = n1;
-
-	DWORD n = 0;
-	//int r = WSASendMsg(sdSend, (LPWSAMSG) & m, 0, & n, NULL, NULL);
-	// here we assume that WSASendMsg does not change anyting in m.
-	// as minimum OS version that support WSASendMSg is Windows Vista/Server 2008
-	// for XP/2003 compatibility reason we utilize WSASendTo
-	int r = WSASendTo(CLowerInterface::Singleton()->sdSend
-		, m.lpBuffers, m.dwBufferCount, & n
-		, 0
-		, m.name, m.namelen
-		, NULL, NULL);
-	if(r != 0)
-	{
-		REPORT_ERROR_ON_TRACE();
-		return 0;
-	}
-#ifdef TRACE
-	printf("%s, line %d, %d bytes sent.\n", __FILE__, __LINE__, n);
-	//printf("Control len = %d\n", m.Control.len);
-	//DumpCMsgHdr(*(CtrlMsgHdr *)m.Control.buf);
-	//
-	printf("Peer name length = %d, socket address:\n", m.namelen);
-	DumpNetworkUInt16((UINT16 *)m.name, sizeof(SOCKADDR_IN6) / 2);
-	//
-	//printf("Buffer count = %d, flags = %x, data len = %d, data: \n"
-	//	, m.dwBufferCount, m.dwFlags, m.lpBuffers[0].len);
-	//DumpHexical((BYTE *)m.lpBuffers[0].buf, m.lpBuffers[0].len);
-	//if(m.dwBufferCount > 1)
-	//	DumpHexical((BYTE *)m.lpBuffers[1].buf, m.lpBuffers[1].len);
-#endif
-	return n;
-}
-
-
 // Remark
 //	Designed side-effect for mobility support: automatically refresh the corresponding address list...
 bool CSocketItemEx::ValidateICC(FSP_NormalPacketHeader *pkt)
 {
 	UINT64	savedICC = pkt->integrity.code;
-	PairSessionID idPair;
-	idPair.dstSessionID = pairSessionID.srcSessionID;
-	idPair.srcSessionID = pairSessionID.dstSessionID;
-	pkt->integrity.id = idPair;
+	pkt->integrity.id.source = pairSessionID.peer;
+	pkt->integrity.id.peer = pairSessionID.source;
 	SetIntegrityCheckCode(pkt);
 	if(pkt->integrity.code != savedICC)
 		return false;
 	// TODO: automatically register remote address as the favorite contact address
 	// iff the integrity check code has passed the validation
-	if(addrFrom.si_family == AF_INET)
-	{
-	}
-	else if(addrFrom.si_family == AF_INET6)
-	{
-	}
-	addrFrom.si_family = 0;	// AF_UNSPEC;	// as the flag
+	//if(addrFrom.si_family == AF_INET)
+	//{
+	//}
+	//else if(addrFrom.si_family == AF_INET6)
+	//{
+	//}
+	//addrFrom.si_family = 0;	// AF_UNSPEC;	// as the flag
 	return true;
 }

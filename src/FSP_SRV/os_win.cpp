@@ -28,8 +28,6 @@ static LPFN_WSARECVMSG	WSARecvMsg;
 
 static int LOCALAPI ReportWSAError(char * msg);
 
-// the FSP over UDP on IPv4
-inline int BindInterface(SOCKET sd, PSOCKADDR_IN pAddrListen);
 // eventually IPv6 version
 inline int BindInterface(SOCKET sd, PSOCKADDR_IN6 pAddrListen);
 
@@ -42,6 +40,8 @@ inline int GetPointerOfWSARecvMsg(SOCKET sd)
 		, (char *) & WSARecvMsg, sizeof(WSARecvMsg), & bytesReturned
 		, NULL, NULL);
 }
+
+
 
 
 //
@@ -137,23 +137,35 @@ CLowerInterface::~CLowerInterface()
 
 
 // TODO: fill in the allowed prefixes with properly multihome support (utilize concept of 'zone')
-int CLowerInterface::EnumEffectiveAddresses(UINT64 *prefixes, int capacity)
+// multihome/mobility/resilence support (see also CInterface::EnumEffectiveAddresses):
+// MAX_PHY_INTERFACES is hard-coded to 4
+// sockAddrTo[0] is the most preferred address (care of address)
+// sockAddrTo[3] is the home-address
+// while sockAddr[1], sockAddr[2] are backup-up/load-balance address (might be zero)
+int LOCALAPI CLowerInterface::EnumEffectiveAddresses(UINT64 *prefixes)
 {
-	// UNRESOLVED! TODO: put home address into prefixes[1]. prefixes[0] stored care-of address
 	// UNRESOLVED! could we make sure u is 64-bit aligned?
-	if(IsIPv6MSGHDR(nearInfo))
+	if (nearInfo.IsIPv6())
 	{
 		prefixes[0] = *(UINT64 *) & nearInfo.u;
+		prefixes[1] = 0;	// IN6_ADDR_ANY; no compatible multicast prefix
 	}
 	else
 	{
-		((PFSP_IN6_ADDR) & prefixes[0])->u.st.prefix = IPv6PREFIX_MARK_FSP;
-		((PFSP_IN6_ADDR) & prefixes[0])->u.st.ipv4 = (nearInfo.u.ipi_addr == 0)
+		((PFSP_IN4_ADDR_PREFIX) & prefixes[0])->prefix = PREFIX_FSP_IP6to4;
+		((PFSP_IN4_ADDR_PREFIX) & prefixes[0])->ipv4 = (nearInfo.u.ipi_addr == 0)
 			? INADDR_LOOPBACK	// in ws2def.h
 			: nearInfo.u.ipi_addr;
-		((PFSP_IN6_ADDR) & prefixes[0])->u.st.port = DEFAULT_FSP_UDPPORT;
+		((PFSP_IN4_ADDR_PREFIX) & prefixes[0])->port = DEFAULT_FSP_UDPPORT;
+		//
+		((PFSP_IN4_ADDR_PREFIX) & prefixes[1])->prefix = PREFIX_FSP_IP6to4;
+		((PFSP_IN4_ADDR_PREFIX)& prefixes[1])->ipv4 = INADDR_BROADCAST;
+		((PFSP_IN4_ADDR_PREFIX) & prefixes[1])->port = DEFAULT_FSP_UDPPORT;
 	}
-	return 1;
+	// we assume that at the very beginning the home address equals the care-of address
+	prefixes[3] = prefixes[0];
+	prefixes[2] = prefixes[1];
+	return 4;
 }
 
 
@@ -190,6 +202,8 @@ inline bool CLowerInterface::LearnOneIPv6Address(PSOCKADDR_IN6 p, int k)
 	addresses[k] = * p;
 	return true;
 }
+
+
 
 #if USE_RAWSOCKET_IPV6
 // learn all configured IPv6 addresses
@@ -249,6 +263,44 @@ inline void CLowerInterface::LearnAddresses()
 	nAddress = k;
 }
 #else
+// Given
+//	SOCKET		The UDP socket to be bound
+//	PSOCKADDR_IN
+//	int			the position that the address is provisioned
+// Return
+//	0 if no error
+//	negative, as the error number
+int CLowerInterface::BindInterface(SOCKET sd, PSOCKADDR_IN pAddrListen, int k)
+{
+	DWORD isHeaderIncluded = TRUE;	// boolean
+
+#ifdef TRACE
+	printf_s("Bind to listen at UDP socket address: %d.%d.%d.%d:%d\n"
+		, pAddrListen->sin_addr.S_un.S_un_b.s_b1
+		, pAddrListen->sin_addr.S_un.S_un_b.s_b2
+		, pAddrListen->sin_addr.S_un.S_un_b.s_b3
+		, pAddrListen->sin_addr.S_un.S_un_b.s_b4
+		, ntohs(pAddrListen->sin_port));
+#endif
+	memcpy(& addresses[k], pAddrListen, sizeof(SOCKADDR_IN));
+	interfaces[k] = 0;
+
+	if (bind(sd, (const struct sockaddr *)pAddrListen, sizeof(SOCKADDR_IN)) != 0)
+	{
+		REPORT_WSAERROR_TRACE("Cannot bind to the selected address");
+		return -1;
+	}
+	// header is needed as it is the way to differentiate IPv4 or IPv6
+	if (setsockopt(sd, IPPROTO_IP, IP_PKTINFO, (char *)& isHeaderIncluded, sizeof(isHeaderIncluded)) != 0)
+	{
+		REPORT_WSAERROR_TRACE("Cannot set socket option to fetch the source IP address");
+		return -1;
+	}
+
+	FD_SET(sd, & sdSet);
+	return 0;
+}
+
 // learn all configured IPv4 address (for FSP over UDP)
 // throws
 //	HRESULT of WSAIOCtrl if cannot query the address
@@ -261,9 +313,8 @@ inline void CLowerInterface::LearnAddresses()
 	struct {
 	    INT iAddressCount;
 		SOCKET_ADDRESS Address[MAX_CONNECTION_NUM * MAX_PHY_INTERFACES];
-		SOCKADDR_INET inAddress[MAX_CONNECTION_NUM * MAX_PHY_INTERFACES];
+		ALIGN(16) SOCKADDR placeholder[MAX_CONNECTION_NUM * MAX_PHY_INTERFACES];
 	} listAddress;
-	PSOCKADDR_IN p;
 
 	DWORD n = 0;
 	int r = 0;
@@ -274,54 +325,63 @@ inline void CLowerInterface::LearnAddresses()
 		throw (HRESULT)r;
 	}
 
-	// set the loopback address as the last-resort of receiving
-	int k = listAddress.iAddressCount;
-	if(k < 0)
+	if (listAddress.iAddressCount < 0)
 		throw E_FAIL;
-	if(k >= sizeof(listAddress.Address) / sizeof(SOCKET_ADDRESS))
-	{
-		listAddress.iAddressCount
-			= k = sizeof(listAddress.Address) / sizeof(SOCKET_ADDRESS) - 1;
-	}
-	p = (PSOCKADDR_IN) & listAddress.inAddress[k];
-	listAddress.Address[k].lpSockaddr = (PSOCKADDR)p;
-	p->sin_family = AF_INET;
-	p->sin_port = DEFAULT_FSP_UDPPORT;
-	p->sin_addr.S_un.S_addr = IN4ADDR_LOOPBACK;
-	*(long long *)p->sin_zero = 0;
 
+	register PSOCKADDR_IN p;
+	int k = 0;
 	nAddress = FD_SETSIZE;
 	FD_ZERO(& sdSet);
-	k = 0;
-	for(register int i = 0; i <= listAddress.iAddressCount; i++)
+	for (register int i = 0; i < listAddress.iAddressCount; i++)
 	{
 		p = (PSOCKADDR_IN)listAddress.Address[i].lpSockaddr;
-		if(p->sin_family != AF_INET)
-			continue;
+#ifdef TRACE
+		printf_s("#%d socket interface address family: %d, length: %d\n"
+			, i
+			, p->sin_family
+			, listAddress.Address[i].iSockaddrLength);
+#endif
+		if (p->sin_family != AF_INET)
+			throw E_UNEXPECTED;	// memory corruption!
 		//
 		if(k >= nAddress)
 			throw E_OUTOFMEMORY;
 		//
 		p->sin_port = DEFAULT_FSP_UDPPORT;
-		memcpy(& addresses[k], p, sizeof(SOCKADDR_IN));
-		interfaces[k] = 0;
-		//
-		if(BindInterface(sdSend, p) != 0)
+		if(BindInterface(sdSend, p, k) != 0)
 		{
 			REPORT_WSAERROR_TRACE("Bind failure");
 			throw E_ABORT;
 		}
-		FD_SET(sdSend, & sdSet);
 		sdSend = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 		if(sdSend == INVALID_SOCKET)
 			throw E_HANDLE;
 		k++;
 	}
-	// specifies the port number and leave the address to IN4ADDR_ANY
+	if (k >= nAddress)
+		throw E_OUTOFMEMORY;
+
+	// Set the loopback address as the last resort of receiving
+	SOCKADDR_IN loopback;
+	p = &loopback;
+	p->sin_family = AF_INET;
+	p->sin_port = DEFAULT_FSP_UDPPORT;
+	p->sin_addr.S_un.S_addr = IN4ADDR_LOOPBACK;
+	*(long long *)p->sin_zero = 0;
+	if (BindInterface(sdSend, p, k) != 0)
+	{
+		REPORT_WSAERROR_TRACE("Fail to bind on loopback interface");
+		throw E_ABORT;
+	}
+
+	sdSend = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+	if (sdSend == INVALID_SOCKET)
+		throw E_HANDLE;
+	// Set the INADDR_ANY for transmission; reuse storage of loopback address
 	p->sin_addr.S_un.S_addr = INADDR_ANY;
 	r = bind(sdSend, (const sockaddr *)p, sizeof(SOCKADDR_IN));
-	//
-	nAddress = k;
+
+	nAddress = k + 1;
 }
 #endif
 
@@ -340,9 +400,9 @@ inline void CLowerInterface::PoolingALT_IDs()
 		{
 			rand_w32(& id, 1);
 			k = id & (MAX_CONNECTION_NUM-1);
-		} while(id <= LAST_WELL_KNOWN_ALT_ID || poolSessionID[k]->sessionID != 0);
+		} while(id <= LAST_WELL_KNOWN_ALT_ID || poolSessionID[k]->pairSessionID.source != 0);
 		//
-		poolSessionID[k]->sessionID = id;
+		poolSessionID[k]->pairSessionID.source = id;
 	}
 }
 
@@ -369,7 +429,7 @@ inline void LOCALAPI CLowerInterface::CommitGetBuffer(BYTE *p, size_t size)
 	// hard-coded: assume MAX_LLS_BLOCK_SIZE never exceed 1MiB and sizeof(size_t) never exceed 8
 	size = (size + 7) & 0xFFFF8;
 	pSignature->size =  size | 1;
-	bufTail = p + size - bufferMemory;
+	bufTail = (int)(p + size - bufferMemory);
 }
 
 
@@ -383,7 +443,7 @@ inline void LOCALAPI CLowerInterface::FreeBuffer(BYTE *p)
 	{
 		do
 		{
-			bufHead += sizeof(PktSignature) + pSignature->size;
+			bufHead += (int)(sizeof(PktSignature) + pSignature->size);
 			if(bufHead == bufTail)
 				break;	// See also CommitGetBuffer()
 			if(secondRound && bufHead > bufTail)
@@ -495,11 +555,15 @@ int CLowerInterface::AcceptAndProcess()
 	CommitGetBuffer(pktBuf, countRecv);
 
 	FSPOperationCode opCode = (FSPOperationCode)
-		(IsIPv6MSGHDR(nearInfo) ? HeaderFSP().hs.opCode : HeaderFSPoverUDP().hs.opCode);
+		(nearInfo.IsIPv6() ? HeaderFSP().hs.opCode : HeaderFSPoverUDP().hs.opCode);
 #ifdef TRACE
-	printf_s("Packet opCode %d received\n", (int)opCode);
+	printf_s("Packet of opCode %d[%s] received\n", (int)opCode, opCodeStrings[opCode]);
+	printf_s("Remote address:\n");
+	DumpNetworkUInt16((UINT16 *)&addrFrom, sizeof(addrFrom) / 2);
+	printf_s("Near sink:\n");
+	DumpNetworkUInt16((UINT16 *)&nearInfo.u, sizeof(nearInfo.u) / 2);
 #endif
-	int lenPrefix = IsIPv6MSGHDR(nearInfo) ? 0 : sizeof(PairSessionID);
+	int lenPrefix = nearInfo.IsIPv6() ? 0 : sizeof(PairSessionID);
 	CSocketItemEx *pSocket = NULL;
 	PktSignature *pSignature;
 	switch(opCode)
@@ -540,6 +604,7 @@ int CLowerInterface::AcceptAndProcess()
 	case RESTORE:
 	case FINISH:
 	case MULTIPLY:
+	case KEEP_ALIVE:
 		pSocket = MapSocket();
 		if(pSocket == NULL)
 			break;
@@ -557,8 +622,8 @@ int CLowerInterface::AcceptAndProcess()
 			pSocket = NULL;	// FreeBuffer(pktBuf);
 			break;
 		}
-		//
-		pSocket->addrFrom = addrFrom;
+		// UNRESOLVED! TODO: take use of allowedPrefixes to select preferred addrFrom in asymmentric network context
+		pSocket->sockAddrTo[0] = addrFrom;
 #ifdef TRACE
 		printf_s("Socket : 0x%08X , buffer : 0x%08X queued\n", (LONG)pSocket, (LONG)pSignature->pkt);
 #endif
@@ -578,24 +643,66 @@ int CLowerInterface::AcceptAndProcess()
 
 
 
-// inline: only in the CLowerInterface constructor may it be called
-inline int BindInterface(SOCKET sd, PSOCKADDR_IN pAddrListen)
+// Given
+//	char *	pointer the data buffer to send back.
+//	int		length of the data to send back, in bytes. must be positive
+// Do
+//	Send back to the remote address where the most recent received packet was sent
+// Return
+//	Number of bytes actually sent (0 means error)
+// Remark
+//	It is safely assume that remote and near address are of the same address family
+int LOCALAPI CLowerInterface::SendBack(char * buf, int len)
 {
-	DWORD isHeaderIncluded = TRUE;	// boolean
-	
-	if(bind(sd, (const struct sockaddr *)pAddrListen, sizeof(SOCKADDR_IN)) != 0)
+	// the final WSAMSG structure
+	PairSessionID sidPair;
+	WSABUF wsaData[2];
+	WSABUF *pToSend;
+	int nToSend;
+
+	wsaData[1].buf = buf;
+	wsaData[1].len = len;
+	if (nearInfo.IsIPv6())
 	{
-		REPORT_WSAERROR_TRACE("Cannot bind to the selected address");
-		return -1;
+		pToSend = &wsaData[1];
+		nToSend = 1;
 	}
-	// header is needed as it is the way to differentiate IPv4 or IPv6
-	if(setsockopt(sd, IPPROTO_IP, IP_PKTINFO, (char *) & isHeaderIncluded, sizeof(isHeaderIncluded)) != 0)
+	else
 	{
-		REPORT_WSAERROR_TRACE("Cannot set socket option to fetch the source IPv6 address");
-		return -1;
+		// Store the local(near end) session ID as the source, the remote end session ID as
+		// the destination session ID in the given session ID association
+		sidPair.peer = HeaderFSPoverUDP().source;
+		sidPair.source = HeaderFSPoverUDP().peer;
+		wsaData[0].buf = (char *)& sidPair;
+		wsaData[0].len = sizeof(PairSessionID);
+		//
+		pToSend = wsaData;
+		nToSend = 2;
 	}
-	return 0;
+	//
+#ifdef TRACE
+	printf_s("Send back to (namelen = %d):\n", sinkInfo.namelen);
+	DumpNetworkUInt16((UINT16 *)& addrFrom, sinkInfo.namelen / 2);
+#endif
+	DWORD n = 0;
+	int r = WSASendTo(sdSend
+		, pToSend, nToSend, &n
+		, 0
+		, (const sockaddr *)& addrFrom, sinkInfo.namelen
+		, NULL, NULL);
+	if (r != 0)
+	{
+		ReportWSAError("CLowerInterface::SendBack");
+		return 0;
+	}
+#ifdef TRACE
+	printf("%s, line %d, %d bytes sent back.\n", __FILE__, __LINE__, n);
+	printf("Peer name length = %d, socket address:\n", sinkInfo.namelen);
+	DumpNetworkUInt16((UINT16 *)& addrFrom, sizeof(SOCKADDR_IN6) / 2);
+#endif
+	return n;
 }
+
 
 
 // inline: only in the CLowerInterface constructor may it be called
@@ -1013,6 +1120,8 @@ DWORD WINAPI HandleFullICC(LPVOID p)
 			case MULTIPLY:
 				p0->OnGetMultiply();
 				break;
+			case KEEP_ALIVE:
+				p0->OnGetKeepAlive();
 			}
 			//
 			p0->SetReady();
@@ -1055,6 +1164,78 @@ bool CSocketItemEx::TestAndWaitReady()
 	}
 	//
 	return true;
+}
+
+
+
+// UNRESOLVED! TODO: enforce rate-limit (and rate-limit based congestion avoidance/control)
+// TODO: UNRESOLVED! is it multi-home awared?
+// Given
+//	ULONG	number of WSABUF descriptor to gathered in sending
+// Return
+//	number of bytes sent, or 0 if error
+int LOCALAPI CSocketItemEx::SendPacket(ULONG n1)
+{
+	LPWSABUF lpBuffers;
+	if (pControlBlock->nearEnd->IsIPv6())
+	{
+		lpBuffers = wsaBuf + 1;
+	}
+	else
+	{
+		// assume sidPair is maintained properly
+		lpBuffers = wsaBuf;
+		n1++;
+	}
+//#ifdef TRACE
+//	printf_s("\nPeer name length = %d, socket address:\n", namelen);
+//	DumpNetworkUInt16((UINT16 *)sockAddrTo, sizeof(SOCKADDR_IN6) / 2);
+//	printf_s("Data to sent:\n----\n");
+//	for (register ULONG i = 0; i < n1; i++)
+//	{
+//		DumpNetworkUInt16((UINT16 *)lpBuffers[i].buf, lpBuffers[i].len / 2);
+//		printf("----\n");
+//	}
+//#endif
+	DWORD n = 0;
+	///It is a headache to specify valid local interface in the parameter block to utilize WSASendMsg
+	// Minimum OS version that support WSASendMsg is Windows Vista/Server 2008
+	// Let the underlying network service select the best outgoing interface
+	//int r = WSASendTo(CLowerInterface::Singleton()->sdSend
+	//	, lpBuffers, n1, &n
+	//	, 0
+	//	, (const struct sockaddr *)sockAddrTo
+	//	, namelen
+	//	, NULL, NULL);
+	///but i don't know why I/O gathering failed sometimes...
+	///it doesn't worth the trouble to figure out it on Microsoft Windows platform!?
+	//RecvSocket = WSASocket(AF_INET, 
+	//   SOCK_DGRAM, 
+	//   IPPROTO_UDP, 
+	//   NULL, 
+	//   0, 
+	//   0);
+	{
+		char buf[MAX_BLOCK_SIZE + sizeof(pairSessionID)];
+		int d = 0;
+		for(register ULONG j = 0; j < n1; j++)
+		{
+			memcpy(buf + d, lpBuffers[j].buf, lpBuffers[j].len);
+			d += lpBuffers[j].len;
+		}
+		n = sendto(CLowerInterface::Singleton()->sdSend, buf, d, 0, (const struct sockaddr *)sockAddrTo, namelen);
+	}
+	int r = (n == SOCKET_ERROR ? -1 : 0);
+	//
+	if (r != 0)
+	{
+		ReportWSAError("CSocketItemEx::SendPacket");
+		return 0;
+	}
+//#ifdef TRACE
+//	printf_s("\n%s, line %d, %d bytes sent.\n", __FILE__, __LINE__, n);
+//#endif
+	return n;
 }
 
 

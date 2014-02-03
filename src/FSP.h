@@ -41,13 +41,13 @@ typedef uint32_t ALT_ID_T;
 #if (VMAC_ARCH_BIG_ENDIAN)
 // in network byte order on a big-endian host
 #define PORT2ALT_ID(port)	((ALT_ID_T)(unsigned short)(port))
-#define IPv6PREFIX_MARK_FSP 0x2002		// prefix of 6to4 overloaded
+#define PREFIX_FSP_IP6to4	0x2002		// prefix of 6to4 overloaded
 #define DEFAULT_FSP_UDPPORT (((unsigned short)'F' << 8) + (unsigned short)'S')
 #else
 // __X86__
 // in network byte order on a little-endian host
 #define PORT2ALT_ID(port)	((ALT_ID_T)(port) << 16)
-#define IPv6PREFIX_MARK_FSP 0x0220		// prefix of 6to4 overloaded
+#define PREFIX_FSP_IP6to4	0x0220		// prefix of 6to4 overloaded
 #define DEFAULT_FSP_UDPPORT ((unsigned short)'F' + ((unsigned short)'S' << 8))
 #endif
 
@@ -57,6 +57,7 @@ typedef uint32_t ALT_ID_T;
 #define LAST_WELL_KNOWN_ALT_ID 65535
 
 
+#define FSP_MAC_IV_SIZE		8	// in bytes
 #define FSP_PUBLIC_KEY_LEN	64	// in bytes
 #define FSP_SESSION_KEY_LEN	16	// in bytes
 
@@ -127,14 +128,14 @@ typedef enum _FSP_Operation_Code
 	CONNECT_REQUEST,
 	ACK_CONNECT_REQUEST,	// may piggyback payload
 	RESET,
-	PERSIST,		// Alias: KEEP_ALIVE, DATA_WITH_ACK,
+	PERSIST,		// Alias: DATA_WITH_ACK,
 	PURE_DATA,		// Without any optional header
 	ADJOURN,
 	ACK_FLUSH,
 	RESTORE,		// RESUME or RESURRECT connection, may piggyback payload
 	FINISH,
 	MULTIPLY,		// To clone connection, may piggyback payload
-	RESERVED_CODE13,
+	KEEP_ALIVE,
 	RESERVED_CODE14,
 	RESERVED_CODE15,
 	RESERVED_CODE16,
@@ -142,6 +143,7 @@ typedef enum _FSP_Operation_Code
 	CONNECT_PARAM,
 	EPHEMERAL_KEY,
 	SELECTIVE_NACK,
+	LARGEST_OP_CODE = SELECTIVE_NACK
 } FSPOperationCode;
 
 
@@ -168,11 +170,12 @@ typedef enum
 	FSP_NotifyFlushed,
 	FSP_NotifyBufferReady,
 	FSP_NotifyDisposed,
+	FSP_IPC_CannotReturn = 23,
 	// 24~31: near end error status
 	FSP_NotifyIOError = 24,
 	FSP_NotifyOverflow,
 	FSP_NotifyNameResolutionFailed,
-	FSP_NotifyUnspecifiedFault
+	LARGEST_FSP_NOTICE = FSP_NotifyNameResolutionFailed
 } FSP_ServiceCode;
 
 
@@ -203,17 +206,19 @@ typedef uint64_t timestamp_t;
 /**
  * struct FSP_IN6_ADDR * may be converted to struct in6_addr *
  */
+// FSP_IN4_ADDR: <'0x2002'><IPv4><FSP UDP Port := 18003><32-bit host-id := 0><32-bit ALT id>
+typedef struct FSP_IN4_ADDR_PREFIX
+{
+	uint16_t	prefix;
+	uint32_t	ipv4;	//IN_ADDR
+	uint16_t	port;
+} *PFSP_IN4_ADDR_PREFIX;
+
 typedef struct FSP_IN6_ADDR
 {
-	// <'0x2002'><IPv4><port><32-bit host-id><32-bit ALT id>
 	union
 	{
-		struct
-		{
-			uint16_t	prefix;
-			uint32_t	ipv4;	//IN_ADDR
-			uint16_t	port;
-		} st;
+		FSP_IN4_ADDR_PREFIX st;
 		uint64_t		subnet;	
 	} u;
 	uint32_t	idHost;
@@ -226,7 +231,7 @@ typedef	struct FSP_PKTINFO
 {
 	uint32_t	ipi_addr;
 	uint32_t	ipi_ifindex;
-	uint32_t	host_id;
+	uint32_t	idHost;
 	ALT_ID_T	idALT;
 	uint32_t	ipi6_ifindex;
 } *PFSP_PKTINFO;
@@ -236,8 +241,8 @@ typedef	struct FSP_PKTINFO
 // FSP in UDP over IPv4
 struct PairSessionID
 {
-	ALT_ID_T srcSessionID;
-	ALT_ID_T dstSessionID;
+	ALT_ID_T source;
+	ALT_ID_T peer;
 };
 
 

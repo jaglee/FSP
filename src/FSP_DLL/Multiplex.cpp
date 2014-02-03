@@ -105,10 +105,9 @@ bool LOCALAPI CSocketItemDl::ToWelcomeMultiply(BackLogItem & backLog)
 		TRACE_HERE("Process listening backlog: : illegal multiplication, silently discard it");
 		return false;
 	}
-	//
-	SetState(QUASI_ACTIVE);	// which would make WriteTo/SendInline, if any in fpAccept, delayed
-	// Multiply: but the upper layer application may still throttle it...
-	PFSP_IN6_ADDR remoteAddr = (PFSP_IN6_ADDR) & pControlBlock->sockAddrTo[0].Ipv6.sin6_addr;
+
+	// Multiply: but the upper layer application may still throttle it...fpRequested CANNOT read or write anything!
+	PFSP_IN6_ADDR remoteAddr = (PFSP_IN6_ADDR) & pControlBlock->peerAddr.ipFSP.allowedPrefixes[MAX_PHY_INTERFACES-1];
 	int r;
 	if( fpRequested == NULL	// This is NOT the same policy as ToWelcomeConnect
 	|| (r = fpRequested(this, & backLog.acceptAddr, remoteAddr)) < 0 )
@@ -117,7 +116,7 @@ bool LOCALAPI CSocketItemDl::ToWelcomeMultiply(BackLogItem & backLog)
 		return false;
 	}
 
-	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend();	// See PrepareToAccept()
+	ControlBlock::PFSP_SocketBuf skb = pControlBlock->GetVeryFirstSendBuf(backLog.initialSN);
 	if(r > 0)
 	{
 		// TODO: force to slide the send window, and merge with the latest data packet

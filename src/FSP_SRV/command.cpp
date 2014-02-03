@@ -29,8 +29,6 @@
  */
 #include "fsp_srv.h"
 
-static int LOCALAPI ResolveToFSPoverIPv4(PFSP_IN6_ADDR, int capacity, const char *, const char *);
-static int LOCALAPI ResolveToIPv6(PFSP_IN6_ADDR arrDst, int capacity, const char *nodeName);
 
 /**
  * Detail implementation of connect request queue is OS-specific
@@ -47,6 +45,11 @@ static ConnectRequestQueue connectRequests;
 //	NON_EXISTENT-->LISTENING
 void LOCALAPI Listen(struct CommandNewSession *pCmd)
 {
+#ifdef TRACE
+	printf_s("Requested to listen on local session %d, assigned event trigger is %s\n"
+		, pCmd->idSession
+		, pCmd->u.szEventName);
+#endif
 	if(! pCmd->ResolvEvent())
 	{
 		REPORT_ERROR_ON_TRACE();
@@ -135,6 +138,7 @@ void LOCALAPI CSocketItemEx::Listen(CommandNewSession *pCmd)
 	}
 
 	// bind to the interface as soon as the control block mapped into server's memory space
+	pairSessionID.source = pCmd->idSession;
 	InitAssociation();
 	//
 	SetReturned();
@@ -145,10 +149,9 @@ void LOCALAPI CSocketItemEx::Listen(CommandNewSession *pCmd)
 
 void LOCALAPI CSocketItemEx::Connect(CommandNewSession *pCmd)
 {
-	TRACE_HERE("called");
-
-	// Resolve the current IP-socket address of the remote end at first
-	FSP_IN6_ADDR addrTo[MAX_PHY_INTERFACES];
+#ifdef TRACE
+	printf_s("Try to make connection to %s (@local session #%u)\n", PeerName(), pairSessionID.source);
+#endif
 	char nodeName[INET6_ADDRSTRLEN];
 	char *peerName = PeerName();
 	const char *serviceName = strchr(peerName, ':');
@@ -162,22 +165,35 @@ void LOCALAPI CSocketItemEx::Connect(CommandNewSession *pCmd)
 	}
 
 	// in this bootstrap project FSP over UDP/IPv4 takes precedence
-	int r = ResolveToFSPoverIPv4(addrTo, MAX_PHY_INTERFACES, peerName, serviceName);
+	int r = ResolveToFSPoverIPv4(peerName, serviceName);
 	if(r <= 0)
 	{
-		r = ResolveToIPv6(addrTo, MAX_PHY_INTERFACES, peerName);
+		r = ResolveToIPv6(peerName);
 		if(r <=  0)
 		{
 			Notify(FSP_NotifyNameResolutionFailed);
 			goto l_return;
 		}
 	}
+	pControlBlock->u.connectParams.idRemote = pControlBlock->peerAddr.ipFSP.sessionID;
 
-	// UNRESOLVED! TODO: mobility support/routing -- find the best interface and local IP address
-	SetRemoteAddress(addrTo);
+	// By default Connect() prefer initiatiating connection from an IPv6 interface
+	// but if the peer is of FSP over UDP/IPv4 address it must be changed
+	// See also {FSP_DLL}CSocketItemDl::CreateControlBlock()
+	if (((PFSP_IN4_ADDR_PREFIX)pControlBlock->peerAddr.ipFSP.allowedPrefixes)->prefix == PREFIX_FSP_IP6to4)
+	{
+		int	ifDefault = pControlBlock->nearEnd[0].u.ipi6_ifindex;
+		for (register int i = 0; i < MAX_PHY_INTERFACES; i++)
+		{
+			pControlBlock->nearEnd[i].InitUDPoverIPv4(ifDefault);
+		}
+	}
+	// See also FSP_DLL$$CSocketItemDl::ToConcludeConnect
+	pControlBlock->nearEnd->u.idALT = pairSessionID.source;
+	//^For compatibility with passive peer behavior, InitAssociation() does not prepare nearEnd[0]
+
 	// bind to the interface as soon as the control block mapped into server's memory space
 	InitAssociation();
-
 	InitiateConnect();
 	SetReturned();
 	SignalEvent();
@@ -185,7 +201,6 @@ void LOCALAPI CSocketItemEx::Connect(CommandNewSession *pCmd)
 l_return:
 	connectRequests.Remove(pCmd->u.s.index);
 }
-
 
 
 
@@ -216,30 +231,18 @@ void CSocketItemEx::Send()
 	// synchronize the state in the 'cache' and the real state
 	lowState = pControlBlock->state;
 	ScheduleEmitQ();
-	if(IsNotReturned())
-	{
-		SetReturned();
-		SignalEvent();
-	}
-	//else // Only after first SNACK echoed back may the acknowledgement to the send returned to ULA
 }
 
 
 
 // Given
-//	PFSP_IN6_ADDR	the array to hold the output FSP/IPv6 addresses
-//	int				the capacity of the array
 //	PCTSTR			the name of the node to be resolved, which might be an IPv4 string representation
 //	PCTSTR			the name of the service to be resolved, which might be a string of decimal port number
 // Return
 //	Number of addresses resolved, negative if error
 // Remark
 //	If (capacity <= 0) it will return 0
-static
-int LOCALAPI ResolveToFSPoverIPv4(PFSP_IN6_ADDR arrDst
-	, int capacity
-	, const char *nodeName
-	, const char *serviceName)
+int LOCALAPI CSocketItemEx::ResolveToFSPoverIPv4(const char *nodeName, const char *serviceName)
 {
 	static const struct addrinfo hints = { 0, AF_INET, };
 	PADDRINFOA pAddrInfo;
@@ -264,20 +267,18 @@ int LOCALAPI ResolveToFSPoverIPv4(PFSP_IN6_ADDR arrDst
 		return 0;
 	}
 
+	// See also CLowerInterface::EnumEffectiveAddresses
+	register PFSP_IN4_ADDR_PREFIX prefixes = (PFSP_IN4_ADDR_PREFIX)pControlBlock->peerAddr.ipFSP.allowedPrefixes;
 	int n = 0;
+	pControlBlock->peerAddr.ipFSP.hostID = 0;
+	pControlBlock->peerAddr.ipFSP.sessionID = PORT2ALT_ID( ((PSOCKADDR_IN)pAddrInfo->ai_addr)->sin_port );
 	do
 	{
 		// Must keep in consistent with TranslateFSPoverIPv4
-		arrDst->u.st.prefix = IPv6PREFIX_MARK_FSP;
-		arrDst->u.st.ipv4 = ((PSOCKADDR_IN)pAddrInfo->ai_addr)->sin_addr.S_un.S_addr;
-		arrDst->u.st.port = DEFAULT_FSP_UDPPORT;
-		// arrDst->idHost = 0;	// UNRESOLVED! where is host id set?
-		arrDst->idALT = PORT2ALT_ID( ((PSOCKADDR_IN)pAddrInfo->ai_addr)->sin_port );
-		// note that port number resolved is already in network byte order
-		n++;
-		arrDst++;
-		pAddrInfo = pAddrInfo->ai_next;
-	} while(n < capacity && pAddrInfo != NULL);
+		prefixes[n].prefix = PREFIX_FSP_IP6to4;
+		prefixes[n].port = DEFAULT_FSP_UDPPORT;
+		prefixes[n].ipv4 = ((PSOCKADDR_IN)pAddrInfo->ai_addr)->sin_addr.S_un.S_addr;
+	} while(++n < MAX_PHY_INTERFACES && (pAddrInfo = pAddrInfo->ai_next) != NULL);
 
 	freeaddrinfo(pAddrInfo);
 	return n;
@@ -285,15 +286,12 @@ int LOCALAPI ResolveToFSPoverIPv4(PFSP_IN6_ADDR arrDst
 
 
 // Given
-//	PFSP_IN6_ADDR	the array to hold the output FSP/IPv6 addresses
-//	int				the capacity of the array
 //	PCTSTR			the name of the node to be resolved, which might be an IPv6 string representation
 // Return
 //	Number of addresses resolved, negative if error
 // Remark
 //	If (capacity <= 0) it will return 0
-static
-int LOCALAPI ResolveToIPv6(PFSP_IN6_ADDR arrDst, int capacity, const char *nodeName)
+int LOCALAPI CSocketItemEx::ResolveToIPv6(const char *nodeName)
 {
 	static const struct addrinfo hints = { 0, AF_INET6, };
 	PADDRINFOA pAddrInfo;
@@ -320,16 +318,15 @@ int LOCALAPI ResolveToIPv6(PFSP_IN6_ADDR arrDst, int capacity, const char *nodeN
 		return 0;
 	}
 
+	// See also CLowerInterface::EnumEffectiveAddresses
+	register UINT64 * prefixes = pControlBlock->peerAddr.ipFSP.allowedPrefixes;
 	int n = 0;
+	pControlBlock->peerAddr.ipFSP.hostID = SOCKADDR_HOST_ID(pAddrInfo->ai_addr);
+	pControlBlock->peerAddr.ipFSP.sessionID = SOCKADDR_ALT_ID(pAddrInfo->ai_addr);
 	do
 	{
-		memcpy(arrDst
-			, & ((PSOCKADDR_IN6)pAddrInfo->ai_addr)->sin6_addr
-			, sizeof(IN6_ADDR));
-		n++;
-		arrDst++;
-		pAddrInfo = pAddrInfo->ai_next;
-	} while(n < capacity && pAddrInfo != NULL);
+		prefixes[n] = *(UINT64 *)(((PSOCKADDR_IN6)pAddrInfo->ai_addr)->sin6_addr.u.Byte);
+	} while(++n < MAX_PHY_INTERFACES && (pAddrInfo = pAddrInfo->ai_next) != NULL);
 
 	freeaddrinfo(pAddrInfo);
 	return n;

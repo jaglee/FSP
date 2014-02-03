@@ -94,9 +94,7 @@ int FSPAPI SendInline(FSPHANDLE hFSPSocket, void * buffer, int len, bool toBeCon
 		if(r < 0)
 			return r;
 		//
-		if(! p->Call<FSP_Send>(TRUE))	// Tell LLS to trigger soft-interrupt only when a SNACK received
-			return -EIO;
-		return  r;
+		return (p->Call<FSP_Send>() ? r : -EIO);
 	}
 	catch(...)
 	{
@@ -218,7 +216,7 @@ void CSocketItemDl::ProcessPendingSend()
 	if(pendingSendBuf != NULL && pendingSendSize > 0)
 	{
 		BufferData(pendingSendSize);
-		Call<FSP_Send>(TRUE);
+		Call<FSP_Send>();
 		if(pendingSendSize > 0)	// should be the norm
 		{
 			SetMutexFree();

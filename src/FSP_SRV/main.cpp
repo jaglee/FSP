@@ -269,13 +269,21 @@ static void LOCALAPI ProcessCommand(HANDLE md)
 		default:
 			pSocket = (CSocketItemEx *)(*CLowerInterface::Singleton())[pCmd->idSession];
 			if(pSocket == NULL || ! pSocket->IsInUse())
+			{
+#ifdef TRACE
+				printf_s("%s (code = %d) called for session #%u\n"
+					, opCodeStrings[pCmd->opCode]
+					, pCmd->opCode
+					, pCmd->idSession);
+#endif
 				break;
+			}
 			//
 			switch(pCmd->opCode)
 			{
 			case FSP_Dispose:
 			case FSP_Reject:
-				pSocket->Disconnect();
+				pSocket->Disconnect(pCmd->opCode);
 				break;
 			case FSP_Send:			// send a packet/group of packets
 				pSocket->Send();

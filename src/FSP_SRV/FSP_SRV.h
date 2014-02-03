@@ -63,6 +63,8 @@ inline UINT64 ntohll(UINT64 h)
  * Get the application layer thread ID from the (IPv6 raw-)socket address
  */
 #define SOCKADDR_ALT_ID(s)  (((PFSP_IN6_ADDR) & ((PSOCKADDR_IN6)(s))->sin6_addr)->idALT)
+#define SOCKADDR_HOST_ID(s)  (((PFSP_IN6_ADDR) & ((PSOCKADDR_IN6)(s))->sin6_addr)->idHost)
+
 
 // per-host connection mumber and listener limit defined in LLS:
 #define MAX_CONNECTION_NUM	16	// 256	// must be some power value of 2
@@ -101,24 +103,30 @@ class CSocketItemEx: public CSocketItem
 {
 	PktSignature * volatile headPacket;
 	PktSignature * volatile tailPacket;
-	WSABUF	wsaBuf[4];
-	PairSessionID	pairSessionID;	// redundant information for sake of ICC (and FSP over UDP/IPv4)
-	SOCKADDR_INET	addrFrom;		// the most recently ICC
+
+	WSABUF	wsaBuf[3];	// at most three segments: the sessionID pair, header and payload
+
+	// multihome/mobility/resilence support (see also CInterface::EnumEffectiveAddresses):
+	// MAX_PHY_INTERFACES is hard-coded to 4
+	// sockAddrTo[0] is the most preferred address (care of address)
+	// sockAddrTo[3] is the home-address
+	// while sockAddr[1], sockAddr[2] are backup-up/load-balance address
+	SOCKADDR_INET	sockAddrTo[MAX_PHY_INTERFACES];
 
 	PktSignature *PushPacketBuffer(PktSignature *);
 	void PopPacketBuffer();
+	int	LOCALAPI SendPacket(ULONG); // work together with wsaBuf
+	int LOCALAPI EmitSetICC(ControlBlock::PFSP_SocketBuf, ControlBlock::seq_t);
 	//
 protected:
 	DWORD	idSrcProcess;
 	HANDLE	hSrcMemory;
 	//
-	WSAMSG	pWSAMsg[2];
-	// [0] should be Care-of-Address/the address prefered
-	// [1] should be Home Address/the address of last-resort
-	char	usingPrimary;	// TODO: default interface index?
 	char	mutex;
 	char	inUse;
 	char	isReady;
+	//
+	int		namelen;	// size of the remote socket address, see WSASendMsg
 	//
 	CSocketItemEx *next;
 	CSocketItemEx *prevSame;
@@ -147,13 +155,12 @@ protected:
 	bool InState(FSP_Session_State s) { return lowState == s; }
 	bool InStates(int n, ...);
 
-	bool IsMilky() const { return (pControlBlock->u.connectParams.delay.limit != 0); }
+	bool IsMilky() const { return (pControlBlock->u.connectParams.delayLimit != 0); }
 	bool ValidateICC(FSP_NormalPacketHeader *);
 	bool ValidateICC() { return ValidateICC(headPacket->pkt); }
 	int  PlacePayload();
 
 	bool LOCALAPI Emit(ControlBlock::PFSP_SocketBuf, ControlBlock::seq_t);
-	int	LOCALAPI SendPacket(ULONG); // work together with wsaBuf
 
 	void Extinguish();
 	void TimeOut();
@@ -188,8 +195,6 @@ public:
 		//
 		return p;
 	}
-	// Get the send buffer block descriptor of the packet to send
-	ControlBlock::PFSP_SocketBuf PeekNextToSend();
 
 	// Convert the relative address in the control block to the address in process space
 	// checked, so that ill-behaviored ULA may not cheat LLS to access data of others
@@ -209,19 +214,11 @@ public:
 	}
 
 
-	ALT_ID_T GetLocalSessionID() const { return MSGHDR_ALT_ID(pWSAMsg[0].Control.buf); }
-	ALT_ID_T GetRemoteSessionID() const { return SOCKADDR_ALT_ID(pWSAMsg[0].name); }
-	void LOCALAPI SetRemoteAddress(PFSP_IN6_ADDR);
-	void LOCALAPI SetRemoteSessionID(ALT_ID_T id)
-	{
-		// UNRESOLVED! hard-coded 2 interface limit for multi-home? See also EmitQ()
-		pairSessionID.dstSessionID
-			= SOCKADDR_ALT_ID(pWSAMsg[0].name)
-			= SOCKADDR_ALT_ID(pWSAMsg[1].name)
-			= id;
-	}
-	char *PeerName() { return (char *)pControlBlock->peerName; }
-	//
+	void LOCALAPI SetRemoteSessionID(ALT_ID_T id);
+	char *PeerName() const { return (char *)pControlBlock->peerAddr.name; }
+	int LOCALAPI ResolveToIPv6(const char *);
+	int LOCALAPI ResolveToFSPoverIPv4(const char *, const char *);
+
 	bool Notify(FSP_ServiceCode);
 	void SignalEvent() { ::SetEvent(hEvent); }
 	//
@@ -229,7 +226,7 @@ public:
 	int LOCALAPI GenerateSNACK(BYTE * buf, ControlBlock::seq_t & seq0);
 	//
 	void InitiateConnect();
-	void Disconnect();
+	void LOCALAPI Disconnect(int);
 	void DisposeOnReset();
 	void OnMultiply();
 	void OnResume();
@@ -308,6 +305,7 @@ public:
 	void OnGetRestore();	// RESTORE may resume or resurrect
 	void OnGetFinish();		// FINISH packet may not 
 	void OnGetMultiply();	// MULTIPLY is treated out-of-band
+	void OnGetKeepAlive();	// KEEP_ALIVE is usually out-of-band
 
 	// any packet with full-weight integrity-check-code except aforementioned
 	friend DWORD WINAPI HandleFullICC(LPVOID p);
@@ -371,17 +369,28 @@ private:
 	FSP_Header &		HeaderFSP() const { return *(FSP_Header *)pktBuf; }
 	template<typename THdr> THdr * FSP_OperationHeader()
 	{
-		return (THdr *)(IsIPv6MSGHDR(nearInfo) ? pktBuf : & pktBuf[sizeof(PairSessionID)]);
+		return (THdr *)(nearInfo.IsIPv6() ? pktBuf : &pktBuf[sizeof(PairSessionID)]);
 	}
 
 	// remote-end address and near-end address
 	SOCKADDR_INET		addrFrom;
 	CtrlMsgHdr			nearInfo;
 	WSAMSG				sinkInfo;	// descriptor of what is received
-	ALT_ID_T			GetLocalSessionID() const;
+
+	// For sending back a packet responding to a received packet only
+	ALT_ID_T			GetLocalSessionID()
+	{
+		return nearInfo.IsIPv6() ? nearInfo.u.idALT : HeaderFSPoverUDP().peer;
+	}
 	ALT_ID_T			SetLocalSessionID(ALT_ID_T);
-	ALT_ID_T			GetRemoteSessionID() const;
-	void				GetEchoingPairSession(PairSessionID &) const;
+
+	// only valid for received message
+	ALT_ID_T			GetRemoteSessionID() const
+	{
+		return nearInfo.IsIPv6() ? SOCKADDR_ALT_ID(sinkInfo.name) : HeaderFSPoverUDP().source;
+	}
+
+	inline int BindInterface(SOCKET, PSOCKADDR_IN, int);
 	CSocketItemEx *		MapSocket() { return (*this)[GetLocalSessionID()]; }
 
 protected:
@@ -404,7 +413,7 @@ protected:
 	void LOCALAPI OnGetResetSignal();
 
 	// define in mobile.cpp
-	int EnumEffectiveAddresses(UINT64 *, int);
+	int LOCALAPI EnumEffectiveAddresses(UINT64 *);
 	int	AcceptAndProcess();
 
 	friend class CSocketItemEx;

@@ -81,10 +81,11 @@ typedef int (FSPAPI *CallbackRequested)(FSPHANDLE, void *, PFSP_IN6_ADDR);
 // Given
 //	FSPHANDLE		the handle of the new created socket
 //	PFSP_InitParams	the context that used to created the socket (may be the listener's context)
-//	PFSP_IN6_ADDR	the remote address that make the connection (address has been converted if IPv4)
 // Remark
 //	ULA may call Dispose if to abort the connection in the call back function
-typedef void (FSPAPI *CallbackConnected)(FSPHANDLE, PFSP_Context, PFSP_IN6_ADDR);
+//	There used to be the third parameter with the type 'CMSGHDR *' which requires advanced IPv6 API support
+//	Now the caller may get the near-side lower-layer control information via FSPControl
+typedef void (FSPAPI *CallbackConnected)(FSPHANDLE, PFSP_Context);
 
 
 // The callback function through which received message is passed to ULA

@@ -23,7 +23,31 @@ using namespace Microsoft::VisualStudio::CppUnitTestFramework;
 #define MAX_PHY_INTERFACES	4
 
 // for line output
-char linebuf[200];
+static char linebuf[200];
+
+
+void UnitTestOpCodeStateNoticeNames()
+{
+	Logger::WriteMessage(opCodeStrings[-1]);
+	Logger::WriteMessage(opCodeStrings[0]);
+	Logger::WriteMessage(opCodeStrings[PERSIST]);
+	Logger::WriteMessage(opCodeStrings[LARGEST_OP_CODE]);
+	Logger::WriteMessage(opCodeStrings[LARGEST_OP_CODE + 1]);
+	//
+	Logger::WriteMessage(stateNames[-1]);
+	Logger::WriteMessage(stateNames[0]);
+	Logger::WriteMessage(stateNames[FSP_Session_State::PAUSING]);
+	Logger::WriteMessage(stateNames[CLOSED]);
+	Logger::WriteMessage(stateNames[CLOSED + 1]);
+	//
+	Logger::WriteMessage(noticeNames[-1]);
+	Logger::WriteMessage(noticeNames[0]);
+	Logger::WriteMessage(noticeNames[FSP_ServiceCode::FSP_NotifyDataReady]);
+	Logger::WriteMessage(noticeNames[FSP_ServiceCode::LARGEST_FSP_NOTICE]);
+	Logger::WriteMessage(noticeNames[LARGEST_FSP_NOTICE + 1]);
+}
+
+
 
 class CSocketItemExDbg: public CSocketItemEx
 {
@@ -1169,7 +1193,12 @@ namespace UnitTestFSP
 	TEST_CLASS(UnitTest1)
 	{
 	public:
-#if 0		
+		TEST_METHOD(TestOpCodeStateNoticeStringizer)
+		{
+			UnitTestOpCodeStateNoticeNames();
+		}
+
+#if 0
 		TEST_METHOD(TestCommandQuasiQ)
 		{
 			UnitTestCommandQuasiQ();

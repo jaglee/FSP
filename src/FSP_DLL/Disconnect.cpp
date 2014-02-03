@@ -181,7 +181,7 @@ int CSocketItemDl::Adjourn(NotifyOrReturn fp1)
 	//
 	// Note that even if the sync-event happens to be triggered when sending, callback function
 	// is not being called if there exists packet in flight 
-	return Call<FSP_Send>(TRUE) ? 0 : -EIO;
+	return (Call<FSP_Send>() ? 0 : -EIO);
 }
 
 
@@ -293,7 +293,7 @@ void CSocketItemDl::ToConcludeAdjourn()
 void CSocketItemDl::OnGetReset()
 {
 	NotifyOrReturn fp1 = NULL;
-	if(InterlockedExchange((unsigned int *) & pControlBlock->state, NON_EXISTENT) == PAUSING)
+	if(InterlockedExchange((LONG *) & pControlBlock->state, NON_EXISTENT) == PAUSING)
 		fp1 = GetResetFlushCallback();
 
 	SetMutexFree();

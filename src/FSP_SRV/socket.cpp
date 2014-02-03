@@ -33,14 +33,6 @@
 // defined in os_win.cpp
 extern bool IsProcessAlive(DWORD);
 
-// Initialize the control message header
-//	WSABUF &	reference to the internal storage of control message
-CtrlMsgHdr::CtrlMsgHdr(WSABUF & control)
-{
-	memset(this, 0, sizeof(CtrlMsgHdr));
-	memcpy(this, control.buf, min(control.len, sizeof(CtrlMsgHdr)));
-}
-
 
 
 CSocketSrvTLB::CSocketSrvTLB()
@@ -126,10 +118,10 @@ CSocketItemEx * CSocketSrvTLB::AllocItem(ALT_ID_T idListener)
 			p->SetPassive();
 			p->isReady = 0;
 			p->inUse = 1;
-			p->sessionID = idListener;
+			p->pairSessionID.source = idListener;
 			// do not break, for purpose of duplicate allocation detection
 		}
-		else if(listenerSlots[i].inUse && listenerSlots[i].sessionID == idListener)
+		else if(listenerSlots[i].inUse && listenerSlots[i].pairSessionID.source == idListener)
 		{
 			if(p != NULL)
 				p->inUse = 0;
@@ -153,7 +145,7 @@ CSocketItemEx * CSocketSrvTLB::AllocItem(ALT_ID_T idListener)
 		{
 			if(p == p1) break;
 			//
-			if(p->sessionID == p1->sessionID)
+			if(p->pairSessionID.source == p1->pairSessionID.source)
 			{
 				p = NULL;
 				break;
@@ -188,7 +180,7 @@ void CSocketSrvTLB::FreeItem(CSocketItemEx *p)
 	// if it is allocated by AllocItem(ALT_ID_T idListener):
 	if(p->IsPassive())
 	{
-		register CSocketItemEx *p1 = poolSessionID[p->sessionID & (MAX_CONNECTION_NUM - 1)];
+		register CSocketItemEx *p1 = poolSessionID[p->pairSessionID.source & (MAX_CONNECTION_NUM - 1)];
 		// detach it from the hash collision list
 		if(p1 != p)
 		{
@@ -206,7 +198,7 @@ void CSocketSrvTLB::FreeItem(CSocketItemEx *p)
 		}
 		else if(p1->prevSame != NULL)
 		{
-			poolSessionID[p->sessionID & (MAX_CONNECTION_NUM - 1)] = p1->prevSame;
+			poolSessionID[p->pairSessionID.source & (MAX_CONNECTION_NUM - 1)] = p1->prevSame;
 		}
 		// else keep at least one entry in the context-addressing TLB
 		this->mutex = SHARED_FREE;
@@ -235,7 +227,7 @@ CSocketItemEx * CSocketSrvTLB::operator[](ALT_ID_T id)
 	register CSocketItemEx *p = poolSessionID[id & (MAX_CONNECTION_NUM-1)];
 	do
 	{
-		if(p->sessionID == id)
+		if(p->pairSessionID.source == id)
 			return p;
 		p = p->prevSame;
 	} while(p != NULL);
@@ -278,75 +270,30 @@ l_return:
 
 
 
-// Return
-//	The send buffer block descriptor of the packet to send
-// Remark
-//	It is assumed that the caller knew there exists at least one packet in the queue
-ControlBlock::PFSP_SocketBuf CSocketItemEx::PeekNextToSend()
-{
-	register int d = int(pControlBlock->sendWindowNextSN - pControlBlock->sendWindowFirstSN);
-	if(d < 0 || d > pControlBlock->sendWindowSize)
-		return NULL;
-
-	d += pControlBlock->sendWindowHeadPos;
-	return pControlBlock->HeadSend()
-		+ (d - pControlBlock->sendBufferBlockN >= 0 ? d - pControlBlock->sendBufferBlockN : d);
-}
-
-
-
 // Initialize the association of the remote end [represent by sockAddrTo] and the near end
 // Side-effect: set the initial 'previous state'
 // TODO: UNRESOLVED! hard-coded here, limit capacity of multi-home support?
 void CSocketItemEx::InitAssociation()
 {
-	// loop roll-out
-	pWSAMsg[0].name = (PSOCKADDR) & pControlBlock->sockAddrTo[0];
-	pWSAMsg[0].namelen = IsIPv6MSGHDR(pControlBlock->nearEnd[0]) 
-		? sizeof(SOCKADDR_IN6) 
-		: sizeof(SOCKADDR_IN);
-	pWSAMsg[0].dwFlags = 0;
-	pWSAMsg[0].Control.buf = (CHAR *) & pControlBlock->nearEnd[0];
-	pWSAMsg[0].Control.len = sizeof(CtrlMsgHdr);
-	// wsaMsg.dwFlags = 0;
-	// 'flag', 'lpBuffers' and 'dwBufferCount' are set on fly
-	pWSAMsg[1].name = (PSOCKADDR) & pControlBlock->sockAddrTo[1];
-	pWSAMsg[1].namelen = IsIPv6MSGHDR(pControlBlock->nearEnd[1]) 
-		? sizeof(SOCKADDR_IN6) 
-		: sizeof(SOCKADDR_IN);
-	pWSAMsg[1].dwFlags = 0;
-	pWSAMsg[1].Control.buf = (CHAR *) & pControlBlock->nearEnd[1];
-	pWSAMsg[1].Control.len = sizeof(CtrlMsgHdr);
+	UINT32 idRemoteHost = pControlBlock->peerAddr.ipFSP.hostID;
+	// 'source' field of pairSessionID shall be filled already. See also CInterface::PoolingALT_IDs()
+	// and CSocketSrvTLB::AllocItem(), AllocItem(ALT_ID_T)
+	pairSessionID.peer = pControlBlock->peerAddr.ipFSP.sessionID;
 
-	pairSessionID.dstSessionID = GetRemoteSessionID();
-	pairSessionID.srcSessionID
-		= MSGHDR_ALT_ID(pControlBlock->nearEnd[0])
-		= MSGHDR_ALT_ID(pControlBlock->nearEnd[1])
-		= this->sessionID;
-
-	lowState = pControlBlock->state;
-	usingPrimary = true;
-	SetReady();
-}
-
-
-// Initialize the message descriptor
-void LOCALAPI CSocketItemEx::SetRemoteAddress(PFSP_IN6_ADDR addrTo)
-{
-	PSOCKADDR_INET pFarEnd = pControlBlock->sockAddrTo;
-	if(addrTo->u.st.prefix == IPv6PREFIX_MARK_FSP)
+	// See also CLowerInterface::EnumEffectiveAddresses
+	register PSOCKADDR_INET const pFarEnd = sockAddrTo;
+	if (!pControlBlock->nearEnd->IsIPv6())
 	{
-		// local address is yet to be determined by the LLS
 		for(register int i = 0; i < MAX_PHY_INTERFACES; i++)
 		{
+			memset(&pFarEnd[i], 0, sizeof(pFarEnd[i]));
 			pFarEnd[i].Ipv4.sin_family = AF_INET;
+			pFarEnd[i].Ipv4.sin_addr.S_un.S_addr
+				= ((PFSP_IN4_ADDR_PREFIX) & pControlBlock->peerAddr.ipFSP.allowedPrefixes[i])->ipv4;
 			pFarEnd[i].Ipv4.sin_port = DEFAULT_FSP_UDPPORT;
-			pFarEnd[i].Ipv4.sin_addr.S_un.S_addr = addrTo[i].u.st.ipv4;
-			memset(pFarEnd[i].Ipv4.sin_zero	// assert(sizeof(pFarEnd[i].Ipv4.sin_zero) == 8)
-				, 0		// idHost is set to zero as well
-				, sizeof(SOCKADDR_IN6) - sizeof(SOCKADDR_IN) + 8 - sizeof(ALT_ID_T));
-			((PFSP_IN6_ADDR) & (pFarEnd[i].Ipv6.sin6_addr))->idALT = addrTo->idALT;
+			((PFSP_IN6_ADDR) & (pFarEnd[i].Ipv6.sin6_addr))->idALT = pairSessionID.peer;
 		}
+		namelen = sizeof(SOCKADDR_IN);
 	}
 	else
 	{
@@ -357,13 +304,42 @@ void LOCALAPI CSocketItemEx::SetRemoteAddress(PFSP_IN6_ADDR addrTo)
 			pFarEnd[i].Ipv6.sin6_flowinfo = 0;
 			pFarEnd[i].Ipv6.sin6_port = 0;
 			pFarEnd[i].Ipv6.sin6_scope_id = 0;
-			pFarEnd[i].Ipv6.sin6_addr = *(PIN6_ADDR) & addrTo[i];
+			((PFSP_IN6_ADDR) & (pFarEnd[i].Ipv6.sin6_addr))->u.subnet
+				= pControlBlock->peerAddr.ipFSP.allowedPrefixes[i];
+			((PFSP_IN6_ADDR) & (pFarEnd[i].Ipv6.sin6_addr))->idHost = idRemoteHost;
+			((PFSP_IN6_ADDR) & (pFarEnd[i].Ipv6.sin6_addr))->idALT = pairSessionID.peer;
 		}
+		namelen = sizeof(SOCKADDR_IN6);
 	}
-	//
-	pControlBlock->u.connectParams.idRemote = addrTo->idALT;
+
+	// the sessionID part of the first (most preferred local interface) FSP address has been set
+	for (register int i = 1; i < MAX_PHY_INTERFACES; i++)
+	{
+		pControlBlock->nearEnd[i].u.idALT = pairSessionID.source;
+	}
+#ifdef TRACE
+	printf_s("InitAssociation, session ID pair: (%u, %u)\n"
+		, pairSessionID.source
+		, pairSessionID.peer);
+#endif
+	wsaBuf[0].buf = (CHAR *)& pairSessionID;
+	wsaBuf[0].len = sizeof(pairSessionID);
+
+	lowState = pControlBlock->state;
+	SetReady();
 }
 
+
+
+//
+void LOCALAPI CSocketItemEx::SetRemoteSessionID(ALT_ID_T id)
+{
+	pairSessionID.peer = id;
+	for (register int i = 0; i < MAX_PHY_INTERFACES; i++)
+	{
+		SOCKADDR_ALT_ID(sockAddrTo + i) = id;
+	}
+}
 
 
 
@@ -522,7 +498,7 @@ void LOCALAPI CSocketItemEx::AffirmConnect(const SConnectParam & initState, ALT_
 	FSP_ConnectParam & varParams = pkt->params;
 	//
 	pkt->cookie = initState.cookie;
-	pkt->timeDelta = htonl(initState.delay.p2p);
+	pkt->timeDelta = htonl(initState.timeDelta);
 	// timeStamp, salt were overlaid; public key was exported already
 
 	// assert(sizeof(initState.allowedPrefixes) >= sizeof(varParams.subnets));
@@ -636,10 +612,10 @@ void CSocketItemEx::Extinguish()
 // Do
 //	Send RESET to the remote peer in the certain states (not guaranteed to be received)
 // See also ~::TimeOut case NON_EXISTENT
-void CSocketItemEx::Disconnect()
+void CSocketItemEx::Disconnect(int reason)
 {
 	if(lowState == CHALLENGING || lowState == CONNECT_AFFIRMING)
-		CLowerInterface::Singleton()->SendPrematureReset(ReturnedValue(), this);
+		CLowerInterface::Singleton()->SendPrematureReset(reason, this);
 	else if(lowState == ESTABLISHED || lowState == CLOSABLE || lowState == PAUSING || lowState == RESUMING)
 		SendPacket<RESET>();
 	//

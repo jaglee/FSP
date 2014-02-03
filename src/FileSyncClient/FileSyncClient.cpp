@@ -4,9 +4,10 @@
 #include "stdafx.h"
 
 #define REMOTE_APPLAYER_NAME "localhost:80"
-// #define REMOTE_APPLAYER_NAME "192.168.234.27:80"
+//#define REMOTE_APPLAYER_NAME "lt-x61t:80"
+// #define REMOTE_APPLAYER_NAME "lt-ux31e:80"
 
-static void FSPAPI onConnected(FSPHANDLE, PFSP_Context, PFSP_IN6_ADDR);
+static void FSPAPI onConnected(FSPHANDLE, PFSP_Context);
 static int	FSPAPI onReceiveWelcome(FSPHANDLE, void *, size_t, bool);
 static int	FSPAPI onReceiveNextBlock(FSPHANDLE, void *, size_t, bool);
 static void FSPAPI onReceiveFileNameReturn(FSPHANDLE, FSP_ServiceCode, int);
@@ -95,46 +96,24 @@ int main()
 
 
 
-void FSPAPI onConnected(FSPHANDLE h, PFSP_Context ctx, PFSP_IN6_ADDR addrAccept)
+void FSPAPI onConnected(FSPHANDLE h, PFSP_Context ctx)
 {
-	printf_s("\n**** Handle of FSP session: 0x%08X ****\nConnected to ", h);
+	printf_s("\nHandle of FSP session: 0x%08X", h);
 	if(h == NULL)
 	{
 		printf_s("\nConnection failure.\n");
 		finished = true;
 		return;
 	}
-	//
-	printf_s("%X::%X::%X ::%X ::%X\n"
-		, net16tohost(addrAccept->u.st.prefix)
-		, net32tohost(addrAccept->u.st.ipv4)
-		, net16tohost(addrAccept->u.st.port)
-		, net32tohost(addrAccept->idHost)
-		, net32tohost(addrAccept->idALT)
-		);
-	// TODO: check context value
-
-	printf_s("To get welcome message...\n");
-	RecvInline(h, onReceiveWelcome);
-}
-
-
-
-static int FSPAPI onReceiveWelcome(FSPHANDLE h, void * welcome, size_t len, bool toBeContinued)
-{
-	printf_s("Welcome message from remote end:\n%s\n", welcome);
-	printf_s("Message length: %d, no more data: %s\n\n", (int)len, toBeContinued ? "no" : "yes");
-	printf_s("To read filename...\n");
-
+	printf_s("\tWelcome message length: %d\n", ctx->len);
+	if(ctx->len > 0)
+		printf_s("%s\n", ctx->welcome);
+	printf_s("\nTo read filename...\t");
 	if(ReadFrom(h, fileName, sizeof(fileName), onReceiveFileNameReturn) < 0)
 	{
 		finished = true;
 		Dispose(h);
-		DebugBreak();
-		return -1;
 	}
-
-	return 0;	// Buffer occupied by what has been peeked has been released, needn't further processing
 }
 
 
@@ -152,7 +131,7 @@ static void FSPAPI onReceiveFileNameReturn(FSPHANDLE h, FSP_ServiceCode resultCo
 	// try to create a new file of the same name. if failed on error file already exists, 
 	// try to change the filename by append a 'C'[if it does not have suffix].
 	// if the new filename exceed MAX_PATH, confuscate the last character
-	printf_s("Remote filename: %s\n", fileName);
+	printf_s("done. Remote filename: %s\n", fileName);
 	try
 	{
  		// TODO: exploit to GetDiskFreeSpace to take use of SECTOR size

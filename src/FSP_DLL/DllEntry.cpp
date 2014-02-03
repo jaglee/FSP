@@ -116,48 +116,6 @@ extern "C" timestamp_t NowUTC()
 
 
 
-CtrlMsgHdr::CtrlMsgHdr(PFSP_IN6_ADDR p)
-{
-	if(p->u.st.prefix == IPv6PREFIX_MARK_FSP)
-	{
-		pktHdr.cmsg_len = sizeof(pktHdr) + sizeof(struct in_pktinfo);
-		pktHdr.cmsg_level = IPPROTO_IP;	/* originating protocol */
-		pktHdr.cmsg_type = IP_PKTINFO;
-		u.ipi_addr = p->u.st.ipv4;
-		u.ipi_ifindex = 0;
-	}
-	else
-	{
-		pktHdr.cmsg_len = sizeof(CtrlMsgHdr);	/* #bytes, including this header */
-		pktHdr.cmsg_level = IPPROTO_IPV6;	/* originating protocol */
-		pktHdr.cmsg_type = IPV6_PKTINFO;
-		*(PIN6_ADDR) & u = *(PIN6_ADDR)p;
-		u.ipi6_ifindex = 0;
-	}
-}
-
-
-
-PFSP_IN6_ADDR CtrlMsgHdr::ExportAddr(struct in6_pktinfo *p)
-{
-	if(IsIPv6MSGHDR(*this))
-	{
-		memcpy(p, & u, sizeof(struct in6_pktinfo));
-	}
-	else
-	{	// FSP over UDP/IPv4
-		((PFSP_IN6_ADDR) & p->ipi6_addr)->u.st.prefix = IPv6PREFIX_MARK_FSP;
-		((PFSP_IN6_ADDR) & p->ipi6_addr)->u.st.ipv4 = u.ipi_addr;
-		((PFSP_IN6_ADDR) & p->ipi6_addr)->u.st.port = DEFAULT_FSP_UDPPORT;
-		((PFSP_IN6_ADDR) & p->ipi6_addr)->idHost = u.host_id;
-		((PFSP_IN6_ADDR) & p->ipi6_addr)->idALT = u.idALT;
-		p->ipi6_ifindex = u.ipi_ifindex;
-	}
-	return (PFSP_IN6_ADDR) & p->ipi6_addr;
-}
-
-
-
 // Given
 //	uint32_t	the limit of the size of the control block. set to 0 to minimize
 //	char []		the buffer to hold the name of the event
@@ -235,6 +193,9 @@ int LOCALAPI CSocketItemDl::Initialize(PFSP_Context psp1, char szEventName[MAX_N
 	else
 		pControlBlock->Init(psp1->sendSize, psp1->recvSize);
 
+	pControlBlock->notices[0] = FSP_IPC_CannotReturn;
+	//^only after the control block is successfully mapped into the memory space of LLS may it be cleared by SetReturned()
+
 	fpRequested = psp1->beforeAccept;
 	fpAccepted = psp1->afterAccept;
 	fpOnError = psp1->onError;
@@ -249,12 +210,11 @@ int LOCALAPI CSocketItemDl::Initialize(PFSP_Context psp1, char szEventName[MAX_N
 
 
 
-
 CSocketItemDl * LOCALAPI CSocketItemDl::CallCreate(CommandNewSession & objCommand, FSP_ServiceCode cmdCode)
 {
-	objCommand.opCode = cmdCode;
+	objCommand.idSession = pairSessionID.source;
 	objCommand.idProcess = ::idThisProcess;
-	objCommand.idSession = sessionID;
+	objCommand.opCode = cmdCode;
 	objCommand.hMemoryMap = hMemoryMap;
 	objCommand.dwMemorySize = dwMemorySize;
 	//
@@ -284,14 +244,15 @@ void CSocketItemDl::WaitEventToDispatch()
 {
 	if(! WaitSetMutex())
 		return;
-	//
+#ifdef TRACE
+	printf_s("\nIn session #%u, state %s\n", pairSessionID.source, stateNames[pControlBlock->state]);
+#endif
 	FSP_ServiceCode notice;
 	int r = 0;
 	while((notice = PopNotice()) != NullCommand)
 	{
 #ifdef TRACE
-		printf_s("\nIn session #%u, state %s, notice %s\n", sessionID
-			, stateNames[pControlBlock->state], noticeNames[notice]);
+		printf_s("\tnotice: %s\n", noticeNames[notice]);
 #endif
 		switch(notice)
 		{
@@ -309,6 +270,17 @@ void CSocketItemDl::WaitEventToDispatch()
 			// safely assume that only in the PAUSING state may NotifyFlushed signaled
 			ToConcludeAdjourn();
 			break;
+		case FSP_IPC_CannotReturn:
+			SetMutexFree();
+			if (pControlBlock->state == LISTENING)
+				NotifyError(FSP_Listen, -EFAULT);
+			else if (pControlBlock->state == CONNECT_BOOTSTRAP || pControlBlock->state == CONNECT_AFFIRMING)
+				this->fpAccepted(NULL, GetAndResetContext());		// general error
+#ifdef TRACE
+			else	// else just ignore the dist
+				printf_s("Get FSP_IPC_CannotReturn in the state %s\n", stateNames[pControlBlock->state]);
+#endif // TRACE
+			return;
 		// TODO: error handlers
 		case FSP_NotifyIOError:
 			break;
@@ -352,22 +324,13 @@ void CSocketItemDl::WaitEventToDispatch()
 	{
 	case LISTENING:
 		if(pControlBlock->HasBacklog())
-		{
 			ProcessBacklog();
-			SetMutexFree();
-		}
-		else
-		{
-			r = (IsNotReturned() ? -EFAULT : 0);
-			SetMutexFree();
-			NotifyError(FSP_Listen, r);
-		}
+		SetMutexFree();
 		break;
 	case CONNECT_BOOTSTRAP:
-		r = (int)IsNotReturned(); 
+		// UNRESOLVED! TODO: if Connect2() is successfully initiated by LLS, a soft interrupt is triggered
+		// should it calls back ULA?
 		SetMutexFree();
-		if(r)
-			this->fpAccepted(NULL, GetAndResetContext(), NULL);		// general error
 		break;
 	case CONNECT_AFFIRMING:
 		ToConcludeConnect();		// SetMutexFree();
@@ -385,10 +348,11 @@ void CSocketItemDl::WaitEventToDispatch()
 	case QUASI_ACTIVE:
 		ToConcludeResurrect();		// SetMutexFree();
 		break;
-	case ESTABLISHED:
-		TRACE_HERE("ProcessPendingSend without notice: shall be obsolesced");
-		// ProcessPendingSend();		// Conclude sending whenever possible
-		break;
+	default:
+		SetMutexFree();
+#ifdef TRACE
+		printf_s("Got an unkown alert from LLS in the state %s\n", stateNames[pControlBlock->state]);
+#endif
 	}
 }
 
@@ -415,98 +379,37 @@ CSocketItemDl * CSocketItemDl::CreateControlBlock(const PFSP_IN6_ADDR nearAddr, 
 		return NULL;
 	}
 	//
-	socketItem->sessionID = nearAddr->idALT;
+	socketItem->pairSessionID.source = nearAddr->idALT;
 	//
 	// TODO: UNRESOLVED! specifies 'ANY' address?
 	//
-	socketItem->pControlBlock->nearEnd[0] = CtrlMsgHdr(nearAddr);
 	CtrlMsgHdr *pNearEnd = socketItem->pControlBlock->nearEnd;
-	if(IsIPv6MSGHDR(*pNearEnd))
+	if(nearAddr->u.st.prefix == PREFIX_FSP_IP6to4)
 	{
-		// local address is yet to be determined by the LLS
 		for(register int i = 0; i < MAX_PHY_INTERFACES; i++)
 		{
 			pNearEnd[i].InitUDPoverIPv4(psp1->ifDefault);
 		}
+		pNearEnd->u.idALT = nearAddr->idALT;
+		pNearEnd->u.ipi_addr = nearAddr->u.st.ipv4;
 	}
 	else
 	{
-		// local address is yet to be determined by the LLS
 		for(register int i = 0; i < MAX_PHY_INTERFACES; i++)
 		{
 			pNearEnd[i].InitNativeIPv6(psp1->ifDefault);
 		}
+		*(PIN6_ADDR) & pNearEnd->u = *(PIN6_ADDR)nearAddr;
 	}
+	// Application Layer Thread ID other than the first default would be set in the LLS
 
 	return socketItem;
 }
 
 
 
-// Given
-//	PFSP_Context		the connection context of the socket, given by ULA
-//	PFSP_IN6_ADDR		const, the listening addresses of the active FSP socket
-//	CommandNewSession & the command context of the socket,  to pass to LLS
-// Return
-//	NULL if it failed, or else the new allocated socket whose session control block has been initialized
-CSocketItemDl * CSocketItemDl::CreateControlBlock(PFSP_Context psp1, const PFSP_IN6_ADDR addrTo, CommandNewSession & cmd)
+bool LOCALAPI CSocketItemDl::Call(const CommandToLLS & cmd, int size)
 {
-	CSocketItemDl *socketItem = socketsTLB.AllocItem();
-	if(socketItem == NULL)
-		return NULL;
-
-	if(socketItem->Initialize(psp1, cmd.u.szEventName) < 0)
-		return NULL;
-
-	if(! socketItem->RegisterDrivingEvent())	
-	{
-		socketsTLB.FreeItem(socketItem);
-		return NULL;
-	}
-
-	// sessionID is yet to be returned by the LLS
-	socketItem->pControlBlock->u.connectParams.idRemote = addrTo->idALT;
-	//
-	CtrlMsgHdr * pNearEnd = socketItem->pControlBlock->nearEnd;
-	PSOCKADDR_INET pFarEnd = socketItem->pControlBlock->sockAddrTo;
-	if(addrTo->u.st.prefix == IPv6PREFIX_MARK_FSP)
-	{
-		// local address is yet to be determined by the LLS
-		for(register int i = 0; i < MAX_PHY_INTERFACES; i++)
-		{
-			pNearEnd[i].InitUDPoverIPv4(psp1->ifDefault);
-			//
-			pFarEnd[i].Ipv4.sin_family = AF_INET;
-			pFarEnd[i].Ipv4.sin_port = DEFAULT_FSP_UDPPORT;
-			pFarEnd[i].Ipv4.sin_addr.S_un.S_addr = addrTo[i].u.st.ipv4;
-			memset(pFarEnd[i].Ipv4.sin_zero	// assert(sizeof(pFarEnd[i].Ipv4.sin_zero) == 8)
-				, 0		// idHost is set to zero as well
-				, sizeof(SOCKADDR_IN6) - sizeof(SOCKADDR_IN) + 8 - sizeof(ALT_ID_T));
-			((PFSP_IN6_ADDR) & (pFarEnd[i].Ipv6.sin6_addr))->idALT = addrTo->idALT;
-		}
-	}
-	else
-	{
-		// local address is yet to be determined by the LLS
-		for(register int i = 0; i < MAX_PHY_INTERFACES; i++)
-		{
-			pNearEnd[i].InitNativeIPv6(psp1->ifDefault);
-			//
-			pFarEnd[i].Ipv6.sin6_family = AF_INET6;
-			pFarEnd[i].Ipv6.sin6_flowinfo = 0;
-			pFarEnd[i].Ipv6.sin6_port = 0;
-			pFarEnd[i].Ipv6.sin6_scope_id = 0;
-			pFarEnd[i].Ipv6.sin6_addr = *(PIN6_ADDR) & addrTo[i];
-		}
-	}
-	//
-	return socketItem;
-}
-
-
-bool LOCALAPI CSocketItemDl::Call(const CommandToLLS & cmd, int size, int returned)
-{
-	SetReturned(returned);
 	return ::WriteFile(_mdService, & cmd, size, & nBytesReadWrite, NULL) != FALSE;
 }
 
@@ -598,7 +501,7 @@ CSocketItemDl * CSocketDLLTLB::operator[](ALT_ID_T sessionID)
 {
 	for(int i = 0; i < sizeOfSet; i++)
 	{
-		if(pSockets[i]->sessionID == sessionID)
+		if(pSockets[i]->pairSessionID.source == sessionID)
 			return pSockets[i];
 	}
 	return NULL;

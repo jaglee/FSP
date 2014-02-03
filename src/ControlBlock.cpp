@@ -39,9 +39,37 @@
 #include "FSP.h"
 #include "FSP_Impl.h"
 
+
+// Reflexing string representation of operation code, for debug purpose
+const char * CStringizeOpCode::names[LARGEST_OP_CODE + 1] =
+{
+	"UNDEFINED/Shall not appear!",
+	"INIT_CONNECT",
+	"ACK_INIT_CONNECT",
+	"CONNECT_REQUEST",
+	"ACK_CONNECT_REQUEST",
+	"RESET",
+	"PERSIST",		// Alias: KEEP_ALIVE, DATA_WITH_ACK,
+	"PURE_DATA",	// Without any optional header
+	"ADJOURN",
+	"ACK_FLUSH",
+	"RESTORE",		// RESUME or RESURRECT connection, may piggyback payload
+	"FINISH",
+	"MULTIPLY",		// To clone connection, may piggyback payload
+	"KEEP_ALIVE",
+	"RESERVED_CODE14",
+	"RESERVED_CODE15",
+	"RESERVED_CODE16",
+	//
+	"CONNECT_PARAM",
+	"EPHEMERAL_KEY",
+	"SELECTIVE_NACK"
+} ;
+
+
 // Reflexing string representation of FSP_Session_State and FSP_ServiceCode, for debug purpose
 // Place here because value of the state or notice/servic code is stored in the control block
-char * stateNames[FSP_Session_State::CLOSED + 1] = 
+const char * CStringizeState::names[CLOSED + 1] =
 {
 	"NON_EXISTENT",
 	// resurrect from CLOSED:
@@ -74,7 +102,7 @@ char * stateNames[FSP_Session_State::CLOSED + 1] =
 	"CLOSED"
 };
 
-char * noticeNames[FSP_ServiceCode::FSP_NotifyUnspecifiedFault + 1] =
+const char * CStringizeNotice::names[LARGEST_FSP_NOTICE + 1] =
 {
 	"NullCommand",
 	// 1~15: DLL to LLS
@@ -103,13 +131,54 @@ char * noticeNames[FSP_ServiceCode::FSP_NotifyUnspecifiedFault + 1] =
 	"FSP_NotifyBufferReady",
 	"FSP_NotifyDisposed",
 	//
-	"Reserved23",
+	"FSP_IPC_CannotReturn",	// LLS cannot return to DLL for some reason
 	// 24~31: near end error status
 	"FSP_NotifyIOError",
 	"FSP_NotifyOverflow",
-	"FSP_NotifyNameResolutionFailed",
-	"FSP_NotifyUnspecifiedFault"
+	"FSP_NotifyNameResolutionFailed"
 };
+
+
+// assume it is atomic (the assumption might be broken!)
+const char * CStringizeOpCode::operator[](int i)
+{
+	static char errmsg[] = "Unknown opCode: 0123467890123";
+	if (i < 0 || i > LARGEST_OP_CODE)
+	{
+		_itoa_s(i, &errmsg[16], 14, 10);
+		return &errmsg[0];
+	}
+	return CStringizeOpCode::names[i];
+}
+
+// assume it is atomic (the assumption might be broken!)
+const char * CStringizeState::operator[](int i)
+{
+	static char errmsg[] = "Unknown state: 0123467890123";
+	if (i < 0 || i > CLOSED)
+	{
+		_itoa_s(i, &errmsg[15], 14, 10);
+		return &errmsg[0];
+	}
+	return CStringizeState::names[i];
+}
+
+// assume it is atomic (the assumption might be broken!)
+const char * CStringizeNotice::operator[](int i)
+{
+	static char errmsg[] = "Unknown notice: 0123467890123";
+	if (i < 0 || i > LARGEST_FSP_NOTICE)
+	{
+		_itoa_s(i, &errmsg[16], 14, 10);
+		return &errmsg[0];
+	}
+	return CStringizeNotice::names[i];
+}
+
+CStringizeOpCode opCodeStrings;
+CStringizeState stateNames;
+CStringizeNotice noticeNames;
+
 
 
 // Remark
@@ -266,7 +335,7 @@ int LOCALAPI ControlBlock::PushNotice(FSP_ServiceCode c)
 	for(register int i = 0; i < FSP_MAX_NUM_NOTICE; i++)
 	{
 		r = _InterlockedCompareExchange8((char *)(notices + i), c, NullCommand);
-		if(r == 0)
+		if(r == NullCommand)
 			return 0;
 		if(r == c)
 			return 1;
@@ -468,6 +537,26 @@ ControlBlock::PFSP_SocketBuf ControlBlock::GetLastBufferedSend()
 }
 
 
+
+
+
+// Return
+//	The send buffer block descriptor of the packet to send
+// Remark
+//	It is assumed that the caller knew there exists at least one packet in the queue
+ControlBlock::PFSP_SocketBuf ControlBlock::PeekNextToSend() const
+{
+	register int d = int(sendWindowNextSN - sendWindowFirstSN);
+	if (d < 0 || d > sendWindowSize)
+		return NULL;
+	if (int(sendWindowNextSN - sendBufferNextSN) >= 0)
+		return NULL;
+
+	d += sendWindowHeadPos;
+	return HeadSend() + (d - sendBufferBlockN >= 0 ? d - sendBufferBlockN : d);
+}
+
+
 // Given
 //	seq_t		the sequence number that is to be assigned to the new allocated packet buffer
 // Do
@@ -516,7 +605,6 @@ ControlBlock::PFSP_SocketBuf LOCALAPI ControlBlock::AllocRecvBuf(seq_t seq1)
 	}
 	//
 	p->ZeroFlags();
-	p->SetFlag<IS_IN_USE>();
 	return p;
 }
 
@@ -556,9 +644,14 @@ void * LOCALAPI ControlBlock::InquireRecvBuf(int & nIO, bool & toBeContinued)
 			return NULL;
 		}
 		//
-		recvWindowFirstSN++;
+		if (p->GetFlag<IS_DELIVERED>())
+		{
+			TRACE_HERE("To double deliver a packet?");
+			return NULL;
+		}
 		p->SetFlag<IS_DELIVERED>();
-		p->SetFlag<IS_IN_USE>(false);
+		//
+		recvWindowFirstSN++;
 		nIO += p->len;
 		//
 		if(! p->GetFlag<TO_BE_CONTINUED>())
@@ -567,7 +660,6 @@ void * LOCALAPI ControlBlock::InquireRecvBuf(int & nIO, bool & toBeContinued)
 			i++;
 			break;
 		}
-		//
 		if(p->len != MAX_BLOCK_SIZE)
 		{
 			nIO = -EFAULT;
@@ -613,9 +705,9 @@ int LOCALAPI ControlBlock::FetchReceived(void * context, fpDeliverData_t fp)
 		if(fp(context, GetRecvPtr(p), p->len) < 0)
 			break;
 
-		p->SetFlag<IS_DELIVERED>();
-		// p->SetFlag<IS_IN_USE>(false);
+		// Set flag in a manner that it would not be re-delivered even IS_DELIVERED flag is not checked
 		p->SetFlag<IS_COMPLETED>(false);
+		p->SetFlag<IS_DELIVERED>();
 		m += p->len;
 
 		// Slide the left border of the receive window firstly
@@ -766,6 +858,27 @@ void ControlBlock::SlideSendWindow()
 
 
 
+// For RESTORE, MULTIPLY or ACK_CONNECT_REQUEST the first packet received is a PERSIST command
+// and very likely it has no piggybacked payload. Such a packet shall be skipped as soon as possible
+void ControlBlock::SkipPurePersist()
+{
+	PFSP_SocketBuf skb = HeadRecv();
+	if (skb->opCode != PERSIST)
+	{
+#ifdef TRACE
+		TRACE_HERE("the caller should make sure the head packet is a PERSIST");
+#endif
+		return;
+	}
+	if (skb->len == 0)
+	{
+		recvWindowHeadPos++;
+		recvWindowFirstSN++;
+	}
+}
+
+
+
 // Return whether it is in the CLOSABLE state or an ADJOURN packet has already been received
 bool ControlBlock::IsClosable()
 {
@@ -814,7 +927,7 @@ bool LOCALAPI ControlBlock::ResizeSendWindow(seq_t seq1, unsigned int adRecvWin)
 		return false;	// you cannot acknowledge a packet not sent yet
 
 	// See also SlideSendWindow() and SlideSendWindow1()
-	assert(uint64_t(sentWidth + adRecvWin) < INT32_MAX);
+	assert((uint64_t)sentWidth + adRecvWin < INT32_MAX);
 	sendWindowSize = min(sendBufferBlockN, int32_t(d + adRecvWin));
 	return true;
 }
