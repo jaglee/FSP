@@ -151,6 +151,8 @@ void UnitTestSendRecvWnd()
 	// emulate received the first data packet
 	ControlBlock::PFSP_SocketBuf skb4 = pSCB->AllocRecvBuf(FIRST_SN);
 	Assert::IsNotNull(skb4);
+	Assert::IsTrue(pSCB->recvWindowFirstSN == FIRST_SN + 1);
+	Assert::IsTrue(pSCB->receiveMaxExpected == FIRST_SN + 1);
 	// TODO: SCB buffer pointer to user space pointer
 	skb4->len = MAX_BLOCK_SIZE - 13;
 	skb4->SetFlag<TO_BE_CONTINUED>(false);
@@ -161,13 +163,11 @@ void UnitTestSendRecvWnd()
 	void *inplaceBuf2 = pSCB->InquireRecvBuf(m2, toBeContinued);
 	Assert::IsNotNull(inplaceBuf2);
 	Assert::IsTrue(m2 == MAX_BLOCK_SIZE - 13);
-	Assert::IsTrue(pSCB->recvWindowFirstSN == FIRST_SN + 1);
-	Assert::IsTrue(pSCB->receiveMaxExpected == FIRST_SN + 1);
 
 	BYTE * stBuf = (BYTE *)_alloca(memsize >> 2);
 	memset(stBuf, 'S', memsize >> 2);
-	int m3 = pSCB->FetchReceived(stBuf, CallbackReceived);
-	Assert::IsTrue(m3 <= 0);
+	//int m3 = pSCB->FetchReceived(stBuf, CallbackReceived);	// outdated
+	//Assert::IsTrue(m3 <= 0);
 
 	ControlBlock::PFSP_SocketBuf skb5 = pSCB->AllocRecvBuf(FIRST_SN);
 	Assert::IsNull(skb5);	// out of order
@@ -211,8 +211,8 @@ void UnitTestSendRecvWnd()
 	Assert::IsTrue(seq4 == FIRST_SN + 5);
 
 	// To support ReadFrom
-	m3 = pSCB->FetchReceived(stBuf, CallbackReceived);
-	Assert::IsTrue(m3 > 0);
+	//m3 = pSCB->FetchReceived(stBuf, CallbackReceived);	// Outdated
+	//Assert::IsTrue(m3 > 0);
 
 	// Clean up
 	free(pSCB);
@@ -249,7 +249,6 @@ void UnitTestResendQueue()
 	skb->SetFlag<IS_COMPLETED>();
 	Assert::IsTrue(pSCB->sendBufferNextSN == FIRST_SN + 1);
 
-
 	skb = pSCB->GetSendBuf();
 	skb->SetFlag<IS_COMPLETED>();
 	Assert::IsTrue(pSCB->sendBufferNextSN == FIRST_SN + 2);
@@ -282,15 +281,13 @@ void UnitTestResendQueue()
 
 	++(pSCB->sendWindowNextSN);
 	skb = pSCB->PeekNextToSend();
-	Assert::IsNotNull(skb);
-	// Unlike CSocketItemEx::PeekNextToSend, ControlBlock::PeekNextToSend does not check overflow
-	// See also comment of ControlBlock::PeekNextToSend
+	Assert::IsNull(skb);
 
 	skb =  pSCB->HeadSend();
-	skb->SetFlag<IS_ACKNOWLEDGED>();
+	//skb->SetFlag<IS_ACKNOWLEDGED>();
 
-	skb = pSCB->HeadSend() + 1;
-	skb->SetFlag<IS_ACKNOWLEDGED>();
+	//skb = pSCB->HeadSend() + 1;
+	//skb->SetFlag<IS_ACKNOWLEDGED>();
 
 	// emulate received the first data packet
 	ControlBlock::PFSP_SocketBuf skb5 = pSCB->AllocRecvBuf(FIRST_SN);
@@ -321,8 +318,14 @@ void UnitTestResendQueue()
 	Assert::IsTrue(seq4 == FIRST_SN + 4);
 
 	lowSocket.RespondSNACK(seq4, snack, 1);
+	Assert::IsTrue(skb->flags == 0);	// GetFlag<IS_ACKNOWLEDGED>()
+	Assert::IsTrue((skb + 1)->flags == 0);	// GetFlag<IS_ACKNOWLEDGED>()
+	Assert::IsTrue((skb + 3)->GetFlag<IS_ACKNOWLEDGED>());
+	Assert::IsTrue(lowSocket.pControlBlock->sendWindowFirstSN == FIRST_SN + 2);
 
 	// TODO: Test round-robin, by slide one...
+	// TODO: change resend window size, test receive max expected SN
+	// TODO: change send window initial size, slow-start? [slide-window based flow control/rate-control?]
 
 	// free(pSCB);	// clean up work done by the destroyer of CSocketItemExDbg
 }
@@ -548,7 +551,6 @@ void UnitTestNoticeQ()
 {
 	ControlBlock *buf = (ControlBlock *)_alloca(sizeof(ControlBlock));
 	ControlBlock & cqq = *buf;
-	BackLogItem item;
 	int n;
 
 	memset(buf, 0, sizeof(ControlBlock));
@@ -574,8 +576,8 @@ void UnitTestNoticeQ()
 	n = cqq.PushNotice(FSP_NotifyRecycled);		// 4
 	Assert::IsFalse(n < 0, L"FSP_NotifyRecycled should have been pushed onto an un-fulfilled queue");
 
-	n = cqq.PushNotice(FSP_NotifyAdjourn);		// 5
-	Assert::IsFalse(n < 0, L"FSP_NotifyAdjourn should have been pushed onto an un-fulfilled queue");
+	n = cqq.PushNotice(FSP_NotifyAccepted);		// 5
+	Assert::IsFalse(n < 0, L"FSP_NotifyAccepted should have been pushed onto an un-fulfilled queue");
 
 	n = cqq.PushNotice(FSP_NotifyFlushed);		// 6
 	Assert::IsFalse(n < 0, L"FSP_NotifyFlushed should have been pushed onto an un-fulfilled queue");
@@ -609,7 +611,7 @@ void UnitTestNoticeQ()
 	Assert::IsTrue(c == FSP_NotifyRecycled, L"What is popped should be what was pushed 4th");
 
 	c = cqq.PopNotice();	// 5
-	Assert::IsTrue(c == FSP_NotifyAdjourn, L"What is popped should be what was pushed 5th");
+	Assert::IsTrue(c == FSP_NotifyAccepted, L"What is popped should be what was pushed 5th");
 
 	c = cqq.PopNotice();	// 6
 	Assert::IsTrue(c == FSP_NotifyFlushed, L"What is popped should be what was pushed 6th");
@@ -689,8 +691,8 @@ void UnitTestVMAC()
 
 	acknowledgement.expectedSN = 1;
 	acknowledgement.sequenceNo = 1;
-	acknowledgement.integrity.id.dstSessionID = htonl(LAST_WELL_KNOWN_ALT_ID); 
-	acknowledgement.integrity.id.srcSessionID = nearEnd.u.idALT;
+	acknowledgement.integrity.id.peer = htonl(LAST_WELL_KNOWN_ALT_ID); 
+	acknowledgement.integrity.id.source = nearEnd.u.idALT;
 
 	memset(acknowledgement.encrypted, 0, sizeof(acknowledgement.encrypted));
 	acknowledgement.hsKey.Set<EPHEMERAL_KEY>(sizeof(FSP_NormalPacketHeader));
@@ -701,11 +703,11 @@ void UnitTestVMAC()
 	CSocketItemExDbg socket;
 	socket.ResetVMAC();
 
-	socket.SetIntegrityCheckCode(& acknowledgement);
+	socket.SetIntegrityCheckCodeP1(& acknowledgement);
 
 	UINT64 savedICC = acknowledgement.integrity.code;
 	acknowledgement.integrity.id = savedId;
-	socket.SetIntegrityCheckCode(& acknowledgement);
+	socket.SetIntegrityCheckCodeP1(& acknowledgement);
 	Assert::AreEqual<UINT64>(savedICC, acknowledgement.integrity.code);
 
 	BYTE ackbuf[sizeof(acknowledgement) + 5];
@@ -714,7 +716,7 @@ void UnitTestVMAC()
 	FSP_AckConnectRequest & ack2 = *(FSP_AckConnectRequest *)(ackbuf + 3);
 
 	ack2.integrity.id = savedId;
-	socket.SetIntegrityCheckCode(& ack2);
+	socket.SetIntegrityCheckCodeP1(& ack2);
 	Assert::AreEqual<UINT64>(savedICC, ack2.integrity.code);
 }
 
@@ -870,12 +872,13 @@ void UnitTestAcknowledge()
 	ControlBlock *pSCB = socket.GetControlBlock();
 	FSP_SelectiveNACK::GapDescriptor gaps[MAX_GAPS_NUM];
 
-	pSCB->sendBufferNextSN = pSCB->sendWindowExpectedSN = pSCB->sendWindowNextSN = pSCB->sendWindowFirstSN = FIRST_SN;
-
+	pSCB->sendWindowExpectedSN = pSCB->sendWindowFirstSN = FIRST_SN;
+	pSCB->sendBufferNextSN = pSCB->sendWindowNextSN = FIRST_SN + 1;
+	// Pretend that the first packet has been sent and is waiting acknowledgement...
 	// A NULL acknowledgement, Keep-Alive
-	int r = socket.RespondSNACK(FIRST_SN, NULL, 0);
+	int r = socket.RespondSNACK(FIRST_SN + 1, NULL, 0);
 	Assert::IsTrue(r == 0 && pSCB->sendBufferNextSN == pSCB->sendWindowFirstSN);
-	Assert::IsTrue(pSCB->sendWindowFirstSN == FIRST_SN);
+	Assert::IsTrue(pSCB->sendWindowFirstSN == FIRST_SN + 1);
 
 	ControlBlock::PFSP_SocketBuf skb = pSCB->GetVeryFirstSendBuf(FIRST_SN);
 	Assert::IsNotNull(skb);

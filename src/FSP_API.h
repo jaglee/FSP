@@ -73,7 +73,9 @@ typedef struct FSP_SocketParameter *PFSP_Context;
 //					exploit CMSG_FIRSTHDR, CMSG_NXTHDR and WSA_CMSG_DATA (CMSG_DATA) to access the header
 //	PFSP_IN6_ADDR	the remote address that make the connection (address has been converted if IPv4)
 // Return
-//	zero (or positive integer) if to continue, negative if to abort
+//	unity (positive integer) is to do a transactional send-receive),
+//	zero if to continue,
+//	negative if to abort
 typedef int (FSPAPI *CallbackRequested)(FSPHANDLE, void *, PFSP_IN6_ADDR);
 
 
@@ -81,25 +83,29 @@ typedef int (FSPAPI *CallbackRequested)(FSPHANDLE, void *, PFSP_IN6_ADDR);
 // Given
 //	FSPHANDLE		the handle of the new created socket
 //	PFSP_InitParams	the context that used to created the socket (may be the listener's context)
+// Return
+//	1	OK, but only one packet is to be sent (transactional)
+//	0	OK, no special processing needed, to keep connection
+//	-1	negative, to reset the connection
 // Remark
 //	ULA may call Dispose if to abort the connection in the call back function
 //	There used to be the third parameter with the type 'CMSGHDR *' which requires advanced IPv6 API support
 //	Now the caller may get the near-side lower-layer control information via FSPControl
-typedef void (FSPAPI *CallbackConnected)(FSPHANDLE, PFSP_Context);
+typedef int (FSPAPI *CallbackConnected)(FSPHANDLE, PFSP_Context);
 
 
 // The callback function through which received message is passed to ULA
 // Given
 //	FSPHANDLE		the handle of the FSP socket (the context)
 //	void *			the pointer to the (partial) message buffer
-//	size_t			the length of the available (partial) message in bytes
+//	int32_t			the length of the available (partial) message in bytes
 //	bool			whether the message is unfinal/partial (to be continued)
 // Return
 //	true(positive non-zero) if processing is successful and the buffer should be release
 //	false(zero) if processing has not finished and the receive buffer should be held
 // Remark
 //	the caller shall make the callback function thread-safe
-typedef int (FSPAPI *CallbackPeeked)(FSPHANDLE, void *, size_t, bool);
+typedef int (FSPAPI *CallbackPeeked)(FSPHANDLE, void *, int32_t, bool);
 
 
 // The function through which the FSP service informs ULA notification due to some particular
@@ -119,7 +125,8 @@ struct FSP_SocketParameter
 {
 	CallbackRequested	beforeAccept;	// may be NULL
 	CallbackConnected	afterAccept;	// cannot be NULL
-	NotifyOrReturn	onError;		// the pointer of the function called back on error, generally shall be set
+	NotifyOrReturn	callback;
+	//^the function pointer of the multiplexer called back on notification or when async-read/write returns
 	const void *	welcome;		// default welcome message, may be NULL
 	unsigned short	len;			// length of the default welcome message
 	union USocketFlags
@@ -129,7 +136,8 @@ struct FSP_SocketParameter
 			unsigned short	milky:		1;
 			unsigned short	encrypting:	1;
 			unsigned short	compressing:1;
-			unsigned short	RESERVED:	12;
+			unsigned short	RESERVED:	11;
+			unsigned short	eom:		1;	// end of message, a run-time flag
 			unsigned short	passive:	1;	// internal use only, shall be ignored by ULA
 		} st;
 		unsigned short flags; //[_In_] the requested features [_Out] the error reason
@@ -208,17 +216,26 @@ int FSPAPI SendInline(FSPHANDLE, void *, int, bool);
 //	FSPHANDLE	the socket handle
 //	void *		the buffer pointer
 //	int			the number of octets to send
+//	char		the flags to indicate whether it is transactional
 //	NotifyOrReturn	the callback function pointer
 // Return
 //	0 if no immediate error, negative if it failed, or positive it was warned (I/O pending)
 // Remark
-//	Only all data have been buffered may be NotifyOrReturn called. Return value passed in NotifyOrReturn is
-//	the number of octets really scheduled to send which may be less or greater
-//	than requested because of compression and/or encryption
-//	NotifyOrReturn might report error even if WriteTo itself return no error
-//	ULA should tell DLL whether the message is completed by call FSPControl. See also ReadFrom()
+//	Return value passed in NotifyOrReturn is the number of octets really scheduled to send
+//	which may be less or greater than requested because of compression and/or encryption
+//	Only all data have been buffered may be NotifyOrReturn called.
+//	Choice of the flag:
+//		0: not finshed more data to follow
+//		1: it is the trail of the containing message
+//		2: it is the last message of the session of the particular transmit direction
+enum EndOfMessageFlag
+{
+	NOT_END_ANYWAY = 0,
+	END_OF_MESSAGE = 1,
+	END_OF_SESSION = 2
+};
 DllSpec
-int FSPAPI WriteTo(FSPHANDLE, void *, int, NotifyOrReturn);
+int FSPAPI WriteTo(FSPHANDLE, void *, int, char, NotifyOrReturn);
 
 
 // given
@@ -226,8 +243,9 @@ int FSPAPI WriteTo(FSPHANDLE, void *, int, NotifyOrReturn);
 //	the pointer to the function called back when peeking finished
 // return 0 if no immediate error, or else the error number
 // remark
-//	if it failed, error number is reported through size_t parameter of 
-//  the PeekCallback while the void * parameter passed will be NULL
+//	if it failed, when CallbackPeeked is called the first parameter is passed with NULL
+//	while the second parameter is passed with the error number
+//	currently the implementation limit the maximum message size of each peek to 2GB
 DllSpec
 int FSPAPI RecvInline(FSPHANDLE, CallbackPeeked);
 
@@ -252,12 +270,10 @@ int FSPAPI ReadFrom(FSPHANDLE, void *, int, NotifyOrReturn);
 
 
 // Adjourn/pause the session by managing to flush all data-in-flight to the remote peer
-// return 0 if no immediate error, or else the error number
-// remark
-//	NotifyOrReturn might return rejection of the adjournment
-//	To resume just SendInline or WriteTo
+// Return 0 if no immediate error, or else the error number.
+// The callback function might return code of delayed error
 DllSpec
-int FSPAPI Adjourn(FSPHANDLE, NotifyOrReturn);
+int FSPAPI Adjourn(FSPHANDLE);
 
 
 

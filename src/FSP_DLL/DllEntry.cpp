@@ -170,7 +170,7 @@ int LOCALAPI CSocketItemDl::Initialize(PFSP_Context psp1, char szEventName[MAX_N
 	}
 
 	// make the event name. the control block address, together with the process id, uniquely identify the event
-	sprintf(szEventName, REVERSE_EVENT_NAME "%08X%08X", idThisProcess, (uint32_t)pControlBlock);
+	sprintf_s(szEventName, MAX_NAME_LENGTH, REVERSE_EVENT_NAME "%08X%08X", idThisProcess, (uint32_t)pControlBlock);
 	// system automatically resets the event state to nonsignaled after a single waiting thread has been released
 	hEvent = CreateEvent(& attrSecurity
 		, FALSE // not manual-reset
@@ -196,14 +196,10 @@ int LOCALAPI CSocketItemDl::Initialize(PFSP_Context psp1, char szEventName[MAX_N
 	pControlBlock->notices[0] = FSP_IPC_CannotReturn;
 	//^only after the control block is successfully mapped into the memory space of LLS may it be cleared by SetReturned()
 
-	fpRequested = psp1->beforeAccept;
-	fpAccepted = psp1->afterAccept;
-	fpOnError = psp1->onError;
-
-	uFlags.flags = psp1->u.flags;
+	// could be exploited by ULA to make distinguishment of services
+	memcpy(&context, psp1, sizeof(FSP_SocketParameter));
 	pendingSendBuf = (BYTE *)psp1->welcome;
 	pendingSendSize = psp1->len;
-	SetListenContext(psp1);	// could be exploited by ULA to make distinguishment of services
 
 	return 0;
 }
@@ -230,7 +226,6 @@ CSocketItemDl * LOCALAPI CSocketItemDl::CallCreate(CommandNewSession & objComman
 // ULA would be punished if memory is deliberately corrupted as dead-loop occured due to dead-lock consume user-space CPU time only
 bool CSocketItemDl::WaitSetMutex()
 {
-	++recurDepth;
 	while(TestSetMutexBusy())
 		_sleep(1);
 	//
@@ -244,14 +239,14 @@ void CSocketItemDl::WaitEventToDispatch()
 {
 	if(! WaitSetMutex())
 		return;
-#ifdef TRACE
+#ifdef TRACE_PACKET
 	printf_s("\nIn session #%u, state %s\n", pairSessionID.source, stateNames[pControlBlock->state]);
 #endif
 	FSP_ServiceCode notice;
 	int r = 0;
 	while((notice = PopNotice()) != NullCommand)
 	{
-#ifdef TRACE
+#ifdef TRACE_PACKET
 		printf_s("\tnotice: %s\n", noticeNames[notice]);
 #endif
 		switch(notice)
@@ -262,20 +257,18 @@ void CSocketItemDl::WaitEventToDispatch()
 		case FSP_NotifyDataReady:
 			ProcessReceiveBuffer();
 			break;
-		case FSP_NotifyAdjourn:
-			SetMutexFree();
-			NotifyError(FSP_NotifyAdjourn, 0);
+		case FSP_NotifyAccepted:
+			ToConcludeAccept();			// SetMutexFree();
 			break;
 		case FSP_NotifyFlushed:
-			// safely assume that only in the PAUSING state may NotifyFlushed signaled
-			ToConcludeAdjourn();
+			ToConcludeAdjourn();	// SetMutexFree();
 			break;
 		case FSP_IPC_CannotReturn:
 			SetMutexFree();
 			if (pControlBlock->state == LISTENING)
 				NotifyError(FSP_Listen, -EFAULT);
 			else if (pControlBlock->state == CONNECT_BOOTSTRAP || pControlBlock->state == CONNECT_AFFIRMING)
-				this->fpAccepted(NULL, GetAndResetContext());		// general error
+				this->fpAccepted(NULL, &context);		// general error
 #ifdef TRACE
 			else	// else just ignore the dist
 				printf_s("Get FSP_IPC_CannotReturn in the state %s\n", stateNames[pControlBlock->state]);
@@ -335,18 +328,9 @@ void CSocketItemDl::WaitEventToDispatch()
 	case CONNECT_AFFIRMING:
 		ToConcludeConnect();		// SetMutexFree();
 		break;
-	case CHALLENGING:
-		// UNRESOLVED!? if(IsNotReturned())	TRACE_HERE("Cannot synchronizing with LLS");
-		ToConcludeAccept();			// SetMutexFree();
-		break;
-	case CLONING:
-		ToConcludeMultiply();		// See also case NotifyAdjourn		// SetMutexFree();
-		break;
-	case RESUMING:
-		ToConcludeResume();			// SetMutexFree();
-		break;
-	case QUASI_ACTIVE:
-		ToConcludeResurrect();		// SetMutexFree();
+	case CLOSABLE:
+	case CLOSED:
+		HitResumableDisconnectedSessionCache();
 		break;
 	default:
 		SetMutexFree();
@@ -433,7 +417,7 @@ int LOCALAPI CSocketItemDl::CopyKey(ALT_ID_T id1)
 DllSpec
 bool EOMReceived(FSPHANDLE hFSPSocket)
 {
-	return ((CSocketItemDl *)hFSPSocket)->EOMRecv();
+	return ((CSocketItemDl *)hFSPSocket)->IsEndOfRecvMsg();
 }
 
 
@@ -459,14 +443,8 @@ CSocketItemDl * CSocketDLLTLB::AllocItem()
 		, 0
 		, sizeof(CSocketItemDl) - sizeof(CSocketItem));
 	// item->prev = item->next = NULL;	// so does other connection state pointers and flags
-	// item->recurDepth = 0;
 	// item->mutex = SHARED_FREE;
 	item->inUse = TRUE;
-
-#ifdef TRACE
-	printf_s("New item allocated, initially recurDepth, mutex, inUse = %d, %d, %d\n",
-		item->recurDepth, item->mutex, item->inUse);
-#endif
 
 	// sizeof(pSockets) / sizeof(CSocketItem *) == MAX_CONNECTION_NUM
 	if(sizeOfSet >= MAX_CONNECTION_NUM)

@@ -34,7 +34,7 @@ static void FSPAPI onReturn(FSPHANDLE h, FSP_ServiceCode code, int value)
 
 
 
-static void FSPAPI onAccepted(FSPHANDLE h, PFSP_Context);
+static int FSPAPI onAccepted(FSPHANDLE h, PFSP_Context);
 static void FSPAPI onFileNameSent(FSPHANDLE, FSP_ServiceCode, int);
 static void FSPAPI toSendNextBlock(FSPHANDLE, FSP_ServiceCode, int);
 
@@ -85,7 +85,7 @@ int main(int argc, char * argv[])
 	memset(& params, 0, sizeof(params));
 	params.beforeAccept = NULL;
 	params.afterAccept = onAccepted;
-	params.onError = onReturn;
+	params.callback = onReturn;
 	params.welcome = defaultWelcome;
 	params.len = (unsigned short)strlen(defaultWelcome) + 1;
 	params.sendSize = MAX_FSP_SHM_SIZE;
@@ -108,12 +108,13 @@ int main(int argc, char * argv[])
 
 
 
-static void FSPAPI onAccepted(FSPHANDLE h, PFSP_Context ctx)
+static int FSPAPI onAccepted(FSPHANDLE h, PFSP_Context ctx)
 {
 	printf_s("\nHandle of FSP session: 0x%08X\n", h);
 	printf_s("\tTo send filename to the remote end...\n");
 	// TODO: check connection context
-	WriteTo(h, fileName, (int)strlen(fileName) + 1, onFileNameSent);
+	WriteTo(h, fileName, (int)strlen(fileName) + 1, END_OF_MESSAGE, onFileNameSent);
+	return 0;
 }
 
 
@@ -128,7 +129,8 @@ static void FSPAPI onFileNameSent(FSPHANDLE h, FSP_ServiceCode c, int r)
 		return;
 	}
 
-	printf("\nFilename has been sent to remote end, to get send buffer for reading and sending inline...\n");
+	printf("Filename has been sent to remote end,\n"
+		"to get send buffer for reading and sending inline...\n");
 	//UNRESOLVED! spawn an implicit thread to receive remote feed-back
 
 	capacity = GetSendBuffer(h, & batchBuffer, MIN_SEND_SEGMENT_SIZE, toSendNextBlock);

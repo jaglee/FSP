@@ -189,25 +189,16 @@ void CSocketItemDl::ProcessBacklog()
 CSocketItemDl * LOCALAPI CSocketItemDl::PrepareToAccept(BackLogItem & backLog, CommandNewSession & cmd)
 {
 	PFSP_IN6_ADDR pListenIP = (PFSP_IN6_ADDR) & backLog.acceptAddr;
-	FSP_SocketParameter context;
-	memset(& context, 0, sizeof(context));
-	context.ifDefault = backLog.acceptAddr.ipi6_ifindex;
-	// a new socket created by accepting remote requested might be multiplied
-	context.beforeAccept = fpRequested;
-	context.afterAccept = fpAccepted;
-	context.onError = fpOnError;
-	context.recvSize = GetListenContext()->recvSize;
-	context.sendSize = GetListenContext()->sendSize;
-	context.u = this->uFlags;
-	context.u.st.passive = 0;
-	// UNRESOLVED! check function pointers!
-	if(uFlags.st.passive)	// this->StateEqual(LISTENING)
+	FSP_SocketParameter newContext = this->context;
+	newContext.ifDefault = backLog.acceptAddr.ipi6_ifindex;
+	newContext.u.st.passive = 0;
+	// UNRESOLVED! check function pointers!?
+	if(! this->context.u.st.passive)	// this->StateEqual(LISTENING)
 	{
-		context.welcome = pendingSendBuf;
-		context.len = pendingSendSize;
+		newContext.welcome = NULL;
+		newContext.len = 0;
 	}
-
-	CSocketItemDl *pSocket = CreateControlBlock(pListenIP, &context, cmd);
+	CSocketItemDl *pSocket = CreateControlBlock(pListenIP, &newContext, cmd);
 	if(pSocket == NULL)
 		return NULL;
 
@@ -285,26 +276,26 @@ bool LOCALAPI CSocketItemDl::ToWelcomeConnect(BackLogItem & backLog)
 
 
 // Auxiliary function that is called when a new connection request is to be accepted
-// in the new created context of the responder
-// Do
-//	CHALLENGING-->ACTIVE
+// in the new created context of the incarnation respondor OR multiplexing initiator
+// Remark
+//	It is legal to chain ReadFrom()/RecvInline()
+//	However, it is illegal to chain WriteTo()/SendInline() if it has already migrated
+//	to the CLOSABLE state from the CHALLENGING, CLONING, RESUMING or QUASI_ACTIVE state
 void CSocketItemDl::ToConcludeAccept()
 {
 	TRACE_HERE("Connection has been accepted");
-	SetState(ESTABLISHED);		// make it legal to chain ReadFrom()/RecvInline()
-	pControlBlock->SkipPurePersist();
 	SetMutexFree();
 	if(fpAccepted != NULL)
-		fpAccepted(this, GetAndResetContext());
+		fpAccepted(this, &context);
 }
 
 
 
-// Auxiliary function that is called when a new connection sucessfully by the initiator
-// Do
-//	CONNECT_AFFIRMING-->ACTIVE
-// Remark
-//	Send PERSIST, ICC, Initial SN, Expected SN, Receive Window [, Payload]
+// Auxiliary function that is called when a new connection request is acknowledged by the responder
+//	CONNECT_AFFIRMING-->[Rcv ACK_CONNECT_REQUEST]-->[API{callback}]
+//	|-->{Return Accept}-->ACTIVE-->[Snd PERSIST[start keep-alive}]
+//	|-->{Return Commit}-->PAUSING-->[Snd ADJOURN{enable retry}]
+//	|-->{Return Reject}-->[Snd RESET]-->NON_EXISTENT
 void CSocketItemDl::ToConcludeConnect()
 {
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadRecv();
@@ -320,37 +311,45 @@ void CSocketItemDl::ToConcludeConnect()
 	// UNRESOLVED! Could welcome message be compressed?
 	// TODO: Provide convient compress/decompress help routines
 	// TODO: provide extensibility of customized compression/decompression method?
-	PFSP_Context pContext = GetAndResetContext();
-	if(pContext != NULL)
-	{
-		pContext->welcome = payload;
-		pContext->len = skb->len;
-		pContext->u.st.compressing = skb->GetFlag<IS_COMPRESSED>();
-	}
+	context.welcome = payload;
+	context.len = skb->len;
+	context.u.st.compressing = skb->GetFlag<IS_COMPRESSED>();
+
 	pControlBlock->recvWindowHeadPos++;
 	pControlBlock->recvWindowFirstSN++;
 
 	TRACE_HERE("connection request has been accepted");
-	SetState(ESTABLISHED);
 
 	// Overlay CONNECT_REQUEST, and yes, it is queued and might be followed by payload packet
 	skb = pControlBlock->HeadSend();	// See also InitConnect() and AffirmConnect()
-	assert(skb != NULL);
 	// while version and sequence number remains as the same as very beginning INIT_CONNECT
 	skb->opCode = PERSIST;
 	skb->len = 0;
 	skb->ZeroFlags();	// As it overlay CONNECT_REQUEST and the packet must have been sent
 
 	SetMutexFree();
+
+	int r = 0;
 	if(fpAccepted != NULL)
-		fpAccepted(this, pContext);
+		r = fpAccepted(this, &context);
+
+	if(r < 0)
+	{
+		Recycle();
+		return;
+	}
+
+	// if it is transactional the head packet should have already be changed to ADJOURN
+	SetState(r == 0 ? ESTABLISHED : PAUSING);
 
 #ifdef TRACE
 	printf_s("Acknowledgement of connection request received, to PERSIST the connection.\n");
 #endif
-	// it might be redundant if WriteTo() was chained in fpAccepted, but it does little harm
-	skb->SetFlag<IS_COMPLETED>();
-	Call<FSP_Send>();
+	if (!skb->GetFlag<BIT_IN_SENDING>())
+	{
+		skb->SetFlag<IS_COMPLETED>();
+		Call<FSP_Send>();
+	}
 }
 
 

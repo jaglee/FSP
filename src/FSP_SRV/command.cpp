@@ -68,6 +68,7 @@ void LOCALAPI Listen(struct CommandNewSession *pCmd)
 }
 
 
+
 // Register an initiative FSP socket
 // Given
 //	_In_ pCmd point to the command context given by ULA
@@ -99,6 +100,7 @@ l_return:
 }
 
 
+// Register an incarnated FSP socket
 // Given
 //	CommandNewSession	the synchronization command context
 // Do
@@ -127,6 +129,10 @@ void LOCALAPI SyncSession(struct CommandNewSession *pCmd)
 
 
 
+// Given
+//	CommandNewSession
+// Do
+//	Routine works of registering a passive FSP socket
 void LOCALAPI CSocketItemEx::Listen(CommandNewSession *pCmd)
 {
 	if(! MapControlBlock(*pCmd))
@@ -147,6 +153,10 @@ void LOCALAPI CSocketItemEx::Listen(CommandNewSession *pCmd)
 
 
 
+// Given
+//	CommandNewSession
+// Do
+//	Routine works of registering a passive FSP socket
 void LOCALAPI CSocketItemEx::Connect(CommandNewSession *pCmd)
 {
 #ifdef TRACE
@@ -204,6 +214,16 @@ l_return:
 
 
 
+// Send the ACK_ADJOURN command, as the response to in-order ADJOURN
+void CSocketItemEx::AckAdjourn()
+{
+	TRACE_HERE("called");
+	// SetState(CLOSABLE);	// Shall be redundant!
+	ReplaceTimer(SCAVENGE_THRESHOLD_ms);
+	SendPacket<ACK_FLUSH>();
+}
+
+
 // Send the FINISH command, as the last step of shut down connection
 void CSocketItemEx::Shutdown()
 {
@@ -238,10 +258,10 @@ void CSocketItemEx::Send()
 // Given
 //	PCTSTR			the name of the node to be resolved, which might be an IPv4 string representation
 //	PCTSTR			the name of the service to be resolved, which might be a string of decimal port number
+// Do
+//	Resolve the UDP socket addresses of the given remote peer and store them in the peerAddr field of SCB
 // Return
 //	Number of addresses resolved, negative if error
-// Remark
-//	If (capacity <= 0) it will return 0
 int LOCALAPI CSocketItemEx::ResolveToFSPoverIPv4(const char *nodeName, const char *serviceName)
 {
 	static const struct addrinfo hints = { 0, AF_INET, };
@@ -285,12 +305,13 @@ int LOCALAPI CSocketItemEx::ResolveToFSPoverIPv4(const char *nodeName, const cha
 }
 
 
+
 // Given
 //	PCTSTR			the name of the node to be resolved, which might be an IPv6 string representation
+// DO
+//	Resolve the IPv6 addresses of the given remote peer and store them in the peerAddr field of SCB
 // Return
 //	Number of addresses resolved, negative if error
-// Remark
-//	If (capacity <= 0) it will return 0
 int LOCALAPI CSocketItemEx::ResolveToIPv6(const char *nodeName)
 {
 	static const struct addrinfo hints = { 0, AF_INET6, };

@@ -116,7 +116,7 @@ int CSocketItemDl::RecvInline(PVOID fp1)
 		return -EBUSY;
 	}
 	//
-	pControlBlock->eomRecv = false;
+	SetEndOfRecvMsg(false);
 	if(! IsRecvBufferEmpty())
 	{
 		SetMutexFree();
@@ -139,9 +139,8 @@ int CSocketItemDl::RecvInline(PVOID fp1)
 int LOCALAPI CSocketItemDl::ReadFrom(void * buffer, int capacity, PVOID fp1)
 {
 #ifdef TRACE
-	printf_s("ReadFrom the FSP pipe to 0x%08X, %d bytes\n", (LONG)buffer,  capacity);
+	printf_s("ReadFrom the FSP pipe to 0x%08X: byte[%d]\n", (LONG)buffer,  capacity);
 #endif
-
 	if(! WaitSetMutex())
 	{
 		TRACE_HERE("deadlock encountered?");
@@ -166,7 +165,7 @@ int LOCALAPI CSocketItemDl::ReadFrom(void * buffer, int capacity, PVOID fp1)
 
 	bytesReceived = 0;
 	waitingRecvSize = capacity;
-	pControlBlock->eomRecv = false;	// See also FetchReceived()
+	SetEndOfRecvMsg(false);	// See also FetchReceived()
 
 	if(fpPeeked != NULL)
 	{
@@ -189,6 +188,7 @@ int LOCALAPI CSocketItemDl::ReadFrom(void * buffer, int capacity, PVOID fp1)
 
 // Return number of bytes actually delivered (might be exploding if decompressed and decrypted)
 // TODO: decrypt, decompress
+inline
 int LOCALAPI CSocketItemDl::DeliverData(void *p, int n)
 {
 	if(n > waitingRecvSize)
@@ -203,6 +203,39 @@ int LOCALAPI CSocketItemDl::DeliverData(void *p, int n)
 }
 
 
+inline
+int CSocketItemDl::FetchReceived()
+{
+	int m = 0;	// note that left border of the receive window slided in the loop body
+	for(ControlBlock::PFSP_SocketBuf p = pControlBlock->FirstReceived(); p->GetFlag<IS_COMPLETED>(); p = pControlBlock->FirstReceived())
+	{
+		if(p->len > MAX_BLOCK_SIZE || p->len < 0)
+			return -EFAULT;
+
+		if(DeliverData(GetRecvPtr(p), p->len) < 0)
+			break;
+
+		// Set flag in a manner that it would not be re-delivered even IS_DELIVERED flag is not checked
+		p->SetFlag<IS_COMPLETED>(false);
+		p->SetFlag<IS_DELIVERED>();
+		m += p->len;
+
+		// Slide the left border of the receive window before possibly set the flag 'end of received message'
+		pControlBlock->SlideRecvWindowByOne();
+		if(! p->GetFlag<TO_BE_CONTINUED>())
+		{
+			SetEndOfRecvMsg();
+			break;
+		}
+		// What? An imcomplete 'to be continued' intermediate packet received?
+		if(p->len != MAX_BLOCK_SIZE)
+			return -EFAULT;
+	}
+	//
+	return m;
+}
+
+
 // Remark
 //	fpReceive would not be reset if internal memeory allocation error detected
 //	If RecvInline() failed (say, due to compression and/or encryption), data may be picked up by ReadFrom()
@@ -210,37 +243,49 @@ int LOCALAPI CSocketItemDl::DeliverData(void *p, int n)
 //	ULA should make sure that the socket is freed in the callback function (if recycling is notified)
 void CSocketItemDl::ProcessReceiveBuffer()
 {
-#ifdef TRACE
+#ifdef TRACE_PACKET
 	printf_s("Process receive buffer in state %s\n", stateNames[pControlBlock->state]);
 #endif
 	// As LLS may set the state into CLOSABLE before DLL have been ready to process the process buffer,
-	// it should be legal to deliver data in CLOSABLE or CLOSED state
-	if(! StateEqual(ESTABLISHED) && ! StateEqual(RESUMING) && ! StateEqual(CLONING) && ! StateEqual(CLOSABLE) && ! StateEqual(CLOSED))
+	// it should be legal to deliver data in CLOSABLE state, but not CLOSED
+	if(! StateEqual(CHALLENGING) && ! StateEqual(ESTABLISHED) && ! StateEqual(RESUMING) && ! StateEqual(CLONING) && ! StateEqual(CLOSABLE))
 	{
-		printf_s("Is it illegal?\n\n");
-		//SetMutexFree();
-		//return;
+#ifdef TRACE
+		printf_s("Is it illegal to ProcessReceiveBuffer in state %s\n", stateNames[pControlBlock->state]);
+#else
+		SetMutexFree();
+		return;
+#endif
+	}
+	if (IsRecvBufferEmpty())
+	{
+#ifdef TRACE
+		printf_s("Receive buffer is empty when ", __FUNCTION__);
+#endif
+		SetMutexFree();
+		return;
 	}
 	//
 	int n;
 	// RecvInline takes precedence
 	if(fpPeeked != NULL)
 	{
-#ifdef TRACE
+#ifdef TRACE_PACKET
 		printf_s("RecvInline...\n");
 #endif
 		bool b;
 		void *p = pControlBlock->InquireRecvBuf(n, b);
-#ifdef TRACE
+#ifdef TRACE_PACKET
 		printf_s("Data to deliver: 0x%08X, length = %u, eom = %d\n", (LONG)p, n, (int)!b);
 #endif
-		// TODO: code review: whether a pure ADJOURN command can terminate a message
 		if(! b)
 		{
-			pControlBlock->eomRecv = true;
+			TRACE_HERE("TODO: code review: whether a pure ADJOURN command can terminate a message");
+			SetEndOfRecvMsg();
 		}
 		else if(n == 0)
 		{
+			TRACE_HERE("Nothing to deliver");
 			mutex = SHARED_FREE;
 			goto l_return;
 		}
@@ -251,7 +296,7 @@ void CSocketItemDl::ProcessReceiveBuffer()
 		if(! b || n < 0)
 			fpPeeked = NULL;
 		//
-		mutex = SHARED_FREE;	//	SetMutexFree();
+		SetMutexFree();
 		if(n < 0)
 			fp1(this, NULL, (size_t) n, false);
 		else
@@ -260,37 +305,60 @@ void CSocketItemDl::ProcessReceiveBuffer()
 		goto l_return;
 	}
 
-	// When ULA have call neither RecvInline() nor ReadFrom() what received should be buffered as is
 	if(waitingRecvBuf == NULL || waitingRecvSize <= 0 || fpReceive == NULL)
 	{
-		mutex = SHARED_FREE;
+#ifdef TRACE
+		printf_s("When ULA have called neither RecvInline() nor ReadFrom(),\n"
+			"what received should be buffered as is\n");
+#endif
+		SetMutexFree();
 		goto l_return;
 	}
 
-	n = pControlBlock->FetchReceived(this, Deliver);
+	n = FetchReceived();
 	if(n < 0)
 	{
-		// UNRESOLVED! Crash recovery? do not reset waitingRecvBuf or fpReceive yet
-		mutex = SHARED_FREE;	//	SetMutexFree();
+#ifdef TRACE
+		printf_s("FetchReceived() return %d\n"
+			"UNRESOLVED! Crash recovery? waitingRecvBuf or fpReceive is not reset yet.\n"
+			, n);
+#endif
+		SetMutexFree();
 		NotifyError(FSP_NotifyOverflow, n);
-		DecreaseDepth();
 		return;
 	}
 	//
-	if(pControlBlock->eomRecv || waitingRecvSize <= 0)
+	if(IsEndOfRecvMsg() || waitingRecvSize <= 0)
 		FinalizeRead();
 	else
-		mutex = SHARED_FREE;
+		SetMutexFree();
 
 l_return:
-	if(IsRecvBufferEmpty())
+	// Even if ULA does not fetch the received data may it be closable
+	if (IsRecvBufferEmpty())
 	{
-		FSP_Session_State s0 = CompareSetState(CLOSABLE, CLOSED);
-		if(s0 == CLOSABLE || s0 == CLOSED)
-			NotifyError(FSP_NotifyRecycled, 0);			// report 'no error', actually
+#ifdef TRACE
+		printf_s("The last packet received is ADJOURN. The session is paused.\n");
+#endif
+		ControlBlock::PFSP_SocketBuf skb = pControlBlock->GetLastReceived();
+		if (skb->opCode == ADJOURN)
+		{
+			SetState(CLOSABLE);
+			Call<FSP_LazyAckAdjourn>();
+		}
 	}
-
-	DecreaseDepth();
+	else if (pControlBlock->IsClosable())
+	{
+#ifdef TRACE
+		printf_s("A full message with ADJOURN as the trailer is in the buffer.\n"
+			"The session is paused.\n");
+#endif
+		SetState(CLOSABLE);
+		Call<FSP_LazyAckAdjourn>();
+	}
+	//
+	if (StateEqual(CLOSABLE))
+		SelfNotify(FSP_NotifyFlushed);
 }
 
 
@@ -299,6 +367,6 @@ void CSocketItemDl::FinalizeRead()
 {
 	NotifyOrReturn fp1 = (NotifyOrReturn)InterlockedExchangePointer((PVOID volatile *) & fpReceive, NULL);
 	waitingRecvBuf = NULL;
-	mutex = SHARED_FREE;	//	SetMutexFree();
+	SetMutexFree();
 	fp1(this, FSP_NotifyDataReady, 0);
 }

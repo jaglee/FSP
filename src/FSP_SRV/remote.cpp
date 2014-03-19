@@ -188,7 +188,7 @@ void LOCALAPI CLowerInterface::OnInitConnectAck()
 	SConnectParam & initState = pSocket->pControlBlock->u.connectParams;
 	ALT_ID_T idListener = initState.idRemote;
 
-	if(! pSocket->InState(CONNECT_BOOTSTRAP))
+	if(! pSocket->InState(CONNECT_BOOTSTRAP) && ! pSocket->InState(QUASI_ACTIVE))
 		goto l_return;
 
 	if(initState.initCheckCode != response.initCheckCode)
@@ -215,6 +215,12 @@ l_return:
 // [into 'CHALLENGING'] (allocate state space, including data buffers, command queue, etc)
 // it is tempting to acknowledge the connect request immediately to save some memory copy
 // however, it is not justified, for throughput throttling is overriding
+//	LISTENING-->/CONNECT_REQUEST/-->[API{new context CHALLENGING, callback}]
+//	|-->[{return}Accept]-->[Snd ACK_CONNECT_REQUEST{in new context}]
+//	|-->[{return}Reject]-->[Snd RESET{abort creating new context}]
+//	CLOSED-->/CONNECT_REQUEST/-->[API{callback}]
+//	|-->[{return}Accept]-->CHALLENGING-->[Snd ACK_CONNECT_REQUEST]
+//	|-->[{return}Reject]-->NON_EXISTENT-->[Snd RESET]
 void LOCALAPI CLowerInterface::OnGetConnectRequest()
 {
 	TRACE_HERE("called");
@@ -225,25 +231,30 @@ void LOCALAPI CLowerInterface::OnGetConnectRequest()
 	// Check whether it is a collision
 	if(pSocket != NULL && pSocket->IsInUse())
 	{
-		if(pSocket->pairSessionID.peer == this->GetRemoteSessionID()
+		if (pSocket->InState(CHALLENGING)
+		&& pSocket->pairSessionID.peer == this->GetRemoteSessionID()
 		&& pSocket->pControlBlock->u.connectParams.cookie == request.cookie)
 		{
-			// retransmit ACK_CONNECT_REQUEST at the head of the send queue
 			pSocket->Retransmit1();
 			return;	// hitted
 		}
+		// 
 		// Or else it is a collision and is silently discard in case an out-of-order RESET reset a legitimate connection
 		// UNRESOLVED! Is this a unbeatable DoS attack to initiator if there is a 'man in the middle'?
-		return;
+		if (!pSocket->InState(CLOSED))
+			return;
 	}
 
 	// Silently discard the request onto illegal or non-listening socket 
-	pSocket = (*this)[request.params.listenerID];	// a dialect of MapSocket
-	if(pSocket == NULL || ! pSocket->TestAndLockReady())
-		return;
+	if (pSocket == NULL || ! pSocket->IsInUse())
+	{
+		pSocket = (*this)[request.params.listenerID];	// a dialect of MapSocket
+		if (pSocket == NULL || !pSocket->IsPassive())
+			return;
+	}
 
-	if(! pSocket->IsPassive())
-		goto l_return;
+	if (!pSocket->TestAndLockReady())
+		return;
 
 	// cf. OnInitConnectAck() and SocketItemEx::AffirmConnect()
 	ALT_ID_T idSession = GetLocalSessionID();
@@ -254,9 +265,11 @@ void LOCALAPI CLowerInterface::OnGetConnectRequest()
 	// UNRESOLVED! TODO: search the cookie blacklist at first
 	if(request.cookie != CalculateCookie((BYTE *) & cm
 			, sizeof(cm)
-			, ntohll(request.timeStamp) + ntohl(request.timeDelta)) )
+			, ntohll(request.timeStamp) + (INT32)ntohl(request.timeDelta)) )
 	{
-		// UNRESOLVED! TODO: put the cookie into the blacklist to fight against DDoS attack
+#ifdef TRACE
+		printf_s("UNRESOLVED! TODO: put the cookie into the blacklist to fight against DDoS attack!?\n");
+#endif
 		goto l_return;	// the packet has been updated and should be discarded
 	}
 
@@ -299,6 +312,8 @@ void LOCALAPI CLowerInterface::OnGetConnectRequest()
 
 	// lastly, put it into the backlog
 	pSocket->pControlBlock->PushBacklog(& backlogItem);
+	// TODO: handling resurrection failure -- just reuse?
+	// if (pSocket->InState(CLOSED)) //;
 	pSocket->SignalEvent();
 
 l_return:
@@ -310,7 +325,7 @@ l_return:
 // Remark
 //	{CONNECT_BOOTSTRAP, CHALLENGING, CONNECT_AFFIRMING, QUASI_ACTIVE,
 //	 CLONING, ACTIVE, PAUSING, RESUMING, CLOSABLE}-->NON_EXISTENT
-//	{NON_EXISTENT, CLOSED, Otherwise}<-->{Ignore}
+//	{Otherwise: NON_EXISTENT, LISTENING, CLOSED}<-->{Ignore}
 //	Doesn't actually reset the state to NON_EXISTENT in LLS
 //	let DLL handle it so that ULA may know the reason of disconnection
 void LOCALAPI CLowerInterface::OnGetResetSignal()
@@ -360,6 +375,7 @@ void LOCALAPI CLowerInterface::OnGetResetSignal()
 		}
 	}
 	// LISTENING state is not affected by reset signal
+	// And a CLOSED session responds to RESTORE only
 }
 
 
@@ -384,9 +400,7 @@ void LOCALAPI CLowerInterface::SendPrematureReset(UINT32 reasons, CSocketItemEx 
 		reject.u.timeStamp = htonll(NowUTC());
 		// See also CSocketItemEx::Emit() and SetIntegrityCheckCode():
 		reject.u2.sidPair = pSocket->pairSessionID;
-		pSocket->wsaBuf[1].buf = (CHAR *) & reject;
-		pSocket->wsaBuf[1].len = (ULONG)(sizeof(reject));
-		pSocket->SendPacket(1);
+		pSocket->SendPacket(1, ScatteredSendBuffers(&reject, sizeof(reject)));
 	}
 	else
 	{
@@ -397,16 +411,27 @@ void LOCALAPI CLowerInterface::SendPrematureReset(UINT32 reasons, CSocketItemEx 
 }
 
 
-
+// Remark
+//	CONNECT_AFFIRMING-->/ACK_CONNECT_REQUEST/-->[API{callback}]
+//	|-->{Return Accept}-->ACTIVE-->[Snd PERSIST[start keep-alive}]
+//	|-->{Return Commit}-->PAUSING-->[Snd ADJOURN{enable retry}]
+//	|-->{Return Reject}-->[Snd RESET]-->NON_EXISTENT
+// See also {FSP_DLL}CSocketItemDl::ToConcludeConnect()
 void LOCALAPI CSocketItemEx::OnConnectRequestAck(FSP_AckConnectRequest & response, int lenData)
 {
 	TRACE_SOCKET();
 
 	if(! InState(CONNECT_AFFIRMING))
+	{
+		TRACE_HERE("Get wandering ACK_CONNECT_REQUEST in non CONNECT_AFFIRMING state");
 		return;
+	}
 
 	if(ntohl(response.expectedSN) != pControlBlock->sendWindowFirstSN)	// See also onGetConnectRequest
+	{
+		TRACE_HERE("Get an unexpected/out-of-order ACK_CONNECT_REQUEST");
 		return;
+	}
 
 	// As we store the encrypted public key in the user memory space we must make sure there is enough memory
 	if(lenData < 0 || lenData > MAX_BLOCK_SIZE - FSP_PUBLIC_KEY_LEN)
@@ -448,23 +473,22 @@ void LOCALAPI CSocketItemEx::OnConnectRequestAck(FSP_AckConnectRequest & respons
 	memcpy(ubuf + lenData, response.encrypted, sizeof(response.encrypted));
 
 	SignalEvent();
-	TRACE_HERE("Trigger soft interrupt");
-
+	// TRACE_HERE("Trigger soft interrupt");
 	// For calculating of RTT it is safely assume that internal processing takes orders of magnitude less time than network transmission
 	tRoundTrip_us = (uint32_t)min(UINT32_MAX, (tRoundTrip_us + (tSessionBegin - tRecentSend) + 1) >> 1);
-	RemoveTimer();
-	//^initiate the timer again only when PERSIST to be sent
 }
 
 
 
 // PERSIST is the acknowledgement to ACK_CONNECT_REQUEST, RESTORE or MULTIPLY
+//	CHALLENING-->/PERSIST/-->{start keep-alive}ACTIVE-->[Notify]
+//	{CLONING, RESUMING, QUASI_ACTIVE}-->/PERSIST/-->{restart keep-alive}ACTIVE-->[Notify]
 void CSocketItemEx::OnGetPersist()
 {
 	TRACE_SOCKET();
 	FSP_Header_Manager hdrManager(& headPacket->pkt);
 
-	if(! InStates(3, CHALLENGING, RESUMING, QUASI_ACTIVE))
+	if(! InStates(4, CHALLENGING, RESUMING, CLONING, QUASI_ACTIVE))
 		return;
 
 	if (!IsValidSequence(headPacket->pktSeqNo))
@@ -498,7 +522,8 @@ void CSocketItemEx::OnGetPersist()
 	if (! ResizeSendWindow(ackSeqNo, headPacket->pkt->GetRecvWS()))
 	{
 #ifdef TRACE
-		printf_s("Acknowledged sequence number: %u (expected: %u), should be in range %u - %u\n"
+		printf_s("Acknowledged sequence number: %u (expected: %u),\n"
+			"\tshould be in range %u - %u\n"
 			, ackSeqNo
 			, pControlBlock->sendWindowExpectedSN
 			, pControlBlock->sendWindowFirstSN
@@ -506,10 +531,26 @@ void CSocketItemEx::OnGetPersist()
 #endif
 		return;
 	}
+	// PERSIST is always the accumulative acknowledgement to ACK_CONNECT_REQUEST, MULTIPLY or RESTORE
+	// however, the send window might be slided already by redundant PERSIST. RespondSNACK is safe
+	RespondSNACK(ackSeqNo, NULL, 0);
 
 	int countPlaced = PlacePayload();
-	if(countPlaced == -ENOMEM && headPacket->lenData > 0 || countPlaced == -EFAULT)
+	if (countPlaced == -ENOMEM && headPacket->lenData > 0 || countPlaced == -EFAULT)
+	{
+#ifdef TRACE
+		printf_s("Internal panic! Cannot place optional payload in PERSIST, error code = %d\n", countPlaced);
+#endif
 		return;
+	}
+#ifdef TRACE
+	printf_s("\nSend window firt SN = %u"
+		"\nAcknowledged SN\t = %u"
+		"\nExpected next SN\t = %u\n"
+		, pControlBlock->sendWindowFirstSN
+		, ackSeqNo
+		, pControlBlock->receiveMaxExpected);
+#endif
 
 	// connection parameter may determine whether the payload is encrypted, however, let ULA handle it...
 	PFSP_HeaderSignature optHdr = hdrManager.PopExtHeader<FSP_HeaderSignature>();
@@ -528,16 +569,17 @@ void CSocketItemEx::OnGetPersist()
 		tSessionBegin = tRecentSend;
 	//^ session of a responsing socket start at the time ACK_CONNECT_REQUEST was sent
 	// while the start time a resuming or resurrecting session remain the original (for sake of key life-cycle management)
+	SetState(ESTABLISHED);
 	InitiateKeepAlive();
-	if(countPlaced > 0)
+	if (countPlaced > 0)
 	{
 #ifdef TRACE
 		printf_s("There is optional payload in the PERSIST packet, payload length = %d\n", countPlaced);
 #endif
 		pControlBlock->PushNotice(FSP_NotifyDataReady);
 	}
-	SignalEvent();
-	return;
+
+	Notify(FSP_NotifyAccepted);
 }
 
 
@@ -545,14 +587,27 @@ void CSocketItemEx::OnGetPersist()
 // KEEP_ALIVE is usually out-of-band and carrying some special optional headers
 void CSocketItemEx::OnGetKeepAlive()
 {
+#ifdef TRACE_PACKET
 	TRACE_SOCKET();
+	printf_s("\tSend queue = (%u, %u)\n"
+		"\tRecv queue = (%u, %u)\n"
+		"\t\tExpected Acknowledgement=%u\n"
+		, pControlBlock->sendWindowFirstSN
+		, pControlBlock->sendBufferNextSN
+		, pControlBlock->recvWindowFirstSN
+		, pControlBlock->receiveMaxExpected
+		, pControlBlock->sendWindowExpectedSN);
+#endif
 	FSP_Header_Manager hdrManager(& headPacket->pkt);
-
+	// In the RESUMING state it may happen to receive a KEEP_ALIVE packet meant to be an accumulative acknowledgement
+	// however a PERSIST MUST be firstly accepted
 	if(lowState != ESTABLISHED && lowState != PAUSING)
 		return;
 
+	// ONLY KEEP_ALIVE might be out-of-send window (because the send window might be empty while a keep-alive must be accept)
 	// UNRESOLVED!? Taking the risk of DoS attack by replayed KEEP_ALIVE...
-	if (!IsValidSequence(headPacket->pktSeqNo))
+	int d = int(headPacket->pktSeqNo - pControlBlock->recvWindowFirstSN);
+	if (d < -1 || d >= pControlBlock->recvBufferBlockN)
 	{
 #ifdef TRACE
 		printf_s("Invalid sequence number: %u, expected: %u - %u\n"
@@ -583,7 +638,8 @@ void CSocketItemEx::OnGetKeepAlive()
 	if (! ResizeSendWindow(ackSeqNo, headPacket->pkt->GetRecvWS()))
 	{
 #ifdef TRACE
-		printf_s("Acknowledged sequence number: %u (expected: %u), should be in range %u - %u\n"
+		printf_s("Acknowledged sequence number: %u (expected: %u),\n"
+			"\tshould be in range %u - %u\n"
 			, ackSeqNo
 			, pControlBlock->sendWindowExpectedSN
 			, pControlBlock->sendWindowFirstSN
@@ -591,10 +647,6 @@ void CSocketItemEx::OnGetKeepAlive()
 #endif
 		return;
 	}
-
-	int countPlaced = PlacePayload();
-	if(countPlaced == -ENOMEM && headPacket->lenData > 0 || countPlaced == -EFAULT)
-		return;
 
 	// connection parameter may determine whether the payload is encrypted, however, let ULA handle it...
 	PFSP_HeaderSignature optHdr = hdrManager.PopExtHeader<FSP_HeaderSignature>();
@@ -623,28 +675,48 @@ void CSocketItemEx::OnGetKeepAlive()
 			gaps[i].gapWidth = ntohs(gaps[i].gapWidth);
 			gaps[i].dataLength = ntohs(gaps[i].dataLength);
 		}
-		if(RespondSNACK(ackSeqNo, gaps, n) < 0)
+		int r = RespondSNACK(ackSeqNo, gaps, n);
+		if(r < 0)
+		{
+#ifdef TRACE
+			printf_s("\n%d: error returned when RespondSNACK. UNRESOLVED! Dump gaps?\n", r);
+#endif
 			return;
+		}
 		optHdr = hdrManager.PopExtHeader<FSP_HeaderSignature>();
 	}
 	else
 	{
-		RespondSNACK(ackSeqNo, NULL, 0);	// in this case it is idempotent
+		int r = RespondSNACK(ackSeqNo, NULL, 0);	// in this case it is idempotent
+		// UNRESOLVED! Silently discard error number returned?
+#ifdef TRACE_PACKET
+		printf_s("RespondSNACK ack#%u return %d\n", ackSeqNo, r);
+#endif
 	}
 
-	if(countPlaced > 0)
-	{
+	int r = PlacePayload();
+	if (r > 0)
+	{ 
 #ifdef TRACE
-		printf_s("There is optional payload in the KEEP_ALIVE packet, payload length = %d\n", countPlaced);
+		printf_s("There is optional payload in the KEEP_ALIVE packet, payload length = %d\n", r);
 #endif
 		pControlBlock->PushNotice(FSP_NotifyDataReady);
 	}
+#ifdef TRACE
+	else if(r < 0)
+	{
+		// most likely because of out-of-order delivery
+		printf_s("Cannot place optional payload in the KEEP_ALIVE packet, error code = %d\n", r);
+	}
+#endif
 	//UNRESOLVED! TODO! only if there're really some
 	Notify(FSP_NotifyBufferReady);
 
 	EmitQ();
 	// Send/resend further simultaneously
-
+#ifdef TRACE_PACKET
+	printf_s("Retransmit on request: queue head, tail = (%d, %d)\n", retransHead, retransTail);
+#endif
 	// Resend: for FSP only on getting SNACK
 	const ControlBlock::seq_t seqHead = pControlBlock->sendWindowFirstSN;
 	const int32_t iHead = pControlBlock->sendWindowHeadPos;
@@ -660,10 +732,13 @@ void CSocketItemEx::OnGetKeepAlive()
 
 
 
-// PURE_DATA
+//	ACTIVE<-->/PURE_DATA/{Actively SNACK, lazily retransmit}
+//	{CLONING, RESUMING}<-->/PURE_DATA/{just prebuffer}
 void CSocketItemEx::OnGetPureData()
 {
+#ifdef TRACE_PACKET
 	TRACE_SOCKET();
+#endif
 	// It's OK to prebuffer received data in CLONING or RESUMING state (but NOT in QUASI_ACTIVE state)
 	// However ULA protocol designer must keep in mind that these prebuffered may be discarded
 	// It's impossible for ULA to accept data in the PAUSING state
@@ -717,19 +792,18 @@ void CSocketItemEx::OnGetPureData()
 
 
 
-// ADJOURN
-//	ACTIVE-->[{if no gap}Snd ACK_FLUSH]-->CLOSABLE-->[Notify]
-//	RESUMING-->[{if no gap}Snd ACK_FLUSH]-->CLOSABLE-->[Notify]
-//	CLONING-->[{if no gap}Snd ACK_FLUSH]-->CLOSABLE-->[Notify]
-//	CLOSABLE<-->[Snd{retransmit} ACK_FLUSH][Processed already]
-//	PAUSING-->[{if no gap}Snd ACK_FLUSH]-->CLOSABLE [Simultaneous Adjourn]-->[Notify]
 // Remark
-//	State transition form ACTIVE, RESUMING or CLONING is handled in KeepAlive()
-//	ADJOURN might be out-of-band, and may carry piggybacked payload, but not any optional header
+//	CHALLENGING-->CLOSABLE-->[Snd ACK_FLUSH]-->[Notify]
+//	{ACTIVE, PAUSING}-->[Notify]
+//    -->{after delivery, if receive buffer has no gap}CLOSABLE
+//    -->[Snd ACK_FLUSH, stop keep-alive]
+//	RESUMING-->{stop keep-alive}CLOSABLE-->[Snd ACK_FLUSH]-->[Notify]
+//	CLONING-->{stop keep-alive}CLOSABLE-->[Snd ACK_FLUSH]-->[Notify]
+//	CLOSABLE<-->[Snd{retransmit} ACK_FLUSH]
 void CSocketItemEx::OnGetAdjourn()
 {
 	TRACE_SOCKET();
-	if(! InStates(5, ESTABLISHED, PAUSING, CLONING, RESUMING, CLOSABLE))
+	if(! InStates(6, CHALLENGING, ESTABLISHED, PAUSING, CLONING, RESUMING, CLOSABLE))
 		return;
 
 	// As calculate ICC may consume CPU resource intensively we are relunctant to send RESET
@@ -738,46 +812,40 @@ void CSocketItemEx::OnGetAdjourn()
 	// preliminary check of sequence numbers [they are IV on calculating ICC]
 	// UNRESOLVED!? Taking the risk of DoS attack by replayed ADJOURN...
 	// TODO: throttle the rate of processing ADJOURN by 'early dropping'
-	if(! IsValidSequence<ADJOURN>(headPacket->pktSeqNo))
+	if(! IsValidSequence(headPacket->pktSeqNo))
 		return;
 
 	if(! ValidateICC())
 		return;
 
-	// TODO: UNRESOLVED!? as ADJOURN pause the session the send window shall be shrinked to the minimum
-	// See also OnResume()
-
 	// Unlike PURE_DATA, a retransmitted ADJOURN cannot be silent discarded
-	if(InState(PAUSING))	// In the PAUSING state ULA is not expecting further data
-	{
-		ReplaceTimer(SCAVENGE_THRESHOLD_ms);
-		SendPacket<ACK_FLUSH>();
-		SetState(CLOSABLE);
-		Notify(FSP_NotifyFlushed);	// Notify(FSP_NotifyAdjourn);
-		return;
-	}
-
 	if(InState(CLOSABLE))	// Just retransmit ACK_FLUSH on duplicated ADJOURN command
 	{
 		SendPacket<ACK_FLUSH>();
 		return;
 	}
 
-	// In the CLONING or RESUMING state payload may be piggybacked as well as in the ESTABLISHED state
-	if(PlacePayload() > 0)
-		Notify(FSP_NotifyDataReady);
+	PlacePayload();
 
-	// TO BE TESTED: an ADJOURN says that all data sent shall be acknowledged!
-	RespondSNACK(ntohl(headPacket->pkt->expectedSN), NULL, 0);
-	// Unlike receive a normal data packet make active acknowledgement to ADJOURN instantly
-	KeepAlive();
-	if(InState(CLOSABLE))	// if it has migrated to CLOSABLE state from other state
-		Notify(FSP_NotifyFlushed);	// Notify(FSP_NotifyAdjourn);
+	if (InState(ESTABLISHED) || InState(PAUSING))
+	{
+		RespondSNACK(ntohl(headPacket->pkt->expectedSN), NULL, 0);
+		Notify(FSP_NotifyDataReady);
+		return;	// and let FSP_DLL to scan the receive queue
+	}
+
+	// TODO: UNRESOLVED!? as ADJOURN pause the session the send window shall be shrinked to the minimum
+	// See also OnGetPersist(), OnResume() and AckAdjourn()
+	// in the state CHALLENGING, RESUMING, CLONING or QUASI_ACTIVE: it is a transactional handshake
+	ReplaceTimer(SCAVENGE_THRESHOLD_ms);
+	SetState(CLOSABLE);
+	SendPacket<ACK_FLUSH>();
+	Notify(FSP_NotifyFlushed);
 }
 
 
 
-// ACK_FLUSH, not actually consume sequence space
+// ACK_FLUSH, no payload but consuming sequence space to fight back play-back DoS attack (via ValidateICC())
 //	PAUSING-->[Notify]-->CLOSABLE
 void CSocketItemEx::OnAdjournAck()
 {
@@ -785,10 +853,10 @@ void CSocketItemEx::OnAdjournAck()
 	if(! InState(PAUSING))
 		return;
 
-	if(! IsValidSequence(headPacket->pktSeqNo))
+	if (!IsValidSequence(headPacket->pktSeqNo))
 		return;
 
-	if(headPacket->lenData != 0)
+	if (headPacket->lenData != 0)
 		return;
 
 	if(! ValidateICC())
@@ -807,8 +875,22 @@ void CSocketItemEx::OnAdjournAck()
 // RESTORE may resume or resurrect a closable/closed connection
 // tLastRecv is not modified
 // UNRESOLVED! If the socket itself has been free...
+/*
+	PAUSING-->/RESTORE/-->[Notify{Adjourn failed} if is legal]-->ACTIVE
+	CLOSABLE-->/RESTORE/-->[API{callback}]
+	|-->[{Return Accept}]-->ACTIVE
+	-->[Snd PERSIST{start keep-alive}]
+	|-->[{Return Commit}]-->PAUSING-->[Snd ADJOURN{enable retry}]
+	|-->[{Return Reject}]-->[Snd RESET]-->NON_EXISTENT
+	CLOSED<-->/RESTORE/{RDSC missed}<-->[Snd ACK_INIT_CONNECT]
+	|-->/RESTORE/{RDSC hit}-->[API{callback}]
+	|-->[{Return Accept}]-->{start keep-alive}ACTIVE-->[Snd PERSIST]
+	|-->[{Return Commit}]-->[Snd ADJOURN{enable retry}]-->PAUSING
+	|-->[{Return Reject}]-->[Snd RESET]-->NON_EXISTENT
+*/
 void CSocketItemEx::OnGetRestore()
 {
+	TRACE_SOCKET();
 	FSP_Header_Manager hdrManager(& headPacket->pkt);
 
 	// A CLOSED connnection may be resurrected, provide the session key is not out of life
@@ -846,30 +928,28 @@ void CSocketItemEx::OnGetRestore()
 
 
 
-// FINISH, not actually consume sequence space
-//	PAUSING-->CLOSED-->[Notify]
+// FINISH, no payload but consuming sequence space to fight back play - back DoS attack(via ValidateICC())
 //	CLOSABLE-->CLOSED-->[Notify]
 //	tLastRecv is not modified
 void CSocketItemEx::OnGetFinish()
 {
 	TRACE_SOCKET();
-	if(! InState(PAUSING) && ! InState(CLOSABLE))
+	if(! InState(CLOSABLE))
 		return;
 
-	if(! IsValidSequence(headPacket->pktSeqNo))
+	if (!IsValidSequence(headPacket->pktSeqNo))
 		return;
 
-	if(headPacket->lenData != 0)
+	if (headPacket->lenData != 0)
 		return;
 
-	if(! ValidateICC())
+	if (!ValidateICC())
 		return;
 
 	ReplaceTimer(SCAVENGE_THRESHOLD_ms);
 	SetState(CLOSED);
-	Notify(FSP_NotifyDataReady);	// Just urge DLL to deliver data to ULA
-
-	TRACE_HERE("To urge DLL to ProcessReceiveBuffer");
+	Notify(FSP_NotifyRecycled);
+	(CLowerInterface::Singleton())->FreeItem(this);
 }
 
 
@@ -877,8 +957,20 @@ void CSocketItemEx::OnGetFinish()
 // MULTIPLY
 // Remark
 //	It is assumed that ULA/DLL implements connection multiplication throttle control
+/*
+	ACTIVE<-->/MULTIPLY/{duplication detected: retransmit acknowledgement}
+	|<-->/MULTIPLY/{collision detected: Snd RESET}
+	|-->/MULTIPLY/-->[API{Callback}]
+	|-->[{Return Accept}]-->{new context}ACTIVE
+	-->[Snd PERSIST {start keep-alive, in the new context}]
+	|-->[{Return Commit}]-->{new context}PAUSING
+	-->[Snd ADJOURN {enable retry, in the new context}]
+	|-->[{Return}:Reject]-->[Snd RESET]-->{abort creating new context}
+	{PAUSING, RESUMING, CLOSABLE}<-->/MULTIPLY/{Snd RESET}
+*/
 void CSocketItemEx::OnGetMultiply()
 {
+	TRACE_SOCKET();
 	FSP_Header_Manager hdrManager(& headPacket->pkt);
 
 	if(! InState(ESTABLISHED))
@@ -927,7 +1019,7 @@ void CSocketItemEx::OnGetMultiply()
 int CSocketItemEx::PlacePayload()
 {
 	ControlBlock::PFSP_SocketBuf skb = AllocRecvBuf(headPacket->pktSeqNo);
-#ifdef TRACE
+#ifdef TRACE_PACKET
 	printf_s("Place %d payload bytes to 0x%08X (duplicated: %d)\n"
 		, headPacket->lenData
 		, (LONG)skb

@@ -163,7 +163,7 @@ typedef union sockaddr_inet
 /**
  * Implemented system limit
  */
-#ifdef USE_RAWSOCKET_IPV6
+#ifndef OVER_UDP_IPv4
 // IPv6 requires that every link in the internet have an MTU of 1280 octets or greater. 
 # define MAX_BLOCK_SIZE		1024
 # define MAX_LLS_BLOCK_SIZE	(MAX_BLOCK_SIZE + sizeof(FSP_Header))		// 1048
@@ -500,8 +500,6 @@ public:
 /**
  * Session Control Block is meant to be shared by LLS and DLL. Shall be prefixed with 'volatile' if LLS is implemented in hardware
  */
-typedef int (LOCALAPI * fpDeliverData_t)(void * context, void * buffer, int len);
-
 enum SocketBufFlagBitPosition
 {
 	BIT_IN_SENDING = 0,
@@ -514,17 +512,27 @@ enum SocketBufFlagBitPosition
 };
 
 
+// It heavily depends on Address Space Layout Randomization and user-space memory segment isolation
+// or similar measures to pretect sensive information, integrity and privacy, of user process
 volatile struct ControlBlock
 {
-	bool	furtherToSend;	// by default each WriteTo() terminates a message automatically
-	bool	eomRecv;		// end of receiving message, notify EndOfMessage in ReadFrom() in out-of-band manner
+	ALIGN(8)	FSP_Session_State state;
 
+	// By design only a sparned/branched(multiplexed/cloned) connection may be milky
 	ALIGN(4)	// sizeof(LONG)
-	FSP_Session_State state;
+	UINT32		allowedDelay;	// 0 if it is wine-alike payload, non-zero if milky; in microseconds
 
-	ALIGN(4)	// sizeof(LONG)
-	UINT32			allowedDelay;	// 0 if it is wine-alike payload, non-zero if milky; in microseconds
-	ALT_ID_T		idParent;
+	ALT_ID_T	idParent;
+
+	ALIGN(8)	// 64-bit aligment
+	FSP_NormalPacketHeader tmpHeader;	// for sending; assume sending is single-threaded for a single session
+
+	// 1, 2.
+	// Used to be the matched list of local and remote addresses.
+	// for security reason the remote addresses were moved to LLS
+	// TODO: UNRESOLVED!? limit multi-home capability to physical interfaces, not logical interfaces?
+	char			nearEndName[INET6_ADDRSTRLEN + 7];	// 72 bytes, in UTF-8
+	CtrlMsgHdr		nearEnd[MAX_PHY_INTERFACES];
 	union
 	{
 		char		name[INET6_ADDRSTRLEN + 7];	// 72 bytes
@@ -536,15 +544,23 @@ volatile struct ControlBlock
 		} ipFSP;
 	} peerAddr;
 
-	FSP_NormalPacketHeader tmpHeader;	// for sending; assume sending is single-threaded for a single session
+	// 3: The negotiated connection parameter
+	union
+	{
+		SConnectParam connectParams;
+		BYTE sessionKey[FSP_SESSION_KEY_LEN];	// overlay with 'initCheckCode' and 'cookie'
+	} u;
+#ifndef NDEBUG
+#define MAC_CTX_PROTECT_SIGN	0xA5A5C3C3A5C3A5C3ULL
+	ALIGN(MAC_ALIGNMENT)
+	uint64_t	_mac_ctx_protect_prolog[2];
+#endif
+	vmac_ctx_t	mac_ctx;
+#ifndef NDEBUG
+	uint64_t	_mac_ctx_protect_epilog[2];
+#endif
 
-	// 1, 2.
-	// Used to be the matched list of local and remote addresses.
-	// for security reason the remote addresses were moved to LLS
-	// TODO: UNRESOLVED!? limit multi-home capability to physical interfaces, not logical interfaces?
-	CtrlMsgHdr		nearEnd[MAX_PHY_INTERFACES];
-
-	// 3 The (very short, roll-out) queue of returned notices
+	// 4: The (very short, roll-out) queue of returned notices
 	FSP_ServiceCode notices[FSP_MAX_NUM_NOTICE];
 	// Backlog for listening/connected socket [for client it could be an alternate of Web Socket]
 	TSingleProviderMultipleConsumerQ<BackLogItem>	backLog;
@@ -616,24 +632,6 @@ volatile struct ControlBlock
 			+ MAX_BLOCK_SIZE * (skb - (PFSP_SocketBuf)((BYTE *)this + recvBufDescriptors));
 	}
 
-	/**
-	* The negotiated connection parameter, deliberately placed just before the send/receive buffer control block
-	* somewhat works as a sentinel: if sessionKey is destroyed, the connection would eventually abort
-	*/
-	union
-	{
-		SConnectParam connectParams;
-		BYTE sessionKey[FSP_SESSION_KEY_LEN];	// overlay with 'initCheckCode' and 'cookie'
-	} u;
-#ifndef NDEBUG
-#define MAC_CTX_PROTECT_SIGN	0xA5A5C3C3A5C3A5C3ULL
-	ALIGN(MAC_ALIGNMENT)
-	uint64_t	_mac_ctx_protect_prolog[2];
-#endif
-	vmac_ctx_t	mac_ctx;
-#ifndef NDEBUG
-	uint64_t	_mac_ctx_protect_epilog[2];
-#endif
 	// 7, 8 Send buffer and Receive buffer
 	// See ControlBlock::Init()
 
@@ -650,9 +648,18 @@ volatile struct ControlBlock
 		sendWindowSize = 1;
 		return skb;
 	}
-	PFSP_SocketBuf GetLastBufferedSend();
-	int CountSendBuffered() const { return int(sendBufferNextSN - sendWindowFirstSN); }
 
+	int CountSendBuffered() const { return int(sendBufferNextSN - sendWindowFirstSN); }
+	// Return the descriptor of the last buffered packet in the send buffer, NULL if the send queue is empty
+	PFSP_SocketBuf GetLastBufferedSend() const
+	{
+		if (CountSendBuffered() <= 0)
+			return NULL;
+		//
+		const register int i = sendBufferNextPos - 1;
+		return HeadSend() + (i < 0 ? sendBufferBlockN - 1 : i);
+	}
+	// Allocate a new send buffer
 	PFSP_SocketBuf	GetSendBuf();
 	// Return
 	//	The send buffer block descriptor of the packet to send next
@@ -665,18 +672,32 @@ volatile struct ControlBlock
 		return HeadSend() + (i < 0 ? i + sendBufferBlockN : i - sendBufferBlockN >= 0 ? i - sendBufferBlockN : i);
 	}
 	PFSP_SocketBuf	PeekNextToSend() const;	// An LLS version of GetNextToSend()
+	bool CheckSendWindowLimit() const { return int(sendWindowNextSN - sendWindowFirstSN) <= sendWindowSize; }
+
 	void * LOCALAPI InquireSendBuf(int &);
 	int LOCALAPI	MarkSendQueue(void *, int, bool);
 
-	//
+	// Return the last received packet, which might be already delivered. The caller should make sure it is illegal to be called
+	PFSP_SocketBuf GetLastReceived() const
+	{
+		const register int i = recvWindowNextPos - 1;
+		return HeadSend() + (i < 0 ? recvBufferBlockN - 1 : i);
+	}
 	PFSP_SocketBuf LOCALAPI AllocRecvBuf(seq_t);
-	int LOCALAPI FetchReceived(void *, fpDeliverData_t);
+	// Slide the left border of the receive window by one slot
+	void SlideRecvWindowByOne()	// shall be atomic!
+	{
+		recvWindowFirstSN++;
+		if(++recvWindowHeadPos - recvBufferBlockN >= 0)
+			recvWindowHeadPos -= recvBufferBlockN;
+	}
 	int LOCALAPI GetSelectiveNACK(seq_t &, FSP_SelectiveNACK::GapDescriptor *, int) const;
 	void * LOCALAPI InquireRecvBuf(int &, bool &);
-	void SkipPurePersist();
 
-	bool IsClosable();
-	// Slide send window to skip all of the acknowledged. The caller should make sure it is legitimate
+	// Check the receive queue to test whether it could migrate to the CLOSABLE state
+	bool IsClosable() const;
+
+	// Slide send window to skip all of the acknowledged
 	void SlideSendWindow();
 	//
 	bool LOCALAPI ResizeSendWindow(seq_t, unsigned int);

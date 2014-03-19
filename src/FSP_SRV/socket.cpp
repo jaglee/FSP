@@ -322,9 +322,7 @@ void CSocketItemEx::InitAssociation()
 		, pairSessionID.source
 		, pairSessionID.peer);
 #endif
-	wsaBuf[0].buf = (CHAR *)& pairSessionID;
-	wsaBuf[0].len = sizeof(pairSessionID);
-
+	isMilky = char(pControlBlock->allowedDelay > 0);	// 0 or 1
 	lowState = pControlBlock->state;
 	SetReady();
 }
@@ -466,12 +464,8 @@ void CSocketItemEx::InitiateConnect()
 
 	pControlBlock->u.connectParams.timeStamp = NowUTC();
 	pkt->timeStamp = htonll(pControlBlock->u.connectParams.timeStamp);
-	//
-	wsaBuf[1].buf = (CHAR *) pkt;
-	wsaBuf[1].len = sizeof(FSP_InitiateRequest);
-	//^ == (ULONG)skb->len;	// See also DLL::InitiateConnect()
-	SendPacket(1);
 	skb->SetFlag<IS_COMPLETED>();	// for resend
+	SendPacket(1, ScatteredSendBuffers(pkt, sizeof(FSP_InitiateRequest)));
 
 	if(timer != NULL)
 	{
@@ -512,9 +506,7 @@ void LOCALAPI CSocketItemEx::AffirmConnect(const SConnectParam & initState, ALT_
 	skb->len = sizeof(FSP_ConnectRequest);
 
 	// TODO: UNRESOLVED! For FSP over IPv6, attach inititator's resource reservation...
-	wsaBuf[1].buf = (CHAR *) pkt;
-	wsaBuf[1].len = (ULONG) skb->len;
-	SendPacket(1);
+	SendPacket(1, ScatteredSendBuffers(pkt, skb->len));
 
 	timestamp_t t1 = NowUTC();	// internal processing takes orders of magnitude less time than network propagation
 	tRoundTrip_us = uint32_t(t1 - tRecentSend);
@@ -610,12 +602,32 @@ void CSocketItemEx::Extinguish()
 
 
 // Do
+//	Recycle the socket
+//	Send RESET to the remote peer if not in CLOSED state
+void CSocketItemEx::CloseSocket()
+{
+	if(lowState == CLOSABLE)
+		SetState(CLOSED);
+
+	if (lowState != CLOSED)
+	{
+		Disconnect();
+		return;
+	}
+
+	ReplaceTimer(SCAVENGE_THRESHOLD_ms);
+	(CLowerInterface::Singleton())->FreeItem(this);
+}
+
+
+
+// Do
 //	Send RESET to the remote peer in the certain states (not guaranteed to be received)
 // See also ~::TimeOut case NON_EXISTENT
-void CSocketItemEx::Disconnect(int reason)
+void CSocketItemEx::Disconnect()
 {
 	if(lowState == CHALLENGING || lowState == CONNECT_AFFIRMING)
-		CLowerInterface::Singleton()->SendPrematureReset(reason, this);
+		CLowerInterface::Singleton()->SendPrematureReset(EINTR, this);
 	else if(lowState == ESTABLISHED || lowState == CLOSABLE || lowState == PAUSING || lowState == RESUMING)
 		SendPacket<RESET>();
 	//

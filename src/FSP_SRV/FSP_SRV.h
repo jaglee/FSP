@@ -99,12 +99,27 @@ struct PktSignature
 };
 
 
+
+struct ScatteredSendBuffers
+{
+	WSABUF	scattered[3];	// at most three segments: the sessionID pair, header and payload
+	ScatteredSendBuffers() { }
+	ScatteredSendBuffers(void * p1, int n1) { scattered[1].buf = (CHAR *)p1; scattered[1].len = n1; }
+	ScatteredSendBuffers(void * p1, int n1, void * p2, int n2)
+	{
+		scattered[1].buf = (CHAR *)p1;
+		scattered[1].len = n1;
+		scattered[2].buf = (CHAR *)p2;
+		scattered[2].len = n2;
+	}
+};
+
+
+
 class CSocketItemEx: public CSocketItem
 {
 	PktSignature * volatile headPacket;
 	PktSignature * volatile tailPacket;
-
-	WSABUF	wsaBuf[3];	// at most three segments: the sessionID pair, header and payload
 
 	// multihome/mobility/resilence support (see also CInterface::EnumEffectiveAddresses):
 	// MAX_PHY_INTERFACES is hard-coded to 4
@@ -115,8 +130,7 @@ class CSocketItemEx: public CSocketItem
 
 	PktSignature *PushPacketBuffer(PktSignature *);
 	void PopPacketBuffer();
-	int	LOCALAPI SendPacket(ULONG); // work together with wsaBuf
-	int LOCALAPI EmitSetICC(ControlBlock::PFSP_SocketBuf, ControlBlock::seq_t);
+	int	SendPacket(register ULONG, ScatteredSendBuffers);
 	//
 protected:
 	DWORD	idSrcProcess;
@@ -125,6 +139,7 @@ protected:
 	char	mutex;
 	char	inUse;
 	char	isReady;
+	char	isMilky;	// ULA cannot change it on the fly;
 	//
 	int		namelen;	// size of the remote socket address, see WSASendMsg
 	//
@@ -155,7 +170,6 @@ protected:
 	bool InState(FSP_Session_State s) { return lowState == s; }
 	bool InStates(int n, ...);
 
-	bool IsMilky() const { return (pControlBlock->u.connectParams.delayLimit != 0); }
 	bool ValidateICC(FSP_NormalPacketHeader *);
 	bool ValidateICC() { return ValidateICC(headPacket->pkt); }
 	int  PlacePayload();
@@ -223,10 +237,11 @@ public:
 	void SignalEvent() { ::SetEvent(hEvent); }
 	//
 	int LOCALAPI RespondSNACK(ControlBlock::seq_t, const FSP_SelectiveNACK::GapDescriptor *, int);
-	int LOCALAPI GenerateSNACK(BYTE * buf, ControlBlock::seq_t & seq0);
+	int LOCALAPI GenerateSNACK(BYTE *, ControlBlock::seq_t &);
 	//
 	void InitiateConnect();
-	void LOCALAPI Disconnect(int);
+	void CloseSocket();
+	void Disconnect();
 	void DisposeOnReset();
 	void OnMultiply();
 	void OnResume();
@@ -235,7 +250,7 @@ public:
 	void LOCALAPI AffirmConnect(const SConnectParam &, ALT_ID_T);
 
 	bool LOCALAPI IsValidSequence(ControlBlock::seq_t seq1);
-	template<FSPOperationCode c> bool LOCALAPI IsValidSequence(ControlBlock::seq_t seq1);
+
 	// Given
 	//	ControlBlock::seq_t	The sequence number of the packet that mostly expected by the remote end
 	//	unsigned int		The advertised size of the receive window, start from aforementioned most expected packet
@@ -256,16 +271,14 @@ public:
 		SetSequenceFlags(& hdr);
 		hdr.hs.Set<FSP_NormalPacketHeader, c>();
 		SetIntegrityCheckCode(hdr);
-		wsaBuf[1].buf = (CHAR *) & hdr;
-		wsaBuf[1].len = sizeof(hdr);
-		return SendPacket(1);
+		return SendPacket(1, ScatteredSendBuffers(&hdr, sizeof(hdr)));
 	}
 
-	void LOCALAPI SetIntegrityCheckCode(FSP_NormalPacketHeader *);
+	void LOCALAPI SetIntegrityCheckCodeP1(FSP_NormalPacketHeader *);
 	void LOCALAPI SetIntegrityCheckCode(FSP_NormalPacketHeader & hdr)
 	{
 		hdr.integrity.id = pairSessionID;
-		SetIntegrityCheckCode(& hdr);
+		SetIntegrityCheckCodeP1(& hdr);
 	}
 	void LOCALAPI SetSequenceFlags(FSP_NormalPacketHeader *, ControlBlock::PFSP_SocketBuf, ControlBlock::seq_t);
 	void LOCALAPI SetSequenceFlags(FSP_NormalPacketHeader *);
@@ -286,6 +299,7 @@ public:
 	bool LOCALAPI ReplaceTimer(uint32_t);
 
 	// Command of ULA
+	void AckAdjourn();
 	void Shutdown();
 	//
 	// Connect and Send are special in the sense that it may take such a long time to complete that
@@ -390,6 +404,7 @@ private:
 		return nearInfo.IsIPv6() ? SOCKADDR_ALT_ID(sinkInfo.name) : HeaderFSPoverUDP().source;
 	}
 
+	inline int BindInterface(SOCKET, PSOCKADDR);	// For FSP over IPv6
 	inline int BindInterface(SOCKET, PSOCKADDR_IN, int);
 	CSocketItemEx *		MapSocket() { return (*this)[GetLocalSessionID()]; }
 

@@ -58,7 +58,7 @@ CLowerInterface::CLowerInterface()
 
 	memset(& nearInfo, 0, sizeof(nearInfo));
 
-#ifdef USE_RAWSOCKET_IPV6
+#ifndef OVER_UDP_IPv4
 	sdSend = socket(AF_INET6, SOCK_RAW, IPPROTO_FSP);
 	if (sdSend == INVALID_SOCKET)
 		throw E_HANDLE;
@@ -205,7 +205,47 @@ inline bool CLowerInterface::LearnOneIPv6Address(PSOCKADDR_IN6 p, int k)
 
 
 
-#if USE_RAWSOCKET_IPV6
+#ifndef OVER_UDP_IPv4	// by default exploit IPv6
+// Given
+//	SOCKET		The UDP socket to be bound
+//	PSOCKADDR_IN
+//	int			the position that the address is provisioned
+// Return
+//	0 if no error
+//	negative, as the error number
+int CLowerInterface::BindInterface(SOCKET sd, PSOCKADDR pAddrListen)
+{
+	DWORD isHeaderIncluded = TRUE;	// boolean
+
+#ifdef TRACE
+	// TODO...
+#endif
+
+	if (bind(sd, pAddrListen, sizeof(SOCKADDR_IN6)) != 0)
+	{
+		REPORT_WSAERROR_TRACE("Cannot bind to the selected address");
+		return -1;
+	}
+
+	// It is challenging to include IPv6 header on sending but it worthes the trouble!
+	if(setsockopt(sd, IPPROTO_IPV6, IPV6_HDRINCL, (char *) & isHeaderIncluded, sizeof(isHeaderIncluded)) != 0)
+	{
+		REPORT_WSAERROR_TRACE("Cannot set socket option to send the IPv6 header");
+		return -1;
+	}
+	
+	if(setsockopt(sd, IPPROTO_IPV6, IPV6_PKTINFO, (char *) & isHeaderIncluded, sizeof(isHeaderIncluded)) != 0)
+	{
+		REPORT_WSAERROR_TRACE("Cannot set socket option to fetch the source IPv6 address");
+		return -1;
+	}
+	//IPV6_RECVIF: outgoing interface should echoed back on this one...
+
+	FD_SET(sd, & sdSet);
+	return 0;
+}
+
+
 // learn all configured IPv6 addresses
 // figure out the associated interface number of each address block(individual prefix)
 // and do house-keeping
@@ -245,7 +285,7 @@ inline void CLowerInterface::LearnAddresses()
 			if(j < i)
 				continue;
 			// we bind on unique physical interface only
-			if(BindInterface(sdSend, (PSOCKADDR_IN6)p) != 0)
+			if(BindInterface(sdSend, p) != 0)
 			{
 				REPORT_WSAERROR_TRACE("Bind failure");
 				throw E_ABORT;
@@ -556,7 +596,7 @@ int CLowerInterface::AcceptAndProcess()
 
 	FSPOperationCode opCode = (FSPOperationCode)
 		(nearInfo.IsIPv6() ? HeaderFSP().hs.opCode : HeaderFSPoverUDP().hs.opCode);
-#ifdef TRACE
+#ifdef TRACE_PACKET
 	printf_s("Packet of opCode %d[%s] received\n", (int)opCode, opCodeStrings[opCode]);
 	printf_s("Remote address:\n");
 	DumpNetworkUInt16((UINT16 *)&addrFrom, sizeof(addrFrom) / 2);
@@ -607,13 +647,18 @@ int CLowerInterface::AcceptAndProcess()
 	case KEEP_ALIVE:
 		pSocket = MapSocket();
 		if(pSocket == NULL)
+		{
+#ifdef TRACE
+			printf_s("Cannot map socket for session#%u\n", GetLocalSessionID());
+#endif
 			break;
+		}
 		//
 		pSignature = (PktSignature *)pktBuf - 1;	// assume aligned_malloc
 		pSignature->pkt = FSP_OperationHeader<FSP_NormalPacketHeader>();
 		pSignature->pktSeqNo = ntohl(pSignature->pkt->sequenceNo);
 		pSignature->lenData = countRecv - lenPrefix - ntohs(pSignature->pkt->hs.hsp);
-#ifdef TRACE
+#ifdef TRACE_PACKET
 		printf_s("packet #%u, payload length %d, to put onto the queue\n", pSignature->pktSeqNo, pSignature->lenData);
 #endif
 		if(pSignature->lenData < 0 || pSignature->lenData > MAX_BLOCK_SIZE)
@@ -624,7 +669,7 @@ int CLowerInterface::AcceptAndProcess()
 		}
 		// UNRESOLVED! TODO: take use of allowedPrefixes to select preferred addrFrom in asymmentric network context
 		pSocket->sockAddrTo[0] = addrFrom;
-#ifdef TRACE
+#ifdef TRACE_PACKET
 		printf_s("Socket : 0x%08X , buffer : 0x%08X queued\n", (LONG)pSocket, (LONG)pSignature->pkt);
 #endif
 		if(pSocket->PushPacketBuffer(pSignature) == NULL)
@@ -1049,7 +1094,7 @@ DWORD WINAPI HandleSendQ(LPVOID p)
 	try
 	{
 		CSocketItemEx *p0 = (CSocketItemEx *)p;
-#ifdef TRACE
+#ifdef TRACE_PACKET
 		printf_s("0x%08X : before HandleSendQ TestAndWaitReady\n", (LONG)p0);
 #endif
 		if(! p0->TestAndWaitReady())
@@ -1059,7 +1104,7 @@ DWORD WINAPI HandleSendQ(LPVOID p)
 			//	CLowerInterface::Singleton()->FreeItem(p0);
 			return 0;
 		}
-#ifdef TRACE
+#ifdef TRACE_PACKET
 		printf_s("0x%08X : after HandleSendQ TestAndWaitReady\n", (LONG)p0);
 #endif
 		p0->EmitQ();
@@ -1082,7 +1127,7 @@ DWORD WINAPI HandleFullICC(LPVOID p)
 		CSocketItemEx *p0 = (CSocketItemEx *)p;
 		while(p0->headPacket)
 		{
-#ifdef TRACE
+#ifdef TRACE_PACKET
 			printf_s("0x%08X : before HandleFullICC TestAndWaitReady\n", (LONG)p0);
 #endif
 			if(! p0->TestAndWaitReady())
@@ -1092,7 +1137,7 @@ DWORD WINAPI HandleFullICC(LPVOID p)
 				//	CLowerInterface::Singleton()->FreeItem(p0);
 				return 0;
 			}
-#ifdef TRACE
+#ifdef TRACE_PACKET
 			printf_s("0x%08X : after HandleFullICC TestAndWaitReady\n", (LONG)p0);
 #endif
 			// synchronize the state in the 'cache' and the real state
@@ -1174,29 +1219,30 @@ bool CSocketItemEx::TestAndWaitReady()
 //	ULONG	number of WSABUF descriptor to gathered in sending
 // Return
 //	number of bytes sent, or 0 if error
-int LOCALAPI CSocketItemEx::SendPacket(ULONG n1)
+int CSocketItemEx::SendPacket(register ULONG n1, ScatteredSendBuffers s)
 {
-	LPWSABUF lpBuffers;
+	register LPWSABUF lpBuffers;
 	if (pControlBlock->nearEnd->IsIPv6())
 	{
-		lpBuffers = wsaBuf + 1;
+		lpBuffers = &s.scattered[1];
 	}
 	else
 	{
-		// assume sidPair is maintained properly
-		lpBuffers = wsaBuf;
+		s.scattered[0].buf = (CHAR *)& pairSessionID;
+		s.scattered[0].len = sizeof(pairSessionID);
+		lpBuffers = s.scattered;
 		n1++;
 	}
-//#ifdef TRACE
-//	printf_s("\nPeer name length = %d, socket address:\n", namelen);
-//	DumpNetworkUInt16((UINT16 *)sockAddrTo, sizeof(SOCKADDR_IN6) / 2);
-//	printf_s("Data to sent:\n----\n");
-//	for (register ULONG i = 0; i < n1; i++)
-//	{
-//		DumpNetworkUInt16((UINT16 *)lpBuffers[i].buf, lpBuffers[i].len / 2);
-//		printf("----\n");
-//	}
-//#endif
+#ifdef TRACE_PACKET
+	printf_s("\nPeer name length = %d, socket address:\n", namelen);
+	DumpNetworkUInt16((UINT16 *)sockAddrTo, sizeof(SOCKADDR_IN6) / 2);
+	printf_s("Data to sent:\n----\n");
+	for (register ULONG i = 0; i < n1; i++)
+	{
+		DumpNetworkUInt16((UINT16 *)lpBuffers[i].buf, lpBuffers[i].len / 2);
+		printf("----\n");
+	}
+#endif
 	DWORD n = 0;
 	///It is a headache to specify valid local interface in the parameter block to utilize WSASendMsg
 	// Minimum OS version that support WSASendMsg is Windows Vista/Server 2008
@@ -1216,7 +1262,7 @@ int LOCALAPI CSocketItemEx::SendPacket(ULONG n1)
 	//   0, 
 	//   0);
 	{
-		char buf[MAX_BLOCK_SIZE + sizeof(pairSessionID)];
+		char buf[MAX_LLS_BLOCK_SIZE];
 		int d = 0;
 		for(register ULONG j = 0; j < n1; j++)
 		{
@@ -1232,9 +1278,9 @@ int LOCALAPI CSocketItemEx::SendPacket(ULONG n1)
 		ReportWSAError("CSocketItemEx::SendPacket");
 		return 0;
 	}
-//#ifdef TRACE
-//	printf_s("\n%s, line %d, %d bytes sent.\n", __FILE__, __LINE__, n);
-//#endif
+#ifdef TRACE_PACKET
+	printf_s("\n%s, line %d, %d bytes sent.\n", __FILE__, __LINE__, n);
+#endif
 	return n;
 }
 

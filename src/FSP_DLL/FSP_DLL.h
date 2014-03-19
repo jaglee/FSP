@@ -91,28 +91,32 @@ class CSocketItemDl: public CSocketItem
 	RSA_GMP			keyTransferer;
 	CSocketItemDl	*next;
 	CSocketItemDl	*prev;
+	// for sake of incarnating new accepted connection
+	FSP_SocketParameter context;
+	char			isFlushing;
+	char			eomSending;
 protected:
 	ALIGN(8)		HANDLE theWaitObject;
 
 	// when request of the initiator just received by the responder and it is to accept
-	CallbackRequested fpRequested;
-	CallbackConnected fpAccepted;
-	// when some exception occured
-	NotifyOrReturn	fpOnError;
+	__declspec(property(get = GetOnRequested))	CallbackRequested fpRequested;
+	CallbackRequested GetOnRequested() const { return context.beforeAccept; }
+
+	__declspec(property(get = GetOnAccepted))		CallbackConnected fpAccepted;
+	CallbackConnected GetOnAccepted() const { return context.afterAccept; }
+
+	// when some exception occured, or the async-send/recv function returned
+	__declspec(property(get = GetOnCallback))		NotifyOrReturn	fpCallback;
+	NotifyOrReturn GetOnCallback() const { return context.callback; }
+
 	// to support full-duplex send and receive does not share the same call back function
 	NotifyOrReturn	fpSent;
 	NotifyOrReturn	fpReceive;		// when data were received and it is to notify the upper layer
 	// to support surveillance RecvInline() over ReadFrom() make CallbackPeeked an independent function
 	CallbackPeeked	fpPeeked;
-	// from FSM point of view, fpReceive could be reused as the callback function pointer for Adjourn
-	// as we knew no receiving is allowed for Adjourn (or Shutdown) to be called.
-	// however, to enable maximum parallism and minimize locks among processes, it pays to occupy  4~8 bytes more memory
-	NotifyOrReturn	fpFlushed;
 
-	FSP_SocketParameter::USocketFlags uFlags;
 	bool			inUse;
 	volatile char	mutex;	// Utilize _InterlockedCompareExchange8 to manage critical resource
-	volatile char	recurDepth;
 
 	BYTE * volatile	pendingSendBuf;
 	int				pendingSendSize;
@@ -161,18 +165,13 @@ protected:
 	void ToConcludeAccept();
 	void ToConcludeAdjourn();
 	void ToConcludeConnect();
-	void ToConcludeMultiply();
-	void ToConcludeResume();
-	void ToConcludeResurrect();
 	//
 	void HitResumableDisconnectedSessionCache();
 
 	int LOCALAPI BufferData(int);
 	int LOCALAPI DeliverData(void *, int);
+	int FetchReceived();
 	void FinalizeRead();
-
-	// MUST be LOCALAPI to be compatible with fpDeliverData_t:
-	static int LOCALAPI Deliver(void * c, void * s, int L) { return ((CSocketItemDl *)c)->DeliverData(s, L); } 
 
 	friend struct CommandToLLS;
 	friend class CSocketDLLTLB;
@@ -182,6 +181,13 @@ protected:
 	friend FSPHANDLE FSPAPI ConnectMU(FSPHANDLE, PFSP_Context);
 
 public:
+	enum FlushingFlag
+	{
+		NOT_FLUSHING = 0,
+		ONLY_FLUSHING = 1,
+		FLUSHING_SHUTDOWN = 2
+	};
+
 	CSocketItemDl() { }	// and lazily initialized
 	~CSocketItemDl()
 	{
@@ -218,17 +224,13 @@ public:
 		return (FSP_Session_State)_InterlockedCompareExchange((long *)& pControlBlock->state, s2, s0);
 	}
 
-	void SetMutexFree() { mutex = SHARED_FREE;  recurDepth--; }
+	void SetMutexFree() { mutex = SHARED_FREE; }
 	bool TestSetMutexBusy() 
 	{
 		return (_InterlockedCompareExchange8(& mutex, SHARED_BUSY, SHARED_FREE) == SHARED_FREE);
 	}
 	bool WaitSetMutex();
 	bool IsInUse() const { return inUse; }
-
-	// instead of use MemoryBarrier(void);
-	uint8_t	DepthIncrease() { return recurDepth++; }
-	uint8_t	DecreaseDepth() { return --recurDepth; }
 
 	void LOCALAPI InstallBootKey(const BYTE key[], size_t len) { keyTransferer.ImportPublicKey(key, len); }
 	void LOCALAPI InstallSessionKey(BYTE sessionKey[])
@@ -261,13 +263,6 @@ public:
 		memcpy(pControlBlock->peerAddr.name, cName, n);	// assume memory space has been zeroed
 	}
 
-	void SetListenContext(PFSP_Context p) { waitingRecvBuf = (BYTE *)p; }
-	PFSP_Context GetListenContext() const { return (PFSP_Context)waitingRecvBuf; }
-	PFSP_Context GetAndResetContext()
-	{
-		return (PFSP_Context)InterlockedExchangePointer((PVOID volatile *)& waitingRecvBuf, NULL);
-	}
-
 	template<FSP_ServiceCode cmd> void InitCommand(CommandToLLS & objCommand)
 	{
 		objCommand.idSession = pairSessionID.source;
@@ -286,6 +281,12 @@ public:
 	CSocketItemDl * LOCALAPI CallCreate(CommandNewSession &, FSP_ServiceCode);
 
 
+	ControlBlock::PFSP_SocketBuf GetSendBuf() { return pControlBlock->GetSendBuf(); }
+	ControlBlock::PFSP_SocketBuf PeekNextToSend() const { return pControlBlock->GetNextToSend(); }
+	//
+	int LOCALAPI AcquireSendBuf(void * &, int);
+	int LOCALAPI PrepareToSend(void *, int, bool);
+	int LOCALAPI SendStream(void *, int, char);
 	bool TestSetSendReturn(NotifyOrReturn fp1) 
 	{
 		return InterlockedCompareExchangePointer((PVOID *) & fpSent, fp1, NULL) == NULL; 
@@ -294,26 +295,18 @@ public:
 	{
 		return (NotifyOrReturn)InterlockedExchangePointer((PVOID volatile *)& fpSent, NULL);
 	}
-	ControlBlock::PFSP_SocketBuf GetSendBuf() { return pControlBlock->GetSendBuf(); }
-	ControlBlock::PFSP_SocketBuf PeekNextToSend() const { return pControlBlock->GetNextToSend(); }
-	//
-	int LOCALAPI AcquireSendBuf(void * &, int);
-	int LOCALAPI PrepareToSend(void *, int, bool);
-	int LOCALAPI SendStream(void *, int);
+
 
 	int	LOCALAPI RecvInline(PVOID);
 	int LOCALAPI ReadFrom(void *, int, PVOID);
-	bool EOMRecv() { return pControlBlock->eomRecv; }
+	bool IsEndOfRecvMsg() const { return context.u.st.eom; }
+	void SetEndOfRecvMsg(bool value = true) { context.u.st.eom = value ? 1 : 0; }
 	bool IsRecvBufferEmpty()  { return pControlBlock->recvWindowFirstSN == pControlBlock->receiveMaxExpected; }
 
-	void SetFlushCallback(NotifyOrReturn fp1) { fpFlushed = fp1; }
-	NotifyOrReturn GetResetFlushCallback()
-	{
-		return (NotifyOrReturn)InterlockedExchangePointer((PVOID volatile *)& fpFlushed, NULL);
-	}
-	int	LOCALAPI Adjourn(NotifyOrReturn);
-	void RevertToResume() { fpFlushed = NULL; SetState(RESUMING); }
-	bool IsClosable() { return pControlBlock->IsClosable(); }
+	int	Adjourn();
+	char GetResetFlushing() { return _InterlockedExchange8(& isFlushing, 0);}
+	void SetFlushing(char value = ONLY_FLUSHING) { isFlushing = value; }
+	void RevertToResume() { isFlushing = 0; SetState(RESUMING); }
 
 	int SelfNotify(FSP_ServiceCode c)
 	{
@@ -327,10 +320,7 @@ public:
 			return 0;
 		}
 	}
-	void NotifyError(FSP_ServiceCode c, int e) { if(fpOnError != NULL) fpOnError(this, c, e); }
-
-	// customized callback function for Shutdown() in Disconnect.cpp
-	static void FSPAPI TryClose(FSPHANDLE h, FSP_ServiceCode c, int r);
+	void NotifyError(FSP_ServiceCode c, int e) { if(fpCallback != NULL) fpCallback(this, c, e); }
 
 	// defined in DllEntry.cpp:
 	static CSocketItemDl * LOCALAPI CreateControlBlock(const PFSP_IN6_ADDR, PFSP_Context, CommandNewSession &);

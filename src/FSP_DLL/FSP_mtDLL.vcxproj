@@ -52,9 +52,8 @@
     <CodeAnalysisRules Condition="'$(Configuration)|$(Platform)'=='Release|Win32'" />
     <CodeAnalysisRuleAssemblies Condition="'$(Configuration)|$(Platform)'=='Release|Win32'" />
     <IncludePath Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">C:\MinGW\msys\1.0\local\include;$(IncludePath)</IncludePath>
-    <LibraryPath Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">C:\MinGW\lib\gcc\mingw32\4.7.2;C:\MinGW\msys\1.0\local\lib;$(LibraryPath)</LibraryPath>
+    <LibraryPath Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">$(LibraryPath)</LibraryPath>
     <IncludePath Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">C:\MinGW\msys\1.0\local\include;$(IncludePath)</IncludePath>
-    <LibraryPath Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">C:\MinGW\lib\gcc\mingw32\4.7.2;C:\MinGW\msys\1.0\local\lib;$(LibraryPath)</LibraryPath>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
@@ -75,7 +74,7 @@
       <SubSystem>Windows</SubSystem>
       <ImportLibrary>$(OutDir)FSP_DLL.lib</ImportLibrary>
       <TargetMachine>MachineX86</TargetMachine>
-      <AdditionalDependencies>libgmp.a;libgcc.a;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>C:\MinGW\msys\1.0\local\lib\libgmp.a;C:\MinGW\lib\gcc\mingw32\4.7.2\libgcc.a;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
@@ -95,7 +94,7 @@
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <ImportLibrary>$(OutDir)FSP_DLL.lib</ImportLibrary>
       <TargetMachine>MachineX86</TargetMachine>
-      <AdditionalDependencies>libgmp.a;libgcc.a;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>C:\MinGW\msys\1.0\local\lib\libgmp.a;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>

@@ -526,35 +526,22 @@ int ControlBlock::MarkSendQueue(void * buf, int n, bool toBeContinued)
 }
 
 
-// Return the descriptor of the last buffered packet in the send buffer, NULL if the send queue is empty
-ControlBlock::PFSP_SocketBuf ControlBlock::GetLastBufferedSend()
-{
-	if(CountSendBuffered() < 0)
-		return NULL;
-	//
-	const register int i = sendBufferNextPos - 1;
-	return HeadSend() + (i < 0 ? sendBufferBlockN - 1 : i );
-}
 
 
-
-
-
-// Return
-//	The send buffer block descriptor of the packet to send
-// Remark
-//	It is assumed that the caller knew there exists at least one packet in the queue
+// Return the send buffer block descriptor of the packet wating to be sent
 ControlBlock::PFSP_SocketBuf ControlBlock::PeekNextToSend() const
 {
-	register int d = int(sendWindowNextSN - sendWindowFirstSN);
-	if (d < 0 || d > sendWindowSize)
-		return NULL;
 	if (int(sendWindowNextSN - sendBufferNextSN) >= 0)
 		return NULL;
 
+	register int d = int(sendWindowNextSN - sendWindowFirstSN);
+	if (d < 0)
+		return NULL;
+	// the caller should check the size of the send window if necessary
 	d += sendWindowHeadPos;
 	return HeadSend() + (d - sendBufferBlockN >= 0 ? d - sendBufferBlockN : d);
 }
+
 
 
 // Given
@@ -679,58 +666,6 @@ void * LOCALAPI ControlBlock::InquireRecvBuf(int & nIO, bool & toBeContinued)
 
 
 // Given
-//	buf: place holder/start address to store the received message data
-//	n: capacity of the buffer, in octets. should not exceed MAX_BLOCK_SIZE * recvBufferBlockN
-// Return
-//	positive integer: number of octets fetched from the receive buffer (not necessarily delivered)
-//	0: no data available
-//	-EPERM		the parameter value is not permited (illegal memory overlap detected)
-//	-ENOMEM		buffer capacity is not large enough the hold the whole content of the last packet
-//	-EFAULT		the descriptor is corrupted (illegal payload length:
-//				payload length of an intermediate packet of a message should be MAX_BLOCK_SIZE,
-//				payload length of any packet should be no less than 0 and no greater than MAX_BLOCK_SIZE)
-// Remark
-//	Automatically slide the receive window. See also SlideReceiveWindow()
-//	Data fetched are not necessarily finished in the message,
-//	nevertheless data would not be fetched across message border
-int LOCALAPI ControlBlock::FetchReceived(void * context, fpDeliverData_t fp)
-{
-	int m = 0;	// note that left border of the receive window slided in the loop body
-	for(PFSP_SocketBuf p = FirstReceived(); p->GetFlag<IS_COMPLETED>(); p = FirstReceived())
-	{
-		if(p->len > MAX_BLOCK_SIZE || p->len < 0)
-			return -EFAULT;
-
-		// decryption and/or decompression are carried out via IoC
-		if(fp(context, GetRecvPtr(p), p->len) < 0)
-			break;
-
-		// Set flag in a manner that it would not be re-delivered even IS_DELIVERED flag is not checked
-		p->SetFlag<IS_COMPLETED>(false);
-		p->SetFlag<IS_DELIVERED>();
-		m += p->len;
-
-		// Slide the left border of the receive window firstly
-		recvWindowFirstSN++;
-		if(++recvWindowHeadPos - recvBufferBlockN >= 0)
-			recvWindowHeadPos -= recvBufferBlockN;
-
-		if(! p->GetFlag<TO_BE_CONTINUED>())
-		{
-			eomRecv = true;
-			break;
-		}
-		// What? An imcomplete 'to be continued' intermediate packet received?
-		if(p->len != MAX_BLOCK_SIZE)
-			return -EFAULT;
-	}
-	//
-	return m;
-}
-
-
-
-// Given
 //	seq_t &			[_Out_]	the sequence number of the mostly expected packet
 //	GapDescriptor *	output buffer of gap descriptors
 //	int				capacity of the buffer, in number of GapDescriptors
@@ -838,7 +773,11 @@ int LOCALAPI ControlBlock::GetSelectiveNACK(seq_t & snExpect, FSP_SelectiveNACK:
 // Slide the left border of the send window and mark the acknowledged buffer block free
 void ControlBlock::SlideSendWindow()
 {
-	for(PFSP_SocketBuf p = HeadSend() + sendWindowHeadPos; p->GetFlag<IS_ACKNOWLEDGED>(); sendWindowFirstSN++)
+	if (CountSendBuffered() <= 0)
+		return;
+		
+	PFSP_SocketBuf p = HeadSend() + sendWindowHeadPos;
+	while(p->GetFlag<IS_ACKNOWLEDGED>())
 	{
 		// don't care len and seq
 		p->flags = 0;
@@ -853,53 +792,38 @@ void ControlBlock::SlideSendWindow()
 		{
 			p++;
 		}
-	}
-}
-
-
-
-// For RESTORE, MULTIPLY or ACK_CONNECT_REQUEST the first packet received is a PERSIST command
-// and very likely it has no piggybacked payload. Such a packet shall be skipped as soon as possible
-void ControlBlock::SkipPurePersist()
-{
-	PFSP_SocketBuf skb = HeadRecv();
-	if (skb->opCode != PERSIST)
-	{
-#ifdef TRACE
-		TRACE_HERE("the caller should make sure the head packet is a PERSIST");
-#endif
-		return;
-	}
-	if (skb->len == 0)
-	{
-		recvWindowHeadPos++;
-		recvWindowFirstSN++;
+		//
+		if (int(sendWindowNextSN - ++sendWindowFirstSN) <= 0)	// it is noticibly different with CountSendBuffered()
+			break;
 	}
 }
 
 
 
 // Return whether it is in the CLOSABLE state or an ADJOURN packet has already been received
-bool ControlBlock::IsClosable()
+bool ControlBlock::IsClosable() const
 {
-	if(state == CLOSABLE)
-		return true;
-	//
 	int m = int(receiveMaxExpected - recvWindowFirstSN);
-	for(int d = 1; d <= m; d++)
+	register int k = recvWindowHeadPos;
+	register PFSP_SocketBuf skb = HeadRecv() + k;
+	// Check the packet before ADJOURN
+	for (int i = 0; i < m - 1; i++)
 	{
-		register int i = recvWindowNextPos - d;
-		PFSP_SocketBuf skb = HeadRecv() + (d < 0 ? recvBufferBlockN - 1 : d);
-		if(skb->opCode == ADJOURN)
+		if (!skb->GetFlag<IS_COMPLETED>())
+			return false;
+		//
+		if (++k - recvBufferBlockN >= 0)
 		{
-#ifdef TRACE
-			printf_s(" ADJOURN received at position displacement %d from the end of the receive queue\n", i);
-#endif
-			state = CLOSABLE;
-			return true;
+			k = 0;
+			skb = HeadRecv();
+		}
+		else
+		{
+			skb++;
 		}
 	}
-	return false;
+	// Check the last receive: it should be ADJOURN
+	return (skb->opCode == ADJOURN);
 }
 
 
@@ -914,6 +838,7 @@ bool ControlBlock::IsClosable()
 //	Whether the given sequence number is legitimate
 // Remark
 //	If the given sequence number is legitimate, send window size of the near end is adjusted
+//	See also SlideSendWindow()
 bool LOCALAPI ControlBlock::ResizeSendWindow(seq_t seq1, unsigned int adRecvWin)
 {
 	// advertisement of an out-of order packet about the receive window size is simply ignored
@@ -926,7 +851,6 @@ bool LOCALAPI ControlBlock::ResizeSendWindow(seq_t seq1, unsigned int adRecvWin)
 	if(d > sentWidth)
 		return false;	// you cannot acknowledge a packet not sent yet
 
-	// See also SlideSendWindow() and SlideSendWindow1()
 	assert((uint64_t)sentWidth + adRecvWin < INT32_MAX);
 	sendWindowSize = min(sendBufferBlockN, int32_t(d + adRecvWin));
 	return true;

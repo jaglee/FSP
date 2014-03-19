@@ -3,13 +3,12 @@
 
 #include "stdafx.h"
 
-#define REMOTE_APPLAYER_NAME "localhost:80"
-//#define REMOTE_APPLAYER_NAME "lt-x61t:80"
+// #define REMOTE_APPLAYER_NAME "localhost:80"
+#define REMOTE_APPLAYER_NAME "lt-x61t:80"
 // #define REMOTE_APPLAYER_NAME "lt-ux31e:80"
 
-static void FSPAPI onConnected(FSPHANDLE, PFSP_Context);
-static int	FSPAPI onReceiveWelcome(FSPHANDLE, void *, size_t, bool);
-static int	FSPAPI onReceiveNextBlock(FSPHANDLE, void *, size_t, bool);
+static int	FSPAPI onConnected(FSPHANDLE, PFSP_Context);
+static int	FSPAPI onReceiveNextBlock(FSPHANDLE, void *, int32_t, bool);
 static void FSPAPI onReceiveFileNameReturn(FSPHANDLE, FSP_ServiceCode, int);
 
 static HANDLE hFile;
@@ -18,7 +17,7 @@ volatile static bool finished = false;
 
 static void FSPAPI onReturn(FSPHANDLE h, FSP_ServiceCode code, int value)
 {
-	printf_s("Notify 0x%08X service code = %d, returned %d\n", h, code, value);
+	printf_s("Notify 0x%08X service code = %d, returned %d\n", (uint32_t)(intptr_t)h, code, value);
 	if(value < 0)
 	{
 		Dispose(h);
@@ -33,8 +32,13 @@ static void FSPAPI onReturn(FSPHANDLE h, FSP_ServiceCode code, int value)
 		printf_s("\nNo enough buffer space to receive data.\n");
 		finished = true;
 		Dispose(h);
-		return;	
 	}
+#ifndef NDEBUG
+	else if(code == FSP_NotifyFlushed)
+	{
+		printf_s("\nSend queue flushed, the session is paused.\n");
+	}
+#endif
 }
 
 
@@ -75,7 +79,7 @@ int main()
 	memset(& parms, sizeof(parms), 0);
 	parms.beforeAccept = NULL;
 	parms.afterAccept = onConnected;
-	parms.onError = onReturn;
+	parms.callback = onReturn;
 	parms.recvSize = MAX_FSP_SHM_SIZE;	// 4MB
 	parms.sendSize = 0;	// the underlying service would give the minimum, however
 	if(Connect2(REMOTE_APPLAYER_NAME, & parms) == NULL)
@@ -96,14 +100,14 @@ int main()
 
 
 
-void FSPAPI onConnected(FSPHANDLE h, PFSP_Context ctx)
+int FSPAPI onConnected(FSPHANDLE h, PFSP_Context ctx)
 {
-	printf_s("\nHandle of FSP session: 0x%08X", h);
+	printf_s("\nHandle of FSP session: 0x%08X", (uint32_t)(intptr_t)h);
 	if(h == NULL)
 	{
 		printf_s("\nConnection failure.\n");
 		finished = true;
-		return;
+		return -1;
 	}
 	printf_s("\tWelcome message length: %d\n", ctx->len);
 	if(ctx->len > 0)
@@ -113,7 +117,9 @@ void FSPAPI onConnected(FSPHANDLE h, PFSP_Context ctx)
 	{
 		finished = true;
 		Dispose(h);
+		return -1;
 	}
+	return 0;
 }
 
 
@@ -131,7 +137,7 @@ static void FSPAPI onReceiveFileNameReturn(FSPHANDLE h, FSP_ServiceCode resultCo
 	// try to create a new file of the same name. if failed on error file already exists, 
 	// try to change the filename by append a 'C'[if it does not have suffix].
 	// if the new filename exceed MAX_PATH, confuscate the last character
-	printf_s("done. Remote filename: %s\n", fileName);
+	printf_s("done.\nRemote filename: %s\n", fileName);
 	try
 	{
  		// TODO: exploit to GetDiskFreeSpace to take use of SECTOR size
@@ -166,7 +172,8 @@ static void FSPAPI onReceiveFileNameReturn(FSPHANDLE h, FSP_ServiceCode resultCo
 				(* --pDot) ++;			// it might be a illegal character, however
 			}
 			// 
-			printf_s("It should be created in the near end, however it exists and the new file would be %s\n", fileName);
+			printf_s("It should be created in the near end,\n"
+				"however it exists and the new file would be %s\n", fileName);
 			//
 			hFile = CreateFile(fileName
 				, GENERIC_WRITE
@@ -199,7 +206,7 @@ static void FSPAPI onReceiveFileNameReturn(FSPHANDLE h, FSP_ServiceCode resultCo
 
 
 
-static int FSPAPI onReceiveNextBlock(FSPHANDLE h, void *buf, size_t len, bool toBeContinued)
+static int FSPAPI onReceiveNextBlock(FSPHANDLE h, void *buf, int32_t len, bool toBeContinued)
 {
 	if(buf == NULL)
 	{

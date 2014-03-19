@@ -162,11 +162,12 @@ typedef enum
 	FSP_Dispose,		// AKA Reset. dispose the socket. connection might be aborted
 	FSP_Send,			// send a packet/a group of packets
 	FSP_Shutdown,		// close the connection
+	FSP_LazyAckAdjourn,
 	// 16~23: LLS to DLL in the backlog
 	FSP_NotifyDataReady = 16,
 	FSP_NotifyReset,
 	FSP_NotifyRecycled,
-	FSP_NotifyAdjourn,
+	FSP_NotifyAccepted,
 	FSP_NotifyFlushed,
 	FSP_NotifyBufferReady,
 	FSP_NotifyDisposed,

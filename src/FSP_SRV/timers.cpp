@@ -169,7 +169,8 @@ void CSocketItemEx::TimeOut()
 void CSocketItemEx::KeepAlive()
 {
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend()+ pControlBlock->sendWindowHeadPos;
-	if(skb->opCode == PERSIST || skb->opCode == ADJOURN)
+	if((skb->opCode == PERSIST || skb->opCode == ADJOURN)
+	 && pControlBlock->sendBufferNextSN != pControlBlock->sendWindowFirstSN)
 	{
 #ifdef TRACE
 		printf_s("Keep-alive session#%u, head packet in the queue is happened to be %s\n"
@@ -183,20 +184,21 @@ void CSocketItemEx::KeepAlive()
 		return;
 	}
 
+	BYTE buf[sizeof(FSP_NormalPacketHeader) + MAX_BLOCK_SIZE];
+	ControlBlock::seq_t seqExpected;
+	int spFull = GenerateSNACK(buf, seqExpected);
 #ifdef TRACE
 	printf_s("Keep-alive session#%u\n"
 		"\tSend head - tail = %d - %d, recv head - tail = %d - %d\n"
+		"\tAcknowledged seq#%u, keep-alive header size = %d\n"
 		, pairSessionID.source
 		, pControlBlock->sendWindowHeadPos
 		, pControlBlock->sendBufferNextPos
 		, pControlBlock->recvWindowHeadPos
-		, pControlBlock->recvWindowNextPos);
+		, pControlBlock->recvWindowNextPos
+		, seqExpected
+		, spFull);
 #endif
-
-	BYTE buf[sizeof(FSP_NormalPacketHeader) + MAX_BLOCK_SIZE];
-	ControlBlock::seq_t seqI;
-	ControlBlock::seq_t seq0 = pControlBlock->sendWindowNextSN;
-	int spFull = GenerateSNACK(buf, seqI);
 
 	if(spFull < 0)
 	{
@@ -207,10 +209,15 @@ void CSocketItemEx::KeepAlive()
 	}
 	if(spFull - sizeof(FSP_NormalPacketHeader) < 0)
 	{
+#ifdef TRACE
+		TRACE_HERE("HandleMemoryCorruption");
+#endif
 		HandleMemoryCorruption();
 		return;
 	}
 
+	// Always try to piggyback the KEEP_ALIVE signal on a normal, pure data packet at first
+	ControlBlock::seq_t seq0 = pControlBlock->sendWindowNextSN;
 	if( spFull - sizeof(FSP_NormalPacketHeader) == 0
 	&& (skb = pControlBlock->PeekNextToSend()) != NULL
 	&& (skb->opCode == PURE_DATA && skb->GetFlag<IS_COMPLETED>() && skb->MarkInSending()
@@ -231,22 +238,24 @@ void CSocketItemEx::KeepAlive()
 	}
 
 	register FSP_NormalPacketHeader *pHdr = (FSP_NormalPacketHeader *)buf;
+	--seq0;	// this is an absolutely out-of-band command packet
 	pHdr->hs.Set<KEEP_ALIVE>(spFull);
 	pHdr->sequenceNo = htonl(seq0);
-	pHdr->expectedSN = htonl(seqI);
+	pHdr->expectedSN = htonl(seqExpected);
 	pHdr->ClearFlags();	// pHdr->u.flags = 0;
 	// here we needn't check memory corruption as mishavior only harms himself
 	pHdr->SetRecvWS(pControlBlock->RecvWindowSize());
 	SetIntegrityCheckCode(*pHdr);
-	wsaBuf[1].buf = (CHAR *)pHdr;
-	wsaBuf[1].len = spFull;
-	SendPacket(1);
+#ifdef TRACE
+	printf_s("To send KEEP_ALIVE seq#%u, acknowledge#%u\n", seq0, seqExpected);
+#endif
+	SendPacket(1, ScatteredSendBuffers(pHdr, spFull));
 }
 
 
 
 // LLS sends packet in the send queue orderly to the remote end, including the ADJOURN packet
-// in the PAUSING state, the heart-beat signal shall be the last ADJOURN command packet
+// See also SlideSendWindow()
 void CSocketItemEx::Flush()
 {
 #ifdef TRACE
@@ -258,17 +267,16 @@ void CSocketItemEx::Flush()
 		, pControlBlock->recvWindowHeadPos
 		, pControlBlock->recvWindowNextPos);
 #endif
-
-	ControlBlock::PFSP_SocketBuf skb = pControlBlock->GetLastBufferedSend();
-	// here it should be impossible that skb == NULL
-	if(skb == NULL || skb->opCode != ADJOURN)
+	pControlBlock->SlideSendWindow();	// if it is not done already
+	//
+	if (pControlBlock->CountSendBuffered() <= 0)
 	{
-		TRACE_HERE("Only an ADJOURN command packet could be the last packet to send in PAUSING state");
-		// UNRESOLVED!? Should take a proper crash recovery action such as notifying ULA?
+		ReplaceTimer(SCAVENGE_THRESHOLD_ms);
+		SetState(CLOSABLE);
 		return;
 	}
 
-	Emit(skb, pControlBlock->sendBufferNextSN - 1);
+	Retransmit1();
 }
 
 
@@ -292,16 +300,26 @@ void CSocketItemEx::Flush()
 //	ONLY when the first packet in the send window is acknowledged may round-trip time re-calibrated
 int LOCALAPI CSocketItemEx::RespondSNACK(ControlBlock::seq_t expectedSN, const FSP_SelectiveNACK::GapDescriptor *gaps, int n)
 {
-	if(this->IsMilky() || n < 0) return -EDOM;
+	if(isMilky || n < 0)
+	{
+		TRACE_HERE("isMilky || n < 0");
+		return -EDOM;
+	}
 
 	// Check validity of the control block descriptors to prevent memory corruption propagation
 	const int seqHead = pControlBlock->sendWindowFirstSN;
 	int sentWidth = int(pControlBlock->sendWindowNextSN - seqHead);
 	int ackSendWidth = int(expectedSN - seqHead);
 	if(ackSendWidth == 0 && n != 0)
+	{
+		TRACE_HERE("ackSendWidth == 0 && n != 0");
 		return -EDOM;
+	}
 	if(ackSendWidth < 0 || ackSendWidth > sentWidth)
+	{
+		TRACE_HERE("ackSendWidth < 0 || ackSendWidth > sentWidth");
 		return -EBADF;
+	}
 	// if the send window width < 0, it will return -EFAULT: fatal error, maybe memory corruption caused by ULA
 
 	const int	capacity = pControlBlock->sendBufferBlockN;
@@ -408,7 +426,7 @@ int LOCALAPI CSocketItemEx::RespondSNACK(ControlBlock::seq_t expectedSN, const F
 	}	
 
 l_success:
-	// retransmission those sent but not acknowledged after expectedSN
+	// register retransmission of those sent but not acknowledged after expectedSN
 	if(retransTail - retransHead < MAX_RETRANSMISSION && (nAck = int(pControlBlock->sendWindowNextSN - expectedSN)) > 0)
 	{
 		tail = pControlBlock->sendWindowHeadPos + ackSendWidth;

@@ -94,6 +94,20 @@ FSPHANDLE FSPAPI ConnectMU(FSPHANDLE hFSP, PFSP_Context psp1)
 }
 
 
+//[{return}Accept{new context}]
+//{ACTIVE on multiply request}-->/[API{callback}]/
+//    -->{start keep-alive}ACTIVE
+//[{return}Commit{new context}] 
+//{ACTIVE on multiply request}-->/API{callback}/
+//      -->{new context}PAUSING-->[Snd ADJOURN {in the new context}]
+//[{return}Reject]
+//{ACTIVE on multiply request}-->/API{callback}/
+//      -->[Snd RESET]-->{abort creating new context, no state transition}
+//| --[Rcv MULTIPLY]-->[API{ Callback }]
+//| -->[{Return Commit}]-->{new context}PAUSING
+//-->[Snd ADJOURN{ enable retry, in the new context }]
+//| -->[{Return Accept}]-->{new context}ACTIVE
+//-->[Snd PERSIST{ start keep - alive, in the new context }]
 // 情形1：(PERSIST, ICC, 流控参数, 半连接参数，载荷)
 // 情形2：(ADJOURN, ICC, 流控参数, SNACK, 载荷)
 // 情形3：RESET...
@@ -149,33 +163,21 @@ bool LOCALAPI CSocketItemDl::ToWelcomeMultiply(BackLogItem & backLog)
 
 
 // Auxiliary function that is called
-// when a new connection context is to be incarnated because of a multiplication request
-void CSocketItemDl::ToConcludeMultiply()
-{
-	// See also ToConcludeConnnect()
-	SetMutexFree();
-}
-
-
-// Auxiliary function that is called
 // when an existing close/closable connection context is hit in the cache
+//[{return}Accept]
+//CLOSABLE-->[Rcv RESTORE]-->/[API{callback}]/
+//    -->{start keep-alive}ACTIVE
+//CLOSED-->[Rcv RESTORE]-->/[API{callback}]/
+//    -->{start keep-alive}ACTIVE
+//[{return}Commit]
+//CLOSABLE-->[Rcv RESTORE]-->[API{callback}]-->PAUSING
+//CLOSED-->[Rcv RESTORE]-->[API{callback}]-->PAUSING
+//[{return}Reject]
+//CLOSABLE{on resumption request}-->/API{callback}/
+//      -->[Snd RESET]-->NON_EXISTENT{to discard the contxt}
+//CLOSED{on resurrect request}-->/API{callback}/
+//      -->[Snd RESET]-->NON_EXISTENT{to discard the context}
 void CSocketItemDl::HitResumableDisconnectedSessionCache()
 {
-}
-
-
-// Auxiliary function that is called
-// when restore of an existing closable/pausing connection is accepted by the remote end
-void CSocketItemDl::ToConcludeResume()
-{
-	//TODO
-	SetMutexFree();
-}
-
-// Auxiliary function that is called
-// when restore of an existing close/closable connection is accepted by the remote end
-void CSocketItemDl::ToConcludeResurrect()
-{
-	//TODO
 	SetMutexFree();
 }

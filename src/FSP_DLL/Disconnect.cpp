@@ -81,8 +81,6 @@ int CSocketItemDl::Recycle()
 
 // Given
 //	FSPHANDLE		the FSP socket
-//	NotifyOrReturn	the pointer to the function called back when it is in the CLOSABLE state
-//					(or the operation is canceled)
 // Do
 //	Check state at first (in CLOSABLE state just return, not in [ACTIVE, PAUSING, RESUMING] return error)  
 //	Then queue the ADJOURN command packet in the send buffer; if the last packet in the send buffer has
@@ -90,7 +88,7 @@ int CSocketItemDl::Recycle()
 // Remark
 //	The connection would be set to the PAUSING state immediately. In the PAUSING state, no data would be accepted
 DllSpec
-int FSPAPI Adjourn(FSPHANDLE hFSPSocket, NotifyOrReturn fp1)
+int FSPAPI Adjourn(FSPHANDLE hFSPSocket)
 {
 	TRACE_HERE("called");
 
@@ -99,19 +97,18 @@ int FSPAPI Adjourn(FSPHANDLE hFSPSocket, NotifyOrReturn fp1)
 	{
 		if(p == NULL)
 			return -EBADF;
-		if(fp1 == NULL)
-			return -EACCES;
 		//
 		if(p->StateEqual(CLOSABLE) || p->StateEqual(CLOSED) || p->StateEqual(NON_EXISTENT))
 		{
-			fp1(p, FSP_NotifyFlushed, 0);
+			p->NotifyError(FSP_NotifyFlushed, 0);
 			return 0;
 		}
 		//
 		if(! p->StateEqual(ESTABLISHED) && ! p->StateEqual(PAUSING) && ! p->StateEqual(RESUMING))
 			return -EDOM;
 		//
-		return p->Adjourn(fp1);
+		p->SetFlushing();
+		return p->Adjourn();
 	}
 	catch(...)
 	{
@@ -127,14 +124,13 @@ int FSPAPI Adjourn(FSPHANDLE hFSPSocket, NotifyOrReturn fp1)
 // Remark
 //	Safely assume that receiving is disabled when PAUSING, to exploit asymmetry of FSP
 //	See also ToConcludeAdjourn() and CSocketItemEx::TimeOut() in FSP_SRV(LLS)
-int CSocketItemDl::Adjourn(NotifyOrReturn fp1)
+int CSocketItemDl::Adjourn()
 {
 	if(! WaitSetMutex())
 		return -EINTR;	// ill-behaviored ULA would be punished by dead-loop
 
-	pControlBlock->furtherToSend = false;	// if it is ever set to true
+	eomSending = EndOfMessageFlag::END_OF_SESSION;
 	SetState(PAUSING);
-	SetFlushCallback(fp1);
 
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->GetLastBufferedSend();
 	if (skb == NULL || skb->opCode != PURE_DATA && skb->opCode != PERSIST && skb->opCode != ADJOURN)
@@ -214,7 +210,8 @@ int FSPAPI Shutdown(FSPHANDLE hFSPSocket)
 			p->SetMutexFree();
 			return EBADF;	// A warning saying that the socket has already been closed
 		}
-		if(p->IsClosable())
+
+		if (p->StateEqual(CLOSABLE))
 		{
 			p->SetMutexFree();
 			return p->Call<FSP_Shutdown>();
@@ -226,8 +223,9 @@ int FSPAPI Shutdown(FSPHANDLE hFSPSocket)
 			return -EDOM;
 		}
 
+		p->SetFlushing(CSocketItemDl::FlushingFlag::FLUSHING_SHUTDOWN);
 		p->SetMutexFree();
-		return p->Adjourn(CSocketItemDl::TryClose);
+		return p->Adjourn();
 	}
 	catch(...)
 	{
@@ -237,30 +235,12 @@ int FSPAPI Shutdown(FSPHANDLE hFSPSocket)
 
 
 
+
 // Remark
 //	CLOSABLE-->[Snd FINISH]-->CLOSED
 //	Assume [API:Adjourn] has been called if it is not in CLOSABLE state
 // See also ToConcludeClose()
-void FSPAPI CSocketItemDl::TryClose(FSPHANDLE h, FSP_ServiceCode c, int r)
-{ 
-#ifdef TRACE
-	printf_s("TryClose 0x%08X, service code = %d, return value = %d\n", (LONG)h, (int)c, r);
-#endif
-	try
-	{
-		if(c == FSP_NotifyFlushed && r >= 0)
-			((CSocketItemDl *)h)->Call<FSP_Shutdown>();
-		else
-			((CSocketItemDl *)h)->NotifyError(c, r);
-	}
-	catch(...)
-	{
-		return;
-	}
-}
-
-
-
+// TODO: End of Message shall be delivered to ULA
 // When the SCB is in PAUSING state, LLS triggers the synchronization event whenever a legitimate ACK_FLUSH is received
 // The event handler in DLL check the SCB state. If it adheres to rule, the state would be changed into CLOSABLE
 // and the working process would callback the notification function
@@ -277,28 +257,37 @@ void CSocketItemDl::ToConcludeAdjourn()
 	}
 	SetState(CLOSABLE);
 	//
-	NotifyOrReturn fp1 = GetResetFlushCallback();
+	char isFlushing = GetResetFlushing();
 	SetMutexFree();
-	if(fp1 != NULL)	// for active adjourn acknowledged by ACK_FLUSH
-		fp1(this, FSP_NotifyFlushed, 0);
+	if(isFlushing == ONLY_FLUSHING)
+	{
+#ifdef TRACE
+		printf_s("ONLY_FLUSHING\n");
+#endif
+		NotifyError(FSP_NotifyFlushed, 0);
+	}
+	else if(isFlushing == FLUSHING_SHUTDOWN)
+	{
+#ifdef TRACE
+		printf_s("FLUSHING_SHUTDOWN\n");
+#endif
+		Call<FSP_Shutdown>();
+	}
 }
 
 
-
 // RESET
-//	{CONNECT_BOOTSTRAP, CHALLENGING, CONNECT_AFFIRMING, QUASI_ACTIVE, CLONING, ACTIVE, PAUSING, RESUMING, CLOSABLE}-->[Notify]-->NON_EXISTENT
+//	{CONNECT_BOOTSTRAP, CHALLENGING, CONNECT_AFFIRMING, QUASI_ACTIVE, CLONING, ACTIVE, PAUSING, RESUMING, CLOSABLE}
+//		-->[Notify]-->NON_EXISTENT
 //	Otherwise<-->{Ignore}
 // Remark
 //	ULA shall not re-free the socket
 void CSocketItemDl::OnGetReset()
 {
-	NotifyOrReturn fp1 = NULL;
-	if(InterlockedExchange((LONG *) & pControlBlock->state, NON_EXISTENT) == PAUSING)
-		fp1 = GetResetFlushCallback();
-
+	FSP_Session_State s = (FSP_Session_State)InterlockedExchange((LONG *)& pControlBlock->state, NON_EXISTENT);
 	SetMutexFree();
-	if(fp1 != NULL)
-		fp1(this, FSP_NotifyReset, -EINTR);
+	if (s == PAUSING)
+		NotifyError(FSP_NotifyFlushed, -ESRCH);	// got RESET while waiting(searching) ACK_FLUSH
 	else
 		NotifyError(FSP_NotifyReset, -EINTR);
 	//

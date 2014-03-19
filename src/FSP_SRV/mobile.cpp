@@ -127,13 +127,13 @@ UINT64 LOCALAPI CalculateCookie(BYTE *header, int sizeHdr, timestamp_t t0)
 	ALIGN(MAC_ALIGNMENT) BYTE m[VMAC_KEY_LEN >> 3];
 	timestamp_t t1 = NowUTC();
 
-//#ifdef TRACE
-//	printf("\n**** Cookie Context timestamp ****\n");
-//	printf("Previous = 0x%016I64X\n", prevCookieContext.timeStamp);
-//	printf("Current  = 0x%016I64X\n", cookieContext.timeStamp);
-//	printf("Packet   = 0x%016I64X\n", t0);
-//	printf("JustNow  = 0x%016I64X\n", t1);
-//#endif
+#ifdef TRACE
+	printf("\n**** Cookie Context timestamp ****\n");
+	printf("Previous = 0x%016I64X\n", prevCookieContext.timeStamp);
+	printf("Current  = 0x%016I64X\n", cookieContext.timeStamp);
+	printf("Packet   = 0x%016I64X\n", t0);
+	printf("JustNow  = 0x%016I64X\n", t1);
+#endif
 
 	// public information included in cookie calculation should be as little as possible
 	if(sizeHdr < 0 || sizeHdr > sizeof(m))
@@ -173,7 +173,7 @@ UINT64 LOCALAPI CalculateCookie(BYTE *header, int sizeHdr, timestamp_t t0)
 //	AAD = (source session ID, destination session ID, flags, receive window free pages
 //		 , version, OpCode, header stack pointer, optional headers)
 #if 0
-void LOCALAPI CSocketItemEx::SetIntegrityCheckCode(FSP_NormalPacketHeader *p1)
+void LOCALAPI CSocketItemEx::SetIntegrityCheckCodeP1(FSP_NormalPacketHeader *p1)
 {
 #define FSP_MAC_IV_SIZE (sizeof(p1->sequenceNo) + sizeof(p1->expectedSN))	
 	unsigned char *m = (BYTE *) & p1->integrity.id;	// the message
@@ -216,7 +216,7 @@ void LOCALAPI CSocketItemEx::SetIntegrityCheckCode(FSP_NormalPacketHeader *p1)
 //  Previous version of SetIntegrityCheckCode() try to align the original message with a little complex algorithm
 //	in favor of less stack memory. This version is simpler but is not very suitable as kernel driver prototype
 //  due to larger stack memory requirement
-void LOCALAPI CSocketItemEx::SetIntegrityCheckCode(FSP_NormalPacketHeader *p1)
+void LOCALAPI CSocketItemEx::SetIntegrityCheckCodeP1(FSP_NormalPacketHeader *p1)
 {
 //#ifdef TRACE
 //	printf_s("First 16 bytes to including in calculate ICC:\n");
@@ -327,13 +327,6 @@ bool LOCALAPI CSocketItemEx::Emit(ControlBlock::PFSP_SocketBuf skb, ControlBlock
 	}
 
 	register FSP_NormalPacketHeader * const pHdr = & pControlBlock->tmpHeader;
-	wsaBuf[1].buf = (CHAR *)pHdr;
-	wsaBuf[1].len = (ULONG)(sizeof(FSP_NormalPacketHeader));
-	wsaBuf[2].buf = (CHAR *)payload;
-	wsaBuf[2].len = (ULONG)skb->len;
-
-	// wsaBuf[0] is reserved for session ID
-	// ICC, if required, is always set just before being sent
 	int result;
 	switch (skb->opCode)
 	{
@@ -345,30 +338,41 @@ bool LOCALAPI CSocketItemEx::Emit(ControlBlock::PFSP_SocketBuf skb, ControlBlock
 			);
 		pHdr->hs.Set<FSP_AckConnectRequest, ACK_CONNECT_REQUEST>();
 		//
-		result = this->SendPacket(2);
+		result = SendPacket(2, ScatteredSendBuffers(pHdr, sizeof(FSP_NormalPacketHeader), payload, skb->len));
 		break;
 	case PERSIST:	// PERSIST is an in-band control packet with optional payload that initiate a half-connection
-		if (timer != NULL)
-		{
-			TRACE_HERE("\nInternal panic! Unclean multiplied connection reuse?\n"
-				"\tTimer to acknowledge connect request ackowledgement is not cleared beforehand.\n");
-			// this is a recovery error, however
-		}
 	case MULTIPLY:	// MULTIPLY is an out-of-band control packet that try to incarnate an new clone of the connection
 	case RESTORE:	// RESTORE is an in-band control packet that try re-established a broken/paused connection
 		tRoundTrip_us = CONNECT_INITIATION_TIMEOUT_ms << 2;	// So to tweak InitiateKeepAlive()
 		InitiateKeepAlive();
-		result = EmitSetICC(skb, seq);
-		break;
 	case ADJOURN:	// ADJOURN is always in the queue
 	case PURE_DATA:
-		result = EmitSetICC(skb, seq);
+		// ICC, if required, is always set just before being sent
+		if (skb->GetFlag<TO_BE_CONTINUED>() && skb->len != MAX_BLOCK_SIZE)
+		{
+			// TODO: debug log failure of segmented and/or online-compressed send
+#ifdef 	TRACE
+			printf_s("\nIncomplete packet to send, opCode = %d\n", skb->opCode);
+#endif
+			return 0;
+		}
+		// Which is the norm. Dynanically generate the fixed header.
+		SetSequenceFlags(pHdr, skb, seq);
+		pHdr->hs.opCode = skb->opCode;
+		pHdr->hs.version = THIS_FSP_VERSION;
+		pHdr->hs.hsp = htons(sizeof(FSP_NormalPacketHeader));
+		// Only when the first acknowledgement is received may the faster Keep-Alive timer started. See also OnGetFullICC()
+		SetIntegrityCheckCode(*pHdr);
+		if (skb->len > 0)
+			result = SendPacket(2, ScatteredSendBuffers(pHdr, sizeof(FSP_NormalPacketHeader), payload, skb->len));
+		else
+			result = SendPacket(1, ScatteredSendBuffers(pHdr, sizeof(FSP_NormalPacketHeader)));
 		break;
 	// Only possible for retransmission
 	case INIT_CONNECT:
 	case CONNECT_REQUEST:
-		wsaBuf[1] = wsaBuf[2];	// See also InitiateConnect() and AffirmConnect()
-		result = this->SendPacket(1);
+		// Header has been included in the payload. See also InitiateConnect() and AffirmConnect()
+		result = SendPacket(1, ScatteredSendBuffers(payload, skb->len));
 		break;
 	default:
 		TRACE_HERE("Unexpected socket buffer block");
@@ -376,38 +380,14 @@ bool LOCALAPI CSocketItemEx::Emit(ControlBlock::PFSP_SocketBuf skb, ControlBlock
 	}
 
 	tRecentSend = NowUTC();
-
-#ifdef TRACE
-	printf_s("Session#%u emit %s, sequence = %u, result = %d, time : 0x%016llX\n"
-		, pairSessionID.source
-		, opCodeStrings[skb->opCode], seq, result, tRecentSend);
-#endif
-
+//#ifdef TRACE
+//	printf_s("Session#%u emit %s, sequence = %u, result = %d, time : 0x%016llX\n"
+//		, pairSessionID.source
+//		, opCodeStrings[skb->opCode], seq, result, tRecentSend);
+//#endif
 	return (result > 0);
 }
 
-
-
-int LOCALAPI CSocketItemEx::EmitSetICC(ControlBlock::PFSP_SocketBuf skb, ControlBlock::seq_t seq)
-{
-	register FSP_NormalPacketHeader * const pHdr = &pControlBlock->tmpHeader;
-	if (skb->GetFlag<TO_BE_CONTINUED>() && skb->len != MAX_BLOCK_SIZE)
-	{
-		// TODO: debug log failure of segmented and/or online-compressed send
-#ifdef 	TRACE
-		printf_s("\nIncomplete packet to send, opCode = %d\n", skb->opCode);
-#endif
-		return 0;
-	}
-	// Which is the norm. Dynanically generate the fixed header.
-	SetSequenceFlags(pHdr, skb, seq);
-	pHdr->hs.opCode = skb->opCode;
-	pHdr->hs.version = THIS_FSP_VERSION;
-	pHdr->hs.hsp = htons(sizeof(FSP_NormalPacketHeader));
-	// Only when the first acknowledgement is received may the faster Keep-Alive timer started. See also OnGetFullICC()
-	SetIntegrityCheckCode(*pHdr);
-	return SendPacket(skb->len > 0 ? 2 : 1);
-}
 
 
 // Emit packet in the send queue, by default transmission of new packets takes precedence
@@ -420,28 +400,27 @@ void CSocketItemEx::EmitQ()
 	int nAvailable = int(pControlBlock->sendBufferNextSN - tail);
 	int nAllowedToSend = int(pControlBlock->sendWindowFirstSN + pControlBlock->sendWindowSize - tail);
 	int n = min(nAvailable, nAllowedToSend);
-
-#ifdef TRACE
-	printf_s("\n%s, session #%u meant to send = %d, allowed to send = %d\n"
-		, __FUNCTION__
-		, pairSessionID.source
-		, nAvailable
-		, nAllowedToSend
-		);
-#endif
+//#ifdef TRACE
+//	printf_s("\n%s, session #%u meant to send = %d, allowed to send = %d\n"
+//		, __FUNCTION__
+//		, pairSessionID.source
+//		, nAvailable
+//		, nAllowedToSend
+//		);
+//#endif
 	if(n <= 0)
 		return;
 
 	ControlBlock::PFSP_SocketBuf skb;
-	while((skb = pControlBlock->PeekNextToSend()) != NULL)
+	while (pControlBlock->CheckSendWindowLimit() && (skb = pControlBlock->PeekNextToSend()) != NULL)
 	{
-#ifdef TRACE
-		printf_s("\nIn session#%u, to emit opcode %s, sequence = %u, len = %d\n"
-			, pairSessionID.source
-			, opCodeStrings[skb->opCode]
-			, pControlBlock->sendWindowNextSN
-			, skb->len);
-#endif
+//#ifdef TRACE
+//		printf_s("\nIn session#%u, to emit opcode %s, sequence = %u, len = %d\n"
+//			, pairSessionID.source
+//			, opCodeStrings[skb->opCode]
+//			, pControlBlock->sendWindowNextSN
+//			, skb->len);
+//#endif
 		if(! skb->GetFlag<IS_COMPLETED>())
 		{
 			TRACE_HERE("the last packet might not be ready, say, "
@@ -477,7 +456,7 @@ bool CSocketItemEx::ValidateICC(FSP_NormalPacketHeader *pkt)
 	UINT64	savedICC = pkt->integrity.code;
 	pkt->integrity.id.source = pairSessionID.peer;
 	pkt->integrity.id.peer = pairSessionID.source;
-	SetIntegrityCheckCode(pkt);
+	SetIntegrityCheckCodeP1(pkt);
 	if(pkt->integrity.code != savedICC)
 		return false;
 	// TODO: automatically register remote address as the favorite contact address
