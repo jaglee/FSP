@@ -282,14 +282,19 @@ static void LOCALAPI ProcessCommand(HANDLE md)
 			switch(pCmd->opCode)
 			{
 			case FSP_Dispose:
+				pSocket->CloseSocket();
+				break;
 			case FSP_Reject:
-				pSocket->Disconnect(pCmd->opCode);
+				pSocket->Disconnect();
 				break;
 			case FSP_Send:			// send a packet/group of packets
 				pSocket->Send();
 				break;
 			case FSP_Shutdown:
 				pSocket->Shutdown();
+				break;
+			case FSP_LazyAckAdjourn:
+				pSocket->AckAdjourn();
 				break;
 			default:
 	#ifndef NDEUBG
