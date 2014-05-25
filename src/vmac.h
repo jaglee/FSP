@@ -15,9 +15,10 @@
  * 
  * 1. We'd like to use either Paulo Barreto's or hardware implementaions but not OpenSSL
  * 2. Adopt stdint.h if compiled under VS2010 or later
- * 3. Implementation of PMUL64, ADD128, get64BE, get64LE, get64PE and their dependents
- *    as well as macro ALIGN, FASTCALL were moved here from vmac.c for sake of code-reuse
- * 4. Add definition of uint16_t on 'stdint.h' is not applicable
+ * 3. For sake of code-reuse implementations of PMUL64, ADD128, get64BE, get64LE, get64PE
+ *    and their dependents, as well as definitions of the macro ALIGN and FASTCALL
+*     were moved here from vmac.c
+ * 4. Add definition of uint16_t if 'stdint.h' is not applicable
  */
 
 /* --------------------------------------------------------------------------
@@ -396,30 +397,14 @@ void vhash_reset(vmac_ctx_t *ctx);
 #  define get64LE(ptr) GET_REVERSED_64(ptr)
 #  define get32BE(ptr) (*(uint32_t *)(ptr))
 #  define get32LE(ptr) GET_REVERSED_32(ptr)
-#  define net64tohost(v) (v)
-#  define net32tohost(v) (v)
-#  define net16tohost(v) (v)
-#  define host64tonet(v) (v)
-#  define host32tonet(v) (v)
-#  define host16tonet(v) (v)
+#  define uint16BE(v) (v)
 #else /* assume little-endian */
 #  define get64BE(ptr) GET_REVERSED_64(ptr)
 #  define get64LE(ptr) (*(uint64_t *)(ptr))
 #  define get32BE(ptr) GET_REVERSED_32(ptr)
 #  define get32LE(ptr) (*(uint32_t *)(ptr))
-#  define net64tohost(v) f_Net64ToHost((uint64_t)v)
-#  define net32tohost(v) f_Net32ToHost((uint32_t)v)
-#  define net16tohost(v) f_Net16ToHost((uint16_t)v)
-#  define host64tonet(v) net64tohost(v)	// purely reverse
-#  define host32tonet(v) net32tohost(v)	// purely reverse
-#  define host16tonet(v) net16tohost(v)	// purely reverse
+#  define uint16BE(v) (((uint16_t)(v) << 8) | ((uint16_t)(v) >> 8))
 #endif
 
-
-#ifdef __cplusplus // or else implementation should provided its own
-static inline uint64_t f_Net64ToHost(uint64_t tmp) { GET_REVERSED_64(& tmp); return tmp; }
-static inline uint32_t f_Net32ToHost(uint32_t tmp) { GET_REVERSED_32(& tmp); return tmp; }
-static inline uint16_t f_Net16ToHost(uint16_t tmp) { return (tmp << 8) | (tmp >> 8); }
-#endif
 
 #endif /* HEADER_AES_H */

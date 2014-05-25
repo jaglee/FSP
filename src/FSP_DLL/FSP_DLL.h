@@ -280,14 +280,13 @@ public:
 	}
 	CSocketItemDl * LOCALAPI CallCreate(CommandNewSession &, FSP_ServiceCode);
 
-
+	int AcquireSendBuf(int);
 	ControlBlock::PFSP_SocketBuf GetSendBuf() { return pControlBlock->GetSendBuf(); }
 	ControlBlock::PFSP_SocketBuf PeekNextToSend() const { return pControlBlock->GetNextToSend(); }
-	//
-	int LOCALAPI AcquireSendBuf(void * &, int);
+
 	int LOCALAPI PrepareToSend(void *, int, bool);
 	int LOCALAPI SendStream(void *, int, char);
-	bool TestSetSendReturn(NotifyOrReturn fp1) 
+	bool TestSetSendReturn(PVOID fp1)
 	{
 		return InterlockedCompareExchangePointer((PVOID *) & fpSent, fp1, NULL) == NULL; 
 	}
@@ -299,11 +298,19 @@ public:
 
 	int	LOCALAPI RecvInline(PVOID);
 	int LOCALAPI ReadFrom(void *, int, PVOID);
+
 	bool IsEndOfRecvMsg() const { return context.u.st.eom; }
 	void SetEndOfRecvMsg(bool value = true) { context.u.st.eom = value ? 1 : 0; }
-	bool IsRecvBufferEmpty()  { return pControlBlock->recvWindowFirstSN == pControlBlock->receiveMaxExpected; }
+	bool IsRecvBufferEmpty()  { return pControlBlock->CountReceived() <= 0; }
 
-	int	Adjourn();
+	// Force LLS to send or queue ADJOURN
+	int	Adjourn()
+	{
+		eomSending = EndOfMessageFlag::END_OF_SESSION;
+		SetState(PAUSING);
+		return (Call<FSP_Send>() ? 0 : -EIO);
+	}
+
 	char GetResetFlushing() { return _InterlockedExchange8(& isFlushing, 0);}
 	void SetFlushing(char value = ONLY_FLUSHING) { isFlushing = value; }
 	void RevertToResume() { isFlushing = 0; SetState(RESUMING); }

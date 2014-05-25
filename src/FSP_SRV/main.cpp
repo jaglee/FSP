@@ -258,13 +258,18 @@ static void LOCALAPI ProcessCommand(HANDLE md)
 		switch(pCmd->opCode)
 		{
 		case FSP_Listen:		// register a passive socket
-			Listen((CommandNewSession *)buffer);
+#ifdef TRACE
+			printf_s("Requested to listen on local session %d, assigned event trigger is %s\n"
+				, pCmd->idSession
+				, ((CommandNewSession *)pCmd)->szEventName);
+#endif
+			Listen(CommandNewSessionSrv(pCmd));
 			break;
 		case InitConnection:	// register an initiative socket			
-			Connect((CommandNewSession *)buffer);
+			Connect(CommandNewSessionSrv(pCmd));
 			break;
 		case SynConnection:
-			SyncSession((CommandNewSession *)buffer);
+			SyncSession(CommandNewSessionSrv(pCmd));
 			break;
 		default:
 			pSocket = (CSocketItemEx *)(*CLowerInterface::Singleton())[pCmd->idSession];
@@ -292,9 +297,6 @@ static void LOCALAPI ProcessCommand(HANDLE md)
 				break;
 			case FSP_Shutdown:
 				pSocket->Shutdown();
-				break;
-			case FSP_LazyAckAdjourn:
-				pSocket->AckAdjourn();
 				break;
 			default:
 	#ifndef NDEUBG

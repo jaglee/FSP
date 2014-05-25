@@ -260,8 +260,14 @@ void CSocketItemDl::WaitEventToDispatch()
 		case FSP_NotifyAccepted:
 			ToConcludeAccept();			// SetMutexFree();
 			break;
+		case FSP_NotifyToAdjourn:
+			ProcessReceiveBuffer();
+			if (!WaitSetMutex())
+				return;
+			ToConcludeAdjourn();		// SetMutexFree();
+			break;
 		case FSP_NotifyFlushed:
-			ToConcludeAdjourn();	// SetMutexFree();
+			ToConcludeAdjourn();		// SetMutexFree();
 			break;
 		case FSP_IPC_CannotReturn:
 			SetMutexFree();
@@ -275,7 +281,7 @@ void CSocketItemDl::WaitEventToDispatch()
 #endif // TRACE
 			return;
 		// TODO: error handlers
-		case FSP_NotifyIOError:
+		case FSP_NotifyOverflow:
 			break;
 		case FSP_NotifyNameResolutionFailed:
 			break;
@@ -354,7 +360,7 @@ CSocketItemDl * CSocketItemDl::CreateControlBlock(const PFSP_IN6_ADDR nearAddr, 
 	if(socketItem == NULL)
 		return NULL;
 
-	if(socketItem->Initialize(psp1, cmd.u.szEventName) < 0)
+	if(socketItem->Initialize(psp1, cmd.szEventName) < 0)
 		return NULL;
 
 	if(! socketItem->RegisterDrivingEvent())
@@ -367,15 +373,15 @@ CSocketItemDl * CSocketItemDl::CreateControlBlock(const PFSP_IN6_ADDR nearAddr, 
 	//
 	// TODO: UNRESOLVED! specifies 'ANY' address?
 	//
-	CtrlMsgHdr *pNearEnd = socketItem->pControlBlock->nearEnd;
+	FSP_PKTINFO_EX *pNearEnd = socketItem->pControlBlock->nearEnd;
 	if(nearAddr->u.st.prefix == PREFIX_FSP_IP6to4)
 	{
 		for(register int i = 0; i < MAX_PHY_INTERFACES; i++)
 		{
 			pNearEnd[i].InitUDPoverIPv4(psp1->ifDefault);
 		}
-		pNearEnd->u.idALT = nearAddr->idALT;
-		pNearEnd->u.ipi_addr = nearAddr->u.st.ipv4;
+		pNearEnd->idALT = nearAddr->idALT;
+		pNearEnd->ipi_addr = nearAddr->u.st.ipv4;
 	}
 	else
 	{
@@ -383,7 +389,7 @@ CSocketItemDl * CSocketItemDl::CreateControlBlock(const PFSP_IN6_ADDR nearAddr, 
 		{
 			pNearEnd[i].InitNativeIPv6(psp1->ifDefault);
 		}
-		*(PIN6_ADDR) & pNearEnd->u = *(PIN6_ADDR)nearAddr;
+		*(PIN6_ADDR)pNearEnd = *(PIN6_ADDR)nearAddr;
 	}
 	// Application Layer Thread ID other than the first default would be set in the LLS
 

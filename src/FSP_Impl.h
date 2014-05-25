@@ -31,8 +31,12 @@
     POSSIBILITY OF SUCH DAMAGE.
  */
 
+//// Comment the whole block of the three lines to disable forcing FSP over IPv6
+//#ifdef OVER_UDP_IPv4
+//#undef OVER_UDP_IPv4
+//#endif
+
 #ifdef _MSC_VER
-#include <winsock2.h>
 #include <ws2tcpip.h>
 #include <mswsock.h>
 #else
@@ -122,21 +126,6 @@ extern CStringizeState stateNames;
 extern CStringizeNotice noticeNames;
 
 /**
- * Backward compatibility support
- */
-#if _WIN32_WINNT < 0x0600
-typedef union sockaddr_inet
-{
-	struct sockaddr_in6 Ipv6;
-	struct sockaddr_in Ipv4;
-	short si_family;	// ADDRESS_FAMILY as of Windows Vista and later
-} SOCKADDR_INET, *PSOCKADDR_INET;
-//
-#define IN4ADDR_LOOPBACK 0x0100007F	// the loop back address 127.0.0.1 in host byte order
-#endif
-
-
-/**
  * IPC
  */
 #define SERVICE_MAILSLOT_NAME "\\\\.\\mailslot\\flexible\\session\\protocol"
@@ -189,6 +178,7 @@ typedef union sockaddr_inet
 #else
   #define DELTA_EPOCH_IN_MICROSECS  11644473600000000ULL
 #endif
+
 // Return the number of microseconds elapsed since Jan 1, 1970 (unix epoch time)
 extern "C" timestamp_t NowUTC();	// it seems that a global property 'Now' is not as clear as this function format
 
@@ -206,13 +196,13 @@ struct $FSP_HeaderSignature: FSP_HeaderSignature
 	{
 		version = THIS_FSP_VERSION;
 		opCode = opCode1;
-		hsp = host16tonet(sizeof(THdr));
+		hsp = uint16BE(sizeof(THdr));
 	}
 	template<BYTE opCode1> void Set(int len1)
 	{
 		version = THIS_FSP_VERSION;
 		opCode = opCode1;
-		hsp = host16tonet((uint16_t)len1);
+		hsp = uint16BE(len1);
 	}
 };
 
@@ -364,86 +354,57 @@ struct FSP_RejectConnect
 };
 
 
-// command to lower layer service
-struct CommandToLLS
-{
-	FSP_ServiceCode opCode;	// operation code
-	DWORD idProcess;
-	ALT_ID_T idSession;
-};
-
-
-// either a passive session, an initiative session
-struct CommandNewSession: CommandToLLS
-{
-	HANDLE	hMemoryMap;		// pass to LLS by ULA, should be duplicated by the server
-	DWORD	dwMemorySize;	// size of the shared memory, in the mapped view
-	union
-	{
-		char	szEventName[MAX_NAME_LENGTH];	// name of the callback event
-		struct
-		{
-			BYTE	notUsed[MAX_NAME_LENGTH / 2];
-			void	*pSocket;
-			int		index;
-			HANDLE	hEvent;
-		} s;
-	} u;
-
-	bool	ResolvEvent();	// implemented in LLS only
-};
-
-
-class ConnectRequestQueue
-{
-	CommandNewSession q[CONNECT_BACKLOG_SIZE];
-	int head;
-	int tail;
-	char mayFull;
-	volatile char mutex;
-public:
-	// ConnectRequestQueue() { head = tail = 0; mayFull = 0; mutex = SHARED_FREE; }
-	int Push(const CommandNewSession *);
-	int Remove(int);
-};
-
 
 /**
- * It requires Advanced IPv6 API support to get the application layer thread ID from the IP packet control structure
+ * Command to lower layer service
+ * Try to make a 32-bit process calling the 64-bit FSP lower-level service possible
+ * by exploiting POST-FIX(!) ALIGN(8)
+ * Feasible in a little-endian CPU, provided that the structure is pre-zeroed
  */
-typedef struct _CMSGHDR
+struct CommandToLLS
 {
-#if _WIN32_WINNT >= 0x0600
-	CMSGHDR		pktHdr;
-#else
-	WSACMSGHDR	pktHdr;
-#endif
-	FSP_PKTINFO	u;
-} *PFSP_MSGHDR;
+	DWORD			idProcess;
+	ALIGN(8)
+	ALT_ID_T		idSession;
+	FSP_ServiceCode	opCode;	// operation code
+
+	CommandToLLS() { memset(this, 0, sizeof(CommandToLLS)); }
+};
 
 
-// packet information on local address and interface number
-// for IPv6, local session ID is derived from local address
-struct CtrlMsgHdr: _CMSGHDR
+struct CommandNewSession: CommandToLLS
 {
+	HANDLE			hMemoryMap;		// pass to LLS by ULA, should be duplicated by the server
+	ALIGN(8)
+	DWORD			dwMemorySize;	// size of the shared memory, in the mapped view
+	char			szEventName[MAX_NAME_LENGTH];	// name of the callback event
+
+	CommandNewSession() { memset(this, 0, sizeof(CommandNewSession)); }
+};
+
+
+
+struct FSP_PKTINFO_EX : FSP_PKTINFO
+{
+	int32_t	cmsg_level;
+	//
 	void InitUDPoverIPv4(ULONG if1)
 	{
-		pktHdr.cmsg_len = sizeof(pktHdr) + sizeof(struct in_pktinfo);
-		pktHdr.cmsg_level = IPPROTO_IP;	/* originating protocol */
-		pktHdr.cmsg_type = IP_PKTINFO;
-		memset(& u, 0, sizeof(u));		// inaddr_any
-		u.ipi_ifindex = if1;
+		memset(this, 0, sizeof(FSP_PKTINFO));		// inaddr_any
+		ipi_ifindex = if1;
+		cmsg_level = IPPROTO_IP;	/* originating protocol */
 	}
+	//
 	void InitNativeIPv6(ULONG if1)
 	{
-		pktHdr.cmsg_len = sizeof(CtrlMsgHdr);	/* #bytes, including this header */
-		pktHdr.cmsg_level = IPPROTO_IPV6;	/* originating protocol */
-		pktHdr.cmsg_type = IPV6_PKTINFO;
-		memset(& u, 0, sizeof(u));		// in6addr_any;
-		u.ipi6_ifindex = if1;
+		memset(this, 0, sizeof(FSP_PKTINFO));		// in6addr_any;
+		ipi6_ifindex = if1;
+		cmsg_level = IPPROTO_IPV6;	/* originating protocol */
 	}
-	bool IsIPv6() const { return (pktHdr.cmsg_level == IPPROTO_IPV6); }
+	//
+	bool IsIPv6() const { return (cmsg_level == IPPROTO_IPV6); }
 };
+
 
 
 struct SConnectParam	// MUST be aligned on 64-bit words!
@@ -476,16 +437,19 @@ struct BackLogItem: SConnectParam
 // 
 template<typename TLogItem> class TSingleProviderMultipleConsumerQ
 {
-	int	MAX_BACKLOG_SIZE;
-	int headQ;
-	int tailQ;
-	char mutex;
-	volatile int count;
-	volatile LONG nProvider;
+	volatile char		mutex;
+	ALIGN(2)
+	volatile short		nProvider;
+	ALIGN(8)
+	int32_t				capacity;
+	volatile int32_t	headQ;
+	volatile int32_t	tailQ;
+	volatile int32_t	count;
 	//
-	TLogItem q[MIN_QUEUED_INTR];
+	ALIGN(8)
+	TLogItem			q[MIN_QUEUED_INTR];
 	//
-	void InitSize() { MAX_BACKLOG_SIZE = MIN_QUEUED_INTR; }	// assume memory has been zeroized
+	void InitSize() { capacity = MIN_QUEUED_INTR; }	// assume memory has been zeroized
 	int InitSize(int);
 
 	friend struct ControlBlock;
@@ -512,11 +476,16 @@ enum SocketBufFlagBitPosition
 };
 
 
+
+class CSocketItem;	// forward declaration for sake of declaring ControlBlock
+
+
 // It heavily depends on Address Space Layout Randomization and user-space memory segment isolation
 // or similar measures to pretect sensive information, integrity and privacy, of user process
 volatile struct ControlBlock
 {
-	ALIGN(8)	FSP_Session_State state;
+	ALIGN(8)
+	FSP_Session_State state;
 
 	// By design only a sparned/branched(multiplexed/cloned) connection may be milky
 	ALIGN(4)	// sizeof(LONG)
@@ -532,7 +501,7 @@ volatile struct ControlBlock
 	// for security reason the remote addresses were moved to LLS
 	// TODO: UNRESOLVED!? limit multi-home capability to physical interfaces, not logical interfaces?
 	char			nearEndName[INET6_ADDRSTRLEN + 7];	// 72 bytes, in UTF-8
-	CtrlMsgHdr		nearEnd[MAX_PHY_INTERFACES];
+	FSP_PKTINFO_EX	nearEnd[MAX_PHY_INTERFACES];
 	union
 	{
 		char		name[INET6_ADDRSTRLEN + 7];	// 72 bytes
@@ -545,6 +514,7 @@ volatile struct ControlBlock
 	} peerAddr;
 
 	// 3: The negotiated connection parameter
+	ALIGN(8)	// 64-bit aligment, make sure that the session key overlays 'initCheckCode' and 'cookie' only
 	union
 	{
 		SConnectParam connectParams;
@@ -562,12 +532,14 @@ volatile struct ControlBlock
 
 	// 4: The (very short, roll-out) queue of returned notices
 	FSP_ServiceCode notices[FSP_MAX_NUM_NOTICE];
+	// A lock for DLL or LLS to gain mutually exclusive access on send or receive buffer
+	char	dllsmutex;	// 2014.6.7 not used yet UNRESOLVED!
 	// Backlog for listening/connected socket [for client it could be an alternate of Web Socket]
 	TSingleProviderMultipleConsumerQ<BackLogItem>	backLog;
 
 	// 5, 6: Send window and receive window descriptor
 	typedef uint32_t seq_t;
-
+private:
 	seq_t		sendWindowFirstSN;	// left-border of the send window
 	seq_t		sendWindowNextSN;	// the sequence number of the next packet to send
 	// it means that the send queue is empty when sendWindowFirstSN == sendWindowSN2Recv
@@ -584,7 +556,7 @@ volatile struct ControlBlock
 	uint32_t	sendBufDescriptors;	// relative to start of the control block,
 
 	seq_t		receiveMaxExpected;	// the next to the right-border of the received area
-	int32_t	recvWindowNextPos;	// the index number of the block with receiveMaxExpected
+	int32_t		recvWindowNextPos;	// the index number of the block with receiveMaxExpected
 	seq_t		recvWindowFirstSN;	// left-border of the receive window (receive queue), may be empty or may be filled but not delivered
 	// it means that the receive queue is empty when recvWindowFirstSN == receiveMaxExpected
 	// (next position, receive buffer maximum sn) (head position, receive window first sn)
@@ -595,6 +567,7 @@ volatile struct ControlBlock
 	uint32_t	recvBuffer;			// relative to start of the control block
 	uint32_t	recvBufDescriptors;	// relative to start of the control block
 
+public:
 	// Total size of FSP_SocketBuf (descriptor): 8 bytes (a 64-bit word)
 	typedef struct FSP_SocketBuf
 	{
@@ -623,33 +596,68 @@ volatile struct ControlBlock
 	// Convert the relative address in the control block to the address in process space, unchecked
 	BYTE * GetSendPtr(const PFSP_SocketBuf skb) const
 	{
-		return (BYTE *)this + sendBuffer
-			+ MAX_BLOCK_SIZE * (skb - (PFSP_SocketBuf)((BYTE *)this + sendBufDescriptors));
+		PFSP_SocketBuf p0 = PFSP_SocketBuf((BYTE *)this + sendBufDescriptors);
+		uint32_t offset = sendBuffer + MAX_BLOCK_SIZE * uint32_t(skb - p0);
+		return (BYTE *)this + offset;
 	}
+	BYTE * GetSendPtr(const ControlBlock::PFSP_SocketBuf skb, uint32_t &offset) const
+	{
+		PFSP_SocketBuf p0 = PFSP_SocketBuf((BYTE *)this + sendBufDescriptors);
+		offset = sendBuffer	+ MAX_BLOCK_SIZE * uint32_t(skb - p0);
+		return (BYTE *)this + offset;
+	}
+
 	BYTE * GetRecvPtr(const PFSP_SocketBuf skb) const
 	{
-		return (BYTE *)this + recvBuffer
-			+ MAX_BLOCK_SIZE * (skb - (PFSP_SocketBuf)((BYTE *)this + recvBufDescriptors));
+		PFSP_SocketBuf p0 = PFSP_SocketBuf((BYTE *)this + recvBufDescriptors);
+		uint32_t offset = recvBuffer + MAX_BLOCK_SIZE * uint32_t(skb - p0);
+		return (BYTE *)this + offset;
+	}
+	BYTE * GetRecvPtr(const ControlBlock::PFSP_SocketBuf skb, uint32_t &offset) const
+	{
+		PFSP_SocketBuf p0 = PFSP_SocketBuf((BYTE *)this + recvBufDescriptors);
+		offset = recvBuffer	+ MAX_BLOCK_SIZE * uint32_t(skb - p0);
+		return (BYTE *)this + offset;
 	}
 
 	// 7, 8 Send buffer and Receive buffer
 	// See ControlBlock::Init()
 
 	//
-	PFSP_SocketBuf LOCALAPI GetVeryFirstSendBuf(seq_t initialSN)
-	{
-		PFSP_SocketBuf skb = HeadSend();
-		skb->version = THIS_FSP_VERSION;
-		skb->ZeroFlags();
-		sendWindowHeadPos = 0;
-		sendWindowExpectedSN = sendWindowNextSN = sendWindowFirstSN = initialSN;
-		sendBufferNextSN = initialSN + 1;
-		sendBufferNextPos = 1;
-		sendWindowSize = 1;
-		return skb;
-	}
-
 	int CountSendBuffered() const { return int(sendBufferNextSN - sendWindowFirstSN); }
+	int CountUnacknowledged() const { return int(sendWindowNextSN - sendWindowFirstSN); }
+	int CountUnacknowledged(seq_t expectedSN) const { return int(sendWindowNextSN - expectedSN); }
+#ifdef TRACE
+	void DumpSendRecvWindowInfo() const
+	{
+		printf_s("\tSend head - tail = %d - %d, SN first = %u, next to send = %u, expected ACK=%u\n"
+			"recv head - tail = %d - %d, SN first = %u, max expected = %u\n"
+			, sendWindowHeadPos
+			, sendBufferNextPos
+			, sendWindowFirstSN
+			, sendWindowNextSN
+			, sendWindowExpectedSN
+			, recvWindowHeadPos
+			, recvWindowNextPos
+			, recvWindowFirstSN
+			, receiveMaxExpected);
+	}
+#else
+	void DumpSendRecvWindowInfo() const {}
+#endif
+
+	PFSP_SocketBuf HeadSend() const { return (PFSP_SocketBuf)((BYTE *)this + sendBufDescriptors); }
+	PFSP_SocketBuf HeadRecv() const { return (PFSP_SocketBuf)((BYTE *)this + recvBufDescriptors); }
+
+	seq_t GetSendWindowFirstSN() const { return sendWindowFirstSN; }
+	seq_t GetSendWindowFirstSN(register int32_t &capacity, register int32_t &iHead) const 
+	{
+		capacity = sendBufferBlockN;
+		iHead = sendWindowHeadPos;
+		return sendWindowFirstSN; 
+	}
+	//
+	PFSP_SocketBuf GetFirstBufferedSend() const { return HeadSend() + sendWindowHeadPos; }
 	// Return the descriptor of the last buffered packet in the send buffer, NULL if the send queue is empty
 	PFSP_SocketBuf GetLastBufferedSend() const
 	{
@@ -672,16 +680,38 @@ volatile struct ControlBlock
 		return HeadSend() + (i < 0 ? i + sendBufferBlockN : i - sendBufferBlockN >= 0 ? i - sendBufferBlockN : i);
 	}
 	PFSP_SocketBuf	PeekNextToSend() const;	// An LLS version of GetNextToSend()
+
 	bool CheckSendWindowLimit() const { return int(sendWindowNextSN - sendWindowFirstSN) <= sendWindowSize; }
+	int ClearSendWindow() { sendWindowHeadPos = sendBufferNextPos = 0; return sendBufferBlockN; }
 
+	int CountReceived() const { return int(receiveMaxExpected - recvWindowFirstSN); }
+	bool IsValidSequence(seq_t seq1)
+	{
+		register int d = int(seq1 - recvWindowFirstSN);
+		// somewhat 'be free to accept' as we didnot enforce 'announced receive window size'
+		return (0 <= d) && (d < recvBufferBlockN);
+	}
+	bool IsOutOfBandStale(seq_t seq1)
+	{
+		register int d = int(seq1 - recvWindowFirstSN);
+		// somewhat 'be free to accept' as we didnot enforce 'announced receive window size'
+		return (d < -1) || (d >= recvBufferBlockN);
+	}
+
+	void LOCALAPI SetSequenceFlags(FSP_NormalPacketHeader *, PFSP_SocketBuf, seq_t);
+	void LOCALAPI SetSequenceFlags(FSP_NormalPacketHeader *, seq_t);
+	void LOCALAPI SetSequenceFlags(FSP_NormalPacketHeader *);
+
+	void LOCALAPI EmitQ(CSocketItem *);	// ONLY implemented in LLS
 	void * LOCALAPI InquireSendBuf(int &);
-	int LOCALAPI	MarkSendQueue(void *, int, bool);
+	int	LOCALAPI MarkSendQueue(void *, int, bool);
 
+	PFSP_SocketBuf GetFirstReceived() const { return HeadRecv() + recvWindowHeadPos; }
 	// Return the last received packet, which might be already delivered. The caller should make sure it is illegal to be called
 	PFSP_SocketBuf GetLastReceived() const
 	{
 		const register int i = recvWindowNextPos - 1;
-		return HeadSend() + (i < 0 ? recvBufferBlockN - 1 : i);
+		return HeadRecv() + (i < 0 ? recvBufferBlockN - 1 : i);
 	}
 	PFSP_SocketBuf LOCALAPI AllocRecvBuf(seq_t);
 	// Slide the left border of the receive window by one slot
@@ -694,6 +724,20 @@ volatile struct ControlBlock
 	int LOCALAPI GetSelectiveNACK(seq_t &, FSP_SelectiveNACK::GapDescriptor *, int) const;
 	void * LOCALAPI InquireRecvBuf(int &, bool &);
 
+	void SetRecvWindowHead(seq_t pktSeqNo)	{ receiveMaxExpected = recvWindowFirstSN = pktSeqNo; }
+	void SetSendWindowWithHeadReserved(seq_t initialSN)
+	{
+		PFSP_SocketBuf skb = HeadSend();
+		skb->version = THIS_FSP_VERSION;
+		skb->ZeroFlags();
+		sendWindowHeadPos = 0;
+		sendWindowExpectedSN = sendWindowNextSN = sendWindowFirstSN = initialSN;
+		sendBufferNextSN = initialSN + 1;
+		sendBufferNextPos = 1;
+		sendWindowSize = 1;
+	}
+	void SetSendWindowSize(int32_t sz1) { sendWindowSize = min(sendBufferBlockN, sz1); }
+
 	// Check the receive queue to test whether it could migrate to the CLOSABLE state
 	bool IsClosable() const;
 
@@ -702,15 +746,12 @@ volatile struct ControlBlock
 	//
 	bool LOCALAPI ResizeSendWindow(seq_t, unsigned int);
 
-	INT32 RecvWindowSize() const // in blocks, width of the receive window
+	// Width of the advertisable receive window (i.e. free receive buffers to advertize), in blocks
+	INT32 RecvWindowSize() const
 	{
-		int d = int(receiveMaxExpected - recvWindowFirstSN);
+		int d = CountReceived();
 		return (d < 0 ? -1 : recvBufferBlockN - d);
 	}
-
-	PFSP_SocketBuf HeadSend() const { return (PFSP_SocketBuf)((BYTE *)this + sendBufDescriptors); }
-	PFSP_SocketBuf HeadRecv() const { return (PFSP_SocketBuf)((BYTE *)this + recvBufDescriptors); }
-	PFSP_SocketBuf FirstReceived() const { return HeadRecv() + recvWindowHeadPos; }
 
 	bool HasBacklog() const { return backLog.count > 0; }
 	bool LOCALAPI	HasBacklog(const BackLogItem *p);
@@ -721,6 +762,11 @@ volatile struct ControlBlock
 
 	int LOCALAPI	Init(int32_t, int32_t);
 	int	LOCALAPI	Init(uint16_t);
+
+	friend void UnitTestSendRecvWnd();
+	friend void UnitTestResendQueue();
+	friend void UnitTestGenerateSNACK();
+	friend void UnitTestAcknowledge();
 };
 
 #include <poppack.h>

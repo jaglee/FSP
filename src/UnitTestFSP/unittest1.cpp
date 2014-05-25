@@ -54,6 +54,7 @@ class CSocketItemExDbg: public CSocketItemEx
 public:
 	CSocketItemExDbg()
 	{
+		isMilky = 0;	// RespondSNACK cares it
 		hMemoryMap = NULL;
 		hEvent = NULL;
 		pControlBlock = (ControlBlock *)malloc
@@ -62,6 +63,7 @@ public:
 	};
 	CSocketItemExDbg(int nSend, int nRecv)
 	{
+		isMilky = 0;	// RespondSNACK cares it
 		hMemoryMap = NULL;
 		hEvent = NULL;
 		pControlBlock = (ControlBlock *)malloc
@@ -83,8 +85,13 @@ public:
 };
 
 
-// Just a test stub
-void LOCALAPI CSocketItemEx::Connect(CommandNewSession *pCmd) { }
+// Just test stubs
+void CSocketItemEx::Connect() { }
+
+CommandNewSessionSrv::CommandNewSessionSrv(const CommandToLLS *p1) { }
+
+void CommandNewSessionSrv::DoConnect() { }
+
 
 
 /**
@@ -120,16 +127,16 @@ void UnitTestSendRecvWnd()
 
 	// set the begin of the send sequence number for the test to work properly
 	// set the negotiated receive window parameter
-	pSCB->recvWindowFirstSN = pSCB->receiveMaxExpected = FIRST_SN;
-
-	ControlBlock::PFSP_SocketBuf skb = pSCB->GetVeryFirstSendBuf(FIRST_SN);
+	pSCB->SetRecvWindowHead(FIRST_SN);
+	pSCB->SetSendWindowWithHeadReserved(FIRST_SN);
+	ControlBlock::PFSP_SocketBuf skb = pSCB->HeadSend();
 	Assert::IsNotNull(skb);
 	Assert::IsTrue(pSCB->sendBufferNextSN == FIRST_SN + 1);
 	// TODO: SCB pointer to user space pointer
 	// TODO: recalibrate pointer...
 	// FSP_AffirmToConnect & request = *(FSP_AffirmToConnect *)(*pControlBlock)[skb];
 
-	int m;
+	int m = MAX_BLOCK_SIZE;
 	void *inplaceBuf = pSCB->InquireSendBuf(m);
 	Assert::IsNotNull(inplaceBuf);	// it might fail if memsize is too small
 	Assert::IsTrue(m > 0);			// it might fail if memsize is too small
@@ -151,7 +158,7 @@ void UnitTestSendRecvWnd()
 	// emulate received the first data packet
 	ControlBlock::PFSP_SocketBuf skb4 = pSCB->AllocRecvBuf(FIRST_SN);
 	Assert::IsNotNull(skb4);
-	Assert::IsTrue(pSCB->recvWindowFirstSN == FIRST_SN + 1);
+	Assert::IsTrue(pSCB->recvWindowFirstSN == FIRST_SN);
 	Assert::IsTrue(pSCB->receiveMaxExpected == FIRST_SN + 1);
 	// TODO: SCB buffer pointer to user space pointer
 	skb4->len = MAX_BLOCK_SIZE - 13;
@@ -245,7 +252,8 @@ void UnitTestResendQueue()
 	// set the negotiated receive window parameter
 	pSCB->recvWindowFirstSN = pSCB->receiveMaxExpected = FIRST_SN;
 
-	ControlBlock::PFSP_SocketBuf skb = pSCB->GetVeryFirstSendBuf(FIRST_SN);
+	pSCB->SetSendWindowWithHeadReserved(FIRST_SN);
+	ControlBlock::PFSP_SocketBuf skb = pSCB->HeadSend();
 	skb->SetFlag<IS_COMPLETED>();
 	Assert::IsTrue(pSCB->sendBufferNextSN == FIRST_SN + 1);
 
@@ -588,8 +596,8 @@ void UnitTestNoticeQ()
 	n = cqq.PushNotice(FSP_NotifyDisposed);
 	Assert::IsFalse(n <= 0, L"Duplicated FSP_NotifyDisposed should be pushed onto queue with warning");
 
-	n = cqq.PushNotice(FSP_NotifyIOError);		// 8
-	Assert::IsFalse(n < 0, L"FSP_NotifyIOError should have been pushed onto an un-fulfilled queue");
+	n = cqq.PushNotice(FSP_IPC_CannotReturn);		// 8
+	Assert::IsFalse(n < 0, L"FSP_IPC_CannotReturn should have been pushed onto an un-fulfilled queue");
 
 	n = cqq.PushNotice(FSP_NotifyOverflow);
 	Assert::IsTrue(n < 0, L"FSP_NotifyOverflow should have failed to be pushed onto a fulfilled queue");
@@ -620,7 +628,7 @@ void UnitTestNoticeQ()
 	Assert::IsTrue(c == FSP_NotifyBufferReady, L"What is popped should be what was pushed 7th");
 
 	c = cqq.PopNotice();	// 8
-	Assert::IsTrue(c == FSP_NotifyIOError, L"What is popped should be what was pushed 8th");
+	Assert::IsTrue(c == FSP_IPC_CannotReturn, L"What is popped should be what was pushed 8th");
 
 	c = cqq.PopNotice();
 	Assert::IsTrue(c == NullCommand, L"NullCommand should be popped from an empty queue");
@@ -671,8 +679,11 @@ void UnitTestVMAC()
 	FSP_Challenge responseZero;	// zero hint no state
 	FSP_AckConnectRequest acknowledgement;
 	CtrlMsgHdr nearEnd;
-
 	timestamp_t t0 = NowUTC();
+
+	int32_t r = 1;
+	r = get32BE(&r);
+	memset(&nearEnd, 0, sizeof(nearEnd));
 	request.timeStamp = htonll(t0);
 	// initCheckCode, salt should be random, but remain as-is for test purpose
 	request.hs.Set<FSP_InitiateRequest, INIT_CONNECT>();
@@ -772,7 +783,7 @@ void UnitTestGenerateSNACK()
 
 	CSocketItemExDbg socket(MAX_BLOCK_NUM, MAX_BLOCK_NUM);
 	ControlBlock *pSCB = socket.GetControlBlock();
-	pSCB->receiveMaxExpected = pSCB->recvWindowFirstSN = FIRST_SN;
+	pSCB->SetRecvWindowHead(FIRST_SN);
 
 	FSP_SelectiveNACK::GapDescriptor gaps[MAX_GAPS_NUM];
 	ControlBlock::seq_t seq0;
@@ -817,8 +828,8 @@ void UnitTestGenerateSNACK()
 	for(int i = 4; i < 0x10003; i++)
 	{
 		skb1 = socket.AllocRecvBuf(FIRST_SN + i);
-		skb1->SetFlag<IS_COMPLETED>();
 		Assert::IsNotNull(skb1);
+		skb1->SetFlag<IS_COMPLETED>();
 	}
 
 	r = pSCB->GetSelectiveNACK(seq0, gaps, MAX_GAPS_NUM);
@@ -840,7 +851,7 @@ void UnitTestGenerateSNACK()
 	}
 
 	pSCB->InquireRecvBuf(r, b);
-	Assert::IsTrue(b && r == 0x400);
+	Assert::IsTrue(b && r == MAX_BLOCK_SIZE * 2);
 
 	skb1 = socket.AllocRecvBuf(FIRST_SN + 3);
 	skb1->SetFlag<IS_COMPLETED>();
@@ -880,7 +891,8 @@ void UnitTestAcknowledge()
 	Assert::IsTrue(r == 0 && pSCB->sendBufferNextSN == pSCB->sendWindowFirstSN);
 	Assert::IsTrue(pSCB->sendWindowFirstSN == FIRST_SN + 1);
 
-	ControlBlock::PFSP_SocketBuf skb = pSCB->GetVeryFirstSendBuf(FIRST_SN);
+	pSCB->SetSendWindowWithHeadReserved(FIRST_SN);
+	ControlBlock::PFSP_SocketBuf skb = pSCB->HeadSend();
 	Assert::IsNotNull(skb);
 	Assert::IsTrue(pSCB->sendWindowSize == 1);	// set by GetVeryFirstSendBuf
 	Assert::IsTrue(pSCB->sendBufferNextSN == FIRST_SN + 1);
@@ -1130,8 +1142,9 @@ void UnitTestReceiveQueue()
 void UnitTestConnectQueue()
 {
 	static ConnectRequestQueue commandRequests;
-	CommandNewSession t;
-	t.opCode = InitConnection;
+	CommandToLLS raw;
+	raw.opCode = InitConnection;
+	CommandNewSessionSrv t(&raw);
 
 	int i = commandRequests.Push(& t);
 	Assert::IsTrue(i >= 0);

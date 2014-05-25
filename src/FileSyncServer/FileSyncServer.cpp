@@ -7,15 +7,12 @@
 #include "../FSP_API.h"
 
 #define MAX_FILENAME_WITH_PATH_LEN	260
-#define MIN_SEND_SEGMENT_SIZE	4096
 
 volatile static bool finished = false;
 static FSPHANDLE hFspListen;
 
 static char		fileName[MAX_FILENAME_WITH_PATH_LEN];
 static int		fd;
-static void	*	batchBuffer;
-static int		capacity;
 
 
 static void FSPAPI onReturn(FSPHANDLE h, FSP_ServiceCode code, int value)
@@ -34,9 +31,9 @@ static void FSPAPI onReturn(FSPHANDLE h, FSP_ServiceCode code, int value)
 
 
 
-static int FSPAPI onAccepted(FSPHANDLE h, PFSP_Context);
+static int	FSPAPI onAccepted(FSPHANDLE h, PFSP_Context);
 static void FSPAPI onFileNameSent(FSPHANDLE, FSP_ServiceCode, int);
-static void FSPAPI toSendNextBlock(FSPHANDLE, FSP_ServiceCode, int);
+static int	FSPAPI toSendNextBlock(FSPHANDLE, void *, int);
 
 /**
  *
@@ -90,7 +87,13 @@ int main(int argc, char * argv[])
 	params.len = (unsigned short)strlen(defaultWelcome) + 1;
 	params.sendSize = MAX_FSP_SHM_SIZE;
 	params.recvSize = 0;	// minimal receiving for download server
+
 	TranslateFSPoverIPv4(& atAddress, 0, 80);	//INADDR_ANY
+	// UNRESOLVE! Does PostAdjourn() losted? // TODO: CreateFWRules
+	//atAddress.u.subnet = 0xAAAA00E0;	// 0xE0 00 AA AA	// shall be learned 
+	//atAddress.idHost = 0;
+	//atAddress.idALT = 0x01000000;		// 0x01 [well, it should be the well-known service number...] 
+
 	hFspListen = ListenAt(& atAddress, & params);
 
 	while(! finished)
@@ -133,10 +136,11 @@ static void FSPAPI onFileNameSent(FSPHANDLE h, FSP_ServiceCode c, int r)
 		"to get send buffer for reading and sending inline...\n");
 	//UNRESOLVED! spawn an implicit thread to receive remote feed-back
 
-	capacity = GetSendBuffer(h, & batchBuffer, MIN_SEND_SEGMENT_SIZE, toSendNextBlock);
-	if(capacity < 0)
+	// We insisted on sending even if only a small buffer of 1 octet is available
+	r = GetSendBuffer(h, 1, toSendNextBlock);
+	if(r < 0)
 	{
-		printf_s("Cannot get send buffer onFileNameSent, error code: %d\n", capacity);
+		printf_s("Cannot get send buffer onFileNameSent, error code: %d\n", r);
 		finished = true;
 		Dispose(h);
 		return;
@@ -145,14 +149,13 @@ static void FSPAPI onFileNameSent(FSPHANDLE h, FSP_ServiceCode c, int r)
 
 
 
-static void FSPAPI toSendNextBlock(FSPHANDLE h, FSP_ServiceCode c, int r)
+static int FSPAPI toSendNextBlock(FSPHANDLE h, void * batchBuffer, int capacity)
 {
-	if(r <= 0)
+	if(capacity <= 0)
 	{
 		finished = true;
-		return;
+		return -1;
 	}
-	capacity = r;
 
 	int bytesRead = _read(fd, batchBuffer, capacity);
 	if(bytesRead < 0)
@@ -160,23 +163,23 @@ static void FSPAPI toSendNextBlock(FSPHANDLE h, FSP_ServiceCode c, int r)
 		printf_s("Error when read the source file\n");
 		finished = true;
 		Dispose(h);
-		return;
+		return -1;
 	}
 	if(bytesRead == 0)
 	{
 		printf_s("The source file is empty.\n");
 		finished = true;
 		Dispose(h);
-		return;
+		return -1;
 	}
 
-	r = _eof(fd);	// re-use the formal parameter. again, negative means error
+	int r = _eof(fd);	// re-use the formal parameter. again, negative means error
 	if(r < 0)
 	{
 		printf_s("Internal errror: cannot guess whether the file reaches the end?\n");
 		finished = true;
 		Dispose(h);
-		return;
+		return -1;
 	}
 
 	printf_s("To send %d bytes to the remote end\n", bytesRead);
@@ -186,17 +189,8 @@ static void FSPAPI toSendNextBlock(FSPHANDLE h, FSP_ServiceCode c, int r)
 	{
 		printf("All content has been sent. To shutdown.\n");
 		Shutdown(h);
-		return;
+		return -1;
 	}
 
-	printf_s("To get free block for further reading and send...\n");
-
-	r = GetSendBuffer(h, & batchBuffer, 1, toSendNextBlock);
-	if(r < 0)
-	{
-		printf_s("Cannot get send buffer toSendNextBlock, error code: %d\n", r);
-		finished = true;
-		Dispose(h);
-		return;
-	}
+	return 0;
 }

@@ -207,17 +207,19 @@ inline
 int CSocketItemDl::FetchReceived()
 {
 	int m = 0;	// note that left border of the receive window slided in the loop body
-	for(ControlBlock::PFSP_SocketBuf p = pControlBlock->FirstReceived(); p->GetFlag<IS_COMPLETED>(); p = pControlBlock->FirstReceived())
+	for(ControlBlock::PFSP_SocketBuf p = pControlBlock->GetFirstReceived();
+		! p->GetFlag<IS_DELIVERED>();
+		p = pControlBlock->GetFirstReceived())
 	{
 		if(p->len > MAX_BLOCK_SIZE || p->len < 0)
 			return -EFAULT;
 
+		if (!p->GetFlag<IS_COMPLETED>())
+			break;	// The buffer block happened to be not ready yet. See CSocketItemEx::PlacePayload()
+
 		if(DeliverData(GetRecvPtr(p), p->len) < 0)
 			break;
-
-		// Set flag in a manner that it would not be re-delivered even IS_DELIVERED flag is not checked
-		p->SetFlag<IS_COMPLETED>(false);
-		p->SetFlag<IS_DELIVERED>();
+		p->SetFlag<IS_DELIVERED>();	// so that it would not be re-delivered
 		m += p->len;
 
 		// Slide the left border of the receive window before possibly set the flag 'end of received message'
@@ -246,21 +248,18 @@ void CSocketItemDl::ProcessReceiveBuffer()
 #ifdef TRACE_PACKET
 	printf_s("Process receive buffer in state %s\n", stateNames[pControlBlock->state]);
 #endif
-	// As LLS may set the state into CLOSABLE before DLL have been ready to process the process buffer,
-	// it should be legal to deliver data in CLOSABLE state, but not CLOSED
-	if(! StateEqual(CHALLENGING) && ! StateEqual(ESTABLISHED) && ! StateEqual(RESUMING) && ! StateEqual(CLONING) && ! StateEqual(CLOSABLE))
+	if (StateEqual(NON_EXISTENT) || StateEqual(CONNECT_BOOTSTRAP) || StateEqual(CLOSED))
 	{
 #ifdef TRACE
 		printf_s("Is it illegal to ProcessReceiveBuffer in state %s\n", stateNames[pControlBlock->state]);
-#else
+#endif
 		SetMutexFree();
 		return;
-#endif
 	}
 	if (IsRecvBufferEmpty())
 	{
 #ifdef TRACE
-		printf_s("Receive buffer is empty when ", __FUNCTION__);
+		printf_s("Receive buffer is empty when %s\n", __FUNCTION__);
 #endif
 		SetMutexFree();
 		return;
@@ -286,8 +285,8 @@ void CSocketItemDl::ProcessReceiveBuffer()
 		else if(n == 0)
 		{
 			TRACE_HERE("Nothing to deliver");
-			mutex = SHARED_FREE;
-			goto l_return;
+			SetMutexFree();
+			return;
 		}
 		//
 		CallbackPeeked fp1 = fpPeeked;
@@ -301,8 +300,7 @@ void CSocketItemDl::ProcessReceiveBuffer()
 			fp1(this, NULL, (size_t) n, false);
 		else
 			fp1(this, p, n, b);
-
-		goto l_return;
+		return;
 	}
 
 	if(waitingRecvBuf == NULL || waitingRecvSize <= 0 || fpReceive == NULL)
@@ -312,7 +310,7 @@ void CSocketItemDl::ProcessReceiveBuffer()
 			"what received should be buffered as is\n");
 #endif
 		SetMutexFree();
-		goto l_return;
+		return;
 	}
 
 	n = FetchReceived();
@@ -332,33 +330,6 @@ void CSocketItemDl::ProcessReceiveBuffer()
 		FinalizeRead();
 	else
 		SetMutexFree();
-
-l_return:
-	// Even if ULA does not fetch the received data may it be closable
-	if (IsRecvBufferEmpty())
-	{
-#ifdef TRACE
-		printf_s("The last packet received is ADJOURN. The session is paused.\n");
-#endif
-		ControlBlock::PFSP_SocketBuf skb = pControlBlock->GetLastReceived();
-		if (skb->opCode == ADJOURN)
-		{
-			SetState(CLOSABLE);
-			Call<FSP_LazyAckAdjourn>();
-		}
-	}
-	else if (pControlBlock->IsClosable())
-	{
-#ifdef TRACE
-		printf_s("A full message with ADJOURN as the trailer is in the buffer.\n"
-			"The session is paused.\n");
-#endif
-		SetState(CLOSABLE);
-		Call<FSP_LazyAckAdjourn>();
-	}
-	//
-	if (StateEqual(CLOSABLE))
-		SelfNotify(FSP_NotifyFlushed);
 }
 
 

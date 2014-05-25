@@ -83,8 +83,7 @@ int CSocketItemDl::Recycle()
 //	FSPHANDLE		the FSP socket
 // Do
 //	Check state at first (in CLOSABLE state just return, not in [ACTIVE, PAUSING, RESUMING] return error)  
-//	Then queue the ADJOURN command packet in the send buffer; if the last packet in the send buffer has
-//	not been sent yet the ADJOURN command is piggybacked on that packet
+//	Then migrate to the PAUSING state and urge LLS to queue and send, if possibly, the ADJOURN command
 // Remark
 //	The connection would be set to the PAUSING state immediately. In the PAUSING state, no data would be accepted
 DllSpec
@@ -117,76 +116,16 @@ int FSPAPI Adjourn(FSPHANDLE hFSPSocket)
 }
 
 
-// DO
-//	Append ADJOURN packet in the send queue. if the last packet in the queue is not sent yet and it is a data packet
-//	(PURE_DATA, PERSIST or ADJOURN) then change the opcode to ADJOURN and mark it as EOM.
-//	Urge LLS to send, silently
-// Remark
-//	Safely assume that receiving is disabled when PAUSING, to exploit asymmetry of FSP
-//	See also ToConcludeAdjourn() and CSocketItemEx::TimeOut() in FSP_SRV(LLS)
-int CSocketItemDl::Adjourn()
-{
-	if(! WaitSetMutex())
-		return -EINTR;	// ill-behaviored ULA would be punished by dead-loop
-
-	eomSending = EndOfMessageFlag::END_OF_SESSION;
-	SetState(PAUSING);
-
-	ControlBlock::PFSP_SocketBuf skb = pControlBlock->GetLastBufferedSend();
-	if (skb == NULL || skb->opCode != PURE_DATA && skb->opCode != PERSIST && skb->opCode != ADJOURN)
-	{
-#ifdef TRACE
-		printf_s("\nNo packet to piggyback the ADJOURN command, allocate new\n");
-#endif
-		skb = GetSendBuf();
-		if(skb == NULL)	// how on earth could it happen? ill-behaviored ULA
-		{
-#ifdef TRACE
-			printf_s("\nThere is no space in the send window to buffer the new ADJOURN command!\n");
-#endif
-			SetMutexFree();
-			return -ENOMEM;
-		}
-		skb->len = 0;
-	} 
-	else if(! skb->MarkInSending())
-	{
-#ifdef TRACE
-		printf_s("\nThe last packet is being sent, cannot piggyback the ADJOURN command, allocate new\n");
-#endif
-		ControlBlock::PFSP_SocketBuf skb2 = GetSendBuf();
-		if(skb2 == NULL)
-		{
-#ifdef TRACE
-			printf_s("\nNo space in the send window to buffer the ADJOURN command while the last packet is being sent.\n");
-#endif
-			SetMutexFree();
-			return -ENOMEM;
-		}
-		skb = skb2;
-		skb->len = 0;
-	}
-	skb->opCode = ADJOURN;
-	skb->SetFlag<TO_BE_CONTINUED>(false);
-	skb->MarkUnsent();
-	skb->SetFlag<IS_COMPLETED>();
-
-	// don't care 'compressing' flag of the tail packet
-	//
-	SetMutexFree();
-	//
-	// Note that even if the sync-event happens to be triggered when sending, callback function
-	// is not being called if there exists packet in flight 
-	return (Call<FSP_Send>() ? 0 : -EIO);
-}
 
 
 // Given
 //	FSPHANDLE		the FSP socket
 // Do
-//	Check state at first (in CLOSED state just return, in CLOSABLE state make state migration immediate and return,
-//	  not in [ACTIVE, PAUSING, RESUMING] return error)
-//  Chain Adjourn operation, with TryClose as the callback function
+//	Check state at first:
+//		in CLOSABLE state make state migration immediate and return,
+//		in CLOSED state just return, 
+//		not in [ACTIVE, PAUSING, RESUMING] return error
+//	Set FLUSHING_SHUTDOWN flag so that 'Adjourn' is permanent otherwise
 // Remark
 //	The caller should make sure Shutdown is not carelessly called more than once in a multi-thread,
 //	continual communication context or else connection reuse(resurrection) may be broken

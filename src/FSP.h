@@ -150,7 +150,7 @@ typedef enum _FSP_Operation_Code
 
 
 
-typedef enum
+typedef enum: char
 {
 	NullCommand = 0,
 	// 1~15: DLL to LLS
@@ -162,7 +162,6 @@ typedef enum
 	FSP_Dispose,		// AKA Reset. dispose the socket. connection might be aborted
 	FSP_Send,			// send a packet/a group of packets
 	FSP_Shutdown,		// close the connection
-	FSP_LazyAckAdjourn,
 	// 16~23: LLS to DLL in the backlog
 	FSP_NotifyDataReady = 16,
 	FSP_NotifyReset,
@@ -171,9 +170,9 @@ typedef enum
 	FSP_NotifyFlushed,
 	FSP_NotifyBufferReady,
 	FSP_NotifyDisposed,
-	FSP_IPC_CannotReturn = 23,
+	FSP_NotifyToAdjourn,	// = 23
 	// 24~31: near end error status
-	FSP_NotifyIOError = 24,
+	FSP_IPC_CannotReturn = 24,
 	FSP_NotifyOverflow,
 	FSP_NotifyNameResolutionFailed,
 	LARGEST_FSP_NOTICE = FSP_NotifyNameResolutionFailed
@@ -190,7 +189,7 @@ typedef uint64_t timestamp_t;
  */
 #ifdef TRACE
 # define CONNECT_INITIATION_TIMEOUT_ms	90000	// 90 seconds
-# define KEEP_ALIVE_TIMEOUT_MIN_ms		5000	// 5 seconds
+# define KEEP_ALIVE_TIMEOUT_MIN_ms		15000	// 15 seconds
 # define TRASIENT_STATE_TIMEOUT_ms		300000	// 5 minutes
 #else
 # define CONNECT_INITIATION_TIMEOUT_ms	9000	// 9 seconds

@@ -34,7 +34,7 @@
 #include <assert.h>
 #include "rsa-gmp.hpp"
 #include "rsassa-pss.h"
-#include "../KeccakReferenceAndOptimized/Sources/KeccakNISTInterface.h"
+#include "../SHA3/KeccakNISTInterface.h"
 
 #define SSA_PSS_PREMASK_SUFFIX	'\x1'
 #define SSA_PSS_SUFFIX_BYTE		((BYTE)'\xbc')	// signed char wourld refuse to be equal to unsigned char
@@ -538,7 +538,6 @@ static BYTE	buf[3072 / 8];	// practically it is for storing temporary random val
 static const int outlen = 224;
 
 
-
 // Given
 //	_Uint32t	[_Out_] placeholder of the random 32-bit words to be generated
 //	int			number of the random 32-bit words to be gererated
@@ -549,14 +548,14 @@ static const int outlen = 224;
 //	The caller should make sure n > 0 or else memory corruption may occur
 extern "C" void rand_w32(unsigned int *p, int n)	//_Uint32t
 {
-	int hashLen = n < 224/32 ? 224 : n < 256/32 ? 256 : n < 384/32 ? 384 : 512;
+	int hashLen = n < 224 / 32 ? 224 : n < 256 / 32 ? 256 : n < 384 / 32 ? 384 : 512;
 	struct
 	{
 		int		r;
 		time_t	f1;
 		clock_t f2;
-	} m	= { n, time(NULL), clock() };	// key material, pseudo-randomly
-	Hash(hashLen, (BitSequence *) & m, sizeof(m) * 8, buf);
+	} m = { n, time(NULL), clock() };	// key material, pseudo-randomly
+	Hash(hashLen, (BitSequence *)& m, sizeof(m) * 8, buf);
 	memcpy(p, buf, n << 2);		// as each _Uint32t is 4 bytes
 }
 

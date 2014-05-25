@@ -28,7 +28,7 @@
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'" Label="Configuration">
     <ConfigurationType>DynamicLibrary</ConfigurationType>
     <CharacterSet>MultiByte</CharacterSet>
-    <PlatformToolset>v120_xp</PlatformToolset>
+    <PlatformToolset>v120</PlatformToolset>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
     <ConfigurationType>DynamicLibrary</ConfigurationType>
@@ -38,12 +38,12 @@
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="Configuration">
     <ConfigurationType>DynamicLibrary</ConfigurationType>
     <CharacterSet>MultiByte</CharacterSet>
-    <PlatformToolset>v120_xp</PlatformToolset>
+    <PlatformToolset>v120</PlatformToolset>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
     <ConfigurationType>DynamicLibrary</ConfigurationType>
     <CharacterSet>MultiByte</CharacterSet>
-    <PlatformToolset>v120_xp</PlatformToolset>
+    <PlatformToolset>v120</PlatformToolset>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <ImportGroup Label="ExtensionSettings">
@@ -107,7 +107,7 @@
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
       <Optimization>Disabled</Optimization>
-      <PreprocessorDefinitions>WIN32;TRACE;_DEBUG;_WINDOWS;_USRDLL;FSP_DLL_EXPORTS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>TRACE_PACKET;OVER_UDP_IPv4;WIN32;TRACE;_DEBUG;_WINDOWS;_USRDLL;FSP_DLL_EXPORTS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <MinimalRebuild>true</MinimalRebuild>
       <BasicRuntimeChecks>EnableFastChecks</BasicRuntimeChecks>
       <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
@@ -190,11 +190,12 @@
   <ItemGroup>
     <ClCompile Include="..\ControlBlock.cpp" />
     <ClCompile Include="..\gcm-aes.c" />
-    <ClCompile Include="..\KeccakReferenceAndOptimized\Sources\KeccakDuplex.c" />
-    <ClCompile Include="..\KeccakReferenceAndOptimized\Sources\KeccakF-1600-opt64.c" />
-    <ClCompile Include="..\KeccakReferenceAndOptimized\Sources\KeccakNISTInterface.c" />
-    <ClCompile Include="..\KeccakReferenceAndOptimized\Sources\KeccakSponge.c" />
     <ClCompile Include="..\rijndael-alg-fst.c" />
+    <ClCompile Include="..\SHA3\KeccakDuplex.c" />
+    <ClCompile Include="..\SHA3\KeccakF-1600-inplace32BI.c" />
+    <ClCompile Include="..\SHA3\KeccakHash.c" />
+    <ClCompile Include="..\SHA3\KeccakNISTInterface.c" />
+    <ClCompile Include="..\SHA3\KeccakSponge.c" />
     <ClCompile Include="..\vmac.c" />
     <ClCompile Include="Disconnect.cpp" />
     <ClCompile Include="DllEntry.cpp" />
@@ -209,17 +210,16 @@
   <ItemGroup>
     <ClInclude Include="..\FSP.h" />
     <ClInclude Include="..\FSP_API.h" />
-    <ClInclude Include="..\KeccakReferenceAndOptimized\Sources\KeccakDuplex.h" />
-    <ClInclude Include="..\KeccakReferenceAndOptimized\Sources\KeccakF-1600-opt64-settings.h" />
-    <ClInclude Include="..\KeccakReferenceAndOptimized\Sources\KeccakNISTInterface.h" />
-    <ClInclude Include="..\KeccakReferenceAndOptimized\Sources\KeccakSponge.h" />
+    <ClInclude Include="..\SHA3\brg_endian.h" />
+    <ClInclude Include="..\SHA3\KeccakDuplex.h" />
+    <ClInclude Include="..\SHA3\KeccakF-1600-interface.h" />
+    <ClInclude Include="..\SHA3\KeccakHash.h" />
+    <ClInclude Include="..\SHA3\KeccakNISTInterface.h" />
+    <ClInclude Include="..\SHA3\KeccakSponge.h" />
     <ClInclude Include="FSP_DLL.h" />
     <ClInclude Include="..\FSP_Impl.h" />
     <ClInclude Include="rsa-gmp.hpp" />
     <ClInclude Include="rsassa-pss.h" />
-  </ItemGroup>
-  <ItemGroup>
-    <None Include="..\KeccakReferenceAndOptimized\Sources\KeccakF-1600-64.macros" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

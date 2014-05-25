@@ -31,24 +31,21 @@
 
 // Given
 //	FSPHANDLE	the socket handle
-//	void **		the place holder for the available buffer
-//	int			the requested capacity of the buffer
 //	NotifyOrReturn	the pointer to the function called back when enough buffer available
 // Return
 //	Size of free send bufffe in bytes, 0 if no free, negative if error
 DllExport
-int FSPAPI GetSendBuffer(FSPHANDLE hFSPSocket, void *(*pBuf), int m, NotifyOrReturn fp1)
+int FSPAPI GetSendBuffer(FSPHANDLE hFSPSocket, int m, CallbackBufferReady fp1)
 {
 	register CSocketItemDl * p = (CSocketItemDl *)hFSPSocket;
 	try
 	{
-		if(m <= 0)
-			return -EDOM;
-		if(! p->StateEqual(ESTABLISHED) && ! p->StateEqual(PAUSING) && ! p->StateEqual(RESUMING))
-			return -EBADF;	// invalid FSP handle	//! p->StateEqual(CHALLENGING)
-		if(! p->TestSetSendReturn(fp1))
+		// Invalid FSP handle: for sake of prebuffering only in a limited number of states sending is prehibited
+		if (p->StateEqual(NON_EXISTENT) || p->StateEqual(LISTENING) || p->StateEqual(CLOSED))
+			return -EBADF;
+		if (!p->TestSetSendReturn(fp1))
 			return -EBUSY;
-		return p->AcquireSendBuf(*pBuf, m);
+		return p->AcquireSendBuf(m);
 	}
 	catch(...)
 	{
@@ -78,17 +75,18 @@ int FSPAPI SendInline(FSPHANDLE hFSPSocket, void * buffer, int len, bool toBeCon
 	{
 		if(! p->WaitSetMutex())
 			return -EINTR;	// UNRESOLVED! Simultaneous one send and one receive shall be allowed!
+		//
 		if(p->StateEqual(PAUSING))
 		{
 			TRACE_HERE("Data requested to be sent in PAUSING state. Migrate to RESUMING state");
 			p->RevertToResume();
-		}	// See also TryClose()
-		else if(! p->StateEqual(ESTABLISHED) && ! p->StateEqual(RESUMING))
-		{
-			// QUASI_ACTIVE and CLONING are excluded. This is a rate-control policy.
-			p->SetMutexFree();
-			return -EPERM;
 		}
+		else if (p->StateEqual(NON_EXISTENT) || p->StateEqual(LISTENING) || p->StateEqual(CLOSED))
+		{
+			p->SetMutexFree();
+			return -EBADF;
+		}
+		//
 		int r = p->PrepareToSend(buffer, len, toBeContinued);
 		p->SetMutexFree();
 		if(r < 0)
@@ -141,25 +139,24 @@ int FSPAPI WriteTo(FSPHANDLE hFSPSocket, void * buffer, int len, char flag, Noti
 }
 
 
-// Given
-//	void * &	the placeholder of the returned buffer
-//	int			the requested capacity
 // Return
 //	Size of currently available free send buffer
-int LOCALAPI CSocketItemDl::AcquireSendBuf(void * & buf, int n)
+int CSocketItemDl::AcquireSendBuf(int n)
 {
 	if(pendingSendBuf != NULL)
-	{
-		buf = NULL;
 		return -EBUSY;
-	}
+	if (n <= 0)
+		return -EDOM;
 	pendingSendSize = n;
-	buf = pControlBlock->InquireSendBuf(n);
-	if(n >= pendingSendSize && SelfNotify(FSP_NotifyBufferReady) < 0)
+
+	void *buf = pControlBlock->InquireSendBuf(n);
+
+	if(buf != NULL && SelfNotify(FSP_NotifyBufferReady) < 0)
 	{
 		TRACE_HERE("cannot generate the soft interrupt?");
 		return -EFAULT;
 	}
+
 	return n;
 }
 
@@ -187,12 +184,11 @@ int LOCALAPI CSocketItemDl::SendStream(void * buffer, int len, char flag)
 		TRACE_HERE("Data requested to be sent in PAUSING state. Migrate to RESUMING state");
 		RevertToResume();
 	}
-	else if(! StateEqual(ESTABLISHED) && ! StateEqual(RESUMING))
+	else if (StateEqual(NON_EXISTENT) || StateEqual(LISTENING) || StateEqual(CLOSED))
 	{
-		TRACE_HERE("Can only send in the ESTABLISHED or RESUMING state.\n"
-			"QUASI_ACTIVE and CLONING are excluded. This is a rate-control policy");
+		TRACE_HERE("Invalid state for sending: NON_EXISTENT, LISTENING or CLOSED.");
 		SetMutexFree();
-		return -EPERM;
+		return -EBADF;
 	}
 
 	if(InterlockedCompareExchangePointer((PVOID *) & pendingSendBuf, buffer, NULL) != NULL)
@@ -213,9 +209,9 @@ int LOCALAPI CSocketItemDl::SendStream(void * buffer, int len, char flag)
 
 // Remark
 //	Side-effect: may modify pendingSendSize and pendingSendBuf if WriteTo() is pending
-//	May call back fpSent and clear the function pointer if GetSendBuf() is pending,
-//	while size of available send buffer is given as the parameter of the call back function
-//	here we have assumed that the underlying binary system does not change execution order of volatile variable
+//	may call back fpSent and clear the function pointer
+//	Here we have assumed that the underlying binary system does not change
+//	execution order of accessing volatile variables
 void CSocketItemDl::ProcessPendingSend()
 {
 #ifdef TRACE_PACKET
@@ -232,13 +228,15 @@ void CSocketItemDl::ProcessPendingSend()
 			SetMutexFree();
 			return;
 		}
-		//
-		if(fpSent == NULL) TRACE_HERE("Internal panic! Lost way to report WriteTo result");
+#if defined(_DEBUG)
+		if (fpSent == NULL)
+			TRACE_HERE("Internal panic! Lost way to report WriteTo result");
+#endif
 	}
 
 	// Set fpSent to NULL BEFORE calling back so that chained send may set new value
 	NotifyOrReturn fp1 = GetResetSendReturn();
-	if(fp1 == NULL)
+	if (fp1 == NULL)
 	{
 		SetMutexFree();
 		return;
@@ -253,20 +251,29 @@ void CSocketItemDl::ProcessPendingSend()
 	}
 	else if(pendingSendSize > 0)	// while pendingSendBuf == NULL
 	{
+		CallbackBufferReady fp2 = (CallbackBufferReady)fp1;
 		int m = pendingSendSize;	// the size of the requested buffer
+		int r = 0;
 		void * p = pControlBlock->InquireSendBuf(m);
-		SetMutexFree();
-		if(m >= pendingSendSize)
+		if (m >= pendingSendSize)
 		{
-			fp1(this, FSP_Send, m);
+			SetMutexFree();
+			r = fp2(this, p, m);
 		}
-		else if(p != NULL && pControlBlock->CountSendBuffered() == 0)
+		else if (pControlBlock->CountSendBuffered() == 0)
 		{
-			pControlBlock->sendWindowHeadPos = 0;
-			pControlBlock->sendBufferNextPos = 0;
-			fp1(this, FSP_Send, pControlBlock->sendBufferBlockN * MAX_BLOCK_SIZE);
-			// Not pendingSendSize. See also ControlBlock::InquireSendBuf()
+			int n = pControlBlock->ClearSendWindow();
+			SetMutexFree();
+			r = fp2(this, pControlBlock->GetSendPtr(pControlBlock->HeadSend()), MAX_BLOCK_SIZE * n);
 		}
+		else
+		{
+			SetMutexFree();
+		}
+		//
+		if (r == 0)
+			TestSetSendReturn(fp2);
+		// UNRESOLVED! TODO: lock the buffer so further reporting of buffer availabity is not 
 	}
 	else
 	{
@@ -390,15 +397,6 @@ l_finish:
 int LOCALAPI CSocketItemDl::PrepareToSend(void * buf, int len, bool toBeContinued)
 {
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->GetLastBufferedSend();
-	int r = pControlBlock->MarkSendQueue(buf, len, toBeContinued);
-	if(r < 0)
-	{
-#ifdef TRACE
-	printf_s("\nMarkSendQueue 0x%08X, len = %d, toBeContinued = %d, returned %d\n", (LONG)buf, len, (int)toBeContinued, r);
-#endif
-		return r;
-	}
-
 	// Automatically mark the previous last packet as completed. See also BufferData()
 	if (skb != NULL)
 	{
@@ -409,6 +407,16 @@ int LOCALAPI CSocketItemDl::PrepareToSend(void * buf, int len, bool toBeContinue
 		skb->SetFlag<IS_COMPLETED>();
 		//^it might be redundant, but did little harm
 	}
+
+	int r = pControlBlock->MarkSendQueue(buf, len, toBeContinued);
+	if (r < 0)
+	{
+#ifdef TRACE
+		printf_s("\nMarkSendQueue 0x%08X, len = %d, toBeContinued = %d, returned %d\n", (LONG)buf, len, (int)toBeContinued, r);
+#endif
+		return r;
+	}
+
 	if(StateEqual(RESUMING))
 	{
 		skb = PeekNextToSend();

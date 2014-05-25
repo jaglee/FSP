@@ -33,7 +33,6 @@
 #include <stdio.h>
 #include <assert.h>
 
-#define _CRT_RAND_S
 #include <stdlib.h>
 
 #include "FSP.h"
@@ -126,14 +125,14 @@ const char * CStringizeNotice::names[LARGEST_FSP_NOTICE + 1] =
 	"FSP_NotifyDataReady",
 	"FSP_NotifyReset",
 	"FSP_NotifyRecycled",
-	"FSP_NotifyAdjourn",
+	"FSP_NotifyAccepted",
 	"FSP_NotifyFlushed",
 	"FSP_NotifyBufferReady",
 	"FSP_NotifyDisposed",
+	"FSP_NotifyToAdjourn",
 	//
-	"FSP_IPC_CannotReturn",	// LLS cannot return to DLL for some reason
 	// 24~31: near end error status
-	"FSP_NotifyIOError",
+	"FSP_IPC_CannotReturn",	// LLS cannot return to DLL for some reason
 	"FSP_NotifyOverflow",
 	"FSP_NotifyNameResolutionFailed"
 };
@@ -192,8 +191,8 @@ int TSingleProviderMultipleConsumerQ<TLogItem>::InitSize(int n)
 	while((n >>= 1) > 0)
 		m++;
 	// assume memory has been zeroed
-	MAX_BACKLOG_SIZE = 1 << m;
-	return MAX_BACKLOG_SIZE;
+	capacity = 1 << m;
+	return capacity;
 }
 
 
@@ -202,27 +201,27 @@ int TSingleProviderMultipleConsumerQ<TLogItem>::InitSize(int n)
 // Return
 //	non-negative on success, or negative on failure
 // Remark
-//	MAX_BACKLOG_SIZE must be some power of 2
+//	capacity must be some power of 2
 template<typename TLogItem>
 int LOCALAPI TSingleProviderMultipleConsumerQ<TLogItem>::Push(const TLogItem *p)
 {
-	if(InterlockedIncrementAcquire(& nProvider) > 1)
+	if(InterlockedIncrementAcquire16(& nProvider) > 1)
 	{
-		InterlockedDecrementRelease(& nProvider);
+		InterlockedDecrementRelease16(& nProvider);
 		return -EBUSY;
 	}
-	if(count >= MAX_BACKLOG_SIZE || nProvider > 1)
+	if(count >= capacity || nProvider > 1)
 	{
-		InterlockedDecrementRelease(& nProvider);
+		InterlockedDecrementRelease16(& nProvider);
 		return -ENOMEM;
 	}
 
 	register int i = tailQ;
 	q[i] = *p;
-	tailQ = (i + 1) & (MAX_BACKLOG_SIZE - 1);
+	tailQ = (i + 1) & (capacity - 1);
 
 	count++;
-	InterlockedDecrementRelease(& nProvider);
+	InterlockedDecrementRelease16(& nProvider);
 	return i;
 }
 
@@ -232,7 +231,7 @@ int LOCALAPI TSingleProviderMultipleConsumerQ<TLogItem>::Push(const TLogItem *p)
 // Return
 //	non-negative on success, or negative on failure
 // Remark
-//	MAX_BACKLOG_SIZE must be some power of 2
+//	capacity must be some power of 2
 //	It is assumed that there is only one producer(optimistic push) but may be multiple consumer(conservative pop)
 template<typename TLogItem>
 int LOCALAPI TSingleProviderMultipleConsumerQ<TLogItem>::Pop(TLogItem *p)
@@ -259,7 +258,7 @@ int LOCALAPI TSingleProviderMultipleConsumerQ<TLogItem>::Pop(TLogItem *p)
 	}
 
 	*p = q[i];
-	headQ = (i + 1) & (MAX_BACKLOG_SIZE - 1);
+	headQ = (i + 1) & (capacity - 1);
 	count--;
 
 l_bailout:
@@ -276,15 +275,15 @@ l_bailout:
 //	If provider lock could not be obtained it will return true ('collision found') instead of raising an 'EBUSY' exception
 bool LOCALAPI ControlBlock::HasBacklog(const BackLogItem *p)
 {
-	if(InterlockedIncrementAcquire(& backLog.nProvider) > 1)
+	if(InterlockedIncrementAcquire16(& backLog.nProvider) > 1)
 	{
-		InterlockedDecrementRelease(& backLog.nProvider);
+		InterlockedDecrementRelease16(& backLog.nProvider);
 		return true;
 	}
 
 	if(backLog.count <= 0)
 	{
-		InterlockedDecrementRelease(& backLog.nProvider);
+		InterlockedDecrementRelease16(& backLog.nProvider);
 		return false;	// empty queue
 	}
 
@@ -296,15 +295,16 @@ bool LOCALAPI ControlBlock::HasBacklog(const BackLogItem *p)
 	{
 		if(pQ[i].idRemote == p->idRemote && pQ[i].salt == p->salt)
 		{
-			InterlockedDecrementRelease(& backLog.nProvider);
+			InterlockedDecrementRelease16(& backLog.nProvider);
 			return true;
 		}
-		i = (i + 1) & (backLog.MAX_BACKLOG_SIZE - 1);
+		i = (i + 1) & (backLog.capacity - 1);
 	} while(i != k);
 	//
-	InterlockedDecrementRelease(& backLog.nProvider);
+	InterlockedDecrementRelease16(& backLog.nProvider);
 	return false;
 }
+
 
 
 // these functions may not implemented nor declared inline, or else linkage error might occur
@@ -448,23 +448,25 @@ ControlBlock::PFSP_SocketBuf ControlBlock::GetSendBuf()
 //		[_In_]  the minimum buffer size requested
 //		[_Out_] the size of the next free send buffer block, no less than what is requested
 // Return
-//	The start address of the next free send buffer block
+//	The start address of the next free send buffer block whose size might be less than requested
 // Remark
 //	It is assumed that the caller have gain exclusive access on the control block among providers
 //	However, LLS may change (sendWindowHeadPos, sendWindowFirstSN) simultaneously, non-atomically
 void * LOCALAPI ControlBlock::InquireSendBuf(int & m)
 {
-	if(m > sendBufferBlockN * MAX_BLOCK_SIZE)
+	if (m > MAX_BLOCK_SIZE * (sendBufferBlockN - CountSendBuffered()))
+	{
+		m = -EDOM;
 		return NULL;
-	//
+	}
+	// and no memory overwritten even it happens that sendBufferNextPos == sendWindowHeadPos
 	register int i = sendBufferNextPos;
 	register int k = sendWindowHeadPos;
+	if (i >= sendBufferBlockN)
+		i -= sendBufferBlockN;
 	register int n = (i >= k)
 		? (sendBufferBlockN - i) * MAX_BLOCK_SIZE
 		: (k - i) * MAX_BLOCK_SIZE;
-	//
-	if(n < m)
-		return NULL;
 	//
 	m = n;
 	return (BYTE *)this + sendBuffer + i * MAX_BLOCK_SIZE;
@@ -545,6 +547,61 @@ ControlBlock::PFSP_SocketBuf ControlBlock::PeekNextToSend() const
 
 
 // Given
+//	FSP_NormalPacketHeader	the place-holder of sequence number and flags
+//	PFSP_SocketBuf			the pointer to the send buffer block descriptor
+//	seq_t					the sequence number of the packet meant to be set
+// Do
+//	Set the sequence number, expected acknowledgment sequencenumber,
+//	flags and the advertised receive window size field of the FSP header 
+void LOCALAPI ControlBlock::SetSequenceFlags(FSP_NormalPacketHeader *pHdr, PFSP_SocketBuf skb, seq_t seq)
+{
+	pHdr->expectedSN = get32BE(&receiveMaxExpected);
+	pHdr->sequenceNo = get32BE(&seq);
+	pHdr->ClearFlags();	// pHdr->u.flags = 0;
+	if (skb->GetFlag<TO_BE_CONTINUED>())
+		pHdr->SetFlag<ToBeContinued>();
+	else
+		pHdr->ClearFlag<ToBeContinued>();
+	// UNRESOLVED! compressed? ECN?
+	// here we needn't check memory corruption as mishavior only harms himself
+	pHdr->SetRecvWS(RecvWindowSize());
+}
+
+
+
+// Given
+//	FSP_NormalPacketHeader	the place-holder of sequence number and flags
+//	seq_t					the sequence number to be accumulatively acknowledged 
+// Do
+//	Set the sequence number, expected acknowledgment sequencenumber,
+//	flags and the advertised receive window size field of the FSP header 
+// UNRESOLVED!? TODO: how to set sequence number/flags of MULTIPLY/RESTORE command
+void LOCALAPI ControlBlock::SetSequenceFlags(FSP_NormalPacketHeader *pHdr, seq_t seqExpected)
+{
+	pHdr->expectedSN = get32BE(&seqExpected);
+	pHdr->sequenceNo = get32BE(&sendWindowNextSN);
+	pHdr->ClearFlags();
+	pHdr->SetRecvWS(RecvWindowSize());
+}
+
+
+
+// Given
+//	FSP_NormalPacketHeader	the place-holder of sequence number and flags
+// Do
+//	Set the default sequence number, expected acknowledgment sequencenumber,
+//	flags and the advertised receive window size field of the FSP header 
+void LOCALAPI ControlBlock::SetSequenceFlags(FSP_NormalPacketHeader *pHdr)
+{
+	pHdr->expectedSN = get32BE(&receiveMaxExpected);
+	pHdr->sequenceNo = get32BE(&sendWindowNextSN);
+	pHdr->ClearFlags();
+	pHdr->SetRecvWS(RecvWindowSize());
+}
+
+
+
+// Given
 //	seq_t		the sequence number that is to be assigned to the new allocated packet buffer
 // Do
 //	Get a receive buffer block from the receive window and set the sequence number
@@ -611,7 +668,7 @@ ControlBlock::PFSP_SocketBuf LOCALAPI ControlBlock::AllocRecvBuf(seq_t seq1)
 //	It is assumed that the timeIn field of the descriptor of a free receive buffer block is 0
 void * LOCALAPI ControlBlock::InquireRecvBuf(int & nIO, bool & toBeContinued)
 {
-	PFSP_SocketBuf p = FirstReceived();	// HeadRecv() + recvWindowHeadPos;
+	PFSP_SocketBuf p = GetFirstReceived();
 	void * const pr = GetRecvPtr(p);	// the pointer value returned
 	//
 	const int tail = recvWindowNextPos;
@@ -684,9 +741,8 @@ int LOCALAPI ControlBlock::GetSelectiveNACK(seq_t & snExpect, FSP_SelectiveNACK:
 	if(n <= 0)
 		return -EDOM;
 	//
-	const seq_t	seq0 = recvWindowFirstSN;
 	snExpect = receiveMaxExpected;
-	if(int(snExpect - seq0) <= 0)
+	if(CountReceived() <= 0)
 		return 0;
 	//
 	register int tail = recvWindowNextPos - 1;
@@ -698,10 +754,11 @@ int LOCALAPI ControlBlock::GetSelectiveNACK(seq_t & snExpect, FSP_SelectiveNACK:
 
 	// To make life easier we have not taken into account of possibility of larger continuous data with much smaller gap
 	// If a 'very large' gap or continuous received area appeared (exceed USHRT_MAX) it would be adjusted
+	seq_t	seq0 = recvWindowFirstSN;
+	seq_t	seq1 = snExpect - 1;
 	UINT32	dataLength;
 	UINT32	gapWidth;
 	int		m = 0;
-	seq_t	seq1 = snExpect - 1;
 	do
 	{
 		if(m >= n && allowedDelay > 0)
@@ -803,11 +860,10 @@ void ControlBlock::SlideSendWindow()
 // Return whether it is in the CLOSABLE state or an ADJOURN packet has already been received
 bool ControlBlock::IsClosable() const
 {
-	int m = int(receiveMaxExpected - recvWindowFirstSN);
 	register int k = recvWindowHeadPos;
 	register PFSP_SocketBuf skb = HeadRecv() + k;
 	// Check the packet before ADJOURN
-	for (int i = 0; i < m - 1; i++)
+	for (int i = 0; i < CountReceived() - 1; i++)
 	{
 		if (!skb->GetFlag<IS_COMPLETED>())
 			return false;
@@ -825,8 +881,6 @@ bool ControlBlock::IsClosable() const
 	// Check the last receive: it should be ADJOURN
 	return (skb->opCode == ADJOURN);
 }
-
-
 
 
 

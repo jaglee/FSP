@@ -54,12 +54,12 @@ ALT_ID_T LOCALAPI CLowerInterface::RandALT_ID(PIN6_ADDR addrList)
 
 	register BYTE *s = addrList->u.Byte;
 	// if there's at least one hint, the ALT_ID_T part of the hint address will be altered if prefix matched
-	if(*(long long *)addrList->u.Byte != 0)
+	if(*(uint64_t *)addrList->u.Byte != 0)
 	{
 		bool isEffective = false;
 		for(register int j = 0; j < nAddress; j++)
 		{
-			if(*(long long *)s == *(long long *)addresses[j].sin6_addr.u.Byte)
+			if(*(uint64_t *)s == *(uint64_t *)addresses[j].sin6_addr.u.Byte)
 			{
 				*(ALT_ID_T *)(s + 12) = p->pairSessionID.source;
 				ifIndex = interfaces[j];
@@ -263,36 +263,6 @@ void LOCALAPI CSocketItemEx::SetIntegrityCheckCodeP1(FSP_NormalPacketHeader *p1)
 
 
 
-void LOCALAPI CSocketItemEx::SetSequenceFlags(FSP_NormalPacketHeader *pHdr, ControlBlock::PFSP_SocketBuf skb, ControlBlock::seq_t seq)
-{
-	// UNRESOLVED! TODO: how to set sequence number/flags of MULTIPLY/RESTORE command
-	pHdr->expectedSN = htonl(pControlBlock->receiveMaxExpected);
-	pHdr->sequenceNo = htonl(seq);
-	pHdr->ClearFlags();	// pHdr->u.flags = 0;
-	if(skb->GetFlag<TO_BE_CONTINUED>())
-		pHdr->SetFlag<ToBeContinued>();
-	else
-		pHdr->ClearFlag<ToBeContinued>();
-	// UNRESOLVED! compressed? ECN?
-	// here we needn't check memory corruption as mishavior only harms himself
-	pHdr->SetRecvWS(pControlBlock->RecvWindowSize());
-}
-
-
-
-void LOCALAPI CSocketItemEx::SetSequenceFlags(FSP_NormalPacketHeader *pHdr)
-{
-	// UNRESOLVED! TODO: how to set sequence number/flags of MULTIPLY/RESTORE command
-	pHdr->expectedSN = htonl(pControlBlock->receiveMaxExpected);
-	pHdr->sequenceNo = htonl(pControlBlock->sendWindowNextSN);
-	pHdr->ClearFlags();
-	// UNRESOLVED! compressed? ECN?
-	// here we needn't check memory corruption as mishavior only harms himself
-	pHdr->SetRecvWS(pControlBlock->RecvWindowSize());
-}
-
-
-
 /**
  * Storage location of command header, send/receive: remark
  * ('payload buffer' means that the full FSP packet is stored in the payload buffer)
@@ -331,19 +301,20 @@ bool LOCALAPI CSocketItemEx::Emit(ControlBlock::PFSP_SocketBuf skb, ControlBlock
 	switch (skb->opCode)
 	{
 	case ACK_CONNECT_REQUEST:
-		SetSequenceFlags(pHdr);
+		pControlBlock->SetSequenceFlags(pHdr);
 		pHdr->integrity.code = htonll(NowUTC());
-		CLowerInterface::Singleton()->EnumEffectiveAddresses(
-			(UINT64 *)((BYTE *)payload + sizeof(FSP_AckConnectKey))
-			);
+		CLowerInterface::Singleton()->EnumEffectiveAddresses(pControlBlock->u.connectParams.allowedPrefixes);
+		memcpy((BYTE *)payload + sizeof(FSP_AckConnectKey)
+			, pControlBlock->u.connectParams.allowedPrefixes
+			, sizeof(UINT64) * MAX_PHY_INTERFACES);
 		pHdr->hs.Set<FSP_AckConnectRequest, ACK_CONNECT_REQUEST>();
 		//
 		result = SendPacket(2, ScatteredSendBuffers(pHdr, sizeof(FSP_NormalPacketHeader), payload, skb->len));
 		break;
-	case PERSIST:	// PERSIST is an in-band control packet with optional payload that initiate a half-connection
 	case MULTIPLY:	// MULTIPLY is an out-of-band control packet that try to incarnate an new clone of the connection
 	case RESTORE:	// RESTORE is an in-band control packet that try re-established a broken/paused connection
 		tRoundTrip_us = CONNECT_INITIATION_TIMEOUT_ms << 2;	// So to tweak InitiateKeepAlive()
+	case PERSIST:	// PERSIST is an in-band control packet with optional payload that confirms a connection
 		InitiateKeepAlive();
 	case ADJOURN:	// ADJOURN is always in the queue
 	case PURE_DATA:
@@ -352,12 +323,15 @@ bool LOCALAPI CSocketItemEx::Emit(ControlBlock::PFSP_SocketBuf skb, ControlBlock
 		{
 			// TODO: debug log failure of segmented and/or online-compressed send
 #ifdef 	TRACE
-			printf_s("\nIncomplete packet to send, opCode = %d\n", skb->opCode);
+			printf_s("\nImcomplete packet to send, opCode: %s(%d, len = %d)\n"
+				, opCodeStrings[skb->opCode]
+				, skb->opCode
+				, skb->len);
 #endif
 			return 0;
 		}
 		// Which is the norm. Dynanically generate the fixed header.
-		SetSequenceFlags(pHdr, skb, seq);
+		pControlBlock->SetSequenceFlags(pHdr, skb, seq);
 		pHdr->hs.opCode = skb->opCode;
 		pHdr->hs.version = THIS_FSP_VERSION;
 		pHdr->hs.hsp = htons(sizeof(FSP_NormalPacketHeader));
@@ -390,65 +364,6 @@ bool LOCALAPI CSocketItemEx::Emit(ControlBlock::PFSP_SocketBuf skb, ControlBlock
 
 
 
-// Emit packet in the send queue, by default transmission of new packets takes precedence
-// To make life easier assume it has gain unique access to the LLS socket
-// See also HandleEmitQ, HandleFullICC
-// TODO: rate-control/quota control
-void CSocketItemEx::EmitQ()
-{
-	ControlBlock::seq_t tail = pControlBlock->sendWindowNextSN;
-	int nAvailable = int(pControlBlock->sendBufferNextSN - tail);
-	int nAllowedToSend = int(pControlBlock->sendWindowFirstSN + pControlBlock->sendWindowSize - tail);
-	int n = min(nAvailable, nAllowedToSend);
-//#ifdef TRACE
-//	printf_s("\n%s, session #%u meant to send = %d, allowed to send = %d\n"
-//		, __FUNCTION__
-//		, pairSessionID.source
-//		, nAvailable
-//		, nAllowedToSend
-//		);
-//#endif
-	if(n <= 0)
-		return;
-
-	ControlBlock::PFSP_SocketBuf skb;
-	while (pControlBlock->CheckSendWindowLimit() && (skb = pControlBlock->PeekNextToSend()) != NULL)
-	{
-//#ifdef TRACE
-//		printf_s("\nIn session#%u, to emit opcode %s, sequence = %u, len = %d\n"
-//			, pairSessionID.source
-//			, opCodeStrings[skb->opCode]
-//			, pControlBlock->sendWindowNextSN
-//			, skb->len);
-//#endif
-		if(! skb->GetFlag<IS_COMPLETED>())
-		{
-			TRACE_HERE("the last packet might not be ready, say, "
-				"during process of sending real-time encrypted long stream");
-			break;
-		}
-		if(! skb->MarkInSending())
-		{
-#ifdef TRACE
-			printf_s("Cannot gain exclusive sending lock on the packet to send."
-				" it might be piggybacked already on KEEP_ALIVE\n");
-#endif
-			continue;
-		}
-		if(! Emit(skb, pControlBlock->sendWindowNextSN))
-		{
-			skb->MarkUnsent();
-			break;
-		}
-		//
-		if(pControlBlock->sendWindowNextSN == pControlBlock->sendWindowFirstSN)
-			tEarliestSend = tRecentSend;
-		//
-		++(pControlBlock->sendWindowNextSN);
-	}
-}
-
-
 // Remark
 //	Designed side-effect for mobility support: automatically refresh the corresponding address list...
 bool CSocketItemEx::ValidateICC(FSP_NormalPacketHeader *pkt)
@@ -469,4 +384,93 @@ bool CSocketItemEx::ValidateICC(FSP_NormalPacketHeader *pkt)
 	//}
 	//addrFrom.si_family = 0;	// AF_UNSPEC;	// as the flag
 	return true;
+}
+
+
+
+
+// Emit packet in the send queue, by default transmission of new packets takes precedence
+// To make life easier assume it has gain unique access to the LLS socket
+// See also HandleEmitQ, HandleFullICC
+// TODO: rate-control/quota control
+void ControlBlock::EmitQ(CSocketItem *context)
+{
+	int nAllowedToSend = int(sendWindowFirstSN + sendWindowSize - sendWindowNextSN);
+	int nAvailable = int(sendBufferNextSN - sendWindowNextSN);
+	int n = min(nAvailable, nAllowedToSend);
+	if (n <= 0)
+		return;
+
+	PFSP_SocketBuf skb;
+	while (CheckSendWindowLimit() && (skb = PeekNextToSend()) != NULL)
+	{
+		if (!skb->GetFlag<IS_COMPLETED>())
+		{
+			TRACE_HERE("the last packet might not be ready, say, "
+				"during process of sending real-time encrypted long stream");
+			break;
+		}
+		if (!skb->MarkInSending())
+		{
+#ifdef TRACE
+			printf_s("Cannot gain exclusive sending lock on the packet to send."
+				" it might be piggybacked already on KEEP_ALIVE\n");
+#endif
+			continue;
+		}
+		if (!CSocketItemEx::Emit((CSocketItemEx *)context, skb, sendWindowNextSN))
+		{
+			skb->MarkUnsent();
+			break;
+		}
+		//
+		if (sendWindowNextSN == sendWindowFirstSN)
+			((CSocketItemEx *)context)->SetEarliestSendTime();
+		//
+		++sendWindowNextSN;
+	}
+	// UNRESOLVED! TODO: to cancel PAUSING the caller of DLL should make it explicitly! 
+	if (state == PAUSING && CountSendBuffered() < sendBufferBlockN)
+	{
+		skb = GetLastBufferedSend();
+		if (skb == NULL || skb->opCode != PURE_DATA && skb->opCode != PERSIST && skb->opCode != ADJOURN)
+		{
+			TRACE_HERE("No packet to piggyback the ADJOURN command, allocate new");
+			skb = GetSendBuf();
+			if (skb == NULL)
+			{
+				TRACE_HERE("no space for the new ADJOURN command!\n"
+					"how on earth could it happen? ill-behaviored ULA or LLS?");
+				return;
+			}
+			skb->len = 0;
+		}
+		else if (skb->opCode != ADJOURN && !skb->MarkInSending())
+		{
+#ifdef TRACE
+			printf_s("\nThe last packet is being sent, cannot piggyback the ADJOURN command, allocate new\n");
+#endif
+			skb = GetSendBuf();
+			if (skb == NULL)
+			{
+				TRACE_HERE("Pausing of the session with a crowded send buffer was canceled illegally?");
+				return;
+			}
+			skb->len = 0;
+		}
+		// else it is a piggybackable PURE_DATA or KEEP_ALIVE that has been MarkInSnding
+		skb->opCode = ADJOURN;
+		skb->MarkUnsent();
+		skb->SetFlag<IS_COMPLETED>();
+		skb->SetFlag<TO_BE_CONTINUED>(false);
+		// it is assumed that ULA has finished compression before it called Adjourn
+
+		// here we assume that in the PAUSING state DLL would refuse to accept further data from ULA
+		if(CheckSendWindowLimit()
+		&& skb->MarkInSending()
+		&& !CSocketItemEx::Emit((CSocketItemEx *)context, skb, sendBufferNextSN - 1))
+		{
+			skb->MarkUnsent();
+		}
+	}
 }

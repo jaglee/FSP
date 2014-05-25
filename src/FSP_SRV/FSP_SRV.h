@@ -35,7 +35,23 @@
 
 #include "../FSP.h"
 #include "../FSP_Impl.h"
-#include <MSWSock.h>
+
+/**
+* It requires Advanced IPv6 API support to get the application layer thread ID from the IP packet control structure
+*/
+// packet information on local address and interface number
+// for IPv6, local session ID is derived from local address
+struct CtrlMsgHdr
+{
+#if _WIN32_WINNT >= 0x0600
+	CMSGHDR		pktHdr;
+#else
+	WSACMSGHDR	pktHdr;
+#endif
+	FSP_PKTINFO	u;
+
+	bool IsIPv6() const { return (pktHdr.cmsg_level == IPPROTO_IPV6); }
+};
 
 
 #if _WIN32_WINNT < 0x0602
@@ -85,6 +101,51 @@ struct RetransmitBacklog
 		return q[i < 0 ? MAX_RETRANSMISSION + i : i];
 	}
 };
+
+
+class CommandNewSessionSrv: CommandToLLS
+{
+	friend class ConnectRequestQueue;
+	friend class CSocketItemEx;
+	friend class CSocketSrvTLB;
+
+	HANDLE	hMemoryMap;		// pass to LLS by ULA, should be duplicated by the server
+	DWORD	dwMemorySize;	// size of the shared memory, in the mapped view
+	HANDLE	hEvent;
+	UINT	index;
+	CSocketItemEx *pSocket;
+
+	bool	isValid() const { return (hEvent != NULL); }
+
+	// defined in command.cpp
+	friend void LOCALAPI Listen(CommandNewSessionSrv &);
+	friend void LOCALAPI Connect(CommandNewSessionSrv &);
+	friend void LOCALAPI SyncSession(CommandNewSessionSrv &);
+
+public:
+	CommandNewSessionSrv(const CommandToLLS *);
+	CommandNewSessionSrv() {}
+
+	void DoConnect();
+};
+
+
+
+// Implemented in os_....cpp because light-weight IPC mutual-locks are OS-dependent
+class ConnectRequestQueue
+{
+	CommandNewSessionSrv q[CONNECT_BACKLOG_SIZE];
+	int	head;
+	int tail;
+	char mayFull;
+	volatile char mutex;
+public:
+	// ConnectRequestQueue() { head = tail = 0; mayFull = 0; mutex = SHARED_FREE; }
+	int Push(const CommandNewSessionSrv *);
+	int Remove(int);
+};
+
+
 
 
 #include <pshpack1.h>
@@ -189,7 +250,7 @@ protected:
 	static VOID NTAPI TimeOut(PVOID c, BOOLEAN) { ((CSocketItemEx *)c)->TimeOut(); } 
 public:
 	//
-	bool MapControlBlock(const CommandNewSession &);
+	bool MapControlBlock(const CommandNewSessionSrv &);
 	void InitAssociation();
 	bool IsInUse() { return inUse != 0; }
 	void SetReady() { isReady = 1; }
@@ -197,34 +258,27 @@ public:
 	// though inUse may be cleared before isReady is cleared
 	bool TestAndLockReady();
 	bool TestAndWaitReady();
-	//
-	// Allocate a receiving buffer in the control block, check memory border
-	ControlBlock::PFSP_SocketBuf LOCALAPI AllocRecvBuf(ControlBlock::seq_t seq1)
+	void SetEarliestSendTime() { tEarliestSend = tRecentSend; }
+
+	bool CheckMemoryBorder(ControlBlock::PFSP_SocketBuf p)
 	{
-		ControlBlock::PFSP_SocketBuf p = pControlBlock->AllocRecvBuf(seq1);
-		// assume sequence number has been checked
 		uint32_t d = uint32_t((BYTE *)p - (BYTE*)pControlBlock);
-		if(d < sizeof(ControlBlock) || d >= dwMemorySize)
-			return NULL;
-		//
-		return p;
+		return (d >= sizeof(ControlBlock) && d < dwMemorySize);
 	}
 
 	// Convert the relative address in the control block to the address in process space
 	// checked, so that ill-behaviored ULA may not cheat LLS to access data of others
 	BYTE * GetSendPtr(const ControlBlock::PFSP_SocketBuf skb) const
 	{
-		BYTE * const p0 = (BYTE *)pControlBlock + pControlBlock->sendBufDescriptors;
-		uint32_t offset = pControlBlock->sendBuffer
-			+ MAX_BLOCK_SIZE * (skb - (ControlBlock::PFSP_SocketBuf)p0);
-		return (offset < sizeof(ControlBlock) || offset >= dwMemorySize) ? NULL : (BYTE *)pControlBlock + offset;
+		uint32_t offset;
+		BYTE * p = pControlBlock->GetSendPtr(skb, offset);
+		return (offset < sizeof(ControlBlock) || offset >= dwMemorySize) ? NULL : p;
 	}
 	BYTE * GetRecvPtr(const ControlBlock::PFSP_SocketBuf skb) const
 	{
-		BYTE * const p0 = (BYTE *)pControlBlock + pControlBlock->recvBufDescriptors;
-		uint32_t offset = pControlBlock->recvBuffer
-			+ MAX_BLOCK_SIZE * (skb - (ControlBlock::PFSP_SocketBuf)p0);
-		return (offset < sizeof(ControlBlock) || offset >= dwMemorySize) ? NULL : (BYTE *)pControlBlock + offset;
+		uint32_t offset;
+		BYTE * p = pControlBlock->GetRecvPtr(skb, offset);
+		return (offset < sizeof(ControlBlock) || offset >= dwMemorySize) ? NULL : p;
 	}
 
 
@@ -249,7 +303,7 @@ public:
 	void HandleMemoryCorruption() {	Extinguish(); }
 	void LOCALAPI AffirmConnect(const SConnectParam &, ALT_ID_T);
 
-	bool LOCALAPI IsValidSequence(ControlBlock::seq_t seq1);
+	bool IsValidSequence(ControlBlock::seq_t seq1) { return pControlBlock->IsValidSequence(seq1); }
 
 	// Given
 	//	ControlBlock::seq_t	The sequence number of the packet that mostly expected by the remote end
@@ -268,7 +322,7 @@ public:
 	{
 		// See also KeepAlive, AffirmConnect and OnAdjournAck
 		FSP_NormalPacketHeader hdr;
-		SetSequenceFlags(& hdr);
+		pControlBlock->SetSequenceFlags(& hdr);
 		hdr.hs.Set<FSP_NormalPacketHeader, c>();
 		SetIntegrityCheckCode(hdr);
 		return SendPacket(1, ScatteredSendBuffers(&hdr, sizeof(hdr)));
@@ -280,17 +334,16 @@ public:
 		hdr.integrity.id = pairSessionID;
 		SetIntegrityCheckCodeP1(& hdr);
 	}
-	void LOCALAPI SetSequenceFlags(FSP_NormalPacketHeader *, ControlBlock::PFSP_SocketBuf, ControlBlock::seq_t);
-	void LOCALAPI SetSequenceFlags(FSP_NormalPacketHeader *);
 
 	//
-	void EmitQ();
+	void EmitQ() { pControlBlock->EmitQ(this); }
+	void DoAdjourn();
 	void KeepAlive();
 	void Flush();
 	void ScheduleEmitQ();
-	void ScheduleConnect(CommandNewSession *);
+	void ScheduleConnect(CommandNewSessionSrv *);
 	// Retransmit the first packet in the send queue
-	void Retransmit1() { Emit(pControlBlock->HeadSend() + pControlBlock->sendWindowHeadPos, pControlBlock->sendWindowFirstSN); }
+	void Retransmit1() { Emit(pControlBlock->GetFirstBufferedSend(), pControlBlock->GetSendWindowFirstSN()); }
 
 	//
 	bool AddTimer();
@@ -299,16 +352,15 @@ public:
 	bool LOCALAPI ReplaceTimer(uint32_t);
 
 	// Command of ULA
-	void AckAdjourn();
 	void Shutdown();
 	//
 	// Connect and Send are special in the sense that it may take such a long time to complete that
 	// if it gains exclusive access of the socket too many packets might be lost
 	// when there are too many packets in the send queue
+	void Connect();
 	void Send();
-	void LOCALAPI Listen(CommandNewSession *);
-	void LOCALAPI Connect(CommandNewSession *);
-	void LOCALAPI SynConnect(CommandNewSession *);
+	void SynConnect();
+	void LOCALAPI Listen(CommandNewSessionSrv &);
 
 	// Event triggered by the remote peer
 	void LOCALAPI OnConnectRequestAck(FSP_AckConnectRequest &, int lenData);
@@ -320,6 +372,12 @@ public:
 	void OnGetFinish();		// FINISH packet may not 
 	void OnGetMultiply();	// MULTIPLY is treated out-of-band
 	void OnGetKeepAlive();	// KEEP_ALIVE is usually out-of-band
+
+	// A public accessible method of emitting the specified packet in the given LLS socket context
+	static bool LOCALAPI Emit(CSocketItemEx *context, ControlBlock::PFSP_SocketBuf skb, ControlBlock::seq_t seq1)
+	{
+		return context->Emit(skb, seq1);
+	}
 
 	// any packet with full-weight integrity-check-code except aforementioned
 	friend DWORD WINAPI HandleFullICC(LPVOID p);
@@ -345,7 +403,7 @@ public:
 	CSocketItemEx * AllocItem();
 	void FreeItem(CSocketItemEx *r);
 	CSocketItemEx * operator[](ALT_ID_T);
-	CSocketItemEx * operator[](const CommandNewSession &);
+	CSocketItemEx * operator[](const CommandNewSessionSrv &);
 };
 
 
@@ -367,6 +425,7 @@ private:
 	static CLowerInterface *pSingleInstance;
 
 	HANDLE	thReceiver;	// the handle of the thread that listens
+	HANDLE	hMobililty;	// handling mobility, the handle of the address-changed event
 	SOCKET	sdSend;		// the socket descriptor, would at last be unbound for sending only
 	SOCKET	sdRecv;		// the socket that received message most recently
 	fd_set	sdSet;		// set of socket descriptor for listening, one element for each physical interface
@@ -404,7 +463,9 @@ private:
 		return nearInfo.IsIPv6() ? SOCKADDR_ALT_ID(sinkInfo.name) : HeaderFSPoverUDP().source;
 	}
 
-	inline int BindInterface(SOCKET, PSOCKADDR);	// For FSP over IPv6
+	// For FSP over IPv6 raw-socket, preconfigure IPv6 interfaces with ALT_ID pool
+	inline void SetLocalApplicationLayerThreadID(ALT_ID_T);
+	// For FSP over UDP/IPv4 bind the UDP-socket
 	inline int BindInterface(SOCKET, PSOCKADDR_IN, int);
 	CSocketItemEx *		MapSocket() { return (*this)[GetLocalSessionID()]; }
 
@@ -444,8 +505,6 @@ public:
 	// It might be necessary to send reset BEFORE a connection context is established
 	void LOCALAPI SendPrematureReset(UINT32 = 0, CSocketItemEx * = NULL);
 
-	// defined in main.cpp. because of their linkage property access is limited to internal
-	inline bool LearnOneIPv6Address(PSOCKADDR_IN6, int);
 	inline void LearnAddresses();
 	inline void PoolingALT_IDs();
 	inline void ProcessRemotePacket();
@@ -465,19 +524,15 @@ public:
 
 
 // OS-specific thread-pool related, for Windows LPTHREAD_START_ROUTINE function
+DWORD WINAPI HandleConnect(LPVOID);
 DWORD WINAPI HandleSendQ(LPVOID);
 DWORD WINAPI HandleFullICC(LPVOID);
-DWORD WINAPI HandleConnect(LPVOID);
 
 // defined in socket.cpp
 void LOCALAPI DumpCMsgHdr(CtrlMsgHdr &);
 void LOCALAPI DumpHexical(BYTE *, int);
 void LOCALAPI DumpNetworkUInt16(UINT16 *, int);
 
-// defined in command.cpp
-void LOCALAPI Listen(struct CommandNewSession *);
-void LOCALAPI Connect(struct CommandNewSession *);
-void LOCALAPI SyncSession(struct CommandNewSession *);
 
 // defined in mobile.cpp
 UINT64 LOCALAPI CalculateCookie(BYTE *, int, timestamp_t);

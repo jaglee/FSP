@@ -2,14 +2,12 @@
 #include <stdlib.h>
 #include "fsp_srv.h"
 
-#include <Iphlpapi.h>
-#include <WinSock2.h>
-#include <WS2tcpip.h>
 #include <MSTcpIP.h>
+#include <Iphlpapi.h>
 
-#include <process.h>
-#include <io.h>
-#include <fcntl.h>
+#include <netfw.h>
+#include <Psapi.h>
+#include <tchar.h>
 
 
 #define REPORT_WSAERROR_TRACE(s) (\
@@ -21,6 +19,66 @@
 #pragma comment(lib, "Ws2_32.lib")
 #pragma comment(lib, "User32.lib")
 
+/*
+
+RFC 2460                   IPv6 Specification              December 1998
+
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|Version| Traffic Class |           Flow Label                  |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|         Payload Length        |  Next Header  |   Hop Limit   |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                                                               |
++                                                               +
+|                                                               |
++                         Source Address                        +
+|                                                               |
++                                                               +
+|                                                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                                                               |
++                                                               +
+|                                                               |
++                      Destination Address                      +
+|                                                               |
++                                                               +
+|                                                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+
+*/
+
+#pragma pack(1)
+struct IPv6_HEADER
+{
+	union
+	{
+		struct
+		{
+			unsigned int version : 4;
+			unsigned int traffic_class : 8;
+			unsigned int flowLabel : 20;
+		};
+		unsigned long version_traffic_flow;
+	};
+	unsigned short payloadLenth;
+	unsigned char nextHeader;	// should be IPPROTO_FSP
+	unsigned char hopLimit;		// should be 255, the maximum
+	IN6_ADDR srcAddr;
+	IN6_ADDR dstAddr;
+
+	void Set(int m, PIN6_ADDR a0, PIN6_ADDR a1)
+	{
+		version_traffic_flow = 6 << 4;	// in network byte order, it would be correct
+		payloadLenth = htons(m);
+		nextHeader = IPPROTO_FSP;
+		hopLimit = 255;		// hard-coded here
+		srcAddr = *a0;
+		dstAddr = *a1;
+	}
+};
+
+#pragma pack()
+
 CLowerInterface	* CLowerInterface::pSingleInstance;
 HANDLE	TimerWheel::timerQueue;
 
@@ -28,8 +86,7 @@ static LPFN_WSARECVMSG	WSARecvMsg;
 
 static int LOCALAPI ReportWSAError(char * msg);
 
-// eventually IPv6 version
-inline int BindInterface(SOCKET sd, PSOCKADDR_IN6 pAddrListen);
+static int CreateFWRules();
 
 // abstract out for sake of testability
 inline int GetPointerOfWSARecvMsg(SOCKET sd)
@@ -42,6 +99,7 @@ inline int GetPointerOfWSARecvMsg(SOCKET sd)
 }
 
 
+VOID NETIOAPI_API_ OnUnicastIpChanged(PVOID, PMIB_UNICASTIPADDRESS_ROW, MIB_NOTIFICATION_TYPE);
 
 
 //
@@ -55,6 +113,8 @@ CLowerInterface::CLowerInterface()
 	// initializw windows socket support
 	if((r = WSAStartup(0x202, & wsaData)) < 0)
 		throw (HRESULT)r;
+
+	CreateFWRules();
 
 	memset(& nearInfo, 0, sizeof(nearInfo));
 
@@ -119,6 +179,7 @@ CLowerInterface::CLowerInterface()
 
 CLowerInterface::~CLowerInterface()
 {
+	CancelMibChangeNotify2(hMobililty);
 	// kill the listening thread at first
 	TerminateThread(thReceiver, 0);
 
@@ -169,81 +230,41 @@ int LOCALAPI CLowerInterface::EnumEffectiveAddresses(UINT64 *prefixes)
 }
 
 
-//
-inline bool CLowerInterface::LearnOneIPv6Address(PSOCKADDR_IN6 p, int k)
-{
-	// only for unspecified/global scope:
-	if(p->sin6_scope_id != 0)
-		return false;
-
-	DWORD m = 0;
-	DWORD r = GetBestInterfaceEx((PSOCKADDR)p, & m);
-	if(r != 0)
-	{
-		m = 0;
-#ifdef TRACE
-		printf("GetBestInterfaceEx (IPv6) error number: %d\n", r);
-#endif
-	}
-
-	for(register int j = 0; j < k; j++)
-	{
-		if(interfaces[j] == m
-			&& * (long long *)(addresses[j].sin6_addr.u.Byte)
-			== * (long long *)(p->sin6_addr.u.Byte))
-		{
-			return false;	// this interface has been enumerated
-		}
-	}
-	//
-	if(k >= nAddress)
-		throw E_OUTOFMEMORY;
-	interfaces[k] = m;
-	addresses[k] = * p;
-	return true;
-}
-
 
 
 #ifndef OVER_UDP_IPv4	// by default exploit IPv6
-// Given
-//	SOCKET		The UDP socket to be bound
-//	PSOCKADDR_IN
-//	int			the position that the address is provisioned
-// Return
-//	0 if no error
-//	negative, as the error number
-int CLowerInterface::BindInterface(SOCKET sd, PSOCKADDR pAddrListen)
+/**
+ the interface to bind might be configured but not started. in that case binding would fail. do
+ netsh wlan start hostednetwork
+ */
+// inline: only in the CLowerInterface constructor may it be called
+inline int BindInterface(SOCKET sd, PSOCKADDR_IN6 pAddrListen)
 {
 	DWORD isHeaderIncluded = TRUE;	// boolean
 
-#ifdef TRACE
-	// TODO...
-#endif
-
-	if (bind(sd, pAddrListen, sizeof(SOCKADDR_IN6)) != 0)
+	if (bind(sd, (const struct sockaddr *)pAddrListen, sizeof(SOCKADDR_IN6)) != 0)
 	{
 		REPORT_WSAERROR_TRACE("Cannot bind to the selected address");
 		return -1;
 	}
 
-	// It is challenging to include IPv6 header on sending but it worthes the trouble!
-	if(setsockopt(sd, IPPROTO_IPV6, IPV6_HDRINCL, (char *) & isHeaderIncluded, sizeof(isHeaderIncluded)) != 0)
+	// It is useless to put it into promiscuous mode WSAIoctl(sd, SIO_RCVALL, ...)
+
+	if (setsockopt(sd, IPPROTO_IPV6, IPV6_HDRINCL, (char *)& isHeaderIncluded, sizeof(isHeaderIncluded)) != 0)
 	{
 		REPORT_WSAERROR_TRACE("Cannot set socket option to send the IPv6 header");
 		return -1;
 	}
-	
-	if(setsockopt(sd, IPPROTO_IPV6, IPV6_PKTINFO, (char *) & isHeaderIncluded, sizeof(isHeaderIncluded)) != 0)
+
+	if (setsockopt(sd, IPPROTO_IPV6, IPV6_PKTINFO, (char *)& isHeaderIncluded, sizeof(isHeaderIncluded)) != 0)
 	{
 		REPORT_WSAERROR_TRACE("Cannot set socket option to fetch the source IPv6 address");
 		return -1;
 	}
-	//IPV6_RECVIF: outgoing interface should echoed back on this one...
 
-	FD_SET(sd, & sdSet);
 	return 0;
 }
+
 
 
 // learn all configured IPv6 addresses
@@ -252,56 +273,127 @@ int CLowerInterface::BindInterface(SOCKET sd, PSOCKADDR pAddrListen)
 // (IPv6 addresses whose lower 32-bits are between 0 and 65535 are reserved, otherwise removed)
 inline void CLowerInterface::LearnAddresses()
 {
-	struct {
-	    INT iAddressCount;
-		SOCKET_ADDRESS Address[MAX_CONNECTION_NUM * MAX_PHY_INTERFACES];
-		SOCKADDR_IN6 in6Address[MAX_CONNECTION_NUM * MAX_PHY_INTERFACES];
-	} listAddress;
-	PSOCKADDR p;
-
-	DWORD n = 0;
-	int r = 0;
-	listAddress.iAddressCount = MAX_CONNECTION_NUM * MAX_PHY_INTERFACES;
-	if((r = WSAIoctl(sdSend, SIO_ADDRESS_LIST_QUERY, NULL, 0, & listAddress, sizeof(listAddress), & n, NULL, NULL)) != 0)
-	{
-		REPORT_WSAERROR_TRACE("Cannot query list of addresses");
-		throw (HRESULT)r;
-	}
+	PMIB_UNICASTIPADDRESS_TABLE table;
+	PIN6_ADDR p;
+	int k = 0;
+	CHAR strIPv6Addr[INET6_ADDRSTRLEN];
 
 	nAddress = FD_SETSIZE;
-	FD_ZERO(& sdSet);
-	int k = 0;
-	for(register int i = 0; i < listAddress.iAddressCount; i++)
+	FD_ZERO(&sdSet);
+	memset(addresses, 0, sizeof(addresses));
+
+	GetUnicastIpAddressTable(AF_INET6, &table);
+	for (register long i = table->NumEntries - 1; i >= 0; i--)
 	{
-		register int j;
-		p = listAddress.Address[i].lpSockaddr;
-		if(p->sa_family == AF_INET6 && LearnOneIPv6Address((PSOCKADDR_IN6)p, k))
+		p = &table->Table[i].Address.Ipv6.sin6_addr;
+
+#ifdef TRACE
+		inet_ntop(AF_INET6, p, strIPv6Addr, sizeof(strIPv6Addr));
+		printf_s("\n%s\nInterfaceIndex = %d, DaD state = %d, ScopeId = %d, SkipAsSource = %d\n"
+			, strIPv6Addr
+			, table->Table[i].InterfaceIndex
+			, table->Table[i].DadState
+			, table->Table[i].ScopeId.Value
+			, table->Table[i].SkipAsSource
+			);
+		//table->Table[i].PrefixOrigin;
+		//table->Table[i].OnLinkPrefixLength;
+#endif
+
+		// UNRESOLVED!!	// only for unspecified/global scope:?
+		if (table->Table[i].ScopeId.Value != 0)
+			continue;
+		if (table->Table[i].DadState != IpDadStateTentative && table->Table[i].DadState != IpDadStatePreferred)
+			continue;
+
+		// Here it is compatible with single physical interfaced host in multi-homed site
+		bool found = false;
+		for (register int j = 0; j < k; j++)
 		{
-			for(j = 0; j < k; j++)
+			if (interfaces[j] == table->Table[i].InterfaceIndex
+			&& *(uint64_t *)(addresses[j].sin6_addr.u.Byte) == *(uint64_t *)(p->u.Byte))
 			{
-				if(interfaces[k] == interfaces[j])
-					break;
+				found = true;
+				break;
 			}
-			if(j < i)
-				continue;
-			// we bind on unique physical interface only
-			if(BindInterface(sdSend, p) != 0)
-			{
-				REPORT_WSAERROR_TRACE("Bind failure");
-				throw E_ABORT;
-			}
-			FD_SET(sdSend, & sdSet);
-			sdSend = socket(AF_INET6, SOCK_RAW, IPPROTO_FSP);
-			if(sdSend == INVALID_SOCKET)
-				throw E_HANDLE;
 		}
+		if (found)	// this interface has been enumerated
+			continue;
+
 		//
+		if (k >= nAddress)
+			throw E_OUTOFMEMORY;
+
+		interfaces[k] = table->Table[i].InterfaceIndex;
+		addresses[k].sin6_family = AF_INET6;
+		addresses[k].sin6_addr = *p;
+		// port number and flowinfo are all zeroed already
+		addresses[k].sin6_scope_id = table->Table[i].ScopeId.Value;
+
+		if (::BindInterface(sdSend, &addresses[k]) != 0)
+		{
+			REPORT_WSAERROR_TRACE("Bind failure");
+			throw E_ABORT;
+		}
+		FD_SET(sdSend, &sdSet);
 		k++;
+
+		sdSend = socket(AF_INET6, SOCK_RAW, IPPROTO_FSP);
+		if (sdSend == INVALID_SOCKET)
+			throw E_HANDLE;
 	}
-	// it would leave one socket unbound for sending packet
-	//
 	nAddress = k;
+	FreeMibTable(table);
+
+	NotifyUnicastIpAddressChange(AF_INET6, OnUnicastIpChanged, NULL, TRUE, &hMobililty);
 }
+
+
+//
+inline void CLowerInterface::SetLocalApplicationLayerThreadID(ALT_ID_T id)
+{
+	MIB_UNICASTIPADDRESS_ROW	row;
+	int r;
+	CHAR strIPv6Addr[INET6_ADDRSTRLEN];
+
+	for (register int i = 0; i < nAddress; i++)
+	{
+		InitializeUnicastIpAddressEntry(&row);
+
+		// ALT_IDs are processed 'as is'
+		*(ALT_ID_T *)&(addresses[i].sin6_addr.u.Byte[12]) = id;
+		row.InterfaceIndex = interfaces[i];
+		row.Address.Ipv6 = addresses[i];
+
+		// UNRESOLVED! if creation failed?
+		r = CreateUnicastIpAddressEntry(&row);
+		inet_ntop(AF_INET6, &row.Address.Ipv6, strIPv6Addr, sizeof(strIPv6Addr));
+		printf_s("It returned %d to set IPv6 address to %s@%d\n", r, strIPv6Addr, interfaces[i]);
+	}
+}
+
+// TODO: for user-mode IPv6, configure contemporary IPv6 address for EVERY unicast interface
+inline void CLowerInterface::PoolingALT_IDs()
+{
+	register int k;
+	ALT_ID_T id;
+	//
+	// refuse to continue if the random number generator doesn't work
+	for (register int i = 0; i < MAX_CONNECTION_NUM; i++)
+	{
+		//
+		do
+		{
+			rand_w32(&id, 1);
+			k = id & (MAX_CONNECTION_NUM - 1);
+		} while (id <= LAST_WELL_KNOWN_ALT_ID || poolSessionID[k]->pairSessionID.source != 0);
+		// for every valid interface, pre-configure the id
+		SetLocalApplicationLayerThreadID(id);
+		//
+		poolSessionID[k]->pairSessionID.source = id;
+	}
+}
+
 #else
 // Given
 //	SOCKET		The UDP socket to be bound
@@ -423,28 +515,28 @@ inline void CLowerInterface::LearnAddresses()
 
 	nAddress = k + 1;
 }
-#endif
 
-
-// UNRESOLVED! TODO: as for IPv6, ALT_ID pool is preconfigured
 inline void CLowerInterface::PoolingALT_IDs()
 {
 	register int k;
 	ALT_ID_T id;
 	//
 	// refuse to continue if the random number generator doesn't work
-	for(register int i = 0; i < MAX_CONNECTION_NUM; i++)
+	for (register int i = 0; i < MAX_CONNECTION_NUM; i++)
 	{
 		//
 		do
 		{
-			rand_w32(& id, 1);
-			k = id & (MAX_CONNECTION_NUM-1);
-		} while(id <= LAST_WELL_KNOWN_ALT_ID || poolSessionID[k]->pairSessionID.source != 0);
+			rand_w32(&id, 1);
+			k = id & (MAX_CONNECTION_NUM - 1);
+		} while (id <= LAST_WELL_KNOWN_ALT_ID || poolSessionID[k]->pairSessionID.source != 0);
 		//
 		poolSessionID[k]->pairSessionID.source = id;
 	}
 }
+#endif
+
+
 
 
 /**
@@ -697,20 +789,21 @@ int CLowerInterface::AcceptAndProcess()
 //	Number of bytes actually sent (0 means error)
 // Remark
 //	It is safely assume that remote and near address are of the same address family
+
 int LOCALAPI CLowerInterface::SendBack(char * buf, int len)
 {
 	// the final WSAMSG structure
 	PairSessionID sidPair;
 	WSABUF wsaData[2];
-	WSABUF *pToSend;
-	int nToSend;
+	IPv6_HEADER hdrIN6;
 
 	wsaData[1].buf = buf;
 	wsaData[1].len = len;
 	if (nearInfo.IsIPv6())
 	{
-		pToSend = &wsaData[1];
-		nToSend = 1;
+		hdrIN6.Set(len, (PIN6_ADDR)& nearInfo.u, (PIN6_ADDR)& addrFrom.Ipv6.sin6_addr);
+		wsaData[0].buf = (char *)& hdrIN6;
+		wsaData[0].len = sizeof(hdrIN6);
 	}
 	else
 	{
@@ -720,9 +813,6 @@ int LOCALAPI CLowerInterface::SendBack(char * buf, int len)
 		sidPair.source = HeaderFSPoverUDP().peer;
 		wsaData[0].buf = (char *)& sidPair;
 		wsaData[0].len = sizeof(PairSessionID);
-		//
-		pToSend = wsaData;
-		nToSend = 2;
 	}
 	//
 #ifdef TRACE
@@ -731,7 +821,7 @@ int LOCALAPI CLowerInterface::SendBack(char * buf, int len)
 #endif
 	DWORD n = 0;
 	int r = WSASendTo(sdSend
-		, pToSend, nToSend, &n
+		, wsaData, 2, &n
 		, 0
 		, (const sockaddr *)& addrFrom, sinkInfo.namelen
 		, NULL, NULL);
@@ -749,51 +839,6 @@ int LOCALAPI CLowerInterface::SendBack(char * buf, int len)
 }
 
 
-
-// inline: only in the CLowerInterface constructor may it be called
-inline int BindInterface(SOCKET sd, PSOCKADDR_IN6 pAddrListen)
-{
-	DWORD optRcvAll = RCVALL_ON; // RCVALL_SOCKETLEVELONLY;
-	DWORD opt_size;
-	DWORD isHeaderIncluded = TRUE;	// boolean
-	
-	if(bind(sd, (const struct sockaddr *)pAddrListen, sizeof(SOCKADDR_IN6)) != 0)
-	{
-		REPORT_WSAERROR_TRACE("Cannot bind to the selected address");
-		return -1;
-	}
-
-	// put it into promiscuous mode
-	opt_size = sizeof(optRcvAll);
-	// The socket handle passed to the WSAIoctl function must be of AF_INET address family, SOCK_RAW socket type, and IPPROTO_IP protocol
-	if(WSAIoctl(sd, SIO_RCVALL, & optRcvAll, sizeof(optRcvAll), NULL, 0, & opt_size, NULL, NULL) != 0)
-	{
-		REPORT_WSAERROR_TRACE("Cannot set it in promiscuous mode");
-		return -1;
-	}
-
-	if(setsockopt(sd, IPPROTO_IPV6, IPV6_PKTINFO, (char *) & isHeaderIncluded, sizeof(isHeaderIncluded)) != 0)
-	{
-		REPORT_WSAERROR_TRACE("Cannot set socket option to fetch the source IPv6 address");
-		return -1;
-	}
-
-	return 0;
-}
-
-/*
-TODO: after configure the ALT_IDs, listen to address change event
-TODO: on reconfiguration, refresh IPv6 end point of each FSP socket
-
-Issue SIO_ADDRESS_LIST_CHANGE IOCTL 
-Issue SIO_ADDRESS_LIST_QUERY IOCTL 
-
-Whenever SIO_ADDRESS_LIST_CHANGE IOCTL notifies the application of address list change 
-(either through overlapped I/O or by signaling FD_ADDRESS_LIST_CHANGE event),
-he whole sequence of actions should be repeated. 
-
-scan all configured FSP socket, modify the near end addresses accordingly
-*/
 
 
 // return the WSA error number, which is greater than zero. may be zero if no error at all.
@@ -886,15 +931,13 @@ bool IsProcessAlive(DWORD idProcess)
 //	Exploit rand_s() to get a string of specified number near-real random 32-bit words 
 // Remark
 //	Hard-coded: at most generate 256 bits
-void rand_w32(uint32_t *p, int n)
+extern "C" void rand_w32(uint32_t *p, int n)
 {
-	for(register int i = 0; i < min(n, 32); i++)
+	for (register int i = 0; i < min(n, 32); i++)
 	{
 		rand_s(p + i);
 	}
 }
-
-
 
 
 
@@ -1029,11 +1072,11 @@ void CSocketItemEx::ScheduleEmitQ()
 
 
 
-void CSocketItemEx::ScheduleConnect(CommandNewSession *pCmd)
+void CSocketItemEx::ScheduleConnect(CommandNewSessionSrv *pCmd)
 {
 	// TODO: RDSC management
 	// Send RESTORE when RDSC hit
-	pCmd->u.s.pSocket = this;
+	pCmd->pSocket = this;
 	QueueUserWorkItem(HandleConnect, pCmd, WT_EXECUTELONGFUNCTION);
 }
 
@@ -1186,8 +1229,7 @@ DWORD WINAPI HandleConnect(LPVOID p)
 {
 	try
 	{
-		CSocketItemEx *p1 = (CSocketItemEx *)((CommandNewSession *)p)->u.s.pSocket;
-		p1->Connect((CommandNewSession *)p);
+		((CommandNewSessionSrv *)p)->DoConnect();
 		return 1;
 	}
 	catch(...)
@@ -1221,17 +1263,26 @@ bool CSocketItemEx::TestAndWaitReady()
 //	number of bytes sent, or 0 if error
 int CSocketItemEx::SendPacket(register ULONG n1, ScatteredSendBuffers s)
 {
-	register LPWSABUF lpBuffers;
+	register LPWSABUF lpBuffers = s.scattered;
+	IPv6_HEADER hdrIN6;
+	n1++;
+
+	// 'Prefer productivity over cleverness - if there is some cleverness'
 	if (pControlBlock->nearEnd->IsIPv6())
 	{
-		lpBuffers = &s.scattered[1];
+		int	d = 0;
+		for (register ULONG j = 1; j < n1; j++)
+		{
+			d += lpBuffers[j].len;
+		}
+		hdrIN6.Set(d, (PIN6_ADDR)& pControlBlock->nearEnd[0], &sockAddrTo->Ipv6.sin6_addr);
+		s.scattered[0].buf = (CHAR *)& hdrIN6;
+		s.scattered[0].len = sizeof(hdrIN6);
 	}
 	else
 	{
 		s.scattered[0].buf = (CHAR *)& pairSessionID;
 		s.scattered[0].len = sizeof(pairSessionID);
-		lpBuffers = s.scattered;
-		n1++;
 	}
 #ifdef TRACE_PACKET
 	printf_s("\nPeer name length = %d, socket address:\n", namelen);
@@ -1244,35 +1295,13 @@ int CSocketItemEx::SendPacket(register ULONG n1, ScatteredSendBuffers s)
 	}
 #endif
 	DWORD n = 0;
-	///It is a headache to specify valid local interface in the parameter block to utilize WSASendMsg
-	// Minimum OS version that support WSASendMsg is Windows Vista/Server 2008
-	// Let the underlying network service select the best outgoing interface
-	//int r = WSASendTo(CLowerInterface::Singleton()->sdSend
-	//	, lpBuffers, n1, &n
-	//	, 0
-	//	, (const struct sockaddr *)sockAddrTo
-	//	, namelen
-	//	, NULL, NULL);
-	///but i don't know why I/O gathering failed sometimes...
-	///it doesn't worth the trouble to figure out it on Microsoft Windows platform!?
-	//RecvSocket = WSASocket(AF_INET, 
-	//   SOCK_DGRAM, 
-	//   IPPROTO_UDP, 
-	//   NULL, 
-	//   0, 
-	//   0);
-	{
-		char buf[MAX_LLS_BLOCK_SIZE];
-		int d = 0;
-		for(register ULONG j = 0; j < n1; j++)
-		{
-			memcpy(buf + d, lpBuffers[j].buf, lpBuffers[j].len);
-			d += lpBuffers[j].len;
-		}
-		n = sendto(CLowerInterface::Singleton()->sdSend, buf, d, 0, (const struct sockaddr *)sockAddrTo, namelen);
-	}
-	int r = (n == SOCKET_ERROR ? -1 : 0);
-	//
+	int r = WSASendTo(CLowerInterface::Singleton()->sdSend
+		, lpBuffers, n1
+		, &n
+		, 0
+		, (const struct sockaddr *)sockAddrTo, namelen
+		, NULL
+		, NULL);
 	if (r != 0)
 	{
 		ReportWSAError("CSocketItemEx::SendPacket");
@@ -1286,7 +1315,7 @@ int CSocketItemEx::SendPacket(register ULONG n1, ScatteredSendBuffers s)
 
 
 
-int ConnectRequestQueue::Push(const CommandNewSession *p)
+int ConnectRequestQueue::Push(const CommandNewSessionSrv *p)
 {
 	while(_InterlockedCompareExchange8(& mutex, SHARED_BUSY, SHARED_FREE) != SHARED_FREE)
 	{
@@ -1344,3 +1373,320 @@ int ConnectRequestQueue::Remove(int i)
 	mutex = SHARED_FREE;
 	return 0;
 }	
+
+
+/*
+mobility support...
+TODO: after configure the ALT_IDs, listen to address change event
+TODO: on reconfiguration, refresh IPv6 end point of each FSP socket
+
+scan all configured FSP socket, modify the near end addresses accordingly
+*/
+//[Avoid dead loop here!]
+VOID NETIOAPI_API_ OnUnicastIpChanged(PVOID, PMIB_UNICASTIPADDRESS_ROW row, MIB_NOTIFICATION_TYPE notificationType)
+{
+	printf_s("MIB_NOTIFICATION_TYPE: %d\n", notificationType);
+	switch (notificationType)
+	{
+	case MibParameterNotification:
+		printf("//// ParameterChange.//\n");
+		break;
+	case MibAddInstance:
+		printf("//// Addition.//\n");
+		break;
+	case MibDeleteInstance:
+		printf("//// Deletion.//\n");
+		break;
+	case MibInitialNotification:
+		printf("//// Initial notification.//\n");
+		return;
+	default:
+		return;
+	}
+	if (row == NULL)
+	{
+		printf("Internal panic! Cannot guess which IP interface was changed\n");
+		return;
+	}
+
+	CHAR strIPv6Addr[INET6_ADDRSTRLEN];
+	// change from:
+	if (inet_ntop(AF_INET6, &(row->Address.Ipv6.sin6_addr), strIPv6Addr, sizeof(strIPv6Addr)) != NULL)
+		printf("\tIt is about %s\n", strIPv6Addr);
+	else
+		ReportWSAError("Cannot figuout out the string representation of the address?");
+
+	MIB_UNICASTIPADDRESS_ROW infoRow;	//SOCKADDR_IN6 addr = row->Address.Ipv6;
+	// InitializeUnicastIpAddressEntry(&infoRow);
+	infoRow.InterfaceLuid = row->InterfaceLuid;
+	infoRow.Address = row->Address;
+	GetUnicastIpAddressEntry(&infoRow);
+
+	// change to:
+	if (inet_ntop(AF_INET6, &(row->Address.Ipv6.sin6_addr), strIPv6Addr, sizeof(strIPv6Addr)) != NULL)
+		printf("\tIt is about %s\n", strIPv6Addr);
+	else
+		ReportWSAError("Cannot figuout out the string representation of the address?");
+}
+
+
+
+// return 0 if no error
+// positive if warning
+static int CreateFWRules()
+{
+	HRESULT hrComInit = S_OK;
+	HRESULT hr = S_OK;
+
+	INetFwPolicy2 *pNetFwPolicy2 = NULL;
+	INetFwRules *pFwRuleSet = NULL;
+	INetFwRule *pFwRule = NULL;
+
+	BSTR bstrRuleName = SysAllocString(L"Flexible Session Protocol");
+	BSTR bstrRuleDescription = SysAllocString(L"Allow network traffic from/to FSP over IPv6");
+	BSTR bstrRuleGroup = SysAllocString(L"FSP/IPv6");	//  and optionally FSP over UDP/IPv4
+	BSTR bstrRulePorts = SysAllocString(L"18003");	// 0x4653, i.e. ASCII Code of 'F' 'S'
+	BSTR bstrRuleService = SysAllocString(L"*");
+	BSTR bstrRuleApplication = NULL;
+	WCHAR	strBuf[MAX_PATH];	// shall not be too deep
+	// Here we assume OLE2ANSI is not defined so that OLECHAR is WCHAR
+#ifdef UNICODE	// when TCHAR is WCHAR, so that it is compatible with OLECHAR
+	//if(GetFullPathName(appPath, MAX_PATH + 1, strBuf, NULL) <= 0)	//
+	GetModuleFileName(NULL, (LPTSTR)strBuf, MAX_PATH);
+	// Windows XP:The string is truncated to nSize characters and is not null-terminated; but here we do not support XP
+#else
+	TCHAR	strBuf0[MAX_PATH + 1];
+	size_t	lenBstr;
+	//QueryFullProcessImageName(GetCurrentProcess(), 0, strBuf0, &(DWORD &)lenBstr);
+	//GetLastError();	// invalid parameter?
+	//GetProcessImageFileName(GetCurrentProcess(), strBuf0, MAX_PATH);	// \Device\Harddisk0\Partition1\...
+	GetModuleFileName(NULL, strBuf0, MAX_PATH);
+	if (mbstowcs_s<MAX_PATH>(&lenBstr, strBuf, strBuf0, MAX_PATH - 1) != 0)
+		goto l_bailout;
+#endif
+	bstrRuleApplication = SysAllocString((const OLECHAR *)strBuf);
+	// BSTR bstrRuleApplication = SysAllocString(L"%programfiles%\\Flexible Session Protocol\\raw_server.exe");
+
+	// Initialize COM.
+	hrComInit = CoInitializeEx(
+		0,
+		COINIT_APARTMENTTHREADED
+		);
+
+	// Ignore RPC_E_CHANGED_MODE; this just means that COM has already been
+	// initialized with a different mode. Since we don't care what the mode is,
+	// we'll just use the existing mode.
+	if (hrComInit != RPC_E_CHANGED_MODE)
+	{
+		if (FAILED(hrComInit))
+		{
+			printf("CoInitializeEx failed: 0x%08lx\n", hrComInit);
+			goto l_bailout;
+		}
+	}
+
+	// Retrieve INetFwPolicy2
+	hr = CoCreateInstance(
+		__uuidof(NetFwPolicy2),
+		NULL,
+		CLSCTX_INPROC_SERVER,
+		__uuidof(INetFwPolicy2),
+		(void**)& pNetFwPolicy2);
+	if (FAILED(hr))
+	{
+		printf("CoCreateInstance for INetFwPolicy2 failed: 0x%08lx\n", hr);
+		goto l_bailout;
+	}
+
+	// Retrieve INetFwRules
+	hr = pNetFwPolicy2->get_Rules(&pFwRuleSet);
+	if (FAILED(hr))
+	{
+		printf("get_Rules failed: 0x%08lx\n", hr);
+		goto l_bailout;
+	}
+
+	// Check whether the rule exists: should return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)
+	// Remove all of the old rules...
+	while (SUCCEEDED(hr = pFwRuleSet->Item(bstrRuleName, &pFwRule)))
+	{
+		pFwRule->Release();
+		if (!SUCCEEDED(pFwRuleSet->Remove(bstrRuleName)))
+			break;	// or else it would fall into deadlock
+	}
+
+
+	// Create a new Firewall Rule object.
+	hr = CoCreateInstance(
+		__uuidof(NetFwRule),
+		NULL,
+		CLSCTX_INPROC_SERVER,
+		__uuidof(INetFwRule),
+		(void**)&pFwRule);
+	if (FAILED(hr))
+	{
+		printf("CoCreateInstance for Firewall Rule failed: 0x%08lx\n", hr);
+		goto l_bailout;
+	}
+	// Outbound rule for FSP: do not specify application nor profile domain
+	// Populate the Firewall Rule object
+	pFwRule->put_Name(bstrRuleName);
+	pFwRule->put_Description(bstrRuleDescription);
+	//pFwRule->put_ApplicationName(bstrRuleApplication);	// do not limit the application for outbound
+	pFwRule->put_Protocol(IPPROTO_FSP);	//  NET_FW_IP_PROTOCOL_TCP == IPPROTO_TCP		
+	// there is no 'port' concept in FSP
+	pFwRule->put_Direction(NET_FW_RULE_DIR_OUT);
+	pFwRule->put_Grouping(bstrRuleGroup);
+	pFwRule->put_Profiles(NET_FW_PROFILE2_ALL);
+	pFwRule->put_Action(NET_FW_ACTION_ALLOW);
+	pFwRule->put_Enabled(VARIANT_TRUE);
+	// LocalAddresses, LocalPorts, RemoteAddresses, RemotePorts, Interfaces and InterfaceTypes are all ignored
+	// Add the Firewall Rule
+	hr = pFwRuleSet->Add(pFwRule);
+	if (FAILED(hr))	// 80070005 // E_ACCESSDENIED
+	{
+		printf("Firewall Rule Add failed: 0x%08lx\n", hr);
+		goto l_bailout;
+	}
+
+
+	// The second rule is inbound/service rule for FSP: bind appliction
+	pFwRule->Release();
+	// must release the old one or else the rule handle is the same as the one exists
+	hr = CoCreateInstance(
+		__uuidof(NetFwRule),
+		NULL,
+		CLSCTX_INPROC_SERVER,
+		__uuidof(INetFwRule),
+		(void**)&pFwRule);
+	if (FAILED(hr))
+	{
+		printf("CoCreateInstance for Firewall Rule failed: 0x%08lx\n", hr);
+		goto l_bailout;
+	}
+	pFwRule->put_Name(bstrRuleName);
+	pFwRule->put_Description(bstrRuleDescription);
+	pFwRule->put_ApplicationName(bstrRuleApplication);
+	// pFwRule->put_ServiceName(bstrRuleService);
+	pFwRule->put_Protocol(IPPROTO_FSP);	// NET_FW_IP_PROTOCOL_TCP
+	pFwRule->put_Direction(NET_FW_RULE_DIR_IN);		// By default the direcion is in
+	pFwRule->put_Grouping(bstrRuleGroup);
+	pFwRule->put_Profiles(NET_FW_PROFILE2_ALL);
+	pFwRule->put_Action(NET_FW_ACTION_ALLOW);
+	pFwRule->put_Enabled(VARIANT_TRUE);
+	// LocalAddresses, LocalPorts, RemoteAddresses, RemotePorts, Interfaces and InterfaceTypes are all ignored
+	// Add the Firewall Rule
+	hr = pFwRuleSet->Add(pFwRule);
+	if (FAILED(hr))	// 8000FFFF // E_UNEXPECTED	// the method failed because the object is already in the collection
+	{
+		printf("Firewall Rule Add failed: 0x%08lx\n", hr);
+		goto l_bailout;
+	}
+
+
+	// The third rule is for outbound FSP over UDP/IPv4
+	pFwRule->Release();
+	// must release the old one or else the rule handle is the same as the one exists
+	hr = CoCreateInstance(
+		__uuidof(NetFwRule),
+		NULL,
+		CLSCTX_INPROC_SERVER,
+		__uuidof(INetFwRule),
+		(void**)&pFwRule);
+	if (FAILED(hr))
+	{
+		printf("CoCreateInstance for Firewall Rule failed: 0x%08lx\n", hr);
+		goto l_bailout;
+	}
+	pFwRule->put_Name(bstrRuleName);
+	pFwRule->put_Description(bstrRuleDescription);
+	pFwRule->put_Protocol(NET_FW_IP_PROTOCOL_UDP);	// NET_FW_IP_VERSION_V4
+	pFwRule->put_LocalPorts(bstrRulePorts);
+	pFwRule->put_RemotePorts(bstrRulePorts);
+	pFwRule->put_Direction(NET_FW_RULE_DIR_OUT);
+	pFwRule->put_Grouping(bstrRuleGroup);
+	pFwRule->put_Profiles(NET_FW_PROFILE2_ALL);
+	pFwRule->put_Action(NET_FW_ACTION_ALLOW);
+	pFwRule->put_Enabled(VARIANT_TRUE);
+	// LocalAddresses, RemoteAddresses, Interfaces and InterfaceTypes are all ignored
+	// Add the Firewall Rule
+	hr = pFwRuleSet->Add(pFwRule);
+	if (FAILED(hr))	// 80070005 // E_ACCESSDENIED
+	{
+		printf("Firewall Rule Add failed: 0x%08lx\n", hr);
+		goto l_bailout;
+	}
+
+
+	// The fourth rule is for inbound/service rule for FSP over UDP/IPv4
+	pFwRule->Release();
+	// must release the old one or else the rule handle is the same as the one exists
+	hr = CoCreateInstance(
+		__uuidof(NetFwRule),
+		NULL,
+		CLSCTX_INPROC_SERVER,
+		__uuidof(INetFwRule),
+		(void**)&pFwRule);
+	if (FAILED(hr))
+	{
+		printf("CoCreateInstance for Firewall Rule failed: 0x%08lx\n", hr);
+		goto l_bailout;
+	}
+	pFwRule->put_Name(bstrRuleName);
+	pFwRule->put_Description(bstrRuleDescription);
+	pFwRule->put_ApplicationName(bstrRuleApplication);
+	// pFwRule->put_ServiceName(bstrRuleService);
+	pFwRule->put_Protocol(NET_FW_IP_PROTOCOL_UDP);	// NET_FW_IP_VERSION_V4
+	pFwRule->put_LocalPorts(bstrRulePorts);
+	pFwRule->put_RemotePorts(bstrRulePorts);
+	pFwRule->put_Direction(NET_FW_RULE_DIR_IN);		// By default the direcion is in
+	pFwRule->put_Grouping(bstrRuleGroup);
+	pFwRule->put_Profiles(NET_FW_PROFILE2_ALL);
+	pFwRule->put_Action(NET_FW_ACTION_ALLOW);
+	pFwRule->put_Enabled(VARIANT_TRUE);
+	// LocalAddresses, RemoteAddresses, Interfaces and InterfaceTypes are all ignored
+	// Add the Firewall Rule
+	hr = pFwRuleSet->Add(pFwRule);
+	if (FAILED(hr))	// 8000FFFF // E_UNEXPECTED	// the method failed because the object is already in the collection
+	{
+		printf("Firewall Rule Add failed: 0x%08lx\n", hr);
+		goto l_bailout;
+	}
+
+
+l_bailout:
+	// Free BSTR's
+	SysFreeString(bstrRuleName);
+	SysFreeString(bstrRuleDescription);
+	SysFreeString(bstrRuleGroup);
+	SysFreeString(bstrRulePorts);
+	SysFreeString(bstrRuleService);
+	if (bstrRuleApplication != NULL)
+		SysFreeString(bstrRuleApplication);
+
+	// Release the INetFwRule object
+	if (pFwRule != NULL)
+	{
+		pFwRule->Release();
+	}
+
+	// Release the INetFwRules object
+	if (pFwRuleSet != NULL)
+	{
+		pFwRuleSet->Release();
+	}
+
+	// Release the INetFwPolicy2 object
+	if (pNetFwPolicy2 != NULL)
+	{
+		pNetFwPolicy2->Release();
+	}
+
+	// Uninitialize COM.
+	if (SUCCEEDED(hrComInit))
+	{
+		CoUninitialize();
+	}
+
+	return 0;
+}

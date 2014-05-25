@@ -236,7 +236,7 @@ CSocketItemEx * CSocketSrvTLB::operator[](ALT_ID_T id)
 
 
 
-CSocketItemEx * CSocketSrvTLB::operator[](const CommandNewSession & cmd)
+CSocketItemEx * CSocketSrvTLB::operator[](const CommandNewSessionSrv & cmd)
 {
 	while(_InterlockedCompareExchange8(& this->mutex
 		, SHARED_BUSY
@@ -315,7 +315,7 @@ void CSocketItemEx::InitAssociation()
 	// the sessionID part of the first (most preferred local interface) FSP address has been set
 	for (register int i = 1; i < MAX_PHY_INTERFACES; i++)
 	{
-		pControlBlock->nearEnd[i].u.idALT = pairSessionID.source;
+		pControlBlock->nearEnd[i].idALT = pairSessionID.source;
 	}
 #ifdef TRACE
 	printf_s("InitAssociation, session ID pair: (%u, %u)\n"
@@ -343,7 +343,7 @@ void LOCALAPI CSocketItemEx::SetRemoteSessionID(ALT_ID_T id)
 
 // Clone the control block whose handle is passed by the command and bind the interfaces
 // Initialize near and remote session ID as well
-bool CSocketItemEx::MapControlBlock(const CommandNewSession & cmd)
+bool CSocketItemEx::MapControlBlock(const CommandNewSessionSrv &cmd)
 {
 #ifdef TRACE
 	printf(__FUNCDNAME__ " called, source process id = %d, size of the shared memory = 0x%X\n", cmd.idProcess, cmd.dwMemorySize);
@@ -402,7 +402,7 @@ bool CSocketItemEx::MapControlBlock(const CommandNewSession & cmd)
 	CloseHandle(hThatProcess);
 	// this->sessionID == cmd.idSession, provided it is a passive/welcome socket, not a initiative socket
 	// assert: the queue of the returned value has been initialized by the caller already
-	hEvent = cmd.u.s.hEvent;
+	hEvent = cmd.hEvent;
 	return true;
 
 l_bailout1:
@@ -428,8 +428,13 @@ int LOCALAPI CSocketItemEx::GenerateSNACK(BYTE * buf, ControlBlock::seq_t & seq0
 		= (FSP_SelectiveNACK::GapDescriptor *) & buf[sizeof(FSP_NormalPacketHeader)];
 	int n = (MAX_BLOCK_SIZE - sizeof(FSP_SelectiveNACK)) / sizeof(pGaps[0]) + 1;
 	n = pControlBlock->GetSelectiveNACK(seq0, pGaps, n);
-	if(n < 0)
+	if (n < 0)
+	{
+#ifdef TRACE
+		printf_s("GetSelectiveNACK return -%X\n", -n);
+#endif
 		return n;
+	}
 
 	// built-in rule: an optional header MUST be 64-bit aligned
 	int spFull = sizeof(FSP_NormalPacketHeader) + sizeof(pGaps[0]) * (n & 0xFFFE);
@@ -462,8 +467,9 @@ void CSocketItemEx::InitiateConnect()
 	if(pkt == NULL)
 		return;	// memory corruption
 
-	pControlBlock->u.connectParams.timeStamp = NowUTC();
-	pkt->timeStamp = htonll(pControlBlock->u.connectParams.timeStamp);
+	pControlBlock->u.connectParams.timeStamp
+		= tRecentSend = NowUTC();	// for calculation of the initial round-trip time
+	pkt->timeStamp = htonll(tRecentSend);
 	skb->SetFlag<IS_COMPLETED>();	// for resend
 	SendPacket(1, ScatteredSendBuffers(pkt, sizeof(FSP_InitiateRequest)));
 
@@ -511,6 +517,7 @@ void LOCALAPI CSocketItemEx::AffirmConnect(const SConnectParam & initState, ALT_
 	timestamp_t t1 = NowUTC();	// internal processing takes orders of magnitude less time than network propagation
 	tRoundTrip_us = uint32_t(t1 - tRecentSend);
 	tRecentSend = t1;
+	SetEarliestSendTime();		// for recalibration of round-trip time on getting acknowledgement
 
 	SetState(CONNECT_AFFIRMING);
 }
@@ -520,7 +527,7 @@ void LOCALAPI CSocketItemEx::AffirmConnect(const SConnectParam & initState, ALT_
 // ACK_CONNECT_REQUEST, Initial SN, Expected SN, Timestamp, Receive Window, responder's half-connection parameter, optional payload
 // Remark
 //	Unlike INITIATE_CONNECT nor CONNECT_REQUEST, there may be a huge queue of payload packet followed
-void LOCALAPI CSocketItemEx::SynConnect(CommandNewSession *pCmd)
+void CSocketItemEx::SynConnect()
 {
 	TRACE_HERE("called");
 
@@ -598,6 +605,21 @@ void CSocketItemEx::Extinguish()
 	RemoveTimer();
 	CSocketItem::Destroy();
 	(CLowerInterface::Singleton())->FreeItem(this);
+}
+
+
+// Do
+//	Adjourn the session
+//	Send ACK_FLUSH to the remote peer if not in CLOSED state and notify the near end ULA
+void CSocketItemEx::DoAdjourn()
+{
+	// TODO: UNRESOLVED!? as ADJOURN pause the session the send window shall be shrinked to the minimum
+	// See also OnGetPersist(), OnResume() and AckAdjourn()
+	// in the state CHALLENGING, RESUMING, CLONING or QUASI_ACTIVE: it is a transactional handshake
+	ReplaceTimer(SCAVENGE_THRESHOLD_ms);
+	SetState(CLOSABLE);
+	SendPacket<ACK_FLUSH>();
+	Notify(FSP_NotifyToAdjourn);
 }
 
 

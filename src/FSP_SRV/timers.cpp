@@ -164,13 +164,11 @@ void CSocketItemEx::TimeOut()
 
 // Send heartbeart signal to the remote end, may trigger retransmission of the remote end
 // If the first packet in the send queue is PERSIST or ADJOURN (and it is unacknowledged)
-// the packet is resent, or else either an out-of-band KEEP_ALIVE whose sequence number is
-// of the next to send is sent 
+// the packet is resent, or else an out-of-band KEEP_ALIVE with the latest sent sequence number is sent 
 void CSocketItemEx::KeepAlive()
 {
-	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend()+ pControlBlock->sendWindowHeadPos;
-	if((skb->opCode == PERSIST || skb->opCode == ADJOURN)
-	 && pControlBlock->sendBufferNextSN != pControlBlock->sendWindowFirstSN)
+	ControlBlock::PFSP_SocketBuf skb = pControlBlock->GetFirstBufferedSend();
+	if (pControlBlock->CountUnacknowledged() > 0 && (skb->opCode == PERSIST || skb->opCode == ADJOURN))
 	{
 #ifdef TRACE
 		printf_s("Keep-alive session#%u, head packet in the queue is happened to be %s\n"
@@ -184,18 +182,14 @@ void CSocketItemEx::KeepAlive()
 		return;
 	}
 
+	// UNRESOLVED! TODO: keep-alive buffer shall be per-session, and fast-retransmission shall be possible!
 	BYTE buf[sizeof(FSP_NormalPacketHeader) + MAX_BLOCK_SIZE];
 	ControlBlock::seq_t seqExpected;
 	int spFull = GenerateSNACK(buf, seqExpected);
 #ifdef TRACE
 	printf_s("Keep-alive session#%u\n"
-		"\tSend head - tail = %d - %d, recv head - tail = %d - %d\n"
 		"\tAcknowledged seq#%u, keep-alive header size = %d\n"
 		, pairSessionID.source
-		, pControlBlock->sendWindowHeadPos
-		, pControlBlock->sendBufferNextPos
-		, pControlBlock->recvWindowHeadPos
-		, pControlBlock->recvWindowNextPos
 		, seqExpected
 		, spFull);
 #endif
@@ -216,38 +210,12 @@ void CSocketItemEx::KeepAlive()
 		return;
 	}
 
-	// Always try to piggyback the KEEP_ALIVE signal on a normal, pure data packet at first
-	ControlBlock::seq_t seq0 = pControlBlock->sendWindowNextSN;
-	if( spFull - sizeof(FSP_NormalPacketHeader) == 0
-	&& (skb = pControlBlock->PeekNextToSend()) != NULL
-	&& (skb->opCode == PURE_DATA && skb->GetFlag<IS_COMPLETED>() && skb->MarkInSending()
-		|| skb->opCode == KEEP_ALIVE)
-	)
-	{
-#ifdef TRACE
-		printf_s("\tTo send back an accumulative acknowledgement.\n");
-#endif
-		// UNRESOLVED! If it is yet out of send window, send an out-of-band packet with null payload instead
-		skb->opCode = KEEP_ALIVE;
-		if(! Emit(skb, seq0))
-		{
-			skb->opCode = PURE_DATA;
-			skb->MarkUnsent();
-		}
-		return;
-	}
-
 	register FSP_NormalPacketHeader *pHdr = (FSP_NormalPacketHeader *)buf;
-	--seq0;	// this is an absolutely out-of-band command packet
 	pHdr->hs.Set<KEEP_ALIVE>(spFull);
-	pHdr->sequenceNo = htonl(seq0);
-	pHdr->expectedSN = htonl(seqExpected);
-	pHdr->ClearFlags();	// pHdr->u.flags = 0;
-	// here we needn't check memory corruption as mishavior only harms himself
-	pHdr->SetRecvWS(pControlBlock->RecvWindowSize());
+	pControlBlock->SetSequenceFlags(pHdr, seqExpected);
 	SetIntegrityCheckCode(*pHdr);
 #ifdef TRACE
-	printf_s("To send KEEP_ALIVE seq#%u, acknowledge#%u\n", seq0, seqExpected);
+	printf_s("To send KEEP_ALIVE seq#%u, acknowledge#%u\n", ntohl(pHdr->sequenceNo), seqExpected);
 #endif
 	SendPacket(1, ScatteredSendBuffers(pHdr, spFull));
 }
@@ -259,23 +227,16 @@ void CSocketItemEx::KeepAlive()
 void CSocketItemEx::Flush()
 {
 #ifdef TRACE
-	printf("Flushing session#%u\n"
-		"\tSend head - tail = %d - %d, recv head - tail = %d - %d\n"
-		, pairSessionID.source
-		, pControlBlock->sendWindowHeadPos
-		, pControlBlock->sendBufferNextPos
-		, pControlBlock->recvWindowHeadPos
-		, pControlBlock->recvWindowNextPos);
+	printf("Flushing session#%u\n", pairSessionID.source);
+	pControlBlock->DumpSendRecvWindowInfo();
 #endif
 	pControlBlock->SlideSendWindow();	// if it is not done already
-	//
-	if (pControlBlock->CountSendBuffered() <= 0)
+	if (pControlBlock->CountSendBuffered() == 0)
 	{
 		ReplaceTimer(SCAVENGE_THRESHOLD_ms);
 		SetState(CLOSABLE);
 		return;
 	}
-
 	Retransmit1();
 }
 
@@ -307,8 +268,11 @@ int LOCALAPI CSocketItemEx::RespondSNACK(ControlBlock::seq_t expectedSN, const F
 	}
 
 	// Check validity of the control block descriptors to prevent memory corruption propagation
-	const int seqHead = pControlBlock->sendWindowFirstSN;
-	int sentWidth = int(pControlBlock->sendWindowNextSN - seqHead);
+	register int32_t	capacity;
+	register int32_t	iHead;
+	register int32_t	tail;
+	ControlBlock::seq_t seqHead = pControlBlock->GetSendWindowFirstSN(capacity, iHead);
+	int sentWidth = pControlBlock->CountUnacknowledged();
 	int ackSendWidth = int(expectedSN - seqHead);
 	if(ackSendWidth == 0 && n != 0)
 	{
@@ -322,8 +286,7 @@ int LOCALAPI CSocketItemEx::RespondSNACK(ControlBlock::seq_t expectedSN, const F
 	}
 	// if the send window width < 0, it will return -EFAULT: fatal error, maybe memory corruption caused by ULA
 
-	const int	capacity = pControlBlock->sendBufferBlockN;
-	int			tail = pControlBlock->sendWindowHeadPos;
+	tail = iHead;
 	if(tail < 0 || tail >= capacity || sentWidth > capacity)	// here tail is still the head
 		return -EFAULT;
 	if(sizeof(ControlBlock) + sizeof(ControlBlock::FSP_SocketBuf) * capacity > dwMemorySize)
@@ -361,7 +324,7 @@ int LOCALAPI CSocketItemEx::RespondSNACK(ControlBlock::seq_t expectedSN, const F
 			if(! p->GetFlag<IS_ACKNOWLEDGED>())
 			{
 				p->SetFlag<IS_ACKNOWLEDGED>();
-				if(seqTail == pControlBlock->sendWindowFirstSN)
+				if(seqTail == seqHead)
 					acknowledged = true;
 			}
 			//
@@ -407,18 +370,17 @@ int LOCALAPI CSocketItemEx::RespondSNACK(ControlBlock::seq_t expectedSN, const F
 	if(acknowledged)
 	{
 		uint32_t	rtt_us = uint32_t(NowUTC() - tEarliestSend);
+		// UNRESOLVED!? TODO: study anti-cheating mechanism
 		tRoundTrip_us = (tRoundTrip_us >> 2) + (tRoundTrip_us >> 1) + ((rtt_us + 3) >> 2);
-		tRoundTrip_us -= tKeepAlive_ms * 250;
-		// it is assumed that RTT is about the same in the upstream and the downstream direction
-		// tKeepAlive = 4RTT and delay of lazy acknowledgement is RTT. fight against the cheater
 		tKeepAlive_ms = tKeepAlive_ms - (tKeepAlive_ms >> 2) + tRoundTrip_us / 1000;
 		if(tKeepAlive_ms < KEEP_ALIVE_TIMEOUT_MIN_ms)
 			tKeepAlive_ms = KEEP_ALIVE_TIMEOUT_MIN_ms;
 		//
+		// We assume that after sliding send window the number of unacknowledged was reduced
 		ChangeKeepAliveClock();
 		pControlBlock->SlideSendWindow();
 		tEarliestSend += (tRecentSend - tEarliestSend)
-			* (sentWidth - int(pControlBlock->sendWindowNextSN - seqHead))
+			* (sentWidth - pControlBlock->CountUnacknowledged())
 			/ sentWidth;
 #ifdef TRACE
 		printf_s("\nCalibrated round trip time: %dus, keep-alive timeout: %dms\n\n", tRoundTrip_us,  tKeepAlive_ms);
@@ -427,9 +389,9 @@ int LOCALAPI CSocketItemEx::RespondSNACK(ControlBlock::seq_t expectedSN, const F
 
 l_success:
 	// register retransmission of those sent but not acknowledged after expectedSN
-	if(retransTail - retransHead < MAX_RETRANSMISSION && (nAck = int(pControlBlock->sendWindowNextSN - expectedSN)) > 0)
+	if(retransTail - retransHead < MAX_RETRANSMISSION && (nAck = pControlBlock->CountUnacknowledged(expectedSN)) > 0)
 	{
-		tail = pControlBlock->sendWindowHeadPos + ackSendWidth;
+		tail = iHead + ackSendWidth;	// recalibrate it
 		if(tail >= capacity)
 			tail -= capacity;
 		p = p0 + tail;

@@ -36,6 +36,7 @@
 static ConnectRequestQueue connectRequests;
 
 
+
 // Register a passive FSP socket
 // Given
 //	_In_ pCmd point to the command context given by ULA
@@ -43,28 +44,23 @@ static ConnectRequestQueue connectRequests;
 //	Nothing
 // Remark
 //	NON_EXISTENT-->LISTENING
-void LOCALAPI Listen(struct CommandNewSession *pCmd)
+void LOCALAPI Listen(CommandNewSessionSrv &cmd)
 {
-#ifdef TRACE
-	printf_s("Requested to listen on local session %d, assigned event trigger is %s\n"
-		, pCmd->idSession
-		, pCmd->u.szEventName);
-#endif
-	if(! pCmd->ResolvEvent())
+	if (!cmd.isValid())
 	{
 		REPORT_ERROR_ON_TRACE();
 		return;
 	}
 
-	CSocketItemEx *socketItem = (CLowerInterface::Singleton())->AllocItem(pCmd->idSession);
+	CSocketItemEx *socketItem = (CLowerInterface::Singleton())->AllocItem(cmd.idSession);
 	if(socketItem == NULL)
 	{
 		TRACE_HERE("Multiple call to listen on the same local session ID?");
-		::SetEvent(pCmd->u.s.hEvent);
+		::SetEvent(cmd.hEvent);
 		return;
 	}
 
-	socketItem->Listen(pCmd);
+	socketItem->Listen(cmd);
 }
 
 
@@ -74,15 +70,15 @@ void LOCALAPI Listen(struct CommandNewSession *pCmd)
 //	_In_ pCmd point to the command context given by ULA
 // Return
 //	Nothing
-void LOCALAPI Connect(struct CommandNewSession *pCmd)
+void LOCALAPI Connect(CommandNewSessionSrv &cmd)
 {
-	if(! pCmd->ResolvEvent())
+	if (!cmd.isValid())
 		return;		// Do not trace, in case logging is overwhelmed
 
-	if( (pCmd->u.s.index = connectRequests.Push(pCmd)) < 0)
+	if( (cmd.index = connectRequests.Push(&cmd)) < 0)
 l_return:
 	{
-		::SetEvent(pCmd->u.s.hEvent);
+		::SetEvent(cmd.hEvent);
 		return;
 	}
 
@@ -90,13 +86,13 @@ l_return:
 	if(socketItem == NULL)
 		goto l_return;	// Do not trace, in case logging is overwhelmed
 
-	if(! socketItem->MapControlBlock(*pCmd))
+	if(! socketItem->MapControlBlock(cmd))
 	{
 		(CLowerInterface::Singleton())->FreeItem(socketItem);
 		goto l_return;	// Do not trace, in case logging is overwhelmed
 	}
 
-	socketItem->ScheduleConnect(pCmd);
+	socketItem->ScheduleConnect(&cmd);
 }
 
 
@@ -108,23 +104,24 @@ l_return:
 //	was found (it is a rare but possible collision) return failure
 //	if a free item was found, map the control block into process space of LLS
 //	and go on to emit the command and optional data packets in the send queue
-void LOCALAPI SyncSession(struct CommandNewSession *pCmd)
+void LOCALAPI SyncSession(CommandNewSessionSrv &cmd)
 {
-	if(! pCmd->ResolvEvent())
+	if(! cmd.isValid())
 	{
 		REPORT_ERROR_ON_TRACE();
 		return;
 	}
 
-	CSocketItemEx *socketItem = (*CLowerInterface::Singleton())[*pCmd];
+	CSocketItemEx *socketItem = (*CLowerInterface::Singleton())[cmd];
 	if(socketItem == NULL)
 	{
 		TRACE_HERE("Internal panic! Cannot map control block of the client into server's memory space");
-		::SetEvent(pCmd->u.s.hEvent);
+		::SetEvent(cmd.hEvent);
 		return;
 	}
 
-	socketItem->SynConnect(pCmd);
+	socketItem->SynConnect();
+	// Only on exception would it signal event to DLL
 }
 
 
@@ -133,18 +130,18 @@ void LOCALAPI SyncSession(struct CommandNewSession *pCmd)
 //	CommandNewSession
 // Do
 //	Routine works of registering a passive FSP socket
-void LOCALAPI CSocketItemEx::Listen(CommandNewSession *pCmd)
+void LOCALAPI CSocketItemEx::Listen(CommandNewSessionSrv &cmd)
 {
-	if(! MapControlBlock(*pCmd))
+	if(! MapControlBlock(cmd))
 	{
 		TRACE_HERE("Fatal situation when to share memory with DLL");
 		(CLowerInterface::Singleton())->FreeItem(this);
-		::SetEvent(pCmd->u.s.hEvent);
+		::SetEvent(cmd.hEvent);
 		return;
 	}
 
 	// bind to the interface as soon as the control block mapped into server's memory space
-	pairSessionID.source = pCmd->idSession;
+	pairSessionID.source = cmd.idSession;
 	InitAssociation();
 	//
 	SetReturned();
@@ -157,32 +154,29 @@ void LOCALAPI CSocketItemEx::Listen(CommandNewSession *pCmd)
 //	CommandNewSession
 // Do
 //	Routine works of registering a passive FSP socket
-void LOCALAPI CSocketItemEx::Connect(CommandNewSession *pCmd)
+void CSocketItemEx::Connect()
 {
 #ifdef TRACE
 	printf_s("Try to make connection to %s (@local session #%u)\n", PeerName(), pairSessionID.source);
 #endif
 	char nodeName[INET6_ADDRSTRLEN];
 	char *peerName = PeerName();
-	const char *serviceName = strchr(peerName, ':');
-	if(serviceName != NULL)
+	int r = ResolveToIPv6(peerName);
+	if (r <= 0)
 	{
-		serviceName++;
-		strncpy_s(nodeName, INET6_ADDRSTRLEN - 1, peerName, serviceName - peerName - 1);
-		// nodeName would be square-bracketed
-		nodeName[serviceName - peerName - 1] = 0;
-		peerName = nodeName;
-	}
-
-	// in this bootstrap project FSP over UDP/IPv4 takes precedence
-	int r = ResolveToFSPoverIPv4(peerName, serviceName);
-	if(r <= 0)
-	{
-		r = ResolveToIPv6(peerName);
+		const char *serviceName = strchr(peerName, ':');
+		if(serviceName != NULL)
+		{
+			serviceName++;
+			strncpy_s(nodeName, INET6_ADDRSTRLEN - 1, peerName, serviceName - peerName - 1);
+			nodeName[serviceName - peerName - 1] = 0;
+			peerName = nodeName;
+		}
+		r = ResolveToFSPoverIPv4(peerName, serviceName);
 		if(r <=  0)
 		{
 			Notify(FSP_NotifyNameResolutionFailed);
-			goto l_return;
+			return;
 		}
 	}
 	pControlBlock->u.connectParams.idRemote = pControlBlock->peerAddr.ipFSP.sessionID;
@@ -192,36 +186,24 @@ void LOCALAPI CSocketItemEx::Connect(CommandNewSession *pCmd)
 	// See also {FSP_DLL}CSocketItemDl::CreateControlBlock()
 	if (((PFSP_IN4_ADDR_PREFIX)pControlBlock->peerAddr.ipFSP.allowedPrefixes)->prefix == PREFIX_FSP_IP6to4)
 	{
-		int	ifDefault = pControlBlock->nearEnd[0].u.ipi6_ifindex;
+		int	ifDefault = pControlBlock->nearEnd[0].ipi6_ifindex;
 		for (register int i = 0; i < MAX_PHY_INTERFACES; i++)
 		{
 			pControlBlock->nearEnd[i].InitUDPoverIPv4(ifDefault);
 		}
 	}
 	// See also FSP_DLL$$CSocketItemDl::ToConcludeConnect
-	pControlBlock->nearEnd->u.idALT = pairSessionID.source;
+	pControlBlock->nearEnd->idALT = pairSessionID.source;
 	//^For compatibility with passive peer behavior, InitAssociation() does not prepare nearEnd[0]
 
 	// bind to the interface as soon as the control block mapped into server's memory space
 	InitAssociation();
 	InitiateConnect();
+
 	SetReturned();
 	SignalEvent();
-
-l_return:
-	connectRequests.Remove(pCmd->u.s.index);
 }
 
-
-
-// Send the ACK_ADJOURN command, as the response to in-order ADJOURN
-void CSocketItemEx::AckAdjourn()
-{
-	TRACE_HERE("called");
-	// SetState(CLOSABLE);	// Shall be redundant!
-	ReplaceTimer(SCAVENGE_THRESHOLD_ms);
-	SendPacket<ACK_FLUSH>();
-}
 
 
 // Send the FINISH command, as the last step of shut down connection
@@ -281,9 +263,9 @@ int LOCALAPI CSocketItemEx::ResolveToFSPoverIPv4(const char *nodeName, const cha
 
 	if(pAddrInfo == NULL)
 	{
-#ifdef TRACE
-		printf("Cannot resolve the IP address of the node %s\n", nodeName);
-#endif
+//#ifdef TRACE
+//		printf("Cannot resolve the IP address of the node %s\n", nodeName);
+//#endif
 		return 0;
 	}
 
@@ -333,9 +315,9 @@ int LOCALAPI CSocketItemEx::ResolveToIPv6(const char *nodeName)
 
 	if(pAddrInfo == NULL)
 	{
-#ifdef TRACE
-		printf("Cannot resolve the IPv6 address of the node %s\n", nodeName);
-#endif
+//#ifdef TRACE
+//		printf("Cannot resolve the IPv6 address of the node %s\n", nodeName);
+//#endif
 		return 0;
 	}
 
@@ -354,10 +336,21 @@ int LOCALAPI CSocketItemEx::ResolveToIPv6(const char *nodeName)
 }
 
 
+// UNRESOLVED! It is OS-dependent, however.
+CommandNewSessionSrv::CommandNewSessionSrv(const CommandToLLS *p1)
+{
+	CommandNewSession *pCmd = (CommandNewSession *)p1;
+	memcpy(this, pCmd, sizeof(CommandToLLS));
+	hMemoryMap = pCmd->hMemoryMap;
+	dwMemorySize = pCmd->dwMemorySize;
+	hEvent = OpenEvent(EVENT_MODIFY_STATE, FALSE, (LPCSTR)pCmd->szEventName);
+}
+
+
 
 // a helper function which is self-describing
-bool CommandNewSession::ResolvEvent()
+void CommandNewSessionSrv::DoConnect()
 {
-	u.s.hEvent = OpenEvent(EVENT_MODIFY_STATE, FALSE, (LPCSTR)u.szEventName);
-	return (u.s.hEvent != NULL);
+	pSocket->Connect();
+	connectRequests.Remove(index);
 }

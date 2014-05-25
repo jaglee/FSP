@@ -130,7 +130,7 @@ bool LOCALAPI CSocketItemDl::ToWelcomeMultiply(BackLogItem & backLog)
 		return false;
 	}
 
-	ControlBlock::PFSP_SocketBuf skb = pControlBlock->GetVeryFirstSendBuf(backLog.initialSN);
+	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend();
 	if(r > 0)
 	{
 		// TODO: force to slide the send window, and merge with the latest data packet
@@ -144,7 +144,7 @@ bool LOCALAPI CSocketItemDl::ToWelcomeMultiply(BackLogItem & backLog)
 		FSP_ConnectParam & varParams = welcome.params;
 		// TODO: handle of milky-payload; multihome/mobility support is always handled by LLS
 		varParams.delayLimit = 0;
-		varParams.initialSN = 0;	// backLog.initialSN to network byte order? not necessarily
+		varParams.initialSN = pControlBlock->u.connectParams.initialSN;
 		varParams.listenerID = pControlBlock->idParent;
 		varParams.hs.Set<CONNECT_PARAM>(sizeof(FSP_NormalPacketHeader) + sizeof(FSP_AckConnectKey));
 		welcome.hsKey.Set<EPHEMERAL_KEY>(sizeof(FSP_NormalPacketHeader));

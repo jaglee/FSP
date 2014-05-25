@@ -13,11 +13,8 @@
       <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
       <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx</Extensions>
     </Filter>
-    <Filter Include="Source Files\SHA3">
-      <UniqueIdentifier>{6af54fc8-1195-49a7-b4ad-42ea471d6fe2}</UniqueIdentifier>
-    </Filter>
-    <Filter Include="Header Files\SHA3">
-      <UniqueIdentifier>{85f4f6c2-b8ec-4dd8-83ff-09062295222a}</UniqueIdentifier>
+    <Filter Include="SHA3">
+      <UniqueIdentifier>{e6bf6856-3e0c-4806-a8a7-22d2f464e548}</UniqueIdentifier>
     </Filter>
   </ItemGroup>
   <ItemGroup>
@@ -51,18 +48,6 @@
     <ClCompile Include="rsassa-pss.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="..\KeccakReferenceAndOptimized\Sources\KeccakDuplex.c">
-      <Filter>Source Files\SHA3</Filter>
-    </ClCompile>
-    <ClCompile Include="..\KeccakReferenceAndOptimized\Sources\KeccakF-1600-opt64.c">
-      <Filter>Source Files\SHA3</Filter>
-    </ClCompile>
-    <ClCompile Include="..\KeccakReferenceAndOptimized\Sources\KeccakNISTInterface.c">
-      <Filter>Source Files\SHA3</Filter>
-    </ClCompile>
-    <ClCompile Include="..\KeccakReferenceAndOptimized\Sources\KeccakSponge.c">
-      <Filter>Source Files\SHA3</Filter>
-    </ClCompile>
     <ClCompile Include="..\gcm-aes.c">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -71,6 +56,21 @@
     </ClCompile>
     <ClCompile Include="..\vmac.c">
       <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="..\SHA3\KeccakDuplex.c">
+      <Filter>SHA3</Filter>
+    </ClCompile>
+    <ClCompile Include="..\SHA3\KeccakHash.c">
+      <Filter>SHA3</Filter>
+    </ClCompile>
+    <ClCompile Include="..\SHA3\KeccakSponge.c">
+      <Filter>SHA3</Filter>
+    </ClCompile>
+    <ClCompile Include="..\SHA3\KeccakF-1600-inplace32BI.c">
+      <Filter>SHA3</Filter>
+    </ClCompile>
+    <ClCompile Include="..\SHA3\KeccakNISTInterface.c">
+      <Filter>SHA3</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
@@ -92,22 +92,23 @@
     <ClInclude Include="rsassa-pss.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="..\KeccakReferenceAndOptimized\Sources\KeccakDuplex.h">
-      <Filter>Header Files\SHA3</Filter>
+    <ClInclude Include="..\SHA3\brg_endian.h">
+      <Filter>SHA3</Filter>
     </ClInclude>
-    <ClInclude Include="..\KeccakReferenceAndOptimized\Sources\KeccakNISTInterface.h">
-      <Filter>Header Files\SHA3</Filter>
+    <ClInclude Include="..\SHA3\KeccakDuplex.h">
+      <Filter>SHA3</Filter>
     </ClInclude>
-    <ClInclude Include="..\KeccakReferenceAndOptimized\Sources\KeccakSponge.h">
-      <Filter>Header Files\SHA3</Filter>
+    <ClInclude Include="..\SHA3\KeccakF-1600-interface.h">
+      <Filter>SHA3</Filter>
     </ClInclude>
-    <ClInclude Include="..\KeccakReferenceAndOptimized\Sources\KeccakF-1600-opt64-settings.h">
-      <Filter>Header Files\SHA3</Filter>
+    <ClInclude Include="..\SHA3\KeccakHash.h">
+      <Filter>SHA3</Filter>
     </ClInclude>
-  </ItemGroup>
-  <ItemGroup>
-    <None Include="..\KeccakReferenceAndOptimized\Sources\KeccakF-1600-64.macros">
-      <Filter>Source Files\SHA3</Filter>
-    </None>
+    <ClInclude Include="..\SHA3\KeccakSponge.h">
+      <Filter>SHA3</Filter>
+    </ClInclude>
+    <ClInclude Include="..\SHA3\KeccakNISTInterface.h">
+      <Filter>SHA3</Filter>
+    </ClInclude>
   </ItemGroup>
 </Project>

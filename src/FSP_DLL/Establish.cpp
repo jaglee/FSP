@@ -121,7 +121,8 @@ void CSocketItemDl::InitiateConnect()
 	// Generate the private-public key pair
 	keyTransferer.GenerateKey(FSP_PUBLIC_KEY_LEN << 3);
 
-	ControlBlock::PFSP_SocketBuf skb = pControlBlock->GetVeryFirstSendBuf(initState.initialSN);
+	pControlBlock->SetSendWindowWithHeadReserved(initState.initialSN);
+	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend();
 	skb->opCode = INIT_CONNECT;
 	skb->len = sizeof(FSP_InitiateRequest);
 	//
@@ -206,12 +207,17 @@ CSocketItemDl * LOCALAPI CSocketItemDl::PrepareToAccept(BackLogItem & backLog, C
 	// IP address, including Session ID stored in nearEnd[0] would be set by CreateControlBlock
 	// Cached session ID in the DLL SocketItem stub is set by CreateControlBlock as well
 
-	memcpy(pSocket->pControlBlock->peerAddr.ipFSP.allowedPrefixes, backLog.allowedPrefixes, sizeof(UINT64)* MAX_PHY_INTERFACES);
+	memcpy(pSocket->pControlBlock->peerAddr.ipFSP.allowedPrefixes
+		, backLog.allowedPrefixes
+		, sizeof(UINT64)* MAX_PHY_INTERFACES);
 	pSocket->pControlBlock->peerAddr.ipFSP.hostID = backLog.remoteHostID;
 	pSocket->pControlBlock->peerAddr.ipFSP.sessionID = backLog.idRemote;
 
-	pSocket->pControlBlock->recvWindowFirstSN = backLog.expectedSN;
-	pSocket->pControlBlock->receiveMaxExpected = backLog.expectedSN;
+	pSocket->pControlBlock->u.connectParams = backLog;
+	// UNRESOLVED!? Correct pSocket->pControlBlock->u.connectParams.allowedPrefixes in LLS
+
+	pSocket->pControlBlock->SetRecvWindowHead(backLog.expectedSN);
+	pSocket->pControlBlock->SetSendWindowWithHeadReserved(backLog.initialSN);
 	
 	return pSocket;
 }
@@ -234,7 +240,7 @@ bool LOCALAPI CSocketItemDl::ToWelcomeConnect(BackLogItem & backLog)
 		return false;
 	}
 
-	ControlBlock::PFSP_SocketBuf skb = pControlBlock->GetVeryFirstSendBuf(backLog.initialSN);
+	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend();
 	FSP_AckConnectKey *pKey = (FSP_AckConnectKey *)GetSendPtr(skb);
 	FSP_ConnectParam *params = (FSP_ConnectParam *)((BYTE *)pKey + sizeof(FSP_AckConnectKey));
 	//
@@ -247,8 +253,7 @@ bool LOCALAPI CSocketItemDl::ToWelcomeConnect(BackLogItem & backLog)
 
 	// TODO: handle of milky-payload; multihome/mobility support is always handled by LLS
 	params->delayLimit = 0;
-	// TODO: exploit initialSN to validate something?
-	params->initialSN = 0;
+	params->initialSN = pControlBlock->u.connectParams.initialSN;
 	//^Here it is redundant, just ignore. See also LLS::OnConnectRequestAck
 	params->listenerID = pControlBlock->idParent;
 	params->hs.Set<CONNECT_PARAM>(sizeof(FSP_NormalPacketHeader) + sizeof(*pKey));
@@ -303,7 +308,7 @@ void CSocketItemDl::ToConcludeConnect()
 	InstallSessionKey(payload + skb->len, FSP_PUBLIC_KEY_LEN);
 
 	// See also FSP_LLS$$CSocketItemEx::Connect()
-	pairSessionID.source = pControlBlock->nearEnd[0].u.idALT;
+	pairSessionID.source = pControlBlock->nearEnd[0].idALT;
 	//^As by default Connect2 set the cached session ID in the DLL SocketItem to 0
 
 	// Deliver the optional payload and skip the ACK_CONNECT_REQUEST packet
@@ -315,8 +320,7 @@ void CSocketItemDl::ToConcludeConnect()
 	context.len = skb->len;
 	context.u.st.compressing = skb->GetFlag<IS_COMPRESSED>();
 
-	pControlBlock->recvWindowHeadPos++;
-	pControlBlock->recvWindowFirstSN++;
+	pControlBlock->SlideRecvWindowByOne();
 
 	TRACE_HERE("connection request has been accepted");
 
@@ -339,7 +343,7 @@ void CSocketItemDl::ToConcludeConnect()
 		return;
 	}
 
-	// if it is transactional the head packet should have already be changed to ADJOURN
+	// LLS should change PERSIST packet to ADJOURN if it has migrated to the PAUSING state
 	SetState(r == 0 ? ESTABLISHED : PAUSING);
 
 #ifdef TRACE

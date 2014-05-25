@@ -108,6 +108,19 @@ typedef int (FSPAPI *CallbackConnected)(FSPHANDLE, PFSP_Context);
 typedef int (FSPAPI *CallbackPeeked)(FSPHANDLE, void *, int32_t, bool);
 
 
+// The pointer of the function callbacked when some inline send buffer is available
+// Given
+//	FSPHANDLE		the handle of the FSP socket (the context)
+//	void *			the start position pointer of the available send buffer
+//	int32_t			the capacity of the available send buffer in bytes
+// Return
+//	0 if no error and further availabililty of buffer should be reported
+//	negative if to be discontinued
+// Remark
+//	the caller shall make the callback function thread-safe
+typedef int (FSPAPI *CallbackBufferReady)(FSPHANDLE, void *, int32_t);
+
+
 // The function through which the FSP service informs ULA notification due to some particular
 // remote message received, or the return value of previous function call
 // Given
@@ -191,9 +204,14 @@ DllSpec
 FSPHANDLE FSPAPI ConnectMU(FSPHANDLE, PFSP_Context);
 
 
-// the API is designed in such a way that the callback function may utilize the buffer pointer immediately
+// given
+//	the handle of the FSP socket to request send buffer for,
+//	the minimum requested size of the buffer,
+//	the pointer to the callback function
+// return
+//	negative if error, or the capacity of immediately available buffer (might be 0)
 DllSpec
-int FSPAPI GetSendBuffer(FSPHANDLE, void **, int, NotifyOrReturn);
+int FSPAPI GetSendBuffer(FSPHANDLE, int, CallbackBufferReady);
 
 
 // Given

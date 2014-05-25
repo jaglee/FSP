@@ -3,9 +3,10 @@
 
 #include "stdafx.h"
 
-// #define REMOTE_APPLAYER_NAME "localhost:80"
-#define REMOTE_APPLAYER_NAME "lt-x61t:80"
+#define REMOTE_APPLAYER_NAME "localhost:80"
+// #define REMOTE_APPLAYER_NAME "lt-x61t:80"
 // #define REMOTE_APPLAYER_NAME "lt-ux31e:80"
+// #define REMOTE_APPLAYER_NAME "E000:AAAA::1"
 
 static int	FSPAPI onConnected(FSPHANDLE, PFSP_Context);
 static int	FSPAPI onReceiveNextBlock(FSPHANDLE, void *, int32_t, bool);

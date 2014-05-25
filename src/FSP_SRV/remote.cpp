@@ -36,15 +36,10 @@
 
 #ifdef TRACE
 #define TRACE_SOCKET()	\
-	printf_s("%s session#%u in state %s\n"	\
-		"\tSend head - tail = %d - %d, recv head - tail = %d - %d\n"	\
-		, __FUNCTION__	\
+	printf_s("%s session#%u in state %s\n", __FUNCTION__	\
 		, pairSessionID.source		\
-		, stateNames[lowState]				\
-		, pControlBlock->sendWindowHeadPos	\
-		, pControlBlock->sendBufferNextPos	\
-		, pControlBlock->recvWindowHeadPos	\
-		, pControlBlock->recvWindowNextPos)
+		, stateNames[lowState]);	\
+	pControlBlock->DumpSendRecvWindowInfo()
 #else
 #define TRACE_SOCKET()
 #endif
@@ -81,16 +76,6 @@ bool CSocketItemEx::TestAndLockReady()
 
 
 inline
-bool LOCALAPI CSocketItemEx::IsValidSequence(ControlBlock::seq_t seq1)
-{
-	int d = int(seq1 - pControlBlock->recvWindowFirstSN);
-	// somewhat 'be free to accept' as we didnot enforce 'announced receive window size'
-	return (0 <= d) && (d < pControlBlock->recvBufferBlockN);
-}
-
-
-
-inline
 bool CSocketItemEx::Notify(FSP_ServiceCode n)
 {
 	int r = pControlBlock->PushNotice(n);
@@ -98,7 +83,7 @@ bool CSocketItemEx::Notify(FSP_ServiceCode n)
 	{
 		SignalEvent();
 #ifdef TRACE
-		printf_s("\nSession #%u raise soft interrupt %d\n", pairSessionID.source, n);
+		printf_s("\nSession #%u raise soft interrupt %s(%d)\n", pairSessionID.source, noticeNames[n], n);
 #endif
 	}
 	return (r >= 0);
@@ -195,7 +180,7 @@ void LOCALAPI CLowerInterface::OnInitConnectAck()
 		goto l_return;
 
 	// TODO: UNRESOLVED!? get resource reservation requirement from IPv6 extension header
-	pSocket->SetRemoteSessionID(initState.idRemote = GetRemoteSessionID());
+	pSocket->SetRemoteSessionID(initState.idRemote = this->GetRemoteSessionID());
 	//^ set to new peer session ID: to support multihome it is necessary even for IPv6
 	initState.timeDelta = ntohl(response.timeDelta);
 	initState.cookie = response.cookie;
@@ -427,7 +412,7 @@ void LOCALAPI CSocketItemEx::OnConnectRequestAck(FSP_AckConnectRequest & respons
 		return;
 	}
 
-	if(ntohl(response.expectedSN) != pControlBlock->sendWindowFirstSN)	// See also onGetConnectRequest
+	if(ntohl(response.expectedSN) != pControlBlock->GetSendWindowFirstSN())	// See also onGetConnectRequest
 	{
 		TRACE_HERE("Get an unexpected/out-of-order ACK_CONNECT_REQUEST");
 		return;
@@ -452,15 +437,13 @@ void LOCALAPI CSocketItemEx::OnConnectRequestAck(FSP_AckConnectRequest & respons
 	memcpy(rIPS.allowedPrefixes, varParams.subnets, sizeof(varParams.subnets));
 
 	ControlBlock::seq_t pktSeqNo = ntohl(response.sequenceNo);
-	pControlBlock->receiveMaxExpected	// would be increased on AllocRecvBuf()
-		= pControlBlock->recvWindowFirstSN = pktSeqNo;
-	pControlBlock->sendWindowSize
-		= min(pControlBlock->sendBufferBlockN, response.GetRecvWS());
+	pControlBlock->SetRecvWindowHead(pktSeqNo);
+	pControlBlock->SetSendWindowSize(response.GetRecvWS());
 
 	// Put the payload (which might be empty) TOGETHER with the encrypted session key in the receive queue
-	ControlBlock::PFSP_SocketBuf skb = AllocRecvBuf(pktSeqNo);
+	ControlBlock::PFSP_SocketBuf skb = pControlBlock->AllocRecvBuf(pktSeqNo);
 	BYTE *ubuf;
-	if(skb == NULL || (ubuf = GetRecvPtr(skb)) == NULL)
+	if (skb == NULL || !CheckMemoryBorder(skb) || (ubuf = GetRecvPtr(skb)) == NULL)
 	{
 		TRACE_HERE("TODO: debug memory corruption error");
 		HandleMemoryCorruption();
@@ -494,10 +477,8 @@ void CSocketItemEx::OnGetPersist()
 	if (!IsValidSequence(headPacket->pktSeqNo))
 	{
 #ifdef TRACE
-		printf_s("Invalid sequence number: %u, expected: %u - %u\n"
-			, headPacket->pktSeqNo
-			, pControlBlock->recvWindowFirstSN
-			, pControlBlock->recvWindowFirstSN + pControlBlock->recvBufferBlockN - 1);
+		printf_s("Invalid sequence number: %u\n", headPacket->pktSeqNo);
+		pControlBlock->DumpSendRecvWindowInfo();
 #endif
 		return;
 	}
@@ -522,34 +503,40 @@ void CSocketItemEx::OnGetPersist()
 	if (! ResizeSendWindow(ackSeqNo, headPacket->pkt->GetRecvWS()))
 	{
 #ifdef TRACE
-		printf_s("Acknowledged sequence number: %u (expected: %u),\n"
-			"\tshould be in range %u - %u\n"
-			, ackSeqNo
-			, pControlBlock->sendWindowExpectedSN
-			, pControlBlock->sendWindowFirstSN
-			, pControlBlock->sendWindowNextSN);
+		printf_s("Acknowledged sequence number: %u\n", ackSeqNo);
+		pControlBlock->DumpSendRecvWindowInfo();
 #endif
 		return;
 	}
+
+	// Calculate RTT before processing the acknowledgement or else it would not be initialized properly
+	tRoundTrip_us = (uint32_t)min(UINT32_MAX, NowUTC() - tRecentSend);
+	if (InState(CHALLENGING))
+		tSessionBegin = tRecentSend;
+	//^ session of a responsing socket start at the time ACK_CONNECT_REQUEST was sent
+	// while the start time a resuming or resurrecting session remain the original (for sake of key life-cycle management)
+	SetState(ESTABLISHED);
+	// timer is already started when SynConnect() for transient state management, rescheduled in RespondSNACK
+
 	// PERSIST is always the accumulative acknowledgement to ACK_CONNECT_REQUEST, MULTIPLY or RESTORE
 	// however, the send window might be slided already by redundant PERSIST. RespondSNACK is safe
 	RespondSNACK(ackSeqNo, NULL, 0);
 
 	int countPlaced = PlacePayload();
-	if (countPlaced == -ENOMEM && headPacket->lenData > 0 || countPlaced == -EFAULT)
+	if (countPlaced == -EFAULT)
 	{
 #ifdef TRACE
 		printf_s("Internal panic! Cannot place optional payload in PERSIST, error code = %d\n", countPlaced);
 #endif
 		return;
 	}
+	else if (countPlaced == -EEXIST)
+	{
+		return;
+	}
+	assert(countPlaced != -EPERM); // countPlaced >= 0
 #ifdef TRACE
-	printf_s("\nSend window firt SN = %u"
-		"\nAcknowledged SN\t = %u"
-		"\nExpected next SN\t = %u\n"
-		, pControlBlock->sendWindowFirstSN
-		, ackSeqNo
-		, pControlBlock->receiveMaxExpected);
+	printf_s("\nAcknowledged SN\t = %u\n", ackSeqNo);
 #endif
 
 	// connection parameter may determine whether the payload is encrypted, however, let ULA handle it...
@@ -561,16 +548,6 @@ void CSocketItemEx::OnGetPersist()
 		// the synchronization option header...
 	}
 
-#ifdef TRACE
-	printf_s("To let ULA migrate from state %s to ESTABLISHED\n", stateNames[lowState]);
-#endif
-	tRoundTrip_us = (uint32_t)min(UINT32_MAX, NowUTC() - tRecentSend);
-	if (InState(CHALLENGING))
-		tSessionBegin = tRecentSend;
-	//^ session of a responsing socket start at the time ACK_CONNECT_REQUEST was sent
-	// while the start time a resuming or resurrecting session remain the original (for sake of key life-cycle management)
-	SetState(ESTABLISHED);
-	InitiateKeepAlive();
 	if (countPlaced > 0)
 	{
 #ifdef TRACE
@@ -578,42 +555,34 @@ void CSocketItemEx::OnGetPersist()
 #endif
 		pControlBlock->PushNotice(FSP_NotifyDataReady);
 	}
+	else
+	{
+		pControlBlock->SlideRecvWindowByOne();
+	}
 
 	Notify(FSP_NotifyAccepted);
 }
 
 
 
-// KEEP_ALIVE is usually out-of-band and carrying some special optional headers
+// KEEP_ALIVE is out-of-band and carrying some special optional headers for mobility support
+//	{ACTIVE, PAUSING}-->/KEEP_ALIVE/-->{Keep state, Retransmit selectively}
 void CSocketItemEx::OnGetKeepAlive()
 {
 #ifdef TRACE_PACKET
 	TRACE_SOCKET();
-	printf_s("\tSend queue = (%u, %u)\n"
-		"\tRecv queue = (%u, %u)\n"
-		"\t\tExpected Acknowledgement=%u\n"
-		, pControlBlock->sendWindowFirstSN
-		, pControlBlock->sendBufferNextSN
-		, pControlBlock->recvWindowFirstSN
-		, pControlBlock->receiveMaxExpected
-		, pControlBlock->sendWindowExpectedSN);
 #endif
-	FSP_Header_Manager hdrManager(& headPacket->pkt);
+	FSP_Header_Manager hdrManager(&headPacket->pkt);
 	// In the RESUMING state it may happen to receive a KEEP_ALIVE packet meant to be an accumulative acknowledgement
 	// however a PERSIST MUST be firstly accepted
 	if(lowState != ESTABLISHED && lowState != PAUSING)
 		return;
 
-	// ONLY KEEP_ALIVE might be out-of-send window (because the send window might be empty while a keep-alive must be accept)
 	// UNRESOLVED!? Taking the risk of DoS attack by replayed KEEP_ALIVE...
-	int d = int(headPacket->pktSeqNo - pControlBlock->recvWindowFirstSN);
-	if (d < -1 || d >= pControlBlock->recvBufferBlockN)
+	if (pControlBlock->IsOutOfBandStale(headPacket->pktSeqNo))
 	{
 #ifdef TRACE
-		printf_s("Invalid sequence number: %u, expected: %u - %u\n"
-			, headPacket->pktSeqNo
-			, pControlBlock->recvWindowFirstSN
-			, pControlBlock->recvWindowFirstSN + pControlBlock->recvBufferBlockN - 1);
+		printf_s("Invalid sequence number:\t %u\n", headPacket->pktSeqNo);
 #endif
 		return;
 	}
@@ -638,12 +607,8 @@ void CSocketItemEx::OnGetKeepAlive()
 	if (! ResizeSendWindow(ackSeqNo, headPacket->pkt->GetRecvWS()))
 	{
 #ifdef TRACE
-		printf_s("Acknowledged sequence number: %u (expected: %u),\n"
-			"\tshould be in range %u - %u\n"
-			, ackSeqNo
-			, pControlBlock->sendWindowExpectedSN
-			, pControlBlock->sendWindowFirstSN
-			, pControlBlock->sendWindowNextSN);
+		printf_s("Acknowledged sequence number: %u\n", ackSeqNo);
+		pControlBlock->DumpSendRecvWindowInfo();
 #endif
 		return;
 	}
@@ -694,33 +659,13 @@ void CSocketItemEx::OnGetKeepAlive()
 #endif
 	}
 
-	int r = PlacePayload();
-	if (r > 0)
-	{ 
-#ifdef TRACE
-		printf_s("There is optional payload in the KEEP_ALIVE packet, payload length = %d\n", r);
-#endif
-		pControlBlock->PushNotice(FSP_NotifyDataReady);
-	}
-#ifdef TRACE
-	else if(r < 0)
-	{
-		// most likely because of out-of-order delivery
-		printf_s("Cannot place optional payload in the KEEP_ALIVE packet, error code = %d\n", r);
-	}
-#endif
-	//UNRESOLVED! TODO! only if there're really some
-	Notify(FSP_NotifyBufferReady);
-
-	EmitQ();
-	// Send/resend further simultaneously
 #ifdef TRACE_PACKET
 	printf_s("Retransmit on request: queue head, tail = (%d, %d)\n", retransHead, retransTail);
 #endif
 	// Resend: for FSP only on getting SNACK
-	const ControlBlock::seq_t seqHead = pControlBlock->sendWindowFirstSN;
-	const int32_t iHead = pControlBlock->sendWindowHeadPos;
-	const int32_t capacity = pControlBlock->sendBufferBlockN;
+	register int32_t capacity;
+	register int32_t iHead;
+	ControlBlock::seq_t seqHead = pControlBlock->GetSendWindowFirstSN(capacity, iHead);
 	ControlBlock::PFSP_SocketBuf skb;
 	for(register int i = retransHead; retransTail - i > 0; i++)
 	{
@@ -728,11 +673,19 @@ void CSocketItemEx::OnGetKeepAlive()
 		skb = pControlBlock->HeadSend() + (k >= capacity ? k - capacity : k);
 		Emit(skb, retransBackLog[i]);	// At most MAX_RETRANSMISSION futile retransmissions
 	}
+
+	if (pControlBlock->CountSendBuffered() < capacity)
+		Notify(FSP_NotifyBufferReady);
+
+	// UNRESOLVED! TODO: prove that 'EmitQ();' is not necessary
 }
 
 
 
-//	ACTIVE<-->/PURE_DATA/{Actively SNACK, lazily retransmit}
+// ACTIVE-->/PURE_DATA/
+//	|-->{if the receive queue are continuous and the tail is ADJOURN}
+//		-->CLOSABLE-->[Snd ACK_ADJOURN, stop keep - alive]-->[Notify]
+//	|-->{if else, keep state, Send SNACK]
 //	{CLONING, RESUMING}<-->/PURE_DATA/{just prebuffer}
 void CSocketItemEx::OnGetPureData()
 {
@@ -753,10 +706,7 @@ void CSocketItemEx::OnGetPureData()
 	if(! IsValidSequence(headPacket->pktSeqNo))
 	{
 #ifdef TRACE
-		printf_s("Invalid sequence number: %u, expected: %u - %u\n"
-			, headPacket->pktSeqNo
-			, pControlBlock->recvWindowFirstSN
-			, pControlBlock->recvWindowFirstSN + pControlBlock->recvBufferBlockN - 1);
+		printf_s("Invalid sequence number:\t %u\n", headPacket->pktSeqNo);
 #endif
 		return;
 	}
@@ -785,8 +735,11 @@ void CSocketItemEx::OnGetPureData()
 	if(PlacePayload() > 0)
 	{
 		ChangeKeepAliveClock();
-		//KeepAlive();	// make active acknowledgement
-		Notify(FSP_NotifyDataReady);
+		KeepAlive();	// make active acknowledgement	// UNRESOLVED! Study fairness of retransmission control
+		if (pControlBlock->IsClosable())
+			DoAdjourn();
+		else
+			Notify(FSP_NotifyDataReady);
 	}
 }
 
@@ -794,9 +747,10 @@ void CSocketItemEx::OnGetPureData()
 
 // Remark
 //	CHALLENGING-->CLOSABLE-->[Snd ACK_FLUSH]-->[Notify]
-//	{ACTIVE, PAUSING}-->[Notify]
-//    -->{after delivery, if receive buffer has no gap}CLOSABLE
-//    -->[Snd ACK_FLUSH, stop keep-alive]
+//	{ACTIVE, PAUSING}-->/ADJOURN/
+//	|-->{if the receive queue are continuous and the tail is ADJOURN}
+//		-->CLOSABLE-->[Snd ACK_ADJOURN, stop keep-alive]-->[Notify]
+//	|-->{or else if data was piggybacked}-->[Notify]
 //	RESUMING-->{stop keep-alive}CLOSABLE-->[Snd ACK_FLUSH]-->[Notify]
 //	CLONING-->{stop keep-alive}CLOSABLE-->[Snd ACK_FLUSH]-->[Notify]
 //	CLOSABLE<-->[Snd{retransmit} ACK_FLUSH]
@@ -812,8 +766,13 @@ void CSocketItemEx::OnGetAdjourn()
 	// preliminary check of sequence numbers [they are IV on calculating ICC]
 	// UNRESOLVED!? Taking the risk of DoS attack by replayed ADJOURN...
 	// TODO: throttle the rate of processing ADJOURN by 'early dropping'
-	if(! IsValidSequence(headPacket->pktSeqNo))
+	if (pControlBlock->IsOutOfBandStale(headPacket->pktSeqNo))
+	{
+#ifdef TRACE
+		printf_s("Invalid sequence number:\t %u\n", headPacket->pktSeqNo);
+#endif
 		return;
+	}
 
 	if(! ValidateICC())
 		return;
@@ -825,22 +784,28 @@ void CSocketItemEx::OnGetAdjourn()
 		return;
 	}
 
-	PlacePayload();
+	if (headPacket->lenData > 0)
+	{
+		int r = PlacePayload();
+		if (r == -EFAULT)
+		{
+			printf_s("Cannot place optional payload in the ADJOURN packet, error code = %d\n", r);
+			return;
+		}	// it is OK if r == -EPERM or r == -EEXIST: duplicate packet to urge it adjourn
+	}		// UNRESOLVED! fairness of adjourn? Anti-DoS-Attack?
 
 	if (InState(ESTABLISHED) || InState(PAUSING))
 	{
 		RespondSNACK(ntohl(headPacket->pkt->expectedSN), NULL, 0);
-		Notify(FSP_NotifyDataReady);
-		return;	// and let FSP_DLL to scan the receive queue
+		if (! pControlBlock->IsClosable())
+		{
+			if (headPacket->lenData > 0)
+				Notify(FSP_NotifyDataReady);
+			return;
+		}
 	}
 
-	// TODO: UNRESOLVED!? as ADJOURN pause the session the send window shall be shrinked to the minimum
-	// See also OnGetPersist(), OnResume() and AckAdjourn()
-	// in the state CHALLENGING, RESUMING, CLONING or QUASI_ACTIVE: it is a transactional handshake
-	ReplaceTimer(SCAVENGE_THRESHOLD_ms);
-	SetState(CLOSABLE);
-	SendPacket<ACK_FLUSH>();
-	Notify(FSP_NotifyFlushed);
+	DoAdjourn();
 }
 
 
@@ -1018,16 +983,21 @@ void CSocketItemEx::OnGetMultiply()
 //	-EFAULT	on memory fault
 int CSocketItemEx::PlacePayload()
 {
-	ControlBlock::PFSP_SocketBuf skb = AllocRecvBuf(headPacket->pktSeqNo);
+	ControlBlock::PFSP_SocketBuf skb = pControlBlock->AllocRecvBuf(headPacket->pktSeqNo);
 #ifdef TRACE_PACKET
 	printf_s("Place %d payload bytes to 0x%08X (duplicated: %d)\n"
 		, headPacket->lenData
 		, (LONG)skb
 		, skb == 0 ? 0 : (int)skb->GetFlag<IS_DELIVERED>());
 #endif
+	// an out-of-receive-window packet is not allowed to be processed
 	if(skb == NULL)
-		return -ENOMEM;
-	if(skb->GetFlag<IS_DELIVERED>())
+		return -EPERM;
+	//UNRESOLVE!? TODO: warning the system administrator that possibly there is network intrusion?
+	if (!CheckMemoryBorder(skb))
+		return -EFAULT;
+	// A keep-alive packet that is out-of-band would be simply ignore
+	if(skb->GetFlag<IS_COMPLETED>())
 		return -EEXIST;
 
 	tLastRecv = NowUTC();
