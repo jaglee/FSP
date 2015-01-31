@@ -61,7 +61,7 @@
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
       <Optimization>Disabled</Optimization>
-      <PreprocessorDefinitions>WIN32;TRACE;_DEBUG;_WINDOWS;_USRDLL;FSP_DLL_EXPORTS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>TRACE_PACKET;WIN32;OVER_UDP_IPv4;TRACE;_DEBUG;_WINDOWS;_USRDLL;FSP_DLL_EXPORTS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <MinimalRebuild>true</MinimalRebuild>
       <BasicRuntimeChecks>EnableFastChecks</BasicRuntimeChecks>
       <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
@@ -102,12 +102,13 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="..\gcm-aes.c" />
-    <ClCompile Include="..\KeccakReferenceAndOptimized\Sources\KeccakDuplex.c" />
-    <ClCompile Include="..\KeccakReferenceAndOptimized\Sources\KeccakF-1600-opt32.c" />
-    <ClCompile Include="..\KeccakReferenceAndOptimized\Sources\KeccakNISTInterface.c" />
-    <ClCompile Include="..\KeccakReferenceAndOptimized\Sources\KeccakSponge.c" />
     <ClCompile Include="..\ControlBlock.cpp" />
     <ClCompile Include="..\rijndael-alg-fst.c" />
+    <ClCompile Include="..\SHA3\KeccakDuplex.c" />
+    <ClCompile Include="..\SHA3\KeccakF-1600-inplace32BI.c" />
+    <ClCompile Include="..\SHA3\KeccakHash.c" />
+    <ClCompile Include="..\SHA3\KeccakNISTInterface.c" />
+    <ClCompile Include="..\SHA3\KeccakSponge.c" />
     <ClCompile Include="..\vmac.c" />
     <ClCompile Include="Disconnect.cpp" />
     <ClCompile Include="DllEntry.cpp" />
@@ -116,25 +117,23 @@
     <ClCompile Include="minilzo.c" />
     <ClCompile Include="Multiplex.cpp" />
     <ClCompile Include="Receive.cpp" />
-    <ClCompile Include="rsa-gmp.cpp" />
-    <ClCompile Include="rsassa-pss.cpp" />
     <ClCompile Include="Send.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\FSP.h" />
     <ClInclude Include="..\FSP_API.h" />
     <ClInclude Include="..\gcm-aes.h" />
-    <ClInclude Include="..\KeccakReferenceAndOptimized\Sources\brg_endian.h" />
-    <ClInclude Include="..\KeccakReferenceAndOptimized\Sources\KeccakDuplex.h" />
-    <ClInclude Include="..\KeccakReferenceAndOptimized\Sources\KeccakF-1600-opt32-settings.h" />
-    <ClInclude Include="..\KeccakReferenceAndOptimized\Sources\KeccakNISTInterface.h" />
-    <ClInclude Include="..\KeccakReferenceAndOptimized\Sources\KeccakSponge.h" />
+    <ClInclude Include="..\SHA3\brg_endian.h" />
+    <ClInclude Include="..\SHA3\KeccakDuplex.h" />
+    <ClInclude Include="..\SHA3\KeccakF-1600-interface.h" />
+    <ClInclude Include="..\SHA3\KeccakHash.h" />
+    <ClInclude Include="..\SHA3\KeccakNISTInterface.h" />
+    <ClInclude Include="..\SHA3\KeccakSponge.h" />
     <ClInclude Include="..\vmac.h" />
     <ClInclude Include="FSP_DLL.h" />
     <ClInclude Include="..\FSP_Impl.h" />
     <ClInclude Include="minilzo.h" />
     <ClInclude Include="rsa-gmp.hpp" />
-    <ClInclude Include="rsassa-pss.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

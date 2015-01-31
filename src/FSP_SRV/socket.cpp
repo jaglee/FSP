@@ -39,7 +39,7 @@ CSocketSrvTLB::CSocketSrvTLB()
 {
 	memset(listenerSlots, 0, sizeof(listenerSlots));
 	memset(itemStorage, 0, sizeof(itemStorage));
-	memset(poolSessionID, 0, sizeof(poolSessionID));
+	memset(poolFiberID, 0, sizeof(poolFiberID));
 	//^ assert(NULL == 0)
 	headFreeSID = & itemStorage[0];
 	tailFreeSID = & itemStorage[MAX_CONNECTION_NUM - 1];
@@ -48,8 +48,8 @@ CSocketSrvTLB::CSocketSrvTLB()
 	register int i = 0;
 	while(i < MAX_CONNECTION_NUM)
 	{
-		poolSessionID[i] = p;
-		poolSessionID[i++]->next = ++p;
+		poolFiberID[i] = p;
+		poolFiberID[i++]->next = ++p;
 		// other link pointers are already set to NULL
 	}
 	tailFreeSID->next = NULL;	// reset last 'next' pointer
@@ -71,22 +71,23 @@ CSocketItemEx * CSocketSrvTLB::AllocItem()
 	}
 
 	CSocketItemEx *p = headFreeSID;
-	while(p != NULL && p->inUse)
-	{	// lazy-move of headFreeSID
-		p = headFreeSID = p->next;
-	}
-
-	if(p == NULL)
-	{
-		tailFreeSID = NULL;	// assert: headFreeSID is set to NULL already
-	}
-	else
+	if(p != NULL)
 	{
 		headFreeSID = p->next;
 		if(headFreeSID == NULL)
 			tailFreeSID = NULL;
 		p->isReady = 0;
-		p->inUse = 1;
+		// See also Extinguish()
+		if(p->inUse)
+		{
+			p->RemoveTimer();
+			p->Destroy();
+		}
+		else
+		{
+			p->inUse = 1;
+		}
+		//
 		p->next = NULL;
 	}
 
@@ -96,7 +97,7 @@ CSocketItemEx * CSocketSrvTLB::AllocItem()
 
 
 // allocate in the listner space
-CSocketItemEx * CSocketSrvTLB::AllocItem(ALT_ID_T idListener)
+CSocketItemEx * CSocketSrvTLB::AllocItem(ALFID_T idListener)
 {
 	// TODO: UNRESOLVED!? Make sure it is multi-thread/muti-core safe
 	while(_InterlockedCompareExchange8(& this->mutex
@@ -109,7 +110,7 @@ CSocketItemEx * CSocketSrvTLB::AllocItem(ALT_ID_T idListener)
 
 	CSocketItemEx *p = NULL;
 	// registeration of passive socket: it is assumed that performance is seldom a concern, at least initially
-	// detect duplication session ID.
+	// detect duplication fiber ID.
 	for(register int i = 0; i < MAX_LISTENER_NUM; i++)
 	{
 		if(! listenerSlots[i].inUse && p == NULL)
@@ -118,10 +119,10 @@ CSocketItemEx * CSocketSrvTLB::AllocItem(ALT_ID_T idListener)
 			p->SetPassive();
 			p->isReady = 0;
 			p->inUse = 1;
-			p->pairSessionID.source = idListener;
+			p->fidPair.source = idListener;
 			// do not break, for purpose of duplicate allocation detection
 		}
-		else if(listenerSlots[i].inUse && listenerSlots[i].pairSessionID.source == idListener)
+		else if(listenerSlots[i].inUse && listenerSlots[i].fidPair.source == idListener)
 		{
 			if(p != NULL)
 				p->inUse = 0;
@@ -129,7 +130,7 @@ CSocketItemEx * CSocketSrvTLB::AllocItem(ALT_ID_T idListener)
 			p = & listenerSlots[i];
 			if(IsProcessAlive(p->idSrcProcess))
 			{
-				TRACE_HERE("collision of listener session ID detected!");
+				TRACE_HERE("collision of listener fiber ID detected!");
 				p = NULL;
 			}
 			break;
@@ -138,14 +139,14 @@ CSocketItemEx * CSocketSrvTLB::AllocItem(ALT_ID_T idListener)
 
 	if(p != NULL)
 	{
-		CSocketItemEx *p0 = poolSessionID[idListener & (MAX_CONNECTION_NUM - 1)];
+		CSocketItemEx *p0 = poolFiberID[idListener & (MAX_CONNECTION_NUM - 1)];
 		register CSocketItemEx *p1;
 		// TODO: UNRESOLVED! Is it unnecessary to detect the stale entry?
 		for(p1 = p0; p1 != NULL; p1 = p1->prevSame)
 		{
 			if(p == p1) break;
 			//
-			if(p->pairSessionID.source == p1->pairSessionID.source)
+			if(p->fidPair.source == p1->fidPair.source)
 			{
 				p = NULL;
 				break;
@@ -154,7 +155,7 @@ CSocketItemEx * CSocketSrvTLB::AllocItem(ALT_ID_T idListener)
 		if(p1 == NULL && p != NULL)
 		{
 			p->prevSame = p0;
-			poolSessionID[idListener & (MAX_CONNECTION_NUM - 1)] = p;
+			poolFiberID[idListener & (MAX_CONNECTION_NUM - 1)] = p;
 		}
 	}
 
@@ -174,13 +175,13 @@ void CSocketSrvTLB::FreeItem(CSocketItemEx *p)
 		Sleep(0);	// just yield out the CPU time slice
 	}
 	//
-	p->inUse = 0;
 	// It is deliberate to keep 'isReady'
 	//
-	// if it is allocated by AllocItem(ALT_ID_T idListener):
+	// if it is allocated by AllocItem(ALFID_T idListener):
 	if(p->IsPassive())
 	{
-		register CSocketItemEx *p1 = poolSessionID[p->pairSessionID.source & (MAX_CONNECTION_NUM - 1)];
+		register CSocketItemEx *p1 = poolFiberID[p->fidPair.source & (MAX_CONNECTION_NUM - 1)];
+		p->inUse = 0;
 		// detach it from the hash collision list
 		if(p1 != p)
 		{
@@ -198,14 +199,14 @@ void CSocketSrvTLB::FreeItem(CSocketItemEx *p)
 		}
 		else if(p1->prevSame != NULL)
 		{
-			poolSessionID[p->pairSessionID.source & (MAX_CONNECTION_NUM - 1)] = p1->prevSame;
+			poolFiberID[p->fidPair.source & (MAX_CONNECTION_NUM - 1)] = p1->prevSame;
 		}
 		// else keep at least one entry in the context-addressing TLB
 		this->mutex = SHARED_FREE;
 		return;
 	}
 
-	// if it is allocated by AllocItem() [by assigning a pseudo-random session ID]
+	// if it is allocated by AllocItem() [by assigning a pseudo-random fiber ID]
 	if(tailFreeSID == NULL)
 	{
 		headFreeSID = tailFreeSID = p;
@@ -216,18 +217,19 @@ void CSocketSrvTLB::FreeItem(CSocketItemEx *p)
 		tailFreeSID = p;
 		p = NULL;	// in case it is not
 	}
+	// postpone processing inUse until next allocation
 
 	this->mutex = SHARED_FREE;
 }
 
 
 
-CSocketItemEx * CSocketSrvTLB::operator[](ALT_ID_T id)
+CSocketItemEx * CSocketSrvTLB::operator[](ALFID_T id)
 {
-	register CSocketItemEx *p = poolSessionID[id & (MAX_CONNECTION_NUM-1)];
+	register CSocketItemEx *p = poolFiberID[id & (MAX_CONNECTION_NUM-1)];
 	do
 	{
-		if(p->pairSessionID.source == id)
+		if(p->fidPair.source == id)
 			return p;
 		p = p->prevSame;
 	} while(p != NULL);
@@ -246,7 +248,7 @@ CSocketItemEx * CSocketSrvTLB::operator[](const CommandNewSessionSrv & cmd)
 		Sleep(0);	// just yield out the CPU time slice
 	}
 	//
-	CSocketItemEx *p = (*this)[cmd.idSession];
+	CSocketItemEx *p = (*this)[cmd.fiberID];
 	if(p != NULL)
 	{
 		if(_InterlockedCompareExchange8((char *) & p->inUse, 1, 0) != 0)
@@ -276,9 +278,9 @@ l_return:
 void CSocketItemEx::InitAssociation()
 {
 	UINT32 idRemoteHost = pControlBlock->peerAddr.ipFSP.hostID;
-	// 'source' field of pairSessionID shall be filled already. See also CInterface::PoolingALT_IDs()
-	// and CSocketSrvTLB::AllocItem(), AllocItem(ALT_ID_T)
-	pairSessionID.peer = pControlBlock->peerAddr.ipFSP.sessionID;
+	// 'source' field of fidPair shall be filled already. See also CInterface::PoolingALFIDs()
+	// and CSocketSrvTLB::AllocItem(), AllocItem(ALFID_T)
+	fidPair.peer = pControlBlock->peerAddr.ipFSP.fiberID;
 
 	// See also CLowerInterface::EnumEffectiveAddresses
 	register PSOCKADDR_INET const pFarEnd = sockAddrTo;
@@ -291,9 +293,9 @@ void CSocketItemEx::InitAssociation()
 			pFarEnd[i].Ipv4.sin_addr.S_un.S_addr
 				= ((PFSP_IN4_ADDR_PREFIX) & pControlBlock->peerAddr.ipFSP.allowedPrefixes[i])->ipv4;
 			pFarEnd[i].Ipv4.sin_port = DEFAULT_FSP_UDPPORT;
-			((PFSP_IN6_ADDR) & (pFarEnd[i].Ipv6.sin6_addr))->idALT = pairSessionID.peer;
+			((PFSP_IN6_ADDR) & (pFarEnd[i].Ipv6.sin6_addr))->idALF = fidPair.peer;
 		}
-		namelen = sizeof(SOCKADDR_IN);
+		// namelen = sizeof(SOCKADDR_IN);
 	}
 	else
 	{
@@ -307,20 +309,20 @@ void CSocketItemEx::InitAssociation()
 			((PFSP_IN6_ADDR) & (pFarEnd[i].Ipv6.sin6_addr))->u.subnet
 				= pControlBlock->peerAddr.ipFSP.allowedPrefixes[i];
 			((PFSP_IN6_ADDR) & (pFarEnd[i].Ipv6.sin6_addr))->idHost = idRemoteHost;
-			((PFSP_IN6_ADDR) & (pFarEnd[i].Ipv6.sin6_addr))->idALT = pairSessionID.peer;
+			((PFSP_IN6_ADDR) & (pFarEnd[i].Ipv6.sin6_addr))->idALF = fidPair.peer;
 		}
-		namelen = sizeof(SOCKADDR_IN6);
+		// namelen = sizeof(SOCKADDR_IN6);
 	}
 
-	// the sessionID part of the first (most preferred local interface) FSP address has been set
+	// the fiberID part of the first (most preferred local interface) FSP address has been set
 	for (register int i = 1; i < MAX_PHY_INTERFACES; i++)
 	{
-		pControlBlock->nearEnd[i].idALT = pairSessionID.source;
+		pControlBlock->nearEnd[i].idALF = fidPair.source;
 	}
 #ifdef TRACE
-	printf_s("InitAssociation, session ID pair: (%u, %u)\n"
-		, pairSessionID.source
-		, pairSessionID.peer);
+	printf_s("InitAssociation, fiber ID pair: (%u, %u)\n"
+		, fidPair.source
+		, fidPair.peer);
 #endif
 	isMilky = char(pControlBlock->allowedDelay > 0);	// 0 or 1
 	lowState = pControlBlock->state;
@@ -330,19 +332,19 @@ void CSocketItemEx::InitAssociation()
 
 
 //
-void LOCALAPI CSocketItemEx::SetRemoteSessionID(ALT_ID_T id)
+void LOCALAPI CSocketItemEx::SetRemoteFiberID(ALFID_T id)
 {
-	pairSessionID.peer = id;
+	fidPair.peer = id;
 	for (register int i = 0; i < MAX_PHY_INTERFACES; i++)
 	{
-		SOCKADDR_ALT_ID(sockAddrTo + i) = id;
+		SOCKADDR_ALFID(sockAddrTo + i) = id;
 	}
 }
 
 
 
 // Clone the control block whose handle is passed by the command and bind the interfaces
-// Initialize near and remote session ID as well
+// Initialize near and remote fiber ID as well
 bool CSocketItemEx::MapControlBlock(const CommandNewSessionSrv &cmd)
 {
 #ifdef TRACE
@@ -400,7 +402,7 @@ bool CSocketItemEx::MapControlBlock(const CommandNewSessionSrv &cmd)
 #endif
 
 	CloseHandle(hThatProcess);
-	// this->sessionID == cmd.idSession, provided it is a passive/welcome socket, not a initiative socket
+	// this->fiberID == cmd.fiberID, provided it is a passive/welcome socket, not a initiative socket
 	// assert: the queue of the returned value has been initialized by the caller already
 	hEvent = cmd.hEvent;
 	return true;
@@ -461,17 +463,35 @@ int LOCALAPI CSocketItemEx::GenerateSNACK(BYTE * buf, ControlBlock::seq_t & seq0
 void CSocketItemEx::InitiateConnect()
 {
 	TRACE_HERE("called");
+	SetState(CONNECT_BOOTSTRAP);
+
+	SConnectParam & initState = pControlBlock->u.connectParams;
+	initState.timeStamp = NowUTC();
+	rand_w32((uint32_t *) & initState,
+		( sizeof(initState.cookie)
+		+ sizeof(initState.initCheckCode)
+		+ sizeof(initState.salt)
+		+ sizeof(initState.initialSN) ) / sizeof(uint32_t) );
+	// Remote fiber ID was set when the control block was created
+	// for calculation of the initial round-trip time
+	pControlBlock->u.connectParams.timeStamp = initState.timeStamp;
+	pControlBlock->SetSendWindowWithHeadReserved(initState.initialSN);
 
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend(); // INIT_CONNECT can only be the very first packet
-	FSP_InitiateRequest *pkt = (FSP_InitiateRequest *)GetSendPtr(skb);
-	if(pkt == NULL)
-		return;	// memory corruption
+	skb->opCode = INIT_CONNECT;
+	skb->len = sizeof(FSP_InitiateRequest);
+	//
+	// Overlay INIT_CONNECT and CONNECT_REQUEST
+	FSP_ConnectRequest & request = *(FSP_ConnectRequest *)GetSendPtr(skb);
+	request.initCheckCode = initState.initCheckCode;
+	request.salt = initState.salt;
+	request.hs.Set<FSP_InitiateRequest, INIT_CONNECT>();	// See also AffirmConnect()
 
-	pControlBlock->u.connectParams.timeStamp
-		= tRecentSend = NowUTC();	// for calculation of the initial round-trip time
-	pkt->timeStamp = htonll(tRecentSend);
+	request.timeStamp = htonll(initState.timeStamp);
 	skb->SetFlag<IS_COMPLETED>();	// for resend
-	SendPacket(1, ScatteredSendBuffers(pkt, sizeof(FSP_InitiateRequest)));
+	// it neednot be unlocked
+	SendPacket(1, ScatteredSendBuffers(& request, sizeof(FSP_InitiateRequest)));
+	// initState.timeStamp is not necessarily tRecentSend
 
 	if(timer != NULL)
 	{
@@ -487,7 +507,7 @@ void CSocketItemEx::InitiateConnect()
 
 // CONNECT_REQUEST, timestamp, Cookie, Salt, ephemeral-key, half-connection parameters [, resource requirement]
 // It is assumed that exclusive access to the socket has been gained
-void LOCALAPI CSocketItemEx::AffirmConnect(const SConnectParam & initState, ALT_ID_T idListener)
+void LOCALAPI CSocketItemEx::AffirmConnect(const SConnectParam & initState, ALFID_T idListener)
 {
 	TRACE_HERE("called");
 
@@ -495,46 +515,63 @@ void LOCALAPI CSocketItemEx::AffirmConnect(const SConnectParam & initState, ALT_
 	FSP_ConnectRequest *pkt = (FSP_ConnectRequest *)this->GetSendPtr(skb);
 	if(pkt == NULL)
 		return;
+
+	SetState(CONNECT_AFFIRMING);
+
 	FSP_ConnectParam & varParams = pkt->params;
-	//
 	pkt->cookie = initState.cookie;
 	pkt->timeDelta = htonl(initState.timeDelta);
+	pkt->initialSN = htonl(initState.initialSN);
 	// timeStamp, salt were overlaid; public key was exported already
-
 	// assert(sizeof(initState.allowedPrefixes) >= sizeof(varParams.subnets));
 	memcpy(varParams.subnets , initState.allowedPrefixes, sizeof(varParams.subnets));
-	varParams.delayLimit = 0;	// for main/root session, milky-payload is unsupported
-	varParams.initialSN = htonl(initState.initialSN);
 	varParams.listenerID = idListener;
+	varParams.hs.Set<MOBILE_PARAM>(sizeof(FSP_ConnectRequest) - sizeof(FSP_ConnectParam));
 	pkt->hs.Set<FSP_ConnectRequest, CONNECT_REQUEST>();
+
 	// while version remains as the same as the very beginning INIT_CONNECT
 	skb->opCode = CONNECT_REQUEST;
 	skb->len = sizeof(FSP_ConnectRequest);
 
 	// TODO: UNRESOLVED! For FSP over IPv6, attach inititator's resource reservation...
-	SendPacket(1, ScatteredSendBuffers(pkt, skb->len));
 
-	timestamp_t t1 = NowUTC();	// internal processing takes orders of magnitude less time than network propagation
-	tRoundTrip_us = uint32_t(t1 - tRecentSend);
-	tRecentSend = t1;
-	SetEarliestSendTime();		// for recalibration of round-trip time on getting acknowledgement
+	// Safely suppose that internal processing takes orders of magnitude less time than network propagation
+	tEarliestSend = tRecentSend;	// tRecentSend was set in InitiateConnect's SendPacket
+	SendPacket(1, ScatteredSendBuffers(pkt, skb->len));	// it would set tRecentSend
+	//
+	tRoundTrip_us = uint32_t(min(UINT32_MAX, tRecentSend - tEarliestSend));
+	// after ACK_CONNECT_REQ would 'tKeepAlive_ms = tRoundTrip_us >> 8';
+	SetEarliestSendTime();
 
-	SetState(CONNECT_AFFIRMING);
+	congestCtrl.Reset();
 }
 
 
 
-// ACK_CONNECT_REQUEST, Initial SN, Expected SN, Timestamp, Receive Window, responder's half-connection parameter, optional payload
 // Remark
-//	Unlike INITIATE_CONNECT nor CONNECT_REQUEST, there may be a huge queue of payload packet followed
+//	For sake of congestion control only one packet is sent presently
+// See also
+//	OnConnectRequestAck; CSocketItemDl::ToWelcomeConnect; CSocketItemDl::ToWelcomeMultiply
 void CSocketItemEx::SynConnect()
 {
 	TRACE_HERE("called");
-
 	// bind to the interface as soon as the control block mapped into server's memory space
 	InitAssociation();
-	ScheduleEmitQ();
-	SetReturned();
+
+	// ephemeral session key material was ready when CSocketItemDl::PrepareToAccept
+#ifdef TRACE
+	TRACE_HERE("session key");
+	printf("0x%X %X %X %X\n"
+		, *(uint32_t *) & pControlBlock->u.sessionKey[0]
+		, *(uint32_t *) & pControlBlock->u.sessionKey[4]
+		, *(uint32_t *) & pControlBlock->u.sessionKey[8]
+		, *(uint32_t *) & pControlBlock->u.sessionKey[12]);
+#endif
+	InstallSessionKey();
+	keyLife = EPHEMERAL_KEY_LIFECYCLE;
+
+	EmitStart();
+	pControlBlock->MoveNextToSend();
 
 	if(timer != NULL)
 	{
@@ -545,25 +582,30 @@ void CSocketItemEx::SynConnect()
 
 	tKeepAlive_ms = TRASIENT_STATE_TIMEOUT_ms;
 	AddTimer();
+
+	SetReturned();	// The success or failure signal is delayed until PERSIST, COMMIT or RESET received
 }
 
 
 
 //ACTIVE<-->[{duplication detected}: retransmit {in the new context}]
-//      |<-->[{no listener}: Snd {out-of-band} RESET]
+//      |<-->[{no listener}: Send {out-of-band} RESET]
 //      |-->[API{Callback}{new context}]-->ACTIVE{new context}
-//         |-->[{Return}:Accept]-->[Snd PERSIST]
-//         |-->[{Return}:Commit]-->[Snd ADJOURN]-->PAUSING{new context}
-//         |-->[{Return}:Reject]-->[Snd RESET]-->NON_EXISTENT
+//         |-->[{Return}:Accept]-->[Send PERSIST]
+//         |-->[{Return}:Commit]-->[Send COMMIT]-->COMMITTING{new context}
+//         |-->[{Return}:Reject]-->[Send RESET]-->NON_EXISTENT
 void CSocketItemEx::OnMultiply()
 {
 }
 
 
 
-//PAUSING-->[Notify{Adjourn failed} if is legal]-->ACTIVE
-//CLOSABLE<-->[{if no listener or it is illegal } Snd RESET]
-//      |-->[Notify if is legal]-->[API{callback}:Send/{go on}]-->ACTIVE
+//PEER_COMMIT-->/RESUME/-->ACTIVE-->[Send PERSIST]{restart keep-alive}
+//COMMITTING2-->/RESUME/-->ACTIVE-->[Send PERSIST]
+//CLOSABLE-->/RESUME/-->[API{callback}]
+//	|-->[{Return Accept}]-->ACTIVE-->[Send PERSIST]{restart keep-alive}
+//	|-->[{Return Commit}]-->COMMITTING-->[Send COMMIT]{enable retry}
+//	|-->[{Return Reject}]-->NON_EXISTENT-->[Send RESET]
 void CSocketItemEx::OnResume()
 {
 	// TODO: re-allocate send buffer/window and receive buffer/window
@@ -571,11 +613,11 @@ void CSocketItemEx::OnResume()
 
 
 
-//CLOSED<-->[{if no listener}Snd RESET]
-//      |<-->[{if is illegal}Snd ACK_INIT_CONNECT from parent listener]
-//      |-->[API{callback}
-//            |-->[{Return}:Accept]-->[Snd PERSIST]-->ACTIVE
-//            |-->[{Return}:Reject]-->[Snd RESET]-->NON_EXISTENT
+//CLOSED<-->/RESUME/{RDSC missed}<-->[Send ACK_INIT_CONNECT]
+//	|-->/RESUME/{RDSC hit}-->[API{callback}]
+//	|-->[{Return Accept}]-->ACTIVE-->[Send PERSIST]{start keep-alive}
+//	|-->[{Return Commit}]-->COMMITTING-->[Send COMMIT]{enable retry}
+//	|-->[{Return Reject}]-->NON_EXISTENT-->[Send RESET]
 void CSocketItemEx::OnResurrect()
 {
 	// TODO: re-allocate buffers
@@ -604,22 +646,34 @@ void CSocketItemEx::Extinguish()
 	SetState(NON_EXISTENT);
 	RemoveTimer();
 	CSocketItem::Destroy();
+	inUse = 0;	// FreeItem does not reset it
 	(CLowerInterface::Singleton())->FreeItem(this);
 }
 
 
 // Do
-//	Adjourn the session
+//	Commit the receive-side half-session on request of the remote end
 //	Send ACK_FLUSH to the remote peer if not in CLOSED state and notify the near end ULA
-void CSocketItemEx::DoAdjourn()
+void CSocketItemEx::PeerCommit()
 {
-	// TODO: UNRESOLVED!? as ADJOURN pause the session the send window shall be shrinked to the minimum
-	// See also OnGetPersist(), OnResume() and AckAdjourn()
-	// in the state CHALLENGING, RESUMING, CLONING or QUASI_ACTIVE: it is a transactional handshake
-	ReplaceTimer(SCAVENGE_THRESHOLD_ms);
-	SetState(CLOSABLE);
+	if (lowState == COMMITTING)
+	{
+		SetState(COMMITTING2);
+	}
+	else if (lowState == COMMITTED)
+	{
+		StopKeepAlive();
+		SetState(CLOSABLE);
+	}
+	else // if (lowState == ESTABLISHED, CHALLENGING, CLONING, RESUMING, QUASI_ACTIVE)
+	{
+		StopKeepAlive();
+		SetState(PEER_COMMIT);
+	}
+	//
 	SendPacket<ACK_FLUSH>();
-	Notify(FSP_NotifyToAdjourn);
+
+	Notify(FSP_NotifyToCommit);
 }
 
 
@@ -628,6 +682,9 @@ void CSocketItemEx::DoAdjourn()
 //	Send RESET to the remote peer if not in CLOSED state
 void CSocketItemEx::CloseSocket()
 {
+	if(!IsInUse())
+		return;
+
 	if(lowState == CLOSABLE)
 		SetState(CLOSED);
 
@@ -642,6 +699,16 @@ void CSocketItemEx::CloseSocket()
 }
 
 
+// Do
+//	Shutdown the socket
+void CSocketItemEx::CloseToNotify()
+{
+	ReplaceTimer(SCAVENGE_THRESHOLD_ms);
+	SetState(CLOSED);
+	(CLowerInterface::Singleton())->FreeItem(this);
+	Notify(FSP_NotifyRecycled);
+}
+
 
 // Do
 //	Send RESET to the remote peer in the certain states (not guaranteed to be received)
@@ -650,13 +717,12 @@ void CSocketItemEx::Disconnect()
 {
 	if(lowState == CHALLENGING || lowState == CONNECT_AFFIRMING)
 		CLowerInterface::Singleton()->SendPrematureReset(EINTR, this);
-	else if(lowState == ESTABLISHED || lowState == CLOSABLE || lowState == PAUSING || lowState == RESUMING)
+	else if(InStates(7, ESTABLISHED, COMMITTING, PEER_COMMIT, COMMITTING2, COMMITTED, CLOSABLE, RESUMING))
 		SendPacket<RESET>();
 	//
 	if(TestAndLockReady())
 	{
 		Extinguish();
-		// UNRESOLVED! Should it SetReady() again?
 	}
 	else
 	{

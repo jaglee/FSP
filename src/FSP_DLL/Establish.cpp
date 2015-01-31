@@ -32,6 +32,8 @@
 #include <stdlib.h>
 #include <tchar.h>
 
+//[API: Listen]
+//	NON_EXISTENT-->LISTENING
 // Given
 //	const PFSP_IN6_ADDR		list of IPv6 addresses that the passive socket to listen at.
 //							terminated with IN6ADDR_ANY_INIT or IN6ADDR_LOOPBACK_INIT
@@ -47,7 +49,8 @@ FSPHANDLE FSPAPI ListenAt(const PFSP_IN6_ADDR listenOn, PFSP_Context psp1)
 { 
 	TRACE_HERE("called");
 
-	if(psp1->len > MAX_BLOCK_SIZE - sizeof(FSP_NormalPacketHeader) - sizeof(FSP_ConnectParam))
+	// TODO: The welcome message CAN be larger
+	if(psp1->len > MAX_BLOCK_SIZE - sizeof(FSP_AckConnectRequest))
 	{
 		// UNRESOLVED! Set last error?
 		return NULL;
@@ -68,6 +71,9 @@ FSPHANDLE FSPAPI ListenAt(const PFSP_IN6_ADDR listenOn, PFSP_Context psp1)
 }
 
 
+//[API: Connect]
+//	CLOSED-->{when RDSC hit}-->QUASI_ACTIVE-->[Send RESUME]{enable retry}
+//	NON_EXISTENT-->CONNECT_BOOTSTRAP
 // Given
 //	const char *	resolvable name (not necessarily domain name) of the remote end
 //	PFSP_Context	the pointer to the parameter structure of the socket to create
@@ -99,51 +105,13 @@ FSPHANDLE FSPAPI Connect2(const char *peerName, PFSP_Context psp1)
 		return NULL;
 	}
 	socketItem->SetPeerName(peerName, strlen(peerName));
-	socketItem->InitiateConnect();
 
 	return socketItem->CallCreate(objCommand, InitConnection);
 }
 
 
-
-// Send the prepare-connection request packet (INITIATE_CONNECT, Timestamp, initiator's check code, 32-bit random)
-// Remark: overlay formal connect request with the connect bootstrap packet
-void CSocketItemDl::InitiateConnect()
-{
-	SConnectParam & initState = pControlBlock->u.connectParams;
-	initState.timeStamp = NowUTC();
-	rand_w32((uint32_t *) & initState,
-		( sizeof(initState.cookie)
-		+ sizeof(initState.initCheckCode)
-		+ sizeof(initState.salt)
-		+ sizeof(initState.initialSN) ) / sizeof(uint32_t) );
-	// Remote session ID was set when the control block was created
-	// Generate the private-public key pair
-	keyTransferer.GenerateKey(FSP_PUBLIC_KEY_LEN << 3);
-
-	pControlBlock->SetSendWindowWithHeadReserved(initState.initialSN);
-	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend();
-	skb->opCode = INIT_CONNECT;
-	skb->len = sizeof(FSP_InitiateRequest);
-	//
-	// Overlay INIT_CONNECT and CONNECT_REQUEST
-	FSP_ConnectRequest & request = *(FSP_ConnectRequest *)GetSendPtr(skb);
-	request.initCheckCode = initState.initCheckCode;
-	request.salt = initState.salt;
-	keyTransferer.ExportPublicKey((BYTE *)request.public_n);	// TO BE FIXED! Memory overflow?
-	request.params.hs.Set<FSP_ConnectRequest, CONNECT_PARAM>();
-	request.hsKey.Set<FSP_InitiateRequest, EPHEMERAL_KEY>();
-	request.hs.Set<FSP_InitiateRequest, INIT_CONNECT>();	// See also AffirmConnect()
-	//
-	skb->SetFlag<IS_COMPLETED>();
-	SetState(CONNECT_BOOTSTRAP);
-	// MUST set the state before calling LLS so that event-driven state transition may work properly
-}
-
-
 // Fetch each of the backlog item in the listening socket, create new socket, prepare the acknowledgement
 // and call LLS to send the acknowledgement to the connnection request or multiplication request
-//	RESET, Timestamp echo, Initial SN echo, Expected SN echo, Reason
 void CSocketItemDl::ProcessBacklog()
 {
 	// TODO: set the default interface to non-zero?
@@ -194,7 +162,7 @@ CSocketItemDl * LOCALAPI CSocketItemDl::PrepareToAccept(BackLogItem & backLog, C
 	newContext.ifDefault = backLog.acceptAddr.ipi6_ifindex;
 	newContext.u.st.passive = 0;
 	// UNRESOLVED! check function pointers!?
-	if(! this->context.u.st.passive)	// this->StateEqual(LISTENING)
+	if(! this->context.u.st.passive)	// this->InState(LISTENING)
 	{
 		newContext.welcome = NULL;
 		newContext.len = 0;
@@ -203,15 +171,15 @@ CSocketItemDl * LOCALAPI CSocketItemDl::PrepareToAccept(BackLogItem & backLog, C
 	if(pSocket == NULL)
 		return NULL;
 
-	pSocket->pControlBlock->idParent = this->pairSessionID.source;
+	pSocket->pControlBlock->idParent = this->fidPair.source;
 	// IP address, including Session ID stored in nearEnd[0] would be set by CreateControlBlock
-	// Cached session ID in the DLL SocketItem stub is set by CreateControlBlock as well
+	// Cached fiber ID in the DLL SocketItem stub is set by CreateControlBlock as well
 
 	memcpy(pSocket->pControlBlock->peerAddr.ipFSP.allowedPrefixes
 		, backLog.allowedPrefixes
 		, sizeof(UINT64)* MAX_PHY_INTERFACES);
 	pSocket->pControlBlock->peerAddr.ipFSP.hostID = backLog.remoteHostID;
-	pSocket->pControlBlock->peerAddr.ipFSP.sessionID = backLog.idRemote;
+	pSocket->pControlBlock->peerAddr.ipFSP.fiberID = backLog.idRemote;
 
 	pSocket->pControlBlock->u.connectParams = backLog;
 	// UNRESOLVED!? Correct pSocket->pControlBlock->u.connectParams.allowedPrefixes in LLS
@@ -226,13 +194,12 @@ CSocketItemDl * LOCALAPI CSocketItemDl::PrepareToAccept(BackLogItem & backLog, C
 // Given
 //	BackLogItem &	the reference to the acception backlog item
 // Do
-//	(ACK_CONNECT_REQUEST, Initial SN, Expected SN, Timestamp, Receive Window, responder's half-connection parameter, optional payload)
-// Remark
-//	Session key generated and encrypted
+//	(ACK_CONNECT_REQ, Initial SN, Expected SN, Timestamp, Receive Window[, responder's half-connection parameter[, payload])
 bool LOCALAPI CSocketItemDl::ToWelcomeConnect(BackLogItem & backLog)
 {
 	// Ask the upper layer whether to accept the connection...fpRequested CANNOT read or write anything!
 	PFSP_IN6_ADDR p = (PFSP_IN6_ADDR) & pControlBlock->peerAddr.ipFSP.allowedPrefixes[MAX_PHY_INTERFACES - 1];
+	//
 	SetState(CHALLENGING);
 	if(fpRequested != NULL && fpRequested(this, & backLog.acceptAddr, p) < 0)
 	{
@@ -241,30 +208,20 @@ bool LOCALAPI CSocketItemDl::ToWelcomeConnect(BackLogItem & backLog)
 	}
 
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend();
-	FSP_AckConnectKey *pKey = (FSP_AckConnectKey *)GetSendPtr(skb);
-	FSP_ConnectParam *params = (FSP_ConnectParam *)((BYTE *)pKey + sizeof(FSP_AckConnectKey));
+	FSP_ConnectParam *params = (FSP_ConnectParam *)GetSendPtr(skb);
 	//
-	InstallBootKey(backLog.bootKey, sizeof(backLog.bootKey));
-	rand_w32((uint32_t *)pControlBlock->u.sessionKey
-			, sizeof(pControlBlock->u.sessionKey) / sizeof(uint32_t));
-	InstallSessionKey(pControlBlock->u.sessionKey);
-	keyTransferer.Encrypt(pControlBlock->u.sessionKey, FSP_SESSION_KEY_LEN, pKey->encrypted);
-	pKey->hsKey.Set<FSP_NormalPacketHeader, EPHEMERAL_KEY>();
+	*(uint64_t *)(pControlBlock->u.sessionKey) = backLog.initCheckCode;
+	*((uint64_t *)(pControlBlock->u.sessionKey) + 1) = backLog.cookie;
 
-	// TODO: handle of milky-payload; multihome/mobility support is always handled by LLS
-	params->delayLimit = 0;
-	params->initialSN = pControlBlock->u.connectParams.initialSN;
-	//^Here it is redundant, just ignore. See also LLS::OnConnectRequestAck
 	params->listenerID = pControlBlock->idParent;
-	params->hs.Set<CONNECT_PARAM>(sizeof(FSP_NormalPacketHeader) + sizeof(*pKey));
+	params->hs.Set<MOBILE_PARAM>(sizeof(FSP_NormalPacketHeader));
 	//
-	skb->opCode = ACK_CONNECT_REQUEST;
-	skb->len = sizeof(*pKey) + sizeof(*params);	// the fixed header is generated on the fly
-	skb->ZeroFlags();
+	skb->opCode = ACK_CONNECT_REQ;
+	skb->len = sizeof(*params);	// the fixed header is generated on the fly
 	//
 	if(pendingSendBuf != NULL && pendingSendSize + skb->len <= MAX_BLOCK_SIZE)
 	{
-		memcpy((BYTE *)pKey + skb->len, pendingSendBuf, pendingSendSize);
+		memcpy((BYTE *)params + skb->len, pendingSendBuf, pendingSendSize);
 		skb->len += pendingSendSize;
 		//
 		pendingSendBuf = NULL;
@@ -272,20 +229,14 @@ bool LOCALAPI CSocketItemDl::ToWelcomeConnect(BackLogItem & backLog)
 	}
 	// else let ProcessPendingSend eventually transmit the welcome message, if any
 	skb->SetFlag<IS_COMPLETED>();
+	// the packet is still locked
 
-#ifdef TRACE
-	printf_s("Connect request accepted, it is in CHALLENGING\n");
-#endif
 	return true;
 }
 
 
 // Auxiliary function that is called when a new connection request is to be accepted
 // in the new created context of the incarnation respondor OR multiplexing initiator
-// Remark
-//	It is legal to chain ReadFrom()/RecvInline()
-//	However, it is illegal to chain WriteTo()/SendInline() if it has already migrated
-//	to the CLOSABLE state from the CHALLENGING, CLONING, RESUMING or QUASI_ACTIVE state
 void CSocketItemDl::ToConcludeAccept()
 {
 	TRACE_HERE("Connection has been accepted");
@@ -297,21 +248,20 @@ void CSocketItemDl::ToConcludeAccept()
 
 
 // Auxiliary function that is called when a new connection request is acknowledged by the responder
-//	CONNECT_AFFIRMING-->[Rcv ACK_CONNECT_REQUEST]-->[API{callback}]
-//	|-->{Return Accept}-->ACTIVE-->[Snd PERSIST[start keep-alive}]
-//	|-->{Return Commit}-->PAUSING-->[Snd ADJOURN{enable retry}]
-//	|-->{Return Reject}-->[Snd RESET]-->NON_EXISTENT
+// CONNECT_AFFIRMING-->[Rcv.ACK_CONNECT_REQ]-->[API{callback}]
+//	|-->{Return Accept}-->ACTIVE-->[Send PERSIST]{start keep-alive}
+//	|-->{Return Commit}-->COMMITTING-->[Send COMMIT]{enable retry}
+//	|-->{Return Reject}-->NON_EXISTENT-->[Send RESET]
 void CSocketItemDl::ToConcludeConnect()
 {
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadRecv();
 	BYTE *payload = GetRecvPtr(skb);
-	InstallSessionKey(payload + skb->len, FSP_PUBLIC_KEY_LEN);
 
 	// See also FSP_LLS$$CSocketItemEx::Connect()
-	pairSessionID.source = pControlBlock->nearEnd[0].idALT;
-	//^As by default Connect2 set the cached session ID in the DLL SocketItem to 0
+	fidPair.source = pControlBlock->nearEnd[0].idALF;
+	//^As by default Connect2 set the cached fiber ID in the DLL SocketItem to 0
 
-	// Deliver the optional payload and skip the ACK_CONNECT_REQUEST packet
+	// Deliver the optional payload and skip the ACK_CONNECT_REQ packet
 	// See also ControlBlock::InquireRecvBuf()
 	// UNRESOLVED! Could welcome message be compressed?
 	// TODO: Provide convient compress/decompress help routines
@@ -329,8 +279,8 @@ void CSocketItemDl::ToConcludeConnect()
 	// while version and sequence number remains as the same as very beginning INIT_CONNECT
 	skb->opCode = PERSIST;
 	skb->len = 0;
-	skb->ZeroFlags();	// As it overlay CONNECT_REQUEST and the packet must have been sent
-
+	skb->Unlock();
+	//^ As it overlays CONNECT_REQUEST and the packet must be unlocked to piggyback payload in the callback function
 	SetMutexFree();
 
 	int r = 0;
@@ -342,36 +292,30 @@ void CSocketItemDl::ToConcludeConnect()
 		Recycle();
 		return;
 	}
-
-	// LLS should change PERSIST packet to ADJOURN if it has migrated to the PAUSING state
-	SetState(r == 0 ? ESTABLISHED : PAUSING);
-
+	// UNRESOLVED! To change the opcode of the last payload packet to COMMIT...
+	SetState(r == 0 ? ESTABLISHED : COMMITTING);
 #ifdef TRACE
 	printf_s("Acknowledgement of connection request received, to PERSIST the connection.\n");
 #endif
-	if (!skb->GetFlag<BIT_IN_SENDING>())
-	{
-		skb->SetFlag<IS_COMPLETED>();
-		Call<FSP_Send>();
-	}
+	Call<FSP_Start>();
 }
 
 
 // Given
 //	PFSP_IN6_ADDR	the place holder of the output FSP/IPv6 address
 //	UINT32		the 32-bit integer representation of the IPv4 address to be translated
-//	UINT32		the session ID, in host byte order
+//	UINT32		the fiber ID, in host byte order
 // Return
 //	the pointer to the place holder of host-id which might be set/updated later
 // Remark
 //	make the rule-adhered IPv6 address, the result is placed in the given pointed place holder
 DllSpec
-UINT32 * TranslateFSPoverIPv4(PFSP_IN6_ADDR p, UINT32 dwIPv4, UINT32 sessionID)
+UINT32 * TranslateFSPoverIPv4(PFSP_IN6_ADDR p, UINT32 dwIPv4, UINT32 fiberID)
 {
 	p->u.st.prefix = PREFIX_FSP_IP6to4;
 	p->u.st.ipv4 = dwIPv4;
 	p->u.st.port = DEFAULT_FSP_UDPPORT;
-	p->idALT = htobe32(sessionID);
+	p->idALF = htobe32(fiberID);
 	return & p->idHost;
 }
 
@@ -379,4 +323,3 @@ UINT32 * TranslateFSPoverIPv4(PFSP_IN6_ADDR p, UINT32 dwIPv4, UINT32 sessionID)
 
 // The sibling functions of Connect2() for 'fast reconnect', 'session resume'
 // and 'connection multiplication' (ConnectMU), is in Multiply.cpp
-	

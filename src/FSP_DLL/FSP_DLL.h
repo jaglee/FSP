@@ -33,7 +33,6 @@
 #define STRICT
 #include <Windows.h>
 #include <conio.h>
-#include "rsa-gmp.hpp"
 
 
 // excluded by WIN32_LEAN_AND_MEAN under VS2003??
@@ -64,9 +63,6 @@ UnregisterWaitEx(
     );
 #endif
 
-
-#define printf _cprintf
-
 #include "../FSP.h"
 #include "../FSP_Impl.h"
 #include "../gcm-aes.h"
@@ -88,7 +84,6 @@ typedef CSocketItem * PSocketItem;
 
 class CSocketItemDl: public CSocketItem
 {
-	RSA_GMP			keyTransferer;
 	CSocketItemDl	*next;
 	CSocketItemDl	*prev;
 	// for sake of incarnating new accepted connection
@@ -105,15 +100,12 @@ protected:
 	__declspec(property(get = GetOnAccepted))		CallbackConnected fpAccepted;
 	CallbackConnected GetOnAccepted() const { return context.afterAccept; }
 
-	// when some exception occured, or the async-send/recv function returned
-	__declspec(property(get = GetOnCallback))		NotifyOrReturn	fpCallback;
-	NotifyOrReturn GetOnCallback() const { return context.callback; }
-
+	NotifyOrReturn	fpCommit;
 	// to support full-duplex send and receive does not share the same call back function
-	NotifyOrReturn	fpSent;
-	NotifyOrReturn	fpReceive;		// when data were received and it is to notify the upper layer
+	NotifyOrReturn	fpRecept;
 	// to support surveillance RecvInline() over ReadFrom() make CallbackPeeked an independent function
 	CallbackPeeked	fpPeeked;
+	CallbackBufferReady fpSent;
 
 	bool			inUse;
 	volatile char	mutex;	// Utilize _InterlockedCompareExchange8 to manage critical resource
@@ -149,21 +141,18 @@ protected:
 	FSP_ServiceCode PopNotice() { return pControlBlock->PopNotice(); }
 
 	// in Establish.cpp
-	int LOCALAPI CopyKey(ALT_ID_T);
-	void InitiateConnect();
+	int LOCALAPI CopyKey(ALFID_T);
 	void ProcessBacklog();
+
 	CSocketItemDl * LOCALAPI PrepareToAccept(BackLogItem &, CommandNewSession &);
 	bool LOCALAPI ToWelcomeConnect(BackLogItem &);
 	bool LOCALAPI ToWelcomeMultiply(BackLogItem &);
-	//
-	void OnGetFinish();
-	void OnGetReset();
 	//
 	void ProcessPendingSend();
 	void ProcessReceiveBuffer();
 	//
 	void ToConcludeAccept();
-	void ToConcludeAdjourn();
+	void ToConcludeCommit();
 	void ToConcludeConnect();
 	//
 	void HitResumableDisconnectedSessionCache();
@@ -211,8 +200,8 @@ public:
 		return pControlBlock->GetRecvPtr(skb);
 	}
 
-
-	bool StateEqual(FSP_Session_State s) const { return pControlBlock->state == s; }
+	FSP_Session_State GetState() const { return pControlBlock->state; }
+	bool InState(FSP_Session_State s) const { return pControlBlock->state == s; }
 	void SetState(FSP_Session_State s) { pControlBlock->state = s; }
 	// For _MSC_ only, as long is considered compatible with enum
 	bool TestSetState(FSP_Session_State s0, FSP_Session_State s2)
@@ -232,31 +221,6 @@ public:
 	bool WaitSetMutex();
 	bool IsInUse() const { return inUse; }
 
-	void LOCALAPI InstallBootKey(const BYTE key[], size_t len) { keyTransferer.ImportPublicKey(key, len); }
-	void LOCALAPI InstallSessionKey(BYTE sessionKey[])
-	{
-#ifndef NDEBUG
-		pControlBlock->_mac_ctx_protect_prolog[0]
-			= pControlBlock->_mac_ctx_protect_prolog[1]
-			= pControlBlock->_mac_ctx_protect_epilog[0]
-			= pControlBlock->_mac_ctx_protect_epilog[1]
-			= MAC_CTX_PROTECT_SIGN;
-#endif
-		vmac_set_key(sessionKey, & pControlBlock->mac_ctx); 
-	}
-	void LOCALAPI InstallSessionKey(const BYTE * encrypted, int len)
-	{
-		keyTransferer.Decrypt(encrypted, len, pControlBlock->u.sessionKey);
-#ifndef NDEBUG
-		pControlBlock->_mac_ctx_protect_prolog[0]
-			= pControlBlock->_mac_ctx_protect_prolog[1]
-			= pControlBlock->_mac_ctx_protect_epilog[0]
-			= pControlBlock->_mac_ctx_protect_epilog[1]
-			= MAC_CTX_PROTECT_SIGN;
-#endif
-		vmac_set_key(pControlBlock->u.sessionKey, &pControlBlock->mac_ctx);
-	}
-
 	void SetPeerName(const char *cName, size_t len)
 	{
 		size_t n = min(len, sizeof(pControlBlock->peerAddr.name));
@@ -265,7 +229,7 @@ public:
 
 	template<FSP_ServiceCode cmd> void InitCommand(CommandToLLS & objCommand)
 	{
-		objCommand.idSession = pairSessionID.source;
+		objCommand.fiberID = fidPair.source;
 		objCommand.idProcess = ::idThisProcess;
 		objCommand.opCode = cmd;
 	}
@@ -280,9 +244,11 @@ public:
 	}
 	CSocketItemDl * LOCALAPI CallCreate(CommandNewSession &, FSP_ServiceCode);
 
-	int AcquireSendBuf(int);
+	int LOCALAPI AcquireSendBuf(int);
+	int LOCALAPI SendInplace(void *, int, bool);
+	int LOCALAPI FinalizeSend(int);
+
 	ControlBlock::PFSP_SocketBuf GetSendBuf() { return pControlBlock->GetSendBuf(); }
-	ControlBlock::PFSP_SocketBuf PeekNextToSend() const { return pControlBlock->GetNextToSend(); }
 
 	int LOCALAPI PrepareToSend(void *, int, bool);
 	int LOCALAPI SendStream(void *, int, char);
@@ -290,11 +256,6 @@ public:
 	{
 		return InterlockedCompareExchangePointer((PVOID *) & fpSent, fp1, NULL) == NULL; 
 	}
-	NotifyOrReturn GetResetSendReturn()
-	{
-		return (NotifyOrReturn)InterlockedExchangePointer((PVOID volatile *)& fpSent, NULL);
-	}
-
 
 	int	LOCALAPI RecvInline(PVOID);
 	int LOCALAPI ReadFrom(void *, int, PVOID);
@@ -303,17 +264,16 @@ public:
 	void SetEndOfRecvMsg(bool value = true) { context.u.st.eom = value ? 1 : 0; }
 	bool IsRecvBufferEmpty()  { return pControlBlock->CountReceived() <= 0; }
 
-	// Force LLS to send or queue ADJOURN
-	int	Adjourn()
-	{
-		eomSending = EndOfMessageFlag::END_OF_SESSION;
-		SetState(PAUSING);
-		return (Call<FSP_Send>() ? 0 : -EIO);
-	}
+	int	Commit();
 
 	char GetResetFlushing() { return _InterlockedExchange8(& isFlushing, 0);}
-	void SetFlushing(char value = ONLY_FLUSHING) { isFlushing = value; }
-	void RevertToResume() { isFlushing = 0; SetState(RESUMING); }
+	bool SetFlushing(NotifyOrReturn fp1) 
+	{
+		if(_InterlockedCompareExchange8(& isFlushing, ONLY_FLUSHING, 0) != 0)
+			return false;
+		return InterlockedCompareExchangePointer((PVOID *)& fpCommit, fp1, NULL) == NULL;
+	}
+	void SetFlushing(char value) { isFlushing = value; }
 
 	int SelfNotify(FSP_ServiceCode c)
 	{
@@ -327,7 +287,7 @@ public:
 			return 0;
 		}
 	}
-	void NotifyError(FSP_ServiceCode c, int e) { if(fpCallback != NULL) fpCallback(this, c, e); }
+	void NotifyError(FSP_ServiceCode c, int e = 0) { if (context.onError != NULL) context.onError(this, c, e); }
 
 	// defined in DllEntry.cpp:
 	static CSocketItemDl * LOCALAPI CreateControlBlock(const PFSP_IN6_ADDR, PFSP_Context, CommandNewSession &);
@@ -337,7 +297,7 @@ public:
 
 class CSocketDLLTLB
 {
-	(CSocketItemDl *)pSockets[MAX_CONNECTION_NUM];
+	CSocketItemDl * pSockets[MAX_CONNECTION_NUM];
 	CSocketItemDl *header;
 	int sizeOfSet;
 public:
@@ -346,8 +306,8 @@ public:
 	void Compress();
 
 	int Count() { return sizeOfSet; }
-	// Application Layer Thread ID (ALT_ID) === sessionID
-	CSocketItemDl * operator [] (ALT_ID_T sessionID);
+	// Application Layer Fiber ID (ALFID) === fiberID
+	CSocketItemDl * operator [] (ALFID_T fiberID);
 	CSocketItemDl * operator [] (int i) { return pSockets[i]; }
 
 	CSocketDLLTLB()

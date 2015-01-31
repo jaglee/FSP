@@ -36,7 +36,7 @@ void UnitTestOpCodeStateNoticeNames()
 	//
 	Logger::WriteMessage(stateNames[-1]);
 	Logger::WriteMessage(stateNames[0]);
-	Logger::WriteMessage(stateNames[FSP_Session_State::PAUSING]);
+	Logger::WriteMessage(stateNames[FSP_Session_State::COMMITTING]);
 	Logger::WriteMessage(stateNames[CLOSED]);
 	Logger::WriteMessage(stateNames[CLOSED + 1]);
 	//
@@ -78,10 +78,13 @@ public:
 	{
 		vhash_reset(& pControlBlock->mac_ctx);	// vmac_set_key
 	}
+
 	ControlBlock *GetControlBlock() const { return pControlBlock; }
+	ControlBlock::PFSP_SocketBuf AllocRecvBuf(ControlBlock::seq_t seq1) { return pControlBlock->AllocRecvBuf(seq1); }
 
 	friend void UnitTestSocketInState();
 	friend void UnitTestResendQueue();
+	friend void UnitTestPacketBuffer();
 };
 
 
@@ -159,11 +162,11 @@ void UnitTestSendRecvWnd()
 	ControlBlock::PFSP_SocketBuf skb4 = pSCB->AllocRecvBuf(FIRST_SN);
 	Assert::IsNotNull(skb4);
 	Assert::IsTrue(pSCB->recvWindowFirstSN == FIRST_SN);
-	Assert::IsTrue(pSCB->receiveMaxExpected == FIRST_SN + 1);
+	Assert::IsTrue(pSCB->recvWindowNextSN == FIRST_SN + 1);
 	// TODO: SCB buffer pointer to user space pointer
 	skb4->len = MAX_BLOCK_SIZE - 13;
 	skb4->SetFlag<TO_BE_CONTINUED>(false);
-	skb4->SetFlag<IS_COMPLETED>();
+	skb4->SetFlag<IS_FULFILLED>();
 
 	int m2;	// onReturn it should == skb4->len, i.e. MAX_BLOCK_SIZE - 13
 	bool toBeContinued;
@@ -185,30 +188,30 @@ void UnitTestSendRecvWnd()
 	// emulate a received message that crosses two packet
 	skb5 = pSCB->AllocRecvBuf(FIRST_SN + 1);
 	Assert::IsNotNull(skb5);
-	Assert::IsTrue(pSCB->receiveMaxExpected == FIRST_SN + 2);
+	Assert::IsTrue(pSCB->recvWindowNextSN == FIRST_SN + 2);
 
 	skb5->len = MAX_BLOCK_SIZE;
 	skb5->SetFlag<TO_BE_CONTINUED>();
-	skb5->SetFlag<IS_COMPLETED>();
+	skb5->SetFlag<IS_FULFILLED>();
 	skb5->MarkInSending();
 
 	skb5 = pSCB->AllocRecvBuf(FIRST_SN + 2);
 	Assert::IsNotNull(skb5);
-	Assert::IsTrue(pSCB->receiveMaxExpected == FIRST_SN + 3);
+	Assert::IsTrue(pSCB->recvWindowNextSN == FIRST_SN + 3);
 
 	skb5->len = MAX_BLOCK_SIZE - 13;
 	skb5->SetFlag<TO_BE_CONTINUED>(false);
-	skb5->SetFlag<IS_COMPLETED>();
+	skb5->SetFlag<IS_FULFILLED>();
 	skb5->MarkInSending();
 
 	// emulate a received-ahead packet
 	skb5 = pSCB->AllocRecvBuf(FIRST_SN + 4);
 	Assert::IsNotNull(skb5);
-	Assert::IsTrue(pSCB->receiveMaxExpected == FIRST_SN + 5);
+	Assert::IsTrue(pSCB->recvWindowNextSN == FIRST_SN + 5);
 
 	skb5->len = MAX_BLOCK_SIZE - 13;
 	skb5->SetFlag<TO_BE_CONTINUED>(false);
-	skb5->SetFlag<IS_COMPLETED>();
+	skb5->SetFlag<IS_FULFILLED>();
 
 	// what is the content of the selective negative acknowledgement?
 	FSP_SelectiveNACK::GapDescriptor snack[4];
@@ -250,7 +253,7 @@ void UnitTestResendQueue()
 
 	// set the begin of the send sequence number for the test to work properly
 	// set the negotiated receive window parameter
-	pSCB->recvWindowFirstSN = pSCB->receiveMaxExpected = FIRST_SN;
+	pSCB->recvWindowFirstSN = pSCB->recvWindowNextSN = FIRST_SN;
 
 	pSCB->SetSendWindowWithHeadReserved(FIRST_SN);
 	ControlBlock::PFSP_SocketBuf skb = pSCB->HeadSend();
@@ -272,24 +275,24 @@ void UnitTestResendQueue()
 	skb = pSCB->GetSendBuf();
 	Assert::IsNull(skb);	// as we knew there're only 4 packet slots 
 
-	skb = pSCB->PeekNextToSend();
-	Assert::IsTrue(skb == pSCB->HeadSend());
+	//skb = pSCB->PeekNextToSend();
+	//Assert::IsTrue(skb == pSCB->HeadSend());
 
 	++(pSCB->sendWindowNextSN);
-	skb = pSCB->PeekNextToSend();
-	Assert::IsTrue(skb == pSCB->HeadSend() + 1);
+	//skb = pSCB->PeekNextToSend();
+	//Assert::IsTrue(skb == pSCB->HeadSend() + 1);
 
 	++(pSCB->sendWindowNextSN);
-	skb = pSCB->PeekNextToSend();
-	Assert::IsTrue(skb == pSCB->HeadSend() + 2);
+	//skb = pSCB->PeekNextToSend();
+	//Assert::IsTrue(skb == pSCB->HeadSend() + 2);
 
 	++(pSCB->sendWindowNextSN);
-	skb = pSCB->PeekNextToSend();
-	Assert::IsTrue(skb == pSCB->HeadSend() + 3);
+	//skb = pSCB->PeekNextToSend();
+	//Assert::IsTrue(skb == pSCB->HeadSend() + 3);
 
 	++(pSCB->sendWindowNextSN);
-	skb = pSCB->PeekNextToSend();
-	Assert::IsNull(skb);
+	//skb = pSCB->PeekNextToSend();
+	//Assert::IsNull(skb);
 
 	skb =  pSCB->HeadSend();
 	//skb->SetFlag<IS_ACKNOWLEDGED>();
@@ -300,20 +303,20 @@ void UnitTestResendQueue()
 	// emulate received the first data packet
 	ControlBlock::PFSP_SocketBuf skb5 = pSCB->AllocRecvBuf(FIRST_SN);
 	Assert::IsNotNull(skb5);
-	skb5->SetFlag<IS_COMPLETED>();
+	skb5->SetFlag<IS_FULFILLED>();
 
 	// emulate a received message that crosses two packet
 	skb5 = pSCB->AllocRecvBuf(FIRST_SN + 1);
 	Assert::IsNotNull(skb5);
-	Assert::IsTrue(pSCB->receiveMaxExpected == FIRST_SN + 2);
+	Assert::IsTrue(pSCB->recvWindowNextSN == FIRST_SN + 2);
 
-	skb5->SetFlag<IS_COMPLETED>();
+	skb5->SetFlag<IS_FULFILLED>();
 
 	skb5 = pSCB->AllocRecvBuf(FIRST_SN + 3);
 	Assert::IsNotNull(skb5);
-	Assert::IsTrue(pSCB->receiveMaxExpected == FIRST_SN + 4);
+	Assert::IsTrue(pSCB->recvWindowNextSN == FIRST_SN + 4);
 
-	skb5->SetFlag<IS_COMPLETED>();
+	skb5->SetFlag<IS_FULFILLED>();
 
 	skb5 = pSCB->AllocRecvBuf(FIRST_SN + 4);
 	Assert::IsNull(skb5);	// No more space in the receive buffer
@@ -346,7 +349,7 @@ void UnitTestResendQueue()
 class CommandSyncSessionTestSub: public CommandSyncSession
 {
 public:
-	CommandSyncSessionTestSub(ALT_ID_T id)
+	CommandSyncSessionTestSub(ALFID_T id)
 	{
 		hMemoryMap = CreateFileMapping(INVALID_HANDLE_VALUE	// backed by the system paging file
 			, NULL	// not inheritable
@@ -566,8 +569,8 @@ void UnitTestNoticeQ()
 	FSP_ServiceCode c = cqq.PopNotice();
 	Assert::IsTrue(c == NullCommand, L"Nothing should be popped out from an empty queue");
 
-	n = cqq.PushNotice(FSP_NotifyDisposed);		// 1
-	Assert::IsFalse(n < 0, L"FSP_NotifyDisposed should have been pushed onto an empty queue");
+	n = cqq.PushNotice(FSP_NotifyTimeout);		// 1
+	Assert::IsFalse(n < 0, L"FSP_NotifyTimeout should have been pushed onto an empty queue");
 
 	n = cqq.PushNotice(FSP_NotifyReset);		// 2
 	Assert::IsFalse(n < 0, L"FSP_NotifyReset should have been pushed onto an un-fulfilled queue");
@@ -593,8 +596,8 @@ void UnitTestNoticeQ()
 	n = cqq.PushNotice(FSP_NotifyBufferReady);	// 7
 	Assert::IsFalse(n < 0, L"FSP_NotifyBufferReady should have been pushed onto an un-fulfilled queue");
 
-	n = cqq.PushNotice(FSP_NotifyDisposed);
-	Assert::IsFalse(n <= 0, L"Duplicated FSP_NotifyDisposed should be pushed onto queue with warning");
+	n = cqq.PushNotice(FSP_NotifyTimeout);
+	Assert::IsFalse(n <= 0, L"Duplicated FSP_NotifyTimeout should be pushed onto queue with warning");
 
 	n = cqq.PushNotice(FSP_IPC_CannotReturn);		// 8
 	Assert::IsFalse(n < 0, L"FSP_IPC_CannotReturn should have been pushed onto an un-fulfilled queue");
@@ -607,7 +610,7 @@ void UnitTestNoticeQ()
 
 	// 
 	c = cqq.PopNotice();	// 1
-	Assert::IsTrue(c == FSP_NotifyDisposed, L"What is popped should be what was pushed 1st");
+	Assert::IsTrue(c == FSP_NotifyTimeout, L"What is popped should be what was pushed 1st");
 
 	c = cqq.PopNotice();	// 2
 	Assert::IsTrue(c == FSP_NotifyReset, L"What is popped should be what was pushed 2nd");
@@ -635,6 +638,16 @@ void UnitTestNoticeQ()
 }
 
 
+void UnitTestCubicRoot()
+{
+	Assert::IsTrue(fabs(CubicRoot(0)) < DBL_EPSILON);
+	Assert::IsTrue(fabs(CubicRoot(-1) + 1) < DBL_EPSILON);
+	Assert::IsTrue(fabs(CubicRoot(1) - 1) < DBL_EPSILON);
+	Assert::IsTrue(fabs(CubicRoot(0.001) - 0.1) < DBL_EPSILON);
+	Assert::IsTrue(fabs(CubicRoot(8) - 2) < DBL_EPSILON);
+}
+
+
 #if 0	// now we make our mind to exploit VMAC
 void UnitTestGMAC()
 {
@@ -652,7 +665,7 @@ void UnitTestGMAC()
 
 	timestamp_t t1 = GetCurrentTimeIn100Nano();
 	responseZero.initCheckCode = request.initCheckCode;
-	(ALT_ID_T &)responseZero.timeDelta = htonl(LAST_WELL_KNOWN_ALT_ID); 
+	(ALFID_T &)responseZero.timeDelta = htonl(LAST_WELL_KNOWN_ALFID); 
 	EvaluateCookie(responseZero, t1, & nearEnd);
 
 	responseZero.timeDelta = htonl((u_long)(t1 - t0)); 
@@ -661,7 +674,7 @@ void UnitTestGMAC()
 
 	affirmedRequest.cookie = responseZero.cookie ^ (((UINT64)request.salt << 32) | request.salt);
 	affirmedRequest.initCheckCode = request.initCheckCode;
-	affirmedRequest.idALT = htonl(LAST_WELL_KNOWN_ALT_ID);
+	affirmedRequest.idALF = htonl(LAST_WELL_KNOWN_ALFID);
 	affirmedRequest.hs.Set<CONNECT_REQUEST>(sizeof(affirmedRequest));
 	affirmedRequest.exTimeStamp.timeStamp = htonll(t0);
 	affirmedRequest.exTimeStamp.timeDelta = htonl((u_long)(t1 - t0));
@@ -690,8 +703,8 @@ void UnitTestVMAC()
 
 	timestamp_t t1 = NowUTC();
 	struct _CookieMaterial cm;
-	cm.idALT = nearEnd.u.idALT;
-	cm.idListener = htonl(LAST_WELL_KNOWN_ALT_ID);
+	cm.idALF = nearEnd.u.idALF;
+	cm.idListener = htonl(LAST_WELL_KNOWN_ALFID);
 	// the cookie depends on the listening session ID AND the responding session ID
 	cm.salt = request.salt;
 	responseZero.initCheckCode = request.initCheckCode;
@@ -702,15 +715,13 @@ void UnitTestVMAC()
 
 	acknowledgement.expectedSN = 1;
 	acknowledgement.sequenceNo = 1;
-	acknowledgement.integrity.id.peer = htonl(LAST_WELL_KNOWN_ALT_ID); 
-	acknowledgement.integrity.id.source = nearEnd.u.idALT;
+	acknowledgement.integrity.id.peer = htonl(LAST_WELL_KNOWN_ALFID); 
+	acknowledgement.integrity.id.source = nearEnd.u.idALF;
 
-	memset(acknowledgement.encrypted, 0, sizeof(acknowledgement.encrypted));
-	acknowledgement.hsKey.Set<EPHEMERAL_KEY>(sizeof(FSP_NormalPacketHeader));
 	// should the connect parameter header. but it doesn't matter
-	acknowledgement.hs.Set<FSP_AckConnectRequest, ACK_CONNECT_REQUEST>();
+	acknowledgement.hs.Set<FSP_AckConnectRequest, ACK_CONNECT_REQ>();
 
-	PairSessionID savedId = acknowledgement.integrity.id;
+	PairALFID savedId = acknowledgement.integrity.id;
 	CSocketItemExDbg socket;
 	socket.ResetVMAC();
 
@@ -775,6 +786,14 @@ void UnitTestQuasibitfield()
 
 
 
+void UnitTestTestSetFlag()
+{
+	static ControlBlock::FSP_SocketBuf buf;
+	Assert::IsTrue(buf.TestSetFlag<IS_COMPLETED>());
+	Assert::IsTrue(buf.flags == 1 << IS_COMPLETED);
+}
+
+
 void UnitTestGenerateSNACK()
 {
 	static const ControlBlock::seq_t FIRST_SN = 12;
@@ -795,31 +814,31 @@ void UnitTestGenerateSNACK()
 	// secondly, one gap only
 	ControlBlock::PFSP_SocketBuf skb1 = socket.AllocRecvBuf(FIRST_SN);
 	Assert::IsNotNull(skb1);
-	Assert::IsTrue(pSCB->receiveMaxExpected == FIRST_SN + 1);
-	skb1->SetFlag<IS_COMPLETED>();
+	Assert::IsTrue(pSCB->recvWindowNextSN == FIRST_SN + 1);
+	skb1->SetFlag<IS_FULFILLED>();
 
 	skb1 = socket.AllocRecvBuf(FIRST_SN + 2);
 	Assert::IsNotNull(skb1);
-	Assert::IsTrue(pSCB->receiveMaxExpected == FIRST_SN + 3);
-	skb1->SetFlag<IS_COMPLETED>();
+	Assert::IsTrue(pSCB->recvWindowNextSN == FIRST_SN + 3);
+	skb1->SetFlag<IS_FULFILLED>();
 
 	r = pSCB->GetSelectiveNACK(seq0, gaps, MAX_GAPS_NUM);
 	Assert::IsTrue(r == 1 && seq0 == FIRST_SN + 3);
 
 	// when a very large gap among small continuous data segments found
 	skb1 = socket.AllocRecvBuf(FIRST_SN + 0x10003);
-	skb1->SetFlag<IS_COMPLETED>();
+	skb1->SetFlag<IS_FULFILLED>();
 	Assert::IsNotNull(skb1);
-	Assert::IsTrue(pSCB->receiveMaxExpected == FIRST_SN + 0x10004);
+	Assert::IsTrue(pSCB->recvWindowNextSN == FIRST_SN + 0x10004);
 
 	r = pSCB->GetSelectiveNACK(seq0, gaps, MAX_GAPS_NUM);
 	Assert::IsTrue(r == 1 && seq0 == FIRST_SN + 3);
 
 	// when gap descriptors overflow
 	skb1 = socket.AllocRecvBuf(FIRST_SN + 0x8003);
-	skb1->SetFlag<IS_COMPLETED>();
+	skb1->SetFlag<IS_FULFILLED>();
 	Assert::IsNotNull(skb1);
-	Assert::IsTrue(pSCB->receiveMaxExpected == FIRST_SN + 0x10004);
+	Assert::IsTrue(pSCB->recvWindowNextSN == FIRST_SN + 0x10004);
 
 	r = pSCB->GetSelectiveNACK(seq0, gaps, MAX_GAPS_NUM);
 	Assert::IsTrue(r == 2 && seq0 == FIRST_SN + 0x8004);
@@ -829,7 +848,7 @@ void UnitTestGenerateSNACK()
 	{
 		skb1 = socket.AllocRecvBuf(FIRST_SN + i);
 		Assert::IsNotNull(skb1);
-		skb1->SetFlag<IS_COMPLETED>();
+		skb1->SetFlag<IS_FULFILLED>();
 	}
 
 	r = pSCB->GetSelectiveNACK(seq0, gaps, MAX_GAPS_NUM);
@@ -841,7 +860,7 @@ void UnitTestGenerateSNACK()
 	Assert::IsTrue(pSCB->recvWindowHeadPos == 1 && pSCB->recvWindowFirstSN == (FIRST_SN + 1));
 
 	skb1 = socket.AllocRecvBuf(FIRST_SN + 1);
-	skb1->SetFlag<IS_COMPLETED>();
+	skb1->SetFlag<IS_FULFILLED>();
 
 	ControlBlock::PFSP_SocketBuf p = pSCB->HeadRecv();
 	for(int i = 0; i < 0x10001; i++)
@@ -854,7 +873,7 @@ void UnitTestGenerateSNACK()
 	Assert::IsTrue(b && r == MAX_BLOCK_SIZE * 2);
 
 	skb1 = socket.AllocRecvBuf(FIRST_SN + 3);
-	skb1->SetFlag<IS_COMPLETED>();
+	skb1->SetFlag<IS_FULFILLED>();
 	skb1->SetFlag<TO_BE_CONTINUED>();
 
 	pSCB->InquireRecvBuf(r, b);
@@ -863,8 +882,8 @@ void UnitTestGenerateSNACK()
 
 	//
 	skb1 = socket.AllocRecvBuf(FIRST_SN + 0x20001);
-	skb1->SetFlag<IS_COMPLETED>();
-	Assert::IsTrue(pSCB->receiveMaxExpected == FIRST_SN + 0x20002);
+	skb1->SetFlag<IS_FULFILLED>();
+	Assert::IsTrue(pSCB->recvWindowNextSN == FIRST_SN + 0x20002);
 
 	r = pSCB->GetSelectiveNACK(seq0, gaps, MAX_GAPS_NUM);
 	// there's a continuous data block which is not delivered yet. however, it is not considered needing a gap descriptor
@@ -883,13 +902,15 @@ void UnitTestAcknowledge()
 	ControlBlock *pSCB = socket.GetControlBlock();
 	FSP_SelectiveNACK::GapDescriptor gaps[MAX_GAPS_NUM];
 
-	pSCB->sendWindowExpectedSN = pSCB->sendWindowFirstSN = FIRST_SN;
+	pSCB->welcomedNextSNtoSend = pSCB->sendWindowFirstSN = FIRST_SN;
 	pSCB->sendBufferNextSN = pSCB->sendWindowNextSN = FIRST_SN + 1;
 	// Pretend that the first packet has been sent and is waiting acknowledgement...
 	// A NULL acknowledgement, Keep-Alive
 	int r = socket.RespondSNACK(FIRST_SN + 1, NULL, 0);
 	Assert::IsTrue(r == 0 && pSCB->sendBufferNextSN == pSCB->sendWindowFirstSN);
 	Assert::IsTrue(pSCB->sendWindowFirstSN == FIRST_SN + 1);
+	Assert::IsTrue(pSCB->sendWindowNextSN == FIRST_SN + 1);
+
 
 	pSCB->SetSendWindowWithHeadReserved(FIRST_SN);
 	ControlBlock::PFSP_SocketBuf skb = pSCB->HeadSend();
@@ -916,6 +937,7 @@ void UnitTestAcknowledge()
 	// acknowledge the first two
 	r = socket.RespondSNACK(FIRST_SN + 2, NULL, 0);
 	Assert::IsTrue(r == 0 && pSCB->sendWindowFirstSN == FIRST_SN + 2);
+	Assert::IsTrue(pSCB->CountUnacknowledged() >= 0);
 	Assert::IsTrue(pSCB->sendWindowSize == MAX_BLOCK_NUM - 2);
 
 	// Now, more test...
@@ -945,32 +967,39 @@ void UnitTestAcknowledge()
 	// this is an illegal one
 	r = socket.RespondSNACK(FIRST_SN, gaps, 1);
 	Assert::IsTrue(r == -EBADF && pSCB->sendWindowFirstSN == FIRST_SN + 2);
+	Assert::IsTrue(pSCB->CountUnacknowledged() >= 0);
 	// again, an outdated one
 	r = socket.RespondSNACK(FIRST_SN + 2, gaps, 1);
 	Assert::IsTrue(r == -EDOM && pSCB->sendWindowFirstSN == FIRST_SN + 2);
+	Assert::IsTrue(pSCB->CountUnacknowledged() >= 0);
 
 	// this is a legal one
 	r = socket.RespondSNACK(FIRST_SN + 5, gaps, 1);
 	Assert::IsTrue(r == 0 && pSCB->sendWindowFirstSN == FIRST_SN + 3);
+	Assert::IsTrue(pSCB->CountUnacknowledged() >= 0);
 
 	// this is a legal but redundant two gaps
 	gaps[1].dataLength = 1;
 	gaps[1].gapWidth = 1;
 	r = socket.RespondSNACK(FIRST_SN + 5, gaps, 2);
 	Assert::IsTrue(r == 0 && pSCB->sendWindowFirstSN == FIRST_SN + 3);
+	Assert::IsTrue(pSCB->CountUnacknowledged() >= 0);
 
 	// two gaps, overlap with previous one [only to urge retransmission of those negatively acknowledged]
 	r = socket.RespondSNACK(FIRST_SN + 7, gaps, 2);
 	Assert::IsTrue(r == 0 && pSCB->sendWindowFirstSN == FIRST_SN + 3);
+	Assert::IsTrue(pSCB->CountUnacknowledged() >= 0);
 
 	// two gaps, do real new acknowledgement
 	r = socket.RespondSNACK(FIRST_SN + 9, gaps, 2);
 	Assert::IsTrue(r == 0 && pSCB->sendWindowFirstSN == FIRST_SN + 5);
+	Assert::IsTrue(pSCB->CountUnacknowledged() >= 0);
 
 	// a very large continuous data segment is acknowledged
 	r = socket.RespondSNACK(FIRST_SN + 0x1000A, gaps, 2);
 	Assert::IsTrue(r == 0 && pSCB->sendWindowFirstSN == FIRST_SN + 0x10006);
 	Assert::IsTrue(pSCB->sendWindowSize == MAX_BLOCK_NUM - 0x10006);
+	Assert::IsTrue(pSCB->CountUnacknowledged() >= 0);
 
 	// Test round-robin...
 	for(int i = MAX_BLOCK_NUM + 2; i < MAX_BLOCK_NUM + 0x10000; i++)
@@ -987,6 +1016,7 @@ void UnitTestAcknowledge()
 	Assert::IsTrue(r == 0 && pSCB->sendWindowHeadPos == 0xEFFC);
 	Assert::IsTrue(pSCB->sendWindowSize == - 0xEFFC);	// overflow, but don't care!
 	Assert::IsTrue(pSCB->sendWindowFirstSN == FIRST_SN + MAX_BLOCK_NUM + 0xEFFC);
+	Assert::IsTrue(pSCB->CountUnacknowledged() >= 0);
 
 	// TODO: Test calculation of RTT and Keep alive timeout 
 }
@@ -997,13 +1027,29 @@ void UnitTestSocketInState()
 {
 	CSocketItemExDbg socket(2, 2);
 	socket.SetState(QUASI_ACTIVE);
-	bool r = socket.InStates(3, PAUSING, RESUMING, QUASI_ACTIVE);
+	bool r = socket.InStates(3, COMMITTING, RESUMING, QUASI_ACTIVE);
 	Assert::IsTrue(r);
 	socket.SetState(CLOSABLE);
-	r = socket.InStates(4, PAUSING, RESUMING, QUASI_ACTIVE, CLOSED);
+	r = socket.InStates(4, COMMITTING2, RESUMING, QUASI_ACTIVE, CLOSED);
 	Assert::IsFalse(r);
 }
 
+
+
+void UnitTestPacketBuffer()
+{
+	CSocketItemExDbg socket(2, 2);
+	PktSignature pktSign;
+
+	memset(& socket, 0, sizeof(CSocketItemExDbg));
+	pktSign.pkt = (FSP_NormalPacketHeader *)0x10;
+	// Peek...return the header packet descriptor itself
+
+	PktSignature *p = socket.PushPacketBuffer(& pktSign);
+	FSP_NormalPacketHeader *hdr = socket.PeekLockPacketBuffer();
+	Assert::IsNotNull(hdr);
+	socket.PopUnlockPacketBuffer();
+}
 
 
 
@@ -1033,10 +1079,10 @@ void UnitTestSocketSrvTLB()
 	IN6_ADDR addrList[MAX_PHY_INTERFACES];
 	// no hint
 	memset(addrList, 0, sizeof(addrList));
-	ALT_ID_T id = (CLowerInterface::Singleton())->RandALT_ID();
+	ALFID_T id = (CLowerInterface::Singleton())->RandALFID();
 	Assert::IsFalse(id == 0, L"There should be free id space");
 
-	id = (CLowerInterface::Singleton())->RandALT_ID(addrList);
+	id = (CLowerInterface::Singleton())->RandALFID(addrList);
 	Assert::IsFalse(id == 0, L"There should be free id space");
 
 	sprintf_s(linebuf, "Allocated ID = %d\n", id);
@@ -1095,7 +1141,20 @@ class CLowerInterfaceDbg: public CLowerInterface
 public:
 	BYTE *	CurrentHead() { return bufferMemory + sizeof(PktSignature) + bufHead; }
 	friend	void UnitTestReceiveQueue();
+	friend	void UnitTestBufferManagement();
 };
+
+
+
+void UnitTestBufferManagement()
+{
+	CLowerInterfaceDbg  intf;
+	BYTE * p = intf.BeginGetBuffer();
+	Assert::IsNotNull(p);
+	intf.CommitGetBuffer(p, 64);
+	intf.FreeBuffer(p);
+	// TODO: pressure test
+}
 
 
 
@@ -1229,6 +1288,12 @@ namespace UnitTestFSP
 		{
 			UnitTestNoticeQ();
 		}
+
+		TEST_METHOD(TestCubicRoot)
+		{
+			UnitTestCubicRoot();
+		}
+
 #if 0
 		TEST_METHOD(TestGMAC)
 		{
@@ -1247,22 +1312,34 @@ namespace UnitTestFSP
 			UnitTestQuasibitfield();
 		}
 
-		
+
+		TEST_METHOD(TestTestSetFlag)
+		{
+			UnitTestTestSetFlag();
+		}
+
+
 		TEST_METHOD(TestSocketSrvTLB)
 		{
 			UnitTestSocketSrvTLB();
 		}
 
 
-		TEST_METHOD(TestReceiveQueue)
+		TEST_METHOD(TestBufferManagement)
 		{
-			UnitTestReceiveQueue();
+			UnitTestBufferManagement();
 		}
 
 
 		TEST_METHOD(TestConnectQueue)
 		{
 			UnitTestConnectQueue();
+		}
+
+
+		TEST_METHOD(TestReceiveQueue)
+		{
+			UnitTestReceiveQueue();
 		}
 
 #if 0
@@ -1295,6 +1372,12 @@ namespace UnitTestFSP
 		TEST_METHOD(TestSocketInState)
 		{
 			UnitTestSocketInState();
+		}
+
+
+		TEST_METHOD(TestPacketBuffer)
+		{
+			UnitTestPacketBuffer();
 		}
 
 

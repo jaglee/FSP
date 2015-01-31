@@ -25,7 +25,7 @@
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="Configuration">
     <ConfigurationType>DynamicLibrary</ConfigurationType>
     <CharacterSet>MultiByte</CharacterSet>
-    <PlatformToolset>v100</PlatformToolset>
+    <PlatformToolset>v110</PlatformToolset>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <ImportGroup Label="ExtensionSettings">
@@ -104,15 +104,12 @@
     <ClCompile Include="..\KeccakReferenceAndOptimized\Sources\KeccakNISTInterface.c" />
     <ClCompile Include="..\KeccakReferenceAndOptimized\Sources\KeccakSponge.c" />
     <ClCompile Include="..\rijndael-alg-fst.c" />
-    <ClCompile Include="..\vmac.c" />
     <ClCompile Include="Disconnect.cpp" />
     <ClCompile Include="DllEntry.cpp" />
     <ClCompile Include="Establish.cpp" />
     <ClCompile Include="Multihome.cpp" />
     <ClCompile Include="Multiplex.cpp" />
     <ClCompile Include="Receive.cpp" />
-    <ClCompile Include="rsa-gmp.cpp" />
-    <ClCompile Include="rsassa-pss.cpp" />
     <ClCompile Include="Send.cpp" />
   </ItemGroup>
   <ItemGroup>
@@ -129,8 +126,6 @@
     <ClInclude Include="..\vmac.h" />
     <ClInclude Include="FSP_DLL.h" />
     <ClInclude Include="..\FSP_Impl.h" />
-    <ClInclude Include="rsa-gmp.hpp" />
-    <ClInclude Include="rsassa-pss.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

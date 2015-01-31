@@ -22,7 +22,7 @@
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="Configuration">
     <ConfigurationType>DynamicLibrary</ConfigurationType>
     <UseDebugLibraries>true</UseDebugLibraries>
-    <PlatformToolset>v120</PlatformToolset>
+    <PlatformToolset>v110</PlatformToolset>
     <CharacterSet>MultiByte</CharacterSet>
     <UseOfMfc>false</UseOfMfc>
   </PropertyGroup>
@@ -98,6 +98,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="..\ControlBlock.cpp" />
+    <ClCompile Include="..\FSP_SRV\CubicRoot.c" />
     <ClCompile Include="..\FSP_SRV\mobile.cpp" />
     <ClCompile Include="..\FSP_SRV\os_win.cpp" />
     <ClCompile Include="..\FSP_SRV\remote.cpp" />

@@ -107,7 +107,7 @@ public:
 // Reflexing string representation of FSP_Session_State and FSP_ServiceCode, for debug purpose
 class CStringizeState
 {
-	static const char * names[CLOSED + 1];
+	static const char * names[LARGEST_FSP_STATE + 1];
 public:
 	const char * operator[](int);
 };
@@ -147,7 +147,14 @@ extern CStringizeNotice noticeNames;
  * Implementation defined timeout
  */
 #define MAXIMUM_SESSION_LIFE_ms		43200000	// 12 hours
-#define	SCAVENGE_THRESHOLD_ms		1800000		// 30 minutes
+
+#ifdef TRACE
+# define KEEP_ALIVE_TIMEOUT_MIN_us	1000000	// 1 second
+# define SCAVENGE_THRESHOLD_ms		180000	// 3 minutes
+#else
+# define KEEP_ALIVE_TIMEOUT_MIN_us	500		// 0.5 millisecond
+# define SCAVENGE_THRESHOLD_ms		1800000	// 30 minutes
+#endif
 
 /**
  * Implemented system limit
@@ -169,6 +176,9 @@ extern CStringizeNotice noticeNames;
 
 #define LOCALAPI __fastcall
 
+// This implement's congestion control parameters
+#define CONGEST_CONTROL_C	0.4
+#define CONGEST_CONTROL_BETA 0.2
 
 /**
  * platform-dependent fundamental utility functions
@@ -178,12 +188,6 @@ extern CStringizeNotice noticeNames;
 #else
   #define DELTA_EPOCH_IN_MICROSECS  11644473600000000ULL
 #endif
-
-// Return the number of microseconds elapsed since Jan 1, 1970 (unix epoch time)
-extern "C" timestamp_t NowUTC();	// it seems that a global property 'Now' is not as clear as this function format
-
-// random generatator is somehow dependent on implementation. hardware prefered.
-extern "C" void	rand_w32(uint32_t *p, int n);
 
 /**
  * Parameter data-structure and Session Control Block data-structure
@@ -212,6 +216,9 @@ enum FSP_FlagPosition: UINT8
 {
 	ToBeContinued = 0,
 	Compressed = 1,
+	Encrypted = 2,
+	Unauthenticated = 3,
+	FirstInFirstDrop = 4,
 	ExplicitCongestion = 7
 };
 
@@ -223,7 +230,7 @@ struct FSP_NormalPacketHeader
 	union
 	{
 		UINT64		code;
-		PairSessionID id;
+		PairALFID	id;
 	} integrity;
 	//
 	UINT8	flags_ws[4];
@@ -259,61 +266,47 @@ struct FSP_Challenge
 {
 	UINT64		cookie;
 	UINT64		initCheckCode;
-	INT32		timeDelta;
+	int32_t		timeDelta;
 	$FSP_HeaderSignature hs;
 };
 
-/**
- * TODO: UNRESOLVED! Server's certificate as an optional header, for IPv6 only?
- */
+
+
 // FSP_ConnectParam assists in renegotiating session key in a PERSIST packet
 // while specifies the parent connection in a MULTIPLY or CONNECT_REQUEST packet
-// To make life easier we support at most two load-balanced IP interfaces
+// MOBILE_PARAM used to be CONNECT_PARAM and it is perfect OK to treat the latter as the canonical alias of the former
 struct FSP_ConnectParam
 {
 	uint64_t	subnets[MAX_PHY_INTERFACES];
-	uint32_t	initialSN;		// initial sequence number, I->R, for this session segment
-	ALT_ID_T	listenerID;
-	uint32_t	delayLimit;		// In microseconds, 0 for no limit
+	ALFID_T		listenerID;
+	//
+	// host id of the application layer fiber, alias of listenerID
+	__declspec(property(get=getHostID, put=setHostID))
+	UINT32	idHostALF;
+	UINT32	getHostID() const { return listenerID; }
+	void	setHostID(UINT32 value) { listenerID = value; }
+	//
 	$FSP_HeaderSignature hs;
 };
 
 
 
-// formal connection request, to be followed by half-connection parameter header
-// acknowledge of the connection request packet is an 'almost normal' FSP packet
-struct FSP_ConnectPublicKey
+struct FSP_ConnectRequest: FSP_InitiateRequest
 {
-	BYTE	public_n[FSP_PUBLIC_KEY_LEN];
-	INT32	timeDelta;
-	$FSP_HeaderSignature hsKey;
-};
-
-
-
-struct FSP_ConnectRequest: FSP_InitiateRequest, FSP_ConnectPublicKey
-{
-	__declspec(property(get=getCookie, put=setCookie))
-	UINT64	cookie;
-	UINT64	getCookie() const { return initCheckCode; }
-	void	setCookie(UINT64 value) { initCheckCode = value; }
+	uint32_t	initialSN;		// initial sequence number, I->R, for this session segment
+	int32_t		timeDelta;
+	uint64_t	cookie;
 	//
 	FSP_ConnectParam params;
 };
 
 
-struct FSP_AckConnectKey
-{
-	BYTE	encrypted[FSP_PUBLIC_KEY_LEN];		// RSAES-PKCS1-v1_5 O
-	INT32	timeDelta;
-	$FSP_HeaderSignature hsKey;
-};
 
-
-struct FSP_AckConnectRequest: FSP_NormalPacketHeader, FSP_AckConnectKey
+struct FSP_AckConnectRequest: FSP_NormalPacketHeader
 {
 	FSP_ConnectParam params;
 };
+
 
 
 struct FSP_SelectiveNACK
@@ -346,7 +339,7 @@ struct FSP_RejectConnect
 		UINT64 integrityCode;
 		UINT64 cookie;
 		UINT64 initCheckCode;
-		PairSessionID sidPair;
+		PairALFID fidPair;
 	} u2;
 	//
 	UINT32 reasons;	// bit field(?)
@@ -365,7 +358,7 @@ struct CommandToLLS
 {
 	DWORD			idProcess;
 	ALIGN(8)
-	ALT_ID_T		idSession;
+	ALFID_T		fiberID;
 	FSP_ServiceCode	opCode;	// operation code
 
 	CommandToLLS() { memset(this, 0, sizeof(CommandToLLS)); }
@@ -411,24 +404,27 @@ struct SConnectParam	// MUST be aligned on 64-bit words!
 {
 	UINT64		initCheckCode;
 	UINT64		cookie;
+	//
 	UINT32		salt;
 	UINT32		initialSN;	// the initial sequence number of the packet to send
-	ALT_ID_T	idRemote;	// ID of the listener or the new forked, depending on context
+	//
+	ALFID_T		idRemote;	// ID of the listener or the new forked, depending on context
 	UINT32		remoteHostID;
-	UINT32		delayLimit;		// in microseconds, for milky payload
-	INT32		timeDelta;		// delay of peer to peer timestamp, delta of clock 
+	//
+	int32_t		timeDelta;		// delay of peer to peer timestamp, delta of clock 
+	int32_t		reserved0;
 	timestamp_t timeStamp;
+	//
 	UINT64		allowedPrefixes[MAX_PHY_INTERFACES];
-};	// totally 48 bytes
+};	// totally 56 bytes, 448 bits
 
 
 
 struct BackLogItem: SConnectParam
 {
-	BYTE		bootKey[FSP_PUBLIC_KEY_LEN];
-	FSP_PKTINFO	acceptAddr;	// including the interface number AND the local session ID
-	ALT_ID_T	idParent;
-	//^ 0 if it is the 'root' acceptor, otherwise the local session ID of the cloned connection
+	FSP_PKTINFO	acceptAddr;	// including the interface number AND the local fiber ID
+	ALFID_T		idParent;
+	//^ 0 if it is the 'root' acceptor, otherwise the local fiber ID of the cloned connection
 	UINT32		expectedSN;	// the expected sequence number of the packet to receive by order
 };
 
@@ -438,8 +434,8 @@ struct BackLogItem: SConnectParam
 template<typename TLogItem> class TSingleProviderMultipleConsumerQ
 {
 	volatile char		mutex;
-	ALIGN(2)
-	volatile short		nProvider;
+	ALIGN(4)
+	volatile LONG		nProvider;
 	ALIGN(8)
 	int32_t				capacity;
 	volatile int32_t	headQ;
@@ -466,11 +462,12 @@ public:
  */
 enum SocketBufFlagBitPosition
 {
-	BIT_IN_SENDING = 0,
+	EXCLUSIVE_LOCK = 0,
 	IS_ACKNOWLEDGED = 1,
 	IS_COMPLETED = 2,
 	IS_DELIVERED = 3,
-	// 4, 5: reserved
+	IS_FULFILLED = 4,	// IS_COMPLETED is for sending. Could reuse bit #2
+	// 5: reserved
 	IS_COMPRESSED = 6,
 	TO_BE_CONTINUED = 7
 };
@@ -491,7 +488,7 @@ volatile struct ControlBlock
 	ALIGN(4)	// sizeof(LONG)
 	UINT32		allowedDelay;	// 0 if it is wine-alike payload, non-zero if milky; in microseconds
 
-	ALT_ID_T	idParent;
+	ALFID_T	idParent;
 
 	ALIGN(8)	// 64-bit aligment
 	FSP_NormalPacketHeader tmpHeader;	// for sending; assume sending is single-threaded for a single session
@@ -499,7 +496,6 @@ volatile struct ControlBlock
 	// 1, 2.
 	// Used to be the matched list of local and remote addresses.
 	// for security reason the remote addresses were moved to LLS
-	// TODO: UNRESOLVED!? limit multi-home capability to physical interfaces, not logical interfaces?
 	char			nearEndName[INET6_ADDRSTRLEN + 7];	// 72 bytes, in UTF-8
 	FSP_PKTINFO_EX	nearEnd[MAX_PHY_INTERFACES];
 	union
@@ -509,7 +505,7 @@ volatile struct ControlBlock
 		{
 			UINT64	allowedPrefixes[MAX_PHY_INTERFACES];
 			UINT32	hostID;
-			ALT_ID_T sessionID;
+			ALFID_T fiberID;
 		} ipFSP;
 	} peerAddr;
 
@@ -549,19 +545,20 @@ private:
 	int32_t		sendWindowHeadPos;	// the index number of the block with sendWindowFirstSN
 	seq_t		sendBufferNextSN;
 	int32_t		sendBufferNextPos;	// the index number of the block with sendBufferNextSN
-	seq_t		sendWindowExpectedSN;
 	//
 	int32_t		sendBufferBlockN;	// capacity of the send buffer
 	uint32_t	sendBuffer;			// relative to start of the control block
 	uint32_t	sendBufDescriptors;	// relative to start of the control block,
 
-	seq_t		receiveMaxExpected;	// the next to the right-border of the received area
-	int32_t		recvWindowNextPos;	// the index number of the block with receiveMaxExpected
+	seq_t		recvWindowNextSN;	// the next to the right-border of the received area
+	int32_t		recvWindowNextPos;	// the index number of the block with recvWindowNextSN
 	seq_t		recvWindowFirstSN;	// left-border of the receive window (receive queue), may be empty or may be filled but not delivered
-	// it means that the receive queue is empty when recvWindowFirstSN == receiveMaxExpected
+	// it means that the receive queue is empty when recvWindowFirstSN == recvWindowNextSN
 	// (next position, receive buffer maximum sn) (head position, receive window first sn)
 	// are managed independently for maximum parallism in DLL and LLS
 	int32_t		recvWindowHeadPos;	// the index number of the block with recvWindowFirstSN
+	//
+	seq_t		welcomedNextSNtoSend;
 	//
 	int32_t		recvBufferBlockN;	// capacity of the receive buffer
 	uint32_t	recvBuffer;			// relative to start of the control block
@@ -586,11 +583,14 @@ public:
 		}
 		template<SocketBufFlagBitPosition i>
 		bool GetFlag() const { return (flags & (1 << i)) != 0; }
+		// TestSetFlag return false if the bit is already set. Works for little-endian CPU only
+		template<SocketBufFlagBitPosition i>
+		bool TestSetFlag() { return _interlockedbittestandset((LONG *) & flags, i) == FALSE; }
 		//
-		bool MarkInSending();
-		void MarkUnsent() { flags &= ~(uint16_t)(1 << BIT_IN_SENDING); }
+		bool Lock();
+		void Unlock() { SetFlag<EXCLUSIVE_LOCK>(false); }
 		//
-		void ZeroFlags() { flags = 0; MarkUnsent(); }
+		void InitFlags() { flags = 1 << EXCLUSIVE_LOCK; }
 	} *PFSP_SocketBuf;
 
 	// Convert the relative address in the control block to the address in process space, unchecked
@@ -628,22 +628,25 @@ public:
 	int CountUnacknowledged() const { return int(sendWindowNextSN - sendWindowFirstSN); }
 	int CountUnacknowledged(seq_t expectedSN) const { return int(sendWindowNextSN - expectedSN); }
 #ifdef TRACE
-	void DumpSendRecvWindowInfo() const
+	int DumpSendRecvWindowInfo() const
 	{
-		printf_s("\tSend head - tail = %d - %d, SN first = %u, next to send = %u, expected ACK=%u\n"
-			"recv head - tail = %d - %d, SN first = %u, max expected = %u\n"
+		return printf_s("\tSend[head, tail] = [%d, %d], packets on flight = %d\n"
+			"\tSN next to send = %u, welcomedNextSNtoSend = %u\n"
+			"\tRecv[head, tail] = [%d, %d], receive window size = %d\n"
+			"\tSN first received = %u, max expected = %u\n"
 			, sendWindowHeadPos
 			, sendBufferNextPos
-			, sendWindowFirstSN
+			, int(sendWindowNextSN - sendWindowFirstSN)
 			, sendWindowNextSN
-			, sendWindowExpectedSN
+			, welcomedNextSNtoSend
 			, recvWindowHeadPos
 			, recvWindowNextPos
+			, int(recvWindowNextSN - recvWindowFirstSN)
 			, recvWindowFirstSN
-			, receiveMaxExpected);
+			, recvWindowNextSN);
 	}
 #else
-	void DumpSendRecvWindowInfo() const {}
+	int DumpSendRecvWindowInfo() const {}
 #endif
 
 	PFSP_SocketBuf HeadSend() const { return (PFSP_SocketBuf)((BYTE *)this + sendBufDescriptors); }
@@ -664,34 +667,34 @@ public:
 		if (CountSendBuffered() <= 0)
 			return NULL;
 		//
-		const register int i = sendBufferNextPos - 1;
+		register int i = sendBufferNextPos - 1;
 		return HeadSend() + (i < 0 ? sendBufferBlockN - 1 : i);
 	}
 	// Allocate a new send buffer
 	PFSP_SocketBuf	GetSendBuf();
-	// Return
-	//	The send buffer block descriptor of the packet to send next
-	// Remark
-	//	It is assumed that the caller knew there exists at least one packet in the queue
-	//	Implement in a way different with that in LLS to maximize parallelism and avoid locking 
 	PFSP_SocketBuf	GetNextToSend() const
 	{
-		register int i = sendBufferNextPos - int(sendBufferNextSN - sendWindowNextSN);
-		return HeadSend() + (i < 0 ? i + sendBufferBlockN : i - sendBufferBlockN >= 0 ? i - sendBufferBlockN : i);
+		register int i = sendWindowHeadPos + (sendWindowNextSN - sendWindowFirstSN);
+		if(i - sendBufferBlockN >= 0)
+			i -= sendBufferBlockN;
+		return HeadSend() + i;
 	}
-	PFSP_SocketBuf	PeekNextToSend() const;	// An LLS version of GetNextToSend()
+	PFSP_SocketBuf	PeekAnteCommit() const;
+	bool CheckSendWindowLimit(int32_t cwnd) const { return int(sendWindowNextSN - sendWindowFirstSN) <= min(sendWindowSize, cwnd); }
 
-	bool CheckSendWindowLimit() const { return int(sendWindowNextSN - sendWindowFirstSN) <= sendWindowSize; }
+	void RoundSendBufferNextPos() { int32_t m = sendBufferNextPos - sendBufferBlockN; if(m >= 0) sendBufferNextPos = m; }
+
+	// UNRESOLVED! Do we have to maintain the last buffered send packet, however?
 	int ClearSendWindow() { sendWindowHeadPos = sendBufferNextPos = 0; return sendBufferBlockN; }
 
-	int CountReceived() const { return int(receiveMaxExpected - recvWindowFirstSN); }
-	bool IsValidSequence(seq_t seq1)
+	int CountReceived() const { return int(recvWindowNextSN - recvWindowFirstSN); }
+	bool IsValidSequence(seq_t seq1) const
 	{
 		register int d = int(seq1 - recvWindowFirstSN);
 		// somewhat 'be free to accept' as we didnot enforce 'announced receive window size'
 		return (0 <= d) && (d < recvBufferBlockN);
 	}
-	bool IsOutOfBandStale(seq_t seq1)
+	bool IsRetriableStale(seq_t seq1) const
 	{
 		register int d = int(seq1 - recvWindowFirstSN);
 		// somewhat 'be free to accept' as we didnot enforce 'announced receive window size'
@@ -707,12 +710,9 @@ public:
 	int	LOCALAPI MarkSendQueue(void *, int, bool);
 
 	PFSP_SocketBuf GetFirstReceived() const { return HeadRecv() + recvWindowHeadPos; }
-	// Return the last received packet, which might be already delivered. The caller should make sure it is illegal to be called
-	PFSP_SocketBuf GetLastReceived() const
-	{
-		const register int i = recvWindowNextPos - 1;
-		return HeadRecv() + (i < 0 ? recvBufferBlockN - 1 : i);
-	}
+	int LOCALAPI GetSelectiveNACK(seq_t &, FSP_SelectiveNACK::GapDescriptor *, int) const;
+
+	// Return the last received packet, which might be already delivered
 	PFSP_SocketBuf LOCALAPI AllocRecvBuf(seq_t);
 	// Slide the left border of the receive window by one slot
 	void SlideRecvWindowByOne()	// shall be atomic!
@@ -721,17 +721,16 @@ public:
 		if(++recvWindowHeadPos - recvBufferBlockN >= 0)
 			recvWindowHeadPos -= recvBufferBlockN;
 	}
-	int LOCALAPI GetSelectiveNACK(seq_t &, FSP_SelectiveNACK::GapDescriptor *, int) const;
 	void * LOCALAPI InquireRecvBuf(int &, bool &);
 
-	void SetRecvWindowHead(seq_t pktSeqNo)	{ receiveMaxExpected = recvWindowFirstSN = pktSeqNo; }
+	void SetRecvWindowHead(seq_t pktSeqNo)	{ recvWindowNextSN = recvWindowFirstSN = pktSeqNo; }
 	void SetSendWindowWithHeadReserved(seq_t initialSN)
 	{
 		PFSP_SocketBuf skb = HeadSend();
+		skb->InitFlags(); // and locked
 		skb->version = THIS_FSP_VERSION;
-		skb->ZeroFlags();
 		sendWindowHeadPos = 0;
-		sendWindowExpectedSN = sendWindowNextSN = sendWindowFirstSN = initialSN;
+		welcomedNextSNtoSend = sendWindowNextSN = sendWindowFirstSN = initialSN;
 		sendBufferNextSN = initialSN + 1;
 		sendBufferNextPos = 1;
 		sendWindowSize = 1;
@@ -741,8 +740,16 @@ public:
 	// Check the receive queue to test whether it could migrate to the CLOSABLE state
 	bool IsClosable() const;
 
-	// Slide send window to skip all of the acknowledged
+	seq_t MoveNextToSend() { return sendWindowNextSN++; }
+	// Slide the send window to skip all of the acknowledged
 	void SlideSendWindow();
+	// Slide the send window to skip the head slot, supposing that it has been acknowledged
+	void SlideSendWindowByOne()	// shall be atomic!
+	{
+		sendWindowFirstSN++;
+		if(++sendWindowHeadPos - sendBufferBlockN >= 0)
+			sendWindowHeadPos -= sendBufferBlockN;
+	}
 	//
 	bool LOCALAPI ResizeSendWindow(seq_t, unsigned int);
 
@@ -775,7 +782,7 @@ public:
 class CSocketItem
 {
 protected:
-	PairSessionID	pairSessionID;
+	PairALFID	fidPair;
 	HANDLE	hEvent;
 	HANDLE	hMemoryMap;
 	DWORD	dwMemorySize;	// size of the shared memory, in the mapped view

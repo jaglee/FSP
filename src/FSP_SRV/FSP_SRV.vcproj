@@ -41,7 +41,7 @@
 			<Tool
 				Name="VCCLCompilerTool"
 				Optimization="0"
-				PreprocessorDefinitions="_WIN32_WINNT=0x0600;TRACE;TRACE_PACKET"
+				PreprocessorDefinitions="OVER_UDP_IPv4;_WIN32_WINNT=0x0600;TRACE;TRACE_PACKET"
 				MinimalRebuild="true"
 				BasicRuntimeChecks="3"
 				RuntimeLibrary="1"
@@ -189,6 +189,10 @@
 				>
 			</File>
 			<File
+				RelativePath=".\CubicRoot.c"
+				>
+			</File>
+			<File
 				RelativePath=".\main.cpp"
 				>
 			</File>
@@ -240,10 +244,6 @@
 			</File>
 			<File
 				RelativePath=".\fsp_srv.h"
-				>
-			</File>
-			<File
-				RelativePath=".\Crypt++GCM\gcm.h"
 				>
 			</File>
 			<File

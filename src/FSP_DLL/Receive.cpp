@@ -147,7 +147,7 @@ int LOCALAPI CSocketItemDl::ReadFrom(void * buffer, int capacity, PVOID fp1)
 		return -EINTR;
 	}
 
-	if(InterlockedCompareExchangePointer((PVOID *) & fpReceive, fp1, NULL) != NULL)
+	if(InterlockedCompareExchangePointer((PVOID *) & fpRecept, fp1, NULL) != NULL)
 	{
 		TRACE_HERE("calling convention error: cannot read the stream before previous ReadFrom called back");
 		SetMutexFree();
@@ -214,7 +214,7 @@ int CSocketItemDl::FetchReceived()
 		if(p->len > MAX_BLOCK_SIZE || p->len < 0)
 			return -EFAULT;
 
-		if (!p->GetFlag<IS_COMPLETED>())
+		if (!p->GetFlag<IS_FULFILLED>())
 			break;	// The buffer block happened to be not ready yet. See CSocketItemEx::PlacePayload()
 
 		if(DeliverData(GetRecvPtr(p), p->len) < 0)
@@ -239,7 +239,7 @@ int CSocketItemDl::FetchReceived()
 
 
 // Remark
-//	fpReceive would not be reset if internal memeory allocation error detected
+//	fpRecept would not be reset if internal memeory allocation error detected
 //	If RecvInline() failed (say, due to compression and/or encryption), data may be picked up by ReadFrom()
 //	SetMutexFree() is splitted because of calling back
 //	ULA should make sure that the socket is freed in the callback function (if recycling is notified)
@@ -248,7 +248,7 @@ void CSocketItemDl::ProcessReceiveBuffer()
 #ifdef TRACE_PACKET
 	printf_s("Process receive buffer in state %s\n", stateNames[pControlBlock->state]);
 #endif
-	if (StateEqual(NON_EXISTENT) || StateEqual(CONNECT_BOOTSTRAP) || StateEqual(CLOSED))
+	if (InState(NON_EXISTENT) || InState(CONNECT_BOOTSTRAP) || InState(PRE_CLOSED) || InState(CLOSED))
 	{
 #ifdef TRACE
 		printf_s("Is it illegal to ProcessReceiveBuffer in state %s\n", stateNames[pControlBlock->state]);
@@ -256,18 +256,11 @@ void CSocketItemDl::ProcessReceiveBuffer()
 		SetMutexFree();
 		return;
 	}
-	if (IsRecvBufferEmpty())
-	{
-#ifdef TRACE
-		printf_s("Receive buffer is empty when %s\n", __FUNCTION__);
-#endif
-		SetMutexFree();
-		return;
-	}
 	//
+	CallbackPeeked fp1 = fpPeeked;
 	int n;
 	// RecvInline takes precedence
-	if(fpPeeked != NULL)
+	if(fp1 != NULL)
 	{
 #ifdef TRACE_PACKET
 		printf_s("RecvInline...\n");
@@ -277,23 +270,22 @@ void CSocketItemDl::ProcessReceiveBuffer()
 #ifdef TRACE_PACKET
 		printf_s("Data to deliver: 0x%08X, length = %u, eom = %d\n", (LONG)p, n, (int)!b);
 #endif
+		// If end-of-message encountered reset fpPeeked so that RecvInline() may work
 		if(! b)
 		{
-			TRACE_HERE("TODO: code review: whether a pure ADJOURN command can terminate a message");
+#ifdef TRACE_PACKET
+			printf_s("Message terminated\n");
+#endif
 			SetEndOfRecvMsg();
+			fpPeeked = NULL;
 		}
-		else if(n == 0)
+		if(n == 0)	// (n == 0 && !b) when the last message is a payloadless COMMIT
 		{
 			TRACE_HERE("Nothing to deliver");
 			SetMutexFree();
 			return;
 		}
-		//
-		CallbackPeeked fp1 = fpPeeked;
-		// Reset fpPeeked so that crash recovery by chained ReadFrom() is possible
-		// If end-of-message encountered reset fpPeeked so that RecvInline() may work
-		if(! b || n < 0)
-			fpPeeked = NULL;
+		// UNRESOLVED! Reset fpPeeked so that crash recovery by chained ReadFrom() is possible if(n < 0) ?
 		//
 		SetMutexFree();
 		if(n < 0)
@@ -303,7 +295,7 @@ void CSocketItemDl::ProcessReceiveBuffer()
 		return;
 	}
 
-	if(waitingRecvBuf == NULL || waitingRecvSize <= 0 || fpReceive == NULL)
+	if(waitingRecvBuf == NULL || waitingRecvSize <= 0 || fpRecept == NULL)
 	{
 #ifdef TRACE
 		printf_s("When ULA have called neither RecvInline() nor ReadFrom(),\n"
@@ -318,11 +310,10 @@ void CSocketItemDl::ProcessReceiveBuffer()
 	{
 #ifdef TRACE
 		printf_s("FetchReceived() return %d\n"
-			"UNRESOLVED! Crash recovery? waitingRecvBuf or fpReceive is not reset yet.\n"
+			"UNRESOLVED! Crash recovery? waitingRecvBuf or fpRecept is not reset yet.\n"
 			, n);
 #endif
 		SetMutexFree();
-		NotifyError(FSP_NotifyOverflow, n);
 		return;
 	}
 	//
@@ -336,8 +327,10 @@ void CSocketItemDl::ProcessReceiveBuffer()
 
 void CSocketItemDl::FinalizeRead()
 {
-	NotifyOrReturn fp1 = (NotifyOrReturn)InterlockedExchangePointer((PVOID volatile *) & fpReceive, NULL);
+	NotifyOrReturn fp1 = (NotifyOrReturn)InterlockedExchangePointer((PVOID volatile *) & fpRecept, NULL);
 	waitingRecvBuf = NULL;
 	SetMutexFree();
-	fp1(this, FSP_NotifyDataReady, 0);
+	// due to multi-task nature although fpRecept has been checked in the caller it could be already reset
+	if(fp1 != NULL)
+		fp1(this, FSP_NotifyDataReady, 0);
 }

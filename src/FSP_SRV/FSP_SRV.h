@@ -36,11 +36,18 @@
 #include "../FSP.h"
 #include "../FSP_Impl.h"
 
+
+// Return the number of microseconds elapsed since Jan 1, 1970 (unix epoch time)
+timestamp_t NowUTC();	// it seems that a global property 'Now' is not as clear as this function format
+
+// random generatator is somehow dependent on implementation. hardware prefered.
+void		rand_w32(uint32_t *p, int n);
+
 /**
 * It requires Advanced IPv6 API support to get the application layer thread ID from the IP packet control structure
 */
 // packet information on local address and interface number
-// for IPv6, local session ID is derived from local address
+// for IPv6, local fiber ID is derived from local address
 struct CtrlMsgHdr
 {
 #if _WIN32_WINNT >= 0x0600
@@ -78,7 +85,7 @@ inline UINT64 ntohll(UINT64 h)
 /**
  * Get the application layer thread ID from the (IPv6 raw-)socket address
  */
-#define SOCKADDR_ALT_ID(s)  (((PFSP_IN6_ADDR) & ((PSOCKADDR_IN6)(s))->sin6_addr)->idALT)
+#define SOCKADDR_ALFID(s)  (((PFSP_IN6_ADDR) & ((PSOCKADDR_IN6)(s))->sin6_addr)->idALF)
 #define SOCKADDR_HOST_ID(s)  (((PFSP_IN6_ADDR) & ((PSOCKADDR_IN6)(s))->sin6_addr)->idHost)
 
 
@@ -88,7 +95,6 @@ inline UINT64 ntohll(UINT64 h)
 #define MAX_RETRANSMISSION	8
 #define	MAX_BUFFER_MEMORY	70536	// 69KiB  // Implementation shall override this
 
-#define DEFAULT_ELAPSE 5000		// retransmit independent of tround-trip-time
 
 // In Microsoft C++, the result of a modulus expression is always the same as the sign of the first operand.
 // Provide a 'safe' code to implement a double-in-single-out circular queue...
@@ -163,7 +169,7 @@ struct PktSignature
 
 struct ScatteredSendBuffers
 {
-	WSABUF	scattered[3];	// at most three segments: the sessionID pair, header and payload
+	WSABUF	scattered[3];	// at most three segments: the fiberID pair, header and payload
 	ScatteredSendBuffers() { }
 	ScatteredSendBuffers(void * p1, int n1) { scattered[1].buf = (CHAR *)p1; scattered[1].len = n1; }
 	ScatteredSendBuffers(void * p1, int n1, void * p2, int n2)
@@ -187,22 +193,22 @@ class CSocketItemEx: public CSocketItem
 	// sockAddrTo[0] is the most preferred address (care of address)
 	// sockAddrTo[3] is the home-address
 	// while sockAddr[1], sockAddr[2] are backup-up/load-balance address
-	SOCKADDR_INET	sockAddrTo[MAX_PHY_INTERFACES];
+	// the extra one is for saving temporary souce address
+	SOCKADDR_INET	sockAddrTo[MAX_PHY_INTERFACES + 1];
 
-	PktSignature *PushPacketBuffer(PktSignature *);
-	void PopPacketBuffer();
-	int	SendPacket(register ULONG, ScatteredSendBuffers);
-	//
 protected:
 	DWORD	idSrcProcess;
 	HANDLE	hSrcMemory;
 	//
-	char	mutex;
+	ALIGN(2)
 	char	inUse;
 	char	isReady;
-	char	isMilky;	// ULA cannot change it on the fly;
 	//
-	int		namelen;	// size of the remote socket address, see WSASendMsg
+	char	isMilky;	// ULA cannot change it on the fly;
+	char	mutex;
+	bool	toUpdateTimer;
+	//
+	int32_t	keyLife;
 	//
 	CSocketItemEx *next;
 	CSocketItemEx *prevSame;
@@ -215,37 +221,82 @@ protected:
 	UINT32		tKeepAlive_ms;	// keep-alive time-out limit in milliseconds
 	HANDLE		timer;
 	timestamp_t	tSessionBegin;
+	timestamp_t tRecentSend;
 	timestamp_t	tLastRecv;
 	timestamp_t tEarliestSend;
-	timestamp_t tRecentSend;
-	union
+	//
+	struct CubicRate
+	{
+		uint32_t	ssthresh;
+		uint32_t	cwnd;
+		uint32_t	cwndFraction;
+		uint32_t	cwndMax;
+		uint32_t	cwndMin;
+		uint32_t	originPoint;
+		double		Wmax;
+		double		K;
+		uint64_t	dMin;
+		timestamp_t T0;
+		//
+		inline void CheckTimeout(timestamp_t);
+		inline void OnCongested();
+		inline void Reset();
+		inline float Update(timestamp_t);
+		//
+	}	congestCtrl;
+	//
+	struct
 	{
 		timestamp_t tMigrate;
 		timestamp_t tKeepAlive;
 	}	clockCheckPoint;
+
 	FSP_Session_State lowState;
+
+	void RestartKeepAlive() { ReplaceTimer(tKeepAlive_ms); }
+	void StopKeepAlive() { ReplaceTimer(SCAVENGE_THRESHOLD_ms); }
+	void RecalibrateKeepAlive(timestamp_t);
 
 	bool IsPassive() const { return lowState == LISTENING; }
 	void SetPassive() { lowState = LISTENING; }
-	void SetState(FSP_Session_State s) { pControlBlock->state = lowState = s; }
+	void SetState(FSP_Session_State s) 
+	{
+		pControlBlock->state = lowState = s;
+		clockCheckPoint.tMigrate = NowUTC();
+	}
 	bool InState(FSP_Session_State s) { return lowState == s; }
 	bool InStates(int n, ...);
 
+	void LOCALAPI InstallSessionKey()
+	{
+#ifndef NDEBUG
+		pControlBlock->_mac_ctx_protect_prolog[0]
+			= pControlBlock->_mac_ctx_protect_prolog[1]
+			= pControlBlock->_mac_ctx_protect_epilog[0]
+			= pControlBlock->_mac_ctx_protect_epilog[1]
+			= MAC_CTX_PROTECT_SIGN;
+#endif
+		vmac_set_key(pControlBlock->u.sessionKey, & pControlBlock->mac_ctx); 
+	}
+
+	// On got valid ICC automatically register source IP address as the favorite returning IP address
 	bool ValidateICC(FSP_NormalPacketHeader *);
 	bool ValidateICC() { return ValidateICC(headPacket->pkt); }
-	int  PlacePayload();
+	bool LOCALAPI HandleMobileParam(PFSP_HeaderSignature);
 
-	bool LOCALAPI Emit(ControlBlock::PFSP_SocketBuf, ControlBlock::seq_t);
+	PktSignature *PushPacketBuffer(PktSignature *);
+	FSP_NormalPacketHeader *PeekLockPacketBuffer();
+	void PopUnlockPacketBuffer();
+	void UnlockPacketBuffer() { mutex = SHARED_FREE; }
+
+	int  LOCALAPI PlacePayload(ControlBlock::PFSP_SocketBuf);
+
+	int	 SendPacket(register ULONG, ScatteredSendBuffers);
+	bool EmitStart();
+	bool LOCALAPI EmitWithICC(ControlBlock::PFSP_SocketBuf, ControlBlock::seq_t);
 
 	void Extinguish();
 	void TimeOut();
-	void InitiateKeepAlive()
-	{
-		tKeepAlive_ms = tRoundTrip_us >> 8;	// slightly less than 4RTT; at most 4.66 hours
-		if(tKeepAlive_ms < KEEP_ALIVE_TIMEOUT_MIN_ms)
-			tKeepAlive_ms = KEEP_ALIVE_TIMEOUT_MIN_ms;
-		ReplaceTimer(tKeepAlive_ms);
-	}
 
 	static VOID NTAPI TimeOut(PVOID c, BOOLEAN) { ((CSocketItemEx *)c)->TimeOut(); } 
 public:
@@ -259,6 +310,7 @@ public:
 	bool TestAndLockReady();
 	bool TestAndWaitReady();
 	void SetEarliestSendTime() { tEarliestSend = tRecentSend; }
+	int32_t GetCongestWindow() const { return congestCtrl.cwnd; }
 
 	bool CheckMemoryBorder(ControlBlock::PFSP_SocketBuf p)
 	{
@@ -282,26 +334,29 @@ public:
 	}
 
 
-	void LOCALAPI SetRemoteSessionID(ALT_ID_T id);
+	void LOCALAPI SetRemoteFiberID(ALFID_T id);
 	char *PeerName() const { return (char *)pControlBlock->peerAddr.name; }
 	int LOCALAPI ResolveToIPv6(const char *);
 	int LOCALAPI ResolveToFSPoverIPv4(const char *, const char *);
 
 	bool Notify(FSP_ServiceCode);
 	void SignalEvent() { ::SetEvent(hEvent); }
+	void SignalReturned() { pControlBlock->notices[0] = FSP_NotifyAccepting; SignalEvent(); }
 	//
 	int LOCALAPI RespondSNACK(ControlBlock::seq_t, const FSP_SelectiveNACK::GapDescriptor *, int);
+	int LOCALAPI RespondSNACK(ControlBlock::seq_t, const PFSP_HeaderSignature);
 	int LOCALAPI GenerateSNACK(BYTE *, ControlBlock::seq_t &);
 	//
 	void InitiateConnect();
 	void CloseSocket();
+	void CloseToNotify();
 	void Disconnect();
 	void DisposeOnReset();
 	void OnMultiply();
 	void OnResume();
 	void OnResurrect();
 	void HandleMemoryCorruption() {	Extinguish(); }
-	void LOCALAPI AffirmConnect(const SConnectParam &, ALT_ID_T);
+	void LOCALAPI AffirmConnect(const SConnectParam &, ALFID_T);
 
 	bool IsValidSequence(ControlBlock::seq_t seq1) { return pControlBlock->IsValidSequence(seq1); }
 
@@ -320,7 +375,7 @@ public:
 	//
 	template<FSPOperationCode c> int SendPacket()
 	{
-		// See also KeepAlive, AffirmConnect and OnAdjournAck
+		// See also KeepAlive, AffirmConnect and OnAckFlush
 		FSP_NormalPacketHeader hdr;
 		pControlBlock->SetSequenceFlags(& hdr);
 		hdr.hs.Set<FSP_NormalPacketHeader, c>();
@@ -331,25 +386,40 @@ public:
 	void LOCALAPI SetIntegrityCheckCodeP1(FSP_NormalPacketHeader *);
 	void LOCALAPI SetIntegrityCheckCode(FSP_NormalPacketHeader & hdr)
 	{
-		hdr.integrity.id = pairSessionID;
+		hdr.integrity.id = fidPair;
 		SetIntegrityCheckCodeP1(& hdr);
 	}
 
-	//
 	void EmitQ() { pControlBlock->EmitQ(this); }
-	void DoAdjourn();
+	void PeerCommit();
 	void KeepAlive();
-	void Flush();
 	void ScheduleEmitQ();
 	void ScheduleConnect(CommandNewSessionSrv *);
-	// Retransmit the first packet in the send queue
-	void Retransmit1() { Emit(pControlBlock->GetFirstBufferedSend(), pControlBlock->GetSendWindowFirstSN()); }
+	// Send COMMIT or KEEP_ALIVE in heartbeat interval
+	void SendHeartbeat();
 
 	//
 	bool AddTimer();
 	bool RemoveTimer();
-	void ChangeKeepAliveClock();
+	void EarlierKeepAlive();
 	bool LOCALAPI ReplaceTimer(uint32_t);
+#ifdef TRACE
+	int DumpTimerInfo(timestamp_t t1) const
+	{
+		return printf_s("\tRound Trip Time = %uus, Keep-alive period = %ums\n"
+			"\tTime elapsed since earlist sent = %lluus\n"
+			"\tNext relative keep-alive shot time=%lluus\n"
+			"\tCongest origin-point time = %llx Congest Window = %d\n"
+			, tRoundTrip_us
+			, tKeepAlive_ms
+			, t1 - tEarliestSend
+			, clockCheckPoint.tKeepAlive - t1
+			, congestCtrl.T0
+			, congestCtrl.cwnd);
+	}
+#else
+	int DumpTimerInfo(timestamp_t) const {}
+#endif
 
 	// Command of ULA
 	void Shutdown();
@@ -358,7 +428,9 @@ public:
 	// if it gains exclusive access of the socket too many packets might be lost
 	// when there are too many packets in the send queue
 	void Connect();
-	void Send();
+	void Start();
+	void UrgeCommit();
+	void Resume();
 	void SynConnect();
 	void LOCALAPI Listen(CommandNewSessionSrv &);
 
@@ -366,17 +438,17 @@ public:
 	void LOCALAPI OnConnectRequestAck(FSP_AckConnectRequest &, int lenData);
 	void OnGetPersist();	// PERSIST packet might be apparently out-of-band/out-of-order
 	void OnGetPureData();	// PURE_DATA
-	void OnGetAdjourn();	// ADJOURN packet might be apparently out-of-band/out-of-order as well
-	void OnAdjournAck();	// ACK_FLUSH is always out-of-band
-	void OnGetRestore();	// RESTORE may resume or resurrect
-	void OnGetFinish();		// FINISH packet may not 
+	void OnGetCommit();		// COMMIT packet might be apparently out-of-band/out-of-order as well
+	void OnAckFlush();		// ACK_FLUSH is always out-of-band
+	void OnGetResume();		// RESUME may resume or resurrect
+	void OnGetRelease();	// RELEASE may not carry payload
 	void OnGetMultiply();	// MULTIPLY is treated out-of-band
 	void OnGetKeepAlive();	// KEEP_ALIVE is usually out-of-band
 
 	// A public accessible method of emitting the specified packet in the given LLS socket context
 	static bool LOCALAPI Emit(CSocketItemEx *context, ControlBlock::PFSP_SocketBuf skb, ControlBlock::seq_t seq1)
 	{
-		return context->Emit(skb, seq1);
+		return context->EmitWithICC(skb, seq1);
 	}
 
 	// any packet with full-weight integrity-check-code except aforementioned
@@ -393,25 +465,25 @@ class CSocketSrvTLB
 protected:
 	CSocketItemEx listenerSlots[MAX_LISTENER_NUM];
 	CSocketItemEx itemStorage[MAX_CONNECTION_NUM];
-	CSocketItemEx *poolSessionID[MAX_CONNECTION_NUM];
+	CSocketItemEx *poolFiberID[MAX_CONNECTION_NUM];
 	CSocketItemEx *headFreeSID, *tailFreeSID;
 	char	mutex;
 public:
 	CSocketSrvTLB();
 
-	CSocketItemEx * AllocItem(ALT_ID_T);
+	CSocketItemEx * AllocItem(ALFID_T);
 	CSocketItemEx * AllocItem();
 	void FreeItem(CSocketItemEx *r);
-	CSocketItemEx * operator[](ALT_ID_T);
+	CSocketItemEx * operator[](ALFID_T);
 	CSocketItemEx * operator[](const CommandNewSessionSrv &);
 };
 
 
 struct _CookieMaterial
 {
-	ALT_ID_T	idALT;
-	ALT_ID_T	idListener;
-	UINT32		salt;
+	UINT32	salt;
+	ALFID_T	idALF;
+	ALFID_T	idListener;
 };
 
 
@@ -420,7 +492,7 @@ struct _CookieMaterial
 class CLowerInterface: public CSocketSrvTLB
 {
 private:
-	struct FSPoverUDP_Header: PairSessionID, FSP_Header { };
+	struct FSPoverUDP_Header: PairALFID, FSP_Header { };
 
 	static CLowerInterface *pSingleInstance;
 
@@ -442,7 +514,7 @@ private:
 	FSP_Header &		HeaderFSP() const { return *(FSP_Header *)pktBuf; }
 	template<typename THdr> THdr * FSP_OperationHeader()
 	{
-		return (THdr *)(nearInfo.IsIPv6() ? pktBuf : &pktBuf[sizeof(PairSessionID)]);
+		return (THdr *)(nearInfo.IsIPv6() ? pktBuf : &pktBuf[sizeof(PairALFID)]);
 	}
 
 	// remote-end address and near-end address
@@ -451,23 +523,23 @@ private:
 	WSAMSG				sinkInfo;	// descriptor of what is received
 
 	// For sending back a packet responding to a received packet only
-	ALT_ID_T			GetLocalSessionID()
+	ALFID_T			GetLocalFiberID()
 	{
-		return nearInfo.IsIPv6() ? nearInfo.u.idALT : HeaderFSPoverUDP().peer;
+		return nearInfo.IsIPv6() ? nearInfo.u.idALF : HeaderFSPoverUDP().peer;
 	}
-	ALT_ID_T			SetLocalSessionID(ALT_ID_T);
+	ALFID_T			SetLocalFiberID(ALFID_T);
 
 	// only valid for received message
-	ALT_ID_T			GetRemoteSessionID() const
+	ALFID_T			GetRemoteFiberID() const
 	{
-		return nearInfo.IsIPv6() ? SOCKADDR_ALT_ID(sinkInfo.name) : HeaderFSPoverUDP().source;
+		return nearInfo.IsIPv6() ? SOCKADDR_ALFID(sinkInfo.name) : HeaderFSPoverUDP().source;
 	}
 
-	// For FSP over IPv6 raw-socket, preconfigure IPv6 interfaces with ALT_ID pool
-	inline void SetLocalApplicationLayerThreadID(ALT_ID_T);
+	// For FSP over IPv6 raw-socket, preconfigure IPv6 interfaces with ALFID pool
+	inline void SetLocalApplicationLayerFiberID(ALFID_T);
 	// For FSP over UDP/IPv4 bind the UDP-socket
 	inline int BindInterface(SOCKET, PSOCKADDR_IN, int);
-	CSocketItemEx *		MapSocket() { return (*this)[GetLocalSessionID()]; }
+	CSocketItemEx *		MapSocket() { return (*this)[GetLocalFiberID()]; }
 
 protected:
 	static DWORD WINAPI ProcessRemotePacket(LPVOID lpParameter);
@@ -498,15 +570,15 @@ public:
 	CLowerInterface();
 	~CLowerInterface();
 
-	// return the least possible overriden random session ID:
-	ALT_ID_T LOCALAPI RandALT_ID(PIN6_ADDR);
-	ALT_ID_T LOCALAPI RandALT_ID();
+	// return the least possible overriden random fiber ID:
+	ALFID_T LOCALAPI RandALFID(PIN6_ADDR);
+	ALFID_T LOCALAPI RandALFID();
 	int LOCALAPI SendBack(char *, int);
 	// It might be necessary to send reset BEFORE a connection context is established
 	void LOCALAPI SendPrematureReset(UINT32 = 0, CSocketItemEx * = NULL);
 
 	inline void LearnAddresses();
-	inline void PoolingALT_IDs();
+	inline void PoolingALFIDs();
 	inline void ProcessRemotePacket();
 	//^ the thread entry function for processing packet sent from the remote-end peer
 };
@@ -536,3 +608,9 @@ void LOCALAPI DumpNetworkUInt16(UINT16 *, int);
 
 // defined in mobile.cpp
 UINT64 LOCALAPI CalculateCookie(BYTE *, int, timestamp_t);
+
+// defined in CubicRoot.c
+extern "C" double CubicRoot(double);
+
+// power(3, a) 	// less stringent than pow(3, a) ?
+inline double CubicPower(double a) { return a * a * a; }

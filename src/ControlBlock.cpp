@@ -46,59 +46,67 @@ const char * CStringizeOpCode::names[LARGEST_OP_CODE + 1] =
 	"INIT_CONNECT",
 	"ACK_INIT_CONNECT",
 	"CONNECT_REQUEST",
-	"ACK_CONNECT_REQUEST",
+	"ACK_CONNECT_REQ",
 	"RESET",
 	"PERSIST",		// Alias: KEEP_ALIVE, DATA_WITH_ACK,
 	"PURE_DATA",	// Without any optional header
-	"ADJOURN",
+	"COMMIT",
 	"ACK_FLUSH",
-	"RESTORE",		// RESUME or RESURRECT connection, may piggyback payload
-	"FINISH",
+	"RESUME",		// RESUME or RESURRECT connection, may piggyback payload
+	"RELEASE",
 	"MULTIPLY",		// To clone connection, may piggyback payload
 	"KEEP_ALIVE",
 	"RESERVED_CODE14",
 	"RESERVED_CODE15",
 	"RESERVED_CODE16",
 	//
-	"CONNECT_PARAM",
-	"EPHEMERAL_KEY",
+	"MOBILE_PARAM",
 	"SELECTIVE_NACK"
 } ;
 
 
 // Reflexing string representation of FSP_Session_State and FSP_ServiceCode, for debug purpose
 // Place here because value of the state or notice/servic code is stored in the control block
-const char * CStringizeState::names[CLOSED + 1] =
+const char * CStringizeState::names[LARGEST_FSP_STATE + 1] =
 {
 	"NON_EXISTENT",
-	// resurrect from CLOSED:
-	"QUASI_ACTIVE",
-	// context cloned by ConnectMU:
-	"CLONING",
+	// the passiver listener to folk new connection handle:
+	"LISTENING",
 	// initiative, after sending initiator's check code, before getting responder's cookie
 	// timeout to retry or NON_EXISTENT:
 	"CONNECT_BOOTSTRAP",
-	// the passiver listener to folk new connection handle:
-	"LISTENING",
-	// after getting legal CONNECT_REQUEST and sending back ACK_CONNECT_REQUEST
+	// after getting legal CONNECT_REQUEST and sending back ACK_CONNECT_REQ
 	// before getting first PERSIST. timeout to NON_EXISTENT:
 	"CHALLENGING",
 	// after getting responder's cookie and sending formal CONNECT_REQUEST
-	// before getting ACK_CONNECT_REQUEST, timeout to retry or NON_EXISTENT
+	// before getting ACK_CONNECT_REQ, timeout to retry or NON_EXISTENT
 	"CONNECT_AFFIRMING",
-	// initiator: after getting the ACK_CONNECT_REQUEST 
+	// initiator: after getting the ACK_CONNECT_REQ 
 	// responder: after getting the first PERSIST
 	// no default timeout. however, implementation could arbitrarily limit a session life
 	"ESTABLISHED",
-	// after sending FLUSH, before getting all packet-in-flight acknowledged.
-	"PAUSING",
-	// after getting all packet-in-flight acknowledged, including the FLUSH packet.
+	// after sending FLUSH, before getting all packet-in-flight acknowledged
+	"COMMITTING",
+	// after receiving FLUSH
+	"PEER_COMMIT",
+	// after both receiving and sending FLUSH, before getting all packet-in-flight acknowledged
+	"COMMITTING2",
+	// after getting all packet-in-flight acknowledged, including the FLUSH packet, without receiving peer's FLUSH
+	"COMMITTED",
+	// after getting all packet-in-flight acknowledged and having received peer's FLUSH and the FLUSH is acknowledgable
 	"CLOSABLE",
-	// after sending RESTORE, before RESTORE acknowledged
-	"RESUMING",
 	// after ULA shutdown the connection in CLOSABLE state gracefully
 	// it isn't a pseudo-state alike TCP, but a physical, resumable/reusable state
-	"CLOSED"
+	"PRE_CLOSED",
+	// after ULA shutdown the connection in CLOSABLE state gracefully
+	// it isn't a pseudo-state alike TCP, but a physical, resumable/reusable state
+	"CLOSED",
+	// context cloned by ConnectMU:
+	"CLONING",
+	// after sending RESUME, before RESUME acknowledged
+	"RESUMING",
+	// resurrect from CLOSED:
+	"QUASI_ACTIVE",
 };
 
 const char * CStringizeNotice::names[LARGEST_FSP_NOTICE + 1] =
@@ -106,34 +114,34 @@ const char * CStringizeNotice::names[LARGEST_FSP_NOTICE + 1] =
 	"NullCommand",
 	// 1~15: DLL to LLS
 	"FSP_Listen",		// register a passive socket
-	"InitConnection",		// register an initiative socket
-	"SynConnection",		// make SCB entry of the DLL and the LLS synchronized
-	"FSP_Reject",
-	"FSP_Timeout",		// 5, 'try later', used to be FSP_Preclose
+	"InitConnection",	// register an initiative socket
+	"FSP_NotifyAccepting",	//  = SynConnection,	// a reverse command to make context ready
+	"FSP_Abort",		// a reverse command. used to be FSP_Preclose/FSP_Timeout, forward command is FSP_Reject
 	"FSP_Dispose",		// AKA Reset. dispose the socket. connection might be aborted
+	"FSP_Start",		// send a start packet such as MULTIPLY, PERSIST and transactional COMMIT
 	"FSP_Send",			// send a packet/a group of packets
+	"FSP_Urge",			// send a packet urgently, mean to urge COMMIT
+	"FSP_Resume",		// cancel COMMIT(unilateral adjourn) or send RESUME
 	"FSP_Shutdown",		// close the connection
-	// 9-15, 7 reserved
-	"Reserved9",
-	"Reserved10",
-	"Reserved11",
+	// 12-15, 4 reserved
 	"Reserved12",
 	"Reserved13",
 	"Reserved14",
 	"Reserved15",
 	// 16~23: LLS to DLL in the backlog
-	"FSP_NotifyDataReady",
-	"FSP_NotifyReset",
-	"FSP_NotifyRecycled",
 	"FSP_NotifyAccepted",
-	"FSP_NotifyFlushed",
+	"FSP_NotifyDataReady",
 	"FSP_NotifyBufferReady",
-	"FSP_NotifyDisposed",
-	"FSP_NotifyToAdjourn",
-	//
+	"FSP_NotifyReset",
+	"FSP_NotifyToCommit",
+	"FSP_NotifyFlushed",
+	"FSP_NotifyFinish",
+	"FSP_NotifyRecycled",
 	// 24~31: near end error status
 	"FSP_IPC_CannotReturn",	// LLS cannot return to DLL for some reason
+	"FSP_MemoryCorruption",
 	"FSP_NotifyOverflow",
+	"FSP_NotifyTimeout",
 	"FSP_NotifyNameResolutionFailed"
 };
 
@@ -205,14 +213,14 @@ int TSingleProviderMultipleConsumerQ<TLogItem>::InitSize(int n)
 template<typename TLogItem>
 int LOCALAPI TSingleProviderMultipleConsumerQ<TLogItem>::Push(const TLogItem *p)
 {
-	if(InterlockedIncrementAcquire16(& nProvider) > 1)
+	if(InterlockedIncrementAcquire(& nProvider) > 1)
 	{
-		InterlockedDecrementRelease16(& nProvider);
+		InterlockedDecrementRelease(& nProvider);
 		return -EBUSY;
 	}
 	if(count >= capacity || nProvider > 1)
 	{
-		InterlockedDecrementRelease16(& nProvider);
+		InterlockedDecrementRelease(& nProvider);
 		return -ENOMEM;
 	}
 
@@ -221,7 +229,7 @@ int LOCALAPI TSingleProviderMultipleConsumerQ<TLogItem>::Push(const TLogItem *p)
 	tailQ = (i + 1) & (capacity - 1);
 
 	count++;
-	InterlockedDecrementRelease16(& nProvider);
+	InterlockedDecrementRelease(& nProvider);
 	return i;
 }
 
@@ -275,15 +283,15 @@ l_bailout:
 //	If provider lock could not be obtained it will return true ('collision found') instead of raising an 'EBUSY' exception
 bool LOCALAPI ControlBlock::HasBacklog(const BackLogItem *p)
 {
-	if(InterlockedIncrementAcquire16(& backLog.nProvider) > 1)
+	if(InterlockedIncrementAcquire(& backLog.nProvider) > 1)
 	{
-		InterlockedDecrementRelease16(& backLog.nProvider);
+		InterlockedDecrementRelease(& backLog.nProvider);
 		return true;
 	}
 
 	if(backLog.count <= 0)
 	{
-		InterlockedDecrementRelease16(& backLog.nProvider);
+		InterlockedDecrementRelease(& backLog.nProvider);
 		return false;	// empty queue
 	}
 
@@ -295,13 +303,13 @@ bool LOCALAPI ControlBlock::HasBacklog(const BackLogItem *p)
 	{
 		if(pQ[i].idRemote == p->idRemote && pQ[i].salt == p->salt)
 		{
-			InterlockedDecrementRelease16(& backLog.nProvider);
+			InterlockedDecrementRelease(& backLog.nProvider);
 			return true;
 		}
 		i = (i + 1) & (backLog.capacity - 1);
 	} while(i != k);
 	//
-	InterlockedDecrementRelease16(& backLog.nProvider);
+	InterlockedDecrementRelease(& backLog.nProvider);
 	return false;
 }
 
@@ -415,12 +423,6 @@ int LOCALAPI ControlBlock::Init(uint16_t nLog)
 }
 
 
-// UNRESOLVED! TODO: the third form of ControlBlock::Init()
-// send and receive buffers are attached later, but descriptors are pre-allocated?
-// NO! because it makes security check of memory mapping overwhelmly complicated, if not impossible at all
-
-
-
 // Return
 //	The block descriptor of the first available send buffer
 // Remark
@@ -434,10 +436,9 @@ ControlBlock::PFSP_SocketBuf ControlBlock::GetSendBuf()
 		return NULL;
 
 	register PFSP_SocketBuf p = HeadSend() + sendBufferNextPos++;
-	p->ZeroFlags();
-	if(sendBufferNextPos - sendBufferBlockN >= 0)
-		sendBufferNextPos = 0;
+	p->InitFlags();
 	sendBufferNextSN++;
+	RoundSendBufferNextPos();
 
 	return p;
 }
@@ -454,21 +455,27 @@ ControlBlock::PFSP_SocketBuf ControlBlock::GetSendBuf()
 //	However, LLS may change (sendWindowHeadPos, sendWindowFirstSN) simultaneously, non-atomically
 void * LOCALAPI ControlBlock::InquireSendBuf(int & m)
 {
-	if (m > MAX_BLOCK_SIZE * (sendBufferBlockN - CountSendBuffered()))
+	if (m <= 0)
 	{
 		m = -EDOM;
 		return NULL;
 	}
+	if(m > MAX_BLOCK_SIZE * (sendBufferBlockN - CountSendBuffered()))
+	{
+		m = -ENOMEM;
+		return NULL;
+	}
 	// and no memory overwritten even it happens that sendBufferNextPos == sendWindowHeadPos
 	register int i = sendBufferNextPos;
-	register int k = sendWindowHeadPos;
-	if (i >= sendBufferBlockN)
-		i -= sendBufferBlockN;
-	register int n = (i >= k)
-		? (sendBufferBlockN - i) * MAX_BLOCK_SIZE
-		: (k - i) * MAX_BLOCK_SIZE;
-	//
-	m = n;
+	if(i == sendWindowHeadPos)
+	{
+		m = MAX_BLOCK_SIZE * ClearSendWindow();
+		return (BYTE *)this + sendBuffer;
+	}
+
+	m = (i > sendWindowHeadPos)
+		? MAX_BLOCK_SIZE * (sendBufferBlockN - i) 
+		: MAX_BLOCK_SIZE * (sendWindowHeadPos - i);
 	return (BYTE *)this + sendBuffer + i * MAX_BLOCK_SIZE;
 }
 
@@ -503,45 +510,29 @@ int ControlBlock::MarkSendQueue(void * buf, int n, bool toBeContinued)
 	m = (n - 1) / MAX_BLOCK_SIZE;
 	for(int j = 0; j < m; j++)
 	{
+		p->InitFlags();
 		p->version = THIS_FSP_VERSION;
 		p->opCode = PURE_DATA;
-		p->ZeroFlags();
 		p->len = MAX_BLOCK_SIZE;
 		p->SetFlag<TO_BE_CONTINUED>(true);
 		p->SetFlag<IS_COMPLETED>();
+		p->Unlock();	// so it could be send
 		p++;
 	}
 	//
+	p->InitFlags();
 	p->version = THIS_FSP_VERSION;
 	p->opCode = PURE_DATA;
-	p->ZeroFlags();
 	p->len = n - MAX_BLOCK_SIZE * m;
 	p->SetFlag<TO_BE_CONTINUED>(toBeContinued && p->len == MAX_BLOCK_SIZE);
 	p->SetFlag<IS_COMPLETED>();
+	p->Unlock();
 	//
 	sendBufferNextPos += m + 1;
 	sendBufferNextSN += m + 1;
+	RoundSendBufferNextPos();
 	// assert(sendBufferNextPos <= sendBufferBlockN);	// See also InquireSendBuf
-	if(sendBufferNextPos - sendBufferBlockN >= 0)
-		sendBufferNextPos -= sendBufferBlockN;
 	return (m + 1);
-}
-
-
-
-
-// Return the send buffer block descriptor of the packet wating to be sent
-ControlBlock::PFSP_SocketBuf ControlBlock::PeekNextToSend() const
-{
-	if (int(sendWindowNextSN - sendBufferNextSN) >= 0)
-		return NULL;
-
-	register int d = int(sendWindowNextSN - sendWindowFirstSN);
-	if (d < 0)
-		return NULL;
-	// the caller should check the size of the send window if necessary
-	d += sendWindowHeadPos;
-	return HeadSend() + (d - sendBufferBlockN >= 0 ? d - sendBufferBlockN : d);
 }
 
 
@@ -555,7 +546,7 @@ ControlBlock::PFSP_SocketBuf ControlBlock::PeekNextToSend() const
 //	flags and the advertised receive window size field of the FSP header 
 void LOCALAPI ControlBlock::SetSequenceFlags(FSP_NormalPacketHeader *pHdr, PFSP_SocketBuf skb, seq_t seq)
 {
-	pHdr->expectedSN = get32BE(&receiveMaxExpected);
+	pHdr->expectedSN = get32BE(&recvWindowNextSN);
 	pHdr->sequenceNo = get32BE(&seq);
 	pHdr->ClearFlags();	// pHdr->u.flags = 0;
 	if (skb->GetFlag<TO_BE_CONTINUED>())
@@ -575,7 +566,6 @@ void LOCALAPI ControlBlock::SetSequenceFlags(FSP_NormalPacketHeader *pHdr, PFSP_
 // Do
 //	Set the sequence number, expected acknowledgment sequencenumber,
 //	flags and the advertised receive window size field of the FSP header 
-// UNRESOLVED!? TODO: how to set sequence number/flags of MULTIPLY/RESTORE command
 void LOCALAPI ControlBlock::SetSequenceFlags(FSP_NormalPacketHeader *pHdr, seq_t seqExpected)
 {
 	pHdr->expectedSN = get32BE(&seqExpected);
@@ -593,7 +583,7 @@ void LOCALAPI ControlBlock::SetSequenceFlags(FSP_NormalPacketHeader *pHdr, seq_t
 //	flags and the advertised receive window size field of the FSP header 
 void LOCALAPI ControlBlock::SetSequenceFlags(FSP_NormalPacketHeader *pHdr)
 {
-	pHdr->expectedSN = get32BE(&receiveMaxExpected);
+	pHdr->expectedSN = get32BE(&recvWindowNextSN);
 	pHdr->sequenceNo = get32BE(&sendWindowNextSN);
 	pHdr->ClearFlags();
 	pHdr->SetRecvWS(RecvWindowSize());
@@ -608,14 +598,14 @@ void LOCALAPI ControlBlock::SetSequenceFlags(FSP_NormalPacketHeader *pHdr)
 // Return
 //	The descriptor of the receive buffer block
 // Remark
-//	It is assumed that it is unnecessary to worry about atomicity of (receiveMaxExpected, recvWindowNextPos)
+//	It is assumed that it is unnecessary to worry about atomicity of (recvWindowNextSN, recvWindowNextPos)
 //  the caller should check and handle duplication of the received data packet
 ControlBlock::PFSP_SocketBuf LOCALAPI ControlBlock::AllocRecvBuf(seq_t seq1)
 {
 	if(int(seq1 - recvWindowFirstSN) < 0)
 		return NULL;	// an outdated packet received
 	//
-	int d = int(seq1 - receiveMaxExpected);
+	int d = int(seq1 - recvWindowNextSN);
 	if(d >= RecvWindowSize())
 		return NULL;
 
@@ -623,9 +613,9 @@ ControlBlock::PFSP_SocketBuf LOCALAPI ControlBlock::AllocRecvBuf(seq_t seq1)
 	if(d == 0)
 	{
 		p = HeadRecv() + recvWindowNextPos++;
-		receiveMaxExpected++;
-		if(recvWindowNextPos >= recvBufferBlockN)
-			recvWindowNextPos = 0;
+		recvWindowNextSN++;
+		if(recvWindowNextPos - recvBufferBlockN >= 0)
+			recvWindowNextPos -= recvBufferBlockN;
 	}
 	else
 	{
@@ -639,16 +629,16 @@ ControlBlock::PFSP_SocketBuf LOCALAPI ControlBlock::AllocRecvBuf(seq_t seq1)
 		//
 		if(notOutOfOrder)
 		{
-			receiveMaxExpected = seq1 + 1;
+			recvWindowNextSN = seq1 + 1;
 			recvWindowNextPos = d + 1 >= recvBufferBlockN ? 0 : d + 1;
 		}
-		else if(p->GetFlag<IS_COMPLETED>())
+		else if(p->GetFlag<IS_FULFILLED>())
 		{
 			return p;	// this is an out-of-order packet and the payload buffer has been filled already
 		}
 	}
 	//
-	p->ZeroFlags();
+	p->InitFlags();
 	return p;
 }
 
@@ -680,7 +670,7 @@ void * LOCALAPI ControlBlock::InquireRecvBuf(int & nIO, bool & toBeContinued)
 		m = tail - recvWindowHeadPos;
 	nIO = 0;
 	toBeContinued = true;
-	for(i = 0; i < m && p->GetFlag<IS_COMPLETED>(); i++)
+	for(i = 0; i < m && p->GetFlag<IS_FULFILLED>(); i++)
 	{
 		if(p->len > MAX_BLOCK_SIZE || p->len < 0)
 		{
@@ -734,14 +724,14 @@ void * LOCALAPI ControlBlock::InquireRecvBuf(int & nIO, bool & toBeContinued)
 // Remark
 //	the field values of the gap descriptors filled would be of host-byte-order
 //	return value may not exceed given capicity of the gaps buffer,
-//	so the sequence number of the mostly expected packet might be calibrated to a value less than receiveMaxExpected
-//	it is assumed that it is unnecessary to worry about atomicity of (recvWindowNextPos, receiveMaxExpected)
+//	so the sequence number of the mostly expected packet might be calibrated to a value less than recvWindowNextSN
+//	it is assumed that it is unnecessary to worry about atomicity of (recvWindowNextPos, recvWindowNextSN)
 int LOCALAPI ControlBlock::GetSelectiveNACK(seq_t & snExpect, FSP_SelectiveNACK::GapDescriptor * buf, int n) const
 {
 	if(n <= 0)
 		return -EDOM;
 	//
-	snExpect = receiveMaxExpected;
+	snExpect = recvWindowNextSN;
 	if(CountReceived() <= 0)
 		return 0;
 	//
@@ -749,8 +739,11 @@ int LOCALAPI ControlBlock::GetSelectiveNACK(seq_t & snExpect, FSP_SelectiveNACK:
 	if(tail < 0)
 		tail = recvBufferBlockN - 1;
 	PFSP_SocketBuf p = HeadRecv() + tail;
-	if(! p->GetFlag<IS_COMPLETED>())
+	if(! p->GetFlag<IS_FULFILLED>())
+	{
+		TRACE_HERE("lock error?");
 		return -EFAULT;
+	}
 
 	// To make life easier we have not taken into account of possibility of larger continuous data with much smaller gap
 	// If a 'very large' gap or continuous received area appeared (exceed USHRT_MAX) it would be adjusted
@@ -780,7 +773,7 @@ int LOCALAPI ControlBlock::GetSelectiveNACK(seq_t & snExpect, FSP_SelectiveNACK:
 				p--;
 			}
 			//
-		} while(int(seq1 - seq0) >= 0 && p->GetFlag<IS_COMPLETED>());
+		} while(int(seq1 - seq0) >= 0 && p->GetFlag<IS_FULFILLED>());
 		//
 		if(int(seq1 - seq0) < 0)
 			break;	// the first (and possibly the last) continuous receive area
@@ -800,7 +793,7 @@ int LOCALAPI ControlBlock::GetSelectiveNACK(seq_t & snExpect, FSP_SelectiveNACK:
 			{
 				p--;
 			}
-		} while(int(seq1 - seq0) >= 0 && ! p->GetFlag<IS_COMPLETED>());
+		} while(int(seq1 - seq0) >= 0 && ! p->GetFlag<IS_FULFILLED>());
 		//
 		if(dataLength > USHRT_MAX || gapWidth > USHRT_MAX)
 		{
@@ -857,15 +850,15 @@ void ControlBlock::SlideSendWindow()
 
 
 
-// Return whether it is in the CLOSABLE state or an ADJOURN packet has already been received
+// Return whether it is in the CLOSABLE state or a COMMIT packet has already been received
 bool ControlBlock::IsClosable() const
 {
 	register int k = recvWindowHeadPos;
 	register PFSP_SocketBuf skb = HeadRecv() + k;
-	// Check the packet before ADJOURN
+	// Check the packet before COMMIT
 	for (int i = 0; i < CountReceived() - 1; i++)
 	{
-		if (!skb->GetFlag<IS_COMPLETED>())
+		if (!skb->GetFlag<IS_FULFILLED>())
 			return false;
 		//
 		if (++k - recvBufferBlockN >= 0)
@@ -878,8 +871,8 @@ bool ControlBlock::IsClosable() const
 			skb++;
 		}
 	}
-	// Check the last receive: it should be ADJOURN
-	return (skb->opCode == ADJOURN);
+	// Check the last receive: it should be COMMIT
+	return (skb->opCode == COMMIT);
 }
 
 
@@ -896,9 +889,9 @@ bool ControlBlock::IsClosable() const
 bool LOCALAPI ControlBlock::ResizeSendWindow(seq_t seq1, unsigned int adRecvWin)
 {
 	// advertisement of an out-of order packet about the receive window size is simply ignored
-	if(int32_t(seq1 - sendWindowExpectedSN) <= 0)
+	if(int32_t(seq1 - welcomedNextSNtoSend) <= 0)
 		return true;
-	sendWindowExpectedSN = seq1;
+	welcomedNextSNtoSend = seq1;
 
 	int32_t sentWidth = int32_t(sendWindowNextSN - sendWindowFirstSN);
 	int32_t d = int(seq1 - sendWindowFirstSN);
@@ -912,12 +905,12 @@ bool LOCALAPI ControlBlock::ResizeSendWindow(seq_t seq1, unsigned int adRecvWin)
 
 
 
-bool ControlBlock::FSP_SocketBuf::MarkInSending()
+bool ControlBlock::FSP_SocketBuf::Lock()
 {
 #if VMAC_ARCH_BIG_ENDIAN
 	// we knew 'flags' is of type uint16_t
-	return InterlockedBitTestAndSet((LONG *) & flags, BIT_IN_SENDING + 16) == 0;
+	return InterlockedBitTestAndSet((LONG *) & flags, EXCLUSIVE_LOCK + 16) == 0;
 #else
-	return InterlockedBitTestAndSet((LONG *) & flags, BIT_IN_SENDING) == 0;
+	return InterlockedBitTestAndSet((LONG *) & flags, EXCLUSIVE_LOCK) == 0;
 #endif
 }

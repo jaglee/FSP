@@ -45,6 +45,9 @@
     <ClCompile Include="..\rijndael-alg-fst.c">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="CubicRoot.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\FSP.h">

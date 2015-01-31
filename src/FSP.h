@@ -36,17 +36,17 @@
 // To borrow some stdint definition from VMAC and VHASH Implementation by Ted Krovetz (tdk@acm.org) and Wei Dai
 #include "vmac.h"
 
-typedef uint32_t ALT_ID_T;
+typedef uint32_t ALFID_T;
 
 #if (VMAC_ARCH_BIG_ENDIAN)
 // in network byte order on a big-endian host
-#define PORT2ALT_ID(port)	((ALT_ID_T)(unsigned short)(port))
+#define PORT2ALFID(port)	((ALFID_T)(unsigned short)(port))
 #define PREFIX_FSP_IP6to4	0x2002		// prefix of 6to4 overloaded
 #define DEFAULT_FSP_UDPPORT (((unsigned short)'F' << 8) + (unsigned short)'S')
 #else
 // __X86__
 // in network byte order on a little-endian host
-#define PORT2ALT_ID(port)	((ALT_ID_T)(port) << 16)
+#define PORT2ALFID(port)	((ALFID_T)(port) << 16)
 #define PREFIX_FSP_IP6to4	0x0220		// prefix of 6to4 overloaded
 #define DEFAULT_FSP_UDPPORT ((unsigned short)'F' + ((unsigned short)'S' << 8))
 #endif
@@ -54,12 +54,12 @@ typedef uint32_t ALT_ID_T;
 
 // last well known application layer thread ID (upper layer application ID)
 // well-known upper layer application ID is compatible with TCP port number
-#define LAST_WELL_KNOWN_ALT_ID 65535
-
+#define LAST_WELL_KNOWN_ALFID 65535
 
 #define FSP_MAC_IV_SIZE		8	// in bytes
-#define FSP_PUBLIC_KEY_LEN	64	// in bytes
 #define FSP_SESSION_KEY_LEN	16	// in bytes
+
+#define INITIAL_CONGESTION_WINDOW	2 // a protocol default congestion control parameter
 
 /**
   error number may appear as REJECT packet 'reason code' where it is unsigned or near-end API return value where it is negative
@@ -88,34 +88,44 @@ typedef uint32_t ALT_ID_T;
 typedef enum _FSP_Session_State
 {
 	NON_EXISTENT = 0, 
-	// resurrect from CLOSED:
-	QUASI_ACTIVE,
-	// context cloned by ConnectMU:
-	CLONING,
+	// the passiver listener to folk new connection handle:
+	LISTENING,
 	// initiative, after sending initiator's check code, before getting responder's cookie
 	// timeout to retry or NON_EXISTENT:
 	CONNECT_BOOTSTRAP,
-	// the passiver listener to folk new connection handle:
-	LISTENING,
-	// after getting legal CONNECT_REQUEST and sending back ACK_CONNECT_REQUEST
+	// after getting legal CONNECT_REQUEST and sending back ACK_CONNECT_REQ
 	// before getting first PERSIST. timeout to NON_EXISTENT:
 	CHALLENGING,
 	// after getting responder's cookie and sending formal CONNECT_REQUEST
-	// before getting ACK_CONNECT_REQUEST, timeout to retry or NON_EXISTENT
+	// before getting ACK_CONNECT_REQ, timeout to retry or NON_EXISTENT
 	CONNECT_AFFIRMING,
-	// initiator: after getting the ACK_CONNECT_REQUEST 
+	// initiator: after getting ACK_CONNECT_REQ 
 	// responder: after getting the first PERSIST
 	// no default timeout. however, implementation could arbitrarily limit a session life
 	ESTABLISHED,
-	// after sending FLUSH, before getting all packet-in-flight acknowledged.
-	PAUSING,
-	// after getting all packet-in-flight acknowledged, including the FLUSH packet.
+	// after sending COMMIT/FLUSH, before getting all packet-in-flight acknowledged.
+	COMMITTING,	// A.K.A. FLUSHING; used to be PAUSING
+	// after getting the peer's COMMIT packet
+	PEER_COMMIT,
+	// after getting the peer's COMMIT and the near end has sent COMMIT
+	COMMITTING2,
+	// after getting ACK_FLUSH, i.e. all packet-in-flight acknowledged, including the COMMIT/FLUSH packet.
+	COMMITTED,	// unilaterally adjourned
+	// after getting the peer's COMMIT/FLUSH in the COMMITTED state, or ACK_FLUSH in the COMMITTING2 state
 	CLOSABLE,
-	// after sending RESTORE, before RESTORE acknowledged
-	RESUMING,
+	// asymmetrically shutdown
+	PRE_CLOSED,
 	// after ULA shutdown the connection in CLOSABLE state gracefully
 	// it isn't a pseudo-state alike TCP, but a physical, resumable/reusable state
-	CLOSED
+	CLOSED,
+	// context cloned/connection multiplying (ESTABLISHED:CLOSABLE)
+	CLONING,
+	// after sending RESUME, before RESUME acknowledged
+	RESUMING,
+	// resurrect from CLOSED:
+	QUASI_ACTIVE,
+	//
+	LARGEST_FSP_STATE = QUASI_ACTIVE
 } FSP_Session_State;
 
 
@@ -126,22 +136,21 @@ typedef enum _FSP_Operation_Code
 	INIT_CONNECT	= 1,
 	ACK_INIT_CONNECT,
 	CONNECT_REQUEST,
-	ACK_CONNECT_REQUEST,	// may piggyback payload
+	ACK_CONNECT_REQ,	// may piggyback payload
 	RESET,
-	PERSIST,		// Alias: DATA_WITH_ACK,
-	PURE_DATA,		// Without any optional header
-	ADJOURN,
+	PERSIST,	// While COMMIT/COMMIT make it transactional
+	PURE_DATA,	// Without any optional header
+	COMMIT,		// A.K.A. FLUSH, used to be ADJOURN
 	ACK_FLUSH,
-	RESTORE,		// RESUME or RESURRECT connection, may piggyback payload
-	FINISH,
-	MULTIPLY,		// To clone connection, may piggyback payload
+	RESUME,		// RESUME or RESURRECT connection, may piggyback payload
+	RELEASE,
+	MULTIPLY,	// To clone connection, may piggyback payload
 	KEEP_ALIVE,
 	RESERVED_CODE14,
 	RESERVED_CODE15,
 	RESERVED_CODE16,
 	//
-	CONNECT_PARAM,
-	EPHEMERAL_KEY,
+	MOBILE_PARAM,
 	SELECTIVE_NACK,
 	LARGEST_OP_CODE = SELECTIVE_NACK
 } FSPOperationCode;
@@ -157,23 +166,30 @@ typedef enum: char
 	FSP_Listen = 1,		// register a passive socket
 	InitConnection,		// register an initiative socket
 	SynConnection,		// make SCB entry of the DLL and the LLS synchronized
-	FSP_Reject,
-	FSP_Timeout,		// 5, 'try later', used to be FSP_Preclose
-	FSP_Dispose,		// AKA Reset. dispose the socket. connection might be aborted
+	FSP_Reject,			// a forward command, explicitly reject some request
+	FSP_Recycle,		// a forward command, connection might be aborted
+	FSP_Start,			// send a start packet such as MULTIPLY, PERSIST and transactional COMMIT
 	FSP_Send,			// send a packet/a group of packets
+	FSP_Urge,			// send a packet urgently, mean to urge COMMIT
+	FSP_Resume,			// cancel COMMIT(unilateral adjourn) or send RESUME
 	FSP_Shutdown,		// close the connection
 	// 16~23: LLS to DLL in the backlog
-	FSP_NotifyDataReady = 16,
-	FSP_NotifyReset,
-	FSP_NotifyRecycled,
-	FSP_NotifyAccepted,
-	FSP_NotifyFlushed,
+	FSP_Abort = FSP_Reject,		// a reverse command, used to be FSP_Preclose/FSP_Timeout
+	FSP_NotifyAccepting = SynConnection,	// a reverse command to make context ready
+	FSP_NotifyAccepted = 16,
+	FSP_NotifyDataReady,
 	FSP_NotifyBufferReady,
-	FSP_NotifyDisposed,
-	FSP_NotifyToAdjourn,	// = 23
+	FSP_NotifyReset,
+	FSP_NotifyToCommit,
+	FSP_NotifyFlushed,
+	FSP_NotifyFinish,
+	FSP_NotifyRecycled,	// = 23
+	FSP_Dispose = FSP_Recycle,		// a reverse command from LLS to DLL meant to synchonize DLL and LLS
 	// 24~31: near end error status
 	FSP_IPC_CannotReturn = 24,
+	FSP_MemoryCorruption,
 	FSP_NotifyOverflow,
+	FSP_NotifyTimeout,
 	FSP_NotifyNameResolutionFailed,
 	LARGEST_FSP_NOTICE = FSP_NotifyNameResolutionFailed
 } FSP_ServiceCode;
@@ -187,15 +203,10 @@ typedef uint64_t timestamp_t;
 /**
  * Protocol defined timeouts
  */
-#ifdef TRACE
-# define CONNECT_INITIATION_TIMEOUT_ms	90000	// 90 seconds
-# define KEEP_ALIVE_TIMEOUT_MIN_ms		15000	// 15 seconds
-# define TRASIENT_STATE_TIMEOUT_ms		300000	// 5 minutes
-#else
-# define CONNECT_INITIATION_TIMEOUT_ms	9000	// 9 seconds
-# define KEEP_ALIVE_TIMEOUT_MIN_ms		500		// half a second
-# define TRASIENT_STATE_TIMEOUT_ms		30000	// half a minute
-#endif
+#define CONNECT_INITIATION_TIMEOUT_ms	30000	// half a minute
+#define TRASIENT_STATE_TIMEOUT_ms		300000	// 5 minutes
+
+
 /***
  * Protocol defined limit
  */
@@ -222,7 +233,7 @@ typedef struct FSP_IN6_ADDR
 		uint64_t		subnet;	
 	} u;
 	uint32_t	idHost;
-	ALT_ID_T	idALT;
+	ALFID_T		idALF;
 } *PFSP_IN6_ADDR;
 
 
@@ -232,17 +243,17 @@ typedef	struct FSP_PKTINFO
 	uint32_t	ipi_addr;
 	uint32_t	ipi_ifindex;
 	uint32_t	idHost;
-	ALT_ID_T	idALT;
+	ALFID_T	idALF;
 	uint32_t	ipi6_ifindex;
 } *PFSP_PKTINFO;
 
 
 
 // FSP in UDP over IPv4
-struct PairSessionID
+struct PairALFID
 {
-	ALT_ID_T source;
-	ALT_ID_T peer;
+	ALFID_T source;
+	ALFID_T peer;
 };
 
 

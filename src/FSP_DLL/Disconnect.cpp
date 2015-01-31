@@ -28,27 +28,11 @@
     POSSIBILITY OF SUCH DAMAGE.
  */
 #include "FSP_DLL.h"
+#include <time.h>
 
 // return 0 if no error, negative if error, positive if warning
 DllExport
 int FSPAPI Dispose(FSPHANDLE hFSPSocket)
-{
-	TRACE_HERE("called");
-	register CSocketItemDl *p = (CSocketItemDl *)hFSPSocket;
-	try
-	{
-		return p->Recycle();
-	}
-	catch(...)
-	{
-		return -EFAULT;
-	}
-}
-
-// abort the connection indicated by the give socket handle instantly
-// return 0 if no zero, negative if error, positive if warning
-DllExport
-int FSPAPI Reset(FSPHANDLE hFSPSocket)
 {
 	TRACE_HERE("called");
 	register CSocketItemDl *p = (CSocketItemDl *)hFSPSocket;
@@ -70,44 +54,48 @@ int CSocketItemDl::Recycle()
 {
 	TRACE_HERE("called");
 	if(! IsInUse())
-		return 1;	// warning: already disposed
+		return EAGAIN;	// warning: already disposed
 
 	// The shared control block MUST be preserved, or else LLS might encountered error
 	// So every time a control block is re-used, it MUST be re-initialized
 	socketsTLB.FreeItem(this);
-	return Call<FSP_Dispose>() ? 0 : -EIO;
+	return Call<FSP_Recycle>() ? 0 : -EIO;
 }
 
 
 // Given
 //	FSPHANDLE		the FSP socket
-// Do
-//	Check state at first (in CLOSABLE state just return, not in [ACTIVE, PAUSING, RESUMING] return error)  
-//	Then migrate to the PAUSING state and urge LLS to queue and send, if possibly, the ADJOURN command
+//	NotifyOrReturn	the callback function
+// Return
+//	-EBADF if the connection is not in valid context
+//	-EDOM if the connection is not in proper state
+//	-EIO if the COMMIT packet cannot be sent
+//	0 if no immediate error
 // Remark
-//	The connection would be set to the PAUSING state immediately. In the PAUSING state, no data would be accepted
+//	the callback function may return delayed error such as Commit rejected the remote end
+//	The connection would remain in the COMMITTED, CLOSABLE or CLOSED state,
+//	or be set to the COMMITTING or COMMITTING2 state immediately.
 DllSpec
-int FSPAPI Adjourn(FSPHANDLE hFSPSocket)
+int FSPAPI Commit(FSPHANDLE hFSPSocket, NotifyOrReturn fp1)
 {
 	TRACE_HERE("called");
 
 	register CSocketItemDl * p = (CSocketItemDl *)hFSPSocket;
 	try
 	{
-		if(p == NULL)
+		if (p == NULL || p->InState(NON_EXISTENT))
 			return -EBADF;
 		//
-		if(p->StateEqual(CLOSABLE) || p->StateEqual(CLOSED) || p->StateEqual(NON_EXISTENT))
+		if(! p->SetFlushing(fp1))
+			return -EDOM;
+		//
+		if(p->InState(COMMITTED) || p->InState(CLOSABLE) || p->InState(PRE_CLOSED) || p->InState(CLOSED))
 		{
-			p->NotifyError(FSP_NotifyFlushed, 0);
+			p->SelfNotify(FSP_NotifyFlushed);
 			return 0;
 		}
 		//
-		if(! p->StateEqual(ESTABLISHED) && ! p->StateEqual(PAUSING) && ! p->StateEqual(RESUMING))
-			return -EDOM;
-		//
-		p->SetFlushing();
-		return p->Adjourn();
+		return p->Commit();
 	}
 	catch(...)
 	{
@@ -120,15 +108,17 @@ int FSPAPI Adjourn(FSPHANDLE hFSPSocket)
 
 // Given
 //	FSPHANDLE		the FSP socket
-// Do
-//	Check state at first:
-//		in CLOSABLE state make state migration immediate and return,
-//		in CLOSED state just return, 
-//		not in [ACTIVE, PAUSING, RESUMING] return error
-//	Set FLUSHING_SHUTDOWN flag so that 'Adjourn' is permanent otherwise
+// Return
+//	-EBADF if the connection is not in proper state
+//	-EINTR if locking of the socket was interrupted
+//	-EIO if the shutdown packet cannot be sent
+//	EDOM if the connection is shutdown down prematurely, i.e.it is a RESET actually
+//	EBADF if the connection is already closed
+//	0 if no error
 // Remark
-//	The caller should make sure Shutdown is not carelessly called more than once in a multi-thread,
-//	continual communication context or else connection reuse(resurrection) may be broken
+//	It is assumed that when Shutdown was called ULA did not expect further data from the remote end
+//	The caller should make sure Shutdown is not carelessly called more than once
+//	in a multi-thread continual communication context or else connection reuse(resurrection) may be broken
 DllSpec
 int FSPAPI Shutdown(FSPHANDLE hFSPSocket)
 {
@@ -136,35 +126,47 @@ int FSPAPI Shutdown(FSPHANDLE hFSPSocket)
 	register CSocketItemDl * p = (CSocketItemDl *)hFSPSocket;
 	try
 	{
-		if(p == NULL)
+		if (p == NULL || !p->IsInUse() || p->InState(NON_EXISTENT))
 			return -EBADF;
 		//
 		// ALWAYS assume shutdown is only called after it has finished receiving
 		// UNRESOLVED! TODO: timeout management?
 		if(! p->WaitSetMutex())
 			return -EINTR;
-		if(! p->IsInUse() || p->StateEqual(CLOSED) || p->StateEqual(NON_EXISTENT))
+
+		if(p->InState(CLOSED))
 		{
 			p->SelfNotify(FSP_NotifyRecycled);
 			p->SetMutexFree();
 			return EBADF;	// A warning saying that the socket has already been closed
 		}
 
-		if (p->StateEqual(CLOSABLE))
+		if (p->InState(COMMITTED) || p->InState(CLOSABLE))
 		{
 			p->SetMutexFree();
-			return p->Call<FSP_Shutdown>();
+			return (p->Call<FSP_Shutdown>() ? 0 : -EIO);
 		}
 
-		if(! p->TestSetState(ESTABLISHED, PAUSING) && ! p->StateEqual(PAUSING) && ! p->TestSetState(RESUMING, PAUSING))
+		if (p->InState(PRE_CLOSED))
 		{
 			p->SetMutexFree();
-			return -EDOM;
+			return EAGAIN;	// A warning saying that the socket is already in graceful shutdown process
+		}
+
+		if(! p->TestSetState(ESTABLISHED, COMMITTING)
+		&& ! p->TestSetState(RESUMING, COMMITTING)
+		&& ! p->InState(COMMITTING)
+		&& ! p->TestSetState(PEER_COMMIT, COMMITTING2)
+		&& ! p->InState(COMMITTING2))
+		{
+			p->SetMutexFree();
+			p->Recycle();
+			return EDOM;	// A warning say that the connection is aborted, actually
 		}
 
 		p->SetFlushing(CSocketItemDl::FlushingFlag::FLUSHING_SHUTDOWN);
 		p->SetMutexFree();
-		return p->Adjourn();
+		return p->Commit();
 	}
 	catch(...)
 	{
@@ -174,28 +176,60 @@ int FSPAPI Shutdown(FSPHANDLE hFSPSocket)
 
 
 
+//[API: Commit]
+//	{ACTIVE, RESUMING}-->COMMITTING-->[Urge COMMIT]
+//	PEER_COMMIT-->COMMITTING2-->[Urge COMMIT]{restart keep-alive}
+//	It might be blocking to wait the send buffer slot to buffer the COMMIT packet
+int CSocketItemDl::Commit()
+{
+	eomSending = EndOfMessageFlag::END_OF_SESSION;
+	//
+	if (InState(ESTABLISHED) || InState(RESUMING))
+		SetState(COMMITTING);
+	else if (InState(PEER_COMMIT))
+		SetState(COMMITTING2);
+	else if (!InState(COMMITTING) && !InState(COMMITTING2))
+		return -EDOM;
+	//
+	ControlBlock::PFSP_SocketBuf skb = pControlBlock->GetLastBufferedSend();
+	if(skb != NULL && skb->Lock())
+	{
+		if(skb->opCode == PURE_DATA || skb->opCode == RESUME || skb->opCode == PERSIST)
+		{
+			skb->SetFlag<TO_BE_CONTINUED>(false);
+		}
+		else
+		{
+			skb->Unlock();
+			skb = NULL;
+		}
+	}
+	// allocate new slot to hold the COMMIT packet
+	if(skb == NULL)
+	{
+		time_t t0 = time(NULL);
+		while((skb = pControlBlock->GetSendBuf()) == NULL)
+		{
+			Sleep(1);
+			if(time(NULL) - t0 > TRASIENT_STATE_TIMEOUT_ms)
+				return -ETIMEDOUT;
+		}
+		skb->len = 0;
+	}
+	// UNRESOLVED! The IS_COMPLETED flag of COMMIT is reused for accumulative acknowledgment?
+	skb->opCode = COMMIT;
+	skb->SetFlag<IS_COMPLETED>();
+	//
+	skb->Unlock();
+	return (Call<FSP_Urge>() ? 0 : -EIO);
+}
+
 
 // Remark
-//	CLOSABLE-->[Snd FINISH]-->CLOSED
-//	Assume [API:Adjourn] has been called if it is not in CLOSABLE state
-// See also ToConcludeClose()
+//	Assume [API:Commit] has been called if it is not in CLOSABLE state
 // TODO: End of Message shall be delivered to ULA
-// When the SCB is in PAUSING state, LLS triggers the synchronization event whenever a legitimate ACK_FLUSH is received
-// The event handler in DLL check the SCB state. If it adheres to rule, the state would be changed into CLOSABLE
-// and the working process would callback the notification function
-void CSocketItemDl::ToConcludeAdjourn()
+void CSocketItemDl::ToConcludeCommit()
 {
-	// Only all packet sent acknowledged(and no further data to send) may it be closable
-	// there might be some curious packet in the receive buffer but it is assumed
-	// that ULA could afford possible loss of remote data in the PAUSING state
-	if(pControlBlock->CountSendBuffered() != 0)
-	{
-		TRACE_HERE("On ACK_FLUSH there should be no data in flight");
-		SetMutexFree();
-		return;
-	}
-	SetState(CLOSABLE);
-	//
 	char isFlushing = GetResetFlushing();
 	SetMutexFree();
 	if(isFlushing == ONLY_FLUSHING)
@@ -203,7 +237,9 @@ void CSocketItemDl::ToConcludeAdjourn()
 #ifdef TRACE
 		printf_s("ONLY_FLUSHING\n");
 #endif
-		NotifyError(FSP_NotifyFlushed, 0);
+		NotifyOrReturn fp1 = (NotifyOrReturn)InterlockedExchangePointer((PVOID *)& fpCommit, NULL);
+		if (fp1 != NULL)
+			fp1(this, FSP_NotifyFlushed, 0);
 	}
 	else if(isFlushing == FLUSHING_SHUTDOWN)
 	{
@@ -212,24 +248,4 @@ void CSocketItemDl::ToConcludeAdjourn()
 #endif
 		Call<FSP_Shutdown>();
 	}
-}
-
-
-// RESET
-//	{CONNECT_BOOTSTRAP, CHALLENGING, CONNECT_AFFIRMING, QUASI_ACTIVE, CLONING, ACTIVE, PAUSING, RESUMING, CLOSABLE}
-//		-->[Notify]-->NON_EXISTENT
-//	Otherwise<-->{Ignore}
-// Remark
-//	ULA shall not re-free the socket
-void CSocketItemDl::OnGetReset()
-{
-	FSP_Session_State s = (FSP_Session_State)InterlockedExchange((LONG *)& pControlBlock->state, NON_EXISTENT);
-	SetMutexFree();
-	if (s == PAUSING)
-		NotifyError(FSP_NotifyFlushed, -ESRCH);	// got RESET while waiting(searching) ACK_FLUSH
-	else
-		NotifyError(FSP_NotifyReset, -EINTR);
-	//
-	socketsTLB.FreeItem(this);
-	Destroy();	// this is different from Recyle()
 }

@@ -41,7 +41,7 @@ int FSPAPI GetSendBuffer(FSPHANDLE hFSPSocket, int m, CallbackBufferReady fp1)
 	try
 	{
 		// Invalid FSP handle: for sake of prebuffering only in a limited number of states sending is prehibited
-		if (p->StateEqual(NON_EXISTENT) || p->StateEqual(LISTENING) || p->StateEqual(CLOSED))
+		if (p->InState(NON_EXISTENT) || p->InState(LISTENING) || p->InState(PRE_CLOSED) || p->InState(CLOSED))
 			return -EBADF;
 		if (!p->TestSetSendReturn(fp1))
 			return -EBUSY;
@@ -66,33 +66,13 @@ int FSPAPI GetSendBuffer(FSPHANDLE hFSPSocket, int m, CallbackBufferReady fp1)
 //	may not exceed the capacity that GetSendBuffer has returned
 //	if the buffer is to be continued, its size MUST be multiplier of MAX_BLOCK_SIZE
 //	SendInline could be chained in tandem with GetSendBuffer
-//  PAUSING--[API:Send{new data}]-->[Snd RESTORE]-->RESUMING
 DllExport
 int FSPAPI SendInline(FSPHANDLE hFSPSocket, void * buffer, int len, bool toBeContinued)
 {
 	register CSocketItemDl * p = (CSocketItemDl *)hFSPSocket;
 	try
 	{
-		if(! p->WaitSetMutex())
-			return -EINTR;	// UNRESOLVED! Simultaneous one send and one receive shall be allowed!
-		//
-		if(p->StateEqual(PAUSING))
-		{
-			TRACE_HERE("Data requested to be sent in PAUSING state. Migrate to RESUMING state");
-			p->RevertToResume();
-		}
-		else if (p->StateEqual(NON_EXISTENT) || p->StateEqual(LISTENING) || p->StateEqual(CLOSED))
-		{
-			p->SetMutexFree();
-			return -EBADF;
-		}
-		//
-		int r = p->PrepareToSend(buffer, len, toBeContinued);
-		p->SetMutexFree();
-		if(r < 0)
-			return r;
-		//
-		return (p->Call<FSP_Send>() ? r : -EIO);
+		return p->SendInplace(buffer, len, toBeContinued);
 	}
 	catch(...)
 	{
@@ -141,7 +121,7 @@ int FSPAPI WriteTo(FSPHANDLE hFSPSocket, void * buffer, int len, char flag, Noti
 
 // Return
 //	Size of currently available free send buffer
-int CSocketItemDl::AcquireSendBuf(int n)
+int LOCALAPI CSocketItemDl::AcquireSendBuf(int n)
 {
 	if(pendingSendBuf != NULL)
 		return -EBUSY;
@@ -161,7 +141,39 @@ int CSocketItemDl::AcquireSendBuf(int n)
 }
 
 
+//[API: Send]
+//	{ACTIVE, PEER_COMMIT}<-->[Send PURE_DATA]
+//	{COMMITTING, COMMITTING2, COMMITTED}-->RESUMING-->[Send RESUME]
+//	CLOSABLE-->RESUMING-->[Send RESUME]{enable retry}
+//	{CONNECT_AFFIRMING, CHALLENGING, CLONING, RESUMING, QUASI_ACTIVE}<-->{just prebuffer}
+// Given
+//	void *		the buffer pointer
+//	int			the number of octets to send
+//	bool		whether it is to be continued
+// Return
+//	number of octets really scheduled to send
+// Remark
+//	SendInplace works in tandem with AcquireSendBuf
+int LOCALAPI CSocketItemDl::SendInplace(void * buffer, int len, bool toBeContinued)
+{
+	if (!WaitSetMutex())
+		return -EINTR;	// UNRESOLVED! Simultaneous one send and one receive shall be allowed!
+	//
+	if (InState(NON_EXISTENT) || InState(CONNECT_BOOTSTRAP) || InState(PRE_CLOSED) || InState(CLOSED))
+	{
+		SetMutexFree();
+		return -EBADF;
+	}
+	//
+	return FinalizeSend(PrepareToSend(buffer, len, toBeContinued));
+}
 
+
+//[API: Send]
+//	{ACTIVE, PEER_COMMIT}<-->[Send PURE_DATA]
+//	{COMMITTING, COMMITTING2, COMMITTED}-->RESUMING-->[Send RESUME]
+//	CLOSABLE-->RESUMING-->[Send RESUME]{enable retry}
+//	{CONNECT_AFFIRMING, CHALLENGING, CLONING, RESUMING, QUASI_ACTIVE}<-->{just prebuffer}
 // Given
 //	void * 	the pointer to the source data buffer
 //	int		the size of the source data in bytes
@@ -169,24 +181,16 @@ int CSocketItemDl::AcquireSendBuf(int n)
 //	Number of bytes put on the send queue
 //	negative on error
 // TODO: buffer data for transactional transfer
-//[API: Send]
-//ACTIVE<-->[Snd PURE_DATA{might be changed to KEEP_ALIVE on flight}]
-//PAUSING-->[Snd RESTORE]-->RESUMING
-//CLOSABLE-->[Snd RESTORE]-->RESUMING
-//RESUMING<-->{Buffer PURE_DATA}
 int LOCALAPI CSocketItemDl::SendStream(void * buffer, int len, char flag)
 {
 	if(! WaitSetMutex())
 		return -EINTR;	// UNRESOLVED! Simultaneous one send and one receive shall be allowed!
 
-	if(StateEqual(PAUSING))
+	if (InState(NON_EXISTENT) || InState(CONNECT_BOOTSTRAP) || InState(PRE_CLOSED) || InState(CLOSED))
 	{
-		TRACE_HERE("Data requested to be sent in PAUSING state. Migrate to RESUMING state");
-		RevertToResume();
-	}
-	else if (StateEqual(NON_EXISTENT) || StateEqual(LISTENING) || StateEqual(CLOSED))
-	{
-		TRACE_HERE("Invalid state for sending: NON_EXISTENT, LISTENING or CLOSED.");
+#ifdef TRACE
+		printf_s("Invalid state for sending: %s\n", stateNames[GetState()]);
+#endif
 		SetMutexFree();
 		return -EBADF;
 	}
@@ -199,12 +203,31 @@ int LOCALAPI CSocketItemDl::SendStream(void * buffer, int len, char flag)
 	bytesBuffered = 0;
 	eomSending = flag;
 
-	int r = BufferData(len);	// pendingSendSize = len;
-	SetMutexFree();
-	// Unlike in SendInline here ULA is triggered as soon as LLS have scheduled to send
-	return (Call<FSP_Send>() ? r : -EIO);
+	return FinalizeSend(BufferData(len));	// pendingSendSize = len;
 }
 
+
+
+int LOCALAPI CSocketItemDl::FinalizeSend(int r)
+{
+	SetMutexFree();
+	if (r < 0)
+		return r;
+	// Prevent premature FSP_Send
+	if (InState(CONNECT_AFFIRMING) || InState(CLONING) || InState(RESUMING) || InState(QUASI_ACTIVE))
+		return r;
+	//
+	if (InState(COMMITTING) || InState(COMMITTING2) || InState(COMMITTED) || InState(CLOSABLE))
+	{
+#ifdef TRACE
+		printf_s("Data requested to be sent in %s state. Migrate to RESUMING state\n", stateNames[GetState()]);
+#endif
+		isFlushing = 0;
+		return (Call<FSP_Resume>() ? r : -EIO);
+	}
+	//
+	return (Call<FSP_Send>() ? r : -EIO);
+}
 
 
 // Remark
@@ -235,8 +258,8 @@ void CSocketItemDl::ProcessPendingSend()
 	}
 
 	// Set fpSent to NULL BEFORE calling back so that chained send may set new value
-	NotifyOrReturn fp1 = GetResetSendReturn();
-	if (fp1 == NULL)
+	CallbackBufferReady fp2 = (CallbackBufferReady)InterlockedExchangePointer((PVOID volatile *)& fpSent, NULL);
+	if (fp2 == NULL)
 	{
 		SetMutexFree();
 		return;
@@ -247,11 +270,10 @@ void CSocketItemDl::ProcessPendingSend()
 	{
 		pendingSendBuf = NULL;	// So that WriteTo() chaining is possible, see also BufferData()
 		SetMutexFree();
-		fp1(this, FSP_Send, bytesBuffered);
+		((NotifyOrReturn)fp2)(this, FSP_Send, bytesBuffered);
 	}
 	else if(pendingSendSize > 0)	// while pendingSendBuf == NULL
 	{
-		CallbackBufferReady fp2 = (CallbackBufferReady)fp1;
 		int m = pendingSendSize;	// the size of the requested buffer
 		int r = 0;
 		void * p = pControlBlock->InquireSendBuf(m);
@@ -273,7 +295,6 @@ void CSocketItemDl::ProcessPendingSend()
 		//
 		if (r == 0)
 			TestSetSendReturn(fp2);
-		// UNRESOLVED! TODO: lock the buffer so further reporting of buffer availabity is not 
 	}
 	else
 	{
@@ -287,7 +308,6 @@ void CSocketItemDl::ProcessPendingSend()
 // Return
 //	number of bytes buffered in the send queue
 // TODO: encryption and/or compression
-// TODO: persist piggyback 
 int LOCALAPI CSocketItemDl::BufferData(int len)
 {
 	ControlBlock::PFSP_SocketBuf p = pControlBlock->GetLastBufferedSend();
@@ -315,7 +335,10 @@ int LOCALAPI CSocketItemDl::BufferData(int len)
 		p->len += k;
 		pendingSendBuf += k;
 		if(p->len >= MAX_BLOCK_SIZE)
+		{
 			p->SetFlag<IS_COMPLETED>();
+			p->Unlock();
+		}
 		//
 		if (m == 0)
 			goto l_finish;
@@ -337,7 +360,10 @@ int LOCALAPI CSocketItemDl::BufferData(int len)
 
 		p->SetFlag<TO_BE_CONTINUED>();
 		if(p->len >= MAX_BLOCK_SIZE)
+		{
 			p->SetFlag<IS_COMPLETED>();
+			p->Unlock();
+		}
 		if (m <= 0)
 			break;
 		//
@@ -354,22 +380,16 @@ l_finish:
 		{
 			p->SetFlag<TO_BE_CONTINUED>(false);
 			p->SetFlag<IS_COMPLETED>();
+			p->Unlock();
 		}
 		else if (eomSending == EndOfMessageFlag::END_OF_SESSION)
 		{
 			p->SetFlag<TO_BE_CONTINUED>(false);
 			p->SetFlag<IS_COMPLETED>();
-			p->opCode = ADJOURN;
+			p->opCode = COMMIT;
+			p->Unlock();
 		}
 		// otherwise WriteTo following may put further data into the last packet buffer
-	}
-	if (StateEqual(RESUMING))
-	{
-		p = PeekNextToSend();	// assert(p != NULL);
-		if (p->opCode == ADJOURN)
-			SetState(PAUSING);
-		else
-			p->opCode = RESTORE;
 	}
 	//
 	return (len - m);
@@ -388,12 +408,6 @@ l_finish:
 //	-EDOM if the second or third parameter is illegal
 // Remark
 //	Would automatically mark the previous last packet as completed
-//TODO...
-//[API: Send]
-//ACTIVE<-->[Snd PURE_DATA{might be changed to KEEP_ALIVE on flight}]
-//PAUSING-->[Snd RESTORE]-->RESUMING
-//CLOSABLE-->[Snd RESTORE]-->RESUMING
-//RESUMING<-->{Buffer PURE_DATA}
 int LOCALAPI CSocketItemDl::PrepareToSend(void * buf, int len, bool toBeContinued)
 {
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->GetLastBufferedSend();
@@ -405,6 +419,7 @@ int LOCALAPI CSocketItemDl::PrepareToSend(void * buf, int len, bool toBeContinue
 #endif
 		skb->SetFlag<TO_BE_CONTINUED>(false);
 		skb->SetFlag<IS_COMPLETED>();
+		skb->Unlock();
 		//^it might be redundant, but did little harm
 	}
 
@@ -415,15 +430,6 @@ int LOCALAPI CSocketItemDl::PrepareToSend(void * buf, int len, bool toBeContinue
 		printf_s("\nMarkSendQueue 0x%08X, len = %d, toBeContinued = %d, returned %d\n", (LONG)buf, len, (int)toBeContinued, r);
 #endif
 		return r;
-	}
-
-	if(StateEqual(RESUMING))
-	{
-		skb = PeekNextToSend();
-		if (skb->opCode == ADJOURN)
-			SetState(PAUSING);
-		else
-			skb->opCode = RESTORE;
 	}
 
 	return r;

@@ -102,20 +102,6 @@ BOOL WINAPI DllMain(HINSTANCE hInstance, DWORD dwReason, LPVOID lpvReserved)
 }
 
 
-// Return the number of microseconds elapsed since Jan 1, 1970 (unix epoch time)
-extern "C" timestamp_t NowUTC()
-{
-	// return the number of 100-nanosecond intervals since January 1, 1601 (UTC), in host byte order
-	FILETIME systemTime;
-	GetSystemTimeAsFileTime(& systemTime);
-
-	timestamp_t & t = *(timestamp_t *) & systemTime;
-	t /= 10;
-	return (t - DELTA_EPOCH_IN_MICROSECS);
-}
-
-
-
 // Given
 //	uint32_t	the limit of the size of the control block. set to 0 to minimize
 //	char []		the buffer to hold the name of the event
@@ -208,7 +194,7 @@ int LOCALAPI CSocketItemDl::Initialize(PFSP_Context psp1, char szEventName[MAX_N
 
 CSocketItemDl * LOCALAPI CSocketItemDl::CallCreate(CommandNewSession & objCommand, FSP_ServiceCode cmdCode)
 {
-	objCommand.idSession = pairSessionID.source;
+	objCommand.fiberID = fidPair.source;
 	objCommand.idProcess = ::idThisProcess;
 	objCommand.opCode = cmdCode;
 	objCommand.hMemoryMap = hMemoryMap;
@@ -240,35 +226,65 @@ void CSocketItemDl::WaitEventToDispatch()
 	if(! WaitSetMutex())
 		return;
 #ifdef TRACE_PACKET
-	printf_s("\nIn session #%u, state %s\n", pairSessionID.source, stateNames[pControlBlock->state]);
+	printf_s("\nIn local fiber#%u, state %s\n", fidPair.source, stateNames[pControlBlock->state]);
 #endif
 	FSP_ServiceCode notice;
-	int r = 0;
 	while((notice = PopNotice()) != NullCommand)
 	{
 #ifdef TRACE_PACKET
 		printf_s("\tnotice: %s\n", noticeNames[notice]);
 #endif
+		if(InState(NON_EXISTENT))
+		{
+			SetMutexFree();
+			NotifyError(notice, -EBADF);
+			return;
+		}
 		switch(notice)
 		{
-		case FSP_NotifyBufferReady:
-			ProcessPendingSend();
+		case FSP_NotifyAccepting:
+			// case SynConection:
+			if(pControlBlock->HasBacklog())
+				ProcessBacklog();
+			if(InState(CONNECT_AFFIRMING))
+				ToConcludeConnect();		// SetMutexFree();
+			else if(InState(CLOSABLE) || InState(CLOSED))
+				HitResumableDisconnectedSessionCache();
+			else
+				SetMutexFree();
+			break;
+		case FSP_Abort:	// used to be FSP_Timeout:
+			SetMutexFree();
+			NotifyError(notice, -EINTR);
+			return;
+		case FSP_Dispose:// a reverse command meant to synchronize DLL and LLS
+			SetMutexFree();
+			NotifyError(notice);
+			return;
+		case FSP_NotifyAccepted:
+			ToConcludeAccept();			// SetMutexFree();
 			break;
 		case FSP_NotifyDataReady:
 			ProcessReceiveBuffer();
 			break;
-		case FSP_NotifyAccepted:
-			ToConcludeAccept();			// SetMutexFree();
+		case FSP_NotifyBufferReady:
+			ProcessPendingSend();
 			break;
-		case FSP_NotifyToAdjourn:
-			ProcessReceiveBuffer();
-			if (!WaitSetMutex())
-				return;
-			ToConcludeAdjourn();		// SetMutexFree();
+		case FSP_NotifyToCommit:
+			// UNRESOLVED! Callback ULA?
+			if (IsRecvBufferEmpty())
+				SetMutexFree();
+			else
+				ProcessReceiveBuffer();
 			break;
 		case FSP_NotifyFlushed:
-			ToConcludeAdjourn();		// SetMutexFree();
+			ToConcludeCommit();		// SetMutexFree();
 			break;
+		case FSP_NotifyFinish:
+		case FSP_NotifyRecycled:
+			SetMutexFree();
+			NotifyError(notice);	// report 'no error', actually
+			return;
 		case FSP_IPC_CannotReturn:
 			SetMutexFree();
 			if (pControlBlock->state == LISTENING)
@@ -279,70 +295,23 @@ void CSocketItemDl::WaitEventToDispatch()
 			else	// else just ignore the dist
 				printf_s("Get FSP_IPC_CannotReturn in the state %s\n", stateNames[pControlBlock->state]);
 #endif // TRACE
+			//
 			return;
-		// TODO: error handlers
-		case FSP_NotifyOverflow:
-			break;
-		case FSP_NotifyNameResolutionFailed:
-			break;
-		// Termination
-		case FSP_NotifyReset:
-			OnGetReset();
-			return;
-		case FSP_Timeout:
-			// UNRESOLVED! TODO: review & test
-			if(StateEqual(QUASI_ACTIVE))
-			{
-				SetState(CLOSED);
-				SetMutexFree();
-				NotifyError(FSP_NotifyRecycled, ENOEXEC);	// Resurrecting is not executed
-			}
-			break;
-		case FSP_NotifyRecycled:
-			NotifyError(FSP_NotifyRecycled, 0);	// report 'no error', actually
+		case FSP_MemoryCorruption:	//
+			this->Recycle();		// Tell LLS to recycle the session context mapping
 			SetMutexFree();
+			NotifyError(notice, -EINTR);
 			return;
-		case FSP_NotifyDisposed:
-			NotifyError(FSP_NotifyDisposed, -EINTR);
+		case FSP_NotifyOverflow:	// LLS should have recyle the session context mapping already
+		case FSP_NotifyTimeout:
+		case FSP_NotifyNameResolutionFailed: // There could be some remedy, let ULA decide it
 			SetMutexFree();
+			NotifyError(notice, -EINTR);
 			return;
 		}
-		r++;
 		// mutex is free in the subroutines such as ProcessPendingSend, ProcessReceiveBuffer
 		if(! WaitSetMutex())
 			return;
-	}
-	//
-	if(r > 0)
-	{
-		SetMutexFree();
-		return;
-	}
-	//
-	switch(pControlBlock->state)
-	{
-	case LISTENING:
-		if(pControlBlock->HasBacklog())
-			ProcessBacklog();
-		SetMutexFree();
-		break;
-	case CONNECT_BOOTSTRAP:
-		// UNRESOLVED! TODO: if Connect2() is successfully initiated by LLS, a soft interrupt is triggered
-		// should it calls back ULA?
-		SetMutexFree();
-		break;
-	case CONNECT_AFFIRMING:
-		ToConcludeConnect();		// SetMutexFree();
-		break;
-	case CLOSABLE:
-	case CLOSED:
-		HitResumableDisconnectedSessionCache();
-		break;
-	default:
-		SetMutexFree();
-#ifdef TRACE
-		printf_s("Got an unkown alert from LLS in the state %s\n", stateNames[pControlBlock->state]);
-#endif
 	}
 }
 
@@ -369,7 +338,7 @@ CSocketItemDl * CSocketItemDl::CreateControlBlock(const PFSP_IN6_ADDR nearAddr, 
 		return NULL;
 	}
 	//
-	socketItem->pairSessionID.source = nearAddr->idALT;
+	socketItem->fidPair.source = nearAddr->idALF;
 	//
 	// TODO: UNRESOLVED! specifies 'ANY' address?
 	//
@@ -380,7 +349,7 @@ CSocketItemDl * CSocketItemDl::CreateControlBlock(const PFSP_IN6_ADDR nearAddr, 
 		{
 			pNearEnd[i].InitUDPoverIPv4(psp1->ifDefault);
 		}
-		pNearEnd->idALT = nearAddr->idALT;
+		pNearEnd->idALF = nearAddr->idALF;
 		pNearEnd->ipi_addr = nearAddr->u.st.ipv4;
 	}
 	else
@@ -405,7 +374,7 @@ bool LOCALAPI CSocketItemDl::Call(const CommandToLLS & cmd, int size)
 
 
 
-int LOCALAPI CSocketItemDl::CopyKey(ALT_ID_T id1)
+int LOCALAPI CSocketItemDl::CopyKey(ALFID_T id1)
 {
 	CSocketItemDl *p1 = socketsTLB[id1];
 	if(p1 == NULL || ! p1->IsInUse())
@@ -419,12 +388,12 @@ int LOCALAPI CSocketItemDl::CopyKey(ALT_ID_T id1)
 
 
 
-
-DllSpec
-bool EOMReceived(FSPHANDLE hFSPSocket)
-{
-	return ((CSocketItemDl *)hFSPSocket)->IsEndOfRecvMsg();
-}
+//
+//DllSpec
+//bool EOMReceived(FSPHANDLE hFSPSocket)
+//{
+//	return ((CSocketItemDl *)hFSPSocket)->IsEndOfRecvMsg();
+//}
 
 
 
@@ -481,11 +450,11 @@ void CSocketDLLTLB::FreeItem(CSocketItemDl *r)
 
 // The caller should check whether it's really a working connection by check inUse flag
 // connection reusable.
-CSocketItemDl * CSocketDLLTLB::operator[](ALT_ID_T sessionID)
+CSocketItemDl * CSocketDLLTLB::operator[](ALFID_T fiberID)
 {
 	for(int i = 0; i < sizeOfSet; i++)
 	{
-		if(pSockets[i]->pairSessionID.source == sessionID)
+		if(pSockets[i]->fidPair.source == fiberID)
 			return pSockets[i];
 	}
 	return NULL;

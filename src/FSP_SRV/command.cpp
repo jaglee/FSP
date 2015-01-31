@@ -52,10 +52,10 @@ void LOCALAPI Listen(CommandNewSessionSrv &cmd)
 		return;
 	}
 
-	CSocketItemEx *socketItem = (CLowerInterface::Singleton())->AllocItem(cmd.idSession);
+	CSocketItemEx *socketItem = (CLowerInterface::Singleton())->AllocItem(cmd.fiberID);
 	if(socketItem == NULL)
 	{
-		TRACE_HERE("Multiple call to listen on the same local session ID?");
+		TRACE_HERE("Multiple call to listen on the same local fiber ID?");
 		::SetEvent(cmd.hEvent);
 		return;
 	}
@@ -100,7 +100,7 @@ l_return:
 // Given
 //	CommandNewSession	the synchronization command context
 // Do
-//	Lookup the SCB item according to the give session ID in the command context, if an existing busy item
+//	Lookup the SCB item according to the give fiber ID in the command context, if an existing busy item
 //	was found (it is a rare but possible collision) return failure
 //	if a free item was found, map the control block into process space of LLS
 //	and go on to emit the command and optional data packets in the send queue
@@ -141,23 +141,21 @@ void LOCALAPI CSocketItemEx::Listen(CommandNewSessionSrv &cmd)
 	}
 
 	// bind to the interface as soon as the control block mapped into server's memory space
-	pairSessionID.source = cmd.idSession;
+	fidPair.source = cmd.fiberID;
 	InitAssociation();
-	//
+
 	SetReturned();
-	SignalEvent();
+	// everyting run smoothly. no interrupt raised
 }
 
 
 
-// Given
-//	CommandNewSession
 // Do
-//	Routine works of registering a passive FSP socket
+//	Make initiative connect context and initiate session establishment
 void CSocketItemEx::Connect()
 {
 #ifdef TRACE
-	printf_s("Try to make connection to %s (@local session #%u)\n", PeerName(), pairSessionID.source);
+	printf_s("Try to make connection to %s (@local fiber#%u)\n", PeerName(), fidPair.source);
 #endif
 	char nodeName[INET6_ADDRSTRLEN];
 	char *peerName = PeerName();
@@ -176,10 +174,11 @@ void CSocketItemEx::Connect()
 		if(r <=  0)
 		{
 			Notify(FSP_NotifyNameResolutionFailed);
+			Destroy();
 			return;
 		}
 	}
-	pControlBlock->u.connectParams.idRemote = pControlBlock->peerAddr.ipFSP.sessionID;
+	pControlBlock->u.connectParams.idRemote = pControlBlock->peerAddr.ipFSP.fiberID;
 
 	// By default Connect() prefer initiatiating connection from an IPv6 interface
 	// but if the peer is of FSP over UDP/IPv4 address it must be changed
@@ -193,46 +192,113 @@ void CSocketItemEx::Connect()
 		}
 	}
 	// See also FSP_DLL$$CSocketItemDl::ToConcludeConnect
-	pControlBlock->nearEnd->idALT = pairSessionID.source;
+	pControlBlock->nearEnd->idALF = fidPair.source;
 	//^For compatibility with passive peer behavior, InitAssociation() does not prepare nearEnd[0]
 
 	// bind to the interface as soon as the control block mapped into server's memory space
 	InitAssociation();
 	InitiateConnect();
 
-	SetReturned();
-	SignalEvent();
+	SignalReturned();
 }
 
 
 
-// Send the FINISH command, as the last step of shut down connection
+//[API: Shutdown]
+//	COMMITTED-->[Send RELEASE]-->PRE_CLOSED
+//	CLOSABLE-->[Send RELEASE]-->CLOSED
 void CSocketItemEx::Shutdown()
 {
 	TRACE_HERE("called");
 
-	ReplaceTimer(SCAVENGE_THRESHOLD_ms);
-	SetState(CLOSED);
-	SendPacket<FINISH>();
-	(CLowerInterface::Singleton())->FreeItem(this);
-
-	Notify(FSP_NotifyRecycled);
+	SendPacket<RELEASE>();
+	if(InState(CLOSABLE))
+		CloseToNotify();
+	else if(InState(COMMITTED))
+		SetState(PRE_CLOSED);
 }
 
 
 // Start sending queued packet(s) in the session control block
-// Given
-//	_In_	ALT_ID_T	the application layer thread id of the session
-// Return
-//	Nothing
 // Remark
 //	Operation code in the given command context would be cleared if send is pending
-void CSocketItemEx::Send()
+void CSocketItemEx::Start()
 {
 	TRACE_HERE("called");
 	// synchronize the state in the 'cache' and the real state
-	lowState = pControlBlock->state;
-	ScheduleEmitQ();
+	if (lowState != pControlBlock->state)
+	{
+		lowState = pControlBlock->state;
+		if (lowState == CLONING || lowState == RESUMING)
+		{
+			tKeepAlive_ms = CONNECT_INITIATION_TIMEOUT_ms;
+			RestartKeepAlive();
+		}
+	}
+	//
+	EmitStart();
+	pControlBlock->MoveNextToSend();
+}
+
+
+
+// Non-conformative DLL/ULA may exploit it to send data out of the congestion control
+// However, context switch would limit the throughput
+// Mean to urge sending of the COMMIT packet
+void CSocketItemEx::UrgeCommit()
+{
+	TRACE_HERE("called");
+	// synchronize the state in the 'cache' and the real state
+	if (lowState != pControlBlock->state)
+	{
+		lowState = pControlBlock->state;
+		if (lowState == COMMITTING || lowState == COMMITTING2)
+			RestartKeepAlive();
+	}
+	//
+	ControlBlock::PFSP_SocketBuf skb = pControlBlock->GetNextToSend();
+	if(skb->Lock())
+		EmitWithICC(skb, pControlBlock->MoveNextToSend());
+}
+
+
+
+// Remark
+//	Scan the send queue replace the unsent COMMIT or the head packet to RESUME
+void CSocketItemEx::Resume()
+{
+	if(pControlBlock->CountSendBuffered() <= 0)
+	{
+		TRACE_HERE("Only active send may resume an adjourned connection or cancel the adjourment"); 
+		return;
+	}
+	//
+	ControlBlock::PFSP_SocketBuf skb;
+	if (InState(COMMITTED) || InState(CLOSABLE))
+	{
+		skb = pControlBlock->GetNextToSend();
+	}
+	else if(InState(COMMITTING) || InState(COMMITTING2))
+	{
+		skb = pControlBlock->PeekAnteCommit();
+		if(skb == NULL)
+			return;
+	}
+	else
+	{
+		return;
+	}
+
+	if(! skb->GetFlag<IS_COMPLETED>())
+	{
+		TRACE_HERE("Not ready to resume, for example, incomplete compression");
+		return;
+	}
+	// UNRESOLVED! But should piggyback the mobility header?
+	skb->Lock();
+	skb->opCode = RESUME;
+	pControlBlock->state = RESUMING;
+	EmitStart();
 }
 
 
@@ -273,7 +339,7 @@ int LOCALAPI CSocketItemEx::ResolveToFSPoverIPv4(const char *nodeName, const cha
 	register PFSP_IN4_ADDR_PREFIX prefixes = (PFSP_IN4_ADDR_PREFIX)pControlBlock->peerAddr.ipFSP.allowedPrefixes;
 	int n = 0;
 	pControlBlock->peerAddr.ipFSP.hostID = 0;
-	pControlBlock->peerAddr.ipFSP.sessionID = PORT2ALT_ID( ((PSOCKADDR_IN)pAddrInfo->ai_addr)->sin_port );
+	pControlBlock->peerAddr.ipFSP.fiberID = PORT2ALFID( ((PSOCKADDR_IN)pAddrInfo->ai_addr)->sin_port );
 	do
 	{
 		// Must keep in consistent with TranslateFSPoverIPv4
@@ -325,7 +391,7 @@ int LOCALAPI CSocketItemEx::ResolveToIPv6(const char *nodeName)
 	register UINT64 * prefixes = pControlBlock->peerAddr.ipFSP.allowedPrefixes;
 	int n = 0;
 	pControlBlock->peerAddr.ipFSP.hostID = SOCKADDR_HOST_ID(pAddrInfo->ai_addr);
-	pControlBlock->peerAddr.ipFSP.sessionID = SOCKADDR_ALT_ID(pAddrInfo->ai_addr);
+	pControlBlock->peerAddr.ipFSP.fiberID = SOCKADDR_ALFID(pAddrInfo->ai_addr);
 	do
 	{
 		prefixes[n] = *(UINT64 *)(((PSOCKADDR_IN6)pAddrInfo->ai_addr)->sin6_addr.u.Byte);

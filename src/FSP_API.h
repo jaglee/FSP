@@ -138,8 +138,9 @@ struct FSP_SocketParameter
 {
 	CallbackRequested	beforeAccept;	// may be NULL
 	CallbackConnected	afterAccept;	// cannot be NULL
-	NotifyOrReturn	callback;
+	NotifyOrReturn	onError;
 	//^the function pointer of the multiplexer called back on notification or when async-read/write returns
+	// which should process negatives and non-negative FSP_NotifyFinish, FSP_NotifyRecycled and FSP_Dispose
 	const void *	welcome;		// default welcome message, may be NULL
 	unsigned short	len;			// length of the default welcome message
 	union USocketFlags
@@ -287,19 +288,27 @@ int FSPAPI ReadFrom(FSPHANDLE, void *, int, NotifyOrReturn);
 
 
 
-// Adjourn/pause the session by managing to flush all data-in-flight to the remote peer
-// Return 0 if no immediate error, or else the error number.
-// The callback function might return code of delayed error
+// Commit sendin by managing to flush all data-in-flight to the remote peer
+// Given
+//	FSPHANDLE		the FSP socket
+//	NotifyOrReturn	the callback function
+// Return
+//	-EBADF if the connection is not in valid context
+//	-EDOM if the connection is not in proper state
+//	-EIO if the COMMIT packet cannot be sent
+//	0 if no immediate error
+// Remark
+//	the callback function may return delayed error such as Commit rejected the remote end
 DllSpec
-int FSPAPI Adjourn(FSPHANDLE);
+int FSPAPI Commit(FSPHANDLE, NotifyOrReturn);
 
 
-
-// Try to terminate the session gracefully
-// return 0 if no immediate error, or else the error number
-// remark
-//	Unlike Adjourn, it is the onError function whose pointer was passed in the socket context parameter that
-//	handle the final result of shutdown (0 if no error/shutdown gracefully, negative if timeout and so on)
+// Try to terminate the session gracefully, automatically commit if not yet 
+// Return 0 if no immediate error, or else the error number
+// The callback function might return code of delayed error
+// Remark
+//	The onError function whose pointer was passed in the socket context parameter would be called
+//	with the final result of shutdown: 0 if no error/shutdown gracefully, negative if abnormal
 DllSpec
 int FSPAPI Shutdown(FSPHANDLE hFSPSocket);
 
@@ -312,13 +321,13 @@ int FSPAPI Dispose(FSPHANDLE hFSPSocket);
 // Given
 //	PFSP_IN6_ADDR	the place holder of the output FSP/IPv6 address
 //	uint32_t		the 32-bit integer representation of the IPv4 address to be translated
-//	ALT_ID_T		the session ID, in host byte order
+//	ALFID_T			the application layer fiber ID, in neutral byte order
 // Return
 //	the pointer to the place holder of host-id which might be set/updated later
 // Remark
 //	make the rule-adhered IPv6 address, the result is placed in the given pointed place holder
 DllSpec
-uint32_t * TranslateFSPoverIPv4(PFSP_IN6_ADDR, uint32_t, ALT_ID_T);
+uint32_t * TranslateFSPoverIPv4(PFSP_IN6_ADDR, uint32_t, ALFID_T);
 
 
 // When use FSPControl to enumerate interfaces,
@@ -331,9 +340,9 @@ uint32_t * TranslateFSPoverIPv4(PFSP_IN6_ADDR, uint32_t, ALT_ID_T);
 DllSpec
 int FSPControl(FSPHANDLE hFSPSocket, unsigned controlCode, ulong_ptr value);
 
-
-DllSpec
-bool EOMReceived(FSPHANDLE);
+//
+//DllSpec
+//bool EOMReceived(FSPHANDLE);
 
 
 #ifdef __cplusplus

@@ -42,21 +42,6 @@
     <ClCompile Include="..\ControlBlock.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="rsa-gmp.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="rsassa-pss.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="..\gcm-aes.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="..\rijndael-alg-fst.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="..\vmac.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
     <ClCompile Include="..\SHA3\KeccakDuplex.c">
       <Filter>SHA3</Filter>
     </ClCompile>
@@ -72,6 +57,12 @@
     <ClCompile Include="..\SHA3\KeccakNISTInterface.c">
       <Filter>SHA3</Filter>
     </ClCompile>
+    <ClCompile Include="..\rijndael-alg-fst.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="..\gcm-aes.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\FSP.h">
@@ -84,12 +75,6 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="..\FSP_Impl.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="rsa-gmp.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="rsassa-pss.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="..\SHA3\brg_endian.h">

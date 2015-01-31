@@ -23,23 +23,15 @@ static void FSPAPI onReturn(FSPHANDLE h, FSP_ServiceCode code, int value)
 	{
 		Dispose(h);
 		finished = true;
+		return;
 	}
-	else if(code == FSP_NotifyReset || code == FSP_NotifyRecycled)
+	if(code == FSP_NotifyFinish || code == FSP_NotifyRecycled)
 	{
-		finished = true;
-	}
-	else if(code == FSP_NotifyOverflow)
-	{
-		printf_s("\nNo enough buffer space to receive data.\n");
-		finished = true;
+		printf_s("Session was shut down.\n");
 		Dispose(h);
+		finished = true;
+		return;
 	}
-#ifndef NDEBUG
-	else if(code == FSP_NotifyFlushed)
-	{
-		printf_s("\nSend queue flushed, the session is paused.\n");
-	}
-#endif
 }
 
 
@@ -80,7 +72,7 @@ int main()
 	memset(& parms, sizeof(parms), 0);
 	parms.beforeAccept = NULL;
 	parms.afterAccept = onConnected;
-	parms.callback = onReturn;
+	parms.onError = onReturn;
 	parms.recvSize = MAX_FSP_SHM_SIZE;	// 4MB
 	parms.sendSize = 0;	// the underlying service would give the minimum, however
 	if(Connect2(REMOTE_APPLAYER_NAME, & parms) == NULL)

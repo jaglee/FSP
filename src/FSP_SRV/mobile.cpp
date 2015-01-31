@@ -30,18 +30,18 @@
 
 #include "fsp_srv.h"
 
-ALT_ID_T CLowerInterface::SetLocalSessionID(ALT_ID_T value)
+ALFID_T CLowerInterface::SetLocalFiberID(ALFID_T value)
 {
-	register volatile ALT_ID_T *p = nearInfo.IsIPv6()
-		? & nearInfo.u.idALT
+	register volatile ALFID_T *p = nearInfo.IsIPv6()
+		? & nearInfo.u.idALF
 		: & HeaderFSPoverUDP().peer;
 	return InterlockedExchange((volatile LONG *)p, value);
 }
 
 
 
-// return the session ID, or 0 if no more slot available
-ALT_ID_T LOCALAPI CLowerInterface::RandALT_ID(PIN6_ADDR addrList)
+// return the fiber ID, or 0 if no more slot available
+ALFID_T LOCALAPI CLowerInterface::RandALFID(PIN6_ADDR addrList)
 {
 	CSocketItemEx *p = headFreeSID;
 	int ifIndex;
@@ -53,7 +53,7 @@ ALT_ID_T LOCALAPI CLowerInterface::RandALT_ID(PIN6_ADDR addrList)
 	}
 
 	register BYTE *s = addrList->u.Byte;
-	// if there's at least one hint, the ALT_ID_T part of the hint address will be altered if prefix matched
+	// if there's at least one hint, the ALFID_T part of the hint address will be altered if prefix matched
 	if(*(uint64_t *)addrList->u.Byte != 0)
 	{
 		bool isEffective = false;
@@ -61,7 +61,7 @@ ALT_ID_T LOCALAPI CLowerInterface::RandALT_ID(PIN6_ADDR addrList)
 		{
 			if(*(uint64_t *)s == *(uint64_t *)addresses[j].sin6_addr.u.Byte)
 			{
-				*(ALT_ID_T *)(s + 12) = p->pairSessionID.source;
+				*(ALFID_T *)(s + 12) = p->fidPair.source;
 				ifIndex = interfaces[j];
 				isEffective = true;
 				break;
@@ -77,7 +77,7 @@ ALT_ID_T LOCALAPI CLowerInterface::RandALT_ID(PIN6_ADDR addrList)
 	else
 	{
 		// by default exploit the first interface configured
-		*(ALT_ID_T *)(s + 12) = p->pairSessionID.source;
+		*(ALFID_T *)(s + 12) = p->fidPair.source;
 		memcpy(s, addresses[0].sin6_addr.u.Byte, 12);
 		ifIndex = interfaces[0];
 	}
@@ -87,12 +87,12 @@ ALT_ID_T LOCALAPI CLowerInterface::RandALT_ID(PIN6_ADDR addrList)
 	tailFreeSID = p;
 	if(headFreeSID == p)
 		p->next = NULL;
-	// just take use of sessionID portion of the new entry
-	return p->pairSessionID.source;
+	// just take use of fiberID portion of the new entry
+	return p->fidPair.source;
 }
 
 
-ALT_ID_T LOCALAPI CLowerInterface::RandALT_ID()
+ALFID_T LOCALAPI CLowerInterface::RandALFID()
 {
 	CSocketItemEx *p = headFreeSID;
 	if(p == NULL)
@@ -108,8 +108,8 @@ ALT_ID_T LOCALAPI CLowerInterface::RandALT_ID()
 		headFreeSID = p;
 	else
 		p->next = NULL;
-	// just take use of sessionID portion of the new entry
-	return p->pairSessionID.source;
+	// just take use of fiberID portion of the new entry
+	return p->fidPair.source;
 }
 
 
@@ -170,7 +170,7 @@ UINT64 LOCALAPI CalculateCookie(BYTE *header, int sizeHdr, timestamp_t t0)
 //	Set ICC value
 // Remark
 //	IV = (sequenceNo, expectedSN)
-//	AAD = (source session ID, destination session ID, flags, receive window free pages
+//	AAD = (source fiber ID, destination fiber ID, flags, receive window free pages
 //		 , version, OpCode, header stack pointer, optional headers)
 #if 0
 void LOCALAPI CSocketItemEx::SetIntegrityCheckCodeP1(FSP_NormalPacketHeader *p1)
@@ -253,7 +253,7 @@ void LOCALAPI CSocketItemEx::SetIntegrityCheckCodeP1(FSP_NormalPacketHeader *p1)
 		|| pControlBlock->_mac_ctx_protect_epilog[0] != MAC_CTX_PROTECT_SIGN
 		|| pControlBlock->_mac_ctx_protect_epilog[1] != MAC_CTX_PROTECT_SIGN)
 	{
-		printf_s("Fatal! VMAC context is destroyed! Session ID = 0x%X\n", this->pairSessionID.source);
+		printf_s("Fatal! VMAC context is destroyed! Session ID = 0x%X\n", this->fidPair.source);
 		return;
 	}
 #endif
@@ -270,24 +270,26 @@ void LOCALAPI CSocketItemEx::SetIntegrityCheckCodeP1(FSP_NormalPacketHeader *p1)
 	INIT_CONNECT		payload buffer	/ temporary: initiator may retransmit it actively/stateless for responder
 	ACK_INIT_CONNECT	temporary		/ temporary: stateless for responder/transient for initiator
 	CONNECT_REQUEST		payload buffer	/ temporary: initiator may retransmit it actively/stateless for responder
-	ACK_CONNECT_REQUEST	separate payload/ temporary: responder may retransmit it passively/transient for initiator
+	ACK_CONNECT_REQ		separate payload/ temporary: responder may retransmit it passively/transient for initiator
 	RESET				temporary		/ temporary: one-shot only
 	PERSIST				separate payload/ separate payload: fixed and optional headers regenerated on each heartbeat
+	COMMIT				separate payload/ separate payload buffer: space reserved for fixed and optional headers
 	PURE_DATA			separate payload/ separate payload: without any optional header, fixed header regenerate whenever retransmit
-	ADJOURN				separate payload/ separate payload buffer: space reserved for fixed and optional headers
+	KEEP_ALIVE			temporary		/ temporary: KEEP_ALIVE is always generate on fly
 	ACK_FLUSH			temporary		/ temporary: ACK_FLUSH is always generate on fly
-	RESTORE				payload buffer	/ payload buffer: initiator of restore operation may retransmit it actively
-	FINISH				temporary		/ temporary: one-shot only
+	RESUME				payload buffer	/ payload buffer: initiator of RESUME operation may retransmit it actively
+	RELEASE				temporary		/ temporary: one-shot only
 	MULTIPLY			payload buffer	/ payload buffer: initiator of clone operation may retransmit it actively
  *
  *
  */
 // Do
-//	Transmit a packet to the remote end, enforcing secure mobility support
+//	Transmit the head packet in the send queue to the remote end
 // Remark
 //  The IP address of the near end may change dynamically
-bool LOCALAPI CSocketItemEx::Emit(ControlBlock::PFSP_SocketBuf skb, ControlBlock::seq_t seq)
+bool CSocketItemEx::EmitStart()
 {
+	ControlBlock::PFSP_SocketBuf skb = pControlBlock->GetFirstBufferedSend();
 	void  *payload = (FSP_NormalPacketHeader *)this->GetSendPtr(skb);
 	if(payload == NULL)
 	{
@@ -300,47 +302,26 @@ bool LOCALAPI CSocketItemEx::Emit(ControlBlock::PFSP_SocketBuf skb, ControlBlock
 	int result;
 	switch (skb->opCode)
 	{
-	case ACK_CONNECT_REQUEST:
+	case ACK_CONNECT_REQ:
 		pControlBlock->SetSequenceFlags(pHdr);
-		pHdr->integrity.code = htonll(NowUTC());
+		pHdr->integrity.code = htonll(tRecentSend);
+
 		CLowerInterface::Singleton()->EnumEffectiveAddresses(pControlBlock->u.connectParams.allowedPrefixes);
-		memcpy((BYTE *)payload + sizeof(FSP_AckConnectKey)
-			, pControlBlock->u.connectParams.allowedPrefixes
-			, sizeof(UINT64) * MAX_PHY_INTERFACES);
-		pHdr->hs.Set<FSP_AckConnectRequest, ACK_CONNECT_REQUEST>();
+		memcpy((BYTE *)payload, pControlBlock->u.connectParams.allowedPrefixes, sizeof(UINT64) * MAX_PHY_INTERFACES);
+
+		pHdr->hs.Set<FSP_AckConnectRequest, ACK_CONNECT_REQ>();
 		//
 		result = SendPacket(2, ScatteredSendBuffers(pHdr, sizeof(FSP_NormalPacketHeader), payload, skb->len));
 		break;
-	case MULTIPLY:	// MULTIPLY is an out-of-band control packet that try to incarnate an new clone of the connection
-	case RESTORE:	// RESTORE is an in-band control packet that try re-established a broken/paused connection
-		tRoundTrip_us = CONNECT_INITIATION_TIMEOUT_ms << 2;	// So to tweak InitiateKeepAlive()
 	case PERSIST:	// PERSIST is an in-band control packet with optional payload that confirms a connection
-		InitiateKeepAlive();
-	case ADJOURN:	// ADJOURN is always in the queue
-	case PURE_DATA:
-		// ICC, if required, is always set just before being sent
-		if (skb->GetFlag<TO_BE_CONTINUED>() && skb->len != MAX_BLOCK_SIZE)
-		{
-			// TODO: debug log failure of segmented and/or online-compressed send
-#ifdef 	TRACE
-			printf_s("\nImcomplete packet to send, opCode: %s(%d, len = %d)\n"
-				, opCodeStrings[skb->opCode]
-				, skb->opCode
-				, skb->len);
-#endif
-			return 0;
-		}
-		// Which is the norm. Dynanically generate the fixed header.
-		pControlBlock->SetSequenceFlags(pHdr, skb, seq);
-		pHdr->hs.opCode = skb->opCode;
-		pHdr->hs.version = THIS_FSP_VERSION;
-		pHdr->hs.hsp = htons(sizeof(FSP_NormalPacketHeader));
-		// Only when the first acknowledgement is received may the faster Keep-Alive timer started. See also OnGetFullICC()
-		SetIntegrityCheckCode(*pHdr);
-		if (skb->len > 0)
-			result = SendPacket(2, ScatteredSendBuffers(pHdr, sizeof(FSP_NormalPacketHeader), payload, skb->len));
-		else
-			result = SendPacket(1, ScatteredSendBuffers(pHdr, sizeof(FSP_NormalPacketHeader)));
+		if(! skb->GetFlag<TO_BE_CONTINUED>())	// which mean it has not been chained with sending
+			skb->SetFlag<IS_COMPLETED>();
+		if(InState(COMMITTING))
+			skb->opCode = COMMIT;
+	case RESUME:	// RESUME is an in-band control packet that try re-established a broken/paused connection
+	case COMMIT:	// COMMIT is always in the queue
+	case MULTIPLY:
+		result = EmitWithICC(skb, pControlBlock->GetSendWindowFirstSN());
 		break;
 	// Only possible for retransmission
 	case INIT_CONNECT:
@@ -348,20 +329,71 @@ bool LOCALAPI CSocketItemEx::Emit(ControlBlock::PFSP_SocketBuf skb, ControlBlock
 		// Header has been included in the payload. See also InitiateConnect() and AffirmConnect()
 		result = SendPacket(1, ScatteredSendBuffers(payload, skb->len));
 		break;
+	// case PURE_DATA:
+		// it cannot be the first packet to send on connection established/resumed,
+		// nor can it be retransmitted separately
 	default:
 		TRACE_HERE("Unexpected socket buffer block");
 		result = 1;	// return false;	// unrecognized packet type is simply ignored ?
 	}
 
-	tRecentSend = NowUTC();
-//#ifdef TRACE
-//	printf_s("Session#%u emit %s, sequence = %u, result = %d, time : 0x%016llX\n"
-//		, pairSessionID.source
-//		, opCodeStrings[skb->opCode], seq, result, tRecentSend);
-//#endif
+#ifdef TRACE_SOCKET
+	printf_s("Session#%u emit %s, result = %d, time : 0x%016llX\n"
+		, fidPair.source, opCodeStrings[skb->opCode], result, tRecentSend);
+#endif
 	return (result > 0);
 }
 
+
+// Do
+//	Transmit a packet to the remote end, enforcing secure mobility support
+// Remark
+//  The IP address of the near end may change dynamically
+bool LOCALAPI CSocketItemEx::EmitWithICC(ControlBlock::PFSP_SocketBuf skb, ControlBlock::seq_t seq)
+{
+	// UNRESOLVED! retransmission consume key life? of course?
+	if(--keyLife <= 0)
+	{
+		TRACE_HERE("Session key run out of life");
+		return false;
+	}
+
+	void  *payload = (FSP_NormalPacketHeader *)this->GetSendPtr(skb);
+	if(payload == NULL)
+	{
+		TRACE_HERE("TODO: debug log memory corruption error");
+		HandleMemoryCorruption();
+		return false;
+	}
+
+	register FSP_NormalPacketHeader * const pHdr = & pControlBlock->tmpHeader;
+	int result;
+	// ICC, if required, is always set just before being sent
+	if (skb->GetFlag<TO_BE_CONTINUED>() && skb->len != MAX_BLOCK_SIZE)
+	{
+		// TODO: debug log failure of segmented and/or online-compressed send
+#ifdef 	TRACE
+		printf_s("\nImcomplete packet to send, opCode: %s(%d, len = %d)\n"
+			, opCodeStrings[skb->opCode]
+			, skb->opCode
+			, skb->len);
+#endif
+		return false;
+	}
+	// Which is the norm. Dynanically generate the fixed header.
+	pControlBlock->SetSequenceFlags(pHdr, skb, seq);
+	pHdr->hs.opCode = skb->opCode;
+	pHdr->hs.version = THIS_FSP_VERSION;
+	pHdr->hs.hsp = htons(sizeof(FSP_NormalPacketHeader));
+	// Only when the first acknowledgement is received may the faster Keep-Alive timer started. See also OnGetFullICC()
+	SetIntegrityCheckCode(*pHdr);
+	if (skb->len > 0)
+		result = SendPacket(2, ScatteredSendBuffers(pHdr, sizeof(FSP_NormalPacketHeader), payload, skb->len));
+	else
+		result = SendPacket(1, ScatteredSendBuffers(pHdr, sizeof(FSP_NormalPacketHeader)));
+
+	return (result > 0);
+}
 
 
 // Remark
@@ -369,8 +401,8 @@ bool LOCALAPI CSocketItemEx::Emit(ControlBlock::PFSP_SocketBuf skb, ControlBlock
 bool CSocketItemEx::ValidateICC(FSP_NormalPacketHeader *pkt)
 {
 	UINT64	savedICC = pkt->integrity.code;
-	pkt->integrity.id.source = pairSessionID.peer;
-	pkt->integrity.id.peer = pairSessionID.source;
+	pkt->integrity.id.source = fidPair.peer;
+	pkt->integrity.id.peer = fidPair.source;
 	SetIntegrityCheckCodeP1(pkt);
 	if(pkt->integrity.code != savedICC)
 		return false;
@@ -383,6 +415,18 @@ bool CSocketItemEx::ValidateICC(FSP_NormalPacketHeader *pkt)
 	//{
 	//}
 	//addrFrom.si_family = 0;	// AF_UNSPEC;	// as the flag
+	sockAddrTo[0] = sockAddrTo[MAX_PHY_INTERFACES];
+	return true;
+}
+
+
+
+bool LOCALAPI CSocketItemEx::HandleMobileParam(PFSP_HeaderSignature optHdr)
+{
+	if (optHdr == NULL || optHdr->opCode != MOBILE_PARAM)
+		return false;
+	//TODO: synchronization of ULA-triggered session key installation
+	// the synchronization option header...
 	return true;
 }
 
@@ -393,84 +437,73 @@ bool CSocketItemEx::ValidateICC(FSP_NormalPacketHeader *pkt)
 // To make life easier assume it has gain unique access to the LLS socket
 // See also HandleEmitQ, HandleFullICC
 // TODO: rate-control/quota control
+// To be checked: atomicity of sendWindowFirstSN and sendWindowHeadPos...
 void ControlBlock::EmitQ(CSocketItem *context)
 {
-	int nAllowedToSend = int(sendWindowFirstSN + sendWindowSize - sendWindowNextSN);
-	int nAvailable = int(sendBufferNextSN - sendWindowNextSN);
-	int n = min(nAvailable, nAllowedToSend);
-	if (n <= 0)
-		return;
-
-	PFSP_SocketBuf skb;
-	while (CheckSendWindowLimit() && (skb = PeekNextToSend()) != NULL)
+	while (int(sendWindowNextSN - sendBufferNextSN) < 0
+		&& CheckSendWindowLimit( ((CSocketItemEx *)context)->GetCongestWindow()) )
 	{
+		register int d = int(sendWindowNextSN - sendWindowFirstSN);
+		if (d < 0)
+			break;
+		d += sendWindowHeadPos;
+		//
+		register PFSP_SocketBuf skb = HeadSend() + (d - sendBufferBlockN >= 0 ? d - sendBufferBlockN : d);
+		// The flag IS_COMPLETED is for double-stage commit of send buffer, for sake of sending online compressed stream
 		if (!skb->GetFlag<IS_COMPLETED>())
 		{
-			TRACE_HERE("the last packet might not be ready, say, "
-				"during process of sending real-time encrypted long stream");
+#ifdef TRACE
+			printf_s("The packet SN#%u is not ready to send; buffered next SN#%u\n", sendWindowNextSN, sendBufferNextSN);
+#endif
 			break;
 		}
-		if (!skb->MarkInSending())
+		if (!skb->Lock())
 		{
 #ifdef TRACE
-			printf_s("Cannot gain exclusive sending lock on the packet to send."
-				" it might be piggybacked already on KEEP_ALIVE\n");
+			printf_s("Should be rare: cannot get the exclusive lock on the packet to send SN#%u\n", sendWindowNextSN);
 #endif
+			++sendWindowNextSN;
 			continue;
 		}
+
 		if (!CSocketItemEx::Emit((CSocketItemEx *)context, skb, sendWindowNextSN))
 		{
-			skb->MarkUnsent();
+			skb->Unlock();
 			break;
 		}
 		//
-		if (sendWindowNextSN == sendWindowFirstSN)
+		if (sendWindowNextSN++ == sendWindowFirstSN) // note that the side-effect is a requirement
 			((CSocketItemEx *)context)->SetEarliestSendTime();
-		//
-		++sendWindowNextSN;
 	}
-	// UNRESOLVED! TODO: to cancel PAUSING the caller of DLL should make it explicitly! 
-	if (state == PAUSING && CountSendBuffered() < sendBufferBlockN)
-	{
-		skb = GetLastBufferedSend();
-		if (skb == NULL || skb->opCode != PURE_DATA && skb->opCode != PERSIST && skb->opCode != ADJOURN)
-		{
-			TRACE_HERE("No packet to piggyback the ADJOURN command, allocate new");
-			skb = GetSendBuf();
-			if (skb == NULL)
-			{
-				TRACE_HERE("no space for the new ADJOURN command!\n"
-					"how on earth could it happen? ill-behaviored ULA or LLS?");
-				return;
-			}
-			skb->len = 0;
-		}
-		else if (skb->opCode != ADJOURN && !skb->MarkInSending())
-		{
-#ifdef TRACE
-			printf_s("\nThe last packet is being sent, cannot piggyback the ADJOURN command, allocate new\n");
-#endif
-			skb = GetSendBuf();
-			if (skb == NULL)
-			{
-				TRACE_HERE("Pausing of the session with a crowded send buffer was canceled illegally?");
-				return;
-			}
-			skb->len = 0;
-		}
-		// else it is a piggybackable PURE_DATA or KEEP_ALIVE that has been MarkInSnding
-		skb->opCode = ADJOURN;
-		skb->MarkUnsent();
-		skb->SetFlag<IS_COMPLETED>();
-		skb->SetFlag<TO_BE_CONTINUED>(false);
-		// it is assumed that ULA has finished compression before it called Adjourn
+}
 
-		// here we assume that in the PAUSING state DLL would refuse to accept further data from ULA
-		if(CheckSendWindowLimit()
-		&& skb->MarkInSending()
-		&& !CSocketItemEx::Emit((CSocketItemEx *)context, skb, sendBufferNextSN - 1))
+
+
+//
+ControlBlock::PFSP_SocketBuf ControlBlock::PeekAnteCommit() const
+{
+	register seq_t seq = sendWindowNextSN;
+	register int d = int(seq - sendWindowFirstSN);
+	register PFSP_SocketBuf skb;
+	if (d < 0)
+		return NULL;
+
+	while (int(seq - sendBufferNextSN) < 0)
+	{
+		d += sendWindowHeadPos;
+		//
+		skb = HeadSend() + (d - sendBufferBlockN >= 0 ? d - sendBufferBlockN : d);
+		if(skb->opCode == COMMIT)
 		{
-			skb->MarkUnsent();
+			if(seq + 1 - sendBufferNextSN >= 0)
+				return NULL;
+			d++;
+			return HeadSend() + (d - sendBufferBlockN >= 0 ? d - sendBufferBlockN : d);
 		}
+
+		seq++;
+		d = int(seq - sendWindowFirstSN);
 	}
+	//
+	return NULL;
 }

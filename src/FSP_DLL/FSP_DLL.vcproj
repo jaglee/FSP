@@ -203,22 +203,6 @@
 				>
 			</File>
 			<File
-				RelativePath="..\KeccakReferenceAndOptimized\Sources\KeccakDuplex.c"
-				>
-			</File>
-			<File
-				RelativePath="..\KeccakReferenceAndOptimized\Sources\KeccakF-1600-opt32.c"
-				>
-			</File>
-			<File
-				RelativePath="..\KeccakReferenceAndOptimized\Sources\KeccakNISTInterface.c"
-				>
-			</File>
-			<File
-				RelativePath="..\KeccakReferenceAndOptimized\Sources\KeccakSponge.c"
-				>
-			</File>
-			<File
 				RelativePath=".\minilzo.c"
 				>
 			</File>
@@ -239,19 +223,7 @@
 				>
 			</File>
 			<File
-				RelativePath=".\rsa-gmp.cpp"
-				>
-			</File>
-			<File
-				RelativePath=".\rsassa-pss.cpp"
-				>
-			</File>
-			<File
 				RelativePath=".\Send.cpp"
-				>
-			</File>
-			<File
-				RelativePath="..\vmac.c"
 				>
 			</File>
 		</Filter>
@@ -278,22 +250,6 @@
 			</File>
 			<File
 				RelativePath="..\gcm-aes.h"
-				>
-			</File>
-			<File
-				RelativePath="..\KeccakReferenceAndOptimized\Sources\KeccakDuplex.h"
-				>
-			</File>
-			<File
-				RelativePath="..\KeccakReferenceAndOptimized\Sources\KeccakF-1600-opt32-settings.h"
-				>
-			</File>
-			<File
-				RelativePath="..\KeccakReferenceAndOptimized\Sources\KeccakNISTInterface.h"
-				>
-			</File>
-			<File
-				RelativePath="..\KeccakReferenceAndOptimized\Sources\KeccakSponge.h"
 				>
 			</File>
 			<File

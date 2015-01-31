@@ -17,15 +17,19 @@ static int		fd;
 
 static void FSPAPI onReturn(FSPHANDLE h, FSP_ServiceCode code, int value)
 {
-	printf_s("Notify 0x%08X service code = %d, returned %d\n", h, code, value);
+	printf_s("Notify 0x%08X service code = %d, returned %d\n", (uint32_t)(intptr_t)h, code, value);
 	if(value < 0)
 	{
 		Dispose(h);
 		finished = true;
+		return;
 	}
-	else if(code == FSP_NotifyReset || code == FSP_NotifyRecycled)
+	if(code == FSP_NotifyFinish || code == FSP_NotifyRecycled)
 	{
+		printf_s("Session was shut down.\n");
+		Dispose(h);
 		finished = true;
+		return;
 	}
 }
 
@@ -33,7 +37,7 @@ static void FSPAPI onReturn(FSPHANDLE h, FSP_ServiceCode code, int value)
 
 static int	FSPAPI onAccepted(FSPHANDLE h, PFSP_Context);
 static void FSPAPI onFileNameSent(FSPHANDLE, FSP_ServiceCode, int);
-static int	FSPAPI toSendNextBlock(FSPHANDLE, void *, int);
+static int	FSPAPI toSendNextBlock(FSPHANDLE, void *, int32_t);
 
 /**
  *
@@ -82,7 +86,7 @@ int main(int argc, char * argv[])
 	memset(& params, 0, sizeof(params));
 	params.beforeAccept = NULL;
 	params.afterAccept = onAccepted;
-	params.callback = onReturn;
+	params.onError = onReturn;
 	params.welcome = defaultWelcome;
 	params.len = (unsigned short)strlen(defaultWelcome) + 1;
 	params.sendSize = MAX_FSP_SHM_SIZE;
@@ -149,7 +153,7 @@ static void FSPAPI onFileNameSent(FSPHANDLE h, FSP_ServiceCode c, int r)
 
 
 
-static int FSPAPI toSendNextBlock(FSPHANDLE h, void * batchBuffer, int capacity)
+static int FSPAPI toSendNextBlock(FSPHANDLE h, void * batchBuffer, int32_t capacity)
 {
 	if(capacity <= 0)
 	{

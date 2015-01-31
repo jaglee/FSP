@@ -33,59 +33,6 @@
  */
 
 // The FSP Finite State Machine is splitted across command.cpp, remote.cpp and timers.cpp
-//	LISTENING
-//	|--...-->[API{Callback}{new context}]
-//      |-->[{return}Accept]-->...
-//      |-->[{return}Reject]-->...
-//	CONNECT_BOOTSTRAP
-//	|--[Rcv: RESET]-->NON_EXISTENT-->[Notify]
-//	|--[Transient State timeout]-->NON_EXISTENT-->[Notify]
-//	CHALLENGING
-//	|--...-->[API{Callback}]
-//      |-->[{Return}Accept]-->...
-//      |-->[{Return}Reject]-->...
-//	|--[Transient State timeout]-->NON_EXISTENT-->[Notify]
-//	CONNECT_AFFIRMING
-//	|--[Rcv: ACK_CONNECT_REQUEST]-->[Notify]-->[Snd PERSIST]-->ACTIVE
-//	|--[Rcv: RESET]-->[Notify]-->NON_EXISTENT
-//	|--[Transient State timeout]-->NON_EXISTENT-->[Notify]
-//	ACTIVE[a.k.a.ESTABLISHED]
-//	|--[Rcv: ADJOURN && {receive buffer has no gap}]-->[CLOSABLE]-->[Notify]
-//	|--[Rcv: MULTIPLY]-->[API{Callback}{new context}]
-//     |-->[{Return}:Accept]-->...
-//     |-->[{Return}:Commit]-->...
-//     |-->[{Return}:Reject]-->...
-//	|--[Rcv: RESET]-->NON_EXISTENT-->[Notify]
-//	|--[Idle timeout]-->NON_EXISTENT-->[Notify]
-//	CLONING
-//	|--[Rcv: PERSIST]-->[Notify]-->ACTIVE
-//	|--[Rcv: ADJOURN]-->[Snd ACK_FLUSH]-->CLOSABLE-->[Notify]
-//	|--[Rcv: RESET]-->NON_EXISTENT-->[Notify]
-//	|--[Transient State timeout]-->NON_EXISTENT-->[Notify]
-//	PAUSING
-//	|--[Rcv: ACK_FLUSH]-->CLOSABLE-->[Notify]
-//	|--[Rcv: ADJOURN]-->[Snd ACK_FLUSH]-->CLOSABLE-->[Notify]
-//	|--[Rcv: FINISH]-->CLOSED-->[Notify]
-//	|--[Rcv: RESET]-->NON_EXISTENT-->[Notify]
-//	|--[Idle timeout]-->NON_EXISTENT-->[Notify]
-//	CLOSABLE
-//	|--[Rcv: RESTORE]-->[API{callback}]-->(ACTIVE | NON_EXISTENT)
-//	|--[Rcv: FINISH]-->CLOSED-->[Notify]
-//	|--[Rcv: RESET]-->[Notify]-->NON_EXISTENT
-//	|--[Session key life timeout]-->[Notify]-->NON_EXISTENT
-// 	RESUMING
-//	|--[Rcv: PERSIST && RESTORE acknowledged]-->ACTIVE-->[Notify]
-//	|--[Rcv: ADJOURN]-->[Snd ACK_FLUSH]-->CLOSABLE-->[Notify]
-//	|--[Rcv: RESET]-->NON_EXISTENT-->[Notify]
-//	|--[Transient State timeout]-->NON_EXISTENT-->[Notify]
-//	CLOSED
-//	|--[Rcv: RESTORE && RDSC hit]-->[API{callback}]
-//      |-->[{Return}:Accept]-->...
-//      |-->[{Return}:Reject]-->...
-// 	QUASI_ACTIVE
-//	|--[Rcv: DATA/PERSIST]-->ACTIVE-->[Notify]
-//	|--[Rcv: RESET]-->NON_EXISTENT-->[Notify]
-//	|--[Transient State timeout]-->CLOSED-->[Notify]
 
 #include "fsp_srv.h"
 
@@ -259,8 +206,8 @@ static void LOCALAPI ProcessCommand(HANDLE md)
 		{
 		case FSP_Listen:		// register a passive socket
 #ifdef TRACE
-			printf_s("Requested to listen on local session %d, assigned event trigger is %s\n"
-				, pCmd->idSession
+			printf_s("Requested to listen on local fiber#%d, assigned event trigger is %s\n"
+				, pCmd->fiberID
 				, ((CommandNewSession *)pCmd)->szEventName);
 #endif
 			Listen(CommandNewSessionSrv(pCmd));
@@ -272,35 +219,43 @@ static void LOCALAPI ProcessCommand(HANDLE md)
 			SyncSession(CommandNewSessionSrv(pCmd));
 			break;
 		default:
-			pSocket = (CSocketItemEx *)(*CLowerInterface::Singleton())[pCmd->idSession];
+			pSocket = (CSocketItemEx *)(*CLowerInterface::Singleton())[pCmd->fiberID];
 			if(pSocket == NULL || ! pSocket->IsInUse())
 			{
 #ifdef TRACE
-				printf_s("%s (code = %d) called for session #%u\n"
+				printf_s("%s (code = %d) called for local fiber#%u\n"
 					, opCodeStrings[pCmd->opCode]
 					, pCmd->opCode
-					, pCmd->idSession);
+					, pCmd->fiberID);
 #endif
 				break;
 			}
 			//
 			switch(pCmd->opCode)
 			{
-			case FSP_Dispose:
-				pSocket->CloseSocket();
-				break;
 			case FSP_Reject:
 				pSocket->Disconnect();
 				break;
+			case FSP_Recycle:
+				pSocket->CloseSocket();
+				break;
+			case FSP_Start:
+				pSocket->Start();
+				break;
 			case FSP_Send:			// send a packet/group of packets
-				pSocket->Send();
+				pSocket->ScheduleEmitQ();
+				break;
+			case FSP_Urge:
+				pSocket->UrgeCommit();
+				break;
+			case FSP_Resume:
+				pSocket->Resume();
 				break;
 			case FSP_Shutdown:
 				pSocket->Shutdown();
 				break;
 			default:
 	#ifndef NDEUBG
-		// TODO: UNRESOLVED! Crash Recovery? if ReadFile fails, it is a crash
 				printf("Internal error: undefined upper layer application command code %d\n", pCmd->opCode);
 	#endif
 				break;

@@ -137,7 +137,7 @@ CLowerInterface::CLowerInterface()
 #endif
 
 	LearnAddresses();
-	PoolingALT_IDs();
+	PoolingALFIDs();
 
 	if((r = GetPointerOfWSARecvMsg(sdSend)) != 0)
 	{
@@ -349,8 +349,9 @@ inline void CLowerInterface::LearnAddresses()
 }
 
 
-//
-inline void CLowerInterface::SetLocalApplicationLayerThreadID(ALT_ID_T id)
+
+// UNRESOLVED!? To be tested: for user-mode IPv6, configure contemporary IPv6 address for EVERY unicast interface
+inline void CLowerInterface::SetLocalApplicationLayerFiberID(ALFID_T id)
 {
 	MIB_UNICASTIPADDRESS_ROW	row;
 	int r;
@@ -360,8 +361,8 @@ inline void CLowerInterface::SetLocalApplicationLayerThreadID(ALT_ID_T id)
 	{
 		InitializeUnicastIpAddressEntry(&row);
 
-		// ALT_IDs are processed 'as is'
-		*(ALT_ID_T *)&(addresses[i].sin6_addr.u.Byte[12]) = id;
+		// ALFIDs are processed 'as is'
+		*(ALFID_T *)&(addresses[i].sin6_addr.u.Byte[12]) = id;
 		row.InterfaceIndex = interfaces[i];
 		row.Address.Ipv6 = addresses[i];
 
@@ -372,11 +373,12 @@ inline void CLowerInterface::SetLocalApplicationLayerThreadID(ALT_ID_T id)
 	}
 }
 
-// TODO: for user-mode IPv6, configure contemporary IPv6 address for EVERY unicast interface
-inline void CLowerInterface::PoolingALT_IDs()
+
+
+inline void CLowerInterface::PoolingALFIDs()
 {
 	register int k;
-	ALT_ID_T id;
+	ALFID_T id;
 	//
 	// refuse to continue if the random number generator doesn't work
 	for (register int i = 0; i < MAX_CONNECTION_NUM; i++)
@@ -386,11 +388,11 @@ inline void CLowerInterface::PoolingALT_IDs()
 		{
 			rand_w32(&id, 1);
 			k = id & (MAX_CONNECTION_NUM - 1);
-		} while (id <= LAST_WELL_KNOWN_ALT_ID || poolSessionID[k]->pairSessionID.source != 0);
+		} while (id <= LAST_WELL_KNOWN_ALFID || poolFiberID[k]->fidPair.source != 0);
 		// for every valid interface, pre-configure the id
-		SetLocalApplicationLayerThreadID(id);
+		SetLocalApplicationLayerFiberID(id);
 		//
-		poolSessionID[k]->pairSessionID.source = id;
+		poolFiberID[k]->fidPair.source = id;
 	}
 }
 
@@ -516,10 +518,10 @@ inline void CLowerInterface::LearnAddresses()
 	nAddress = k + 1;
 }
 
-inline void CLowerInterface::PoolingALT_IDs()
+inline void CLowerInterface::PoolingALFIDs()
 {
 	register int k;
-	ALT_ID_T id;
+	ALFID_T id;
 	//
 	// refuse to continue if the random number generator doesn't work
 	for (register int i = 0; i < MAX_CONNECTION_NUM; i++)
@@ -529,9 +531,9 @@ inline void CLowerInterface::PoolingALT_IDs()
 		{
 			rand_w32(&id, 1);
 			k = id & (MAX_CONNECTION_NUM - 1);
-		} while (id <= LAST_WELL_KNOWN_ALT_ID || poolSessionID[k]->pairSessionID.source != 0);
+		} while (id <= LAST_WELL_KNOWN_ALFID || poolFiberID[k]->fidPair.source != 0);
 		//
-		poolSessionID[k]->pairSessionID.source = id;
+		poolFiberID[k]->fidPair.source = id;
 	}
 }
 #endif
@@ -695,7 +697,7 @@ int CLowerInterface::AcceptAndProcess()
 	printf_s("Near sink:\n");
 	DumpNetworkUInt16((UINT16 *)&nearInfo.u, sizeof(nearInfo.u) / 2);
 #endif
-	int lenPrefix = nearInfo.IsIPv6() ? 0 : sizeof(PairSessionID);
+	int lenPrefix = nearInfo.IsIPv6() ? 0 : sizeof(PairALFID );
 	CSocketItemEx *pSocket = NULL;
 	PktSignature *pSignature;
 	switch(opCode)
@@ -709,13 +711,14 @@ int CLowerInterface::AcceptAndProcess()
 	case CONNECT_REQUEST:
 		OnGetConnectRequest();
 		break;
-	case ACK_CONNECT_REQUEST:	// connect request acknowledged
+	case ACK_CONNECT_REQ:	// connect request acknowledged
 		pSocket = MapSocket();
 		if(pSocket == NULL)
 			break;
 		//
-		if(! pSocket->IsInUse())
+		if(! pSocket->TestAndLockReady())
 		{
+			TRACE_HERE("lost ACK_CONNECT_REQ due to lack of locks");
 			pSocket = NULL;	// FreeBuffer(pktBuf);
 			break;
 		}
@@ -728,20 +731,19 @@ int CLowerInterface::AcceptAndProcess()
 		OnGetResetSignal();
 		break;
 	// TODO: get hint of explicit congest notification
-	// TODO: automatically register remote address as the favorable contact address (?)
 	case PERSIST:
 	case PURE_DATA:
-	case ADJOURN:
+	case COMMIT:
 	case ACK_FLUSH:
-	case RESTORE:
-	case FINISH:
+	case RESUME:
+	case RELEASE:
 	case MULTIPLY:
 	case KEEP_ALIVE:
 		pSocket = MapSocket();
 		if(pSocket == NULL)
 		{
 #ifdef TRACE
-			printf_s("Cannot map socket for session#%u\n", GetLocalSessionID());
+			printf_s("Cannot map socket for local fiber#%u\n", GetLocalFiberID());
 #endif
 			break;
 		}
@@ -759,8 +761,8 @@ int CLowerInterface::AcceptAndProcess()
 			pSocket = NULL;	// FreeBuffer(pktBuf);
 			break;
 		}
-		// UNRESOLVED! TODO: take use of allowedPrefixes to select preferred addrFrom in asymmentric network context
-		pSocket->sockAddrTo[0] = addrFrom;
+		// save the source address temporarily as it is not necessariy legitimate
+		pSocket->sockAddrTo[MAX_PHY_INTERFACES] = addrFrom;
 #ifdef TRACE_PACKET
 		printf_s("Socket : 0x%08X , buffer : 0x%08X queued\n", (LONG)pSocket, (LONG)pSignature->pkt);
 #endif
@@ -793,7 +795,7 @@ int CLowerInterface::AcceptAndProcess()
 int LOCALAPI CLowerInterface::SendBack(char * buf, int len)
 {
 	// the final WSAMSG structure
-	PairSessionID sidPair;
+	PairALFID fidPair;
 	WSABUF wsaData[2];
 	IPv6_HEADER hdrIN6;
 
@@ -807,12 +809,12 @@ int LOCALAPI CLowerInterface::SendBack(char * buf, int len)
 	}
 	else
 	{
-		// Store the local(near end) session ID as the source, the remote end session ID as
-		// the destination session ID in the given session ID association
-		sidPair.peer = HeaderFSPoverUDP().source;
-		sidPair.source = HeaderFSPoverUDP().peer;
-		wsaData[0].buf = (char *)& sidPair;
-		wsaData[0].len = sizeof(PairSessionID);
+		// Store the local(near end) fiber ID as the source, the remote end fiber ID as
+		// the destination fiber ID in the given fiber ID association
+		fidPair.peer = HeaderFSPoverUDP().source;
+		fidPair.source = HeaderFSPoverUDP().peer;
+		wsaData[0].buf = (char *)& fidPair;
+		wsaData[0].len = sizeof(fidPair);
 	}
 	//
 #ifdef TRACE
@@ -889,7 +891,7 @@ void TraceLastError(char * fileName, int lineNo, char *funcName, char *s1)
  */
 
 // Return the number of microseconds elapsed since Jan 1, 1970 UTC (unix epoch)
-extern "C" timestamp_t NowUTC()
+timestamp_t NowUTC()
 {
 	// return the number of 100-nanosecond intervals since January 1, 1601 (UTC), in host byte order
 	FILETIME systemTime;
@@ -931,7 +933,7 @@ bool IsProcessAlive(DWORD idProcess)
 //	Exploit rand_s() to get a string of specified number near-real random 32-bit words 
 // Remark
 //	Hard-coded: at most generate 256 bits
-extern "C" void rand_w32(uint32_t *p, int n)
+void rand_w32(uint32_t *p, int n)
 {
 	for (register int i = 0; i < min(n, 32); i++)
 	{
@@ -1000,32 +1002,32 @@ TimerWheel::~TimerWheel()
 
 bool CSocketItemEx::AddTimer()
 {
-	if(::CreateTimerQueueTimer(& timer, TimerWheel::Singleton()
+	return (
+		::CreateTimerQueueTimer(& timer, TimerWheel::Singleton()
 			, TimeOut	// WAITORTIMERCALLBACK
 			, this		// LPParameter
 			, tKeepAlive_ms
 			, tKeepAlive_ms
 			, WT_EXECUTEINTIMERTHREAD
-			) )
-	{
-		clockCheckPoint.tMigrate = NowUTC();
-		return true;
-	}
-	else
-	{
-		return false;
-	}
+			) != FALSE
+		);
 }
 
 
 
-void CSocketItemEx::ChangeKeepAliveClock()
+// Remark
+//	Timestamp arithmetic is rendered in the Galois feild
+//	clockCheckPoint and tLastRecv must be well defined
+void CSocketItemEx::EarlierKeepAlive()
 {
-	timestamp_t t1 = NowUTC();
-	if(clockCheckPoint.tKeepAlive - t1 < tRoundTrip_us)
+//#ifdef TRACE
+//	TRACE_HERE("keep alive earlier");
+//	DumpTimerInfo(tLastRecv);
+//#endif
+	if (clockCheckPoint.tKeepAlive - tLastRecv < tRoundTrip_us)
 		return;
 	//
-	clockCheckPoint.tKeepAlive = t1 + tRoundTrip_us;
+	clockCheckPoint.tKeepAlive = tLastRecv + tRoundTrip_us;
 	::ChangeTimerQueueTimer(TimerWheel::Singleton(), timer, tRoundTrip_us / 1000, tKeepAlive_ms);
 }
 
@@ -1047,6 +1049,10 @@ bool CSocketItemEx::RemoveTimer()
 
 
 
+// Given
+//	uint32_t		number of millisecond delayed to trigger the timer
+// Return
+//	true if the timer was set, false if it failed.
 bool LOCALAPI CSocketItemEx::ReplaceTimer(uint32_t period)
 {
 	clockCheckPoint.tKeepAlive = NowUTC() + period * 1000;
@@ -1075,7 +1081,7 @@ void CSocketItemEx::ScheduleEmitQ()
 void CSocketItemEx::ScheduleConnect(CommandNewSessionSrv *pCmd)
 {
 	// TODO: RDSC management
-	// Send RESTORE when RDSC hit
+	// Send RESUME when RDSC hit
 	pCmd->pSocket = this;
 	QueueUserWorkItem(HandleConnect, pCmd, WT_EXECUTELONGFUNCTION);
 }
@@ -1111,8 +1117,9 @@ PktSignature * CSocketItemEx::PushPacketBuffer(PktSignature *pNext)
 
 
 
+// only if there is some packet in the queue would it be locked
 inline
-void CSocketItemEx::PopPacketBuffer()
+FSP_NormalPacketHeader * CSocketItemEx::PeekLockPacketBuffer()
 {
 	while(_InterlockedCompareExchange8(& mutex
 		, SHARED_BUSY
@@ -1122,8 +1129,32 @@ void CSocketItemEx::PopPacketBuffer()
 		Sleep(0);	// just yield out the CPU time slice
 	}
 
+	if(headPacket == NULL)
+	{
+		// assert(tailPacket == NULL);
+		mutex = SHARED_FREE;
+		return NULL;
+	}
+
+	return headPacket->pkt;
+}
+
+
+
+// assume mutex is busy
+inline
+void CSocketItemEx::PopUnlockPacketBuffer()
+{
+	if(headPacket == NULL)
+	{
+		// assert(tailPacket == NULL);
+		mutex = SHARED_FREE;
+		return;
+	}
+
 	PktSignature *p = headPacket->next;	// MUST put before FreeBuffer or else it may be overwritten
 	CLowerInterface::Singleton()->FreeBuffer((BYTE *)headPacket + sizeof(PktSignature));
+
 	if((headPacket = p) == NULL)
 		tailPacket = NULL;
 
@@ -1137,9 +1168,6 @@ DWORD WINAPI HandleSendQ(LPVOID p)
 	try
 	{
 		CSocketItemEx *p0 = (CSocketItemEx *)p;
-#ifdef TRACE_PACKET
-		printf_s("0x%08X : before HandleSendQ TestAndWaitReady\n", (LONG)p0);
-#endif
 		if(! p0->TestAndWaitReady())
 		{
 			//// UNRESOLVED! How to forceful reset the session if it is locked...
@@ -1147,9 +1175,6 @@ DWORD WINAPI HandleSendQ(LPVOID p)
 			//	CLowerInterface::Singleton()->FreeItem(p0);
 			return 0;
 		}
-#ifdef TRACE_PACKET
-		printf_s("0x%08X : after HandleSendQ TestAndWaitReady\n", (LONG)p0);
-#endif
 		p0->EmitQ();
 		p0->SetReady();
 
@@ -1168,24 +1193,20 @@ DWORD WINAPI HandleFullICC(LPVOID p)
 	try
 	{
 		CSocketItemEx *p0 = (CSocketItemEx *)p;
-		while(p0->headPacket)
+		FSP_NormalPacketHeader *hdr;
+		while(hdr = p0->PeekLockPacketBuffer())
 		{
-#ifdef TRACE_PACKET
-			printf_s("0x%08X : before HandleFullICC TestAndWaitReady\n", (LONG)p0);
-#endif
 			if(! p0->TestAndWaitReady())
 			{
 				//// UNRESOLVED! How to forceful reset the session if it is locked...
 				//if(p0->IsInUse())
 				//	CLowerInterface::Singleton()->FreeItem(p0);
+				p0->UnlockPacketBuffer();
 				return 0;
 			}
-#ifdef TRACE_PACKET
-			printf_s("0x%08X : after HandleFullICC TestAndWaitReady\n", (LONG)p0);
-#endif
 			// synchronize the state in the 'cache' and the real state
 			p0->lowState = p0->pControlBlock->state;
-			switch(p0->headPacket->pkt->hs.opCode)
+			switch(hdr->hs.opCode)
 			{
 			case PERSIST:
 				p0->OnGetPersist();
@@ -1193,17 +1214,17 @@ DWORD WINAPI HandleFullICC(LPVOID p)
 			case PURE_DATA:
 				p0->OnGetPureData();
 				break;
-			case ADJOURN:
-				p0->OnGetAdjourn();
+			case COMMIT:
+				p0->OnGetCommit();
 				break;
 			case ACK_FLUSH:
-				p0->OnAdjournAck();
+				p0->OnAckFlush();
 				break;
-			case RESTORE:
-				p0->OnGetRestore();
+			case RESUME:
+				p0->OnGetResume();
 				break;
-			case FINISH:
-				p0->OnGetFinish();
+			case RELEASE:
+				p0->OnGetRelease();
 				break;
 			case MULTIPLY:
 				p0->OnGetMultiply();
@@ -1213,7 +1234,7 @@ DWORD WINAPI HandleFullICC(LPVOID p)
 			}
 			//
 			p0->SetReady();
-			p0->PopPacketBuffer();
+			p0->PopUnlockPacketBuffer();
 		}
 		return 1;
 	}
@@ -1247,7 +1268,10 @@ bool CSocketItemEx::TestAndWaitReady()
 	{
 		Sleep(1);
 		if(time(NULL) - t0 > TRASIENT_STATE_TIMEOUT_ms)
+		{
+			TRACE_HERE("TestAndWaitReady timeout");
 			return false;
+		}
 	}
 	//
 	return true;
@@ -1281,25 +1305,29 @@ int CSocketItemEx::SendPacket(register ULONG n1, ScatteredSendBuffers s)
 	}
 	else
 	{
-		s.scattered[0].buf = (CHAR *)& pairSessionID;
-		s.scattered[0].len = sizeof(pairSessionID);
+		s.scattered[0].buf = (CHAR *)& fidPair;
+		s.scattered[0].len = sizeof(fidPair);
 	}
-#ifdef TRACE_PACKET
-	printf_s("\nPeer name length = %d, socket address:\n", namelen);
-	DumpNetworkUInt16((UINT16 *)sockAddrTo, sizeof(SOCKADDR_IN6) / 2);
-	printf_s("Data to sent:\n----\n");
-	for (register ULONG i = 0; i < n1; i++)
-	{
-		DumpNetworkUInt16((UINT16 *)lpBuffers[i].buf, lpBuffers[i].len / 2);
-		printf("----\n");
-	}
-#endif
+
+	tRecentSend = NowUTC();
+//#ifdef TRACE_PACKET
+//	printf_s("\nPeer socket address:\n");
+//	DumpNetworkUInt16((UINT16 *)sockAddrTo, sizeof(SOCKADDR_IN6) / 2);
+//	printf_s("Data to sent:\n----\n");
+//	for (register ULONG i = 0; i < n1; i++)
+//	{
+//		DumpNetworkUInt16((UINT16 *)lpBuffers[i].buf, lpBuffers[i].len / 2);
+//		printf("----\n");
+//	}
+//#endif
 	DWORD n = 0;
+	// UNRESOLVED! Mixed IPv4/IPv6 network interface, i.e.dual hosted networks
 	int r = WSASendTo(CLowerInterface::Singleton()->sdSend
 		, lpBuffers, n1
 		, &n
 		, 0
-		, (const struct sockaddr *)sockAddrTo, namelen
+		, (const struct sockaddr *)sockAddrTo
+		, sockAddrTo->si_family == AF_INET6 ? sizeof(sockAddrTo->Ipv6) : sizeof(sockAddrTo->Ipv4)
 		, NULL
 		, NULL);
 	if (r != 0)
@@ -1377,7 +1405,7 @@ int ConnectRequestQueue::Remove(int i)
 
 /*
 mobility support...
-TODO: after configure the ALT_IDs, listen to address change event
+TODO: after configure the ALFIDs, listen to address change event
 TODO: on reconfiguration, refresh IPv6 end point of each FSP socket
 
 scan all configured FSP socket, modify the near end addresses accordingly

@@ -1,6 +1,6 @@
 /*
  * DLL to service FSP upper layer application
- * Session control functions: Multiplication/Adjournment/Resumption
+ * Session control functions: Multiplication/Commitment/Resumption
  * Milk-transport is only implented on multiplicated secondary connection
  *
     Copyright (c) 2012, Jason Gao
@@ -57,6 +57,9 @@ v.	远端拒绝连接复制（远端因无空闲的Session ID等原因，回复带有拒绝码的Reset报文）
 vi.	超时；
 vii.	其他运行时错误。
 **/
+//[API: Multiply]
+//	NON_EXISTENT-->CLONING-->[Send MULTIPLY]{enable retry}
+// UNRESOLVED! ALLOCATED NEW SESSION ID in LLS?
 // Given
 //	FSPHANDLE		the handle of the parent FSP socket to be multiplied
 //	PFSP_Context	the pointer to the parameter structure of the socket to create by multiplication
@@ -88,30 +91,23 @@ FSPHANDLE FSPAPI ConnectMU(FSPHANDLE hFSP, PFSP_Context psp1)
 		psp1->u.flags = EBADF;	// E_HANDLE;
 		return NULL;
 	}
-	// TODO: SHOULD derive ephemeral seesion key from the parent session at first. See also CopyKey()
+	// TODO: SHOULD derive ephemeral session key from the parent session at first. See also CopyKey()
 	// TODO: SHOULD constuct the MULTIPLY command packet
 	return socketItem->CallCreate(objCommand, SynConnection);
 }
 
 
-//[{return}Accept{new context}]
-//{ACTIVE on multiply request}-->/[API{callback}]/
-//    -->{start keep-alive}ACTIVE
-//[{return}Commit{new context}] 
-//{ACTIVE on multiply request}-->/API{callback}/
-//      -->{new context}PAUSING-->[Snd ADJOURN {in the new context}]
-//[{return}Reject]
-//{ACTIVE on multiply request}-->/API{callback}/
-//      -->[Snd RESET]-->{abort creating new context, no state transition}
-//| --[Rcv MULTIPLY]-->[API{ Callback }]
-//| -->[{Return Commit}]-->{new context}PAUSING
-//-->[Snd ADJOURN{ enable retry, in the new context }]
-//| -->[{Return Accept}]-->{new context}ACTIVE
-//-->[Snd PERSIST{ start keep - alive, in the new context }]
+
+//{ACTIVE, COMMITTING, PEER_COMMIT, COMMITTING2, COMMITTED, CLOSABLE}
+//	|-->/MULTIPLY/-->[API{Callback}]
+//	|-->[{Return Accept}]-->{new context}ACTIVE
+//		-->[Send PERSIST]{start keep-alive}
+//	|-->[{Return Commit}]-->{new context}COMMITTING
+//		-->[Send COMMIT]{enable retry}
+//	|-->[{Return}:Reject]-->[Send RESET] {abort creating new context}
 // 情形1：(PERSIST, ICC, 流控参数, 半连接参数，载荷)
-// 情形2：(ADJOURN, ICC, 流控参数, SNACK, 载荷)
+// 情形2：(COMMIT, ICC, 流控参数, SNACK, 载荷)
 // 情形3：RESET...
-// UNRESOLVED! ALLOCATED NEW SESSION ID in LLS
 bool LOCALAPI CSocketItemDl::ToWelcomeMultiply(BackLogItem & backLog)
 {
 	if(CopyKey(backLog.idParent) < 0)
@@ -122,6 +118,19 @@ bool LOCALAPI CSocketItemDl::ToWelcomeMultiply(BackLogItem & backLog)
 
 	// Multiply: but the upper layer application may still throttle it...fpRequested CANNOT read or write anything!
 	PFSP_IN6_ADDR remoteAddr = (PFSP_IN6_ADDR) & pControlBlock->peerAddr.ipFSP.allowedPrefixes[MAX_PHY_INTERFACES-1];
+
+	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend();
+	FSP_AckConnectRequest & welcome = *(FSP_AckConnectRequest *)GetSendPtr(skb);
+	FSP_ConnectParam & varParams = welcome.params;
+
+	varParams.listenerID = pControlBlock->idParent;
+	varParams.hs.Set<MOBILE_PARAM>(sizeof(FSP_NormalPacketHeader));
+	welcome.hs.Set<PERSIST>(sizeof(welcome));
+	//
+	skb->opCode = PERSIST;	// unlike in CHALLENGING state
+	skb->len = sizeof(welcome);
+	skb->Unlock();
+
 	int r;
 	if( fpRequested == NULL	// This is NOT the same policy as ToWelcomeConnect
 	|| (r = fpRequested(this, & backLog.acceptAddr, remoteAddr)) < 0 )
@@ -129,54 +138,27 @@ bool LOCALAPI CSocketItemDl::ToWelcomeMultiply(BackLogItem & backLog)
 		// UNRESOLVED! report that the upper layer application reject it?
 		return false;
 	}
-
-	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend();
-	if(r > 0)
-	{
-		// TODO: force to slide the send window, and merge with the latest data packet
-		// TODO: check 'QUASI_ACTIVE' state in the sending function
-		skb->opCode = ADJOURN;
-		SetState(PAUSING);
-	}
-	else
-	{
-		FSP_AckConnectRequest & welcome = *(FSP_AckConnectRequest *)GetSendPtr(skb);
-		FSP_ConnectParam & varParams = welcome.params;
-		// TODO: handle of milky-payload; multihome/mobility support is always handled by LLS
-		varParams.delayLimit = 0;
-		varParams.initialSN = pControlBlock->u.connectParams.initialSN;
-		varParams.listenerID = pControlBlock->idParent;
-		varParams.hs.Set<CONNECT_PARAM>(sizeof(FSP_NormalPacketHeader) + sizeof(FSP_AckConnectKey));
-		welcome.hsKey.Set<EPHEMERAL_KEY>(sizeof(FSP_NormalPacketHeader));
-		welcome.hs.Set<PERSIST>(sizeof(welcome));
-		//
-		skb->opCode = PERSIST;	// unlike in CHALLENGING state
-		skb->len = sizeof(welcome);
-		//
-		SetState(ESTABLISHED);
-	}
-	// the integrityCode is to be automatically set by LLS
-	skb->SetFlag<IS_COMPLETED>();
+	// UNRESOLVED! To change the opcode of the last payload packet to COMMIT...
+	SetState(r == 0 ? ESTABLISHED : COMMITTING);
 
 	return true;
 }
 
 
-// Auxiliary function that is called
-// when an existing close/closable connection context is hit in the cache
 //[{return}Accept]
-//CLOSABLE-->[Rcv RESTORE]-->/[API{callback}]/
-//    -->{start keep-alive}ACTIVE
-//CLOSED-->[Rcv RESTORE]-->/[API{callback}]/
-//    -->{start keep-alive}ACTIVE
+//	{CLOSABLE, CLOSED}-->[Rcv.RESUME]-->[API{callback}]-->/return Accept/
+//		-->ACTIVE-->[Send PERSIST]{restart keep-alive}
 //[{return}Commit]
-//CLOSABLE-->[Rcv RESTORE]-->[API{callback}]-->PAUSING
-//CLOSED-->[Rcv RESTORE]-->[API{callback}]-->PAUSING
+//	CLOSABLE-->[Rcv.RESUME]-->[API{callback}]
+//		-->/return Commit/-->COMMITTING-->[Send COMMIT]{enable retry}
+//	CLOSED-->[Rcv.RESUME]-->[API{callback}]
+//		-->/return Commit/-->COMMITTING-->[Send COMMIT]{enable retry}
 //[{return}Reject]
-//CLOSABLE{on resumption request}-->/API{callback}/
-//      -->[Snd RESET]-->NON_EXISTENT{to discard the contxt}
-//CLOSED{on resurrect request}-->/API{callback}/
-//      -->[Snd RESET]-->NON_EXISTENT{to discard the context}
+//	CLOSABLE-->[Rcv.RESUME]-->[API{callback}]-->/return Reject/
+//		-->[Send RESET]-->NON_EXISTENT
+//	CLOSED-->[Rcv.RESUME]-->[API{callback}]-->/return Reject/
+//		-->[Send RESET]-->NON_EXISTENT
+// Auxiliary function that is called when an existing closed connection context is hit in the cache
 void CSocketItemDl::HitResumableDisconnectedSessionCache()
 {
 	SetMutexFree();

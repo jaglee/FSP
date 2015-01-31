@@ -1,10 +1,10 @@
 /*
  * FSP lower-layer service program, software time-wheel, might be accelerated by hardware
  * heartbeat callback and its related functions to
- * - retransmit INITIATE_CONNECT, CONNECT_REQUEST, RESTORE or MULTIPLY
+ * - retransmit INITIATE_CONNECT, CONNECT_REQUEST, RESUME or MULTIPLY
  * - send heartbeat signal PERSIST
  * - idle timeout of CONNECT_BOOTSTRAP, CONNECT_AFFIRMING, QUASI_ACTIVE, CLONING
- *	 or CHALLENGING, as well as ACTIVE, RESUMING or PAUSING state
+ *	 or CHALLENGING, as well as ACTIVE, RESUMING or COMMITTING state
  * - and finally, 'lazy' garbage collecting of CLOSABLE or CLOSED state
  *
     Copyright (c) 2012, Jason Gao
@@ -40,30 +40,40 @@
 /**
   When a socket is created the alarm clock is not initiated. Instead, the alarm clock is initiated
   when a first time-out event handler is registered in the timewheel:
-  1.INIT_CONNECT family, init_connect retransmission, registered when Emit INIT_CONNECT.
+  1.INIT_CONNECT family, INIT_CONNECT retransmission, registered when Emit INIT_CONNECT.
 	It is the time when the initiator starts the time-out mechanism
-  2.connect_request retransmission, inherits the time-out clock of init_connect retransmission
-  3.INIT_CONNECT family, multiply retransmissin, registered when Emit MULTIPLY
-  4.INIT_CONNECT family, restore retransmission, registered when Emit RESTORE
-  5.Transient State Timeout family, challenging timeout, registered when Emit ACK_CONNECT_REQUEST
+  2.INIT_CONNECT family, CONNECT_REQUEST retransmission, inherits the time-out clock of INIT_CONNECT retransmission
+  3.INIT_CONNECT family, MULTIPLY retransmissin, registered when Emit MULTIPLY
+  4.INIT_CONNECT family, RESUME retransmission, registered when Emit RESUME
+  5.Transient State Timeout family, challenging timeout, registered when Emit ACK_CONNECT_REQ
 	It is the time when the responder starts the time-out mechanism
-  6.KEEP_ALIVE family, persist heartbeat, the timeout interval updated when Emit PERSIST
-  7.KEEP_ALIVE family, adjourn heartbeat, the timeout interval of 'persist heartbeat' inherited
-	updated on getting the first ADJOURN packet of the cloned connection
-  8.scavenging event, registered when Emit FINISH in the CLOSABLE state (and it is migrated to CLOSED state)
-	or when get ACK_ADJOURN packet in the PAUSING state (and it is migrated to CLOSABLE state)
+  6.KEEP_ALIVE family, persist heartbeat, the timeout interval of when emitting KEEP_ALIVE/retransmitting PERSIST
+  7.KEEP_ALIVE family, adjourn heartbeat, the timeout interval of retransmitting COMMIT
+  8.Scavenging event, registered when Emit RELEASE in the CLOSABLE state (and it is migrated to CLOSED state)
+	or when get ACK_FLUSH packet in the COMMITTING state (and it is migrated to CLOSABLE state)
 
   Timeout is almost always notified to ULA
-	[Retransmit INIT_CONNECT timeout]	CONNECT_BOOTSTRAP-->NON_EXISTENT
-	[Retransmit CONNECT_REQUEST timeout]CONNECT_AFFIRMING-->NON_EXISTENT
-	[Retransmit RESTORE Timeout] {QUASI_ACTIVE, RESUMING}-->CLOSED
-	[Retransmit MULTIPLY Timeout] CLONING-->NON_EXISTENT
+  ACK_INIT_CONNECT or RELEASE is never retransmitted.
+  ACK_CONNECT_REQ, PURE_DATA or ACK_FLUSH is retransmitted on demand.
 
-  ACK_INIT_CONNECT or FINISH is never retransmitted.
-  ACK_CONNECT_REQUEST, PURE_DATA or ACK_FLUSH is retransmitted on demand.
-  Continual PERSIST or ADJOURN packets are sent as heart-beating signals.
+  Continual KEEP_ALIVE packets are sent as heartbeat signals. PERSIST or COMMIT may be retransmit in the heartbeat interval
+  
+  [Transient State timeout]
+	  {CONNECT_BOOTSTRAP, CHALLENGING, CONNECT_AFFIRMING}-->NON_EXISTENT
+	  {COMMITTING, COMMITTING2}-->NON_EXISTENT
+	  CLONING-->NON_EXISTENT
+	  CLOSABLE-->CLOSED-->[Send RELEASE]
+	  {RESUMING, QUASI_ACTIVE}-->CLOSED
 
-  Garbage Collecting occurs when it timeouts in CHANLLENGING, CLOSABLE, or CLOSED state where resource is to be freed.
+  Implementation should start garbage collecting as soon as it switches into NON_EXSISTENT state.
+
+  [Idle Timeout]
+	  ACTIVE-->NON_EXISTENT
+	  PEER_COMMIT-->NON_EXISTENT
+	  COMMITTED-->NON_EXISTENT
+
+  [Free Timeout]
+	  CLOSED-->NON_EXISTENT
 
   Heartbeat_Interval_0 = RTT0 << 2
   RTT_N = Max(1, Average(persist_time - send_time) - Heartbeat_Interval_N)
@@ -75,121 +85,178 @@
 
 // Timeout of initiation family retransmission, keep-alive transmission and Scanvenger activation
 // State idle timeout
-// A SCB in the CLOSABLE state could be restored while in the CLOSED state could be resurrected
-// Remark
-//	Transient-state timeout is only possible in CONNECT_BOOTSTRAP, CONNECT_AFFIRMING, CLONING, CHALLENGING
-//	or QUASI_ACTIVE state, where the check point clock 'tMigrate' was set in the subroutine AddTimer()
+// A SCB in the CLOSABLE state could be RESUMEd while in the CLOSED state could be resurrected
 void CSocketItemEx::TimeOut()
 {
 	if(! this->TestAndLockReady())
+	{
+		TRACE_HERE("Timeout not executed due to lack of locks");
 		return;
-	//
+	}
+
 	timestamp_t t1 = NowUTC();
+//#ifdef TRACE
+//	TRACE_HERE(" it's time-outed");
+//	DumpTimerInfo(t1);
+//#endif
 	switch(lowState)
 	{
 	case NON_EXISTENT:
 		Extinguish();
-		break;
+		return;	// needn't	SetReady();
 	// Note that CONNECT_BOOTSTRAP and CONNECT_AFFIRMING are counted into one transient period
 	case CONNECT_BOOTSTRAP:
 	case CONNECT_AFFIRMING:
-	case CLONING:
 	case CHALLENGING:
-		if(t1 - clockCheckPoint.tMigrate > (TRASIENT_STATE_TIMEOUT_ms << 10))
+		if (t1 - clockCheckPoint.tMigrate > (TRASIENT_STATE_TIMEOUT_ms << 10))
 		{
 #ifdef TRACE
 			printf_s("\nTransient state time out in state %s\n", stateNames[lowState]);
 #endif
-			if(! Notify(FSP_NotifyDisposed))
-				break;
-			// Wait some time to let DLL do cleaning work at first
+			Notify(FSP_NotifyTimeout);
 			lowState = NON_EXISTENT;
-			break;
+			SetReady();
+			return;	// let calling of Extingush() in the NON_EXISTENT state to do cleanup 
 		}
 		// TO BE TESTED...
 		if(lowState != CHALLENGING)
-			Retransmit1();
+			EmitStart();
 		break;
 	case ESTABLISHED:
-	case PAUSING:
-	case RESUMING:
-		if(t1 - tSessionBegin > (MAXIMUM_SESSION_LIFE_ms << 10) || t1 - tLastRecv > (SCAVENGE_THRESHOLD_ms << 10))
+		if(t1 - tLastRecv > (SCAVENGE_THRESHOLD_ms << 10))
 		{
-			if(! Notify(FSP_NotifyDisposed))
-				break;
 			ReplaceTimer(TRASIENT_STATE_TIMEOUT_ms);
-			// Wait some time to let DLL do cleaning work at first
+			Notify(FSP_Abort);	// donot actively reset peer's context
 			lowState = NON_EXISTENT;
-			break;
+			SetReady();
+			return;	// let calling of Extingush() in the NON_EXISTENT state to do cleanup 
 		}
-		// TO BE TESTED...
-		if(lowState == ESTABLISHED)
+	case PEER_COMMIT:
+	case COMMITTED:
+	case COMMITTING:
+	case COMMITTING2:
+		if(t1 - tSessionBegin > (MAXIMUM_SESSION_LIFE_ms << 10))
+		{
+			ReplaceTimer(TRASIENT_STATE_TIMEOUT_ms);
+			Notify(FSP_Abort);	// donot actively reset peer's context
+			lowState = NON_EXISTENT;
+			SetReady();
+			return;	// let calling of Extingush() in the NON_EXISTENT state to do cleanup 
+		}
+		//
+		if (lowState != COMMITTED)
 			KeepAlive();
-		else if(lowState == PAUSING)
-			Flush();
-		else
-			Retransmit1();
 		break;
-	// UNRESOLVED! make difference of SCAVENGE_THRESHOLD and TIME_WAIT_TO_CLOSE?
-	case CLOSABLE:
-	case CLOSED:
-		if(t1 - tSessionBegin >  (MAXIMUM_SESSION_LIFE_ms << 10))
-			Extinguish();
-		else
-			SetState(CLOSED);
-		break;
-	case QUASI_ACTIVE:
-		if( t1 - clockCheckPoint.tMigrate > (TRASIENT_STATE_TIMEOUT_ms << 10)
+	case PRE_CLOSED:
+		if((t1 - clockCheckPoint.tMigrate) > (TRASIENT_STATE_TIMEOUT_ms << 10)
 		 || t1 - tSessionBegin >  (MAXIMUM_SESSION_LIFE_ms << 10) )
 		{
 #ifdef TRACE
-			printf_s("\nTransient state time out or key out of life in the QUASI_ACTIVE state\n");
+			printf_s("\nTransient state time out in the %s state\n", stateNames[lowState]);
 #endif
-			if(! Notify(FSP_Timeout))
-				break;
-			//
-			ReplaceTimer(SCAVENGE_THRESHOLD_ms);
-			lowState = CLOSED;
-			break;
+			Notify(FSP_Abort);	// a connection that cannot be gracefully shutdown is aborted instead
+			// UNRESOLVED!? But PRE_CLOSED connection might be resurrected
+			lowState = NON_EXISTENT;
+			SetReady();
+			return;	// let calling of Extingush() in the NON_EXISTENT state to do cleanup 
 		}
-		// TO BE TESTED...
-		Retransmit1();
+		//
+		SendPacket<RELEASE>();
+		break;
+	case CLOSABLE:	// CLOSABLE does not automatically timeout to CLOSED
+	case CLOSED:
+		if(t1 - tSessionBegin >  (MAXIMUM_SESSION_LIFE_ms << 10))
+		{
+			ReplaceTimer(TRASIENT_STATE_TIMEOUT_ms);
+			Notify(FSP_Dispose);
+			lowState = NON_EXISTENT;
+			SetReady();
+			return;	// let calling of Extingush() in the NON_EXISTENT state to do cleanup 
+		}
+		break;
+	case CLONING:
+	case RESUMING:
+	case QUASI_ACTIVE:
+		if (t1 - clockCheckPoint.tMigrate > (TRASIENT_STATE_TIMEOUT_ms << 10)
+		 || t1 - tSessionBegin >  (MAXIMUM_SESSION_LIFE_ms << 10) )
+		{
+#ifdef TRACE
+			printf_s("\nTransient state time out or key out of life in the %s state\n", stateNames[lowState]);
+#endif
+			Notify(FSP_NotifyTimeout);	// UNRESOLVED! But if Notify failed?
+			lowState = NON_EXISTENT;
+			SetReady();
+			return;	// let calling of Extingush() in the NON_EXISTENT state to do cleanup 
+		}
+		EmitStart();
 		break;
 	}
+
+	if (toUpdateTimer)
+	{
+		toUpdateTimer = false;
+		RestartKeepAlive();
+	}
+
+	// but if we could possibly query it from the internal information of the timer!
+	clockCheckPoint.tKeepAlive = t1 + tKeepAlive_ms * 1000ULL;
 
 	SetReady();
 }
 
 
-
 // Send heartbeart signal to the remote end, may trigger retransmission of the remote end
-// If the first packet in the send queue is PERSIST or ADJOURN (and it is unacknowledged)
-// the packet is resent, or else an out-of-band KEEP_ALIVE with the latest sent sequence number is sent 
+/**
+-	Retransmission of PERSIST
+	An FSP node in the ESTABLISHED state MUST retransmit the unacknowledged PERSIST packet
+	at the tempo of transmitting heartbeat signals.
+-	Retransmission of COMMIT
+	An FSP node in the COMMITTING or COMMITTING2 state MUST retransmit the unacknowledged COMMIT packet
+	at the tempo of transmitting heartbeat signals. 
+-	LLS should change PERSIST packet to COMMIT if it has migrated to the COMMITTING or COMMITTING2 state
+*/
 void CSocketItemEx::KeepAlive()
 {
-	ControlBlock::PFSP_SocketBuf skb = pControlBlock->GetFirstBufferedSend();
-	if (pControlBlock->CountUnacknowledged() > 0 && (skb->opCode == PERSIST || skb->opCode == ADJOURN))
+	if (pControlBlock->CountUnacknowledged() > 0)
 	{
-#ifdef TRACE
-		printf_s("Keep-alive session#%u, head packet in the queue is happened to be %s\n"
-			, pairSessionID.source
-			, opCodeStrings[skb->opCode]);
-#endif
-		// UNRESOLVED! Could sendWindowHeadPos and sendWindowFirstSN update in an atomic manner?
 		// it is waste of time if the packet is already acknowledged however it do little harm
 		// and it doesn't worth the trouble to handle low-possibility situation
-		Retransmit1();
-		return;
+		// prefer productivity over code elegancy
+		ControlBlock::PFSP_SocketBuf skb = pControlBlock->GetFirstBufferedSend();
+		//
+		uint8_t	headOpCode = skb->opCode;
+		if (headOpCode == PERSIST)
+		{
+#ifdef TRACE
+			printf_s("Keep-alive local fiber#%u, head packet in the queue is happened to be %s\n"
+				, fidPair.source
+				, opCodeStrings[headOpCode]);
+			pControlBlock->DumpSendRecvWindowInfo();
+#endif
+			// PERSIST/COMMIT packet in the head of the receive queue is the accumulative acknowledgment as well 
+			EmitWithICC(skb, pControlBlock->GetSendWindowFirstSN());
+			return;
+		}
+		//
+		if (headOpCode == COMMIT)	// assert(skb->len > 0); // not necessarily
+			EmitWithICC(skb, pControlBlock->GetSendWindowFirstSN());
 	}
 
-	// UNRESOLVED! TODO: keep-alive buffer shall be per-session, and fast-retransmission shall be possible!
+	SendHeartbeat();
+}
+
+
+
+
+void CSocketItemEx::SendHeartbeat()
+{
 	BYTE buf[sizeof(FSP_NormalPacketHeader) + MAX_BLOCK_SIZE];
 	ControlBlock::seq_t seqExpected;
 	int spFull = GenerateSNACK(buf, seqExpected);
 #ifdef TRACE
-	printf_s("Keep-alive session#%u\n"
+	printf_s("Keep-alive local fiber#%u\n"
 		"\tAcknowledged seq#%u, keep-alive header size = %d\n"
-		, pairSessionID.source
+		, fidPair.source
 		, seqExpected
 		, spFull);
 #endif
@@ -221,27 +288,6 @@ void CSocketItemEx::KeepAlive()
 }
 
 
-
-// LLS sends packet in the send queue orderly to the remote end, including the ADJOURN packet
-// See also SlideSendWindow()
-void CSocketItemEx::Flush()
-{
-#ifdef TRACE
-	printf("Flushing session#%u\n", pairSessionID.source);
-	pControlBlock->DumpSendRecvWindowInfo();
-#endif
-	pControlBlock->SlideSendWindow();	// if it is not done already
-	if (pControlBlock->CountSendBuffered() == 0)
-	{
-		ReplaceTimer(SCAVENGE_THRESHOLD_ms);
-		SetState(CLOSABLE);
-		return;
-	}
-	Retransmit1();
-}
-
-
-
 // Given
 //	ControlBlock::seq_t		the maximum sequence number expected by the remote end, without gaps
 //	const GapDescriptor *	array of the gap descriptors
@@ -255,10 +301,13 @@ void CSocketItemEx::Flush()
 //	-EFAULT if memory corrupted
 //	0 if no error
 // Remark
-//	FSP do retransmission passively, only retransmit those explicitly negatively acknowledged
-//	treat the KEEP-ALIVE signal as if it were a timer interrupt
-//	for testability and differentiated transmission policy we do not make real retransmissin yet
-//	ONLY when the first packet in the send window is acknowledged may round-trip time re-calibrated
+//	An FSP makes retransmission passively in the sense that it only retransmits those explicitly negatively acknowledged
+//	FSP is conservative in retransmission in the sense that it treats the KEEP-ALIVE signal as if
+//	it were a timer and the interrupt rate should be considerably lower than predefined timer
+//	FSP node simply retransmits lost packets of stream payload while ignores milky payload,
+//	though we know newer packet are of high priority in retransmission for milky payload
+//	while older packets are of higher value for stream payload
+//  if n == 0 it is an accumulative acknowledgment
 int LOCALAPI CSocketItemEx::RespondSNACK(ControlBlock::seq_t expectedSN, const FSP_SelectiveNACK::GapDescriptor *gaps, int n)
 {
 	if(isMilky || n < 0)
@@ -293,8 +342,14 @@ int LOCALAPI CSocketItemEx::RespondSNACK(ControlBlock::seq_t expectedSN, const F
 		return -EFAULT;
 
 	//
-	ControlBlock::PFSP_SocketBuf p0 = pControlBlock->HeadSend(); 
+	ControlBlock::PFSP_SocketBuf p0 = pControlBlock->HeadSend();
+	timestamp_t	tNow = NowUTC();
+	uint64_t	rtt64_us = tNow - tEarliestSend;
+	bool		acknowledged = false;	// whether the head packet of the send queue is acknowledged 
+	uint32_t	countAck = 0;
+
 	retransTail = retransHead = 0;
+
 	if(ackSendWidth == 0)
 		goto l_success;
 
@@ -306,9 +361,10 @@ int LOCALAPI CSocketItemEx::RespondSNACK(ControlBlock::seq_t expectedSN, const F
 	ControlBlock::seq_t	seqTail = expectedSN;
 	int			k = 0;
 	int			nAck;
-	bool		acknowledged = false;
+	bool		lessRecent = false;
 	do
 	{
+		// when n == 0 gaps[k] would not be tested, and it is treated as accumulative acknowledgment
 		if(k < n && (gaps[k].dataLength < 0 || gaps[k].gapWidth < 0 || gaps[k].dataLength == 0 && gaps[k].gapWidth == 0))
 			return -EBADF;
 
@@ -324,6 +380,7 @@ int LOCALAPI CSocketItemEx::RespondSNACK(ControlBlock::seq_t expectedSN, const F
 			if(! p->GetFlag<IS_ACKNOWLEDGED>())
 			{
 				p->SetFlag<IS_ACKNOWLEDGED>();
+				countAck++;
 				if(seqTail == seqHead)
 					acknowledged = true;
 			}
@@ -344,13 +401,14 @@ int LOCALAPI CSocketItemEx::RespondSNACK(ControlBlock::seq_t expectedSN, const F
 	
 		// the gap might cross over the first packet in the send window, as out-of-order NACK might be received
 		nAck = min(gaps[k].gapWidth, int32_t(seqTail - seqHead));
-		// for milky payload, newer packet are of high priority when retransmitting
-		// while for stream payload older packets are of higher value
 		while(nAck-- > 0)
 		{
 			seqTail--;
-			// Simply retransmit stream payload and ignore milky payload
-			if(! p->GetFlag<IS_ACKNOWLEDGED>())
+			//
+			if(! lessRecent)
+				lessRecent
+				= rtt64_us - (tRecentSend - tEarliestSend) * (seqTail - seqHead) / sentWidth >= tRoundTrip_us * 2;
+			if(! p->GetFlag<IS_ACKNOWLEDGED>() && lessRecent)
 				retransBackLog[--retransHead] = seqTail;
 			//
 			if(--tail < 0)
@@ -367,29 +425,48 @@ int LOCALAPI CSocketItemEx::RespondSNACK(ControlBlock::seq_t expectedSN, const F
 		k++;
 	} while(int(seqTail - seqHead) > 0);
 
-	if(acknowledged)
-	{
-		uint32_t	rtt_us = uint32_t(NowUTC() - tEarliestSend);
-		// UNRESOLVED!? TODO: study anti-cheating mechanism
-		tRoundTrip_us = (tRoundTrip_us >> 2) + (tRoundTrip_us >> 1) + ((rtt_us + 3) >> 2);
-		tKeepAlive_ms = tKeepAlive_ms - (tKeepAlive_ms >> 2) + tRoundTrip_us / 1000;
-		if(tKeepAlive_ms < KEEP_ALIVE_TIMEOUT_MIN_ms)
-			tKeepAlive_ms = KEEP_ALIVE_TIMEOUT_MIN_ms;
-		//
-		// We assume that after sliding send window the number of unacknowledged was reduced
-		ChangeKeepAliveClock();
-		pControlBlock->SlideSendWindow();
-		tEarliestSend += (tRecentSend - tEarliestSend)
-			* (sentWidth - pControlBlock->CountUnacknowledged())
-			/ sentWidth;
-#ifdef TRACE
-		printf_s("\nCalibrated round trip time: %dus, keep-alive timeout: %dms\n\n", tRoundTrip_us,  tKeepAlive_ms);
-#endif
-	}	
-
 l_success:
+	if(congestCtrl.dMin <= 0 || congestCtrl.dMin > rtt64_us)
+		congestCtrl.dMin = rtt64_us;
+	//
+	// Cubic congestion control; additive increase
+	//
+	while(countAck > 0)	// it is an if. just to avoid goto
+	{
+		const int SCALE = (1 << 24);
+		int ii;
+		if(congestCtrl.cwnd < congestCtrl.ssthresh)
+		{
+			ii = min(countAck, congestCtrl.ssthresh - congestCtrl.cwnd);
+			congestCtrl.cwnd += ii;
+			if( (countAck -= ii) <= 0)
+				break;
+		}
+
+		float f = congestCtrl.Update(tNow) * countAck;
+		ii = uint32_t(floor(f));
+		congestCtrl.cwnd += ii;
+		congestCtrl.cwndFraction += uint32_t((f - ii) * SCALE);
+		if(congestCtrl.cwndFraction > SCALE)
+		{
+			congestCtrl.cwnd ++;
+			congestCtrl.cwndFraction -= SCALE;
+		}
+		break;	// 'while' is an if
+	}
+
+	// negatively acknowledged in the send queue tail:
+	nAck = pControlBlock->CountUnacknowledged(expectedSN);
+
+	// Clearly we're quite relunctant to assume that loss of packet were caused by congestion
+	if(nAck > 1 && (tNow - tRecentSend) > tRoundTrip_us)
+		congestCtrl.OnCongested();
+	else
+		congestCtrl.CheckTimeout(tNow);
+
+	// for testability and differentiated transmission policy we do not make real retransmissin yet
 	// register retransmission of those sent but not acknowledged after expectedSN
-	if(retransTail - retransHead < MAX_RETRANSMISSION && (nAck = pControlBlock->CountUnacknowledged(expectedSN)) > 0)
+	if(nAck > 0 && retransTail - retransHead < MAX_RETRANSMISSION)
 	{
 		tail = iHead + ackSendWidth;	// recalibrate it
 		if(tail >= capacity)
@@ -398,7 +475,9 @@ l_success:
 		seqTail = expectedSN;	// seqHead + ackSendWidth;
 		do
 		{
-			// UNRESOLVED! TODO: estimate send time of the packet
+			if(rtt64_us - (tRecentSend - tEarliestSend) * (seqTail - seqHead) / sentWidth < tRoundTrip_us * 2)
+				break;
+			//
 			if(! p->GetFlag<IS_ACKNOWLEDGED>())
 			{
 				if(retransTail - retransHead >= MAX_RETRANSMISSION)
@@ -419,10 +498,156 @@ l_success:
 			}
 		} while(--nAck > 0);
 	}
-	else if(retransTail - retransHead > MAX_RETRANSMISSION)
+	else while(retransTail - retransHead > MAX_RETRANSMISSION)
 	{
-		retransHead =  retransTail - MAX_RETRANSMISSION;
+		retransHead = retransTail - MAX_RETRANSMISSION;
+	}
+
+	//	ONLY when the first packet in the send window is acknowledged may round-trip time re-calibrated
+	if(acknowledged)
+	{
+		// UNRESOLVED! to be studied: does RTT increment linearly?
+		toUpdateTimer = true;
+		// We assume that after sliding send window the number of unacknowledged was reduced
+		pControlBlock->SlideSendWindow();
+		RecalibrateKeepAlive(rtt64_us);
+#ifdef TRACE
+		printf_s("We guess new tEarliestSend based on relatively tRecentSend = %lld\n"
+			"\ttEarliestSend = %lld, sendWidth = %d, packets on flight = %d\n"
+			, (tNow - tRecentSend)
+			, (tNow - tEarliestSend)
+			, sentWidth
+			, pControlBlock->CountUnacknowledged()
+			);
+		if(int64_t(tRecentSend - tEarliestSend) < 0 || sentWidth <= pControlBlock->CountUnacknowledged())
+			TRACE_HERE("function domain error in guess tEarliestSend");
+#endif
+		// assert(int64_t(tRecentSend - tEarliestSend) >= 0 && sentWidth > pControlBlock->CountUnacknowledged());
+		tEarliestSend += (tRecentSend - tEarliestSend) * (sentWidth - pControlBlock->CountUnacknowledged()) / sentWidth;
+#ifdef TRACE
+		printf_s("\ttRecentSend - tEarliestSend = %lluus, about %llums\n"
+			, (tRecentSend - tEarliestSend)
+			, (tRecentSend - tEarliestSend) >> 10
+			);
+#endif
 	}
 
 	return 0;
+}
+
+
+
+// TODO: testability: output the SNACK structure
+// TODO: UNRESOLVED! Just silently discard the malformed packet?
+int LOCALAPI CSocketItemEx::RespondSNACK(ControlBlock::seq_t ackSeqNo, const PFSP_HeaderSignature optHdr)
+{
+	if (optHdr == NULL || optHdr->opCode != SELECTIVE_NACK)
+	{
+#ifdef TRACE_PACKET
+		TRACE_HERE("accumulative acknowledgement");
+#endif
+		return RespondSNACK(ackSeqNo, NULL, 0);
+	}
+
+	FSP_SelectiveNACK::GapDescriptor *gaps = (FSP_SelectiveNACK::GapDescriptor *)((BYTE *)& headPacket->pkt + ntohs(optHdr->hsp));
+	FSP_SelectiveNACK *pHdr = (FSP_SelectiveNACK *)((BYTE *)optHdr + sizeof(*optHdr) - sizeof(*pHdr));
+	int n = int((BYTE *)gaps - (BYTE *)pHdr);
+	if (n < 0)
+		return -EBADF;	// this is a malformed packet.
+
+	n /= sizeof(FSP_SelectiveNACK::GapDescriptor);
+	if (pHdr->lastGap != 0)
+		n++;
+	for (register int i = n - 1; i >= 0; i--)
+	{
+		gaps[i].gapWidth = ntohs(gaps[i].gapWidth);
+		gaps[i].dataLength = ntohs(gaps[i].dataLength);
+	}
+
+	return RespondSNACK(ackSeqNo, gaps, n);
+}
+
+
+
+
+// this member function is called by KeepAlive() only. however, for testability we separate this block of code
+void CSocketItemEx::RecalibrateKeepAlive(uint64_t rtt64_us)
+{
+#ifdef TRACE
+	TRACE_HERE("to recalibrate keep-alive period");
+	printf_s("\tRTT_old is about %ums, tKeepAlive = %ums. Most recent RTT is about %llums\n"
+		, tRoundTrip_us >> 10
+		, tKeepAlive_ms
+		, rtt64_us >> 10);
+#endif
+
+	// Note that the raw round trip time includes the heartbeat-delay. See also EarlierKeepAlive()
+	uint64_t rttRaw = (rtt64_us + 3) >> 2;
+	rttRaw += tRoundTrip_us >> 1;
+	tKeepAlive_ms >>= 1;
+	tKeepAlive_ms += UINT32(rttRaw >> 9);	// Aproximate 1000/2 with 512
+	tRoundTrip_us = UINT32(min(rttRaw, UINT32_MAX));
+	// make sure tKeepAlive is not insanely small after calibration
+	tKeepAlive_ms = max(tKeepAlive_ms, UINT32(min((rtt64_us + KEEP_ALIVE_TIMEOUT_MIN_us) >> 10, UINT32_MAX)));
+
+#ifdef TRACE
+	printf_s("\tCalibrated round trip time = %uus, keep-alive timeout = %ums\n\n", tRoundTrip_us,  tKeepAlive_ms);
+#endif
+}
+
+void CSocketItemEx::CubicRate::CheckTimeout(timestamp_t t1)
+{
+	if(T0 > 0 && t1 - T0 > (TRASIENT_STATE_TIMEOUT_ms << 10))
+		Reset();
+}
+
+
+
+void CSocketItemEx::CubicRate::OnCongested()
+{
+	T0 = 0;
+	Wmax = cwnd < Wmax	// fast convergence is always applied
+		? cwnd * (2 - CONGEST_CONTROL_BETA) / 2
+		: cwnd;
+	cwnd = max(cwndMin, uint32_t(cwnd * (1 - CONGEST_CONTROL_BETA)));
+	ssthresh = cwnd;
+	cwndFraction = 0;
+}
+
+
+
+void CSocketItemEx::CubicRate::Reset()
+{
+	Wmax = 0;
+	T0 = 0;	// the epoch of last congestion
+	originPoint = 0;
+	K = 0;
+	dMin = 0;
+	cwnd = cwndMin = INITIAL_CONGESTION_WINDOW;	// UNRESOLVED! minimum rate guarantee...
+	ssthresh = cwnd;
+	cwndFraction = 0;
+}
+
+
+// brute-force float-point calculation of increase delta
+float CSocketItemEx::CubicRate::Update(timestamp_t t1)
+{
+	if (T0 <= 0)
+	{
+		T0 = t1;
+		if (cwnd < Wmax)
+		{
+			K = CubicRoot((Wmax - cwnd) / CONGEST_CONTROL_C);
+			originPoint = uint32_t(Wmax);
+		}
+		else
+		{
+			K = 0;
+			originPoint = cwnd;
+		}
+	}
+	// The unit of the time
+	double W = CONGEST_CONTROL_C * CubicPower((t1 + dMin - T0) * 1e-6) + originPoint;
+	// some anti-alias measure should be taken by the caller
+	return float(W > cwnd ? W / cwnd - 1 : 0.01); 
 }
