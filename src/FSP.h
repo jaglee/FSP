@@ -33,8 +33,8 @@
 #define THIS_FSP_VERSION	0	// current version
 #define IPPROTO_FSP			144	// value of protocol field for FSP over IPv6
 
-// To borrow some stdint definition from VMAC and VHASH Implementation by Ted Krovetz (tdk@acm.org) and Wei Dai
-#include "vmac.h"
+// To borrow some stdint definitions
+#include "gcm-aes.h"
 
 typedef uint32_t ALFID_T;
 
@@ -56,8 +56,9 @@ typedef uint32_t ALFID_T;
 // well-known upper layer application ID is compatible with TCP port number
 #define LAST_WELL_KNOWN_ALFID 65535
 
-#define FSP_MAC_IV_SIZE		8	// in bytes
 #define FSP_SESSION_KEY_LEN	16	// in bytes
+#define FSP_MAC_IV_SIZE		12	// in bytes
+#define FSP_TAG_SIZE		8	// in bytes
 
 #define INITIAL_CONGESTION_WINDOW	2 // a protocol default congestion control parameter
 
@@ -85,7 +86,7 @@ typedef uint32_t ALFID_T;
 
 #include <errno.h>
 
-typedef enum _FSP_Session_State
+typedef enum _FSP_Session_State: char
 {
 	NON_EXISTENT = 0, 
 	// the passiver listener to folk new connection handle:
@@ -131,7 +132,7 @@ typedef enum _FSP_Session_State
 
 
 // operation code
-typedef enum _FSP_Operation_Code
+typedef enum _FSP_Operation_Code: char
 {
 	INIT_CONNECT	= 1,
 	ACK_INIT_CONNECT,
@@ -174,7 +175,6 @@ typedef enum: char
 	FSP_Resume,			// cancel COMMIT(unilateral adjourn) or send RESUME
 	FSP_Shutdown,		// close the connection
 	// 16~23: LLS to DLL in the backlog
-	FSP_Abort = FSP_Reject,		// a reverse command, used to be FSP_Preclose/FSP_Timeout
 	FSP_NotifyAccepting = SynConnection,	// a reverse command to make context ready
 	FSP_NotifyAccepted = 16,
 	FSP_NotifyDataReady,
@@ -243,7 +243,7 @@ typedef	struct FSP_PKTINFO
 	uint32_t	ipi_addr;
 	uint32_t	ipi_ifindex;
 	uint32_t	idHost;
-	ALFID_T	idALF;
+	ALFID_T		idALF;
 	uint32_t	ipi6_ifindex;
 } *PFSP_PKTINFO;
 

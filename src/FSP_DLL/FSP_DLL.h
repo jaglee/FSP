@@ -107,7 +107,7 @@ protected:
 	CallbackPeeked	fpPeeked;
 	CallbackBufferReady fpSent;
 
-	bool			inUse;
+	volatile bool	inUse;
 	volatile char	mutex;	// Utilize _InterlockedCompareExchange8 to manage critical resource
 
 	BYTE * volatile	pendingSendBuf;
@@ -141,7 +141,6 @@ protected:
 	FSP_ServiceCode PopNotice() { return pControlBlock->PopNotice(); }
 
 	// in Establish.cpp
-	int LOCALAPI CopyKey(ALFID_T);
 	void ProcessBacklog();
 
 	CSocketItemDl * LOCALAPI PrepareToAccept(BackLogItem &, CommandNewSession &);
@@ -202,7 +201,7 @@ public:
 
 	FSP_Session_State GetState() const { return pControlBlock->state; }
 	bool InState(FSP_Session_State s) const { return pControlBlock->state == s; }
-	void SetState(FSP_Session_State s) { pControlBlock->state = s; }
+	void SetState(FSP_Session_State s) { _InterlockedExchange8((char *) & pControlBlock->state, s); }
 	// For _MSC_ only, as long is considered compatible with enum
 	bool TestSetState(FSP_Session_State s0, FSP_Session_State s2)
 	{
@@ -213,11 +212,8 @@ public:
 		return (FSP_Session_State)_InterlockedCompareExchange((long *)& pControlBlock->state, s2, s0);
 	}
 
-	void SetMutexFree() { mutex = SHARED_FREE; }
-	bool TestSetMutexBusy() 
-	{
-		return (_InterlockedCompareExchange8(& mutex, SHARED_BUSY, SHARED_FREE) == SHARED_FREE);
-	}
+	void SetMutexFree() { _InterlockedExchange8(& mutex, 0); }
+	bool TestSetMutexBusy() { return !_InterlockedCompareExchange8(& mutex, 1, 0); }
 	bool WaitSetMutex();
 	bool IsInUse() const { return inUse; }
 

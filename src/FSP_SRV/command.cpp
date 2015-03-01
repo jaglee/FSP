@@ -112,7 +112,7 @@ void LOCALAPI SyncSession(CommandNewSessionSrv &cmd)
 		return;
 	}
 
-	CSocketItemEx *socketItem = (*CLowerInterface::Singleton())[cmd];
+	CSocketItemEx *socketItem = CLowerInterface::Singleton()->AllocItem(cmd);
 	if(socketItem == NULL)
 	{
 		TRACE_HERE("Internal panic! Cannot map control block of the client into server's memory space");
@@ -226,9 +226,8 @@ void CSocketItemEx::Start()
 {
 	TRACE_HERE("called");
 	// synchronize the state in the 'cache' and the real state
-	if (lowState != pControlBlock->state)
+	if (_InterlockedExchange8((char *) & lowState, pControlBlock->state) != pControlBlock->state)
 	{
-		lowState = pControlBlock->state;
 		if (lowState == CLONING || lowState == RESUMING)
 		{
 			tKeepAlive_ms = CONNECT_INITIATION_TIMEOUT_ms;
@@ -249,9 +248,8 @@ void CSocketItemEx::UrgeCommit()
 {
 	TRACE_HERE("called");
 	// synchronize the state in the 'cache' and the real state
-	if (lowState != pControlBlock->state)
+	if (_InterlockedExchange8((char *) & lowState, pControlBlock->state) != pControlBlock->state)
 	{
-		lowState = pControlBlock->state;
 		if (lowState == COMMITTING || lowState == COMMITTING2)
 			RestartKeepAlive();
 	}
@@ -318,12 +316,12 @@ int LOCALAPI CSocketItemEx::ResolveToFSPoverIPv4(const char *nodeName, const cha
 	// assume the project is compiled in ANSI/MBCS language mode
 	if(getaddrinfo(nodeName, serviceName, & hints, & pAddrInfo) != 0)
 	{
-#ifdef TRACE
+//#ifdef TRACE
 		DWORD err = WSAGetLastError();
 		char buffer[1024];
 		FormatMessage(FORMAT_MESSAGE_FROM_SYSTEM, NULL, err, 0, (LPTSTR) & buffer, 1024, NULL);
-		printf("Cannot Resolve the IP address of the node %s, error code = %d\n %s\n", nodeName, err, (LPTSTR) buffer);
-#endif
+		printf_s("Cannot Resolve the IPv4 address of the node %s, error code = %d\n %s\n", nodeName, err, (LPTSTR) buffer);
+//#endif
 		return -1;
 	}
 

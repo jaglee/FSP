@@ -116,14 +116,15 @@ const char * CStringizeNotice::names[LARGEST_FSP_NOTICE + 1] =
 	"FSP_Listen",		// register a passive socket
 	"InitConnection",	// register an initiative socket
 	"FSP_NotifyAccepting",	//  = SynConnection,	// a reverse command to make context ready
-	"FSP_Abort",		// a reverse command. used to be FSP_Preclose/FSP_Timeout, forward command is FSP_Reject
+	"FSP_Reject",		// a reverse command. used to be FSP_Preclose/FSP_Timeout, forward command is FSP_Reject
 	"FSP_Dispose",		// AKA Reset. dispose the socket. connection might be aborted
 	"FSP_Start",		// send a start packet such as MULTIPLY, PERSIST and transactional COMMIT
 	"FSP_Send",			// send a packet/a group of packets
 	"FSP_Urge",			// send a packet urgently, mean to urge COMMIT
 	"FSP_Resume",		// cancel COMMIT(unilateral adjourn) or send RESUME
 	"FSP_Shutdown",		// close the connection
-	// 12-15, 4 reserved
+	// 11-15, 5 reserved
+	"Reserved11",
 	"Reserved12",
 	"Reserved13",
 	"Reserved14",
@@ -244,10 +245,7 @@ int LOCALAPI TSingleProviderMultipleConsumerQ<TLogItem>::Push(const TLogItem *p)
 template<typename TLogItem>
 int LOCALAPI TSingleProviderMultipleConsumerQ<TLogItem>::Pop(TLogItem *p)
 {
-	while(_InterlockedCompareExchange8(& mutex
-		, SHARED_BUSY
-		, SHARED_FREE)
-		!= SHARED_FREE)
+	while(_InterlockedCompareExchange8(& mutex, 1, 0))
 	{
 		Sleep(0);	// just yield out the CPU time slice
 	}
@@ -270,7 +268,7 @@ int LOCALAPI TSingleProviderMultipleConsumerQ<TLogItem>::Pop(TLogItem *p)
 	count--;
 
 l_bailout:
-	_InterlockedExchange8(& mutex, SHARED_FREE);	// with memory barrier release semantics assumed
+	_InterlockedExchange8(& mutex, 0);	// with memory barrier release semantics assumed
 	return i;
 }
 
@@ -395,10 +393,10 @@ int LOCALAPI ControlBlock::Init(int32_t sendSize, int32_t recvSize)
 	// here we let it interleaved:
 	// send buffer descriptors, receive buffer descriptors, receive buffer blocks and send buffer blocks
 	// we're sure that FSP_SocketBuf itself is 64-bit aligned. to make buffer block 64-bit aligned
-	sendBufDescriptors = (sizeof(ControlBlock) + 7) & 0xFFFFFFF8;
-	recvBufDescriptors = sendBufDescriptors + sizeof(FSP_SocketBuf) * sendBufferBlockN;
-	recvBuffer = (sendBufDescriptors + sizeDescriptors + 7) & 0xFFFFFFF8;
-	sendBuffer = recvBuffer + recvBufferBlockN * MAX_BLOCK_SIZE;
+	_InterlockedExchange(& sendBufDescriptors, (sizeof(ControlBlock) + 7) & 0xFFFFFFF8);
+	_InterlockedExchange(& recvBufDescriptors, sendBufDescriptors + sizeof(FSP_SocketBuf) * sendBufferBlockN);
+	_InterlockedExchange(& recvBuffer, (sendBufDescriptors + sizeDescriptors + 7) & 0xFFFFFFF8);
+	_InterlockedExchange(& sendBuffer, recvBuffer + recvBufferBlockN * MAX_BLOCK_SIZE);
 
 	memset((BYTE *)this + sendBufDescriptors, 0, sizeDescriptors);
 
@@ -436,7 +434,7 @@ ControlBlock::PFSP_SocketBuf ControlBlock::GetSendBuf()
 		return NULL;
 
 	register PFSP_SocketBuf p = HeadSend() + sendBufferNextPos++;
-	p->InitFlags();
+	p->InitFlags();	// and locked
 	sendBufferNextSN++;
 	RoundSendBufferNextPos();
 
@@ -510,17 +508,17 @@ int ControlBlock::MarkSendQueue(void * buf, int n, bool toBeContinued)
 	m = (n - 1) / MAX_BLOCK_SIZE;
 	for(int j = 0; j < m; j++)
 	{
-		p->InitFlags();
+		p->InitFlags();	// and locked
 		p->version = THIS_FSP_VERSION;
 		p->opCode = PURE_DATA;
 		p->len = MAX_BLOCK_SIZE;
-		p->SetFlag<TO_BE_CONTINUED>(true);
+		p->SetFlag<TO_BE_CONTINUED>();
 		p->SetFlag<IS_COMPLETED>();
 		p->Unlock();	// so it could be send
 		p++;
 	}
 	//
-	p->InitFlags();
+	p->InitFlags();	// and locked
 	p->version = THIS_FSP_VERSION;
 	p->opCode = PURE_DATA;
 	p->len = n - MAX_BLOCK_SIZE * m;
@@ -546,8 +544,8 @@ int ControlBlock::MarkSendQueue(void * buf, int n, bool toBeContinued)
 //	flags and the advertised receive window size field of the FSP header 
 void LOCALAPI ControlBlock::SetSequenceFlags(FSP_NormalPacketHeader *pHdr, PFSP_SocketBuf skb, seq_t seq)
 {
-	pHdr->expectedSN = get32BE(&recvWindowNextSN);
-	pHdr->sequenceNo = get32BE(&seq);
+	pHdr->expectedSN = htobe32(recvWindowNextSN);
+	pHdr->sequenceNo = htobe32(seq);
 	pHdr->ClearFlags();	// pHdr->u.flags = 0;
 	if (skb->GetFlag<TO_BE_CONTINUED>())
 		pHdr->SetFlag<ToBeContinued>();
@@ -568,8 +566,8 @@ void LOCALAPI ControlBlock::SetSequenceFlags(FSP_NormalPacketHeader *pHdr, PFSP_
 //	flags and the advertised receive window size field of the FSP header 
 void LOCALAPI ControlBlock::SetSequenceFlags(FSP_NormalPacketHeader *pHdr, seq_t seqExpected)
 {
-	pHdr->expectedSN = get32BE(&seqExpected);
-	pHdr->sequenceNo = get32BE(&sendWindowNextSN);
+	pHdr->sequenceNo = htobe32(sendWindowNextSN);
+	pHdr->expectedSN = htobe32(seqExpected);
 	pHdr->ClearFlags();
 	pHdr->SetRecvWS(RecvWindowSize());
 }
@@ -583,8 +581,8 @@ void LOCALAPI ControlBlock::SetSequenceFlags(FSP_NormalPacketHeader *pHdr, seq_t
 //	flags and the advertised receive window size field of the FSP header 
 void LOCALAPI ControlBlock::SetSequenceFlags(FSP_NormalPacketHeader *pHdr)
 {
-	pHdr->expectedSN = get32BE(&recvWindowNextSN);
-	pHdr->sequenceNo = get32BE(&sendWindowNextSN);
+	pHdr->expectedSN = htobe32(recvWindowNextSN);
+	pHdr->sequenceNo = htobe32(sendWindowNextSN);
 	pHdr->ClearFlags();
 	pHdr->SetRecvWS(RecvWindowSize());
 }
@@ -596,7 +594,7 @@ void LOCALAPI ControlBlock::SetSequenceFlags(FSP_NormalPacketHeader *pHdr)
 // Do
 //	Get a receive buffer block from the receive window and set the sequence number
 // Return
-//	The descriptor of the receive buffer block
+//	The locked descriptor of the receive buffer block
 // Remark
 //	It is assumed that it is unnecessary to worry about atomicity of (recvWindowNextSN, recvWindowNextPos)
 //  the caller should check and handle duplication of the received data packet
@@ -638,7 +636,7 @@ ControlBlock::PFSP_SocketBuf LOCALAPI ControlBlock::AllocRecvBuf(seq_t seq1)
 		}
 	}
 	//
-	p->InitFlags();
+	p->InitFlags();	// and locked
 	return p;
 }
 

@@ -90,10 +90,7 @@ int FSPAPI Commit(FSPHANDLE hFSPSocket, NotifyOrReturn fp1)
 			return -EDOM;
 		//
 		if(p->InState(COMMITTED) || p->InState(CLOSABLE) || p->InState(PRE_CLOSED) || p->InState(CLOSED))
-		{
-			p->SelfNotify(FSP_NotifyFlushed);
-			return 0;
-		}
+			return EBADF;	// warning that the socket has already been committed
 		//
 		return p->Commit();
 	}
@@ -126,7 +123,7 @@ int FSPAPI Shutdown(FSPHANDLE hFSPSocket)
 	register CSocketItemDl * p = (CSocketItemDl *)hFSPSocket;
 	try
 	{
-		if (p == NULL || !p->IsInUse() || p->InState(NON_EXISTENT))
+		if (p == NULL || !p->IsInUse())
 			return -EBADF;
 		//
 		// ALWAYS assume shutdown is only called after it has finished receiving
@@ -134,15 +131,15 @@ int FSPAPI Shutdown(FSPHANDLE hFSPSocket)
 		if(! p->WaitSetMutex())
 			return -EINTR;
 
-		if(p->InState(CLOSED))
+		if(p->InState(CLOSED) || p->InState(NON_EXISTENT))
 		{
-			p->SelfNotify(FSP_NotifyRecycled);
 			p->SetMutexFree();
 			return EBADF;	// A warning saying that the socket has already been closed
 		}
 
 		if (p->InState(COMMITTED) || p->InState(CLOSABLE))
 		{
+			// Send RELEASE and wait peer's RELEASE. LLS to signal NotifyFinish, NotifyReset or NotifyTimeout
 			p->SetMutexFree();
 			return (p->Call<FSP_Shutdown>() ? 0 : -EIO);
 		}
@@ -179,17 +176,32 @@ int FSPAPI Shutdown(FSPHANDLE hFSPSocket)
 //[API: Commit]
 //	{ACTIVE, RESUMING}-->COMMITTING-->[Urge COMMIT]
 //	PEER_COMMIT-->COMMITTING2-->[Urge COMMIT]{restart keep-alive}
+// Return
+//	-EINTR if cannot gain the exclusive lock
+//	-EDOM if in erraneous state
+//	-ETIMEDOUT if blocked due to lack of buffer 
+// Remark
 //	It might be blocking to wait the send buffer slot to buffer the COMMIT packet
 int CSocketItemDl::Commit()
 {
 	eomSending = EndOfMessageFlag::END_OF_SESSION;
 	//
+	if(! WaitSetMutex())
+		return -EINTR;
+
 	if (InState(ESTABLISHED) || InState(RESUMING))
+	{
 		SetState(COMMITTING);
+	}
 	else if (InState(PEER_COMMIT))
+	{
 		SetState(COMMITTING2);
+	}
 	else if (!InState(COMMITTING) && !InState(COMMITTING2))
+	{
+		SetMutexFree();
 		return -EDOM;
+	}
 	//
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->GetLastBufferedSend();
 	if(skb != NULL && skb->Lock())
@@ -210,9 +222,12 @@ int CSocketItemDl::Commit()
 		time_t t0 = time(NULL);
 		while((skb = pControlBlock->GetSendBuf()) == NULL)
 		{
+			SetMutexFree();
 			Sleep(1);
 			if(time(NULL) - t0 > TRASIENT_STATE_TIMEOUT_ms)
 				return -ETIMEDOUT;
+			if(! WaitSetMutex())
+				return -EINTR;
 		}
 		skb->len = 0;
 	}
@@ -221,6 +236,7 @@ int CSocketItemDl::Commit()
 	skb->SetFlag<IS_COMPLETED>();
 	//
 	skb->Unlock();
+	SetMutexFree();
 	return (Call<FSP_Urge>() ? 0 : -EIO);
 }
 

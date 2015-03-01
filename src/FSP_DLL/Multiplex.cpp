@@ -91,8 +91,8 @@ FSPHANDLE FSPAPI ConnectMU(FSPHANDLE hFSP, PFSP_Context psp1)
 		psp1->u.flags = EBADF;	// E_HANDLE;
 		return NULL;
 	}
-	// TODO: SHOULD derive ephemeral session key from the parent session at first. See also CopyKey()
 	// TODO: SHOULD constuct the MULTIPLY command packet
+	// TODO: SHOULD install a new, derived session key!
 	return socketItem->CallCreate(objCommand, SynConnection);
 }
 
@@ -110,12 +110,6 @@ FSPHANDLE FSPAPI ConnectMU(FSPHANDLE hFSP, PFSP_Context psp1)
 // «È–Œ3£∫RESET...
 bool LOCALAPI CSocketItemDl::ToWelcomeMultiply(BackLogItem & backLog)
 {
-	if(CopyKey(backLog.idParent) < 0)
-	{
-		TRACE_HERE("Process listening backlog: : illegal multiplication, silently discard it");
-		return false;
-	}
-
 	// Multiply: but the upper layer application may still throttle it...fpRequested CANNOT read or write anything!
 	PFSP_IN6_ADDR remoteAddr = (PFSP_IN6_ADDR) & pControlBlock->peerAddr.ipFSP.allowedPrefixes[MAX_PHY_INTERFACES-1];
 

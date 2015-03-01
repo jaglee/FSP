@@ -110,6 +110,7 @@ int main(int argc, char * argv[])
 	if(hFspListen != NULL)
 		Dispose(hFspListen);
 
+	getchar();
 	return 0;
 }
 
@@ -192,7 +193,11 @@ static int FSPAPI toSendNextBlock(FSPHANDLE h, void * batchBuffer, int32_t capac
 	if(r)
 	{
 		printf("All content has been sent. To shutdown.\n");
-		Shutdown(h);
+		if(Shutdown(h) != 0)
+		{
+			Dispose(h);
+			finished = true;
+		}
 		return -1;
 	}
 

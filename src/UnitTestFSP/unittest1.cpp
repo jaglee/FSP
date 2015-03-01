@@ -54,7 +54,7 @@ class CSocketItemExDbg: public CSocketItemEx
 public:
 	CSocketItemExDbg()
 	{
-		isMilky = 0;	// RespondSNACK cares it
+		// isMilky = 0;	// RespondSNACK cares it
 		hMemoryMap = NULL;
 		hEvent = NULL;
 		pControlBlock = (ControlBlock *)malloc
@@ -63,7 +63,7 @@ public:
 	};
 	CSocketItemExDbg(int nSend, int nRecv)
 	{
-		isMilky = 0;	// RespondSNACK cares it
+		// isMilky = 0;	// RespondSNACK cares it
 		hMemoryMap = NULL;
 		hEvent = NULL;
 		pControlBlock = (ControlBlock *)malloc
@@ -83,8 +83,8 @@ public:
 	ControlBlock::PFSP_SocketBuf AllocRecvBuf(ControlBlock::seq_t seq1) { return pControlBlock->AllocRecvBuf(seq1); }
 
 	friend void UnitTestSocketInState();
+	friend void UnitTestReceiveQueue();
 	friend void UnitTestResendQueue();
-	friend void UnitTestPacketBuffer();
 };
 
 
@@ -193,7 +193,7 @@ void UnitTestSendRecvWnd()
 	skb5->len = MAX_BLOCK_SIZE;
 	skb5->SetFlag<TO_BE_CONTINUED>();
 	skb5->SetFlag<IS_FULFILLED>();
-	skb5->MarkInSending();
+	skb5->Lock();
 
 	skb5 = pSCB->AllocRecvBuf(FIRST_SN + 2);
 	Assert::IsNotNull(skb5);
@@ -202,7 +202,7 @@ void UnitTestSendRecvWnd()
 	skb5->len = MAX_BLOCK_SIZE - 13;
 	skb5->SetFlag<TO_BE_CONTINUED>(false);
 	skb5->SetFlag<IS_FULFILLED>();
-	skb5->MarkInSending();
+	skb5->Lock();
 
 	// emulate a received-ahead packet
 	skb5 = pSCB->AllocRecvBuf(FIRST_SN + 4);
@@ -789,7 +789,7 @@ void UnitTestQuasibitfield()
 void UnitTestTestSetFlag()
 {
 	static ControlBlock::FSP_SocketBuf buf;
-	Assert::IsTrue(buf.TestSetFlag<IS_COMPLETED>());
+	buf.SetFlag<IS_COMPLETED>();
 	Assert::IsTrue(buf.flags == 1 << IS_COMPLETED);
 }
 
@@ -918,14 +918,14 @@ void UnitTestAcknowledge()
 	Assert::IsTrue(pSCB->sendWindowSize == 1);	// set by GetVeryFirstSendBuf
 	Assert::IsTrue(pSCB->sendBufferNextSN == FIRST_SN + 1);
 	skb->SetFlag<IS_COMPLETED>();
-	skb->MarkInSending();
+	skb->Lock();
 
 	skb = pSCB->GetSendBuf();
 	skb->SetFlag<IS_COMPLETED>();
-	skb->MarkInSending();
+	skb->Lock();
 	pSCB->GetSendBuf();
 	skb->SetFlag<IS_COMPLETED>();
-	skb->MarkInSending();
+	skb->Lock();
 	Assert::IsTrue(pSCB->sendBufferNextSN == FIRST_SN + 3);
 
 	// emulate sending, together with setting skb->timeOut
@@ -946,7 +946,7 @@ void UnitTestAcknowledge()
 		skb = pSCB->GetSendBuf();
 		Assert::IsTrue(skb != NULL);
 		skb->SetFlag<IS_COMPLETED>();
-		skb->MarkInSending();
+		skb->Lock();
 	}
 	pSCB->sendWindowNextSN += MAX_BLOCK_NUM - 3;
 	Assert::IsTrue(pSCB->sendWindowNextSN == FIRST_SN + MAX_BLOCK_NUM);
@@ -1007,7 +1007,7 @@ void UnitTestAcknowledge()
 		skb = pSCB->GetSendBuf();
 		Assert::IsTrue(skb != NULL);
 		skb->SetFlag<IS_COMPLETED>();
-		skb->MarkInSending();
+		skb->Lock();
 	}
 	pSCB->sendWindowNextSN += 0x10000;	// queuing to send is not the same as sending
 
@@ -1032,23 +1032,6 @@ void UnitTestSocketInState()
 	socket.SetState(CLOSABLE);
 	r = socket.InStates(4, COMMITTING2, RESUMING, QUASI_ACTIVE, CLOSED);
 	Assert::IsFalse(r);
-}
-
-
-
-void UnitTestPacketBuffer()
-{
-	CSocketItemExDbg socket(2, 2);
-	PktSignature pktSign;
-
-	memset(& socket, 0, sizeof(CSocketItemExDbg));
-	pktSign.pkt = (FSP_NormalPacketHeader *)0x10;
-	// Peek...return the header packet descriptor itself
-
-	PktSignature *p = socket.PushPacketBuffer(& pktSign);
-	FSP_NormalPacketHeader *hdr = socket.PeekLockPacketBuffer();
-	Assert::IsNotNull(hdr);
-	socket.PopUnlockPacketBuffer();
 }
 
 
@@ -1139,22 +1122,9 @@ void UnitTestDerivedClass()
 class CLowerInterfaceDbg: public CLowerInterface
 {
 public:
-	BYTE *	CurrentHead() { return bufferMemory + sizeof(PktSignature) + bufHead; }
+	PktBufferBlock *CurrentHead() { return freeBufferHead; }
 	friend	void UnitTestReceiveQueue();
-	friend	void UnitTestBufferManagement();
 };
-
-
-
-void UnitTestBufferManagement()
-{
-	CLowerInterfaceDbg  intf;
-	BYTE * p = intf.BeginGetBuffer();
-	Assert::IsNotNull(p);
-	intf.CommitGetBuffer(p, 64);
-	intf.FreeBuffer(p);
-	// TODO: pressure test
-}
 
 
 
@@ -1174,25 +1144,35 @@ void UnitTestReceiveQueue()
 		DbgRaiseAssertionFailure();
 	}
 	CLowerInterfaceDbg & lowerSrv = *pLowerSrv;
+	CSocketItemExDbg socket(2, 2);
 
-	const int MAX_BLOCKS = MAX_BUFFER_MEMORY / (sizeof(PktSignature) + MAX_LLS_BLOCK_SIZE);
-	BYTE *p0 = lowerSrv.BeginGetBuffer();
-	BYTE *p = p0;
-	for(int i = 0; i < MAX_BLOCKS; i++)
+	lowerSrv.InitBuffer();	// initialize the chained list of the free blocks
+
+	PktBufferBlock *p0 = lowerSrv.GetBuffer();
+	PktBufferBlock *p = p0;
+	for(int i = 0; i < MAX_BUFFER_BLOCKS; i++)
 	{
 		Assert::IsTrue(p != NULL);
-		lowerSrv.CommitGetBuffer(p, MAX_LLS_BLOCK_SIZE - 3);
-		Assert::IsTrue(((PktSignature *)p - 1)->size == MAX_LLS_BLOCK_SIZE + 1);
-		p = lowerSrv.BeginGetBuffer();
+		p = lowerSrv.GetBuffer();
 	}
 	Assert::IsTrue(p == NULL);
 	//
+	memset(& socket, 0, sizeof(CSocketItemExDbg));
+
+	socket.PushPacketBuffer(p0);
+
+	// Peek...return the header packet descriptor itself
+	FSP_NormalPacketHeader *hdr = socket.PeekLockPacketBuffer();
+	Assert::IsNotNull(hdr);
+	socket.PopUnlockPacketBuffer();
+
+	// So, p0 has been freed
 	p = p0;
-	for(int i = 0; i < MAX_BLOCKS; i++)
+	for(int i = 0; i < MAX_BUFFER_BLOCKS - 1; i++)
 	{
+		Assert::IsTrue(p == lowerSrv.CurrentHead());	// what? needs it been asserted?
+		p++;
 		lowerSrv.FreeBuffer(p);
-		p += MAX_LLS_BLOCK_SIZE + sizeof(PktSignature);
-		Assert::IsTrue(p == lowerSrv.CurrentHead());
 	}
 }
 
@@ -1262,6 +1242,104 @@ void UnitTestHeaderManager()
 }
 
 
+// TODO...
+static void pbuf(void *p, int len, char *s)
+{
+	int i;
+	if (s)
+		printf("%s", s);
+	for (i = 0; i < len; i++)
+		printf("%02x", ((unsigned char *)p)[i]);
+	printf("\n");
+}
+
+
+
+void UnitTestVMAC_AE()
+{
+	vmac_ae_ctx_t *ctx;
+	uint64_t tagh, tagh2, tagl, tagl2;
+	void *p;
+	unsigned char *m, *ct, *pt;
+	unsigned char key[] = "abcdefghijklmnop";
+	unsigned char nonce[] = "bcdefghi\0\0\0\0\0\0\0\0";
+	unsigned int  vector_lengths[] = {0, 3, 48, 300, 3000000};
+	#if (VMAC_TAG_LEN == 64)
+	char *should_be[] = {"4EDE4AE94EDD87E1","3E4DA5C2AAD72DD9",
+	                     "386A3E7B2867701B","48827AB2ABA0191D",
+	                     "400563BE24C6B88A"};
+	#else
+	char *should_be[] = {"E87569084EFF3E1CCA1500C5A6A89CE6",
+	                     "BE94EE5EF0B907A0917BCB8FE772AB08",
+	                     "DF371629033248692F31ABA01270DC05",
+	                     "17C9B2477A6B256F5B80B40292BE0E34",
+	                     "B9CCCE965D131DEF578CAC1CA56476B6"};
+	#endif
+	unsigned speed_lengths[] = {16, 32, 64, 128, 256, 512, 1024, 2048, 4096};
+	unsigned speed_iters[] = {1<<22, 1<<21, 1<<20, 1<<19, 1<<18,
+	                               1<<17, 1<<16, 1<<15, 1<<14};
+	unsigned int i, j;
+    clock_t ticks;
+    double cpb;
+	const unsigned int buf_len = 3 * (1 << 20);
+	
+	/* Initialize context and message buffer, all 16-byte aligned */
+	p = malloc(sizeof(vmac_ae_ctx_t) + 16);
+	ctx = (vmac_ae_ctx_t *)(((size_t)p + 16) & ~((size_t)15));
+	p = malloc(buf_len + 32);
+	m = (unsigned char *)(((size_t)p + 16) & ~((size_t)15));
+	p = malloc(buf_len + 32);
+	ct = (unsigned char *)(((size_t)p + 16) & ~((size_t)15));
+	p = malloc(buf_len + 32);
+	pt = (unsigned char *)(((size_t)p + 16) & ~((size_t)15));
+	/* memset(m, 0, buf_len + 16); */
+	vmac_ae_set_key(key, ctx);
+	vmac_ae_reset(ctx);
+	
+	/* Generate vectors */
+	for (i = 0; i < sizeof(vector_lengths)/sizeof(unsigned int); i++) {
+		for (j = 0; j < vector_lengths[i]; j++)
+			m[j] = (unsigned char)('a'+j%3);
+		vmac_ae_header(m, vector_lengths[i], ctx);
+		vmac_ae_encrypt(m, ct, vector_lengths[i], nonce, 8, ctx);
+		vmac_ae_footer(m, vector_lengths[i], ctx);
+		tagh = vmac_ae_finalize(&tagl, ctx);
+		vmac_ae_header(m, vector_lengths[i], ctx);
+		vmac_ae_decrypt(ct, pt, vector_lengths[i], nonce, 8, ctx);
+		vmac_ae_footer(m, vector_lengths[i], ctx);
+		tagh2 = vmac_ae_finalize(&tagl2, ctx);
+		#if (VMAC_TAG_LEN == 64)
+		printf("\'abc\' * %7u: %016llX Should be: %s\n",
+		      vector_lengths[i]/3,tagh,should_be[i]);
+		printf("Encrypt/decrypt %s, tags %s\n",
+		      (memcmp(pt, m, vector_lengths[i])  ? "mismatch" : "match"),
+		      (tagh == tagh2 ? "match" : "mismatch"));
+		#else
+		printf("\'abc\' * %7u: %016llX%016llX\nShould be      : %s\n",
+		      vector_lengths[i]/3,tagh,tagl,should_be[i]);
+		printf("Encrypt/decrypt %s, tags %s\n",
+		      (memcmp(pt, m, vector_lengths[i])  ? "mismatch" : "match"),
+		      ((tagh == tagh2) && (tagl == tagl2) ? "match" : "mismatch"));
+		#endif
+	}
+	
+	/* Speed test */
+#if 1
+#define VMAC_HZ  2e9	// 2Ghz
+	for (i = 0; i < sizeof(speed_lengths)/sizeof(unsigned int); i++) {
+		ticks = clock();
+		for (j = 0; j < speed_iters[i]; j++) {
+			vmac_ae_encrypt(m, ct, speed_lengths[i], nonce, 8, ctx);
+			tagh = vmac_ae_finalize(&tagl, ctx);
+			nonce[7]++;
+		}
+		ticks = clock() - ticks;
+		cpb = ((ticks*VMAC_HZ)/
+		      ((double)CLOCKS_PER_SEC*speed_lengths[i]*speed_iters[i]));
+		printf("%4u bytes, %2.2f cpb\n", speed_lengths[i], cpb);
+	}
+#endif
+}
 
 namespace UnitTestFSP
 {		
@@ -1307,6 +1385,15 @@ namespace UnitTestFSP
 		}
 
 
+		TEST_METHOD(TestVMAC_AE)
+		{
+#if 0
+			// as VMAC_AE failed unit test we remove VMAC support
+			UnitTestVMAC_AE();
+#endif
+		}
+
+
 		TEST_METHOD(TestQuasibitfield)
 		{
 			UnitTestQuasibitfield();
@@ -1322,12 +1409,6 @@ namespace UnitTestFSP
 		TEST_METHOD(TestSocketSrvTLB)
 		{
 			UnitTestSocketSrvTLB();
-		}
-
-
-		TEST_METHOD(TestBufferManagement)
-		{
-			UnitTestBufferManagement();
 		}
 
 
@@ -1372,12 +1453,6 @@ namespace UnitTestFSP
 		TEST_METHOD(TestSocketInState)
 		{
 			UnitTestSocketInState();
-		}
-
-
-		TEST_METHOD(TestPacketBuffer)
-		{
-			UnitTestPacketBuffer();
 		}
 
 

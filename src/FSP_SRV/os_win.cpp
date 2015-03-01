@@ -150,10 +150,8 @@ CLowerInterface::CLowerInterface()
 	sinkInfo.Control.buf = (char *) & nearInfo;
 	sinkInfo.Control.len = sizeof(nearInfo);
 
-	bufHead = bufTail = 0;
-	memset(bufferMemory, 0, sizeof(bufferMemory));
-
-	mutex = SHARED_FREE;
+	InitBuffer();
+	SetMutexFree();
 	pSingleInstance = this;
 
 	// only after the required fields initialized may the listener thread started
@@ -165,9 +163,7 @@ CLowerInterface::CLowerInterface()
 		, this		// LPVOID lpParameter
 		, 0			// DWORD dwCreationFlags: run on creation
 		, & idReceiver);	// LPDWORD lpThreadId
-#ifdef TRACE
-	printf("Thead ID of the receiver of the packet from the remote end point = %d\r\n", idReceiver);
-#endif
+	printf_s("Thead ID of the receiver of the packet from the remote end point = %d\r\n", idReceiver);
 	if(thReceiver == NULL)
 	{
 		REPORT_ERROR_ON_TRACE();
@@ -286,8 +282,7 @@ inline void CLowerInterface::LearnAddresses()
 	for (register long i = table->NumEntries - 1; i >= 0; i--)
 	{
 		p = &table->Table[i].Address.Ipv6.sin6_addr;
-
-#ifdef TRACE
+		// show which interfaces were bound
 		inet_ntop(AF_INET6, p, strIPv6Addr, sizeof(strIPv6Addr));
 		printf_s("\n%s\nInterfaceIndex = %d, DaD state = %d, ScopeId = %d, SkipAsSource = %d\n"
 			, strIPv6Addr
@@ -298,12 +293,12 @@ inline void CLowerInterface::LearnAddresses()
 			);
 		//table->Table[i].PrefixOrigin;
 		//table->Table[i].OnLinkPrefixLength;
-#endif
 
 		// UNRESOLVED!!	// only for unspecified/global scope:?
 		if (table->Table[i].ScopeId.Value != 0)
 			continue;
-		if (table->Table[i].DadState != IpDadStateTentative && table->Table[i].DadState != IpDadStatePreferred)
+		//table->Table[i].DadState != IpDadStateTentative && 
+		if (table->Table[i].DadState != IpDadStatePreferred)
 			continue;
 
 		// Here it is compatible with single physical interfaced host in multi-homed site
@@ -408,14 +403,13 @@ int CLowerInterface::BindInterface(SOCKET sd, PSOCKADDR_IN pAddrListen, int k)
 {
 	DWORD isHeaderIncluded = TRUE;	// boolean
 
-#ifdef TRACE
 	printf_s("Bind to listen at UDP socket address: %d.%d.%d.%d:%d\n"
 		, pAddrListen->sin_addr.S_un.S_un_b.s_b1
 		, pAddrListen->sin_addr.S_un.S_un_b.s_b2
 		, pAddrListen->sin_addr.S_un.S_un_b.s_b3
 		, pAddrListen->sin_addr.S_un.S_un_b.s_b4
 		, ntohs(pAddrListen->sin_port));
-#endif
+
 	memcpy(& addresses[k], pAddrListen, sizeof(SOCKADDR_IN));
 	interfaces[k] = 0;
 
@@ -469,12 +463,6 @@ inline void CLowerInterface::LearnAddresses()
 	for (register int i = 0; i < listAddress.iAddressCount; i++)
 	{
 		p = (PSOCKADDR_IN)listAddress.Address[i].lpSockaddr;
-#ifdef TRACE
-		printf_s("#%d socket interface address family: %d, length: %d\n"
-			, i
-			, p->sin_family
-			, listAddress.Address[i].iSockaddrLength);
-#endif
 		if (p->sin_family != AF_INET)
 			throw E_UNEXPECTED;	// memory corruption!
 		//
@@ -541,60 +529,40 @@ inline void CLowerInterface::PoolingALFIDs()
 
 
 
-/**
- * A simple memory allocation mechanism based on contiguous segment
- */
-inline BYTE * CLowerInterface::BeginGetBuffer()
+// multi-threaded buffer meant to keep busy receivers from starving occasional network users
+inline void CLowerInterface::InitBuffer()
 {
-	register int i = bufTail;
-	if(i > MAX_BUFFER_MEMORY - sizeof(PktSignature) - MAX_LLS_BLOCK_SIZE)
-		i = 0;
-	PktSignature *pSignature = (PktSignature *)(bufferMemory + i);
-	if((pSignature->size & 1) == 1)
-		return NULL;	// the segment is already in use
-	return (BYTE *)(pSignature + 1);
-}
+	memset(bufferMemory, 0, sizeof(bufferMemory));
 
-
-
-inline void LOCALAPI CLowerInterface::CommitGetBuffer(BYTE *p, size_t size)
-{
-	PktSignature *pSignature = (PktSignature *)(p - sizeof(PktSignature));
-	// hard-coded: assume MAX_LLS_BLOCK_SIZE never exceed 1MiB and sizeof(size_t) never exceed 8
-	size = (size + 7) & 0xFFFF8;
-	pSignature->size =  size | 1;
-	bufTail = (int)(p + size - bufferMemory);
-}
-
-
-
-inline void LOCALAPI CLowerInterface::FreeBuffer(BYTE *p)
-{
-	PktSignature *pSignature = (PktSignature *)(p - sizeof(PktSignature));
-	bool secondRound = false;	// just guard against dead-loop
-	pSignature->size &= 0xFFFF8;	// hard coded: at most 1MB
-	if(pSignature == (PktSignature *)(bufferMemory + bufHead))
+	register PktBufferBlock *p = NULL;
+	for(register int i = MAX_BUFFER_BLOCKS - 1; i >= 0; i--)
 	{
-		do
-		{
-			bufHead += (int)(sizeof(PktSignature) + pSignature->size);
-			if(bufHead == bufTail)
-				break;	// See also CommitGetBuffer()
-			if(secondRound && bufHead > bufTail)
-			{
-				REPORT_ERRMSG_ON_TRACE("possibly falled into dead-loop");
-				break;
-			}
-			if(bufHead > MAX_BUFFER_MEMORY - sizeof(PktSignature) - MAX_LLS_BLOCK_SIZE)
-			{
-				bufHead = 0;
-				secondRound = true;
-			}
-			if(bufHead == bufTail)
-				break;	// See also BeginGetBuffer()
-		} while(! (((PktSignature *)(bufferMemory + bufHead))->size & 1));
+		bufferMemory[i].next = p;
+		p = & bufferMemory[i];
 	}
+
+	freeBufferHead = p;
 }
+
+
+inline PktBufferBlock * CLowerInterface::GetBuffer()
+{
+	register PktBufferBlock *p = freeBufferHead;
+	if(p == NULL)
+		return NULL;
+	//
+	freeBufferHead = p->next;
+	return p;
+}
+
+
+// UNRESOLVED! Check validity of the buffer block signature?
+inline void LOCALAPI CLowerInterface::FreeBuffer(PktBufferBlock *p)
+{
+	p->next = freeBufferHead;
+	freeBufferHead = p;
+}
+
 
 
 // retrieve message from remote end point
@@ -642,10 +610,7 @@ inline void CLowerInterface::ProcessRemotePacket()
 		}
 		for(i = 0; i < (int) readFDs.fd_count; i++)
 		{
-			while(_InterlockedCompareExchange8(& this->mutex
-				, SHARED_BUSY
-				, SHARED_FREE) 
-				!= SHARED_FREE)
+			while(_InterlockedCompareExchange8(& this->mutex, 1, 0))
 			{
 				Sleep(0);	// just yield out the CPU time slice
 			}
@@ -654,7 +619,7 @@ inline void CLowerInterface::ProcessRemotePacket()
 			sinkInfo.dwFlags = 0;
 			sdRecv = readFDs.fd_array[i];
 			r = AcceptAndProcess();
-			mutex = SHARED_FREE;
+			SetMutexFree();
 			//
 			if(r == E_ABORT)
 				return;
@@ -666,14 +631,20 @@ inline void CLowerInterface::ProcessRemotePacket()
 
 int CLowerInterface::AcceptAndProcess()
 {
-	if((pktBuf = BeginGetBuffer()) == NULL)
+	if((pktBuf = GetBuffer()) == NULL)
 		return ENOMEM;	
 
 	// Unfortunately, it was proven that no matter whether there is MSG_PEEK
 	// MSG_PARTIAL is not supported by the underlying raw socket service
 	// so scattered I/O is actually unutilized.
 	WSABUF	scatteredBuf[1];
-	scatteredBuf[0].buf = (CHAR *)pktBuf;
+	// FSP is meant to optimize towards IPv6. OVER_UDP_IPv4 is just for conceptual test
+	// NO! We don't intend to support dual-stack in FSP.
+#ifdef OVER_UDP_IPv4
+	scatteredBuf[0].buf = (CHAR *) & pktBuf->idPair;
+#else
+	scatteredBuf[0].buf = (CHAR *) & pktBuf->hdr;
+#endif
 	scatteredBuf[0].len = MAX_LLS_BLOCK_SIZE;
 	sinkInfo.lpBuffers = scatteredBuf;
 	sinkInfo.dwBufferCount = 1;
@@ -682,14 +653,20 @@ int CLowerInterface::AcceptAndProcess()
 	if(r != 0)
 	{
 		REPORT_WSAERROR_TRACE("Cannot receive packet information");
-		mutex = SHARED_FREE;
+		SetMutexFree();
 		return E_ABORT; // TO DO: crash recovery
 	}
 
-	CommitGetBuffer(pktBuf, countRecv);
+	// From the receiver's point of view the local fiber id was stored in the peer fiber id field of the received packet
+#ifdef OVER_UDP_IPv4
+	nearInfo.u.idALF = pktBuf->idPair.peer;
+	SOCKADDR_ALFID(sinkInfo.name) = pktBuf->idPair.source;
+#else
+	pktBuf->idPair.peer = nearInfo.u.idALF;
+	pktBuf->idPair.source = SOCKADDR_ALFID(sinkInfo.name);
+#endif
 
-	FSPOperationCode opCode = (FSPOperationCode)
-		(nearInfo.IsIPv6() ? HeaderFSP().hs.opCode : HeaderFSPoverUDP().hs.opCode);
+	FSPOperationCode opCode = (FSPOperationCode) pktBuf->hdr.hs.opCode;
 #ifdef TRACE_PACKET
 	printf_s("Packet of opCode %d[%s] received\n", (int)opCode, opCodeStrings[opCode]);
 	printf_s("Remote address:\n");
@@ -699,7 +676,6 @@ int CLowerInterface::AcceptAndProcess()
 #endif
 	int lenPrefix = nearInfo.IsIPv6() ? 0 : sizeof(PairALFID );
 	CSocketItemEx *pSocket = NULL;
-	PktSignature *pSignature;
 	switch(opCode)
 	{
 	case INIT_CONNECT:
@@ -748,14 +724,12 @@ int CLowerInterface::AcceptAndProcess()
 			break;
 		}
 		//
-		pSignature = (PktSignature *)pktBuf - 1;	// assume aligned_malloc
-		pSignature->pkt = FSP_OperationHeader<FSP_NormalPacketHeader>();
-		pSignature->pktSeqNo = ntohl(pSignature->pkt->sequenceNo);
-		pSignature->lenData = countRecv - lenPrefix - ntohs(pSignature->pkt->hs.hsp);
+		pktBuf->pktSeqNo = ntohl(pktBuf->GetHeaderFSP()->sequenceNo);
+		pktBuf->lenData = countRecv - lenPrefix - ntohs(pktBuf->GetHeaderFSP()->hs.hsp);
 #ifdef TRACE_PACKET
 		printf_s("packet #%u, payload length %d, to put onto the queue\n", pSignature->pktSeqNo, pSignature->lenData);
 #endif
-		if(pSignature->lenData < 0 || pSignature->lenData > MAX_BLOCK_SIZE)
+		if(pktBuf->lenData < 0 || pktBuf->lenData > MAX_BLOCK_SIZE)
 		{
 			pSocket->HandleMemoryCorruption();
 			pSocket = NULL;	// FreeBuffer(pktBuf);
@@ -766,7 +740,8 @@ int CLowerInterface::AcceptAndProcess()
 #ifdef TRACE_PACKET
 		printf_s("Socket : 0x%08X , buffer : 0x%08X queued\n", (LONG)pSocket, (LONG)pSignature->pkt);
 #endif
-		if(pSocket->PushPacketBuffer(pSignature) == NULL)
+		// only if the queue has not started needs it queue HandleICC
+		if(pSocket->PushPacketBuffer(pktBuf) == NULL)
 			QueueUserWorkItem(HandleFullICC, pSocket, WT_EXECUTEDEFAULT);
 		break;
 	default:
@@ -791,33 +766,25 @@ int CLowerInterface::AcceptAndProcess()
 //	Number of bytes actually sent (0 means error)
 // Remark
 //	It is safely assume that remote and near address are of the same address family
-
 int LOCALAPI CLowerInterface::SendBack(char * buf, int len)
 {
-	// the final WSAMSG structure
-	PairALFID fidPair;
 	WSABUF wsaData[2];
+#ifdef OVER_UDP_IPv4
+	// Store the local(near end) fiber ID as the source, the remote end fiber ID as
+	// the destination fiber ID in the given fiber ID association
+	pktBuf->idPair.peer = InterlockedExchange(& pktBuf->idPair.source, pktBuf->idPair.peer);
+	wsaData[0].buf = (char *) & pktBuf->idPair;
+	wsaData[0].len = sizeof(pktBuf->idPair);
+#else
 	IPv6_HEADER hdrIN6;
-
+	//
+	hdrIN6.Set(len, (PIN6_ADDR)& nearInfo.u, (PIN6_ADDR)& addrFrom.Ipv6.sin6_addr);
+	wsaData[0].buf = (char *)& hdrIN6;
+	wsaData[0].len = sizeof(hdrIN6);
+#endif
 	wsaData[1].buf = buf;
 	wsaData[1].len = len;
-	if (nearInfo.IsIPv6())
-	{
-		hdrIN6.Set(len, (PIN6_ADDR)& nearInfo.u, (PIN6_ADDR)& addrFrom.Ipv6.sin6_addr);
-		wsaData[0].buf = (char *)& hdrIN6;
-		wsaData[0].len = sizeof(hdrIN6);
-	}
-	else
-	{
-		// Store the local(near end) fiber ID as the source, the remote end fiber ID as
-		// the destination fiber ID in the given fiber ID association
-		fidPair.peer = HeaderFSPoverUDP().source;
-		fidPair.source = HeaderFSPoverUDP().peer;
-		wsaData[0].buf = (char *)& fidPair;
-		wsaData[0].len = sizeof(fidPair);
-	}
-	//
-#ifdef TRACE
+#ifdef TRACE_PACKET
 	printf_s("Send back to (namelen = %d):\n", sinkInfo.namelen);
 	DumpNetworkUInt16((UINT16 *)& addrFrom, sinkInfo.namelen / 2);
 #endif
@@ -832,7 +799,7 @@ int LOCALAPI CLowerInterface::SendBack(char * buf, int len)
 		ReportWSAError("CLowerInterface::SendBack");
 		return 0;
 	}
-#ifdef TRACE
+#ifdef TRACE_PACKET
 	printf("%s, line %d, %d bytes sent back.\n", __FILE__, __LINE__, n);
 	printf("Peer name length = %d, socket address:\n", sinkInfo.namelen);
 	DumpNetworkUInt16((UINT16 *)& addrFrom, sizeof(SOCKADDR_IN6) / 2);
@@ -840,6 +807,38 @@ int LOCALAPI CLowerInterface::SendBack(char * buf, int len)
 	return n;
 }
 
+
+
+
+
+// Given
+//	CSocketItemEx *	the pointer to the premature socket (default NULL)
+//	UINT32			reason code flags of reset (default zero)
+// Do
+//	Send back the echoed reset at the same interface of receiving
+//	in CHALLENGING, CONNECT_AFFIRMING, unresumable CLOSABLE and unrecoverable CLOSED state,
+//	and of course, throttled LISTENING state
+void LOCALAPI CLowerInterface::SendPrematureReset(UINT32 reasons, CSocketItemEx *pSocket)
+{
+	TRACE_HERE("called");
+
+	struct FSP_RejectConnect reject;
+	reject.reasons = reasons;
+	reject.hs.Set<FSP_RejectConnect, RESET>();
+	if(pSocket)
+	{
+		// In CHALLENGING, CONNECT_AFFIRMING where the peer address is known
+		reject.u.timeStamp = htonll(NowUTC());
+		// See also CSocketItemEx::Emit() and SetIntegrityCheckCode():
+		reject.u2.fidPair = pSocket->fidPair;
+		pSocket->SendPacket(1, ScatteredSendBuffers(&reject, sizeof(reject)));
+	}
+	else
+	{
+		memcpy(& reject, pktBuf->GetHeaderFSP(), sizeof(reject.u) + sizeof(reject.u2));
+		SendBack((char *) & reject, sizeof(reject));
+	}
+}
 
 
 
@@ -1020,10 +1019,10 @@ bool CSocketItemEx::AddTimer()
 //	clockCheckPoint and tLastRecv must be well defined
 void CSocketItemEx::EarlierKeepAlive()
 {
-//#ifdef TRACE
-//	TRACE_HERE("keep alive earlier");
-//	DumpTimerInfo(tLastRecv);
-//#endif
+#ifdef TRACE_PACKET
+	TRACE_HERE("keep alive earlier");
+	DumpTimerInfo(tLastRecv);
+#endif
 	if (clockCheckPoint.tKeepAlive - tLastRecv < tRoundTrip_us)
 		return;
 	//
@@ -1087,19 +1086,19 @@ void CSocketItemEx::ScheduleConnect(CommandNewSessionSrv *pCmd)
 }
 
 
-
+// Given
+//	PktSignature *	the pointer to the next packe buffer to be put into the receive-process queue of the socket
+// Return
+//	Previous tail pointer of the receive-process queue. Null if there is no receive-process queue previously
 inline
-PktSignature * CSocketItemEx::PushPacketBuffer(PktSignature *pNext)
+PktBufferBlock * CSocketItemEx::PushPacketBuffer(PktBufferBlock *pNext)
 {
-	while(_InterlockedCompareExchange8(& mutex
-		, SHARED_BUSY
-		, SHARED_FREE)
-		!= SHARED_FREE)
+	while(_InterlockedCompareExchange8(& mutex, 1, 0))
 	{
 		Sleep(0);	// just yield out the CPU time slice
 	}
 
-	PktSignature *p = tailPacket;
+	PktBufferBlock *p = tailPacket;
 	pNext->next = NULL;
 	if(p == NULL)
 	{
@@ -1111,7 +1110,7 @@ PktSignature * CSocketItemEx::PushPacketBuffer(PktSignature *pNext)
 		tailPacket = pNext;
 	}
 
-	mutex = SHARED_FREE;
+	SetMutexFree();
 	return p;
 }
 
@@ -1121,10 +1120,7 @@ PktSignature * CSocketItemEx::PushPacketBuffer(PktSignature *pNext)
 inline
 FSP_NormalPacketHeader * CSocketItemEx::PeekLockPacketBuffer()
 {
-	while(_InterlockedCompareExchange8(& mutex
-		, SHARED_BUSY
-		, SHARED_FREE)
-		!= SHARED_FREE)
+	while(_InterlockedCompareExchange8(& mutex, 1, 0))
 	{
 		Sleep(0);	// just yield out the CPU time slice
 	}
@@ -1132,11 +1128,11 @@ FSP_NormalPacketHeader * CSocketItemEx::PeekLockPacketBuffer()
 	if(headPacket == NULL)
 	{
 		// assert(tailPacket == NULL);
-		mutex = SHARED_FREE;
+		SetMutexFree();
 		return NULL;
 	}
 
-	return headPacket->pkt;
+	return headPacket->GetHeaderFSP();
 }
 
 
@@ -1148,17 +1144,17 @@ void CSocketItemEx::PopUnlockPacketBuffer()
 	if(headPacket == NULL)
 	{
 		// assert(tailPacket == NULL);
-		mutex = SHARED_FREE;
+		SetMutexFree();
 		return;
 	}
 
-	PktSignature *p = headPacket->next;	// MUST put before FreeBuffer or else it may be overwritten
-	CLowerInterface::Singleton()->FreeBuffer((BYTE *)headPacket + sizeof(PktSignature));
+	PktBufferBlock *p = headPacket->next;	// MUST put before FreeBuffer or else it may be overwritten
+	CLowerInterface::Singleton()->FreeBuffer(headPacket);
 
 	if((headPacket = p) == NULL)
 		tailPacket = NULL;
 
-	mutex = SHARED_FREE;
+	SetMutexFree();
 }
 
 
@@ -1345,14 +1341,14 @@ int CSocketItemEx::SendPacket(register ULONG n1, ScatteredSendBuffers s)
 
 int ConnectRequestQueue::Push(const CommandNewSessionSrv *p)
 {
-	while(_InterlockedCompareExchange8(& mutex, SHARED_BUSY, SHARED_FREE) != SHARED_FREE)
+	while(_InterlockedCompareExchange8(& mutex, 1, 0))
 	{
 		Sleep(0);
 	}
 	//
 	if(mayFull != 0 && tail == head)
 	{
-		mutex = SHARED_FREE;
+		SetMutexFree();
 		return -1;
 	}
 
@@ -1362,7 +1358,7 @@ int ConnectRequestQueue::Push(const CommandNewSessionSrv *p)
 	q[i] = *p;
 	mayFull = 1;
 	//
-	mutex = SHARED_FREE;
+	SetMutexFree();
 	return i;
 }
 
@@ -1375,7 +1371,7 @@ int ConnectRequestQueue::Push(const CommandNewSessionSrv *p)
 //	-1	if no item could be removed
 int ConnectRequestQueue::Remove(int i)
 {
-	while(_InterlockedCompareExchange8(& mutex, SHARED_BUSY, SHARED_FREE) != SHARED_FREE)
+	while(_InterlockedCompareExchange8(& mutex, 1, 0))
 	{
 		Sleep(0);
 	}
@@ -1385,7 +1381,7 @@ int ConnectRequestQueue::Remove(int i)
 	//
 	if(mayFull == 0 && head == tail)
 	{
-		mutex = SHARED_FREE;
+		SetMutexFree();
 		return -1;
 	}
 	//
@@ -1398,7 +1394,7 @@ int ConnectRequestQueue::Remove(int i)
 		} while(head != tail && q[head].opCode == NullCommand);
 	mayFull = 0;
 	//
-	mutex = SHARED_FREE;
+	SetMutexFree();
 	return 0;
 }	
 

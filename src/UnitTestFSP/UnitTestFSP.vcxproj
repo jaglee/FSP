@@ -68,7 +68,7 @@
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <AdditionalLibraryDirectories>$(VCInstallDir)UnitTest\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>C:\MinGW\msys\1.0\local\lib\libgmp.a;C:\MinGW\lib\gcc\mingw32\4.7.2\libgcc.a;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
@@ -88,7 +88,7 @@
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
       <AdditionalLibraryDirectories>$(VCInstallDir)UnitTest\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>C:\MinGW\msys\1.0\local\lib\libgmp.a;C:\MinGW\lib\gcc\mingw32\4.7.2\libgcc.a;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>%(AdditionalDependencies)</AdditionalDependencies>
       <ImageHasSafeExceptionHandlers>false</ImageHasSafeExceptionHandlers>
     </Link>
   </ItemDefinitionGroup>
@@ -100,11 +100,13 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="..\ControlBlock.cpp" />
+    <ClCompile Include="..\FSP_SRV\CubicRoot.c" />
     <ClCompile Include="..\FSP_SRV\mobile.cpp" />
     <ClCompile Include="..\FSP_SRV\os_win.cpp" />
     <ClCompile Include="..\FSP_SRV\remote.cpp" />
     <ClCompile Include="..\FSP_SRV\socket.cpp" />
     <ClCompile Include="..\FSP_SRV\timers.cpp" />
+    <ClCompile Include="..\FSP_SRV\vmac_ae.c" />
     <ClCompile Include="..\rijndael-alg-fst.c" />
     <ClCompile Include="..\vmac.c" />
     <ClCompile Include="unittest1.cpp" />

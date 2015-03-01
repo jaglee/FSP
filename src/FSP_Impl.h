@@ -46,14 +46,11 @@
 
 #include <limits.h>
 #include <errno.h>
+#include <stdio.h>
 
-#include "vmac.h"
+// borrow intrinsic pragmas
+#include "gcm-aes.h"
 #define	MAC_ALIGNMENT 16
-
-// X86 intrinsic, support by ARM
-// TODO: gcc equivalence?
-#include <intrin.h>
-#pragma intrinsic(memset, memcpy)
 
 #if (_MSC_VER >= 1600)
 #pragma intrinsic(_InterlockedCompareExchange8, _InterlockedExchange8)
@@ -75,6 +72,14 @@ FORCEINLINE char _InterlockedExchange8(volatile char * a, char b)
 	__asm mov	AL, b;
 	__asm xchg	AL, byte ptr[ecx];
 }
+
+
+FORCEINLINE char _InterlockedExchange16(volatile short * a, short b)
+{
+	__asm mov	ecx, a;
+	__asm mov	AX, b;
+	__asm xchg	AX, word ptr[ecx];
+}
 #endif
 
 
@@ -82,7 +87,6 @@ FORCEINLINE char _InterlockedExchange8(volatile char * a, char b)
  * For testability
  */
 #ifdef TRACE
-# include <stdio.h>
 # define TRACE_HERE(s) printf("\n/**\n * %s, line %d\n * %s\n * %s\n */\n", __FILE__, __LINE__, __FUNCDNAME__, s)
 # define REPORT_ERROR_ON_TRACE() \
 	TraceLastError(__FILE__, __LINE__, __FUNCDNAME__, "ERROR REPORT")
@@ -138,10 +142,6 @@ extern CStringizeNotice noticeNames;
 #else
 #define	CONNECT_BACKLOG_SIZE	512
 #endif
-
-// value space of mutex defined by this application
-#define SHARED_BUSY 1
-#define SHARED_FREE 0
 
 /**
  * Implementation defined timeout
@@ -200,13 +200,13 @@ struct $FSP_HeaderSignature: FSP_HeaderSignature
 	{
 		version = THIS_FSP_VERSION;
 		opCode = opCode1;
-		hsp = uint16BE(sizeof(THdr));
+		hsp = htobe16(sizeof(THdr));
 	}
 	template<BYTE opCode1> void Set(int len1)
 	{
 		version = THIS_FSP_VERSION;
 		opCode = opCode1;
-		hsp = uint16BE(len1);
+		hsp = htobe16(len1);
 	}
 };
 
@@ -479,12 +479,12 @@ class CSocketItem;	// forward declaration for sake of declaring ControlBlock
 
 // It heavily depends on Address Space Layout Randomization and user-space memory segment isolation
 // or similar measures to pretect sensive information, integrity and privacy, of user process
-volatile struct ControlBlock
+struct ControlBlock
 {
 	ALIGN(8)
-	FSP_Session_State state;
+	volatile FSP_Session_State state;
 
-	// By design only a sparned/branched(multiplexed/cloned) connection may be milky
+	// By design only a spawned/branched(multiplexed/cloned) connection may be milky
 	ALIGN(4)	// sizeof(LONG)
 	UINT32		allowedDelay;	// 0 if it is wine-alike payload, non-zero if milky; in microseconds
 
@@ -516,15 +516,6 @@ volatile struct ControlBlock
 		SConnectParam connectParams;
 		BYTE sessionKey[FSP_SESSION_KEY_LEN];	// overlay with 'initCheckCode' and 'cookie'
 	} u;
-#ifndef NDEBUG
-#define MAC_CTX_PROTECT_SIGN	0xA5A5C3C3A5C3A5C3ULL
-	ALIGN(MAC_ALIGNMENT)
-	uint64_t	_mac_ctx_protect_prolog[2];
-#endif
-	vmac_ctx_t	mac_ctx;
-#ifndef NDEBUG
-	uint64_t	_mac_ctx_protect_epilog[2];
-#endif
 
 	// 4: The (very short, roll-out) queue of returned notices
 	FSP_ServiceCode notices[FSP_MAX_NUM_NOTICE];
@@ -547,8 +538,6 @@ private:
 	int32_t		sendBufferNextPos;	// the index number of the block with sendBufferNextSN
 	//
 	int32_t		sendBufferBlockN;	// capacity of the send buffer
-	uint32_t	sendBuffer;			// relative to start of the control block
-	uint32_t	sendBufDescriptors;	// relative to start of the control block,
 
 	seq_t		recvWindowNextSN;	// the next to the right-border of the received area
 	int32_t		recvWindowNextPos;	// the index number of the block with recvWindowNextSN
@@ -561,9 +550,11 @@ private:
 	seq_t		welcomedNextSNtoSend;
 	//
 	int32_t		recvBufferBlockN;	// capacity of the receive buffer
-	uint32_t	recvBuffer;			// relative to start of the control block
-	uint32_t	recvBufDescriptors;	// relative to start of the control block
 
+	volatile	long	sendBufDescriptors;	// relative to start of the control block, may be updated via memory map
+	volatile	long	recvBufDescriptors;	// relative to start of the control block, may be updated via memory map
+	volatile	long	sendBuffer;			// relative to start of the control block
+	volatile	long	recvBuffer;			// relative to start of the control block
 public:
 	// Total size of FSP_SocketBuf (descriptor): 8 bytes (a 64-bit word)
 	typedef struct FSP_SocketBuf
@@ -577,30 +568,27 @@ public:
 		void SetFlag(bool value = true)
 		{
 			if(value)
-				flags |= (1 << i);
+				_InterlockedOr16((SHORT *) & flags, 1 << i);
 			else
-				flags &= ~(uint16_t)(1 << i); 
+				_InterlockedAnd16((SHORT *) & flags, ~(uint16_t)(1 << i)); 
 		}
 		template<SocketBufFlagBitPosition i>
 		bool GetFlag() const { return (flags & (1 << i)) != 0; }
-		// TestSetFlag return false if the bit is already set. Works for little-endian CPU only
-		template<SocketBufFlagBitPosition i>
-		bool TestSetFlag() { return _interlockedbittestandset((LONG *) & flags, i) == FALSE; }
 		//
 		bool Lock();
 		void Unlock() { SetFlag<EXCLUSIVE_LOCK>(false); }
 		//
-		void InitFlags() { flags = 1 << EXCLUSIVE_LOCK; }
+		void InitFlags() { _InterlockedExchange16((SHORT *) & flags, 1 << EXCLUSIVE_LOCK); }
 	} *PFSP_SocketBuf;
 
 	// Convert the relative address in the control block to the address in process space, unchecked
-	BYTE * GetSendPtr(const PFSP_SocketBuf skb) const
+	BYTE * GetSendPtr(const PFSP_SocketBuf skb)
 	{
 		PFSP_SocketBuf p0 = PFSP_SocketBuf((BYTE *)this + sendBufDescriptors);
 		uint32_t offset = sendBuffer + MAX_BLOCK_SIZE * uint32_t(skb - p0);
 		return (BYTE *)this + offset;
 	}
-	BYTE * GetSendPtr(const ControlBlock::PFSP_SocketBuf skb, uint32_t &offset) const
+	BYTE * GetSendPtr(const ControlBlock::PFSP_SocketBuf skb, uint32_t &offset)
 	{
 		PFSP_SocketBuf p0 = PFSP_SocketBuf((BYTE *)this + sendBufDescriptors);
 		offset = sendBuffer	+ MAX_BLOCK_SIZE * uint32_t(skb - p0);
@@ -788,7 +776,7 @@ protected:
 	DWORD	dwMemorySize;	// size of the shared memory, in the mapped view
 	ControlBlock *pControlBlock;
 
-	void SetReturned() { pControlBlock->notices[0] = NullCommand; }	// clear the 'NOT-returned' notice
+	void SetReturned() { _InterlockedExchange8((char *)pControlBlock->notices, NullCommand); }	// clear the 'NOT-returned' notice
 
 	~CSocketItem() { Destroy(); }
 	void Destroy()

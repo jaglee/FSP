@@ -57,7 +57,7 @@ int main(int argc, char * argv[])
 		, & attrSecurity);
 	if(md == INVALID_HANDLE_VALUE)
 	{
-		printf("Panic! Cannot create the mailslot to accept service request.\n");
+		printf("Panic!Cannot create the mailslot to accept service request.\n");
 		return -1;
 	}
 
@@ -68,7 +68,7 @@ int main(int argc, char * argv[])
 	}
 	catch(HRESULT x)
 	{
-		// TODO: UNRESOLVED! handle the exception?!
+		// TODO: UNRESOLVED!handle the exception?!
 		printf("In main: exception number 0x%X, cannot access lower interface, aborted.\n", x); 
 		goto l_bailout;
 	}
@@ -79,7 +79,7 @@ int main(int argc, char * argv[])
 	}
 	catch(HRESULT x)
 	{
-		printf("In main: exception number 0x%X, internal panic! Cannot start the timer\n", x); 
+		printf("In main: exception number 0x%X, internal panic!Cannot start the timer\n", x); 
 		goto l_bailout;
 	}
 
@@ -190,7 +190,7 @@ static void LOCALAPI ProcessCommand(HANDLE md)
 	BYTE buffer[MAX_CTRLBUF_LEN];
 	DWORD nBytesRead;
 	CommandToLLS *pCmd = (CommandToLLS *) buffer;
-	// TODO: UNRESOLVED! there should be performance profiling variables to record how many commands have been processed?
+	// TODO: UNRESOLVED!there should be performance profiling variables to record how many commands have been processed?
     static int n = 0;
 	CSocketItemEx *pSocket;
 	// TRACE_HERE("called");
@@ -205,11 +205,9 @@ static void LOCALAPI ProcessCommand(HANDLE md)
 		switch(pCmd->opCode)
 		{
 		case FSP_Listen:		// register a passive socket
-#ifdef TRACE
 			printf_s("Requested to listen on local fiber#%d, assigned event trigger is %s\n"
 				, pCmd->fiberID
 				, ((CommandNewSession *)pCmd)->szEventName);
-#endif
 			Listen(CommandNewSessionSrv(pCmd));
 			break;
 		case InitConnection:	// register an initiative socket			
@@ -220,10 +218,10 @@ static void LOCALAPI ProcessCommand(HANDLE md)
 			break;
 		default:
 			pSocket = (CSocketItemEx *)(*CLowerInterface::Singleton())[pCmd->fiberID];
-			if(pSocket == NULL || ! pSocket->IsInUse())
+			if(pSocket == NULL || !pSocket->IsInUse())
 			{
 #ifdef TRACE
-				printf_s("%s (code = %d) called for local fiber#%u\n"
+				printf_s("Erratic!%s (code = %d) called for invalid local fiber#%u\n"
 					, opCodeStrings[pCmd->opCode]
 					, pCmd->opCode
 					, pCmd->fiberID);
@@ -268,7 +266,7 @@ static void LOCALAPI ProcessCommand(HANDLE md)
 		n++;
 	}
 #ifndef NDEBUG
-	// TODO: UNRESOLVED! Crash Recovery? if ReadFile fails, it is a crash
-	printf("Fatal! Read mailslot error, command channel broken\n");
+	// TODO: UNRESOLVED!Crash Recovery? if ReadFile fails, it is a crash
+	printf("Fatal!Read mailslot error, command channel broken\n");
 #endif
 }

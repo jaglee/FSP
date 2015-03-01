@@ -54,7 +54,7 @@ CSocketSrvTLB::CSocketSrvTLB()
 	}
 	tailFreeSID->next = NULL;	// reset last 'next' pointer
 	//
-	mutex = SHARED_FREE;
+	SetMutexFree();
 }
 
 
@@ -62,10 +62,7 @@ CSocketSrvTLB::CSocketSrvTLB()
 CSocketItemEx * CSocketSrvTLB::AllocItem()
 {
 	// TODO: UNRESOLVED!? Make sure it is multi-thread/muti-core safe
-	while(_InterlockedCompareExchange8(& this->mutex
-		, SHARED_BUSY
-		, SHARED_FREE) 
-		!= SHARED_FREE)
+	while(_InterlockedCompareExchange8(& this->mutex, 1, 0))
 	{
 		Sleep(0);	// just yield out the CPU time slice
 	}
@@ -76,22 +73,18 @@ CSocketItemEx * CSocketSrvTLB::AllocItem()
 		headFreeSID = p->next;
 		if(headFreeSID == NULL)
 			tailFreeSID = NULL;
-		p->isReady = 0;
+		_InterlockedExchange8(& p->isReady, 0);
 		// See also Extinguish()
-		if(p->inUse)
+		if(_InterlockedExchange8(& p->inUse, 1))
 		{
 			p->RemoveTimer();
 			p->Destroy();
-		}
-		else
-		{
-			p->inUse = 1;
 		}
 		//
 		p->next = NULL;
 	}
 
-	this->mutex = SHARED_FREE;
+	SetMutexFree();
 	return p;
 }
 
@@ -100,10 +93,7 @@ CSocketItemEx * CSocketSrvTLB::AllocItem()
 CSocketItemEx * CSocketSrvTLB::AllocItem(ALFID_T idListener)
 {
 	// TODO: UNRESOLVED!? Make sure it is multi-thread/muti-core safe
-	while(_InterlockedCompareExchange8(& this->mutex
-		, SHARED_BUSY
-		, SHARED_FREE) 
-		!= SHARED_FREE)
+	while(_InterlockedCompareExchange8(& this->mutex, 1, 0))
 	{
 		Sleep(0);	// just yield out the CPU time slice
 	}
@@ -117,9 +107,8 @@ CSocketItemEx * CSocketSrvTLB::AllocItem(ALFID_T idListener)
 		{
 			p = & listenerSlots[i];
 			p->SetPassive();
-			p->isReady = 0;
-			p->inUse = 1;
 			p->fidPair.source = idListener;
+			p->SetNotReadyUse();
 			// do not break, for purpose of duplicate allocation detection
 		}
 		else if(listenerSlots[i].inUse && listenerSlots[i].fidPair.source == idListener)
@@ -159,7 +148,7 @@ CSocketItemEx * CSocketSrvTLB::AllocItem(ALFID_T idListener)
 		}
 	}
 
-	this->mutex = SHARED_FREE;
+	SetMutexFree();
 	return p;
 }
 
@@ -167,10 +156,7 @@ CSocketItemEx * CSocketSrvTLB::AllocItem(ALFID_T idListener)
 void CSocketSrvTLB::FreeItem(CSocketItemEx *p)
 {
 	// TODO: UNRESOLVED!? Make sure it is multi-thread/muti-core safe
-	while(_InterlockedCompareExchange8(& this->mutex
-		, SHARED_BUSY
-		, SHARED_FREE) 
-		!= SHARED_FREE)
+	while(_InterlockedCompareExchange8(& this->mutex, 1, 0))
 	{
 		Sleep(0);	// just yield out the CPU time slice
 	}
@@ -202,7 +188,7 @@ void CSocketSrvTLB::FreeItem(CSocketItemEx *p)
 			poolFiberID[p->fidPair.source & (MAX_CONNECTION_NUM - 1)] = p1->prevSame;
 		}
 		// else keep at least one entry in the context-addressing TLB
-		this->mutex = SHARED_FREE;
+		SetMutexFree();
 		return;
 	}
 
@@ -219,7 +205,7 @@ void CSocketSrvTLB::FreeItem(CSocketItemEx *p)
 	}
 	// postpone processing inUse until next allocation
 
-	this->mutex = SHARED_FREE;
+	SetMutexFree();
 }
 
 
@@ -238,12 +224,9 @@ CSocketItemEx * CSocketSrvTLB::operator[](ALFID_T id)
 
 
 
-CSocketItemEx * CSocketSrvTLB::operator[](const CommandNewSessionSrv & cmd)
+CSocketItemEx * CSocketSrvTLB::AllocItem(const CommandNewSessionSrv & cmd)
 {
-	while(_InterlockedCompareExchange8(& this->mutex
-		, SHARED_BUSY
-		, SHARED_FREE) 
-		!= SHARED_FREE)
+	while(_InterlockedCompareExchange8(& this->mutex, 1, 0))
 	{
 		Sleep(0);	// just yield out the CPU time slice
 	}
@@ -266,7 +249,7 @@ CSocketItemEx * CSocketSrvTLB::operator[](const CommandNewSessionSrv & cmd)
 		p->SetReady();
 	}
 l_return:
-	this->mutex = SHARED_FREE;
+	SetMutexFree();
 	return p;
 }
 
@@ -319,12 +302,11 @@ void CSocketItemEx::InitAssociation()
 	{
 		pControlBlock->nearEnd[i].idALF = fidPair.source;
 	}
-#ifdef TRACE
+#ifndef NDEBUG
 	printf_s("InitAssociation, fiber ID pair: (%u, %u)\n"
 		, fidPair.source
 		, fidPair.peer);
 #endif
-	isMilky = char(pControlBlock->allowedDelay > 0);	// 0 or 1
 	lowState = pControlBlock->state;
 	SetReady();
 }
@@ -347,8 +329,8 @@ void LOCALAPI CSocketItemEx::SetRemoteFiberID(ALFID_T id)
 // Initialize near and remote fiber ID as well
 bool CSocketItemEx::MapControlBlock(const CommandNewSessionSrv &cmd)
 {
-#ifdef TRACE
-	printf(__FUNCDNAME__ " called, source process id = %d, size of the shared memory = 0x%X\n", cmd.idProcess, cmd.dwMemorySize);
+#ifndef NDEBUG
+	printf_s(__FUNCDNAME__ " called, source process id = %d, size of the shared memory = 0x%X\n", cmd.idProcess, cmd.dwMemorySize);
 #endif
 	// TODO: UNRESOLVED! To be reviewed: is it safe to reuse the shared memory?
 	if(idSrcProcess == cmd.idProcess && hSrcMemory == cmd.hMemoryMap)
@@ -366,7 +348,7 @@ bool CSocketItemEx::MapControlBlock(const CommandNewSessionSrv &cmd)
 		return false;
 	}
 #ifdef TRACE
-	printf("Handle of the source process is %I64X, handle of the shared memory in the source process is %I64X\n"
+	printf_s("Handle of the source process is %I64X, handle of the shared memory in the source process is %I64X\n"
 		, (long long)hThatProcess
 		, (long long)cmd.hMemoryMap);
 #endif
@@ -385,7 +367,7 @@ bool CSocketItemEx::MapControlBlock(const CommandNewSessionSrv &cmd)
 	}
 
 #ifdef TRACE
-	printf("Handle of the mapped memory in current process is %I64X\n", (long long)hMemoryMap);
+	printf_s("Handle of the mapped memory in current process is %I64X\n", (long long)hMemoryMap);
 #endif
 
 	dwMemorySize = cmd.dwMemorySize;
@@ -398,7 +380,7 @@ bool CSocketItemEx::MapControlBlock(const CommandNewSessionSrv &cmd)
 		goto l_bailout1;
 	}
 #ifdef TRACE
-	printf("Successfully take use of the shared memory object.\r\n");
+	printf_s("Successfully take use of the shared memory object.\r\n");
 #endif
 
 	CloseHandle(hThatProcess);
@@ -433,7 +415,7 @@ int LOCALAPI CSocketItemEx::GenerateSNACK(BYTE * buf, ControlBlock::seq_t & seq0
 	if (n < 0)
 	{
 #ifdef TRACE
-		printf_s("GetSelectiveNACK return -%X\n", -n);
+		printf_s("GetSelectiveNACK return -0x%X\n", -n);
 #endif
 		return n;
 	}
@@ -482,16 +464,22 @@ void CSocketItemEx::InitiateConnect()
 	skb->len = sizeof(FSP_InitiateRequest);
 	//
 	// Overlay INIT_CONNECT and CONNECT_REQUEST
-	FSP_ConnectRequest & request = *(FSP_ConnectRequest *)GetSendPtr(skb);
-	request.initCheckCode = initState.initCheckCode;
-	request.salt = initState.salt;
-	request.hs.Set<FSP_InitiateRequest, INIT_CONNECT>();	// See also AffirmConnect()
+	FSP_ConnectRequest *q = (FSP_ConnectRequest *)GetSendPtr(skb);
+	if(q == NULL)
+	{
+		TRACE_HERE("Memory corruption!");
+		return;
+	}
+	q->initCheckCode = initState.initCheckCode;
+	q->salt = initState.salt;
+	q->hs.Set<FSP_InitiateRequest, INIT_CONNECT>();	// See also AffirmConnect()
 
-	request.timeStamp = htonll(initState.timeStamp);
+	q->timeStamp = htonll(initState.timeStamp);
 	skb->SetFlag<IS_COMPLETED>();	// for resend
 	// it neednot be unlocked
-	SendPacket(1, ScatteredSendBuffers(& request, sizeof(FSP_InitiateRequest)));
+	SendPacket(1, ScatteredSendBuffers(q, sizeof(FSP_InitiateRequest)));
 	// initState.timeStamp is not necessarily tRecentSend
+	SetEarliestSendTime();
 
 	if(timer != NULL)
 	{
@@ -514,7 +502,10 @@ void LOCALAPI CSocketItemEx::AffirmConnect(const SConnectParam & initState, ALFI
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend(); // Reuse what's occupied by INIT_CONNECT
 	FSP_ConnectRequest *pkt = (FSP_ConnectRequest *)this->GetSendPtr(skb);
 	if(pkt == NULL)
+	{
+		TRACE_HERE("memory corruption");
 		return;
+	}
 
 	SetState(CONNECT_AFFIRMING);
 
@@ -536,12 +527,10 @@ void LOCALAPI CSocketItemEx::AffirmConnect(const SConnectParam & initState, ALFI
 	// TODO: UNRESOLVED! For FSP over IPv6, attach inititator's resource reservation...
 
 	// Safely suppose that internal processing takes orders of magnitude less time than network propagation
-	tEarliestSend = tRecentSend;	// tRecentSend was set in InitiateConnect's SendPacket
 	SendPacket(1, ScatteredSendBuffers(pkt, skb->len));	// it would set tRecentSend
 	//
 	tRoundTrip_us = uint32_t(min(UINT32_MAX, tRecentSend - tEarliestSend));
 	// after ACK_CONNECT_REQ would 'tKeepAlive_ms = tRoundTrip_us >> 8';
-	SetEarliestSendTime();
 
 	congestCtrl.Reset();
 }
@@ -629,10 +618,10 @@ void CSocketItemEx::OnResurrect()
 // See also Extinguish() and *::TimeOut() {case NON_EXISTENT}
 void CSocketItemEx::DisposeOnReset()
 {
-	pControlBlock->notices[0] = FSP_NotifyReset;
+	_InterlockedExchange8((char *)pControlBlock->notices, FSP_NotifyReset);
+	SetState(NON_EXISTENT);
 	// It is somewhat an NMI to ULA
 	SignalEvent();
-	SetState(NON_EXISTENT);
 	ReplaceTimer(TRASIENT_STATE_TIMEOUT_ms);
 }
 

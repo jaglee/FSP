@@ -224,6 +224,10 @@
 				RelativePath="..\vmac.c"
 				>
 			</File>
+			<File
+				RelativePath=".\vmac_ae.c"
+				>
+			</File>
 		</Filter>
 		<Filter
 			Name="Header Files"

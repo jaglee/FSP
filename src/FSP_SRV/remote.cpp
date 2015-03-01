@@ -44,10 +44,8 @@
 #define TRACE_SOCKET()
 #endif
 
-static const char READY_FOR_USE[2] = { 1, 1 };
-static const char NOT_READY_USE[2] = { 1, 0 };
 
-
+// Allas! it would be very concise in the Swift language
 inline
 bool CSocketItemEx::InStates(int n, ...)
 {
@@ -60,17 +58,6 @@ bool CSocketItemEx::InStates(int n, ...)
 	}
 	va_end(allowedStates);
 	return false;
-}
-
-
-
-// It is assumed that inUse and isReady are stored compactly (octet by octet)
-inline
-bool CSocketItemEx::TestAndLockReady()
-{
-	return _InterlockedCompareExchange16((SHORT *) & inUse
-		, *(SHORT *)NOT_READY_USE
-		, *(SHORT *)READY_FOR_USE) == *(SHORT *)READY_FOR_USE; 
 }
 
 
@@ -135,17 +122,18 @@ void LOCALAPI CLowerInterface::OnGetInitConnect()
 	}
 
 	// To make the FSP challenge of the responder	
-	FSP_InitiateRequest & initRequest = *FSP_OperationHeader<FSP_InitiateRequest>();
+	FSP_InitiateRequest *q = FSP_OperationHeader<FSP_InitiateRequest>();
 	FSP_Challenge challenge;
-	// the remote address is not changed
-	timestamp_t t0 = ntohll(initRequest.timeStamp);
-	timestamp_t t1 = NowUTC();
 	struct _CookieMaterial cm;
-	challenge.initCheckCode = initRequest.initCheckCode;
+	// the remote address is not changed
+	timestamp_t t0 = ntohll(q->timeStamp);
+	timestamp_t t1 = NowUTC();
+
+	challenge.initCheckCode = q->initCheckCode;
 	cm.idALF = fiberID;
 	cm.idListener = GetLocalFiberID();
 	// the cookie depends on the listening fiber ID AND the responding fiber ID
-	cm.salt = initRequest.salt;
+	cm.salt = q->salt;
 	challenge.cookie = CalculateCookie((BYTE *) & cm, sizeof(cm), t1);
 	challenge.timeDelta = htonl((u_long)(t1 - t0));
 	challenge.hs.Set<FSP_Challenge, ACK_INIT_CONNECT>();
@@ -167,7 +155,7 @@ void LOCALAPI CLowerInterface::OnInitConnectAck()
 	TRACE_HERE("called");
 
 	//	find the socket item firstly
-	FSP_Challenge & response = *FSP_OperationHeader<FSP_Challenge>();
+	FSP_Challenge *pkt = FSP_OperationHeader<FSP_Challenge>();
 	CSocketItemEx *pSocket = MapSocket();
 	if(pSocket == NULL)
 		return;
@@ -184,14 +172,14 @@ void LOCALAPI CLowerInterface::OnInitConnectAck()
 	if(! pSocket->InState(CONNECT_BOOTSTRAP) && ! pSocket->InState(QUASI_ACTIVE))
 		goto l_return;
 
-	if(initState.initCheckCode != response.initCheckCode)
+	if(initState.initCheckCode != pkt->initCheckCode)
 		goto l_return;
 
 	// TODO: UNRESOLVED!? get resource reservation requirement from IPv6 extension header
 	pSocket->SetRemoteFiberID(initState.idRemote = this->GetRemoteFiberID());
 	//^ set to new peer fiber ID: to support multihome it is necessary even for IPv6
-	initState.timeDelta = ntohl(response.timeDelta);
-	initState.cookie = response.cookie;
+	initState.timeDelta = ntohl(pkt->timeDelta);
+	initState.cookie = pkt->cookie;
 	EnumEffectiveAddresses(initState.allowedPrefixes);
 
 	pSocket->AffirmConnect(initState, idListener);
@@ -223,7 +211,7 @@ void LOCALAPI CLowerInterface::OnGetConnectRequest()
 {
 	TRACE_HERE("called");
 
-	FSP_ConnectRequest & request = *FSP_OperationHeader<FSP_ConnectRequest>();
+	FSP_ConnectRequest *q = FSP_OperationHeader<FSP_ConnectRequest>();
 	CSocketItemEx *pSocket = MapSocket();
 
 	// Check whether it is a collision
@@ -231,7 +219,7 @@ void LOCALAPI CLowerInterface::OnGetConnectRequest()
 	{
 		if (pSocket->InState(CHALLENGING)
 		&& pSocket->fidPair.peer == this->GetRemoteFiberID()
-		&& pSocket->pControlBlock->u.connectParams.cookie == request.cookie)
+		&& pSocket->pControlBlock->u.connectParams.cookie == q->cookie)
 		{
 			pSocket->EmitStart();
 			return;	// hitted
@@ -239,19 +227,19 @@ void LOCALAPI CLowerInterface::OnGetConnectRequest()
 		// 
 		// Or else it is a collision and is silently discard in case an out-of-order RESET reset a legitimate connection
 		// UNRESOLVED! Is this a unbeatable DoS attack to initiator if there is a 'man in the middle'?
-		if (!pSocket->InState(CLOSED))
+		if (! pSocket->InState(CLOSED))
 			return;
 	}
 
 	// Silently discard the request onto illegal or non-listening socket 
 	if (pSocket == NULL || ! pSocket->IsInUse())
 	{
-		pSocket = (*this)[request.params.listenerID];	// a dialect of MapSocket
+		pSocket = (*this)[q->params.listenerID];	// a dialect of MapSocket
 		if (pSocket == NULL || !pSocket->IsPassive())
 			return;
 	}
 
-	if (!pSocket->TestAndLockReady())
+	if (! pSocket->TestAndLockReady())
 	{
 		TRACE_HERE("lost of CONNECT_REQUEST due to lack of locks");
 		return;
@@ -260,13 +248,14 @@ void LOCALAPI CLowerInterface::OnGetConnectRequest()
 	// cf. OnInitConnectAck() and SocketItemEx::AffirmConnect()
 	ALFID_T fiberID = GetLocalFiberID();
 	struct _CookieMaterial cm;
+
+	cm.idListener = q->params.listenerID;
 	cm.idALF = fiberID;
-	cm.idListener = request.params.listenerID;
-	cm.salt = request.salt;
+	cm.salt = q->salt;
 	// UNRESOLVED! TODO: search the cookie blacklist at first
-	if(request.cookie != CalculateCookie((BYTE *) & cm
+	if(q->cookie != CalculateCookie((BYTE *) & cm
 			, sizeof(cm)
-			, ntohll(request.timeStamp) + (INT32)ntohl(request.timeDelta)) )
+			, ntohll(q->timeStamp) + (INT32)ntohl(q->timeDelta)) )
 	{
 #ifdef TRACE
 		printf_s("UNRESOLVED! TODO: put the cookie into the blacklist to fight against DDoS attack!?\n");
@@ -291,23 +280,23 @@ void LOCALAPI CLowerInterface::OnGetConnectRequest()
 		fspAddr->idALF = fiberID;
 		backlogItem.acceptAddr.ipi6_ifindex = pHdr->u.ipi_ifindex;
 	}
-	backlogItem.initCheckCode = request.initCheckCode;
-	backlogItem.salt = request.salt;
+	backlogItem.initCheckCode = q->initCheckCode;
+	backlogItem.salt = q->salt;
 	backlogItem.remoteHostID = nearInfo.IsIPv6() ? SOCKADDR_HOST_ID(sinkInfo.name) : 0;
 	//^See also GetRemoteFiberID()
 	backlogItem.idRemote = GetRemoteFiberID();
 	backlogItem.idParent = 0;
-	backlogItem.cookie = request.cookie;
+	backlogItem.cookie = q->cookie;
 	// UNRESOLVED!? timeDelta, timeStamp?
 	// Simply ignore the duplicated request
 	if(pSocket->pControlBlock->HasBacklog(& backlogItem))
 		goto l_return;
 
 	rand_w32(& backlogItem.initialSN, 1);
-	backlogItem.expectedSN = ntohl(request.initialSN);	// CONNECT_REQUEST does NOT consume a sequence number
+	backlogItem.expectedSN = ntohl(q->initialSN);	// CONNECT_REQUEST does NOT consume a sequence number
 
-	assert(sizeof(backlogItem.allowedPrefixes) == sizeof(request.params.subnets));
-	memcpy(backlogItem.allowedPrefixes, request.params.subnets, sizeof(UINT64) * MAX_PHY_INTERFACES);
+	assert(sizeof(backlogItem.allowedPrefixes) == sizeof(q->params.subnets));
+	memcpy(backlogItem.allowedPrefixes, q->params.subnets, sizeof(UINT64) * MAX_PHY_INTERFACES);
 
 	// lastly, put it into the backlog
 	pSocket->pControlBlock->PushBacklog(& backlogItem);
@@ -379,37 +368,6 @@ void LOCALAPI CLowerInterface::OnGetResetSignal()
 
 
 
-// Given
-//	CSocketItemEx *	the pointer to the premature socket (default NULL)
-//	UINT32			reason code flags of reset (default zero)
-// Do
-//	Send back the echoed reset at the same interface of receiving
-//	in CHALLENGING, CONNECT_AFFIRMING, unresumable CLOSABLE and unrecoverable CLOSED state,
-//	and of course, throttled LISTENING state
-void LOCALAPI CLowerInterface::SendPrematureReset(UINT32 reasons, CSocketItemEx *pSocket)
-{
-	TRACE_HERE("called");
-
-	struct FSP_RejectConnect reject;
-	reject.reasons = reasons;
-	reject.hs.Set<FSP_RejectConnect, RESET>();
-	if(pSocket)
-	{
-		// In CHALLENGING, CONNECT_AFFIRMING where the peer address is known
-		reject.u.timeStamp = htonll(NowUTC());
-		// See also CSocketItemEx::Emit() and SetIntegrityCheckCode():
-		reject.u2.fidPair = pSocket->fidPair;
-		pSocket->SendPacket(1, ScatteredSendBuffers(&reject, sizeof(reject)));
-	}
-	else
-	{
-		BYTE *p = nearInfo.IsIPv6() ? HeaderFSP().headerContent : HeaderFSPoverUDP().headerContent;
-		memcpy(& reject, p, sizeof(reject.u) + sizeof(reject.u2));
-		SendBack((char *) & reject, sizeof(reject));
-	}
-}
-
-
 // Remark
 //	CONNECT_AFFIRMING-->/ACK_CONNECT_REQ/-->[API{callback}]
 //		|-->{Return Accept}-->ACTIVE-->[Send PERSIST]{start keep-alive}
@@ -419,7 +377,6 @@ void LOCALAPI CLowerInterface::SendPrematureReset(UINT32 reasons, CSocketItemEx 
 void LOCALAPI CSocketItemEx::OnConnectRequestAck(FSP_AckConnectRequest & response, int lenData)
 {
 	TRACE_SOCKET();
-
 	if(! InState(CONNECT_AFFIRMING))
 	{
 		TRACE_HERE("Get wandering ACK_CONNECT_REQ in non CONNECT_AFFIRMING state");
@@ -507,7 +464,6 @@ void LOCALAPI CSocketItemEx::OnConnectRequestAck(FSP_AckConnectRequest & respons
 void CSocketItemEx::OnGetPersist()
 {
 	TRACE_SOCKET();
-
 	if(! InStates(5, CHALLENGING, ESTABLISHED, RESUMING, CLONING, QUASI_ACTIVE))
 		return;
 
@@ -544,8 +500,8 @@ void CSocketItemEx::OnGetPersist()
 	}
 
 	// UNRESOLVED! TODO: split ResizeSendWindow? Merge it with 'Acknowledgement'?
-	ControlBlock::seq_t ackSeqNo = ntohl(headPacket->pkt->expectedSN);
-	if (! ResizeSendWindow(ackSeqNo, headPacket->pkt->GetRecvWS()))
+	ControlBlock::seq_t ackSeqNo = ntohl(headPacket->GetHeaderFSP()->expectedSN);
+	if (! ResizeSendWindow(ackSeqNo, headPacket->GetHeaderFSP()->GetRecvWS()))
 	{
 #ifdef TRACE
 		printf_s("Cannot resize send window. Acknowledged sequence number: %u\n", ackSeqNo);
@@ -582,7 +538,7 @@ void CSocketItemEx::OnGetPersist()
 #endif
 	pControlBlock->SlideSendWindowByOne();	// See also RespondSNACK
 
-	FSP_Header_Manager hdrManager(& headPacket->pkt);
+	FSP_Header_Manager hdrManager(headPacket->GetHeaderFSP());
 	PFSP_HeaderSignature optHdr = hdrManager.PopExtHeader<FSP_HeaderSignature>();
 	HandleMobileParam(optHdr);	// no more extension header expected for PERSIST
 
@@ -653,9 +609,9 @@ void CSocketItemEx::OnGetKeepAlive()
 		return;
 	}
 
-	ControlBlock::seq_t ackSeqNo = ntohl(headPacket->pkt->expectedSN);
-	FSP_Header_Manager hdrManager(&headPacket->pkt);
-	if (! ResizeSendWindow(ackSeqNo, headPacket->pkt->GetRecvWS()))
+	ControlBlock::seq_t ackSeqNo = ntohl(headPacket->GetHeaderFSP()->expectedSN);
+	FSP_Header_Manager hdrManager(headPacket->GetHeaderFSP());
+	if (!ResizeSendWindow(ackSeqNo, headPacket->GetHeaderFSP()->GetRecvWS()))
 	{
 #ifdef TRACE
 		printf_s("Cannot adjust the send window on KEEP_ALIVE!? Acknowledged sequence number: %u\n", ackSeqNo);
@@ -741,10 +697,10 @@ void CSocketItemEx::OnGetPureData()
 		return;
 	}
 
-	if(! ResizeSendWindow(ntohl(headPacket->pkt->expectedSN), headPacket->pkt->GetRecvWS()))
+	if(! ResizeSendWindow(ntohl(headPacket->GetHeaderFSP()->expectedSN), headPacket->GetHeaderFSP()->GetRecvWS()))
 	{
 #ifdef TRACE
-		printf_s("An out of order acknowledgement? seq#%u\n", ntohl(headPacket->pkt->expectedSN));
+		printf_s("An out of order acknowledgement? seq#%u\n", ntohl(headPacket->GetHeaderFSP()->expectedSN));
 #endif
 		return;
 	}
@@ -897,7 +853,7 @@ void CSocketItemEx::OnAckFlush()
 		SetState(COMMITTED);
 	}
 
-	RespondSNACK(ntohl(headPacket->pkt->expectedSN), NULL, 0);
+	RespondSNACK(ntohl(headPacket->GetHeaderFSP()->expectedSN), NULL, 0);
 
 	Notify(FSP_NotifyFlushed);
 }
@@ -911,7 +867,7 @@ void CSocketItemEx::OnAckFlush()
 void CSocketItemEx::OnGetResume()
 {
 	TRACE_SOCKET();
-	FSP_Header_Manager hdrManager(& headPacket->pkt);
+	FSP_Header_Manager hdrManager(headPacket->GetHeaderFSP());
 
 	// A CLOSED connnection may be resurrected, provide the session key is not out of life
 	// A replayed/redundant RESUME would be eventually acknowedged by a legitimate PERSIST
@@ -924,7 +880,7 @@ void CSocketItemEx::OnGetResume()
 	if(! ValidateICC())
 		return;
 
-	if(! ResizeSendWindow(ntohl(headPacket->pkt->expectedSN), headPacket->pkt->GetRecvWS()))
+	if(! ResizeSendWindow(ntohl(headPacket->GetHeaderFSP()->expectedSN), headPacket->GetHeaderFSP()->GetRecvWS()))
 		return;
 	tLastRecv = NowUTC();
 
@@ -1004,7 +960,7 @@ void CSocketItemEx::OnGetRelease()
 void CSocketItemEx::OnGetMultiply()
 {
 	TRACE_SOCKET();
-	FSP_Header_Manager hdrManager(& headPacket->pkt);
+	FSP_Header_Manager hdrManager(headPacket->GetHeaderFSP());
 
 	if(! InStates(6, ESTABLISHED, COMMITTING, PEER_COMMIT, COMMITTING2, COMMITTED, CLOSABLE))
 		return;
@@ -1060,6 +1016,7 @@ int LOCALAPI CSocketItemEx::PlacePayload(ControlBlock::PFSP_SocketBuf skb)
 	if(skb->GetFlag<IS_FULFILLED>())
 		return -EEXIST;
 
+	FSP_NormalPacketHeader *pHdr = headPacket->GetHeaderFSP();
 	if(headPacket->lenData > 0)
 	{
 		BYTE *ubuf = GetRecvPtr(skb);
@@ -1068,11 +1025,11 @@ int LOCALAPI CSocketItemEx::PlacePayload(ControlBlock::PFSP_SocketBuf skb)
 			HandleMemoryCorruption();
 			return -EFAULT;
 		}
-		memcpy(ubuf, (BYTE *)headPacket->pkt + ntohs(headPacket->pkt->hs.hsp), headPacket->lenData);
-		skb->SetFlag<TO_BE_CONTINUED>((headPacket->pkt->GetFlag<ToBeContinued>() != 0) && (skb->opCode != COMMIT));
+		memcpy(ubuf, (BYTE *)pHdr + ntohs(pHdr->hs.hsp), headPacket->lenData);
+		skb->SetFlag<TO_BE_CONTINUED>((pHdr->GetFlag<ToBeContinued>() != 0) && (skb->opCode != COMMIT));
 	}
-	skb->version = headPacket->pkt->hs.version;
-	skb->opCode = headPacket->pkt->hs.opCode;
+	skb->version = pHdr->hs.version;
+	skb->opCode = pHdr->hs.opCode;
 	skb->len = headPacket->lenData;
 	skb->SetFlag<IS_FULFILLED>();
 

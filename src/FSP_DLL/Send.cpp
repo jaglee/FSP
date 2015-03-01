@@ -106,7 +106,7 @@ int FSPAPI WriteTo(FSPHANDLE hFSPSocket, void * buffer, int len, char flag, Noti
 		if(fp1 == NULL)
 			return -EDOM;
 		//
-		if(! p->TestSetSendReturn(fp1))
+		if(!p->TestSetSendReturn(fp1))
 			return -EBUSY;
 		//
 		int r = p->SendStream(buffer, len, flag);
@@ -157,7 +157,7 @@ int LOCALAPI CSocketItemDl::AcquireSendBuf(int n)
 int LOCALAPI CSocketItemDl::SendInplace(void * buffer, int len, bool toBeContinued)
 {
 	if (!WaitSetMutex())
-		return -EINTR;	// UNRESOLVED! Simultaneous one send and one receive shall be allowed!
+		return -EINTR;	// UNRESOLVED!Simultaneous one send and one receive shall be allowed!
 	//
 	if (InState(NON_EXISTENT) || InState(CONNECT_BOOTSTRAP) || InState(PRE_CLOSED) || InState(CLOSED))
 	{
@@ -183,8 +183,8 @@ int LOCALAPI CSocketItemDl::SendInplace(void * buffer, int len, bool toBeContinu
 // TODO: buffer data for transactional transfer
 int LOCALAPI CSocketItemDl::SendStream(void * buffer, int len, char flag)
 {
-	if(! WaitSetMutex())
-		return -EINTR;	// UNRESOLVED! Simultaneous one send and one receive shall be allowed!
+	if(!WaitSetMutex())
+		return -EINTR;	// UNRESOLVED!Simultaneous one send and one receive shall be allowed!
 
 	if (InState(NON_EXISTENT) || InState(CONNECT_BOOTSTRAP) || InState(PRE_CLOSED) || InState(CLOSED))
 	{
@@ -253,7 +253,7 @@ void CSocketItemDl::ProcessPendingSend()
 		}
 #if defined(_DEBUG)
 		if (fpSent == NULL)
-			TRACE_HERE("Internal panic! Lost way to report WriteTo result");
+			TRACE_HERE("Internal panic!Lost way to report WriteTo result");
 #endif
 	}
 
@@ -292,7 +292,7 @@ void CSocketItemDl::ProcessPendingSend()
 		{
 			SetMutexFree();
 		}
-		//
+		// ULA hints that sent was not finished sent yet. Continue to use the saved function pointer as the callback handle
 		if (r == 0)
 			TestSetSendReturn(fp2);
 	}
@@ -311,13 +311,13 @@ void CSocketItemDl::ProcessPendingSend()
 int LOCALAPI CSocketItemDl::BufferData(int len)
 {
 	ControlBlock::PFSP_SocketBuf p = pControlBlock->GetLastBufferedSend();
-	// UNRESOLVED! milky-payload: apply FIFD instead of FIFO
+	// UNRESOLVED!milky-payload: apply FIFD instead of FIFO
 	int m = len;
 	if (m <= 0)
 		return -EDOM;
 	//
 	// pack the byte stream, TODO: encryption and compression
-	if(p != NULL && ! p->GetFlag<IS_COMPLETED>())
+	if(p != NULL && !p->GetFlag<IS_COMPLETED>())
 	{
 #ifdef TRACE
 		printf_s("BufferData: assert(p->GetFlag<TO_BE_CONTINUED>() && p->len < MAX_BLOCK_SIZE || p->opCode == PERSIST && p->len == 0)");
@@ -325,7 +325,7 @@ int LOCALAPI CSocketItemDl::BufferData(int len)
 #ifndef NDEBUG
 		if (p->len < 0 || p->len >= MAX_BLOCK_SIZE)
 		{
-			printf_s("Internal panic! Length of an incomplete packet is %d, while requested BUfferData len is %d?\n", p->len, m);
+			printf_s("Internal panic!Length of an incomplete packet is %d, while requested BUfferData len is %d?\n", p->len, m);
 			return 0;
 		}
 #endif

@@ -1,0 +1,15 @@
+SHA3, source code
+gmp
+{compile: MinGW; lib64!}
+ntdll.lib: windows kit\8.0\lib\win8\um // #pragma comment(lib, "ntdll.lib") //?
+
+
+Two U.S. patents have been issued for OCB mode.[5] However, a special exemption has been granted so that OCB mode can be used in software licensed under the GNU General Public License without cost, as well as for any non-commercial, non-governmental application. Since the authors have only applied for patent protection in the U.S., the algorithm is free to use in software not developed and not sold inside the U.S.[6]
+As of January 2013, the author has granted a free license for any open source license certified by the Open Source Initiative
+
+
+Macro definitions for testability
+NDEBUG -- Release, driver only
+DEBUG - DEBUG mode
+TRACE - DEBUG mode, meant to trace execution path
+TRACE_PACKET - DEBUG mode, meant to trace send-receive

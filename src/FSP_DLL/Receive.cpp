@@ -95,7 +95,7 @@ int FSPAPI ReadFrom(FSPHANDLE hFSPSocket, void *buf, int capacity, NotifyOrRetur
 int CSocketItemDl::RecvInline(PVOID fp1)
 {
 	TRACE_HERE("BEFORE WaitSetMutex");
-	if(! WaitSetMutex())
+	if(!WaitSetMutex())
 	{
 		TRACE_HERE("deadlock encountered?");
 		return -EINTR;
@@ -117,7 +117,7 @@ int CSocketItemDl::RecvInline(PVOID fp1)
 	}
 	//
 	SetEndOfRecvMsg(false);
-	if(! IsRecvBufferEmpty())
+	if(!IsRecvBufferEmpty())
 	{
 		SetMutexFree();
 		return SelfNotify(FSP_NotifyDataReady);
@@ -141,7 +141,7 @@ int LOCALAPI CSocketItemDl::ReadFrom(void * buffer, int capacity, PVOID fp1)
 #ifdef TRACE
 	printf_s("ReadFrom the FSP pipe to 0x%08X: byte[%d]\n", (LONG)buffer,  capacity);
 #endif
-	if(! WaitSetMutex())
+	if(!WaitSetMutex())
 	{
 		TRACE_HERE("deadlock encountered?");
 		return -EINTR;
@@ -157,7 +157,7 @@ int LOCALAPI CSocketItemDl::ReadFrom(void * buffer, int capacity, PVOID fp1)
 	// Check whether previous ReadFrom finished (no waitingRecvBuf), effectively serialize receiving
 	if(InterlockedCompareExchangePointer((PVOID *) & waitingRecvBuf, buffer, NULL) != NULL)
 	{
-		TRACE_HERE(" -EADDRINUSE most likely by previous ReadFrom");
+		TRACE_HERE("-EADDRINUSE most likely by previous ReadFrom");
 		SetMutexFree();
 		return -EDEADLK;
 	}
@@ -172,9 +172,9 @@ int LOCALAPI CSocketItemDl::ReadFrom(void * buffer, int capacity, PVOID fp1)
 		SetMutexFree();
 		return 0;
 	}
-	// NO! We do not reset fpPeeked. RecvInline() just takes precedence over ReadFrom()
+	// NO!We do not reset fpPeeked. RecvInline() just takes precedence over ReadFrom()
 
-	if(! IsRecvBufferEmpty())
+	if(!IsRecvBufferEmpty())
 	{
 		SetMutexFree();
 		return SelfNotify(FSP_NotifyDataReady);
@@ -208,7 +208,7 @@ int CSocketItemDl::FetchReceived()
 {
 	int m = 0;	// note that left border of the receive window slided in the loop body
 	for(ControlBlock::PFSP_SocketBuf p = pControlBlock->GetFirstReceived();
-		! p->GetFlag<IS_DELIVERED>();
+		!p->GetFlag<IS_DELIVERED>();
 		p = pControlBlock->GetFirstReceived())
 	{
 		if(p->len > MAX_BLOCK_SIZE || p->len < 0)
@@ -224,7 +224,7 @@ int CSocketItemDl::FetchReceived()
 
 		// Slide the left border of the receive window before possibly set the flag 'end of received message'
 		pControlBlock->SlideRecvWindowByOne();
-		if(! p->GetFlag<TO_BE_CONTINUED>())
+		if(!p->GetFlag<TO_BE_CONTINUED>())
 		{
 			SetEndOfRecvMsg();
 			break;
@@ -271,7 +271,7 @@ void CSocketItemDl::ProcessReceiveBuffer()
 		printf_s("Data to deliver: 0x%08X, length = %u, eom = %d\n", (LONG)p, n, (int)!b);
 #endif
 		// If end-of-message encountered reset fpPeeked so that RecvInline() may work
-		if(! b)
+		if(!b)
 		{
 #ifdef TRACE_PACKET
 			printf_s("Message terminated\n");
@@ -285,7 +285,7 @@ void CSocketItemDl::ProcessReceiveBuffer()
 			SetMutexFree();
 			return;
 		}
-		// UNRESOLVED! Reset fpPeeked so that crash recovery by chained ReadFrom() is possible if(n < 0) ?
+		// UNRESOLVED!Reset fpPeeked so that crash recovery by chained ReadFrom() is possible if(n < 0) ?
 		//
 		SetMutexFree();
 		if(n < 0)
@@ -310,7 +310,7 @@ void CSocketItemDl::ProcessReceiveBuffer()
 	{
 #ifdef TRACE
 		printf_s("FetchReceived() return %d\n"
-			"UNRESOLVED! Crash recovery? waitingRecvBuf or fpRecept is not reset yet.\n"
+			"UNRESOLVED!Crash recovery? waitingRecvBuf or fpRecept is not reset yet.\n"
 			, n);
 #endif
 		SetMutexFree();

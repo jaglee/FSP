@@ -71,11 +71,7 @@ BOOL WINAPI DllMain(HINSTANCE hInstance, DWORD dwReason, LPVOID lpvReserved)
 		AllowDuplicateHandle();
 		GetServiceSA(& attrSecurity);
 #ifdef TRACE
-		if(AllocConsole())
-		{
-//			_cprintf("_cprintf: Console window of the GUI application created.\n");
-			printf("Console window of the GUI application created.\n");
-		}
+		AllocConsole();
 #endif
 		_mdService = CreateFile(SERVICE_MAILSLOT_NAME
 				, GENERIC_WRITE	
@@ -164,7 +160,7 @@ int LOCALAPI CSocketItemDl::Initialize(PFSP_Context psp1, char szEventName[MAX_N
 		, (LPCTSTR )szEventName);
 
 #ifdef TRACE
-	printf("ID of current process is %d, handle of the event is %08X\n", idThisProcess, hEvent);
+	printf_s("ID of current process is %d, handle of the event is %08X\n", idThisProcess, hEvent);
 #endif
 	if(hEvent == INVALID_HANDLE_VALUE || hEvent == NULL)
 	{
@@ -253,10 +249,6 @@ void CSocketItemDl::WaitEventToDispatch()
 			else
 				SetMutexFree();
 			break;
-		case FSP_Abort:	// used to be FSP_Timeout:
-			SetMutexFree();
-			NotifyError(notice, -EINTR);
-			return;
 		case FSP_Dispose:// a reverse command meant to synchronize DLL and LLS
 			SetMutexFree();
 			NotifyError(notice);
@@ -270,6 +262,10 @@ void CSocketItemDl::WaitEventToDispatch()
 		case FSP_NotifyBufferReady:
 			ProcessPendingSend();
 			break;
+		case FSP_NotifyReset:
+			SetMutexFree();
+			NotifyError(notice, -EINTR);
+			return;
 		case FSP_NotifyToCommit:
 			// UNRESOLVED! Callback ULA?
 			if (IsRecvBufferEmpty())
@@ -370,20 +366,6 @@ CSocketItemDl * CSocketItemDl::CreateControlBlock(const PFSP_IN6_ADDR nearAddr, 
 bool LOCALAPI CSocketItemDl::Call(const CommandToLLS & cmd, int size)
 {
 	return ::WriteFile(_mdService, & cmd, size, & nBytesReadWrite, NULL) != FALSE;
-}
-
-
-
-int LOCALAPI CSocketItemDl::CopyKey(ALFID_T id1)
-{
-	CSocketItemDl *p1 = socketsTLB[id1];
-	if(p1 == NULL || ! p1->IsInUse())
-		return -1;
-	//
-	pControlBlock->idParent = id1;
-	pControlBlock->u = p1->pControlBlock->u;
-	pControlBlock->mac_ctx = p1->pControlBlock->mac_ctx;
-	return 0;
 }
 
 

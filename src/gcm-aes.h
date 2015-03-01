@@ -19,6 +19,33 @@
 #ifndef _GCM_AES_H_
 #define _GCM_AES_H_
 
+ 
+#if !_MSC_VER || _MSC_VER >= 1600 /* Try stdint.h if non-Microsoft */
+#ifdef  __cplusplus
+#define __STDC_CONSTANT_MACROS
+#endif
+#include <stdint.h>
+#elif (_MSC_VER)                  /* Microsoft C ealier than VS2010 does not have stdint.h    */
+typedef __int32 int32_t;
+typedef __int64 int64_t;
+typedef unsigned __int8 uint8_t;
+typedef unsigned __int16 uint16_t;
+typedef unsigned __int32 uint32_t;
+typedef unsigned __int64 uint64_t;
+#define INT32_MAX	0x7FFFFFFF
+#define UINT32_MAX	0xFFFFFFFFU
+#define UINT64_C(v) v ## UI64
+#else                             /* Guess sensibly - may need adaptation  */
+typedef long int32_t;
+typedef unsigned char	uint8_t;
+typedef unsigned short	uint16_t;
+typedef unsigned long	uint32_t;
+typedef unsigned long long uint64_t;
+#define INT32_MAX	0x7FFFFFFF
+#define UINT32_MAX	0xFFFFFFFFU
+#define UINT64_C(v) v ## ULL
+#endif
+
 #include "rijndael-alg-fst.h"
 
 // assume the compiler support 64-bit integer. and it is assumed that the operand is properly alligned
@@ -41,29 +68,32 @@
             ( ((l) << 40) & 0x00FF000000000000LL ) |       \
             ( ((l) << 56) & 0xFF00000000000000LL ) )
 
-__inline u32 be32toh(u32 v) 
+__inline uint32_t be32toh(uint32_t v) 
 { 
 	return _DWORD_SWAP(v);
 }
 
-__inline u32 htobe32(u32 v)
+__inline uint32_t htobe32(uint32_t v)
 { 
 	return _DWORD_SWAP(v);
 }
 
 
-__inline u64 be64toh(u64 v) 
+__inline uint64_t be64toh(uint64_t v) 
 { 
 	return _QWORD_SWAP(v);
 }
 
-__inline u64 htobe64(u64 v) 
+__inline uint64_t htobe64(uint64_t v) 
 { 
 	return _QWORD_SWAP(v);
 }
 #else
 
+#include <intrin.h>
+#pragma intrinsic(memset, memcpy)
 #pragma intrinsic(_byteswap_ushort, _byteswap_ulong, _byteswap_uint64)
+
 #define be16toh(v) _byteswap_ushort(v)
 #define htobe16(v) _byteswap_ushort(v)
 #define be32toh(v) _byteswap_ulong(v)
@@ -80,15 +110,13 @@ __inline u64 htobe64(u64 v)
 #define GCM_BLOCK_LEN_POWER 4	// 2^^4 == 16
 #define GMAC_SALT_LEN		4	// As of RFC4543
 
-typedef long long i64;
-typedef unsigned long long u64;
 
 typedef struct _GCM_AES_CTX {
-	u32	K[4*(RIJNDAEL_MAXNR + 1)];
-	u8	H[GCM_BLOCK_LEN];	/* hash subkey */
-	u8	X[GCM_BLOCK_LEN];	/* to X<m+n+1> */
-	u8	J[GCM_BLOCK_LEN];	/* counter block */
-	int	rounds;
+	uint32_t	K[4*(RIJNDAEL_MAXNR + 1)];
+	uint8_t		H[GCM_BLOCK_LEN];	/* hash subkey */
+	uint8_t		X[GCM_BLOCK_LEN];	/* to X<m+n+1> */
+	uint8_t		J[GCM_BLOCK_LEN];	/* counter block */
+	int32_t		rounds;
 } GCM_AES_CTX;
 
 #ifdef __cplusplus
@@ -97,40 +125,40 @@ extern "C" {
 
 // Given
 //	GCM_AES_CTX *	pointer to the GCM context
-//	const u8 *		byte array representation of AES key
+//	const uint8_t *		byte array representation of AES key
 //	int				length in bytes of the key, must be 16, 24 or 32
-//	const u8 *		byte array representation of initial vector, must of 96-bit
+//	const uint8_t *		byte array representation of initial vector, must of 96-bit
 // Do
 //	Initialize the Galois/Counter Mode AES context, including deriving the hash sub-key
 //	so that successive AE operation is feasible
-void	GCM_AES_Init(GCM_AES_CTX *, const u8 *, int, const u8 *);
+void	GCM_AES_Init(GCM_AES_CTX *, const uint8_t *, int, const uint8_t *);
 
 // Given
 //	GCM_AES_CTX *	pointer to the GCM context
-//	const u8 *		byte array representation of AES key AND the salt, as of RFC4543
+//	const uint8_t *		byte array representation of AES key AND the salt, as of RFC4543
 //	int				length in bytes of the key, must be 20, 28 or 36
 // Do
 //	Initialize the Galois/Counter Mode AES-GMAC context, including deriving the hash sub-key
 //	so that successive AE/GMAC operation is feasible
-void	GMAC_InitWithKey(GCM_AES_CTX *, const u8 *, int);
+void	GMAC_InitWithKey(GCM_AES_CTX *, const uint8_t *, int);
 
 
 // Given
 //	GCM_AES_CTX *	pointer to the GCM context
-//	const u8 *		byte array representation of initial vector, must be of 64-bit, as of RFC4543
+//	const uint8_t *		byte array representation of initial vector, must be of 64-bit, as of RFC4543
 // Do
 //	Set IV of the Galois/Counter Mode AES-GMAC context
-void	GMAC_SetIV(GCM_AES_CTX *, const u8 *);
+void	GMAC_SetIV(GCM_AES_CTX *, const uint8_t *);
 
 
 // Given
 //	GCM_AES_CTX *	pointer to the GCM context
-//	const u8 * P	byte array representation of the plaintext
-//	u32 bytesP		length in bytes of the plaintext
-//	const u8 * A	byte array representation of the additional authentication data
-//	u32 bytesA		length in bytes of the additional authentication data
-//	u8 * C			placeholder of the ciphertext. the buffer size maynot be less than bytesP
-//	u8 * T			placeholder of the tag(secure digest). the buffe size MAYNOT be less than bytesT
+//	const uint8_t * P	byte array representation of the plaintext
+//	uint32_t bytesP		length in bytes of the plaintext
+//	const uint8_t * A	byte array representation of the additional authentication data
+//	uint32_t bytesA		length in bytes of the additional authentication data
+//	uint8_t * C			placeholder of the ciphertext. the buffer size maynot be less than bytesP
+//	uint8_t * T			placeholder of the tag(secure digest). the buffe size MAYNOT be less than bytesT
 //	int bytesT		capacity in byte of the tag buffer
 // Do
 //	Encrypt the plaintext into ciphertext, store the ciphertext into the buffer specified by C
@@ -139,21 +167,21 @@ void	GMAC_SetIV(GCM_AES_CTX *, const u8 *);
 //	-2 if parameter error
 //  0 if success
 int		GCM_AES_EncryptAndAuthenticate(GCM_AES_CTX *ctx
-									, const u8 *P, u32 bytesP
-									, const u8 *A, u32 bytesA
-									, u8 *C	// capacity of ciphertext buffer MUST be no less than bytesP
-									, u8 *T, int bytesT
+									, const uint8_t *P, uint32_t bytesP
+									, const uint8_t *A, uint32_t bytesA
+									, uint8_t *C	// capacity of ciphertext buffer MUST be no less than bytesP
+									, uint8_t *T, int bytesT
 									);
 
 // Given
 //	GCM_AES_CTX *	pointer to the GCM context
-//	const u8 * C	byte array representation of the ciphertext
-//	u32 bytesC		length in bytes of the ciphertext
-//	const u8 * A	byte array representation of the additional authentication data
-//	u32 bytesA		length in bytes of the additional authentication data
-//	const u8 * T	byte array representation of the tag(secure digest)
+//	const uint8_t * C	byte array representation of the ciphertext
+//	uint32_t bytesC		length in bytes of the ciphertext
+//	const uint8_t * A	byte array representation of the additional authentication data
+//	uint32_t bytesA		length in bytes of the additional authentication data
+//	const uint8_t * T	byte array representation of the tag(secure digest)
 //	int bytesT		length in bytes of the tag
-//	u8 * P			placeholder of the plaintext . the buffer size MAYNOT be less than bytesC
+//	uint8_t * P			placeholder of the plaintext . the buffer size MAYNOT be less than bytesC
 // Do
 //	Authenticate the ciphertext, the additional data and the tag, if success
 //	decrypt and store the ciphertext into the buffer specified by C
@@ -162,16 +190,238 @@ int		GCM_AES_EncryptAndAuthenticate(GCM_AES_CTX *ctx
 //	-1 if authentication failed
 //  0 if success
 int		GCM_AES_AuthenticatedDecrypt(GCM_AES_CTX *ctx
-									, const u8 *C, u32 bytesC
-									, const u8 *A, u32 bytesA
-									, const u8 *T, int bytesT
-									, u8 *P	// capacity of plaintext buffer MUST be no less than bytesC
+									, const uint8_t *C, uint32_t bytesC
+									, const uint8_t *A, uint32_t bytesA
+									, const uint8_t *T, int bytesT
+									, uint8_t *P	// capacity of plaintext buffer MUST be no less than bytesC
 									);
 
-int		GCM_SecureHash(GCM_AES_CTX *ctx, const u8 *A, u32 bytesA, u8 *T, int bytesT);
+int		GCM_SecureHash(GCM_AES_CTX *ctx, const uint8_t *A, uint32_t bytesA, uint8_t *T, int bytesT);
 
 #ifdef __cplusplus
 }
 #endif
+
+
+/* ----------------------------------------------------------------------- *
+ * The following routines are used in this implementation. They are
+ * written via macros to simulate zero-overhead call-by-reference.
+ * All have default implemantations for when they are not defined in an
+ * architecture-specific manner.
+ *
+ * MUL64: 64x64->128-bit multiplication
+ * PMUL64: assumes top bits cleared on inputs
+ * ADD128: 128x128->128-bit addition
+ * GET_REVERSED_64: load and byte-reverse 64-bit word  
+ * GET_REVERSED_32: load and byte-reverse 32-bit word (added by Jason Gao)
+ * ----------------------------------------------------------------------- */
+
+/* ----------------------------------------------------------------------- */
+#if (__GNUC__ && (__x86_64__ || __amd64__))
+/* ----------------------------------------------------------------------- */
+
+#define ADD128(rh,rl,ih,il)                                               \
+    asm ("addq %3, %1 \n\t"                                               \
+         "adcq %2, %0"                                                    \
+    : "+r"(rh),"+r"(rl)                                                   \
+    : "r"(ih),"r"(il) : "cc");
+
+#define MUL64(rh,rl,i1,i2)                                                \
+    asm ("mulq %3" : "=a"(rl), "=d"(rh) : "a"(i1), "r"(i2) : "cc")
+
+#define PMUL64 MUL64
+
+#define GET_REVERSED_64(p)                                                \
+    ({uint64_t x;                                                         \
+     asm ("bswapq %0" : "=r" (x) : "0"(*(uint64_t *)(p))); x;})
+
+#define GET_REVERSED_32(p)                                                \
+    ({uint32_t x;                                                         \
+     asm ("bswap %0" : "=r" (x) : "0"(*(uint32_t *)(p))); x;})
+
+/* ----------------------------------------------------------------------- */
+#elif (__GNUC__ && __i386__)
+/* ----------------------------------------------------------------------- */
+
+#define GET_REVERSED_64(p)                                                \
+    ({ uint64_t x;                                                        \
+    uint32_t *tp = (uint32_t *)(p);                                       \
+    asm  ("bswap %%edx\n\t"                                               \
+          "bswap %%eax"                                                   \
+    : "=A"(x)                                                             \
+    : "a"(tp[1]), "d"(tp[0]));                                            \
+    x; })
+
+#define GET_REVERSED_32(p)                                                \
+    ({uint32_t x;                                                         \
+     asm ("bswap %0" : "=r" (x) : "0"(*(uint32_t *)(p))); x;})
+
+/* ----------------------------------------------------------------------- */
+#elif (__GNUC__ && __ppc64__)
+/* ----------------------------------------------------------------------- */
+
+#define ADD128(rh,rl,ih,il)                                               \
+    asm volatile (  "addc %1, %1, %3 \n\t"                                \
+                    "adde %0, %0, %2"                                     \
+    : "+r"(rh),"+r"(rl)                                                   \
+    : "r"(ih),"r"(il));
+
+#define MUL64(rh,rl,i1,i2)                                                \
+{ uint64_t _i1 = (i1), _i2 = (i2);                                        \
+    rl = _i1 * _i2;                                                       \
+    asm volatile ("mulhdu %0, %1, %2" : "=r" (rh) : "r" (_i1), "r" (_i2));\
+}
+
+#define PMUL64 MUL64
+
+#define GET_REVERSED_64(p)                                                \
+    ({ uint32_t hi, lo, *_p = (uint32_t *)(p);                            \
+       asm volatile ("lwbrx %0, %1, %2" : "=r"(lo) : "b%"(0), "r"(_p) );  \
+       asm volatile ("lwbrx %0, %1, %2" : "=r"(hi) : "b%"(4), "r"(_p) );  \
+       ((uint64_t)hi << 32) | (uint64_t)lo; } )
+
+#define GET_REVERSED_32(p)                                                \
+    ({ uint32_t lo, *_p = (uint32_t *)(p);								  \
+       asm volatile ("lwbrx %0, %1, %2" : "=r"(lo) : "b%"(0), "r"(_p) );  \
+       lo; } )
+
+/* ----------------------------------------------------------------------- */
+#elif (__GNUC__ && (__ppc__ || __PPC__))
+/* ----------------------------------------------------------------------- */
+
+#define GET_REVERSED_64(p)                                                \
+    ({ uint32_t hi, lo, *_p = (uint32_t *)(p);                            \
+       asm volatile ("lwbrx %0, %1, %2" : "=r"(lo) : "b%"(0), "r"(_p) );  \
+       asm volatile ("lwbrx %0, %1, %2" : "=r"(hi) : "b%"(4), "r"(_p) );  \
+       ((uint64_t)hi << 32) | (uint64_t)lo; } )
+
+#define GET_REVERSED_32(p)                                                \
+    ({ uint32_t lo, *_p = (uint32_t *)(p);								  \
+       asm volatile ("lwbrx %0, %1, %2" : "=r"(lo) : "b%"(0), "r"(_p) );  \
+       lo; } )
+
+/* ----------------------------------------------------------------------- */
+#elif (__GNUC__ && (__ARMEL__ || __ARM__))
+/* ----------------------------------------------------------------------- */
+
+#define bswap32(v)                                                        \
+({ uint32_t tmp,out;                                                      \
+    asm volatile(                                                         \
+        "eor    %1, %2, %2, ror #16\n"                                    \
+        "bic    %1, %1, #0x00ff0000\n"                                    \
+        "mov    %0, %2, ror #8\n"                                         \
+        "eor    %0, %0, %1, lsr #8"                                       \
+    : "=r" (out), "=&r" (tmp)                                             \
+    : "r" (v));                                                           \
+    out;})
+
+/* ----------------------------------------------------------------------- */
+#elif _MSC_VER
+/* ----------------------------------------------------------------------- */
+
+#include <intrin.h>
+
+#if (_M_IA64 || _M_X64) && \
+    (!defined(__INTEL_COMPILER) || __INTEL_COMPILER >= 1000)
+#define MUL64(rh,rl,i1,i2)   (rl) = _umul128(i1,i2,&(rh));
+#pragma intrinsic(_umul128)
+#define PMUL64 MUL64
+#endif
+
+/* MSVC uses add, adc in this version */
+#define ADD128(rh,rl,ih,il)                                          \
+    {   uint64_t _il = (il);                                         \
+        (rl) += (_il);                                               \
+        (rh) += (ih) + ((rl) < (_il));                               \
+    }
+
+#if _MSC_VER >= 1300
+#define GET_REVERSED_64(p) _byteswap_uint64(*(uint64_t *)(p))
+#define GET_REVERSED_32(p) _byteswap_ulong(*(uint32_t *)(p))
+#pragma intrinsic(_byteswap_uint64, _byteswap_ulong)
+#endif
+
+#if _MSC_VER >= 1400 && \
+    (!defined(__INTEL_COMPILER) || __INTEL_COMPILER >= 1000)
+#define MUL32(i1,i2)    (__emulu((uint32_t)(i1),(uint32_t)(i2)))
+#pragma intrinsic(__emulu)
+#endif
+
+/* ----------------------------------------------------------------------- */
+#endif
+/* ----------------------------------------------------------------------- */
+
+#if __GNUC__
+#define ALIGN(n)      __attribute__ ((aligned(n))) 
+#define NOINLINE      __attribute__ ((noinline))
+#define FASTCALL
+#elif _MSC_VER
+#define ALIGN(n)      __declspec(align(n))
+#define NOINLINE      __declspec(noinline)
+#define FASTCALL      __fastcall
+#else
+#define ALIGN(n)
+#define NOINLINE
+#define FASTCALL
+#endif
+
+/* ----------------------------------------------------------------------- */
+/* Default implementations, if not defined above                           */
+/* ----------------------------------------------------------------------- */
+
+#ifndef ADD128
+#define ADD128(rh,rl,ih,il)                                              \
+    {   uint64_t _il = (il);                                             \
+        (rl) += (_il);                                                   \
+        if ((rl) < (_il)) (rh)++;                                        \
+        (rh) += (ih);                                                    \
+    }
+#endif
+
+#ifndef MUL32
+#define MUL32(i1,i2)    ((uint64_t)(uint32_t)(i1)*(uint32_t)(i2))
+#endif
+
+#ifndef PMUL64              /* rh may not be same as i1 or i2 */
+#define PMUL64(rh,rl,i1,i2) /* Assumes m doesn't overflow     */         \
+    {   uint64_t _i1 = (i1), _i2 = (i2);                                 \
+        uint64_t m = MUL32(_i1,_i2>>32) + MUL32(_i1>>32,_i2);            \
+        rh         = MUL32(_i1>>32,_i2>>32);                             \
+        rl         = MUL32(_i1,_i2);                                     \
+        ADD128(rh,rl,(m >> 32),(m << 32));                               \
+    }
+#endif
+
+#ifndef MUL64
+#define MUL64(rh,rl,i1,i2)                                               \
+    {   uint64_t _i1 = (i1), _i2 = (i2);                                 \
+        uint64_t m1= MUL32(_i1,_i2>>32);                                 \
+        uint64_t m2= MUL32(_i1>>32,_i2);                                 \
+        rh         = MUL32(_i1>>32,_i2>>32);                             \
+        rl         = MUL32(_i1,_i2);                                     \
+        ADD128(rh,rl,(m1 >> 32),(m1 << 32));                             \
+        ADD128(rh,rl,(m2 >> 32),(m2 << 32));                             \
+    }
+#endif
+
+#ifndef GET_REVERSED_64
+#ifndef bswap64
+#ifndef bswap32
+#define bswap32(x)                                                        \
+  ({ uint32_t bsx = (x);                                                  \
+      ((((bsx) & 0xff000000u) >> 24) | (((bsx) & 0x00ff0000u) >>  8) |    \
+       (((bsx) & 0x0000ff00u) <<  8) | (((bsx) & 0x000000ffu) << 24)); })
+#endif
+#define bswap64(x)                                                        \
+     ({ union { uint64_t ll; uint32_t l[2]; } w, r;                       \
+         w.ll = (x);                                                      \
+         r.l[0] = bswap32 (w.l[1]);                                       \
+         r.l[1] = bswap32 (w.l[0]);                                       \
+         r.ll; })
+#endif
+#define GET_REVERSED_64(p) bswap64(*(uint64_t *)(p)) 
+#define GET_REVERSED_32(p) bswap32(*(uint32_t *)(p))
+#endif
+
 
 #endif /* _GMAC_H_ */

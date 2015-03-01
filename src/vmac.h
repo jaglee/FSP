@@ -17,8 +17,9 @@
  * 2. Adopt stdint.h if compiled under VS2010 or later
  * 3. For sake of code-reuse implementations of PMUL64, ADD128, get64BE, get64LE, get64PE
  *    and their dependents, as well as definitions of the macro ALIGN and FASTCALL
-*     were moved here from vmac.c
+ *    were moved here from vmac.c
  * 4. Add definition of uint16_t if 'stdint.h' is not applicable
+ * 5. vhash_abort -> vmac_reset (more readable)
  */
 
 /* --------------------------------------------------------------------------
@@ -69,7 +70,7 @@ typedef unsigned long long uint64_t;
 /* --------------------------------------------------------------------------
  * This implementation had been modified slightly by Jason Gao
  * supports only one free AES implementations: Paulo Barreto's
- * the source file (rijndael-alg-fst.c, .h) is inlucded in this distribution
+ * the source file (rijndael-alg-fst.c, .h) is included in this distribution
  * ----------------------------------------------------------------------- */
 
 #include "rijndael-alg-fst.h"

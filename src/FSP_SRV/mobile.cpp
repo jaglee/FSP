@@ -30,12 +30,12 @@
 
 #include "fsp_srv.h"
 
+// From the receiver's point of view the local fiber id was stored in the peer fiber id field of the received packet
 ALFID_T CLowerInterface::SetLocalFiberID(ALFID_T value)
 {
-	register volatile ALFID_T *p = nearInfo.IsIPv6()
-		? & nearInfo.u.idALF
-		: & HeaderFSPoverUDP().peer;
-	return InterlockedExchange((volatile LONG *)p, value);
+	if(nearInfo.IsIPv6())
+		nearInfo.u.idALF = value;
+	return InterlockedExchange((volatile LONG *) & pktBuf->idPair.peer, value);
 }
 
 
@@ -119,12 +119,16 @@ UINT64 LOCALAPI CalculateCookie(BYTE *header, int sizeHdr, timestamp_t t0)
 {
 	static struct
 	{
+		ALIGN(MAC_ALIGNMENT)
+		BYTE		nonce_prefix[FSP_MAC_IV_SIZE - sizeof(timestamp_t)];
 		timestamp_t timeStamp;
+		ALIGN(MAC_ALIGNMENT)
 		timestamp_t timeSign;
-		vmac_ctx_t	ctx;
+		ALIGN(MAC_ALIGNMENT)
+		ae_ctx		ctx;
 	} prevCookieContext, cookieContext;
 	//
-	ALIGN(MAC_ALIGNMENT) BYTE m[VMAC_KEY_LEN >> 3];
+	ALIGN(MAC_ALIGNMENT) BYTE m[OCB_KEY_LEN];
 	timestamp_t t1 = NowUTC();
 
 #ifdef TRACE
@@ -143,24 +147,28 @@ UINT64 LOCALAPI CalculateCookie(BYTE *header, int sizeHdr, timestamp_t t0)
 
 	if(t1 - cookieContext.timeStamp > INT_MAX)
 	{
-		BYTE	st[VMAC_KEY_LEN >> 3];
+		ALIGN(MAC_ALIGNMENT)
+		BYTE	st[FSP_SESSION_KEY_LEN];	// in bytes
 		memcpy(& prevCookieContext, & cookieContext, sizeof(cookieContext));
 		//
 		cookieContext.timeStamp = t1;
 		rand_w32((uint32_t *) & st, sizeof(st) / sizeof(uint32_t));
 		//
-		vmac_set_key((unsigned char *) & st, & cookieContext.ctx);
+		ae_init(& cookieContext.ctx, st, FSP_SESSION_KEY_LEN, FSP_MAC_IV_SIZE, FSP_TAG_SIZE);
 	}
 
-	return ((long long)(t0 - cookieContext.timeStamp) < INT_MAX)
-		? vmac(m, sizeHdr
-			, (unsigned char * ) & cookieContext.timeStamp
-			, & (cookieContext.timeSign = t0)
-			, & cookieContext.ctx)
-		: vmac(m, sizeHdr
-			, (unsigned char * ) & prevCookieContext.timeStamp
-			, & (prevCookieContext.timeSign = t0)
-			, & prevCookieContext.ctx);
+	ALIGN(MAC_ALIGNMENT) block r;
+	if((long long)(t0 - cookieContext.timeStamp) < INT_MAX)
+	{
+		cookieContext.timeSign = t0;
+		ae_encrypt(& cookieContext.ctx, cookieContext.nonce_prefix, m, sizeof(m), & cookieContext.timeSign, sizeof(timestamp_t), & m, & r, 1);
+	}
+	else
+	{
+		prevCookieContext.timeSign = t0;
+		ae_encrypt(& prevCookieContext.ctx, prevCookieContext.nonce_prefix, m, sizeof(m), & prevCookieContext.timeSign, sizeof(timestamp_t), & m, & r, 1);
+	}
+	return *(uint64_t *) & r;
 }
 
 
@@ -172,50 +180,6 @@ UINT64 LOCALAPI CalculateCookie(BYTE *header, int sizeHdr, timestamp_t t0)
 //	IV = (sequenceNo, expectedSN)
 //	AAD = (source fiber ID, destination fiber ID, flags, receive window free pages
 //		 , version, OpCode, header stack pointer, optional headers)
-#if 0
-void LOCALAPI CSocketItemEx::SetIntegrityCheckCodeP1(FSP_NormalPacketHeader *p1)
-{
-#define FSP_MAC_IV_SIZE (sizeof(p1->sequenceNo) + sizeof(p1->expectedSN))	
-	unsigned char *m = (BYTE *) & p1->integrity.id;	// the message
-	uint64_t tag;
-	unsigned char pad[MAC_ALIGNMENT];
-	ALIGN(MAC_ALIGNMENT) unsigned char nonce[16];	// see vmac()
-	// "An i byte nonce, is made as the first 16-i bytes of n being zero, and the final i the nonce."
-	// here it is (p1->sequenceNo, p1->expectedSN) of 8 bytes
-	memset(nonce, 0, sizeof(nonce) - FSP_MAC_IV_SIZE);
-	memcpy(nonce + sizeof(nonce) - FSP_MAC_IV_SIZE, p1, FSP_MAC_IV_SIZE);
-	//
-	// prepare vmac memory alignment and initialize the padding
-	unsigned int mbytes = ntohs(p1->hs.hsp) - FSP_MAC_IV_SIZE;
-	int misAlign = (int)m & (MAC_ALIGNMENT - 1);
-	int padLen = (MAC_ALIGNMENT - (int)(mbytes & (MAC_ALIGNMENT - 1))) & (MAC_ALIGNMENT - 1);
-	if(misAlign > 0)
-	{
-		memcpy(pad, m - misAlign, misAlign);
-		memmove(m - misAlign, m, mbytes);
-	}
-	if(padLen - misAlign > 0)
-		memcpy(pad + misAlign, m + mbytes, padLen - misAlign);
-	if(padLen > 0)
-		memset(m - misAlign + mbytes, 0, padLen);
-	//
-	tag = vmac(m - misAlign, mbytes, nonce, NULL, & pControlBlock->mac_ctx);
-	// recover what's been moved and initialized
-	if(misAlign > 0)
-	{
-		memmove(m, m - misAlign, mbytes);
-		memcpy(m - misAlign, pad, misAlign);
-	}
-	if(padLen - misAlign > 0)
-		memcpy(m + mbytes, pad + misAlign, padLen - misAlign);
-	//
-	p1->integrity.code = tag;
-#undef FSP_MAC_IV_SIZE
-}
-#endif
-//  Previous version of SetIntegrityCheckCode() try to align the original message with a little complex algorithm
-//	in favor of less stack memory. This version is simpler but is not very suitable as kernel driver prototype
-//  due to larger stack memory requirement
 void LOCALAPI CSocketItemEx::SetIntegrityCheckCodeP1(FSP_NormalPacketHeader *p1)
 {
 //#ifdef TRACE
@@ -223,8 +187,8 @@ void LOCALAPI CSocketItemEx::SetIntegrityCheckCodeP1(FSP_NormalPacketHeader *p1)
 //	DumpNetworkUInt16((UINT16 *)p1, 16);
 //#endif
 	// prepare vmac memory alignment and initialize the padding
-	ALIGN(MAC_ALIGNMENT) unsigned char nonce[16];	// see vmac()
-	int & mbytes = *((int *)nonce);
+	ALIGN(MAC_ALIGNMENT) unsigned char nonce[FSP_MAC_IV_SIZE];
+	int32_t & mbytes = *((int32_t *)nonce);
 	ALIGN(MAC_ALIGNMENT) unsigned char padded[MAX_BLOCK_SIZE];
 
 	mbytes = ntohs(p1->hs.hsp) - FSP_MAC_IV_SIZE;
@@ -248,20 +212,22 @@ void LOCALAPI CSocketItemEx::SetIntegrityCheckCodeP1(FSP_NormalPacketHeader *p1)
 //	DumpNetworkUInt16((UINT16 *)& pControlBlock->mac_ctx, sizeof(pControlBlock->mac_ctx) / 2);
 //#endif
 #ifndef NDEBUG
-	if (pControlBlock->_mac_ctx_protect_prolog[0] != MAC_CTX_PROTECT_SIGN
-		|| pControlBlock->_mac_ctx_protect_prolog[1] != MAC_CTX_PROTECT_SIGN
-		|| pControlBlock->_mac_ctx_protect_epilog[0] != MAC_CTX_PROTECT_SIGN
-		|| pControlBlock->_mac_ctx_protect_epilog[1] != MAC_CTX_PROTECT_SIGN)
+	if (_mac_ctx_protect_prolog[0] != MAC_CTX_PROTECT_SIGN
+		|| _mac_ctx_protect_prolog[1] != MAC_CTX_PROTECT_SIGN
+		|| _mac_ctx_protect_epilog[0] != MAC_CTX_PROTECT_SIGN
+		|| _mac_ctx_protect_epilog[1] != MAC_CTX_PROTECT_SIGN)
 	{
-		printf_s("Fatal! VMAC context is destroyed! Session ID = 0x%X\n", this->fidPair.source);
+		printf_s("Fatal! MAC context is destroyed! Session ID = 0x%X\n", this->fidPair.source);
 		return;
 	}
 #endif
-	p1->integrity.code = vmac(padded, mbytes, nonce, NULL, &pControlBlock->mac_ctx);
+	ALIGN(MAC_ALIGNMENT) block r;
+	ae_encrypt(& mac_ctx, nonce, NULL, 0, padded, mbytes, NULL, & r, 1);
+	p1->integrity.code = *(uint64_t *) & r;
 #undef FSP_MAC_IV_SIZE
 }
 
-
+// TODO: Check Integrity code should apply ae_decrypt
 
 /**
  * Storage location of command header, send/receive: remark
@@ -334,14 +300,16 @@ bool CSocketItemEx::EmitStart()
 		// nor can it be retransmitted separately
 	default:
 		TRACE_HERE("Unexpected socket buffer block");
-		result = 1;	// return false;	// unrecognized packet type is simply ignored ?
+		result = 0;	// unrecognized packet type is simply ignored?!
 	}
 
 #ifdef TRACE_SOCKET
 	printf_s("Session#%u emit %s, result = %d, time : 0x%016llX\n"
 		, fidPair.source, opCodeStrings[skb->opCode], result, tRecentSend);
 #endif
-	return (result > 0);
+	if(result > 0)
+		SetEarliestSendTime();
+	return (result >= 0);
 }
 
 
@@ -372,12 +340,12 @@ bool LOCALAPI CSocketItemEx::EmitWithICC(ControlBlock::PFSP_SocketBuf skb, Contr
 	if (skb->GetFlag<TO_BE_CONTINUED>() && skb->len != MAX_BLOCK_SIZE)
 	{
 		// TODO: debug log failure of segmented and/or online-compressed send
-#ifdef 	TRACE
+//#ifdef TRACE
 		printf_s("\nImcomplete packet to send, opCode: %s(%d, len = %d)\n"
 			, opCodeStrings[skb->opCode]
 			, skb->opCode
 			, skb->len);
-#endif
+//#endif
 		return false;
 	}
 	// Which is the norm. Dynanically generate the fixed header.
@@ -459,9 +427,9 @@ void ControlBlock::EmitQ(CSocketItem *context)
 		}
 		if (!skb->Lock())
 		{
-#ifdef TRACE
+//#ifdef TRACE
 			printf_s("Should be rare: cannot get the exclusive lock on the packet to send SN#%u\n", sendWindowNextSN);
-#endif
+//#endif
 			++sendWindowNextSN;
 			continue;
 		}

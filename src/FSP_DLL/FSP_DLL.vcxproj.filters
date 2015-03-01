@@ -1,58 +1,18 @@
 ﻿<?xml version="1.0" encoding="utf-8"?>
 <Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup>
-    <Filter Include="Source Files">
-      <UniqueIdentifier>{4FC737F1-C7A5-4376-A066-2A32D752A2FF}</UniqueIdentifier>
-      <Extensions>cpp;c;cxx;def;odl;idl;hpj;bat;asm;asmx</Extensions>
-    </Filter>
-    <Filter Include="Header Files">
-      <UniqueIdentifier>{93995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
-      <Extensions>h;hpp;hxx;hm;inl;inc;xsd</Extensions>
-    </Filter>
-    <Filter Include="Resource Files">
-      <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
-      <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx</Extensions>
-    </Filter>
-    <Filter Include="SHA3">
-      <UniqueIdentifier>{8e90c486-9f4a-44fb-a177-5ae734b94ae3}</UniqueIdentifier>
-    </Filter>
-  </ItemGroup>
-  <ItemGroup>
-    <ClCompile Include="Disconnect.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="DllEntry.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="Establish.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="Multiplex.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="Receive.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="Send.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="IOControl.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="minilzo.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="..\rijndael-alg-fst.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="..\vmac.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="..\gcm-aes.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="..\ControlBlock.cpp">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\ControlBlock.cpp" />
+    <ClCompile Include="..\gcm-aes.c" />
+    <ClCompile Include="..\rijndael-alg-fst.c" />
+    <ClCompile Include="Disconnect.cpp" />
+    <ClCompile Include="DllEntry.cpp" />
+    <ClCompile Include="Establish.cpp" />
+    <ClCompile Include="Multihome.cpp" />
+    <ClCompile Include="Multiplex.cpp" />
+    <ClCompile Include="Receive.cpp" />
+    <ClCompile Include="Send.cpp" />
+    <ClCompile Include="..\SHA3\KeccakDuplex.c">
+      <Filter>SHA3</Filter>
     </ClCompile>
     <ClCompile Include="..\SHA3\KeccakF-1600-inplace32BI.c">
       <Filter>SHA3</Filter>
@@ -60,40 +20,19 @@
     <ClCompile Include="..\SHA3\KeccakHash.c">
       <Filter>SHA3</Filter>
     </ClCompile>
-    <ClCompile Include="..\SHA3\KeccakDuplex.c">
+    <ClCompile Include="..\SHA3\KeccakNISTInterface.c">
       <Filter>SHA3</Filter>
     </ClCompile>
     <ClCompile Include="..\SHA3\KeccakSponge.c">
       <Filter>SHA3</Filter>
     </ClCompile>
-    <ClCompile Include="..\SHA3\KeccakNISTInterface.c">
-      <Filter>SHA3</Filter>
-    </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="..\FSP.h">
-      <Filter>Header Files</Filter>
+    <ClInclude Include="..\SHA3\brg_endian.h">
+      <Filter>SHA3</Filter>
     </ClInclude>
-    <ClInclude Include="..\FSP_API.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="FSP_DLL.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="..\FSP_Impl.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="minilzo.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="..\vmac.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="rsa-gmp.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="..\gcm-aes.h">
-      <Filter>Header Files</Filter>
+    <ClInclude Include="..\SHA3\KeccakDuplex.h">
+      <Filter>SHA3</Filter>
     </ClInclude>
     <ClInclude Include="..\SHA3\KeccakF-1600-interface.h">
       <Filter>SHA3</Filter>
@@ -101,17 +40,32 @@
     <ClInclude Include="..\SHA3\KeccakHash.h">
       <Filter>SHA3</Filter>
     </ClInclude>
-    <ClInclude Include="..\SHA3\brg_endian.h">
-      <Filter>SHA3</Filter>
-    </ClInclude>
-    <ClInclude Include="..\SHA3\KeccakDuplex.h">
+    <ClInclude Include="..\SHA3\KeccakNISTInterface.h">
       <Filter>SHA3</Filter>
     </ClInclude>
     <ClInclude Include="..\SHA3\KeccakSponge.h">
       <Filter>SHA3</Filter>
     </ClInclude>
-    <ClInclude Include="..\SHA3\KeccakNISTInterface.h">
-      <Filter>SHA3</Filter>
+    <ClInclude Include="..\FSP.h">
+      <Filter>Headers</Filter>
     </ClInclude>
+    <ClInclude Include="..\FSP_API.h">
+      <Filter>Headers</Filter>
+    </ClInclude>
+    <ClInclude Include="FSP_DLL.h">
+      <Filter>Headers</Filter>
+    </ClInclude>
+    <ClInclude Include="..\FSP_Impl.h">
+      <Filter>Headers</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="SHA3">
+      <UniqueIdentifier>{dce7dc3e-4d98-49e4-a2c5-da366930f156}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Headers">
+      <UniqueIdentifier>{80498912-648c-4812-ba2b-721b582689ef}</UniqueIdentifier>
+      <Extensions>*.h</Extensions>
+    </Filter>
   </ItemGroup>
 </Project>

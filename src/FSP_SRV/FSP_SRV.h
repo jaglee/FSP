@@ -35,7 +35,14 @@
 
 #include "../FSP.h"
 #include "../FSP_Impl.h"
+#include "ae.h"
 
+#define READY_FOR_USE 0x0101
+#if VMAC_ARCH_BIG_ENDIAN
+#define NOT_READY_USE 0x0100
+#else
+#define NOT_READY_USE 0x0001
+#endif
 
 // Return the number of microseconds elapsed since Jan 1, 1970 (unix epoch time)
 timestamp_t NowUTC();	// it seems that a global property 'Now' is not as clear as this function format
@@ -93,7 +100,7 @@ inline UINT64 ntohll(UINT64 h)
 #define MAX_CONNECTION_NUM	16	// 256	// must be some power value of 2
 #define MAX_LISTENER_NUM	4
 #define MAX_RETRANSMISSION	8
-#define	MAX_BUFFER_MEMORY	70536	// 69KiB  // Implementation shall override this
+#define	MAX_BUFFER_BLOCKS	64	// 65~66KiB, 64bit CPU consumes more // Implementation shall override this
 
 
 // In Microsoft C++, the result of a modulus expression is always the same as the sign of the first operand.
@@ -149,6 +156,8 @@ public:
 	// ConnectRequestQueue() { head = tail = 0; mayFull = 0; mutex = SHARED_FREE; }
 	int Push(const CommandNewSessionSrv *);
 	int Remove(int);
+	void SetMutexFree() { _InterlockedExchange8(& mutex, 0); }
+
 };
 
 
@@ -156,13 +165,25 @@ public:
 
 #include <pshpack1.h>
 
+// we prefer productivity over 'cleverness': read buffer block itself is of fixed size
 struct PktSignature
 {
-	PktSignature			*next;
-	FSP_NormalPacketHeader	*pkt;
-	ControlBlock::seq_t		pktSeqNo;
-	int		lenData;
-	size_t	size;
+	ALIGN(8)
+	struct PktBufferBlock *next;
+	ALIGN(8)
+	int32_t	lenData;
+	ControlBlock::seq_t	pktSeqNo;	// in host byte-order
+};
+
+
+
+struct PktBufferBlock: PktSignature
+{
+	PairALFID	idPair;
+	FSP_NormalPacketHeader hdr;
+	BYTE	payload[MAX_LLS_BLOCK_SIZE];
+	//
+	FSP_NormalPacketHeader *GetHeaderFSP() { return &(this->hdr); }
 };
 
 
@@ -183,10 +204,11 @@ struct ScatteredSendBuffers
 
 
 
+// Review it carefully!Only Interlock* operation may be applied on any volatile member variable
 class CSocketItemEx: public CSocketItem
 {
-	PktSignature * volatile headPacket;
-	PktSignature * volatile tailPacket;
+	PktBufferBlock * volatile headPacket;
+	PktBufferBlock * volatile tailPacket;
 
 	// multihome/mobility/resilence support (see also CInterface::EnumEffectiveAddresses):
 	// MAX_PHY_INTERFACES is hard-coded to 4
@@ -201,17 +223,20 @@ protected:
 	HANDLE	hSrcMemory;
 	//
 	ALIGN(2)
-	char	inUse;
-	char	isReady;
+	volatile char	inUse;
+	volatile char	isReady;
+
+	volatile char	mutex;
+	volatile char	toUpdateTimer;
+
+	FSP_Session_State lowState;
+
 	//
-	char	isMilky;	// ULA cannot change it on the fly;
-	char	mutex;
-	bool	toUpdateTimer;
+	ALIGN(4)
+	volatile int32_t	keyLife;
 	//
-	int32_t	keyLife;
-	//
-	CSocketItemEx *next;
-	CSocketItemEx *prevSame;
+	CSocketItemEx * volatile next;
+	CSocketItemEx * volatile prevSame;
 	//
 	RetransmitBacklog retransBackLog;
 	int			retransHead;
@@ -251,7 +276,18 @@ protected:
 		timestamp_t tKeepAlive;
 	}	clockCheckPoint;
 
-	FSP_Session_State lowState;
+#ifndef NDEBUG
+#define MAC_CTX_PROTECT_SIGN	0xA5A5C3C3A5C3A5C3ULL
+	ALIGN(MAC_ALIGNMENT)
+	uint64_t	_mac_ctx_protect_prolog[2];
+#endif
+	ALIGN(MAC_ALIGNMENT)
+	ae_ctx		mac_ctx;
+#ifndef NDEBUG
+	uint64_t	_mac_ctx_protect_epilog[2];
+#endif
+
+	void SetMutexFree() { _InterlockedExchange8(& mutex, 0); }
 
 	void RestartKeepAlive() { ReplaceTimer(tKeepAlive_ms); }
 	void StopKeepAlive() { ReplaceTimer(SCAVENGE_THRESHOLD_ms); }
@@ -261,7 +297,8 @@ protected:
 	void SetPassive() { lowState = LISTENING; }
 	void SetState(FSP_Session_State s) 
 	{
-		pControlBlock->state = lowState = s;
+		_InterlockedExchange8((char *) & pControlBlock->state, s);
+		lowState = s;
 		clockCheckPoint.tMigrate = NowUTC();
 	}
 	bool InState(FSP_Session_State s) { return lowState == s; }
@@ -270,24 +307,25 @@ protected:
 	void LOCALAPI InstallSessionKey()
 	{
 #ifndef NDEBUG
-		pControlBlock->_mac_ctx_protect_prolog[0]
-			= pControlBlock->_mac_ctx_protect_prolog[1]
-			= pControlBlock->_mac_ctx_protect_epilog[0]
-			= pControlBlock->_mac_ctx_protect_epilog[1]
+		_mac_ctx_protect_prolog[0]
+			= _mac_ctx_protect_prolog[1]
+			= _mac_ctx_protect_epilog[0]
+			= _mac_ctx_protect_epilog[1]
 			= MAC_CTX_PROTECT_SIGN;
 #endif
-		vmac_set_key(pControlBlock->u.sessionKey, & pControlBlock->mac_ctx); 
+		// nonce length is fixed 16 bytes while tag length is fixed 8 bytes
+		ae_init(& mac_ctx, pControlBlock->u.sessionKey, FSP_SESSION_KEY_LEN, FSP_MAC_IV_SIZE, FSP_TAG_SIZE);
 	}
 
 	// On got valid ICC automatically register source IP address as the favorite returning IP address
 	bool ValidateICC(FSP_NormalPacketHeader *);
-	bool ValidateICC() { return ValidateICC(headPacket->pkt); }
+	bool ValidateICC() { return ValidateICC(headPacket->GetHeaderFSP()); }
 	bool LOCALAPI HandleMobileParam(PFSP_HeaderSignature);
 
-	PktSignature *PushPacketBuffer(PktSignature *);
+	PktBufferBlock *PushPacketBuffer(PktBufferBlock *);
 	FSP_NormalPacketHeader *PeekLockPacketBuffer();
 	void PopUnlockPacketBuffer();
-	void UnlockPacketBuffer() { mutex = SHARED_FREE; }
+	void UnlockPacketBuffer() { _InterlockedExchange8(& mutex, 0); }
 
 	int  LOCALAPI PlacePayload(ControlBlock::PFSP_SocketBuf);
 
@@ -303,11 +341,12 @@ public:
 	//
 	bool MapControlBlock(const CommandNewSessionSrv &);
 	void InitAssociation();
-	bool IsInUse() { return inUse != 0; }
-	void SetReady() { isReady = 1; }
+	bool IsInUse() const { return inUse != 0; }
+	void SetReady() { _InterlockedExchange8(& isReady, 1); }
 	// It is assumed that the socket is set ready only after it is put into use
 	// though inUse may be cleared before isReady is cleared
-	bool TestAndLockReady();
+	SHORT SetNotReadyUse() { return _InterlockedExchange16((SHORT *) & inUse, NOT_READY_USE); }
+	bool TestAndLockReady() { return _InterlockedCompareExchange16((SHORT *) & inUse, NOT_READY_USE, READY_FOR_USE) == READY_FOR_USE; }
 	bool TestAndWaitReady();
 	void SetEarliestSendTime() { tEarliestSend = tRecentSend; }
 	int32_t GetCongestWindow() const { return congestCtrl.cwnd; }
@@ -320,13 +359,13 @@ public:
 
 	// Convert the relative address in the control block to the address in process space
 	// checked, so that ill-behaviored ULA may not cheat LLS to access data of others
-	BYTE * GetSendPtr(const ControlBlock::PFSP_SocketBuf skb) const
+	BYTE * GetSendPtr(const ControlBlock::PFSP_SocketBuf skb)
 	{
 		uint32_t offset;
 		BYTE * p = pControlBlock->GetSendPtr(skb, offset);
 		return (offset < sizeof(ControlBlock) || offset >= dwMemorySize) ? NULL : p;
 	}
-	BYTE * GetRecvPtr(const ControlBlock::PFSP_SocketBuf skb) const
+	BYTE * GetRecvPtr(const ControlBlock::PFSP_SocketBuf skb)
 	{
 		uint32_t offset;
 		BYTE * p = pControlBlock->GetRecvPtr(skb, offset);
@@ -341,7 +380,7 @@ public:
 
 	bool Notify(FSP_ServiceCode);
 	void SignalEvent() { ::SetEvent(hEvent); }
-	void SignalReturned() { pControlBlock->notices[0] = FSP_NotifyAccepting; SignalEvent(); }
+	void SignalReturned() { _InterlockedExchange8((char *)pControlBlock->notices, FSP_NotifyAccepting); SignalEvent(); }
 	//
 	int LOCALAPI RespondSNACK(ControlBlock::seq_t, const FSP_SelectiveNACK::GapDescriptor *, int);
 	int LOCALAPI RespondSNACK(ControlBlock::seq_t, const PFSP_HeaderSignature);
@@ -395,8 +434,6 @@ public:
 	void KeepAlive();
 	void ScheduleEmitQ();
 	void ScheduleConnect(CommandNewSessionSrv *);
-	// Send COMMIT or KEEP_ALIVE in heartbeat interval
-	void SendHeartbeat();
 
 	//
 	bool AddTimer();
@@ -467,15 +504,16 @@ protected:
 	CSocketItemEx itemStorage[MAX_CONNECTION_NUM];
 	CSocketItemEx *poolFiberID[MAX_CONNECTION_NUM];
 	CSocketItemEx *headFreeSID, *tailFreeSID;
-	char	mutex;
+	volatile char mutex;
 public:
 	CSocketSrvTLB();
 
+	CSocketItemEx * AllocItem(const CommandNewSessionSrv &);
 	CSocketItemEx * AllocItem(ALFID_T);
 	CSocketItemEx * AllocItem();
 	void FreeItem(CSocketItemEx *r);
+	void SetMutexFree() { _InterlockedExchange8(& mutex, 0); }
 	CSocketItemEx * operator[](ALFID_T);
-	CSocketItemEx * operator[](const CommandNewSessionSrv &);
 };
 
 
@@ -504,54 +542,40 @@ private:
 	DWORD	interfaces[FD_SETSIZE];
 	SOCKADDR_IN6 addresses[FD_SETSIZE];	// by default IPv6 addresses, but an entry might be a UDP over IPv4 address
 	int		nAddress;
-	char	mutex;		// Utilize _InterlockedCompareExchange8 to manage critical resource
+	volatile char	mutex;		// Utilize _InterlockedCompareExchange8 to manage critical resource
 
 	// intermediate buffer to hold the fixed packet header, the optional header and the data
 	DWORD	countRecv;
-	BYTE	*pktBuf;
-
-	FSPoverUDP_Header &	HeaderFSPoverUDP() const { return *(FSPoverUDP_Header *)pktBuf; }
-	FSP_Header &		HeaderFSP() const { return *(FSP_Header *)pktBuf; }
-	template<typename THdr> THdr * FSP_OperationHeader()
-	{
-		return (THdr *)(nearInfo.IsIPv6() ? pktBuf : &pktBuf[sizeof(PairALFID)]);
-	}
+	PktBufferBlock *pktBuf;
 
 	// remote-end address and near-end address
 	SOCKADDR_INET		addrFrom;
 	CtrlMsgHdr			nearInfo;
 	WSAMSG				sinkInfo;	// descriptor of what is received
 
-	// For sending back a packet responding to a received packet only
-	ALFID_T			GetLocalFiberID()
-	{
-		return nearInfo.IsIPv6() ? nearInfo.u.idALF : HeaderFSPoverUDP().peer;
-	}
-	ALFID_T			SetLocalFiberID(ALFID_T);
+	template<typename THdr> THdr * FSP_OperationHeader() { return (THdr *) & pktBuf->hdr; }
 
-	// only valid for received message
-	ALFID_T			GetRemoteFiberID() const
-	{
-		return nearInfo.IsIPv6() ? SOCKADDR_ALFID(sinkInfo.name) : HeaderFSPoverUDP().source;
-	}
+	ALFID_T			GetLocalFiberID() const { return nearInfo.u.idALF; }
+	ALFID_T			SetLocalFiberID(ALFID_T);
+	ALFID_T			GetRemoteFiberID() const  { return SOCKADDR_ALFID(sinkInfo.name); }
 
 	// For FSP over IPv6 raw-socket, preconfigure IPv6 interfaces with ALFID pool
 	inline void SetLocalApplicationLayerFiberID(ALFID_T);
 	// For FSP over UDP/IPv4 bind the UDP-socket
 	inline int BindInterface(SOCKET, PSOCKADDR_IN, int);
-	CSocketItemEx *		MapSocket() { return (*this)[GetLocalFiberID()]; }
+	CSocketItemEx	*MapSocket() { return (*this)[GetLocalFiberID()]; }
 
 protected:
 	static DWORD WINAPI ProcessRemotePacket(LPVOID lpParameter);
 
-	int		bufTail;
-	int		bufHead;
-	ALIGN(8) BYTE bufferMemory[MAX_BUFFER_MEMORY];
+	PktBufferBlock *freeBufferHead;
+	ALIGN(8) PktBufferBlock bufferMemory[MAX_BUFFER_BLOCKS];
 
 	// OS-dependent
-	BYTE	*BeginGetBuffer();
-	void	LOCALAPI CommitGetBuffer(BYTE *, size_t);
-	void	LOCALAPI FreeBuffer(BYTE *);
+	void	SetMutexFree() { _InterlockedExchange8(& mutex, 0); }
+	void	InitBuffer();
+	PktBufferBlock	*GetBuffer();
+	void	LOCALAPI FreeBuffer(PktBufferBlock *);
 
 	// defined in remote.cpp
 	// processing individual type of packet header

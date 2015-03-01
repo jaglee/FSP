@@ -38,31 +38,17 @@
 #include <time.h>
 
 /**
-  When a socket is created the alarm clock is not initiated. Instead, the alarm clock is initiated
-  when a first time-out event handler is registered in the timewheel:
-  1.INIT_CONNECT family, INIT_CONNECT retransmission, registered when Emit INIT_CONNECT.
-	It is the time when the initiator starts the time-out mechanism
-  2.INIT_CONNECT family, CONNECT_REQUEST retransmission, inherits the time-out clock of INIT_CONNECT retransmission
-  3.INIT_CONNECT family, MULTIPLY retransmissin, registered when Emit MULTIPLY
-  4.INIT_CONNECT family, RESUME retransmission, registered when Emit RESUME
-  5.Transient State Timeout family, challenging timeout, registered when Emit ACK_CONNECT_REQ
-	It is the time when the responder starts the time-out mechanism
-  6.KEEP_ALIVE family, persist heartbeat, the timeout interval of when emitting KEEP_ALIVE/retransmitting PERSIST
-  7.KEEP_ALIVE family, adjourn heartbeat, the timeout interval of retransmitting COMMIT
-  8.Scavenging event, registered when Emit RELEASE in the CLOSABLE state (and it is migrated to CLOSED state)
-	or when get ACK_FLUSH packet in the COMMITTING state (and it is migrated to CLOSABLE state)
+  Continual KEEP_ALIVE packets are sent as heartbeat signals. PERSIST or COMMIT may be retransmitted in the heartbeat interval
+  RELEASE may be retransmitted in the heartbeat interval as well
+  ACK_CONNECT_REQ, PURE_DATA or ACK_FLUSH is retransmitted on demand.
+  ACK_INIT_CONNECT is never retransmitted.
 
   Timeout is almost always notified to ULA
-  ACK_INIT_CONNECT or RELEASE is never retransmitted.
-  ACK_CONNECT_REQ, PURE_DATA or ACK_FLUSH is retransmitted on demand.
-
-  Continual KEEP_ALIVE packets are sent as heartbeat signals. PERSIST or COMMIT may be retransmit in the heartbeat interval
   
   [Transient State timeout]
 	  {CONNECT_BOOTSTRAP, CHALLENGING, CONNECT_AFFIRMING}-->NON_EXISTENT
-	  {COMMITTING, COMMITTING2}-->NON_EXISTENT
+	  {COMMITTING, COMMITTING2, PRE_CLOSED}-->NON_EXISTENT
 	  CLONING-->NON_EXISTENT
-	  CLOSABLE-->CLOSED-->[Send RELEASE]
 	  {RESUMING, QUASI_ACTIVE}-->CLOSED
 
   Implementation should start garbage collecting as soon as it switches into NON_EXSISTENT state.
@@ -81,6 +67,12 @@
   The actual heartbeat interval should be no less than one OS time slice interval 
 **/
 
+// let calling of Extingush() in the NON_EXISTENT state to do cleanup 
+#define TIMED_OUT() \
+		Notify(FSP_NotifyTimeout);	\
+		lowState = NON_EXISTENT;	\
+		SetReady();	\
+		return
 
 
 // Timeout of initiation family retransmission, keep-alive transmission and Scanvenger activation
@@ -90,7 +82,10 @@ void CSocketItemEx::TimeOut()
 {
 	if(! this->TestAndLockReady())
 	{
-		TRACE_HERE("Timeout not executed due to lack of locks");
+#ifdef TRACE
+		printf_s("\nTimeout not executed due to lack of locks in state %s. InUse: %d, IsReady: %d\n"
+			, stateNames[lowState], IsInUse(), isReady);
+#endif
 		return;
 	}
 
@@ -102,8 +97,9 @@ void CSocketItemEx::TimeOut()
 	switch(lowState)
 	{
 	case NON_EXISTENT:
+		TRACE_HERE("After Extinguish() it needn't SetReady();");
 		Extinguish();
-		return;	// needn't	SetReady();
+		return;
 	// Note that CONNECT_BOOTSTRAP and CONNECT_AFFIRMING are counted into one transient period
 	case CONNECT_BOOTSTRAP:
 	case CONNECT_AFFIRMING:
@@ -113,10 +109,7 @@ void CSocketItemEx::TimeOut()
 #ifdef TRACE
 			printf_s("\nTransient state time out in state %s\n", stateNames[lowState]);
 #endif
-			Notify(FSP_NotifyTimeout);
-			lowState = NON_EXISTENT;
-			SetReady();
-			return;	// let calling of Extingush() in the NON_EXISTENT state to do cleanup 
+			TIMED_OUT();
 		}
 		// TO BE TESTED...
 		if(lowState != CHALLENGING)
@@ -126,22 +119,23 @@ void CSocketItemEx::TimeOut()
 		if(t1 - tLastRecv > (SCAVENGE_THRESHOLD_ms << 10))
 		{
 			ReplaceTimer(TRASIENT_STATE_TIMEOUT_ms);
-			Notify(FSP_Abort);	// donot actively reset peer's context
-			lowState = NON_EXISTENT;
-			SetReady();
-			return;	// let calling of Extingush() in the NON_EXISTENT state to do cleanup 
+			TIMED_OUT();
+		}
+	case COMMITTING:
+	case COMMITTING2:
+		if((t1 - clockCheckPoint.tMigrate) > (TRASIENT_STATE_TIMEOUT_ms << 10))
+		{
+#ifdef TRACE
+			printf_s("\nTransient state time out in the %s state\n", stateNames[lowState]);
+#endif
+			TIMED_OUT();
 		}
 	case PEER_COMMIT:
 	case COMMITTED:
-	case COMMITTING:
-	case COMMITTING2:
 		if(t1 - tSessionBegin > (MAXIMUM_SESSION_LIFE_ms << 10))
 		{
 			ReplaceTimer(TRASIENT_STATE_TIMEOUT_ms);
-			Notify(FSP_Abort);	// donot actively reset peer's context
-			lowState = NON_EXISTENT;
-			SetReady();
-			return;	// let calling of Extingush() in the NON_EXISTENT state to do cleanup 
+			TIMED_OUT();
 		}
 		//
 		if (lowState != COMMITTED)
@@ -154,11 +148,8 @@ void CSocketItemEx::TimeOut()
 #ifdef TRACE
 			printf_s("\nTransient state time out in the %s state\n", stateNames[lowState]);
 #endif
-			Notify(FSP_Abort);	// a connection that cannot be gracefully shutdown is aborted instead
 			// UNRESOLVED!? But PRE_CLOSED connection might be resurrected
-			lowState = NON_EXISTENT;
-			SetReady();
-			return;	// let calling of Extingush() in the NON_EXISTENT state to do cleanup 
+			TIMED_OUT();
 		}
 		//
 		SendPacket<RELEASE>();
@@ -168,35 +159,47 @@ void CSocketItemEx::TimeOut()
 		if(t1 - tSessionBegin >  (MAXIMUM_SESSION_LIFE_ms << 10))
 		{
 			ReplaceTimer(TRASIENT_STATE_TIMEOUT_ms);
-			Notify(FSP_Dispose);
+			if(lowState == CLOSABLE)
+				Notify(FSP_Dispose);
 			lowState = NON_EXISTENT;
 			SetReady();
 			return;	// let calling of Extingush() in the NON_EXISTENT state to do cleanup 
 		}
 		break;
 	case CLONING:
-	case RESUMING:
-	case QUASI_ACTIVE:
 		if (t1 - clockCheckPoint.tMigrate > (TRASIENT_STATE_TIMEOUT_ms << 10)
 		 || t1 - tSessionBegin >  (MAXIMUM_SESSION_LIFE_ms << 10) )
 		{
 #ifdef TRACE
 			printf_s("\nTransient state time out or key out of life in the %s state\n", stateNames[lowState]);
 #endif
-			Notify(FSP_NotifyTimeout);	// UNRESOLVED! But if Notify failed?
-			lowState = NON_EXISTENT;
+			TIMED_OUT();
+		}
+		EmitStart();
+		break;
+	case RESUMING:
+	case QUASI_ACTIVE:
+		if (t1 - tSessionBegin >  (MAXIMUM_SESSION_LIFE_ms << 10) )
+		{
+#ifdef TRACE
+			printf_s("\nTransient state time out or key out of life in the %s state\n", stateNames[lowState]);
+#endif
+			TIMED_OUT();
+		}
+		else if(t1 - clockCheckPoint.tMigrate > (TRASIENT_STATE_TIMEOUT_ms << 10))
+		{
+			ReplaceTimer(SCAVENGE_THRESHOLD_ms);
+			Notify(FSP_NotifyTimeout);
+			lowState = CLOSED;
 			SetReady();
-			return;	// let calling of Extingush() in the NON_EXISTENT state to do cleanup 
+			return;
 		}
 		EmitStart();
 		break;
 	}
 
-	if (toUpdateTimer)
-	{
-		toUpdateTimer = false;
+	if (_InterlockedExchange8(& toUpdateTimer, 0))
 		RestartKeepAlive();
-	}
 
 	// but if we could possibly query it from the internal information of the timer!
 	clockCheckPoint.tKeepAlive = t1 + tKeepAlive_ms * 1000ULL;
@@ -227,7 +230,7 @@ void CSocketItemEx::KeepAlive()
 		uint8_t	headOpCode = skb->opCode;
 		if (headOpCode == PERSIST)
 		{
-#ifdef TRACE
+#ifdef TRACE_PACKET
 			printf_s("Keep-alive local fiber#%u, head packet in the queue is happened to be %s\n"
 				, fidPair.source
 				, opCodeStrings[headOpCode]);
@@ -242,18 +245,11 @@ void CSocketItemEx::KeepAlive()
 			EmitWithICC(skb, pControlBlock->GetSendWindowFirstSN());
 	}
 
-	SendHeartbeat();
-}
-
-
-
-
-void CSocketItemEx::SendHeartbeat()
-{
+	// Send COMMIT or KEEP_ALIVE in heartbeat interval
 	BYTE buf[sizeof(FSP_NormalPacketHeader) + MAX_BLOCK_SIZE];
 	ControlBlock::seq_t seqExpected;
 	int spFull = GenerateSNACK(buf, seqExpected);
-#ifdef TRACE
+#ifdef TRACE_PACKET
 	printf_s("Keep-alive local fiber#%u\n"
 		"\tAcknowledged seq#%u, keep-alive header size = %d\n"
 		, fidPair.source
@@ -263,16 +259,12 @@ void CSocketItemEx::SendHeartbeat()
 
 	if(spFull < 0)
 	{
-#ifdef TRACE
 		printf_s("Fatal error %d encountered when generate SNACK\n", spFull);
-#endif
 		return;
 	}
 	if(spFull - sizeof(FSP_NormalPacketHeader) < 0)
 	{
-#ifdef TRACE
 		TRACE_HERE("HandleMemoryCorruption");
-#endif
 		HandleMemoryCorruption();
 		return;
 	}
@@ -281,7 +273,7 @@ void CSocketItemEx::SendHeartbeat()
 	pHdr->hs.Set<KEEP_ALIVE>(spFull);
 	pControlBlock->SetSequenceFlags(pHdr, seqExpected);
 	SetIntegrityCheckCode(*pHdr);
-#ifdef TRACE
+#ifdef TRACE_PACKET
 	printf_s("To send KEEP_ALIVE seq#%u, acknowledge#%u\n", ntohl(pHdr->sequenceNo), seqExpected);
 #endif
 	SendPacket(1, ScatteredSendBuffers(pHdr, spFull));
@@ -310,12 +302,6 @@ void CSocketItemEx::SendHeartbeat()
 //  if n == 0 it is an accumulative acknowledgment
 int LOCALAPI CSocketItemEx::RespondSNACK(ControlBlock::seq_t expectedSN, const FSP_SelectiveNACK::GapDescriptor *gaps, int n)
 {
-	if(isMilky || n < 0)
-	{
-		TRACE_HERE("isMilky || n < 0");
-		return -EDOM;
-	}
-
 	// Check validity of the control block descriptors to prevent memory corruption propagation
 	register int32_t	capacity;
 	register int32_t	iHead;
@@ -507,7 +493,7 @@ l_success:
 	if(acknowledged)
 	{
 		// UNRESOLVED! to be studied: does RTT increment linearly?
-		toUpdateTimer = true;
+		_InterlockedExchange8(& toUpdateTimer, 1);
 		// We assume that after sliding send window the number of unacknowledged was reduced
 		pControlBlock->SlideSendWindow();
 		RecalibrateKeepAlive(rtt64_us);
@@ -549,7 +535,8 @@ int LOCALAPI CSocketItemEx::RespondSNACK(ControlBlock::seq_t ackSeqNo, const PFS
 		return RespondSNACK(ackSeqNo, NULL, 0);
 	}
 
-	FSP_SelectiveNACK::GapDescriptor *gaps = (FSP_SelectiveNACK::GapDescriptor *)((BYTE *)& headPacket->pkt + ntohs(optHdr->hsp));
+	FSP_SelectiveNACK::GapDescriptor *gaps
+		= (FSP_SelectiveNACK::GapDescriptor *)((BYTE *)headPacket->GetHeaderFSP() + ntohs(optHdr->hsp));
 	FSP_SelectiveNACK *pHdr = (FSP_SelectiveNACK *)((BYTE *)optHdr + sizeof(*optHdr) - sizeof(*pHdr));
 	int n = int((BYTE *)gaps - (BYTE *)pHdr);
 	if (n < 0)

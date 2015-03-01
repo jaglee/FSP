@@ -87,7 +87,7 @@ int main()
 	if(hFile != NULL && hFile != INVALID_HANDLE_VALUE)
 		CloseHandle(hFile);
 
-	Sleep(3000);	// so that the other thread may send RESET successfully
+	getchar(); // Sleep(3000);	// so that the other thread may send RESET successfully
 	return 0;
 }
 
@@ -228,7 +228,11 @@ static int FSPAPI onReceiveNextBlock(FSPHANDLE h, void *buf, int32_t len, bool t
 	if(! toBeContinued)
 	{
 		printf_s("All data have been received, to shutdown...\n");
-		Shutdown(h);
+		if(Shutdown(h) != 0)
+		{
+			Dispose(h);
+			finished = true;
+		}
 	}
 
 	return 1;
