@@ -47,12 +47,12 @@
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <LinkIncremental>true</LinkIncremental>
     <IntDir>$(SolutionDir)$(ProjectName)_$(Configuration)\</IntDir>
-    <IncludePath>C:\MinGW\msys\1.0\local\include;$(IncludePath)</IncludePath>
+    <IncludePath>$(IncludePath)</IncludePath>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
     <LinkIncremental>true</LinkIncremental>
     <IntDir>$(SolutionDir)$(ProjectName)_$(Configuration)\</IntDir>
-    <IncludePath>C:\MinGW\msys\1.0\local\include;$(IncludePath)</IncludePath>
+    <IncludePath>$(IncludePath)</IncludePath>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
@@ -93,8 +93,6 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClInclude Include="..\..\FSP\FSP_Impl.h" />
-    <ClInclude Include="..\..\FSP\FSP_SRV\fsp_srv.h" />
     <ClInclude Include="..\rijndael-alg-fst.h" />
     <ClInclude Include="targetver.h" />
   </ItemGroup>
@@ -102,13 +100,12 @@
     <ClCompile Include="..\ControlBlock.cpp" />
     <ClCompile Include="..\FSP_SRV\CubicRoot.c" />
     <ClCompile Include="..\FSP_SRV\mobile.cpp" />
+    <ClCompile Include="..\FSP_SRV\ocb.c" />
     <ClCompile Include="..\FSP_SRV\os_win.cpp" />
     <ClCompile Include="..\FSP_SRV\remote.cpp" />
     <ClCompile Include="..\FSP_SRV\socket.cpp" />
     <ClCompile Include="..\FSP_SRV\timers.cpp" />
-    <ClCompile Include="..\FSP_SRV\vmac_ae.c" />
     <ClCompile Include="..\rijndael-alg-fst.c" />
-    <ClCompile Include="..\vmac.c" />
     <ClCompile Include="unittest1.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

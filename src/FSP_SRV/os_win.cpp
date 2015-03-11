@@ -727,7 +727,7 @@ int CLowerInterface::AcceptAndProcess()
 		pktBuf->pktSeqNo = ntohl(pktBuf->GetHeaderFSP()->sequenceNo);
 		pktBuf->lenData = countRecv - lenPrefix - ntohs(pktBuf->GetHeaderFSP()->hs.hsp);
 #ifdef TRACE_PACKET
-		printf_s("packet #%u, payload length %d, to put onto the queue\n", pSignature->pktSeqNo, pSignature->lenData);
+		printf_s("packet #%u, payload length %d, to put onto the queue\n", pktBuf->pktSeqNo, pktBuf->lenData);
 #endif
 		if(pktBuf->lenData < 0 || pktBuf->lenData > MAX_BLOCK_SIZE)
 		{
@@ -738,7 +738,7 @@ int CLowerInterface::AcceptAndProcess()
 		// save the source address temporarily as it is not necessariy legitimate
 		pSocket->sockAddrTo[MAX_PHY_INTERFACES] = addrFrom;
 #ifdef TRACE_PACKET
-		printf_s("Socket : 0x%08X , buffer : 0x%08X queued\n", (LONG)pSocket, (LONG)pSignature->pkt);
+		printf_s("Socket : 0x%08X , buffer : 0x%08X queued\n", (LONG)pSocket, (LONG)pktBuf->GetHeaderFSP());
 #endif
 		// only if the queue has not started needs it queue HandleICC
 		if(pSocket->PushPacketBuffer(pktBuf) == NULL)

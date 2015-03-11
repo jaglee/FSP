@@ -272,7 +272,7 @@ void CSocketItemEx::KeepAlive()
 	register FSP_NormalPacketHeader *pHdr = (FSP_NormalPacketHeader *)buf;
 	pHdr->hs.Set<KEEP_ALIVE>(spFull);
 	pControlBlock->SetSequenceFlags(pHdr, seqExpected);
-	SetIntegrityCheckCode(*pHdr);
+	SetIntegrityCheckCode(pHdr);
 #ifdef TRACE_PACKET
 	printf_s("To send KEEP_ALIVE seq#%u, acknowledge#%u\n", ntohl(pHdr->sequenceNo), seqExpected);
 #endif

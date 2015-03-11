@@ -283,6 +283,11 @@ protected:
 #endif
 	ALIGN(MAC_ALIGNMENT)
 	ae_ctx		mac_ctx;
+	// prepare vmac memory alignment and initialize the padding
+	ALIGN(MAC_ALIGNMENT) unsigned char padded[sizeof(FSP_NormalPacketHeader) + MAX_BLOCK_SIZE + MAC_ALIGNMENT];
+	ALIGN(MAC_ALIGNMENT) unsigned char nonce[FSP_MAC_IV_SIZE];
+	ALIGN(MAC_ALIGNMENT) unsigned char xcrypted[MAX_BLOCK_SIZE];	// decrypted or ciphered, it depends
+
 #ifndef NDEBUG
 	uint64_t	_mac_ctx_protect_epilog[2];
 #endif
@@ -317,9 +322,6 @@ protected:
 		ae_init(& mac_ctx, pControlBlock->u.sessionKey, FSP_SESSION_KEY_LEN, FSP_MAC_IV_SIZE, FSP_TAG_SIZE);
 	}
 
-	// On got valid ICC automatically register source IP address as the favorite returning IP address
-	bool ValidateICC(FSP_NormalPacketHeader *);
-	bool ValidateICC() { return ValidateICC(headPacket->GetHeaderFSP()); }
 	bool LOCALAPI HandleMobileParam(PFSP_HeaderSignature);
 
 	PktBufferBlock *PushPacketBuffer(PktBufferBlock *);
@@ -418,16 +420,14 @@ public:
 		FSP_NormalPacketHeader hdr;
 		pControlBlock->SetSequenceFlags(& hdr);
 		hdr.hs.Set<FSP_NormalPacketHeader, c>();
-		SetIntegrityCheckCode(hdr);
+		SetIntegrityCheckCode(& hdr);
 		return SendPacket(1, ScatteredSendBuffers(&hdr, sizeof(hdr)));
 	}
 
-	void LOCALAPI SetIntegrityCheckCodeP1(FSP_NormalPacketHeader *);
-	void LOCALAPI SetIntegrityCheckCode(FSP_NormalPacketHeader & hdr)
-	{
-		hdr.integrity.id = fidPair;
-		SetIntegrityCheckCodeP1(& hdr);
-	}
+	void LOCALAPI SetIntegrityCheckCode(FSP_NormalPacketHeader *, int32_t = 0);
+	// On got valid ICC automatically register source IP address as the favorite returning IP address
+	bool LOCALAPI ValidateICC(FSP_NormalPacketHeader *, int32_t = 0);
+	bool ValidateICC() { return ValidateICC(headPacket->GetHeaderFSP(), headPacket->lenData); }
 
 	void EmitQ() { pControlBlock->EmitQ(this); }
 	void PeerCommit();
@@ -500,8 +500,11 @@ public:
 class CSocketSrvTLB
 {
 protected:
+	ALIGN(MAC_ALIGNMENT)
 	CSocketItemEx listenerSlots[MAX_LISTENER_NUM];
+	ALIGN(MAC_ALIGNMENT)
 	CSocketItemEx itemStorage[MAX_CONNECTION_NUM];
+	//
 	CSocketItemEx *poolFiberID[MAX_CONNECTION_NUM];
 	CSocketItemEx *headFreeSID, *tailFreeSID;
 	volatile char mutex;

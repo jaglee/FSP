@@ -11,41 +11,8 @@
     <ClCompile Include="Multiplex.cpp" />
     <ClCompile Include="Receive.cpp" />
     <ClCompile Include="Send.cpp" />
-    <ClCompile Include="..\SHA3\KeccakDuplex.c">
-      <Filter>SHA3</Filter>
-    </ClCompile>
-    <ClCompile Include="..\SHA3\KeccakF-1600-inplace32BI.c">
-      <Filter>SHA3</Filter>
-    </ClCompile>
-    <ClCompile Include="..\SHA3\KeccakHash.c">
-      <Filter>SHA3</Filter>
-    </ClCompile>
-    <ClCompile Include="..\SHA3\KeccakNISTInterface.c">
-      <Filter>SHA3</Filter>
-    </ClCompile>
-    <ClCompile Include="..\SHA3\KeccakSponge.c">
-      <Filter>SHA3</Filter>
-    </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="..\SHA3\brg_endian.h">
-      <Filter>SHA3</Filter>
-    </ClInclude>
-    <ClInclude Include="..\SHA3\KeccakDuplex.h">
-      <Filter>SHA3</Filter>
-    </ClInclude>
-    <ClInclude Include="..\SHA3\KeccakF-1600-interface.h">
-      <Filter>SHA3</Filter>
-    </ClInclude>
-    <ClInclude Include="..\SHA3\KeccakHash.h">
-      <Filter>SHA3</Filter>
-    </ClInclude>
-    <ClInclude Include="..\SHA3\KeccakNISTInterface.h">
-      <Filter>SHA3</Filter>
-    </ClInclude>
-    <ClInclude Include="..\SHA3\KeccakSponge.h">
-      <Filter>SHA3</Filter>
-    </ClInclude>
     <ClInclude Include="..\FSP.h">
       <Filter>Headers</Filter>
     </ClInclude>
@@ -60,9 +27,6 @@
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
-    <Filter Include="SHA3">
-      <UniqueIdentifier>{dce7dc3e-4d98-49e4-a2c5-da366930f156}</UniqueIdentifier>
-    </Filter>
     <Filter Include="Headers">
       <UniqueIdentifier>{80498912-648c-4812-ba2b-721b582689ef}</UniqueIdentifier>
       <Extensions>*.h</Extensions>

@@ -7,6 +7,7 @@
 #include <mstcpip.h>
 
 // Headers for CppUnitTest
+#define _ALLOW_KEYWORD_MACROS
 #include "CppUnitTest.h"
 
 using namespace Microsoft::VisualStudio::CppUnitTestFramework;
@@ -74,13 +75,19 @@ public:
 	{
 		free(pControlBlock);
 	}
-	void LOCALAPI ResetVMAC()
-	{
-		vhash_reset(& pControlBlock->mac_ctx);	// vmac_set_key
-	}
+	//void LOCALAPI ResetVMAC()
+	//{
+	//	vhash_reset(& pControlBlock->mac_ctx);	// vmac_set_key
+	//}
 
 	ControlBlock *GetControlBlock() const { return pControlBlock; }
 	ControlBlock::PFSP_SocketBuf AllocRecvBuf(ControlBlock::seq_t seq1) { return pControlBlock->AllocRecvBuf(seq1); }
+	void InstallSessionKey(BYTE key[16])
+	{
+		memcpy(pControlBlock->u.sessionKey, key, sizeof(key));
+		CSocketItemEx::InstallSessionKey();
+	}
+	void SetPairOfFiberID(ALFID_T src, ALFID_T dst) { fidPair.source = src; fidPair.peer = dst; }
 
 	friend void UnitTestSocketInState();
 	friend void UnitTestReceiveQueue();
@@ -688,6 +695,8 @@ void UnitTestGMAC()
 
 void UnitTestVMAC()
 {
+#if 0
+			// as VMAC_AE failed unit test we remove VMAC support
 	FSP_InitiateRequest request;
 	FSP_Challenge responseZero;	// zero hint no state
 	FSP_AckConnectRequest acknowledgement;
@@ -695,7 +704,7 @@ void UnitTestVMAC()
 	timestamp_t t0 = NowUTC();
 
 	int32_t r = 1;
-	r = get32BE(&r);
+	r = htobe32(r);
 	memset(&nearEnd, 0, sizeof(nearEnd));
 	request.timeStamp = htonll(t0);
 	// initCheckCode, salt should be random, but remain as-is for test purpose
@@ -740,6 +749,7 @@ void UnitTestVMAC()
 	ack2.integrity.id = savedId;
 	socket.SetIntegrityCheckCodeP1(& ack2);
 	Assert::AreEqual<UINT64>(savedICC, ack2.integrity.code);
+#endif
 }
 
 
@@ -1257,6 +1267,7 @@ static void pbuf(void *p, int len, char *s)
 
 void UnitTestVMAC_AE()
 {
+#if 0
 	vmac_ae_ctx_t *ctx;
 	uint64_t tagh, tagh2, tagl, tagl2;
 	void *p;
@@ -1339,7 +1350,64 @@ void UnitTestVMAC_AE()
 		printf("%4u bytes, %2.2f cpb\n", speed_lengths[i], cpb);
 	}
 #endif
+#endif
 }
+
+
+
+void UnitTestOCB_MAC()
+{
+	FSP_InitiateRequest request;
+	FSP_Challenge responseZero;	// zero hint no state
+	FSP_AckConnectRequest acknowledgement;
+	CtrlMsgHdr nearEnd;
+	timestamp_t t0 = NowUTC();
+
+	int32_t r = 1;
+	r = htobe32(r);
+	memset(&nearEnd, 0, sizeof(nearEnd));
+	request.timeStamp = htonll(t0);
+	// initCheckCode, salt should be random, but remain as-is for test purpose
+	request.hs.Set<FSP_InitiateRequest, INIT_CONNECT>();
+
+	timestamp_t t1 = NowUTC();
+	struct _CookieMaterial cm;
+	cm.idALF = nearEnd.u.idALF;
+	cm.idListener = htonl(LAST_WELL_KNOWN_ALFID);
+	// the cookie depends on the listening session ID AND the responding session ID
+	cm.salt = request.salt;
+	responseZero.initCheckCode = request.initCheckCode;
+	responseZero.cookie = CalculateCookie((BYTE *) & cm, sizeof(cm), t1);
+	responseZero.timeDelta = htonl((u_long)(t1 - t0)); 
+	responseZero.cookie ^= ((UINT64)request.salt << 32) | request.salt;
+	responseZero.hs.Set<FSP_Challenge, ACK_INIT_CONNECT>();
+
+	acknowledgement.expectedSN = 1;
+	acknowledgement.sequenceNo = 1;
+	// should the connect parameter header. but it doesn't matter
+	acknowledgement.hs.Set<FSP_AckConnectRequest, ACK_CONNECT_REQ>();
+
+	BYTE samplekey[16] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
+	CSocketItemExDbg socket;
+	socket.SetPairOfFiberID(nearEnd.u.idALF, htonl(LAST_WELL_KNOWN_ALFID));
+
+	socket.InstallSessionKey(samplekey);
+	socket.SetIntegrityCheckCode(& acknowledgement);
+
+	// ValidateICC validates the received packet, the source and sink ID should be exchanged for the receiver
+	socket.SetPairOfFiberID(htonl(LAST_WELL_KNOWN_ALFID), nearEnd.u.idALF);
+
+	bool checked = socket.ValidateICC(& acknowledgement);
+	Assert::IsTrue(checked);
+
+	socket.SetIntegrityCheckCode(& acknowledgement, 9);	// arbitrary length in the stack
+
+	socket.SetPairOfFiberID(nearEnd.u.idALF, htonl(LAST_WELL_KNOWN_ALFID));
+	checked = socket.ValidateICC(& acknowledgement, 9);
+	Assert::IsTrue(checked);
+}
+
+
 
 namespace UnitTestFSP
 {		
@@ -1387,10 +1455,13 @@ namespace UnitTestFSP
 
 		TEST_METHOD(TestVMAC_AE)
 		{
-#if 0
-			// as VMAC_AE failed unit test we remove VMAC support
 			UnitTestVMAC_AE();
-#endif
+		}
+
+
+		TEST_METHOD(TestOCB_MAC)
+		{
+			UnitTestOCB_MAC();
 		}
 
 

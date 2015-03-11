@@ -173,61 +173,56 @@ UINT64 LOCALAPI CalculateCookie(BYTE *header, int sizeHdr, timestamp_t t0)
 
 
 // Given
-//	The header to be filled with 
+//	FSP_NormalPacketHeader *	The pointer to the fixed header to be filled
+//	int32_t						The payload length
 // Do
 //	Set ICC value
 // Remark
 //	IV = (sequenceNo, expectedSN)
 //	AAD = (source fiber ID, destination fiber ID, flags, receive window free pages
 //		 , version, OpCode, header stack pointer, optional headers)
-void LOCALAPI CSocketItemEx::SetIntegrityCheckCodeP1(FSP_NormalPacketHeader *p1)
+void LOCALAPI CSocketItemEx::SetIntegrityCheckCode(FSP_NormalPacketHeader *p1, int32_t ptLen)
 {
 //#ifdef TRACE
 //	printf_s("First 16 bytes to including in calculate ICC:\n");
 //	DumpNetworkUInt16((UINT16 *)p1, 16);
 //#endif
-	// prepare vmac memory alignment and initialize the padding
-	ALIGN(MAC_ALIGNMENT) unsigned char nonce[FSP_MAC_IV_SIZE];
-	int32_t & mbytes = *((int32_t *)nonce);
-	ALIGN(MAC_ALIGNMENT) unsigned char padded[MAX_BLOCK_SIZE];
+	ALIGN(MAC_ALIGNMENT) BYTE tag[OCB_TAG_LEN];
+	int32_t aadLen = ntohs(p1->hs.hsp) - FSP_MAC_IV_SIZE;
 
-	mbytes = ntohs(p1->hs.hsp) - FSP_MAC_IV_SIZE;
-	if (mbytes > sizeof(padded) || mbytes <= 0)
+	if (aadLen > sizeof(padded) || aadLen <= 0)
 		return;
-	memcpy_s(padded, sizeof(padded), (BYTE *) & p1->integrity.id, mbytes);
-	if (mbytes < sizeof(padded))
-		memset(padded + mbytes, 0, min(mbytes + MAC_ALIGNMENT, sizeof(padded)));
+	
+	BYTE *payload = (BYTE *) & p1->integrity.id + aadLen;
+	int nPadded = 0;
+	BYTE *pt = NULL;
 
-	// "An i byte nonce, is made as the first 16-i bytes of n being zero, and the final i the nonce."
-	// here it is (p1->sequenceNo, p1->expectedSN) of 8 bytes
-	memset(nonce, 0, sizeof(nonce) - FSP_MAC_IV_SIZE);
-	memcpy(nonce + sizeof(nonce) - FSP_MAC_IV_SIZE, p1, FSP_MAC_IV_SIZE);
-	//
-//#ifdef TRACE
-//	printf_s("Nonce:\n");
-//	DumpNetworkUInt16((UINT16 *)nonce, 8);
-//	printf_s("Padded data of %d bytes (original: %d):\n", ((mbytes + MAC_ALIGNMENT - 1) & ~(MAC_ALIGNMENT - 1)) / 2, mbytes);
-//	DumpNetworkUInt16((UINT16 *)padded, ((mbytes + MAC_ALIGNMENT - 1) & ~(MAC_ALIGNMENT - 1)) / 2);
-//	printf_s("VMAC Context: \n");
-//	DumpNetworkUInt16((UINT16 *)& pControlBlock->mac_ctx, sizeof(pControlBlock->mac_ctx) / 2);
-//#endif
-#ifndef NDEBUG
-	if (_mac_ctx_protect_prolog[0] != MAC_CTX_PROTECT_SIGN
-		|| _mac_ctx_protect_prolog[1] != MAC_CTX_PROTECT_SIGN
-		|| _mac_ctx_protect_epilog[0] != MAC_CTX_PROTECT_SIGN
-		|| _mac_ctx_protect_epilog[1] != MAC_CTX_PROTECT_SIGN)
+	p1->integrity.id = fidPair;
+	memcpy_s(padded, sizeof(padded), (BYTE *) & p1->integrity.id, aadLen);
+	if(aadLen % MAC_ALIGNMENT > 0)
 	{
-		printf_s("Fatal! MAC context is destroyed! Session ID = 0x%X\n", this->fidPair.source);
-		return;
+		nPadded = MAC_ALIGNMENT - aadLen % MAC_ALIGNMENT;
+		memset(padded + aadLen, 0, nPadded);
 	}
-#endif
-	ALIGN(MAC_ALIGNMENT) block r;
-	ae_encrypt(& mac_ctx, nonce, NULL, 0, padded, mbytes, NULL, & r, 1);
-	p1->integrity.code = *(uint64_t *) & r;
-#undef FSP_MAC_IV_SIZE
+	if(ptLen > 0)
+	{
+		pt = padded + aadLen + nPadded;
+		if(memcpy_s(pt, sizeof(padded) - aadLen - nPadded, payload, ptLen) != 0)
+			return;
+	}
+
+	// significant nonce bits are (p1->sequenceNo, p1->expectedSN) of 8 bytes
+	memset(nonce, 0, sizeof(nonce));
+	memcpy(nonce + sizeof(nonce) - (sizeof(p1->sequenceNo) + sizeof(p1->expectedSN))
+		, & p1->sequenceNo
+		, sizeof(p1->sequenceNo) + sizeof(p1->expectedSN));
+
+	ae_encrypt(& mac_ctx, nonce, pt, ptLen, padded, aadLen, xcrypted, tag, AE_FINALIZE);
+	p1->integrity.code = *(uint64_t *)tag;
+	if(ptLen > 0)
+		memcpy(payload, xcrypted, ptLen);
 }
 
-// TODO: Check Integrity code should apply ae_decrypt
 
 /**
  * Storage location of command header, send/receive: remark
@@ -353,8 +348,7 @@ bool LOCALAPI CSocketItemEx::EmitWithICC(ControlBlock::PFSP_SocketBuf skb, Contr
 	pHdr->hs.opCode = skb->opCode;
 	pHdr->hs.version = THIS_FSP_VERSION;
 	pHdr->hs.hsp = htons(sizeof(FSP_NormalPacketHeader));
-	// Only when the first acknowledgement is received may the faster Keep-Alive timer started. See also OnGetFullICC()
-	SetIntegrityCheckCode(*pHdr);
+	SetIntegrityCheckCode(pHdr, skb->len);
 	if (skb->len > 0)
 		result = SendPacket(2, ScatteredSendBuffers(pHdr, sizeof(FSP_NormalPacketHeader), payload, skb->len));
 	else
@@ -363,17 +357,52 @@ bool LOCALAPI CSocketItemEx::EmitWithICC(ControlBlock::PFSP_SocketBuf skb, Contr
 	return (result > 0);
 }
 
-
+// Given
+//	FSP_NormalPacketHeader *	The pointer to the fixed header
+//	int32_t						The size of the ciphertext
+// Return
+//	true if the full packet passed authentication and the the payload successfully decrypted
 // Remark
 //	Designed side-effect for mobility support: automatically refresh the corresponding address list...
-bool CSocketItemEx::ValidateICC(FSP_NormalPacketHeader *pkt)
+bool CSocketItemEx::ValidateICC(FSP_NormalPacketHeader *p1, int32_t ctLen)
 {
-	UINT64	savedICC = pkt->integrity.code;
-	pkt->integrity.id.source = fidPair.peer;
-	pkt->integrity.id.peer = fidPair.source;
-	SetIntegrityCheckCodeP1(pkt);
-	if(pkt->integrity.code != savedICC)
+	ALIGN(MAC_ALIGNMENT) BYTE tag[OCB_TAG_LEN];
+	int32_t aadLen = ntohs(p1->hs.hsp) - FSP_MAC_IV_SIZE;
+
+	if (aadLen > sizeof(padded) || aadLen <= 0)
 		return false;
+	
+	BYTE *payload = (BYTE *) & p1->integrity.id + aadLen;
+	int nPadded = 0;
+	BYTE *ct = NULL;
+
+	*(UINT64 *)tag = p1->integrity.code;
+	p1->integrity.id.source = fidPair.peer;
+	p1->integrity.id.peer = fidPair.source;
+	memcpy_s(padded, sizeof(padded), (BYTE *) & p1->integrity.id, aadLen);
+	if(aadLen % MAC_ALIGNMENT > 0)
+	{
+		nPadded = MAC_ALIGNMENT - aadLen % MAC_ALIGNMENT;
+		memset(padded + aadLen, 0, nPadded);
+	}
+	if(ctLen > 0)
+	{
+		ct = padded + aadLen + nPadded;
+		if(memcpy_s(ct, sizeof(padded) - aadLen - nPadded, payload, ctLen) != 0)
+			return false;
+	}
+
+	// significant nonce bits are (p1->sequenceNo, p1->expectedSN) of 8 bytes
+	memset(nonce, 0, sizeof(nonce));
+	memcpy(nonce + sizeof(nonce) - (sizeof(p1->sequenceNo) + sizeof(p1->expectedSN))
+		, & p1->sequenceNo
+		, sizeof(p1->sequenceNo) + sizeof(p1->expectedSN));
+
+	if(ae_decrypt(& mac_ctx, nonce, ct, ctLen, padded, aadLen, xcrypted, tag, AE_FINALIZE) == AE_INVALID)
+		return false;
+	if(ctLen > 0)
+		memcpy(payload, xcrypted, ctLen);
+
 	// TODO: automatically register remote address as the favorite contact address
 	// iff the integrity check code has passed the validation
 	//if(addrFrom.si_family == AF_INET)

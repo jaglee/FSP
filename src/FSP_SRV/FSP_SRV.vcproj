@@ -201,6 +201,10 @@
 				>
 			</File>
 			<File
+				RelativePath=".\ocb.c"
+				>
+			</File>
+			<File
 				RelativePath=".\os_win.cpp"
 				>
 			</File>
@@ -218,14 +222,6 @@
 			</File>
 			<File
 				RelativePath=".\timers.cpp"
-				>
-			</File>
-			<File
-				RelativePath="..\vmac.c"
-				>
-			</File>
-			<File
-				RelativePath=".\vmac_ae.c"
 				>
 			</File>
 		</Filter>

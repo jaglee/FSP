@@ -195,11 +195,6 @@
     <ClCompile Include="..\ControlBlock.cpp" />
     <ClCompile Include="..\gcm-aes.c" />
     <ClCompile Include="..\rijndael-alg-fst.c" />
-    <ClCompile Include="..\SHA3\KeccakDuplex.c" />
-    <ClCompile Include="..\SHA3\KeccakF-1600-inplace32BI.c" />
-    <ClCompile Include="..\SHA3\KeccakHash.c" />
-    <ClCompile Include="..\SHA3\KeccakNISTInterface.c" />
-    <ClCompile Include="..\SHA3\KeccakSponge.c" />
     <ClCompile Include="Disconnect.cpp" />
     <ClCompile Include="DllEntry.cpp" />
     <ClCompile Include="Establish.cpp" />
@@ -211,12 +206,6 @@
   <ItemGroup>
     <ClInclude Include="..\FSP.h" />
     <ClInclude Include="..\FSP_API.h" />
-    <ClInclude Include="..\SHA3\brg_endian.h" />
-    <ClInclude Include="..\SHA3\KeccakDuplex.h" />
-    <ClInclude Include="..\SHA3\KeccakF-1600-interface.h" />
-    <ClInclude Include="..\SHA3\KeccakHash.h" />
-    <ClInclude Include="..\SHA3\KeccakNISTInterface.h" />
-    <ClInclude Include="..\SHA3\KeccakSponge.h" />
     <ClInclude Include="FSP_DLL.h" />
     <ClInclude Include="..\FSP_Impl.h" />
   </ItemGroup>
