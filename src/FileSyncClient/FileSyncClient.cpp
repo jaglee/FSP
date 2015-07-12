@@ -12,6 +12,9 @@ static int	FSPAPI onConnected(FSPHANDLE, PFSP_Context);
 static int	FSPAPI onReceiveNextBlock(FSPHANDLE, void *, int32_t, bool);
 static void FSPAPI onReceiveFileNameReturn(FSPHANDLE, FSP_ServiceCode, int);
 
+static unsigned char bufPrivateKey[CRYPTO_NACL_KEYBYTES];
+static unsigned char bufPublicKey[CRYPTO_NACL_KEYBYTES];
+
 static HANDLE hFile;
 static char fileName[MAX_PATH];
 volatile static bool finished = false;
@@ -87,6 +90,7 @@ int main()
 	if(hFile != NULL && hFile != INVALID_HANDLE_VALUE)
 		CloseHandle(hFile);
 
+	printf("\n\nPress Enter to exit...");
 	getchar(); // Sleep(3000);	// so that the other thread may send RESET successfully
 	return 0;
 }
@@ -102,9 +106,30 @@ int FSPAPI onConnected(FSPHANDLE h, PFSP_Context ctx)
 		finished = true;
 		return -1;
 	}
+
 	printf_s("\tWelcome message length: %d\n", ctx->len);
-	if(ctx->len > 0)
-		printf_s("%s\n", ctx->welcome);
+	if(ctx->len <= 0)
+	{
+		printf_s("Security context is not fulfilled: the peer did not provide the public key.\n");
+	}
+
+	int mLen = strlen((const char *)ctx->welcome) + 1;
+	printf_s("%s\n", ctx->welcome);
+
+	CryptoNaClKeyPair(bufPublicKey, bufPrivateKey);
+
+	unsigned char bufPeersKey[CRYPTO_NACL_KEYBYTES];
+	unsigned char bufSharedKey[CRYPTO_NACL_KEYBYTES];
+	memset(bufPeersKey, 0, CRYPTO_NACL_KEYBYTES);
+	memcpy(bufPeersKey, (const char *)ctx->welcome + mLen, CRYPTO_NACL_KEYBYTES);
+
+	CryptoNaClGetSharedSecret(bufSharedKey, bufPeersKey, bufPrivateKey);
+
+	InstallAuthEncKey(h, bufSharedKey, CRYPTO_NACL_KEYBYTES, INT32_MAX);
+
+	// UNRESOLVED! Should put into the reverse 'welcome' message!
+	WriteTo(h, bufPublicKey, CRYPTO_NACL_KEYBYTES, END_OF_MESSAGE, NULL);
+
 	printf_s("\nTo read filename...\t");
 	if(ReadFrom(h, fileName, sizeof(fileName), onReceiveFileNameReturn) < 0)
 	{

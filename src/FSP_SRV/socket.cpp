@@ -260,7 +260,7 @@ l_return:
 // TODO: UNRESOLVED! hard-coded here, limit capacity of multi-home support?
 void CSocketItemEx::InitAssociation()
 {
-	UINT32 idRemoteHost = pControlBlock->peerAddr.ipFSP.hostID;
+	uint32_t idRemoteHost = pControlBlock->peerAddr.ipFSP.hostID;
 	// 'source' field of fidPair shall be filled already. See also CInterface::PoolingALFIDs()
 	// and CSocketSrvTLB::AllocItem(), AllocItem(ALFID_T)
 	fidPair.peer = pControlBlock->peerAddr.ipFSP.fiberID;
@@ -399,43 +399,38 @@ l_bailout:
 
 
 // Given
-//	BYTE *		the placeholder for the returned gap descriptors, shall be at of at least MAX_BLOCK_SIZE bytes
-//	seq_t &		the placeholder for the returned maximum expected sequence number
+//	FSP_SelectiveNACK::GapDescriptor *	the placeholder for the returned gap descriptors, shall be at of at least MAX_BLOCK_SIZE bytes
+//	seq_t &								the placeholder for the returned maximum expected sequence number
 // Return
-//	Number of bytes taken by the gap descriptors, including the fixed header fields
-//	0 or negative indicates that some error occurred
+//	Number of bytes taken by the gap descriptors, including the suffix fields of the SNACK header
+//	negative indicates that some error occurred
 // Remark
 //	For milky payload this function should never be called
-int LOCALAPI CSocketItemEx::GenerateSNACK(BYTE * buf, ControlBlock::seq_t & seq0)
+int32_t LOCALAPI CSocketItemEx::GenerateSNACK(FSP_PreparedKEEP_ALIVE &buf, ControlBlock::seq_t & seq0)
 {
-	FSP_SelectiveNACK::GapDescriptor *pGaps
-		= (FSP_SelectiveNACK::GapDescriptor *) & buf[sizeof(FSP_NormalPacketHeader)];
-	int n = (MAX_BLOCK_SIZE - sizeof(FSP_SelectiveNACK)) / sizeof(pGaps[0]) + 1;
+	FSP_SelectiveNACK::GapDescriptor *pGaps = buf.gaps;
+	register int n = sizeof(buf.gaps) / sizeof(pGaps[0]);
 	n = pControlBlock->GetSelectiveNACK(seq0, pGaps, n);
 	if (n < 0)
 	{
 #ifdef TRACE
-		printf_s("GetSelectiveNACK return -0x%X\n", -n);
+		printf_s("GetSelectiveNACK return -0x%X\n", n);
 #endif
 		return n;
 	}
 
 	// built-in rule: an optional header MUST be 64-bit aligned
-	int spFull = sizeof(FSP_NormalPacketHeader) + sizeof(pGaps[0]) * (n & 0xFFFE);
-	FSP_SelectiveNACK *pSNACK = (FSP_SelectiveNACK *)(buf + spFull);
-	spFull += sizeof(FSP_SelectiveNACK);
-	if((n & 1) == 0)
-		pSNACK->lastGap = 0;
+	buf.n = n;
+	FSP_SelectiveNACK *pSNACK = (FSP_SelectiveNACK *)(pGaps + n);
 	pSNACK->hs.Set<FSP_NormalPacketHeader, SELECTIVE_NACK>();
-
-	for(register int i = n - 1; i >= 0; i--)
+	while(--n >= 0)
 	{
-		pGaps[i].dataLength = htons(pGaps[i].dataLength);
-		pGaps[i].gapWidth = htons(pGaps[i].gapWidth);
+		pGaps[n].dataLength = htobe32(pGaps[n].dataLength);
+		pGaps[n].gapWidth = htobe32(pGaps[n].gapWidth);
 	}
-	// ONLY those marked as gap are considered unacknowledged
 
-	return spFull;
+	pSNACK->ackTime = htobe32((uint32_t)NowUTC());
+	return int32_t((uint8_t *)pSNACK + sizeof(FSP_SelectiveNACK) - (uint8_t *)pGaps);
 }
 
 
@@ -447,19 +442,20 @@ void CSocketItemEx::InitiateConnect()
 	TRACE_HERE("called");
 	SetState(CONNECT_BOOTSTRAP);
 
-	SConnectParam & initState = pControlBlock->u.connectParams;
-	initState.timeStamp = NowUTC();
+	SConnectParam & initState = pControlBlock->connectParams;
 	rand_w32((uint32_t *) & initState,
 		( sizeof(initState.cookie)
 		+ sizeof(initState.initCheckCode)
 		+ sizeof(initState.salt)
 		+ sizeof(initState.initialSN) ) / sizeof(uint32_t) );
+	initState.timeStamp = NowUTC();
 	// Remote fiber ID was set when the control block was created
 	// for calculation of the initial round-trip time
-	pControlBlock->u.connectParams.timeStamp = initState.timeStamp;
-	pControlBlock->SetSendWindowWithHeadReserved(initState.initialSN);
+	pControlBlock->connectParams.timeStamp = initState.timeStamp;
+	pControlBlock->SetSendWindowHead(initState.initialSN);
 
-	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend(); // INIT_CONNECT can only be the very first packet
+	// INIT_CONNECT can only be the very first packet
+	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend();
 	skb->opCode = INIT_CONNECT;
 	skb->len = sizeof(FSP_InitiateRequest);
 	//
@@ -474,7 +470,7 @@ void CSocketItemEx::InitiateConnect()
 	q->salt = initState.salt;
 	q->hs.Set<FSP_InitiateRequest, INIT_CONNECT>();	// See also AffirmConnect()
 
-	q->timeStamp = htonll(initState.timeStamp);
+	q->timeStamp = htobe64(initState.timeStamp);
 	skb->SetFlag<IS_COMPLETED>();	// for resend
 	// it neednot be unlocked
 	SendPacket(1, ScatteredSendBuffers(q, sizeof(FSP_InitiateRequest)));
@@ -511,9 +507,8 @@ void LOCALAPI CSocketItemEx::AffirmConnect(const SConnectParam & initState, ALFI
 
 	FSP_ConnectParam & varParams = pkt->params;
 	pkt->cookie = initState.cookie;
-	pkt->timeDelta = htonl(initState.timeDelta);
-	pkt->initialSN = htonl(initState.initialSN);
-	// timeStamp, salt were overlaid; public key was exported already
+	pkt->timeDelta = htobe32(initState.timeDelta);
+	pkt->initialSN = htobe32(initState.initialSN);
 	// assert(sizeof(initState.allowedPrefixes) >= sizeof(varParams.subnets));
 	memcpy(varParams.subnets , initState.allowedPrefixes, sizeof(varParams.subnets));
 	varParams.listenerID = idListener;
@@ -531,10 +526,32 @@ void LOCALAPI CSocketItemEx::AffirmConnect(const SConnectParam & initState, ALFI
 	//
 	tRoundTrip_us = uint32_t(min(UINT32_MAX, tRecentSend - tEarliestSend));
 	// after ACK_CONNECT_REQ would 'tKeepAlive_ms = tRoundTrip_us >> 8';
-
-	congestCtrl.Reset();
 }
 
+
+
+
+// Given
+//	FSPOperationCode		the opCode of the new inserted or updated to
+// Do
+//	Update the opCode of the head packet in the send queue to designated, or
+//	insert a new packet of the designated opCode if the queue is still empty
+// Remark
+//	It is assumed that DLL/ULA is waiting for LLS when this subroutine is eventually called
+void LOCALAPI CSocketItemEx::ReplaceSendQueueHead(FSPOperationCode opCode)
+{
+	ControlBlock::PFSP_SocketBuf skb;
+	if(pControlBlock->CountSendBuffered() <= 0)
+	{
+		skb = pControlBlock->GetSendBuf();
+		skb->len = 0;
+	}
+	else
+	{
+		skb = pControlBlock->GetSendQueueHead();
+	}
+	skb->opCode = opCode;
+}
 
 
 // Remark
@@ -547,17 +564,14 @@ void CSocketItemEx::SynConnect()
 	// bind to the interface as soon as the control block mapped into server's memory space
 	InitAssociation();
 
-	// ephemeral session key material was ready when CSocketItemDl::PrepareToAccept
-#ifdef TRACE
-	TRACE_HERE("session key");
-	printf("0x%X %X %X %X\n"
-		, *(uint32_t *) & pControlBlock->u.sessionKey[0]
-		, *(uint32_t *) & pControlBlock->u.sessionKey[4]
-		, *(uint32_t *) & pControlBlock->u.sessionKey[8]
-		, *(uint32_t *) & pControlBlock->u.sessionKey[12]);
-#endif
-	InstallSessionKey();
-	keyLife = EPHEMERAL_KEY_LIFECYCLE;
+	// See also CSocketItemEx::Start()
+	if(lowState == ESTABLISHED)
+		ReplaceSendQueueHead(PERSIST);
+	else if(lowState == COMMITTING || lowState == COMMITTING2)
+		ReplaceSendQueueHead(COMMIT);
+	else // It MUST be in CHALLENGING state
+		InstallEphemeralKey();
+	//^ ephemeral session key material was ready when CSocketItemDl::PrepareToAccept
 
 	EmitStart();
 	pControlBlock->MoveNextToSend();
@@ -734,11 +748,11 @@ void LOCALAPI DumpHexical(BYTE * buf, int len)
 
 
 
-void LOCALAPI DumpNetworkUInt16(UINT16 * buf, int len)
+void LOCALAPI DumpNetworkUInt16(uint16_t * buf, int len)
 {
 	for(register int i = 0; i < len; i++)
 	{
-		printf("%04X ", ntohs(buf[i]));
+		printf("%04X ", be16toh(buf[i]));
 	}
 	printf("\n");
 }

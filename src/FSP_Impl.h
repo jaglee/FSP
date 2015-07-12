@@ -50,7 +50,8 @@
 
 // borrow intrinsic pragmas
 #include "gcm-aes.h"
-#define	MAC_ALIGNMENT 16
+#define	MAC_ALIGNMENT	16
+#define COOKIE_KEY_LEN	16
 
 #if (_MSC_VER >= 1600)
 #pragma intrinsic(_InterlockedCompareExchange8, _InterlockedExchange8)
@@ -217,19 +218,18 @@ enum FSP_FlagPosition: UINT8
 	ToBeContinued = 0,
 	Compressed = 1,
 	Encrypted = 2,
-	Unauthenticated = 3,
+	RESERVED_AT_3,
 	FirstInFirstDrop = 4,
-	ExplicitCongestion = 7
 };
 
 
 struct FSP_NormalPacketHeader
 {
-	UINT32 sequenceNo;
-	UINT32 expectedSN;
+	uint32_t sequenceNo;
+	uint32_t expectedSN;
 	union
 	{
-		UINT64		code;
+		uint64_t	code;
 		PairALFID	id;
 	} integrity;
 	//
@@ -240,6 +240,11 @@ struct FSP_NormalPacketHeader
 	However, for IPv6 jumbo packet it can easily reach 512MB or even more
  */
 	$FSP_HeaderSignature hs;
+
+	// Set the outlet sequence number
+	void operator>>=(uint32_t seq1) { sequenceNo = htobe32(seq1); }
+	// Set the inlet sequence number
+	void operator<<=(uint32_t seq1) { expectedSN = htobe32(seq1); }
 
 	// A bruteforce but safe method of set or retrieve recvWS, with byte order translation
 	int32_t GetRecvWS() const { return ((int32_t)flags_ws[0] << 16) + (flags_ws[1] << 8) + flags_ws[2]; }
@@ -254,8 +259,8 @@ struct FSP_NormalPacketHeader
 struct FSP_InitiateRequest
 {
 	timestamp_t timeStamp;
-	UINT64		initCheckCode;
-	UINT32		salt;
+	uint64_t	initCheckCode;
+	uint32_t	salt;
 	$FSP_HeaderSignature hs;
 };
 
@@ -264,16 +269,16 @@ struct FSP_InitiateRequest
 // to be followed by the certificate optional header
 struct FSP_Challenge
 {
-	UINT64		cookie;
-	UINT64		initCheckCode;
+	uint64_t		cookie;
+	uint64_t	initCheckCode;
 	int32_t		timeDelta;
 	$FSP_HeaderSignature hs;
 };
 
 
 
-// FSP_ConnectParam assists in renegotiating session key in a PERSIST packet
-// while specifies the parent connection in a MULTIPLY or CONNECT_REQUEST packet
+// FSP_ConnectParam specifies the parent connection in a MULTIPLY or CONNECT_REQUEST packet
+// while alias as the mobile parameters
 // MOBILE_PARAM used to be CONNECT_PARAM and it is perfect OK to treat the latter as the canonical alias of the former
 struct FSP_ConnectParam
 {
@@ -282,9 +287,9 @@ struct FSP_ConnectParam
 	//
 	// host id of the application layer fiber, alias of listenerID
 	__declspec(property(get=getHostID, put=setHostID))
-	UINT32	idHostALF;
-	UINT32	getHostID() const { return listenerID; }
-	void	setHostID(UINT32 value) { listenerID = value; }
+	uint32_t	idHostALF;
+	uint32_t	getHostID() const { return listenerID; }
+	void	setHostID(uint32_t value) { listenerID = value; }
 	//
 	$FSP_HeaderSignature hs;
 };
@@ -309,15 +314,30 @@ struct FSP_AckConnectRequest: FSP_NormalPacketHeader
 
 
 
+// Mandatory additional header for KEEP_ALIVE
+// minumum constituent of a SNACK header
 struct FSP_SelectiveNACK
 {
 	struct GapDescriptor
 	{
-		UINT16	gapWidth;	// in packets
-		UINT16	dataLength;	// in packets
+		uint32_t	gapWidth;	// in packets
+		uint32_t	dataLength;	// in packets
 	};
-	uint32_t	lastGap;	// assert(sizeof(GapDescriptor) == sizeof(lastGap));
+	uint32_t		ackTime;	// in micro-seconds. Interval of KEEP_ALIVE cannot exceed an hour
 	$FSP_HeaderSignature hs;
+};
+
+
+
+struct FSP_PreparedKEEP_ALIVE
+{
+	FSP_NormalPacketHeader hdr;
+	FSP_SelectiveNACK::GapDescriptor gaps[(MAX_BLOCK_SIZE - sizeof(FSP_SelectiveNACK)) / sizeof(FSP_SelectiveNACK::GapDescriptor)];
+	uint32_t		ackTime;	// sentinel, actually
+	$FSP_HeaderSignature hs;	// sentinel, actually
+	uint32_t		n;	// n >= 0, number of (gapWidth, dataLength) tuples
+	//
+	uint32_t		GetSaltValue() const { return gaps[n].gapWidth; }	// it overlays on ackTime
 };
 
 
@@ -329,20 +349,20 @@ struct FSP_RejectConnect
 		timestamp_t timeStamp;
 		struct
 		{
-			UINT32 initial;
-			UINT32 expected;
+			uint32_t initial;
+			uint32_t expected;
 		} sn;
 	} u;
 	//
 	union
 	{
-		UINT64 integrityCode;
-		UINT64 cookie;
-		UINT64 initCheckCode;
+		uint64_t integrityCode;
+		uint64_t cookie;
+		uint64_t initCheckCode;
 		PairALFID fidPair;
 	} u2;
 	//
-	UINT32 reasons;	// bit field(?)
+	uint32_t reasons;	// bit field(?)
 	$FSP_HeaderSignature hs;
 };
 
@@ -358,7 +378,7 @@ struct CommandToLLS
 {
 	DWORD			idProcess;
 	ALIGN(8)
-	ALFID_T		fiberID;
+	ALFID_T			fiberID;
 	FSP_ServiceCode	opCode;	// operation code
 
 	CommandToLLS() { memset(this, 0, sizeof(CommandToLLS)); }
@@ -402,20 +422,20 @@ struct FSP_PKTINFO_EX : FSP_PKTINFO
 
 struct SConnectParam	// MUST be aligned on 64-bit words!
 {
-	UINT64		initCheckCode;
-	UINT64		cookie;
-	//
-	UINT32		salt;
-	UINT32		initialSN;	// the initial sequence number of the packet to send
-	//
-	ALFID_T		idRemote;	// ID of the listener or the new forked, depending on context
-	UINT32		remoteHostID;
-	//
-	int32_t		timeDelta;		// delay of peer to peer timestamp, delta of clock 
-	int32_t		reserved0;
+	// the first four fields are to be initiaized with random value
+	uint64_t	initCheckCode;
+	uint64_t	cookie;
+	uint32_t	salt;
+	uint32_t	initialSN;	// the initial sequence number of the packet to send
+	// together with the first four fields, totally 256 bits, could be overlaid
 	timestamp_t timeStamp;
 	//
-	UINT64		allowedPrefixes[MAX_PHY_INTERFACES];
+	int32_t		timeDelta;	// delay of peer to peer timestamp, delta of clock 
+	int32_t		keyLength;	// by default 16 bytes
+	ALFID_T		idRemote;	// ID of the listener or the new forked, depending on context
+	uint32_t	remoteHostID;
+	//
+	uint64_t	allowedPrefixes[MAX_PHY_INTERFACES];
 };	// totally 56 bytes, 448 bits
 
 
@@ -425,7 +445,7 @@ struct BackLogItem: SConnectParam
 	FSP_PKTINFO	acceptAddr;	// including the interface number AND the local fiber ID
 	ALFID_T		idParent;
 	//^ 0 if it is the 'root' acceptor, otherwise the local fiber ID of the cloned connection
-	UINT32		expectedSN;	// the expected sequence number of the packet to receive by order
+	uint32_t	expectedSN;	// the expected sequence number of the packet to receive by order
 };
 
 
@@ -483,12 +503,8 @@ struct ControlBlock
 {
 	ALIGN(8)
 	volatile FSP_Session_State state;
-
-	// By design only a spawned/branched(multiplexed/cloned) connection may be milky
-	ALIGN(4)	// sizeof(LONG)
-	UINT32		allowedDelay;	// 0 if it is wine-alike payload, non-zero if milky; in microseconds
-
-	ALFID_T	idParent;
+	char			newKeyPending;
+	ALFID_T			idParent;
 
 	ALIGN(8)	// 64-bit aligment
 	FSP_NormalPacketHeader tmpHeader;	// for sending; assume sending is single-threaded for a single session
@@ -503,30 +519,27 @@ struct ControlBlock
 		char		name[INET6_ADDRSTRLEN + 7];	// 72 bytes
 		struct
 		{
-			UINT64	allowedPrefixes[MAX_PHY_INTERFACES];
-			UINT32	hostID;
+			uint64_t	allowedPrefixes[MAX_PHY_INTERFACES];
+			uint32_t	hostID;
 			ALFID_T fiberID;
 		} ipFSP;
 	} peerAddr;
 
 	// 3: The negotiated connection parameter
 	ALIGN(8)	// 64-bit aligment, make sure that the session key overlays 'initCheckCode' and 'cookie' only
-	union
-	{
-		SConnectParam connectParams;
-		BYTE sessionKey[FSP_SESSION_KEY_LEN];	// overlay with 'initCheckCode' and 'cookie'
-	} u;
+	SConnectParam connectParams;
 
 	// 4: The (very short, roll-out) queue of returned notices
 	FSP_ServiceCode notices[FSP_MAX_NUM_NOTICE];
-	// A lock for DLL or LLS to gain mutually exclusive access on send or receive buffer
-	char	dllsmutex;	// 2014.6.7 not used yet UNRESOLVED!
 	// Backlog for listening/connected socket [for client it could be an alternate of Web Socket]
 	TSingleProviderMultipleConsumerQ<BackLogItem>	backLog;
 
 	// 5, 6: Send window and receive window descriptor
 	typedef uint32_t seq_t;
-private:
+
+	//
+	// BEGIN REGION: buffer descriptors 
+	//
 	seq_t		sendWindowFirstSN;	// left-border of the send window
 	seq_t		sendWindowNextSN;	// the sequence number of the next packet to send
 	// it means that the send queue is empty when sendWindowFirstSN == sendWindowSN2Recv
@@ -555,7 +568,7 @@ private:
 	volatile	long	recvBufDescriptors;	// relative to start of the control block, may be updated via memory map
 	volatile	long	sendBuffer;			// relative to start of the control block
 	volatile	long	recvBuffer;			// relative to start of the control block
-public:
+
 	// Total size of FSP_SocketBuf (descriptor): 8 bytes (a 64-bit word)
 	typedef struct FSP_SocketBuf
 	{
@@ -580,6 +593,9 @@ public:
 		//
 		void InitFlags() { _InterlockedExchange16((SHORT *) & flags, 1 << EXCLUSIVE_LOCK); }
 	} *PFSP_SocketBuf;
+	//
+	// END REGION: buffer descriptors
+	//
 
 	// Convert the relative address in the control block to the address in process space, unchecked
 	BYTE * GetSendPtr(const PFSP_SocketBuf skb)
@@ -634,21 +650,14 @@ public:
 			, recvWindowNextSN);
 	}
 #else
-	int DumpSendRecvWindowInfo() const {}
+	int DumpSendRecvWindowInfo() const { return 0; }
 #endif
 
 	PFSP_SocketBuf HeadSend() const { return (PFSP_SocketBuf)((BYTE *)this + sendBufDescriptors); }
 	PFSP_SocketBuf HeadRecv() const { return (PFSP_SocketBuf)((BYTE *)this + recvBufDescriptors); }
 
-	seq_t GetSendWindowFirstSN() const { return sendWindowFirstSN; }
-	seq_t GetSendWindowFirstSN(register int32_t &capacity, register int32_t &iHead) const 
-	{
-		capacity = sendBufferBlockN;
-		iHead = sendWindowHeadPos;
-		return sendWindowFirstSN; 
-	}
-	//
-	PFSP_SocketBuf GetFirstBufferedSend() const { return HeadSend() + sendWindowHeadPos; }
+	// Return the head packet even if the send queue is empty
+	PFSP_SocketBuf GetSendQueueHead() const { return HeadSend() + sendWindowHeadPos; }
 	// Return the descriptor of the last buffered packet in the send buffer, NULL if the send queue is empty
 	PFSP_SocketBuf GetLastBufferedSend() const
 	{
@@ -668,7 +677,7 @@ public:
 		return HeadSend() + i;
 	}
 	PFSP_SocketBuf	PeekAnteCommit() const;
-	bool CheckSendWindowLimit(int32_t cwnd) const { return int(sendWindowNextSN - sendWindowFirstSN) <= min(sendWindowSize, cwnd); }
+	bool CheckSendWindowLimit() const { return int(sendWindowNextSN - sendWindowFirstSN) <= sendWindowSize; }
 
 	void RoundSendBufferNextPos() { int32_t m = sendBufferNextPos - sendBufferBlockN; if(m >= 0) sendBufferNextPos = m; }
 
@@ -676,6 +685,8 @@ public:
 	int ClearSendWindow() { sendWindowHeadPos = sendBufferNextPos = 0; return sendBufferBlockN; }
 
 	int CountReceived() const { return int(recvWindowNextSN - recvWindowFirstSN); }
+	seq_t GetRecvWindowFirstSN() const { return recvWindowFirstSN; }
+
 	bool IsValidSequence(seq_t seq1) const
 	{
 		register int d = int(seq1 - recvWindowFirstSN);
@@ -699,6 +710,7 @@ public:
 
 	PFSP_SocketBuf GetFirstReceived() const { return HeadRecv() + recvWindowHeadPos; }
 	int LOCALAPI GetSelectiveNACK(seq_t &, FSP_SelectiveNACK::GapDescriptor *, int) const;
+	int LOCALAPI DealWithSNACK(seq_t, const FSP_SelectiveNACK::GapDescriptor *, int n);
 
 	// Return the last received packet, which might be already delivered
 	PFSP_SocketBuf LOCALAPI AllocRecvBuf(seq_t);
@@ -711,7 +723,17 @@ public:
 	}
 	void * LOCALAPI InquireRecvBuf(int &, bool &);
 
-	void SetRecvWindowHead(seq_t pktSeqNo)	{ recvWindowNextSN = recvWindowFirstSN = pktSeqNo; }
+	void SetRecvWindowHead(seq_t pktSeqNo)
+	{
+		recvWindowNextSN = recvWindowFirstSN = pktSeqNo; 
+		recvWindowHeadPos = recvWindowNextPos = 0;
+	}
+	void SetSendWindowHead(seq_t initialSN)
+	{
+		sendBufferNextSN = sendWindowNextSN = sendWindowFirstSN = initialSN;
+		welcomedNextSNtoSend = initialSN;
+		sendWindowHeadPos = sendBufferNextPos = 0;
+	}
 	void SetSendWindowWithHeadReserved(seq_t initialSN)
 	{
 		PFSP_SocketBuf skb = HeadSend();
@@ -757,11 +779,6 @@ public:
 
 	int LOCALAPI	Init(int32_t, int32_t);
 	int	LOCALAPI	Init(uint16_t);
-
-	friend void UnitTestSendRecvWnd();
-	friend void UnitTestResendQueue();
-	friend void UnitTestGenerateSNACK();
-	friend void UnitTestAcknowledge();
 };
 
 #include <poppack.h>
@@ -801,7 +818,7 @@ protected:
 class FSP_Header_Manager
 {
 	BYTE		*pHdr;
-	UINT16		pStackPointer;
+	uint16_t		pStackPointer;
 public:
 	// Initialize the FSP_Header manager for pushing operations
 	// Given
@@ -821,7 +838,7 @@ public:
 	FSP_Header_Manager(void *p1)
 	{
 		pHdr = (BYTE *)p1;
-		pStackPointer = ntohs(((FSP_Header *)p1)->hs.hsp);
+		pStackPointer = be16toh(((FSP_Header *)p1)->hs.hsp);
 	}
 	//
 	// Push an extension header
@@ -832,7 +849,7 @@ public:
 	// Remark
 	//	THdr is a template class/struct type that must be 64-bit aligned
 	//	If the first header is not the fixed header, what returned may not be treated as the final stack pointer
-	template<typename THdr> UINT16 PushExtHeader(THdr *pExtHdr)
+	template<typename THdr> uint16_t PushExtHeader(THdr *pExtHdr)
 	{
 		memcpy(pHdr + pStackPointer, pExtHdr, sizeof(THdr));
 		pStackPointer += sizeof(THdr);
@@ -845,8 +862,8 @@ public:
 	//	The caller should check that pStackPointer does not fall into dead-loop
 	template<typename THdr>	THdr * PopExtHeader()
 	{
-		UINT16 prevOffset = pStackPointer - sizeof(FSP_HeaderSignature);
-		pStackPointer = ntohs( ( (PFSP_HeaderSignature)(pHdr + prevOffset) )->hsp );
+		uint16_t prevOffset = pStackPointer - sizeof(FSP_HeaderSignature);
+		pStackPointer = be16toh( ( (PFSP_HeaderSignature)(pHdr + prevOffset) )->hsp );
 		if(pStackPointer < sizeof(FSP_NormalPacketHeader) || pStackPointer >= prevOffset)
 			return NULL;
 		return (THdr *)(pHdr + pStackPointer - sizeof(THdr));

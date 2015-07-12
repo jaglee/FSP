@@ -93,7 +93,7 @@
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
       <Optimization>Disabled</Optimization>
-      <PreprocessorDefinitions>OVER_UDP_IPv4;WIN32;TRACE;_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>TRACE;OVER_UDP_IPv4;WIN32;_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <MinimalRebuild>true</MinimalRebuild>
       <BasicRuntimeChecks>EnableFastChecks</BasicRuntimeChecks>
       <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
@@ -114,7 +114,7 @@
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>
       <Optimization>Disabled</Optimization>
-      <PreprocessorDefinitions>OVER_UDP_IPv4;WIN32;TRACE;_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>TRACE;OVER_UDP_IPv4;WIN32;_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <BasicRuntimeChecks>EnableFastChecks</BasicRuntimeChecks>
       <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
       <PrecompiledHeader>
@@ -176,10 +176,10 @@
     <ClCompile Include="..\gcm-aes.c" />
     <ClCompile Include="..\rijndael-alg-fst.c" />
     <ClCompile Include="command.cpp" />
+    <ClCompile Include="CRC64.c" />
     <ClCompile Include="CubicRoot.c" />
     <ClCompile Include="main.cpp" />
     <ClCompile Include="mobile.cpp" />
-    <ClCompile Include="ocb.c" />
     <ClCompile Include="os_win.cpp" />
     <ClCompile Include="remote.cpp" />
     <ClCompile Include="socket.cpp" />
@@ -190,7 +190,6 @@
     <ClInclude Include="..\FSP_API.h" />
     <ClInclude Include="..\FSP_Impl.h" />
     <ClInclude Include="..\gcm-aes.h" />
-    <ClInclude Include="ae.h" />
     <ClInclude Include="fsp_srv.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

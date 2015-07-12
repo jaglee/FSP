@@ -8,6 +8,10 @@
 
 #define MAX_FILENAME_WITH_PATH_LEN	260
 
+const char		*defaultWelcome = "File synchronizer based on Flexible Session Protocol, version 0.1";
+// assume that address space layout randomization keep the secret hard to find
+static unsigned char bufPrivateKey[CRYPTO_NACL_KEYBYTES];
+
 volatile static bool finished = false;
 static FSPHANDLE hFspListen;
 
@@ -45,7 +49,6 @@ static int	FSPAPI toSendNextBlock(FSPHANDLE, void *, int32_t);
  */
 int main(int argc, char * argv[])
 {
-	char * defaultWelcome = "File synchronizer based on Flexible Session Protocol, version 0.1";
 	errno_t	err;
 
 	if(argc != 2 || strlen(argv[1]) >= MAX_FILENAME_WITH_PATH_LEN)
@@ -66,20 +69,11 @@ int main(int argc, char * argv[])
 		return -2;
 	}
 
-	//hFile = CreateFile(fileName
-	//	, GENERIC_READ
-	//	, FILE_SHARE_READ
-	//	, NULL
-	//	, OPEN_EXISTING
-	//	, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_POSIX_SEMANTICS | FILE_FLAG_SEQUENTIAL_SCAN
-	//	, NULL);	// the client should take use of 'FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH' for ultimate integrity
-	//if(hFile == INVALID_HANDLE_VALUE)
-	//{
-	//	ReportLastError();
-	//	printf_s("Cannot open file %s\n", fileName);
-	//	DebugBreak();
-	//	return -2;
-	//}
+	unsigned short mLen = (unsigned short)strlen(defaultWelcome) + 1;
+	unsigned char *thisWelcome = (unsigned char *)_alloca(mLen + CRYPTO_NACL_KEYBYTES);
+	unsigned char *bufPublicKey = (unsigned char *)thisWelcome + mLen;;
+	memcpy(thisWelcome, defaultWelcome, mLen);	//+\000012345678901234567890123456789012
+	CryptoNaClKeyPair(bufPublicKey, bufPrivateKey);
 
 	FSP_SocketParameter params;
 	FSP_IN6_ADDR atAddress;
@@ -87,8 +81,8 @@ int main(int argc, char * argv[])
 	params.beforeAccept = NULL;
 	params.afterAccept = onAccepted;
 	params.onError = onReturn;
-	params.welcome = defaultWelcome;
-	params.len = (unsigned short)strlen(defaultWelcome) + 1;
+	params.welcome = thisWelcome;
+	params.len = mLen + CRYPTO_NACL_KEYBYTES;
 	params.sendSize = MAX_FSP_SHM_SIZE;
 	params.recvSize = 0;	// minimal receiving for download server
 
@@ -110,6 +104,7 @@ int main(int argc, char * argv[])
 	if(hFspListen != NULL)
 		Dispose(hFspListen);
 
+	printf("\n\nPress Enter to exit...");
 	getchar();
 	return 0;
 }
@@ -119,6 +114,17 @@ int main(int argc, char * argv[])
 static int FSPAPI onAccepted(FSPHANDLE h, PFSP_Context ctx)
 {
 	printf_s("\nHandle of FSP session: 0x%08X\n", h);
+
+	// peer's first message is placed into welcome part of the ctx
+	unsigned char bufPublicKey[CRYPTO_NACL_KEYBYTES];
+	unsigned char bufSharedKey[CRYPTO_NACL_KEYBYTES];
+	memset(bufPublicKey, 0, CRYPTO_NACL_KEYBYTES);
+	memcpy_s(bufPublicKey, CRYPTO_NACL_KEYBYTES, ctx->welcome, ctx->len);
+	CryptoNaClGetSharedSecret(bufSharedKey, bufPublicKey, bufPrivateKey);
+
+	printf_s("\tTo install the negotiated shared key...\n");
+	InstallAuthEncKey(h, bufSharedKey, CRYPTO_NACL_KEYBYTES, INT32_MAX); 
+
 	printf_s("\tTo send filename to the remote end...\n");
 	// TODO: check connection context
 	WriteTo(h, fileName, (int)strlen(fileName) + 1, END_OF_MESSAGE, onFileNameSent);

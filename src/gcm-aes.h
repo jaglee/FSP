@@ -2,6 +2,7 @@
  * Copyright (c) 2013 Jason Gao <jagao@outlook.com>
  * Inspired by original work of Mike Belopuhov <mike@vantronix.net>
  * This code implements Galois/Counter Mode using the AES cipher as to description of FIPS SP 800-38D
+ * with certain limitations
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -125,63 +126,58 @@ extern "C" {
 
 // Given
 //	GCM_AES_CTX *	pointer to the GCM context
-//	const uint8_t *		byte array representation of AES key
+//	const uint8_t *	byte array representation of AES key
 //	int				length in bytes of the key, must be 16, 24 or 32
-//	const uint8_t *		byte array representation of initial vector, must of 96-bit
-// Do
-//	Initialize the Galois/Counter Mode AES context, including deriving the hash sub-key
-//	so that successive AE operation is feasible
-void	GCM_AES_Init(GCM_AES_CTX *, const uint8_t *, int, const uint8_t *);
+void	GCM_AES_SetKey(GCM_AES_CTX *, const uint8_t *, int);
 
 // Given
 //	GCM_AES_CTX *	pointer to the GCM context
-//	const uint8_t *		byte array representation of AES key AND the salt, as of RFC4543
-//	int				length in bytes of the key, must be 20, 28 or 36
+//	uint32_t	*	the non-default salt
 // Do
-//	Initialize the Galois/Counter Mode AES-GMAC context, including deriving the hash sub-key
-//	so that successive AE/GMAC operation is feasible
-void	GMAC_InitWithKey(GCM_AES_CTX *, const uint8_t *, int);
-
-
-// Given
-//	GCM_AES_CTX *	pointer to the GCM context
-//	const uint8_t *		byte array representation of initial vector, must be of 64-bit, as of RFC4543
-// Do
-//	Set IV of the Galois/Counter Mode AES-GMAC context
-void	GMAC_SetIV(GCM_AES_CTX *, const uint8_t *);
+//	Set the internal salt to the given value XOR with the origin value
+// Return
+//	The original salt
+// Remark
+//	The salt is the leftmost 32-bit of the 96-bit IV. The value is just a bit string of length 32
+uint32_t GCM_AES_XorSalt(GCM_AES_CTX *, uint32_t);
 
 
 // Given
 //	GCM_AES_CTX *	pointer to the GCM context
-//	const uint8_t * P	byte array representation of the plaintext
-//	uint32_t bytesP		length in bytes of the plaintext
-//	const uint8_t * A	byte array representation of the additional authentication data
-//	uint32_t bytesA		length in bytes of the additional authentication data
-//	uint8_t * C			placeholder of the ciphertext. the buffer size maynot be less than bytesP
-//	uint8_t * T			placeholder of the tag(secure digest). the buffe size MAYNOT be less than bytesT
-//	int bytesT		capacity in byte of the tag buffer
+//	uint64_t		the rightmost 64-bit of the 96-bit initial vector
+//	const uint8_t *	P, byte array representation of the plaintext
+//	uint32_t		length in bytes of the plaintext
+//	const uint64_t* byte array representation of the additional authentication data
+//	uint32_t		length in bytes of the additional authentication data
+//	uint64_t*		placeholder of the ciphertext. the buffer size maynot be less than bytesP
+//	uint8_t *		placeholder of the tag(secure digest). the buffe size MAYNOT be less than bytesT
+//	int				capacity in byte of the tag buffer
 // Do
 //	Encrypt the plaintext into ciphertext, store the ciphertext into the buffer specified by C
 //	and calculte the authenticate tag, store the tag into the buffer specified by T 
 // Return
 //	-2 if parameter error
 //  0 if success
-int		GCM_AES_EncryptAndAuthenticate(GCM_AES_CTX *ctx
-									, const uint8_t *P, uint32_t bytesP
-									, const uint8_t *A, uint32_t bytesA
-									, uint8_t *C	// capacity of ciphertext buffer MUST be no less than bytesP
-									, uint8_t *T, int bytesT
-									);
+// Remark
+//	The additional authenticated data and the output buffer must be aligned on 64-bit border
+//	a 32-bit per-session pseudo-random salt is automatically prefixed to IV internally
+int	GCM_AES_AuthenticatedEncrypt(GCM_AES_CTX *ctx, uint64_t IV
+								, const uint8_t *P, uint32_t bytesP
+								, const uint64_t *aad, uint32_t bytesA
+								, uint64_t *bufCipherText	// capacity of ciphertext buffer MUST be no less than bytesP
+								, uint8_t *T, int bytesT
+								);
 
 // Given
 //	GCM_AES_CTX *	pointer to the GCM context
-//	const uint8_t * C	byte array representation of the ciphertext
-//	uint32_t bytesC		length in bytes of the ciphertext
-//	const uint8_t * A	byte array representation of the additional authentication data
-//	uint32_t bytesA		length in bytes of the additional authentication data
-//	const uint8_t * T	byte array representation of the tag(secure digest)
-//	int bytesT		length in bytes of the tag
-//	uint8_t * P			placeholder of the plaintext . the buffer size MAYNOT be less than bytesC
+//	uint64_t		the rightmost 64-bit of the 96-bit initial vector
+//	const uint8_t*	C, byte array representation of the ciphertext
+//	uint32_t		length in bytes of the ciphertext
+//	const uint64_t* byte array representation of the additional authentication data
+//	uint32_t		length in bytes of the additional authentication data
+//	const uint8_t *	byte array representation of the tag(secure digest)
+//	int				length in bytes of the tag
+//	uint64_t*		placeholder of the plaintext. the buffer size MAY NOT be less than bytesC
 // Do
 //	Authenticate the ciphertext, the additional data and the tag, if success
 //	decrypt and store the ciphertext into the buffer specified by C
@@ -189,14 +185,30 @@ int		GCM_AES_EncryptAndAuthenticate(GCM_AES_CTX *ctx
 //	-2 if parameter error
 //	-1 if authentication failed
 //  0 if success
-int		GCM_AES_AuthenticatedDecrypt(GCM_AES_CTX *ctx
+// Remark
+//	The additional authenticated data and the output buffer must be aligned on 64-bit border
+//	a 32-bit per-session pseudo-random salt is automatically prefixed to IV internally
+int	GCM_AES_AuthenticateAndDecrypt(GCM_AES_CTX *ctx, uint64_t IV
 									, const uint8_t *C, uint32_t bytesC
-									, const uint8_t *A, uint32_t bytesA
+									, const uint64_t *aad, uint32_t bytesA
 									, const uint8_t *T, int bytesT
-									, uint8_t *P	// capacity of plaintext buffer MUST be no less than bytesC
+									, uint64_t *bufPlainText	// capacity of plaintext buffer MUST be no less than bytesC
 									);
 
-int		GCM_SecureHash(GCM_AES_CTX *ctx, const uint8_t *A, uint32_t bytesA, uint8_t *T, int bytesT);
+// Given
+//	GCM_AES_CTX *	pointer to the GCM context
+//	uint64_t		the initial vector, limit to 64-bit
+//	const uint8_t * A, the byte string input to calculate secure hash, must be 64-bit aligned!
+//	uint32_t		length of the inputted byte string to have secure hash calculated
+//	uint8_t *		placeholder of the tag(secure digest). the buffe size MAYNOT be less than bytesT
+//	int				capacity in byte of the tag buffer
+// Do
+//	Encrypt the plaintext into ciphertext, store the ciphertext into the buffer specified by C
+//	and calculte the authenticate tag, store the tag into the buffer specified by T 
+// Return
+//	-2 if parameter error
+//  0 if success
+int	GCM_SecureHash(GCM_AES_CTX *ctx, uint64_t nonce, const uint8_t *A, uint32_t bytesA, uint8_t *T, int bytesT);
 
 #ifdef __cplusplus
 }

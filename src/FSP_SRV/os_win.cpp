@@ -1,5 +1,3 @@
-#define _CRT_RAND_S
-#include <stdlib.h>
 #include "fsp_srv.h"
 
 #include <MSTcpIP.h>
@@ -69,7 +67,7 @@ struct IPv6_HEADER
 	void Set(int m, PIN6_ADDR a0, PIN6_ADDR a1)
 	{
 		version_traffic_flow = 6 << 4;	// in network byte order, it would be correct
-		payloadLenth = htons(m);
+		payloadLenth = htobe16(m);
 		nextHeader = IPPROTO_FSP;
 		hopLimit = 255;		// hard-coded here
 		srcAddr = *a0;
@@ -145,10 +143,10 @@ CLowerInterface::CLowerInterface()
 		throw (HRESULT)r;
 	}
 
-	sinkInfo.name =  (struct sockaddr *) & addrFrom;
-	sinkInfo.namelen = sizeof(addrFrom);
-	sinkInfo.Control.buf = (char *) & nearInfo;
-	sinkInfo.Control.len = sizeof(nearInfo);
+	mesgInfo.name =  (struct sockaddr *) & addrFrom;
+	mesgInfo.namelen = sizeof(addrFrom);
+	mesgInfo.Control.buf = (char *) & nearInfo;
+	mesgInfo.Control.len = sizeof(nearInfo);
 
 	InitBuffer();
 	SetMutexFree();
@@ -199,12 +197,12 @@ CLowerInterface::~CLowerInterface()
 // sockAddrTo[0] is the most preferred address (care of address)
 // sockAddrTo[3] is the home-address
 // while sockAddr[1], sockAddr[2] are backup-up/load-balance address (might be zero)
-int LOCALAPI CLowerInterface::EnumEffectiveAddresses(UINT64 *prefixes)
+int LOCALAPI CLowerInterface::EnumEffectiveAddresses(uint64_t *prefixes)
 {
 	// UNRESOLVED! could we make sure u is 64-bit aligned?
 	if (nearInfo.IsIPv6())
 	{
-		prefixes[0] = *(UINT64 *) & nearInfo.u;
+		prefixes[0] = *(uint64_t *) & nearInfo.u;
 		prefixes[1] = 0;	// IN6_ADDR_ANY; no compatible multicast prefix
 	}
 	else
@@ -408,7 +406,7 @@ int CLowerInterface::BindInterface(SOCKET sd, PSOCKADDR_IN pAddrListen, int k)
 		, pAddrListen->sin_addr.S_un.S_un_b.s_b2
 		, pAddrListen->sin_addr.S_un.S_un_b.s_b3
 		, pAddrListen->sin_addr.S_un.S_un_b.s_b4
-		, ntohs(pAddrListen->sin_port));
+		, be16toh(pAddrListen->sin_port));
 
 	memcpy(& addresses[k], pAddrListen, sizeof(SOCKADDR_IN));
 	interfaces[k] = 0;
@@ -616,7 +614,7 @@ inline void CLowerInterface::ProcessRemotePacket()
 			}
 			// Unfortunately, it was proven that no matter whether there is MSG_PEEK
 			// MSG_PARTIAL is not supported by the underlying raw socket service
-			sinkInfo.dwFlags = 0;
+			mesgInfo.dwFlags = 0;
 			sdRecv = readFDs.fd_array[i];
 			r = AcceptAndProcess();
 			SetMutexFree();
@@ -646,10 +644,10 @@ int CLowerInterface::AcceptAndProcess()
 	scatteredBuf[0].buf = (CHAR *) & pktBuf->hdr;
 #endif
 	scatteredBuf[0].len = MAX_LLS_BLOCK_SIZE;
-	sinkInfo.lpBuffers = scatteredBuf;
-	sinkInfo.dwBufferCount = 1;
+	mesgInfo.lpBuffers = scatteredBuf;
+	mesgInfo.dwBufferCount = 1;
 
-	int	r = WSARecvMsg(sdRecv, & sinkInfo, & countRecv, NULL, NULL);
+	int	r = WSARecvMsg(sdRecv, & mesgInfo, & countRecv, NULL, NULL);
 	if(r != 0)
 	{
 		REPORT_WSAERROR_TRACE("Cannot receive packet information");
@@ -659,22 +657,24 @@ int CLowerInterface::AcceptAndProcess()
 
 	// From the receiver's point of view the local fiber id was stored in the peer fiber id field of the received packet
 #ifdef OVER_UDP_IPv4
+	countRecv -= sizeof(PairALFID);	// extra prefixed bytes are substracted
 	nearInfo.u.idALF = pktBuf->idPair.peer;
-	SOCKADDR_ALFID(sinkInfo.name) = pktBuf->idPair.source;
+	SOCKADDR_ALFID(mesgInfo.name) = pktBuf->idPair.source;
 #else
 	pktBuf->idPair.peer = nearInfo.u.idALF;
-	pktBuf->idPair.source = SOCKADDR_ALFID(sinkInfo.name);
+	pktBuf->idPair.source = SOCKADDR_ALFID(mesgInfo.name);
 #endif
 
 	FSPOperationCode opCode = (FSPOperationCode) pktBuf->hdr.hs.opCode;
 #ifdef TRACE_PACKET
 	printf_s("Packet of opCode %d[%s] received\n", (int)opCode, opCodeStrings[opCode]);
 	printf_s("Remote address:\n");
-	DumpNetworkUInt16((UINT16 *)&addrFrom, sizeof(addrFrom) / 2);
+	DumpNetworkUInt16((uint16_t *) & addrFrom, sizeof(addrFrom) / 2);
 	printf_s("Near sink:\n");
-	DumpNetworkUInt16((UINT16 *)&nearInfo.u, sizeof(nearInfo.u) / 2);
+	DumpNetworkUInt16((uint16_t *) & nearInfo.u, sizeof(nearInfo.u) / 2);
+	printf_s("Fixed header:\n");
+	DumpNetworkUInt16((uint16_t *) & pktBuf->hdr, sizeof(pktBuf->hdr) / 2);
 #endif
-	int lenPrefix = nearInfo.IsIPv6() ? 0 : sizeof(PairALFID );
 	CSocketItemEx *pSocket = NULL;
 	switch(opCode)
 	{
@@ -698,8 +698,7 @@ int CLowerInterface::AcceptAndProcess()
 			pSocket = NULL;	// FreeBuffer(pktBuf);
 			break;
 		}
-		pSocket->OnConnectRequestAck( *FSP_OperationHeader<FSP_AckConnectRequest>()
-			, countRecv - lenPrefix  - sizeof(FSP_AckConnectRequest) );
+		pSocket->OnConnectRequestAck( *FSP_OperationHeader<FSP_AckConnectRequest>(), countRecv  - sizeof(FSP_AckConnectRequest) );
 		pSocket->SetReady();
 		pSocket = NULL;	// FreeBuffer(pktBuf);
 		break;
@@ -723,9 +722,16 @@ int CLowerInterface::AcceptAndProcess()
 #endif
 			break;
 		}
+		if(pSocket->fidPair.peer != pktBuf->idPair.source)		// note that pktBuf is the received
+		{
+#ifdef TRACE
+			printf_s("Source fiber ID #%u the packet does not matched context\n", GetRemoteFiberID());
+#endif
+			break;
+		}
 		//
-		pktBuf->pktSeqNo = ntohl(pktBuf->GetHeaderFSP()->sequenceNo);
-		pktBuf->lenData = countRecv - lenPrefix - ntohs(pktBuf->GetHeaderFSP()->hs.hsp);
+		pktBuf->lenData = countRecv - be16toh(pktBuf->GetHeaderFSP()->hs.hsp);
+		pktBuf->pktSeqNo = be32toh(pktBuf->GetHeaderFSP()->sequenceNo);
 #ifdef TRACE_PACKET
 		printf_s("packet #%u, payload length %d, to put onto the queue\n", pktBuf->pktSeqNo, pktBuf->lenData);
 #endif
@@ -785,14 +791,14 @@ int LOCALAPI CLowerInterface::SendBack(char * buf, int len)
 	wsaData[1].buf = buf;
 	wsaData[1].len = len;
 #ifdef TRACE_PACKET
-	printf_s("Send back to (namelen = %d):\n", sinkInfo.namelen);
-	DumpNetworkUInt16((UINT16 *)& addrFrom, sinkInfo.namelen / 2);
+	printf_s("Send back to (namelen = %d):\n", mesgInfo.namelen);
+	DumpNetworkUInt16((uint16_t *)& addrFrom, mesgInfo.namelen / 2);
 #endif
 	DWORD n = 0;
 	int r = WSASendTo(sdSend
 		, wsaData, 2, &n
 		, 0
-		, (const sockaddr *)& addrFrom, sinkInfo.namelen
+		, (const sockaddr *)& addrFrom, mesgInfo.namelen
 		, NULL, NULL);
 	if (r != 0)
 	{
@@ -801,8 +807,8 @@ int LOCALAPI CLowerInterface::SendBack(char * buf, int len)
 	}
 #ifdef TRACE_PACKET
 	printf("%s, line %d, %d bytes sent back.\n", __FILE__, __LINE__, n);
-	printf("Peer name length = %d, socket address:\n", sinkInfo.namelen);
-	DumpNetworkUInt16((UINT16 *)& addrFrom, sizeof(SOCKADDR_IN6) / 2);
+	printf("Peer name length = %d, socket address:\n", mesgInfo.namelen);
+	DumpNetworkUInt16((uint16_t *)& addrFrom, sizeof(SOCKADDR_IN6) / 2);
 #endif
 	return n;
 }
@@ -813,12 +819,12 @@ int LOCALAPI CLowerInterface::SendBack(char * buf, int len)
 
 // Given
 //	CSocketItemEx *	the pointer to the premature socket (default NULL)
-//	UINT32			reason code flags of reset (default zero)
+//	uint32_t			reason code flags of reset (default zero)
 // Do
 //	Send back the echoed reset at the same interface of receiving
 //	in CHALLENGING, CONNECT_AFFIRMING, unresumable CLOSABLE and unrecoverable CLOSED state,
 //	and of course, throttled LISTENING state
-void LOCALAPI CLowerInterface::SendPrematureReset(UINT32 reasons, CSocketItemEx *pSocket)
+void LOCALAPI CLowerInterface::SendPrematureReset(uint32_t reasons, CSocketItemEx *pSocket)
 {
 	TRACE_HERE("called");
 
@@ -828,7 +834,7 @@ void LOCALAPI CLowerInterface::SendPrematureReset(UINT32 reasons, CSocketItemEx 
 	if(pSocket)
 	{
 		// In CHALLENGING, CONNECT_AFFIRMING where the peer address is known
-		reject.u.timeStamp = htonll(NowUTC());
+		reject.u.timeStamp = htobe64(NowUTC());
 		// See also CSocketItemEx::Emit() and SetIntegrityCheckCode():
 		reject.u2.fidPair = pSocket->fidPair;
 		pSocket->SendPacket(1, ScatteredSendBuffers(&reject, sizeof(reject)));
@@ -922,22 +928,6 @@ bool IsProcessAlive(DWORD idProcess)
 	CloseHandle(hProcess);
 
 	return (r && exitCode == STILL_ACTIVE);
-}
-
-
-// Given
-//	_Uint32t	[_Out_] placeholder of the random 32-bit words to be generated
-//	int			number of the random 32-bit words to be gererated
-// Do
-//	Exploit rand_s() to get a string of specified number near-real random 32-bit words 
-// Remark
-//	Hard-coded: at most generate 256 bits
-void rand_w32(uint32_t *p, int n)
-{
-	for (register int i = 0; i < min(n, 32); i++)
-	{
-		rand_s(p + i);
-	}
 }
 
 
@@ -1306,16 +1296,16 @@ int CSocketItemEx::SendPacket(register ULONG n1, ScatteredSendBuffers s)
 	}
 
 	tRecentSend = NowUTC();
-//#ifdef TRACE_PACKET
-//	printf_s("\nPeer socket address:\n");
-//	DumpNetworkUInt16((UINT16 *)sockAddrTo, sizeof(SOCKADDR_IN6) / 2);
-//	printf_s("Data to sent:\n----\n");
-//	for (register ULONG i = 0; i < n1; i++)
-//	{
-//		DumpNetworkUInt16((UINT16 *)lpBuffers[i].buf, lpBuffers[i].len / 2);
-//		printf("----\n");
-//	}
-//#endif
+#ifdef TRACE_PACKET
+	printf_s("\nPeer socket address:\n");
+	DumpNetworkUInt16((uint16_t *)sockAddrTo, sizeof(SOCKADDR_IN6) / 2);
+	printf_s("Data to sent:\n----\n");
+	for (register ULONG i = 0; i < n1; i++)
+	{
+		DumpNetworkUInt16((uint16_t *)lpBuffers[i].buf, lpBuffers[i].len / 2);
+		printf("----\n");
+	}
+#endif
 	DWORD n = 0;
 	// UNRESOLVED! Mixed IPv4/IPv6 network interface, i.e.dual hosted networks
 	int r = WSASendTo(CLowerInterface::Singleton()->sdSend

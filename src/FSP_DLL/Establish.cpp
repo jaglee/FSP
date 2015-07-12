@@ -177,12 +177,12 @@ CSocketItemDl * LOCALAPI CSocketItemDl::PrepareToAccept(BackLogItem & backLog, C
 
 	memcpy(pSocket->pControlBlock->peerAddr.ipFSP.allowedPrefixes
 		, backLog.allowedPrefixes
-		, sizeof(UINT64)* MAX_PHY_INTERFACES);
+		, sizeof(uint64_t)* MAX_PHY_INTERFACES);
 	pSocket->pControlBlock->peerAddr.ipFSP.hostID = backLog.remoteHostID;
 	pSocket->pControlBlock->peerAddr.ipFSP.fiberID = backLog.idRemote;
 
-	pSocket->pControlBlock->u.connectParams = backLog;
-	// UNRESOLVED!? Correct pSocket->pControlBlock->u.connectParams.allowedPrefixes in LLS
+	pSocket->pControlBlock->connectParams = backLog;
+	// UNRESOLVED!? Correct pSocket->pControlBlock->connectParams.allowedPrefixes in LLS
 
 	pSocket->pControlBlock->SetRecvWindowHead(backLog.expectedSN);
 	pSocket->pControlBlock->SetSendWindowWithHeadReserved(backLog.initialSN);
@@ -210,8 +210,7 @@ bool LOCALAPI CSocketItemDl::ToWelcomeConnect(BackLogItem & backLog)
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend();
 	FSP_ConnectParam *params = (FSP_ConnectParam *)GetSendPtr(skb);
 	//
-	*(uint64_t *)(pControlBlock->u.sessionKey) = backLog.initCheckCode;
-	*((uint64_t *)(pControlBlock->u.sessionKey) + 1) = backLog.cookie;
+	memcpy(& pControlBlock->connectParams, & backLog, FSP_MAX_KEY_SIZE);
 
 	params->listenerID = pControlBlock->idParent;
 	params->hs.Set<MOBILE_PARAM>(sizeof(FSP_NormalPacketHeader));
@@ -232,17 +231,6 @@ bool LOCALAPI CSocketItemDl::ToWelcomeConnect(BackLogItem & backLog)
 	// the packet is still locked
 
 	return true;
-}
-
-
-// Auxiliary function that is called when a new connection request is to be accepted
-// in the new created context of the incarnation respondor OR multiplexing initiator
-void CSocketItemDl::ToConcludeAccept()
-{
-	TRACE_HERE("Connection has been accepted");
-	SetMutexFree();
-	if(fpAccepted != NULL)
-		fpAccepted(this, &context);
 }
 
 
@@ -271,16 +259,10 @@ void CSocketItemDl::ToConcludeConnect()
 	context.u.st.compressing = skb->GetFlag<IS_COMPRESSED>();
 
 	pControlBlock->SlideRecvWindowByOne();
+	// Overlay CONNECT_REQUEST
+	pControlBlock->sendWindowNextSN = pControlBlock->sendWindowFirstSN;
 
 	TRACE_HERE("connection request has been accepted");
-
-	// Overlay CONNECT_REQUEST, and yes, it is queued and might be followed by payload packet
-	skb = pControlBlock->HeadSend();	// See also InitConnect() and AffirmConnect()
-	// while version and sequence number remains as the same as very beginning INIT_CONNECT
-	skb->opCode = PERSIST;
-	skb->len = 0;
-	skb->Unlock();
-	//^ As it overlays CONNECT_REQUEST and the packet must be unlocked to piggyback payload in the callback function
 	SetMutexFree();
 
 	int r = 0;
@@ -292,7 +274,7 @@ void CSocketItemDl::ToConcludeConnect()
 		Recycle();
 		return;
 	}
-	// UNRESOLVED! To change the opcode of the last payload packet to COMMIT...
+
 	SetState(r == 0 ? ESTABLISHED : COMMITTING);
 #ifdef TRACE
 	printf_s("Acknowledgement of connection request received, to PERSIST the connection.\n");
@@ -303,20 +285,59 @@ void CSocketItemDl::ToConcludeConnect()
 
 // Given
 //	PFSP_IN6_ADDR	the place holder of the output FSP/IPv6 address
-//	UINT32		the 32-bit integer representation of the IPv4 address to be translated
-//	UINT32		the fiber ID, in host byte order
+//	uint32_t		the 32-bit integer representation of the IPv4 address to be translated
+//	uint32_t		the fiber ID, in host byte order
 // Return
 //	the pointer to the place holder of host-id which might be set/updated later
 // Remark
 //	make the rule-adhered IPv6 address, the result is placed in the given pointed place holder
 DllSpec
-UINT32 * TranslateFSPoverIPv4(PFSP_IN6_ADDR p, UINT32 dwIPv4, UINT32 fiberID)
+uint32_t * TranslateFSPoverIPv4(PFSP_IN6_ADDR p, uint32_t dwIPv4, uint32_t fiberID)
 {
 	p->u.st.prefix = PREFIX_FSP_IP6to4;
 	p->u.st.ipv4 = dwIPv4;
 	p->u.st.port = DEFAULT_FSP_UDPPORT;
 	p->idALF = htobe32(fiberID);
 	return & p->idHost;
+}
+
+
+
+DllSpec
+int FSPAPI InstallAuthEncKey(FSPHANDLE h, BYTE * key, int keySize, int32_t keyLife)
+{
+	if(keySize < FSP_MIN_KEY_SIZE || keySize > FSP_MAX_KEY_SIZE || keySize % sizeof(uint64_t) != 0 || keyLife <= 0)
+		return -EDOM;
+	try
+	{
+		CSocketItemDl *pSocket = (CSocketItemDl *)h;
+		return pSocket->InstallKey(key, keySize, keyLife);
+	}
+	catch(...)
+	{
+		return -EFAULT;
+	}
+}
+
+
+
+// Given
+//	BYTE *		byte stream of the key
+//	int			length of the key, should be multiplication of 8
+//	int32_t		life of the key, maximum number of packets that may utilize the key
+// Return
+//	-EGAIN if installation of a new key is not yet synchronized with the peer
+//	0 if no failure
+int LOCALAPI CSocketItemDl::InstallKey(BYTE *key, int keySize, int32_t keyLife)
+{
+	if(_InterlockedCompareExchange8(& pControlBlock->newKeyPending, 1, 0) != 0)
+		return -EAGAIN;
+	//
+	memcpy(& pControlBlock->connectParams, key, keySize);
+	pControlBlock->connectParams.keyLength = keySize;
+	pControlBlock->connectParams.timeDelta = keyLife;
+	//
+	return 0;
 }
 
 

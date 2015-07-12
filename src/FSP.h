@@ -33,12 +33,15 @@
 #define THIS_FSP_VERSION	0	// current version
 #define IPPROTO_FSP			144	// value of protocol field for FSP over IPv6
 
+#define ARCH_BIG_ENDIAN		0	// by default it works for little-endian architecture
+
 // To borrow some stdint definitions
 #include "gcm-aes.h"
 
 typedef uint32_t ALFID_T;
 
-#if (VMAC_ARCH_BIG_ENDIAN)
+
+#if ARCH_BIG_ENDIAN
 // in network byte order on a big-endian host
 #define PORT2ALFID(port)	((ALFID_T)(unsigned short)(port))
 #define PREFIX_FSP_IP6to4	0x2002		// prefix of 6to4 overloaded
@@ -56,8 +59,8 @@ typedef uint32_t ALFID_T;
 // well-known upper layer application ID is compatible with TCP port number
 #define LAST_WELL_KNOWN_ALFID 65535
 
-#define FSP_SESSION_KEY_LEN	16	// in bytes
-#define FSP_MAC_IV_SIZE		12	// in bytes
+#define FSP_MAX_KEY_SIZE	32	// in bytes
+#define FSP_MIN_KEY_SIZE	16	// in bytes
 #define FSP_TAG_SIZE		8	// in bytes
 
 #define INITIAL_CONGESTION_WINDOW	2 // a protocol default congestion control parameter
@@ -206,11 +209,6 @@ typedef uint64_t timestamp_t;
 #define CONNECT_INITIATION_TIMEOUT_ms	30000	// half a minute
 #define TRASIENT_STATE_TIMEOUT_ms		300000	// 5 minutes
 
-
-/***
- * Protocol defined limit
- */
-#define EPHEMERAL_KEY_LIFECYCLE	(1024*1024 - 1)
 
 #include <pshpack1.h>
 

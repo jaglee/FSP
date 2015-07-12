@@ -178,7 +178,7 @@ void CSocketItemEx::Connect()
 			return;
 		}
 	}
-	pControlBlock->u.connectParams.idRemote = pControlBlock->peerAddr.ipFSP.fiberID;
+	pControlBlock->connectParams.idRemote = pControlBlock->peerAddr.ipFSP.fiberID;
 
 	// By default Connect() prefer initiatiating connection from an IPv6 interface
 	// but if the peer is of FSP over UDP/IPv4 address it must be changed
@@ -228,11 +228,17 @@ void CSocketItemEx::Start()
 	// synchronize the state in the 'cache' and the real state
 	if (_InterlockedExchange8((char *) & lowState, pControlBlock->state) != pControlBlock->state)
 	{
+#ifdef TRACE
+		printf_s("To send first packet in %s [%d]\n", stateNames[lowState], lowState);
+#endif
 		if (lowState == CLONING || lowState == RESUMING)
-		{
 			tKeepAlive_ms = CONNECT_INITIATION_TIMEOUT_ms;
-			RestartKeepAlive();
-		}
+		else if(lowState == ESTABLISHED)
+			ReplaceSendQueueHead(PERSIST);
+		else if(lowState == COMMITTING || lowState == COMMITTING2)
+			ReplaceSendQueueHead(COMMIT);
+		//
+		RestartKeepAlive();
 	}
 	//
 	EmitStart();
@@ -386,13 +392,13 @@ int LOCALAPI CSocketItemEx::ResolveToIPv6(const char *nodeName)
 	}
 
 	// See also CLowerInterface::EnumEffectiveAddresses
-	register UINT64 * prefixes = pControlBlock->peerAddr.ipFSP.allowedPrefixes;
+	register uint64_t * prefixes = pControlBlock->peerAddr.ipFSP.allowedPrefixes;
 	int n = 0;
 	pControlBlock->peerAddr.ipFSP.hostID = SOCKADDR_HOST_ID(pAddrInfo->ai_addr);
 	pControlBlock->peerAddr.ipFSP.fiberID = SOCKADDR_ALFID(pAddrInfo->ai_addr);
 	do
 	{
-		prefixes[n] = *(UINT64 *)(((PSOCKADDR_IN6)pAddrInfo->ai_addr)->sin6_addr.u.Byte);
+		prefixes[n] = *(uint64_t *)(((PSOCKADDR_IN6)pAddrInfo->ai_addr)->sin6_addr.u.Byte);
 	} while(++n < MAX_PHY_INTERFACES && (pAddrInfo = pAddrInfo->ai_next) != NULL);
 
 	freeaddrinfo(pAddrInfo);

@@ -15,7 +15,7 @@
  * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
-
+#define _CRT_RAND_S
 #include <stdlib.h>
 #include <string.h>
 #include "gcm-aes.h"
@@ -42,6 +42,9 @@
 	((uint64_t *)(X))[0] ^= htobe64((uint64_t)(bytesA) << 3),	\
 	((uint64_t *)(X))[1] ^= htobe64((uint64_t)(bytesC) << 3)	\
 	)
+
+
+const uint8_t J0[4] = { 0, 0, 0, 1};
 
 /* Computes a block multiplication in the GF(2^128) */
 /* didnot bother to enhance performance of ghash_gfmul */
@@ -76,81 +79,83 @@ static void ghash_gfmul(void *X, void *Y, void *Z)
 }
 
 
-void GCM_AES_Init(GCM_AES_CTX *ctx, const uint8_t *K, int bytesK, const uint8_t *IV)
+
+// external IV part of ctx->J definitely cross 64-bit alignment border
+// so we should not exploit 64-bit integer assignment
+static __inline
+void GCM_AES_SetIV(GCM_AES_CTX *ctx, const uint8_t *IV)
+{
+	// Reset hash state
+	bzero(ctx->X, GCM_BLOCK_LEN);
+
+	*(uint32_t *) & ctx->J[GCM_IV_LEN_FIXED] = *(uint32_t *)J0;
+	bcopy(IV, ctx->J + GMAC_SALT_LEN, GCM_IV_LEN_FIXED - GMAC_SALT_LEN);
+}
+
+
+
+void GCM_AES_SetKey(GCM_AES_CTX *ctx, const uint8_t *K, int bytesK)
 {
 	// AES key schedule
 	ctx->rounds = rijndaelKeySetupEnc(ctx->K, K, bytesK * 8);
 
-	// Hash state
-	bzero(ctx->H, GCM_BLOCK_LEN);
-	bzero(ctx->X, GCM_BLOCK_LEN);
-	rijndaelEncrypt(ctx->K, ctx->rounds, ctx->X, ctx->H);
-
-	// J0/pre-Initial Counter Block (as the length of IV is fixed to 96 bits)
-	bcopy(IV, ctx->J, GCM_IV_LEN_FIXED);
-	*(uint32_t *) & ctx->J[GCM_IV_LEN_FIXED] = htobe32(1);
-}
-
-
-void GMAC_InitWithKey(GCM_AES_CTX *ctx, const uint8_t *K, int bytesK)
-{
-	// AES key schedule
-	ctx->rounds = rijndaelKeySetupEnc(ctx->K, K, (bytesK - GMAC_SALT_LEN) * 8);
-
-	// Hash state
+	// The HASH sub-key
 	bzero(ctx->H, GCM_BLOCK_LEN);
 	bzero(ctx->X, GCM_BLOCK_LEN);
 	rijndaelEncrypt(ctx->K, ctx->rounds, ctx->X, ctx->H);
 
 	// Salt of J0/pre-Initial Counter Block, as to RFC4543
 	// assert(GMAC_SALT_LEN == sizeof(uint32_t));
-	*(uint32_t *)ctx->J = *(uint32_t *) & K[bytesK - GMAC_SALT_LEN];
+	*(uint32_t *)ctx->J = *(uint32_t *)ctx->H ^ *(uint32_t *)K;
 }
 
 
-void GMAC_SetIV(GCM_AES_CTX *ctx, const uint8_t *IV)
+
+uint32_t GCM_AES_XorSalt(GCM_AES_CTX *ctx, uint32_t salt)
 {
-	// well, it may cross 64-bit alignment border so we should not exploit 64-bit integer assignment
-	bcopy(IV, ctx->J + GMAC_SALT_LEN, GCM_IV_LEN_FIXED - GMAC_SALT_LEN);
-	*(uint32_t *) & ctx->J[GCM_IV_LEN_FIXED] = htobe32(1);
+	register uint32_t u = *(uint32_t *)ctx->J;
+	*(uint32_t *)ctx->J = u ^ salt;
+	return u;
 }
 
 
-int	GCM_AES_EncryptAndAuthenticate(GCM_AES_CTX *ctx
+
+int	GCM_AES_AuthenticatedEncrypt(GCM_AES_CTX *ctx, uint64_t IV
 								, const uint8_t *P, uint32_t bytesP
-								, const uint8_t *A, uint32_t bytesA
-								, uint8_t *C	// capacity of ciphertext buffer MUST be no less than bytesP
-								, uint8_t *T, int bytesT
-								)
+								, const uint64_t *aad, uint32_t bytesA
+								, uint64_t *bufCipherText	// capacity of ciphertext buffer MUST be no less than bytesP
+								, uint8_t *T, int bytesT)
 {
-	uint32_t	blk[4] = { 0, 0, 0, 0 };
 	uint8_t	keystream[GCM_BLOCK_LEN];
+	uint64_t	blk[2] = { 0, 0 };
 	int	plen;
 	int nMinus1;
-	uint32_t *x;
-	register int i, j;
+	uint64_t *x;
+	register int i;
 
 	if(bytesT > GCM_BLOCK_LEN)
 		return -2;
+
+	GCM_AES_SetIV(ctx, (const uint8_t *) & IV);
 
 	// AAD at first
 	if (bytesA > 0)
 	{
 		nMinus1 = bytesA >> GCM_BLOCK_LEN_POWER;
 		plen = bytesA & (GCM_BLOCK_LEN - 1);
-		x = (uint32_t *)A;
+		x = (uint64_t *)aad;
 		for (i = 0; i < nMinus1; i++)
 		{
 			gfadd(ctx->X, x, ctx->X);
-			ghash_gfmul((uint32_t *)ctx->X, (uint32_t *)ctx->H, (uint32_t *)ctx->X);
-			x += 4;
+			ghash_gfmul(ctx->X, ctx->H, ctx->X);
+			x += GCM_BLOCK_LEN / sizeof(uint64_t);
 		}
 		if (plen != 0)
 		{
-			bcopy(A + (bytesA - plen), (uint8_t *)blk, plen);
+			bcopy((uint8_t *)aad + (bytesA - plen), (uint8_t *)blk, plen);
 			gfadd(ctx->X, blk, ctx->X);
-			ghash_gfmul((uint32_t *)ctx->X, (uint32_t *)ctx->H, (uint32_t *)ctx->X);
-			blk[0] = blk[1] = blk[2] = blk[3] = 0;
+			ghash_gfmul(ctx->X, ctx->H, ctx->X);
+			blk[0] = blk[1] = 0;		// for security reason
 		}
 	}
 
@@ -159,43 +164,42 @@ int	GCM_AES_EncryptAndAuthenticate(GCM_AES_CTX *ctx
 	{
 		nMinus1 = bytesP >> GCM_BLOCK_LEN_POWER;
 		plen = bytesP & (GCM_BLOCK_LEN - 1);
-		x = (uint32_t *)C;
+		x = bufCipherText;
 		// ICB
 		gfinc(ctx->J);
 		for(i = 0; i < nMinus1; i++)
 		{
 			rijndaelEncrypt(ctx->K, ctx->rounds, ctx->J, keystream);
-			gfadd(P + (i << GCM_BLOCK_LEN_POWER), keystream, C + (i << GCM_BLOCK_LEN_POWER));
+			bcopy(P, (uint8_t *)blk, GCM_BLOCK_LEN);
+			P += GCM_BLOCK_LEN;
+			gfadd(blk, keystream, x);
 			gfinc(ctx->J);
 			//
 			gfadd(ctx->X, x, ctx->X);
-			ghash_gfmul((uint32_t *)ctx->X, (uint32_t *)ctx->H, (uint32_t *)ctx->X);
-			x += 4;
+			ghash_gfmul(ctx->X, ctx->H, ctx->X);
+			x += GCM_BLOCK_LEN / sizeof(uint64_t);
 		}
 
+		blk[0] = blk[1] = 0;	// there maybe some plaintext in the temporary buffer
 		if (plen != 0)
 		{
 			rijndaelEncrypt(ctx->K, ctx->rounds, ctx->J, keystream);
-			for(i = 0, j = bytesP - plen; i < plen; i++, j++)
-			{
-				 C[j] = P[j] ^ keystream[i];
-			}
-			//
-			bcopy(C + (bytesP - plen), (uint8_t *)blk, plen);
+			for(i = 0; i < plen; i++)
+				((uint8_t *)x)[i] = P[i] ^ keystream[i];
+			bcopy(x, (uint8_t *)blk, plen);
 			gfadd(ctx->X, blk, ctx->X);
-			ghash_gfmul((uint32_t *)ctx->X, (uint32_t *)ctx->H, (uint32_t *)ctx->X);
-			blk[0] = blk[1] = blk[2] = blk[3] = 0;
+			ghash_gfmul(ctx->X, ctx->H, ctx->X);
+			blk[0] = blk[1] = 0;		// for security reason
 		}
 	}
 
 	// The length round: somewhat roll-out of ghash_update (but conform to the original GCM specification)
 	gf_addlen(bytesA, bytesP, ctx->X);
-	ghash_gfmul((uint32_t *)ctx->X, (uint32_t *)ctx->H, (uint32_t *)ctx->X);
+	ghash_gfmul(ctx->X, ctx->H, ctx->X);
 
 	// The final round, compute the secured digest
-	// UNRESOLVED!could make a platform-depended representation of '1'
 	/* GCTR(J0); assume IV is 96 bits; recover J0 first */
-	*(uint32_t *) & ctx->J[GCM_IV_LEN_FIXED] = htobe32(1);
+	*(uint32_t *) & ctx->J[GCM_IV_LEN_FIXED] = *(const uint32_t *)J0;
 	rijndaelEncrypt(ctx->K, ctx->rounds, ctx->J, keystream);
 	for (i = 0; i < bytesT; i++)
 		T[i] = ctx->X[i] ^ keystream[i];
@@ -207,75 +211,78 @@ int	GCM_AES_EncryptAndAuthenticate(GCM_AES_CTX *ctx
 
 
 
-int	GCM_AES_AuthenticatedDecrypt(GCM_AES_CTX *ctx
-								, const uint8_t *C, uint32_t bytesC
-								, const uint8_t *A, uint32_t bytesA
-								, const uint8_t *T, int bytesT
-								, uint8_t *P	// capacity of plaintext buffer MUST be no less than bytesC
-								)
+
+int	GCM_AES_AuthenticateAndDecrypt(GCM_AES_CTX *ctx, uint64_t IV
+									, const uint8_t *C, uint32_t bytesC
+									, const uint64_t *aad, uint32_t bytesA
+									, const uint8_t *T, int bytesT
+									, uint64_t *bufPlainText	// capacity of plaintext buffer MUST be no less than bytesC
+									)
 {
-	uint32_t	blk[4] = { 0, 0, 0, 0 };
+	uint64_t blk[2] = { 0, 0 };
 	uint8_t	keystream[GCM_BLOCK_LEN];
 	int	plen;
 	int nMinus1;
-	uint32_t *x;
-	register int i, j;
+	uint64_t *x;
+	register int i;
 
 	if(bytesT > GCM_BLOCK_LEN)
 		return -2;
 
-	// A at first
+	GCM_AES_SetIV(ctx, (const uint8_t *) & IV);
+
 	// AAD at first
 	if (bytesA > 0)
 	{
 		nMinus1 = bytesA >> GCM_BLOCK_LEN_POWER;
 		plen = bytesA & (GCM_BLOCK_LEN - 1);
-		x = (uint32_t *)A;
+		x = (uint64_t *)aad;
 		for (i = 0; i < nMinus1; i++)
 		{
 			gfadd(ctx->X, x, ctx->X);
-			ghash_gfmul((uint32_t *)ctx->X, (uint32_t *)ctx->H, (uint32_t *)ctx->X);
-			x += 4;
+			ghash_gfmul(ctx->X, ctx->H, ctx->X);
+			x += GCM_BLOCK_LEN / sizeof(uint64_t);
 		}
 		if (plen != 0)
 		{
-			bcopy(A + (bytesA - plen), (uint8_t *)blk, plen);
+			bcopy((uint8_t *)aad + (bytesA - plen), (uint8_t *)blk, plen);
 			gfadd(ctx->X, blk, ctx->X);
-			ghash_gfmul((uint32_t *)ctx->X, (uint32_t *)ctx->H, (uint32_t *)ctx->X);
-			blk[0] = blk[1] = blk[2] = blk[3] = 0;
+			ghash_gfmul(ctx->X, ctx->H, ctx->X);
+			blk[0] = blk[1] = 0;		// for security reason
 		}
 	}
-
 
 	// Continue GHASH on C
 	if(bytesC > 0)
 	{
+		const uint8_t *x = C;
 		nMinus1 = bytesC >> GCM_BLOCK_LEN_POWER;
 		plen = bytesC & (GCM_BLOCK_LEN - 1);
-		x = (uint32_t *)C;
 		for (i = 0; i < nMinus1; i++)
 		{
-			gfadd(ctx->X, x, ctx->X);
-			ghash_gfmul((uint32_t *)ctx->X, (uint32_t *)ctx->H, (uint32_t *)ctx->X);
-			x += 4;
+			bcopy(x, (uint8_t *)blk, GCM_BLOCK_LEN); 
+			gfadd(ctx->X, blk, ctx->X);
+			ghash_gfmul(ctx->X, ctx->H, ctx->X);
+			x += GCM_BLOCK_LEN;
 		}
+
+		blk[0] = blk[1] = 0;	// there maybe some ciphertext in the temporary buffer
 		if (plen != 0)
 		{
-			bcopy(C + (bytesC - plen), (uint8_t *)blk, plen);
+			bcopy(x, (uint8_t *)blk, plen);
 			gfadd(ctx->X, blk, ctx->X);
-			ghash_gfmul((uint32_t *)ctx->X, (uint32_t *)ctx->H, (uint32_t *)ctx->X);
-			blk[0] = blk[1] = blk[2] = blk[3] = 0;
+			ghash_gfmul(ctx->X, ctx->H, ctx->X);
+			blk[0] = blk[1] = 0;		// for security reason
 		}
 	}
 
 	// The length round: somewhat roll-out of ghash_update (but conform to the original GCM specification)
-	gf_addlen(bytesA, bytesC , ctx->X);
-	ghash_gfmul((uint32_t *)ctx->X, (uint32_t *)ctx->H, (uint32_t *)ctx->X);
+	gf_addlen(bytesA, bytesC, ctx->X);
+	ghash_gfmul(ctx->X, ctx->H, ctx->X);
 
 	// The final round, authenticate the digest
-	// UNRESOLVED!could make a platform-depended representation of '1'
 	/* GCTR(J0); assume IV is 96 bits; recover J0 first */
-	*(uint32_t *) & ctx->J[GCM_IV_LEN_FIXED] = htobe32(1);
+	*(uint32_t *) & ctx->J[GCM_IV_LEN_FIXED] = *(uint32_t *)J0;
 	rijndaelEncrypt(ctx->K, ctx->rounds, ctx->J, keystream);
 	for (i = 0; i < bytesT; i++)
 	{
@@ -288,23 +295,27 @@ int	GCM_AES_AuthenticatedDecrypt(GCM_AES_CTX *ctx
 	{
 		nMinus1 = bytesC >> GCM_BLOCK_LEN_POWER;
 		plen = bytesC & (GCM_BLOCK_LEN - 1);
+		x = bufPlainText;
 		// ICB
 		gfinc(ctx->J);
 		for(i = 0; i < nMinus1; i++)
 		{
 			rijndaelEncrypt(ctx->K, ctx->rounds, ctx->J, keystream);
-			gfadd(C + (i << GCM_BLOCK_LEN_POWER), keystream, P + (i << GCM_BLOCK_LEN_POWER));
+			bcopy(C, (uint8_t *)blk, GCM_BLOCK_LEN);
+			C += GCM_BLOCK_LEN;
+			gfadd(blk, keystream, x);
 			gfinc(ctx->J);
+			x += GCM_BLOCK_LEN / sizeof(uint64_t);
 		}
 		if (plen)
 		{
 			rijndaelEncrypt(ctx->K, ctx->rounds, ctx->J, keystream);
-			for(i = 0, j = bytesC - plen; i < plen; i++, j++)
-			{
-				 P[j] = C[j] ^ keystream[i];
-			}
+			for(i = 0; i < plen; i++)
+				 ((uint8_t *)x)[i] = C[i] ^ keystream[i];
 		}
+		blk[0] = blk[1] = 0;	// for security reason
 	}
+
 	bzero(ctx->X, GCM_BLOCK_LEN);
 	bzero(keystream, sizeof(keystream));	// for security reason
 
@@ -313,7 +324,7 @@ int	GCM_AES_AuthenticatedDecrypt(GCM_AES_CTX *ctx
 
 
 
-int GCM_SecureHash(GCM_AES_CTX *ctx, const uint8_t *A, uint32_t bytesA, uint8_t *T, int bytesT)
+int GCM_SecureHash(GCM_AES_CTX *ctx, uint64_t nonce, const uint8_t *A, uint32_t bytesA, uint8_t *T, int bytesT)
 {
-	return GCM_AES_EncryptAndAuthenticate(ctx, NULL, 0, A, bytesA, NULL, T, bytesT);
+	return GCM_AES_AuthenticatedEncrypt(ctx, nonce, NULL, 0, (const uint64_t *)A, bytesA, NULL, T, bytesT);
 }

@@ -123,7 +123,7 @@
       <SubSystem>Windows</SubSystem>
       <ImportLibrary>$(OutDir)FSP_DLL.lib</ImportLibrary>
       <TargetMachine>MachineX86</TargetMachine>
-      <AdditionalDependencies>libgmp.a;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>%(AdditionalDependencies)</AdditionalDependencies>
       <ImageHasSafeExceptionHandlers>false</ImageHasSafeExceptionHandlers>
     </Link>
   </ItemDefinitionGroup>
@@ -145,7 +145,7 @@
       <ProgramDatabaseFile>$(OutDir)FSP_DLL.pdb</ProgramDatabaseFile>
       <SubSystem>Windows</SubSystem>
       <ImportLibrary>$(OutputPath)FSP_DLL.lib</ImportLibrary>
-      <AdditionalDependencies>libgmp.a;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <Bscmake>
       <PreserveSbr>true</PreserveSbr>
@@ -195,13 +195,14 @@
     <ClCompile Include="..\ControlBlock.cpp" />
     <ClCompile Include="..\gcm-aes.c" />
     <ClCompile Include="..\rijndael-alg-fst.c" />
+    <ClCompile Include="CryptoStub.c" />
     <ClCompile Include="Disconnect.cpp" />
     <ClCompile Include="DllEntry.cpp" />
     <ClCompile Include="Establish.cpp" />
-    <ClCompile Include="Multihome.cpp" />
     <ClCompile Include="Multiplex.cpp" />
     <ClCompile Include="Receive.cpp" />
     <ClCompile Include="Send.cpp" />
+    <ClCompile Include="tweetnacl.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\FSP.h" />

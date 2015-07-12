@@ -113,22 +113,20 @@ ALFID_T LOCALAPI CLowerInterface::RandALFID()
 }
 
 
-// Remark
-//	Rekeying every INT_MAX microseconds (about 2147 seconds, i.e. about 35 minutes) due to time-delta limit
-UINT64 LOCALAPI CalculateCookie(BYTE *header, int sizeHdr, timestamp_t t0)
+
+uint64_t LOCALAPI CalculateCookie(BYTE *header, int sizeHdr, timestamp_t t0)
 {
 	static struct
 	{
 		ALIGN(MAC_ALIGNMENT)
-		BYTE		nonce_prefix[FSP_MAC_IV_SIZE - sizeof(timestamp_t)];
 		timestamp_t timeStamp;
 		ALIGN(MAC_ALIGNMENT)
 		timestamp_t timeSign;
 		ALIGN(MAC_ALIGNMENT)
-		ae_ctx		ctx;
+		GCM_AES_CTX	ctx;
 	} prevCookieContext, cookieContext;
 	//
-	ALIGN(MAC_ALIGNMENT) BYTE m[OCB_KEY_LEN];
+	ALIGN(MAC_ALIGNMENT) BYTE m[sizeof(FSP_InitiateRequest)];
 	timestamp_t t1 = NowUTC();
 
 #ifdef TRACE
@@ -148,80 +146,233 @@ UINT64 LOCALAPI CalculateCookie(BYTE *header, int sizeHdr, timestamp_t t0)
 	if(t1 - cookieContext.timeStamp > INT_MAX)
 	{
 		ALIGN(MAC_ALIGNMENT)
-		BYTE	st[FSP_SESSION_KEY_LEN];	// in bytes
+		BYTE	st[COOKIE_KEY_LEN];	// in bytes
 		memcpy(& prevCookieContext, & cookieContext, sizeof(cookieContext));
 		//
 		cookieContext.timeStamp = t1;
 		rand_w32((uint32_t *) & st, sizeof(st) / sizeof(uint32_t));
 		//
-		ae_init(& cookieContext.ctx, st, FSP_SESSION_KEY_LEN, FSP_MAC_IV_SIZE, FSP_TAG_SIZE);
+		GCM_AES_SetKey(& cookieContext.ctx, st, COOKIE_KEY_LEN);
 	}
 
-	ALIGN(MAC_ALIGNMENT) block r;
+	BYTE tag[sizeof(uint64_t)];
 	if((long long)(t0 - cookieContext.timeStamp) < INT_MAX)
 	{
 		cookieContext.timeSign = t0;
-		ae_encrypt(& cookieContext.ctx, cookieContext.nonce_prefix, m, sizeof(m), & cookieContext.timeSign, sizeof(timestamp_t), & m, & r, 1);
+		GCM_SecureHash(& cookieContext.ctx, cookieContext.timeStamp, m, sizeof(m), tag, sizeof(tag));
 	}
 	else
 	{
 		prevCookieContext.timeSign = t0;
-		ae_encrypt(& prevCookieContext.ctx, prevCookieContext.nonce_prefix, m, sizeof(m), & prevCookieContext.timeSign, sizeof(timestamp_t), & m, & r, 1);
+		GCM_SecureHash(& prevCookieContext.ctx, prevCookieContext.timeStamp, m, sizeof(m), tag, sizeof(tag));
 	}
-	return *(uint64_t *) & r;
+	return *(uint64_t *)tag;
+}
+
+
+
+
+void CSocketItemEx::InstallEphemeralKey()
+{
+#ifdef TRACE
+	printf_s("Session key materials:\n");
+	DumpNetworkUInt16((uint16_t *)  & pControlBlock->connectParams, FSP_MAX_KEY_SIZE / 2);
+#endif
+	// contextOfICC.savedCRC = true; // don't care
+	contextOfICC.keyLife = 0;
+	// Overlay with 'initCheckCode', 'cookie', 'salt', 'initialSN' and 'timeStamp'
+	contextOfICC.curr.precomputedICC[0] 
+		=  CalculateCRC64(* (uint64_t *) & fidPair, (uint8_t *) & pControlBlock->connectParams, FSP_MAX_KEY_SIZE);
+
+	PairALFID recvFIDPair;
+	recvFIDPair.peer = fidPair.source;
+	recvFIDPair.source = fidPair.peer;
+	contextOfICC.curr.precomputedICC[1]
+		=  CalculateCRC64(* (uint64_t *) & recvFIDPair, (uint8_t *) & pControlBlock->connectParams, FSP_MAX_KEY_SIZE);
+#ifdef TRACE
+	printf_s("Precomputed ICC 0:");
+	DumpNetworkUInt16((uint16_t *)  & contextOfICC.curr.precomputedICC[0], 4);
+	printf_s("Precomputed ICC 1:");
+	DumpNetworkUInt16((uint16_t *)  & contextOfICC.curr.precomputedICC[1], 4);
+#endif
+}
+
+
+
+// TODO: (see also ValidateICC)
+// Install session key might be quick, e.g. a pre-shared key installed as soon as CHALLENGE
+// If there's no data in flight, the send key is installed immediately
+// But only in CHALLENGING, PEER_COMMIT, COMMITTING2 or CLOSABLE state
+// may the first receive sequence number of the packet that exploited the new key set
+void CSocketItemEx::InstallSessionKey()
+{
+#ifndef NDEBUG
+	contextOfICC._mac_ctx_protect_prolog[0]
+		= contextOfICC._mac_ctx_protect_prolog[1]
+		= contextOfICC._mac_ctx_protect_epilog[0]
+		= contextOfICC._mac_ctx_protect_epilog[1]
+		= MAC_CTX_PROTECT_SIGN;
+#endif
+	contextOfICC.savedCRC = (contextOfICC.keyLife == 0);
+	contextOfICC.prev = contextOfICC.curr;
+	contextOfICC.keyLife = pControlBlock->connectParams.timeDelta;
+	contextOfICC.firstSendSNewKey = pControlBlock->sendWindowNextSN;
+	contextOfICC.firstRecvSNewKey = pControlBlock->recvWindowNextSN;
+	
+	GCM_AES_SetKey(& contextOfICC.curr.gcm_aes, (uint8_t *) & pControlBlock->connectParams, pControlBlock->connectParams.keyLength);
 }
 
 
 // Given
-//	FSP_NormalPacketHeader *	The pointer to the fixed header to be filled
+//	FSP_NormalPacketHeader *	The pointer to the fixed header, plaintext may or may not follow
+//	void *	[in,out]			The plaintext/ciphertext, either payload or optional header
 //	int32_t						The payload length
+//	uint32_t					The xor'ed salt
 // Do
 //	Set ICC value
 // Remark
 //	IV = (sequenceNo, expectedSN)
 //	AAD = (source fiber ID, destination fiber ID, flags, receive window free pages
 //		 , version, OpCode, header stack pointer, optional headers)
-void LOCALAPI CSocketItemEx::SetIntegrityCheckCode(FSP_NormalPacketHeader *p1, int32_t ptLen)
+void LOCALAPI CSocketItemEx::SetIntegrityCheckCode(FSP_NormalPacketHeader *p1, void *content, int32_t ptLen, uint32_t salt)
 {
-//#ifdef TRACE
-//	printf_s("First 16 bytes to including in calculate ICC:\n");
-//	DumpNetworkUInt16((UINT16 *)p1, 16);
-//#endif
-	ALIGN(MAC_ALIGNMENT) BYTE tag[OCB_TAG_LEN];
-	int32_t aadLen = ntohs(p1->hs.hsp) - FSP_MAC_IV_SIZE;
-
-	if (aadLen > sizeof(padded) || aadLen <= 0)
-		return;
+	ALIGN(MAC_ALIGNMENT) uint64_t tag[FSP_TAG_SIZE / sizeof(uint64_t)];
 	
-	BYTE *payload = (BYTE *) & p1->integrity.id + aadLen;
-	int nPadded = 0;
-	BYTE *pt = NULL;
-
-	p1->integrity.id = fidPair;
-	memcpy_s(padded, sizeof(padded), (BYTE *) & p1->integrity.id, aadLen);
-	if(aadLen % MAC_ALIGNMENT > 0)
+#ifdef TRACE_PACKET
+	printf_s("\nBefore GCM_AES_AuthenticatedEncrypt: ptLen = %d\n", ptLen);
+	DumpNetworkUInt16((uint16_t *)p1, sizeof(FSP_NormalPacketHeader) / 2);
+#endif
+	uint32_t seqNo = be32toh(p1->sequenceNo);
+	// CRC64
+	if(contextOfICC.keyLife == 0)
 	{
-		nPadded = MAC_ALIGNMENT - aadLen % MAC_ALIGNMENT;
-		memset(padded + aadLen, 0, nPadded);
+#ifdef TRACE_PACKET
+		printf_s("\nPrecomputed ICC: ");
+		DumpNetworkUInt16((uint16_t *) & contextOfICC.curr.precomputedICC[0], sizeof(uint64_t) / 2);
+#endif
+		p1->integrity.code = contextOfICC.curr.precomputedICC[0];
+		tag[0] = CalculateCRC64(0, (uint8_t *)p1, sizeof(FSP_NormalPacketHeader));
 	}
-	if(ptLen > 0)
+	else if(int32_t(seqNo - contextOfICC.firstSendSNewKey) < 0 && contextOfICC.savedCRC)
 	{
-		pt = padded + aadLen + nPadded;
-		if(memcpy_s(pt, sizeof(padded) - aadLen - nPadded, payload, ptLen) != 0)
+#ifdef TRACE_PACKET
+		printf_s("\nPrecomputed ICC: ");
+		DumpNetworkUInt16((uint16_t *) & contextOfICC.prev.precomputedICC[0], sizeof(uint64_t) / 2);
+#endif
+		p1->integrity.code = contextOfICC.prev.precomputedICC[0];
+		tag[0] = CalculateCRC64(0, (uint8_t *)p1, sizeof(FSP_NormalPacketHeader));
+	}
+	else
+	{
+		GCM_AES_CTX *pCtx = int32_t(seqNo - contextOfICC.firstSendSNewKey) < 0
+			? & contextOfICC.prev.gcm_aes
+			: & contextOfICC.curr.gcm_aes;
+		uint32_t byteA = be16toh(p1->hs.hsp);
+		if(byteA < sizeof(FSP_NormalPacketHeader) || byteA > MAX_LLS_BLOCK_SIZE || (byteA & (sizeof(uint64_t) - 1)) != 0)
 			return;
+
+		// Synchronize the session key
+		if(seqNo == contextOfICC.firstSendSNewKey)
+			p1->SetFlag<Encrypted>();
+		p1->integrity.id = fidPair;
+		GCM_AES_XorSalt(pCtx, salt);
+		if(GCM_AES_AuthenticatedEncrypt(pCtx, *(uint64_t *)p1
+			, (const uint8_t *)content, ptLen
+			, (const uint64_t *)p1 + 1, byteA - sizeof(uint64_t)
+			, (uint64_t *)content
+			, (uint8_t *)tag, FSP_TAG_SIZE)
+			!= 0)
+		{
+			TRACE_HERE("Encryption error?");
+			GCM_AES_XorSalt(pCtx, salt);
+			return;
+		}
+		GCM_AES_XorSalt(pCtx, salt);
 	}
 
-	// significant nonce bits are (p1->sequenceNo, p1->expectedSN) of 8 bytes
-	memset(nonce, 0, sizeof(nonce));
-	memcpy(nonce + sizeof(nonce) - (sizeof(p1->sequenceNo) + sizeof(p1->expectedSN))
-		, & p1->sequenceNo
-		, sizeof(p1->sequenceNo) + sizeof(p1->expectedSN));
-
-	ae_encrypt(& mac_ctx, nonce, pt, ptLen, padded, aadLen, xcrypted, tag, AE_FINALIZE);
-	p1->integrity.code = *(uint64_t *)tag;
-	if(ptLen > 0)
-		memcpy(payload, xcrypted, ptLen);
+	p1->integrity.code = tag[0];
+#ifdef TRACE_PACKET
+	printf_s("After GCM_AES_AuthenticatedEncrypt:\n");	DumpNetworkUInt16((uint16_t *)p1, sizeof(FSP_NormalPacketHeader) / 2);
+#endif
 }
+
+
+
+// Given
+//	FSP_NormalPacketHeader *	The pointer to the fixed header
+//	int32_t						The size of the ciphertext
+//	uint32_t					The xor'ed salt
+// Return
+//	true if all of the headers passed authentication and the optional payload successfully decrypted
+// Remark
+//	Assume the headers are 64-bit aligned
+//	UNRESOLVED!? Is it meaningless to recover the ICC field?	// p1->integrity.code = *(uint64_t *)tag;
+bool CSocketItemEx::ValidateICC(FSP_NormalPacketHeader *p1, int32_t ctLen, uint32_t salt)
+{
+	ALIGN(MAC_ALIGNMENT) uint64_t tag[FSP_TAG_SIZE / sizeof(uint64_t)];
+
+	// UNRESOLVED! But if out-of-order packet which set the sequence number continually received within the receive window?
+	// synchronize the session key
+	//if(p1->GetFlag<Encrypted>())
+	//	contextOfICC.firstRecvSNewKey = headPacket->pktSeqNo;
+
+	tag[0] = p1->integrity.code;
+#ifdef TRACE_PACKET
+	printf_s("Before GCM_AES_AuthenticateAndDecrypt:\n");
+	DumpNetworkUInt16((uint16_t *)p1, sizeof(FSP_NormalPacketHeader) / 2);
+#endif
+	uint32_t seqNo = be32toh(p1->sequenceNo);
+	register bool r;
+	// CRC64
+	if(contextOfICC.keyLife == 0)
+	{
+#ifdef TRACE_PACKET
+		printf_s("\nPrecomputed ICC: ");
+		DumpNetworkUInt16((uint16_t *) & contextOfICC.curr.precomputedICC[1], sizeof(uint64_t) / 2);
+#endif
+		// well, well, send is not the same as receive...
+		p1->integrity.code = contextOfICC.curr.precomputedICC[1];
+		r = (tag[0] == CalculateCRC64(0, (uint8_t *)p1, sizeof(FSP_NormalPacketHeader)));
+	}
+	else if(int32_t(seqNo - contextOfICC.firstRecvSNewKey) < 0 && contextOfICC.savedCRC)
+	{
+#ifdef TRACE_PACKET
+		printf_s("\nPrecomputed ICC: ");
+		DumpNetworkUInt16((uint16_t *) & contextOfICC.prev.precomputedICC[1], sizeof(uint64_t) / 2);
+#endif
+		// well, well, send is not the same as receive...
+		p1->integrity.code = contextOfICC.prev.precomputedICC[1];
+		r = (tag[0] == CalculateCRC64(0, (uint8_t *)p1, sizeof(FSP_NormalPacketHeader)));
+	}
+	else
+	{
+		GCM_AES_CTX *pCtx = int32_t(seqNo - contextOfICC.firstRecvSNewKey) < 0
+			? & contextOfICC.prev.gcm_aes
+			: & contextOfICC.curr.gcm_aes;
+		uint32_t byteA = be16toh(p1->hs.hsp);
+		if(byteA < sizeof(FSP_NormalPacketHeader) || byteA > MAX_LLS_BLOCK_SIZE || (byteA & (sizeof(uint64_t) - 1)) != 0)
+			return false;
+
+		GCM_AES_XorSalt(pCtx, salt);
+		p1->integrity.id.source = fidPair.peer;
+		p1->integrity.id.peer = fidPair.source;
+		// CRC64 is the initial integrity check algorithm
+		r = (GCM_AES_AuthenticateAndDecrypt(pCtx, *(uint64_t *)p1
+			, (const uint8_t *)p1 + byteA, ctLen
+			, (const uint64_t *)p1 + 1, byteA - sizeof(uint64_t)
+			, (const uint8_t *)tag, FSP_TAG_SIZE
+			, (uint64_t *)p1 + byteA / sizeof(uint64_t))
+			== 0);
+		GCM_AES_XorSalt(pCtx, salt);
+	}
+	p1->integrity.code = tag[0];
+	if(! r)
+		return false;
+
+	ChangeRemoteValidatedIP();
+	return true;
+}
+
 
 
 /**
@@ -233,9 +384,9 @@ void LOCALAPI CSocketItemEx::SetIntegrityCheckCode(FSP_NormalPacketHeader *p1, i
 	CONNECT_REQUEST		payload buffer	/ temporary: initiator may retransmit it actively/stateless for responder
 	ACK_CONNECT_REQ		separate payload/ temporary: responder may retransmit it passively/transient for initiator
 	RESET				temporary		/ temporary: one-shot only
-	PERSIST				separate payload/ separate payload: fixed and optional headers regenerated on each heartbeat
+	PERSIST				separate payload/ separate payload: fixed header regenerated on retransmission
 	COMMIT				separate payload/ separate payload buffer: space reserved for fixed and optional headers
-	PURE_DATA			separate payload/ separate payload: without any optional header, fixed header regenerate whenever retransmit
+	PURE_DATA			separate payload/ separate payload: fixed header regenerated on retransmission
 	KEEP_ALIVE			temporary		/ temporary: KEEP_ALIVE is always generate on fly
 	ACK_FLUSH			temporary		/ temporary: ACK_FLUSH is always generate on fly
 	RESUME				payload buffer	/ payload buffer: initiator of RESUME operation may retransmit it actively
@@ -250,7 +401,7 @@ void LOCALAPI CSocketItemEx::SetIntegrityCheckCode(FSP_NormalPacketHeader *p1, i
 //  The IP address of the near end may change dynamically
 bool CSocketItemEx::EmitStart()
 {
-	ControlBlock::PFSP_SocketBuf skb = pControlBlock->GetFirstBufferedSend();
+	ControlBlock::PFSP_SocketBuf skb = pControlBlock->GetSendQueueHead();
 	void  *payload = (FSP_NormalPacketHeader *)this->GetSendPtr(skb);
 	if(payload == NULL)
 	{
@@ -265,10 +416,10 @@ bool CSocketItemEx::EmitStart()
 	{
 	case ACK_CONNECT_REQ:
 		pControlBlock->SetSequenceFlags(pHdr);
-		pHdr->integrity.code = htonll(tRecentSend);
+		pHdr->integrity.code = htobe64(tRecentSend);
 
-		CLowerInterface::Singleton()->EnumEffectiveAddresses(pControlBlock->u.connectParams.allowedPrefixes);
-		memcpy((BYTE *)payload, pControlBlock->u.connectParams.allowedPrefixes, sizeof(UINT64) * MAX_PHY_INTERFACES);
+		CLowerInterface::Singleton()->EnumEffectiveAddresses(pControlBlock->connectParams.allowedPrefixes);
+		memcpy((BYTE *)payload, pControlBlock->connectParams.allowedPrefixes, sizeof(uint64_t) * MAX_PHY_INTERFACES);
 
 		pHdr->hs.Set<FSP_AckConnectRequest, ACK_CONNECT_REQ>();
 		//
@@ -277,12 +428,12 @@ bool CSocketItemEx::EmitStart()
 	case PERSIST:	// PERSIST is an in-band control packet with optional payload that confirms a connection
 		if(! skb->GetFlag<TO_BE_CONTINUED>())	// which mean it has not been chained with sending
 			skb->SetFlag<IS_COMPLETED>();
-		if(InState(COMMITTING))
+		if(InState(COMMITTING) || InState(COMMITTING2))
 			skb->opCode = COMMIT;
 	case RESUME:	// RESUME is an in-band control packet that try re-established a broken/paused connection
 	case COMMIT:	// COMMIT is always in the queue
 	case MULTIPLY:
-		result = EmitWithICC(skb, pControlBlock->GetSendWindowFirstSN());
+		result = EmitWithICC(skb, pControlBlock->sendWindowFirstSN);
 		break;
 	// Only possible for retransmission
 	case INIT_CONNECT:
@@ -314,11 +465,28 @@ bool CSocketItemEx::EmitStart()
 //  The IP address of the near end may change dynamically
 bool LOCALAPI CSocketItemEx::EmitWithICC(ControlBlock::PFSP_SocketBuf skb, ControlBlock::seq_t seq)
 {
+#ifdef _DEBUG
+	if(skb->opCode == INIT_CONNECT || skb->opCode == ACK_INIT_CONNECT || skb->opCode == CONNECT_REQUEST || skb->opCode == ACK_CONNECT_REQ)
+	{
+		printf_s("Assertion failed! %s (opcode: %d) has no ICC field\n", opCodeStrings[skb->opCode], skb->opCode);
+		return false;
+	}
+#endif
 	// UNRESOLVED! retransmission consume key life? of course?
-	if(--keyLife <= 0)
+	if(contextOfICC.keyLife == 1)
 	{
 		TRACE_HERE("Session key run out of life");
 		return false;
+	}
+
+	//
+	if(contextOfICC.keyLife > 0)
+	{
+		contextOfICC.keyLife--;
+	}
+	else if(_InterlockedCompareExchange8(& pControlBlock->newKeyPending, 0, 1) != 0)
+	{
+		// but only in some limit state may a new key installed!
 	}
 
 	void  *payload = (FSP_NormalPacketHeader *)this->GetSendPtr(skb);
@@ -347,73 +515,14 @@ bool LOCALAPI CSocketItemEx::EmitWithICC(ControlBlock::PFSP_SocketBuf skb, Contr
 	pControlBlock->SetSequenceFlags(pHdr, skb, seq);
 	pHdr->hs.opCode = skb->opCode;
 	pHdr->hs.version = THIS_FSP_VERSION;
-	pHdr->hs.hsp = htons(sizeof(FSP_NormalPacketHeader));
-	SetIntegrityCheckCode(pHdr, skb->len);
+	pHdr->hs.hsp = htobe16(sizeof(FSP_NormalPacketHeader));
+	SetIntegrityCheckCode(pHdr, (BYTE *)payload, skb->len);
 	if (skb->len > 0)
 		result = SendPacket(2, ScatteredSendBuffers(pHdr, sizeof(FSP_NormalPacketHeader), payload, skb->len));
 	else
 		result = SendPacket(1, ScatteredSendBuffers(pHdr, sizeof(FSP_NormalPacketHeader)));
 
 	return (result > 0);
-}
-
-// Given
-//	FSP_NormalPacketHeader *	The pointer to the fixed header
-//	int32_t						The size of the ciphertext
-// Return
-//	true if the full packet passed authentication and the the payload successfully decrypted
-// Remark
-//	Designed side-effect for mobility support: automatically refresh the corresponding address list...
-bool CSocketItemEx::ValidateICC(FSP_NormalPacketHeader *p1, int32_t ctLen)
-{
-	ALIGN(MAC_ALIGNMENT) BYTE tag[OCB_TAG_LEN];
-	int32_t aadLen = ntohs(p1->hs.hsp) - FSP_MAC_IV_SIZE;
-
-	if (aadLen > sizeof(padded) || aadLen <= 0)
-		return false;
-	
-	BYTE *payload = (BYTE *) & p1->integrity.id + aadLen;
-	int nPadded = 0;
-	BYTE *ct = NULL;
-
-	*(UINT64 *)tag = p1->integrity.code;
-	p1->integrity.id.source = fidPair.peer;
-	p1->integrity.id.peer = fidPair.source;
-	memcpy_s(padded, sizeof(padded), (BYTE *) & p1->integrity.id, aadLen);
-	if(aadLen % MAC_ALIGNMENT > 0)
-	{
-		nPadded = MAC_ALIGNMENT - aadLen % MAC_ALIGNMENT;
-		memset(padded + aadLen, 0, nPadded);
-	}
-	if(ctLen > 0)
-	{
-		ct = padded + aadLen + nPadded;
-		if(memcpy_s(ct, sizeof(padded) - aadLen - nPadded, payload, ctLen) != 0)
-			return false;
-	}
-
-	// significant nonce bits are (p1->sequenceNo, p1->expectedSN) of 8 bytes
-	memset(nonce, 0, sizeof(nonce));
-	memcpy(nonce + sizeof(nonce) - (sizeof(p1->sequenceNo) + sizeof(p1->expectedSN))
-		, & p1->sequenceNo
-		, sizeof(p1->sequenceNo) + sizeof(p1->expectedSN));
-
-	if(ae_decrypt(& mac_ctx, nonce, ct, ctLen, padded, aadLen, xcrypted, tag, AE_FINALIZE) == AE_INVALID)
-		return false;
-	if(ctLen > 0)
-		memcpy(payload, xcrypted, ctLen);
-
-	// TODO: automatically register remote address as the favorite contact address
-	// iff the integrity check code has passed the validation
-	//if(addrFrom.si_family == AF_INET)
-	//{
-	//}
-	//else if(addrFrom.si_family == AF_INET6)
-	//{
-	//}
-	//addrFrom.si_family = 0;	// AF_UNSPEC;	// as the flag
-	sockAddrTo[0] = sockAddrTo[MAX_PHY_INTERFACES];
-	return true;
 }
 
 
@@ -429,7 +538,6 @@ bool LOCALAPI CSocketItemEx::HandleMobileParam(PFSP_HeaderSignature optHdr)
 
 
 
-
 // Emit packet in the send queue, by default transmission of new packets takes precedence
 // To make life easier assume it has gain unique access to the LLS socket
 // See also HandleEmitQ, HandleFullICC
@@ -437,8 +545,7 @@ bool LOCALAPI CSocketItemEx::HandleMobileParam(PFSP_HeaderSignature optHdr)
 // To be checked: atomicity of sendWindowFirstSN and sendWindowHeadPos...
 void ControlBlock::EmitQ(CSocketItem *context)
 {
-	while (int(sendWindowNextSN - sendBufferNextSN) < 0
-		&& CheckSendWindowLimit( ((CSocketItemEx *)context)->GetCongestWindow()) )
+	while (int(sendWindowNextSN - sendBufferNextSN) < 0 && CheckSendWindowLimit())
 	{
 		register int d = int(sendWindowNextSN - sendWindowFirstSN);
 		if (d < 0)
@@ -472,35 +579,4 @@ void ControlBlock::EmitQ(CSocketItem *context)
 		if (sendWindowNextSN++ == sendWindowFirstSN) // note that the side-effect is a requirement
 			((CSocketItemEx *)context)->SetEarliestSendTime();
 	}
-}
-
-
-
-//
-ControlBlock::PFSP_SocketBuf ControlBlock::PeekAnteCommit() const
-{
-	register seq_t seq = sendWindowNextSN;
-	register int d = int(seq - sendWindowFirstSN);
-	register PFSP_SocketBuf skb;
-	if (d < 0)
-		return NULL;
-
-	while (int(seq - sendBufferNextSN) < 0)
-	{
-		d += sendWindowHeadPos;
-		//
-		skb = HeadSend() + (d - sendBufferBlockN >= 0 ? d - sendBufferBlockN : d);
-		if(skb->opCode == COMMIT)
-		{
-			if(seq + 1 - sendBufferNextSN >= 0)
-				return NULL;
-			d++;
-			return HeadSend() + (d - sendBufferBlockN >= 0 ? d - sendBufferBlockN : d);
-		}
-
-		seq++;
-		d = int(seq - sendWindowFirstSN);
-	}
-	//
-	return NULL;
 }

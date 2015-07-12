@@ -28,17 +28,21 @@
     POSSIBILITY OF SUCH DAMAGE.
  */
 
+#define _CRT_RAND_S
+#include <stdlib.h>
+
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+
 #include <stdio.h>
 #include <time.h>
 
 #include "../FSP.h"
 #include "../FSP_Impl.h"
-#include "ae.h"
 
 #define READY_FOR_USE 0x0101
-#if VMAC_ARCH_BIG_ENDIAN
+
+#if ARCH_BIG_ENDIAN
 #define NOT_READY_USE 0x0100
 #else
 #define NOT_READY_USE 0x0001
@@ -47,8 +51,11 @@
 // Return the number of microseconds elapsed since Jan 1, 1970 (unix epoch time)
 timestamp_t NowUTC();	// it seems that a global property 'Now' is not as clear as this function format
 
+
 // random generatator is somehow dependent on implementation. hardware prefered.
-void		rand_w32(uint32_t *p, int n);
+// might be optimized by loop unrolling
+inline void	 rand_w32(uint32_t *p, int n) { for (register int i = 0; i < min(n, 32); i++) { rand_s(p + i); } }
+
 
 /**
 * It requires Advanced IPv6 API support to get the application layer thread ID from the IP packet control structure
@@ -72,16 +79,16 @@ struct CtrlMsgHdr
 /**
  * Windows 8/Server 2012, with support of Visual Studio 2012, provide native support of htonll and ntohll
  */
-inline UINT64 htonll(UINT64 u) 
+inline uint64_t htonll(uint64_t u) 
 {
-	register UINT64 L = (UINT64)htonl(*(UINT32 *)&u) << 32;
-	return L | htonl(*((UINT32 *)&u + 1));
+	register uint64_t L = (uint64_t)htonl(*(uint32_t *)&u) << 32;
+	return L | htonl(*((uint32_t *)&u + 1));
 }
 
-inline UINT64 ntohll(UINT64 h)
+inline uint64_t ntohll(uint64_t h)
 {
-	register UINT64 L = (UINT64)ntohl(*(UINT32 *)&h) << 32;
-	return L | ntohl(*((UINT32 *)&h + 1));
+	register uint64_t L = (uint64_t)ntohl(*(uint32_t *)&h) << 32;
+	return L | ntohl(*((uint32_t *)&h + 1));
 }
 /*
  *
@@ -103,17 +110,6 @@ inline UINT64 ntohll(UINT64 h)
 #define	MAX_BUFFER_BLOCKS	64	// 65~66KiB, 64bit CPU consumes more // Implementation shall override this
 
 
-// In Microsoft C++, the result of a modulus expression is always the same as the sign of the first operand.
-// Provide a 'safe' code to implement a double-in-single-out circular queue...
-struct RetransmitBacklog
-{
-	ControlBlock::seq_t q[MAX_RETRANSMISSION];
-	ControlBlock::seq_t & operator[](int i)
-	{
-		i %= MAX_RETRANSMISSION;
-		return q[i < 0 ? MAX_RETRANSMISSION + i : i];
-	}
-};
 
 
 class CommandNewSessionSrv: CommandToLLS
@@ -204,9 +200,41 @@ struct ScatteredSendBuffers
 
 
 
+
+// Context management of 
+struct ICC_Context
+{
+#ifndef NDEBUG
+#define MAC_CTX_PROTECT_SIGN	0xA5A5C3C3A5C3A5C3ULL
+	ALIGN(MAC_ALIGNMENT)
+	uint64_t	_mac_ctx_protect_prolog[2];
+#endif
+	union
+	{
+		uint64_t	precomputedICC[2];	// [0] is for output/send, [1] is for input/receive
+		ALIGN(MAC_ALIGNMENT)
+		GCM_AES_CTX	gcm_aes;
+	} curr, prev;
+
+#ifndef NDEBUG
+	uint64_t	_mac_ctx_protect_epilog[2];
+#endif
+	// Only life of current ICC key is cared about 
+	int32_t		keyLife;
+	// Previous key is applied for CRC only
+	bool		savedCRC;
+	// only when there is no packet left applied with previous key may current key changed  
+	// the sequence number of the packet to send and expected which utilized last key
+	ControlBlock::seq_t	firstSendSNewKey;
+	ControlBlock::seq_t	firstRecvSNewKey;
+};
+
+
 // Review it carefully!Only Interlock* operation may be applied on any volatile member variable
 class CSocketItemEx: public CSocketItem
 {
+	friend class CLowerInterface;
+	friend class CSocketSrvTLB;
 	PktBufferBlock * volatile headPacket;
 	PktBufferBlock * volatile tailPacket;
 
@@ -231,44 +259,18 @@ protected:
 
 	FSP_Session_State lowState;
 
-	//
-	ALIGN(4)
-	volatile int32_t	keyLife;
-	//
 	CSocketItemEx * volatile next;
 	CSocketItemEx * volatile prevSame;
-	//
-	RetransmitBacklog retransBackLog;
-	int			retransHead;
-	int			retransTail;
 
-	UINT32		tRoundTrip_us;	// round trip time evaluated in microseconds
-	UINT32		tKeepAlive_ms;	// keep-alive time-out limit in milliseconds
+	uint32_t	tRoundTrip_us;	// round trip time evaluated in microseconds
+	uint32_t	tKeepAlive_ms;	// keep-alive time-out limit in milliseconds
 	HANDLE		timer;
 	timestamp_t	tSessionBegin;
 	timestamp_t tRecentSend;
 	timestamp_t	tLastRecv;
 	timestamp_t tEarliestSend;
-	//
-	struct CubicRate
-	{
-		uint32_t	ssthresh;
-		uint32_t	cwnd;
-		uint32_t	cwndFraction;
-		uint32_t	cwndMax;
-		uint32_t	cwndMin;
-		uint32_t	originPoint;
-		double		Wmax;
-		double		K;
-		uint64_t	dMin;
-		timestamp_t T0;
-		//
-		inline void CheckTimeout(timestamp_t);
-		inline void OnCongested();
-		inline void Reset();
-		inline float Update(timestamp_t);
-		//
-	}	congestCtrl;
+
+	uint32_t	tLastAck;
 	//
 	struct
 	{
@@ -276,21 +278,7 @@ protected:
 		timestamp_t tKeepAlive;
 	}	clockCheckPoint;
 
-#ifndef NDEBUG
-#define MAC_CTX_PROTECT_SIGN	0xA5A5C3C3A5C3A5C3ULL
-	ALIGN(MAC_ALIGNMENT)
-	uint64_t	_mac_ctx_protect_prolog[2];
-#endif
-	ALIGN(MAC_ALIGNMENT)
-	ae_ctx		mac_ctx;
-	// prepare vmac memory alignment and initialize the padding
-	ALIGN(MAC_ALIGNMENT) unsigned char padded[sizeof(FSP_NormalPacketHeader) + MAX_BLOCK_SIZE + MAC_ALIGNMENT];
-	ALIGN(MAC_ALIGNMENT) unsigned char nonce[FSP_MAC_IV_SIZE];
-	ALIGN(MAC_ALIGNMENT) unsigned char xcrypted[MAX_BLOCK_SIZE];	// decrypted or ciphered, it depends
-
-#ifndef NDEBUG
-	uint64_t	_mac_ctx_protect_epilog[2];
-#endif
+	ICC_Context		contextOfICC;
 
 	void SetMutexFree() { _InterlockedExchange8(& mutex, 0); }
 
@@ -309,19 +297,6 @@ protected:
 	bool InState(FSP_Session_State s) { return lowState == s; }
 	bool InStates(int n, ...);
 
-	void LOCALAPI InstallSessionKey()
-	{
-#ifndef NDEBUG
-		_mac_ctx_protect_prolog[0]
-			= _mac_ctx_protect_prolog[1]
-			= _mac_ctx_protect_epilog[0]
-			= _mac_ctx_protect_epilog[1]
-			= MAC_CTX_PROTECT_SIGN;
-#endif
-		// nonce length is fixed 16 bytes while tag length is fixed 8 bytes
-		ae_init(& mac_ctx, pControlBlock->u.sessionKey, FSP_SESSION_KEY_LEN, FSP_MAC_IV_SIZE, FSP_TAG_SIZE);
-	}
-
 	bool LOCALAPI HandleMobileParam(PFSP_HeaderSignature);
 
 	PktBufferBlock *PushPacketBuffer(PktBufferBlock *);
@@ -339,10 +314,15 @@ protected:
 	void TimeOut();
 
 	static VOID NTAPI TimeOut(PVOID c, BOOLEAN) { ((CSocketItemEx *)c)->TimeOut(); } 
+
+	// any packet with full-weight integrity-check-code except aforementioned
+	friend DWORD WINAPI HandleFullICC(LPVOID p);
+
 public:
 	//
 	bool MapControlBlock(const CommandNewSessionSrv &);
 	void InitAssociation();
+
 	bool IsInUse() const { return inUse != 0; }
 	void SetReady() { _InterlockedExchange8(& isReady, 1); }
 	// It is assumed that the socket is set ready only after it is put into use
@@ -350,8 +330,11 @@ public:
 	SHORT SetNotReadyUse() { return _InterlockedExchange16((SHORT *) & inUse, NOT_READY_USE); }
 	bool TestAndLockReady() { return _InterlockedCompareExchange16((SHORT *) & inUse, NOT_READY_USE, READY_FOR_USE) == READY_FOR_USE; }
 	bool TestAndWaitReady();
+
 	void SetEarliestSendTime() { tEarliestSend = tRecentSend; }
-	int32_t GetCongestWindow() const { return congestCtrl.cwnd; }
+
+	void InstallEphemeralKey();
+	void InstallSessionKey();
 
 	bool CheckMemoryBorder(ControlBlock::PFSP_SocketBuf p)
 	{
@@ -384,9 +367,9 @@ public:
 	void SignalEvent() { ::SetEvent(hEvent); }
 	void SignalReturned() { _InterlockedExchange8((char *)pControlBlock->notices, FSP_NotifyAccepting); SignalEvent(); }
 	//
-	int LOCALAPI RespondSNACK(ControlBlock::seq_t, const FSP_SelectiveNACK::GapDescriptor *, int);
-	int LOCALAPI RespondSNACK(ControlBlock::seq_t, const PFSP_HeaderSignature);
-	int LOCALAPI GenerateSNACK(BYTE *, ControlBlock::seq_t &);
+	int LOCALAPI RespondToSNACK(ControlBlock::seq_t, const FSP_SelectiveNACK::GapDescriptor *, int);
+	int LOCALAPI RespondToSNACK(ControlBlock::seq_t, const PFSP_HeaderSignature);
+	int32_t LOCALAPI GenerateSNACK(FSP_PreparedKEEP_ALIVE &, ControlBlock::seq_t &);
 	//
 	void InitiateConnect();
 	void CloseSocket();
@@ -398,6 +381,7 @@ public:
 	void OnResurrect();
 	void HandleMemoryCorruption() {	Extinguish(); }
 	void LOCALAPI AffirmConnect(const SConnectParam &, ALFID_T);
+	void LOCALAPI ReplaceSendQueueHead(FSPOperationCode);
 
 	bool IsValidSequence(ControlBlock::seq_t seq1) { return pControlBlock->IsValidSequence(seq1); }
 
@@ -424,10 +408,25 @@ public:
 		return SendPacket(1, ScatteredSendBuffers(&hdr, sizeof(hdr)));
 	}
 
-	void LOCALAPI SetIntegrityCheckCode(FSP_NormalPacketHeader *, int32_t = 0);
-	// On got valid ICC automatically register source IP address as the favorite returning IP address
-	bool LOCALAPI ValidateICC(FSP_NormalPacketHeader *, int32_t = 0);
+	// Given the fixed header, the content (plaintext), the length of the context and the xor-value of salt
+	void LOCALAPI SetIntegrityCheckCode(FSP_NormalPacketHeader *, void * = NULL, int32_t = 0, uint32_t = 0);
+	// Solid input,  the payload, if any, is copied later
+	bool LOCALAPI ValidateICC(FSP_NormalPacketHeader *, int32_t = 0, uint32_t = 0);
 	bool ValidateICC() { return ValidateICC(headPacket->GetHeaderFSP(), headPacket->lenData); }
+	//	On got valid ICC automatically register source IP address as the favorite returning IP address
+	void ChangeRemoteValidatedIP()
+	{
+		// TODO: automatically register remote address as the favorite contact address
+		// iff the integrity check code has passed the validation
+		//if(addrFrom.si_family == AF_INET)
+		//{
+		//}
+		//else if(addrFrom.si_family == AF_INET6)
+		//{
+		//}
+		//addrFrom.si_family = 0;	// AF_UNSPEC;	// as the flag
+		sockAddrTo[0] = sockAddrTo[MAX_PHY_INTERFACES];
+	}
 
 	void EmitQ() { pControlBlock->EmitQ(this); }
 	void PeerCommit();
@@ -446,16 +445,13 @@ public:
 		return printf_s("\tRound Trip Time = %uus, Keep-alive period = %ums\n"
 			"\tTime elapsed since earlist sent = %lluus\n"
 			"\tNext relative keep-alive shot time=%lluus\n"
-			"\tCongest origin-point time = %llx Congest Window = %d\n"
 			, tRoundTrip_us
 			, tKeepAlive_ms
 			, t1 - tEarliestSend
-			, clockCheckPoint.tKeepAlive - t1
-			, congestCtrl.T0
-			, congestCtrl.cwnd);
+			, clockCheckPoint.tKeepAlive - t1);
 	}
 #else
-	int DumpTimerInfo(timestamp_t) const {}
+	int DumpTimerInfo(timestamp_t) const { return 0; }
 #endif
 
 	// Command of ULA
@@ -487,11 +483,6 @@ public:
 	{
 		return context->EmitWithICC(skb, seq1);
 	}
-
-	// any packet with full-weight integrity-check-code except aforementioned
-	friend DWORD WINAPI HandleFullICC(LPVOID p);
-	friend class CSocketSrvTLB;
-	friend class CLowerInterface;
 };
 
 #include <poppack.h>
@@ -522,7 +513,7 @@ public:
 
 struct _CookieMaterial
 {
-	UINT32	salt;
+	uint32_t	salt;
 	ALFID_T	idALF;
 	ALFID_T	idListener;
 };
@@ -554,13 +545,13 @@ private:
 	// remote-end address and near-end address
 	SOCKADDR_INET		addrFrom;
 	CtrlMsgHdr			nearInfo;
-	WSAMSG				sinkInfo;	// descriptor of what is received
+	WSAMSG				mesgInfo;	// descriptor of what is received
 
 	template<typename THdr> THdr * FSP_OperationHeader() { return (THdr *) & pktBuf->hdr; }
 
 	ALFID_T			GetLocalFiberID() const { return nearInfo.u.idALF; }
 	ALFID_T			SetLocalFiberID(ALFID_T);
-	ALFID_T			GetRemoteFiberID() const  { return SOCKADDR_ALFID(sinkInfo.name); }
+	ALFID_T			GetRemoteFiberID() const  { return SOCKADDR_ALFID(mesgInfo.name); }
 
 	// For FSP over IPv6 raw-socket, preconfigure IPv6 interfaces with ALFID pool
 	inline void SetLocalApplicationLayerFiberID(ALFID_T);
@@ -588,7 +579,7 @@ protected:
 	void LOCALAPI OnGetResetSignal();
 
 	// define in mobile.cpp
-	int LOCALAPI EnumEffectiveAddresses(UINT64 *);
+	int LOCALAPI EnumEffectiveAddresses(uint64_t *);
 	int	AcceptAndProcess();
 
 	friend class CSocketItemEx;
@@ -602,7 +593,7 @@ public:
 	ALFID_T LOCALAPI RandALFID();
 	int LOCALAPI SendBack(char *, int);
 	// It might be necessary to send reset BEFORE a connection context is established
-	void LOCALAPI SendPrematureReset(UINT32 = 0, CSocketItemEx * = NULL);
+	void LOCALAPI SendPrematureReset(uint32_t = 0, CSocketItemEx * = NULL);
 
 	inline void LearnAddresses();
 	inline void PoolingALFIDs();
@@ -630,14 +621,17 @@ DWORD WINAPI HandleFullICC(LPVOID);
 // defined in socket.cpp
 void LOCALAPI DumpCMsgHdr(CtrlMsgHdr &);
 void LOCALAPI DumpHexical(BYTE *, int);
-void LOCALAPI DumpNetworkUInt16(UINT16 *, int);
+void LOCALAPI DumpNetworkUInt16(uint16_t *, int);
 
 
 // defined in mobile.cpp
-UINT64 LOCALAPI CalculateCookie(BYTE *, int, timestamp_t);
+uint64_t LOCALAPI CalculateCookie(BYTE *, int, timestamp_t);
 
 // defined in CubicRoot.c
 extern "C" double CubicRoot(double);
+
+// defined in CRC64.c
+extern "C" uint64_t CalculateCRC64(register uint64_t, register uint8_t *, size_t);
 
 // power(3, a) 	// less stringent than pow(3, a) ?
 inline double CubicPower(double a) { return a * a * a; }

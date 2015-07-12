@@ -50,6 +50,7 @@
 #endif
 
 #define MAX_FSP_SHM_SIZE		0x400000	// 4MB
+#define CRYPTO_NACL_KEYBYTES	32
 
 typedef union
 {
@@ -148,7 +149,7 @@ struct FSP_SocketParameter
 		struct
 		{
 			unsigned short	milky:		1;
-			unsigned short	encrypting:	1;
+			unsigned short	RESERVED_AE:1;	// reserved for further authenticated encryption
 			unsigned short	compressing:1;
 			unsigned short	RESERVED:	11;
 			unsigned short	eom:		1;	// end of message, a run-time flag
@@ -203,6 +204,22 @@ FSPHANDLE FSPAPI Connect2(const char *, PFSP_Context);
 //	The handle returned might be useless, if CallbackConnected report error laterly
 DllSpec
 FSPHANDLE FSPAPI ConnectMU(FSPHANDLE, PFSP_Context);
+
+
+
+// given
+//	the handle of the FSP socket to install the session key
+//	the buffer of the key
+//	the length of the key in bytes
+//	the life of the key in terms of number of packets allowed to send or resend
+// return
+//	0 if no error
+//	-EDOM if parameter domain error
+//	-EFAULT if unexpected exception
+//	-EIO if I/O interface error between the message layer and the packet layer
+DllSpec
+int FSPAPI InstallAuthEncKey(FSPHANDLE, uint8_t *, int, int32_t);
+
 
 
 // given
@@ -278,7 +295,6 @@ int FSPAPI RecvInline(FSPHANDLE, CallbackPeeked);
 // Return
 //	0 if no immediate error, negative if error
 // Remark
-//	ULA MUST call ReadFrom to accept data if the socket is compressing and/or encrypting
 //	NotifyOrReturn is called when receive buffer is full OR end of message encountered
 //	NotifyOrReturn might report error later even if ReadFrom itself return no error
 //	Return value passed in NotifyOrReturn is number of octets really received
@@ -344,6 +360,60 @@ int FSPControl(FSPHANDLE hFSPSocket, unsigned controlCode, ulong_ptr value);
 //DllSpec
 //bool EOMReceived(FSPHANDLE);
 
+
+
+// Given
+//	pointer to the buffer of exported public key
+//	pointer to the buffer of exported private key
+// Do
+//	Generate the public-private key pair
+// Return
+//	0 (always succeed in presumed constant time)
+DllSpec
+int FSPAPI CryptoNaClKeyPair(unsigned char *bufPublicKey, unsigned char *bufPrivateKey);
+
+
+// Given
+//	pointer to the buffer of the shared secret, crypto_core_hsalsa20_tweet_KEYBYTES = 32 bytes
+//	the byte string of the peer's public key
+//	the byte string of the near end's private key
+// Do
+//	Derive the shared secret
+// Return
+//	0 (always succeed in presumed constant time)
+DllSpec
+int FSPAPI CryptoNaClGetSharedSecret(unsigned char *bufSharedSecret, const unsigned char *peersPublicKey, const unsigned char *nearPrivateKey);
+
+
+
+
+// Given
+//	pointer to the buffer of the output hash, 32 bytes
+//	the input byte string to calculate the hash
+//	the length of the byte string
+// Do
+//	get the SHA512 result
+// Return
+//	0 (always succeed in presumed constant time)
+DllSpec
+int FSPAPI CryptoNaClHash(unsigned char *buf, const unsigned char *input, unsigned long long len);
+
+
+
+
+// Given
+//	pointer to the buffer of the output hash, 32 bytes
+//	the input byte string of the 32 bytes exponent
+//	the input byte string of the 32 bytes base
+// Do
+//	get the SHA256 result
+// Return
+//	0 (always succeed in presumed constant time)
+DllSpec
+int FSPAPI CryptoNaClScalarMult(unsigned char *buf, const unsigned char *exp, const unsigned char *base);
+
+DllSpec
+int FSPAPI CryptoNaClScalarMultBase(unsigned char *buf, const unsigned char *exp);
 
 #ifdef __cplusplus
 	}

@@ -1,10 +1,6 @@
 #include "targetver.h"
 
-#include "../FSP_SRV/fsp_srv.h"
-
-#include <WinSock2.h>
-#include <WS2tcpip.h>
-#include <mstcpip.h>
+#include "FSP_TestClass.h"
 
 // Headers for CppUnitTest
 #define _ALLOW_KEYWORD_MACROS
@@ -12,16 +8,10 @@
 
 using namespace Microsoft::VisualStudio::CppUnitTestFramework;
 
-#pragma comment(lib, "Ws2_32.lib")
-#pragma comment(lib, "ntdll.lib")
+// 
+void UnitTestGenerateSNACK();
+void UnitTestSendRecvWnd();
 
-
-#ifdef MAX_CONNECTION_NUM
-#undef MAX_CONNECTION_NUM
-#endif
-#define MAX_CONNECTION_NUM	256
-
-#define MAX_PHY_INTERFACES	4
 
 // for line output
 static char linebuf[200];
@@ -50,51 +40,6 @@ void UnitTestOpCodeStateNoticeNames()
 
 
 
-class CSocketItemExDbg: public CSocketItemEx
-{
-public:
-	CSocketItemExDbg()
-	{
-		// isMilky = 0;	// RespondSNACK cares it
-		hMemoryMap = NULL;
-		hEvent = NULL;
-		pControlBlock = (ControlBlock *)malloc
-			(sizeof(ControlBlock) + (sizeof(ControlBlock::FSP_SocketBuf) + MAX_BLOCK_SIZE) * 8);
-		pControlBlock->Init(MAX_BLOCK_SIZE * 2, MAX_BLOCK_SIZE * 2);
-	};
-	CSocketItemExDbg(int nSend, int nRecv)
-	{
-		// isMilky = 0;	// RespondSNACK cares it
-		hMemoryMap = NULL;
-		hEvent = NULL;
-		pControlBlock = (ControlBlock *)malloc
-			(sizeof(ControlBlock) + (sizeof(ControlBlock::FSP_SocketBuf) + MAX_BLOCK_SIZE) * (nSend + nRecv));
-		pControlBlock->Init(MAX_BLOCK_SIZE * nSend, MAX_BLOCK_SIZE * nRecv);
-	};
-	~CSocketItemExDbg()
-	{
-		free(pControlBlock);
-	}
-	//void LOCALAPI ResetVMAC()
-	//{
-	//	vhash_reset(& pControlBlock->mac_ctx);	// vmac_set_key
-	//}
-
-	ControlBlock *GetControlBlock() const { return pControlBlock; }
-	ControlBlock::PFSP_SocketBuf AllocRecvBuf(ControlBlock::seq_t seq1) { return pControlBlock->AllocRecvBuf(seq1); }
-	void InstallSessionKey(BYTE key[16])
-	{
-		memcpy(pControlBlock->u.sessionKey, key, sizeof(key));
-		CSocketItemEx::InstallSessionKey();
-	}
-	void SetPairOfFiberID(ALFID_T src, ALFID_T dst) { fidPair.source = src; fidPair.peer = dst; }
-
-	friend void UnitTestSocketInState();
-	friend void UnitTestReceiveQueue();
-	friend void UnitTestResendQueue();
-};
-
-
 // Just test stubs
 void CSocketItemEx::Connect() { }
 
@@ -112,240 +57,6 @@ int LOCALAPI CallbackReceived(void *c, void *s, int n)
 	// do nothing else
 	Assert::IsTrue(n > 0);
 	return 0;
-}
-
-
-
-/**
- * Unit Test of:
- * InquireSendBuf
- * MarkSendQueue
- * InquireRecvBuf
- * FetchReceived
- * AllocRecvBuf
- * GetSelectiveNACK
- */
-void UnitTestSendRecvWnd()
-{
-	int memsize = sizeof(ControlBlock) + (sizeof ControlBlock::FSP_SocketBuf + MAX_BLOCK_SIZE) * 8;
-	const ControlBlock::seq_t FIRST_SN = 12;
-
-	ControlBlock * pSCB = (ControlBlock *)malloc(memsize);
-	pSCB->Init((memsize - sizeof(ControlBlock))/ 2, (memsize - sizeof(ControlBlock)) / 2);
-	//pSCB->sendWindowSize = pSCB->sendBufferSize;	// shall do nothing with send buffer management
-	//^ shall set to min(sendBufferSize, remoteReceiveWindowSize);
-
-	// set the begin of the send sequence number for the test to work properly
-	// set the negotiated receive window parameter
-	pSCB->SetRecvWindowHead(FIRST_SN);
-	pSCB->SetSendWindowWithHeadReserved(FIRST_SN);
-	ControlBlock::PFSP_SocketBuf skb = pSCB->HeadSend();
-	Assert::IsNotNull(skb);
-	Assert::IsTrue(pSCB->sendBufferNextSN == FIRST_SN + 1);
-	// TODO: SCB pointer to user space pointer
-	// TODO: recalibrate pointer...
-	// FSP_AffirmToConnect & request = *(FSP_AffirmToConnect *)(*pControlBlock)[skb];
-
-	int m = MAX_BLOCK_SIZE;
-	void *inplaceBuf = pSCB->InquireSendBuf(m);
-	Assert::IsNotNull(inplaceBuf);	// it might fail if memsize is too small
-	Assert::IsTrue(m > 0);			// it might fail if memsize is too small
-	if(m < MAX_BLOCK_SIZE * 2)
-		return;
-
-	m = MAX_BLOCK_SIZE * 2 - 13;	// deliberate take use of less than maximum capacity
-	memset(inplaceBuf, 'F', m);
-	int k = pSCB->MarkSendQueue(inplaceBuf, m, true);
-	Assert::IsFalse(k > 0);
-	k = pSCB->MarkSendQueue(inplaceBuf, m, false);
-	Assert::IsTrue(k > 0);
-	Assert::IsTrue(pSCB->sendBufferNextSN == FIRST_SN + 3);
-
-	ControlBlock::PFSP_SocketBuf skb3 = pSCB->HeadSend() + 2;
-	skb->SetFlag<IS_ACKNOWLEDGED>();
-	skb3->SetFlag<IS_ACKNOWLEDGED>();
-
-	// emulate received the first data packet
-	ControlBlock::PFSP_SocketBuf skb4 = pSCB->AllocRecvBuf(FIRST_SN);
-	Assert::IsNotNull(skb4);
-	Assert::IsTrue(pSCB->recvWindowFirstSN == FIRST_SN);
-	Assert::IsTrue(pSCB->recvWindowNextSN == FIRST_SN + 1);
-	// TODO: SCB buffer pointer to user space pointer
-	skb4->len = MAX_BLOCK_SIZE - 13;
-	skb4->SetFlag<TO_BE_CONTINUED>(false);
-	skb4->SetFlag<IS_FULFILLED>();
-
-	int m2;	// onReturn it should == skb4->len, i.e. MAX_BLOCK_SIZE - 13
-	bool toBeContinued;
-	void *inplaceBuf2 = pSCB->InquireRecvBuf(m2, toBeContinued);
-	Assert::IsNotNull(inplaceBuf2);
-	Assert::IsTrue(m2 == MAX_BLOCK_SIZE - 13);
-
-	BYTE * stBuf = (BYTE *)_alloca(memsize >> 2);
-	memset(stBuf, 'S', memsize >> 2);
-	//int m3 = pSCB->FetchReceived(stBuf, CallbackReceived);	// outdated
-	//Assert::IsTrue(m3 <= 0);
-
-	ControlBlock::PFSP_SocketBuf skb5 = pSCB->AllocRecvBuf(FIRST_SN);
-	Assert::IsNull(skb5);	// out of order
-	//
-	skb5 = pSCB->AllocRecvBuf(FIRST_SN + 6);
-	Assert::IsTrue(skb5 != skb4);	// it depends that IsNull(skb5)
-
-	// emulate a received message that crosses two packet
-	skb5 = pSCB->AllocRecvBuf(FIRST_SN + 1);
-	Assert::IsNotNull(skb5);
-	Assert::IsTrue(pSCB->recvWindowNextSN == FIRST_SN + 2);
-
-	skb5->len = MAX_BLOCK_SIZE;
-	skb5->SetFlag<TO_BE_CONTINUED>();
-	skb5->SetFlag<IS_FULFILLED>();
-	skb5->Lock();
-
-	skb5 = pSCB->AllocRecvBuf(FIRST_SN + 2);
-	Assert::IsNotNull(skb5);
-	Assert::IsTrue(pSCB->recvWindowNextSN == FIRST_SN + 3);
-
-	skb5->len = MAX_BLOCK_SIZE - 13;
-	skb5->SetFlag<TO_BE_CONTINUED>(false);
-	skb5->SetFlag<IS_FULFILLED>();
-	skb5->Lock();
-
-	// emulate a received-ahead packet
-	skb5 = pSCB->AllocRecvBuf(FIRST_SN + 4);
-	Assert::IsNotNull(skb5);
-	Assert::IsTrue(pSCB->recvWindowNextSN == FIRST_SN + 5);
-
-	skb5->len = MAX_BLOCK_SIZE - 13;
-	skb5->SetFlag<TO_BE_CONTINUED>(false);
-	skb5->SetFlag<IS_FULFILLED>();
-
-	// what is the content of the selective negative acknowledgement?
-	FSP_SelectiveNACK::GapDescriptor snack[4];
-	ControlBlock::seq_t seq4;
-	int m4 = pSCB->GetSelectiveNACK(seq4, snack, 4);
-	Assert::IsTrue(m4 == 1 && snack[0].dataLength == 1 && snack[0].gapWidth == 1);
-	Assert::IsTrue(seq4 == FIRST_SN + 5);
-
-	// To support ReadFrom
-	//m3 = pSCB->FetchReceived(stBuf, CallbackReceived);	// Outdated
-	//Assert::IsTrue(m3 > 0);
-
-	// Clean up
-	free(pSCB);
-}
-
-
-/**
- * Unit Test of:
- * GetSendBuf
- * PeekNextToSend
- * AllocRecvBuf
- * GetSelectiveNACK
- * RespondSNACK
- * GetNextResend
- */
-void UnitTestResendQueue()
-{
-	const ControlBlock::seq_t FIRST_SN = 12;
-	CSocketItemExDbg lowSocket;
-	int memsize = sizeof(ControlBlock) + (sizeof ControlBlock::FSP_SocketBuf + MAX_BLOCK_SIZE) * 8;
-	memset(& lowSocket, 0, sizeof(CSocketItemExDbg));
-	lowSocket.dwMemorySize = memsize;
-
-	ControlBlock * pSCB = (ControlBlock *)malloc(lowSocket.dwMemorySize);
-	lowSocket.pControlBlock = pSCB;
-
-	pSCB->Init((memsize - sizeof(ControlBlock)) / 2, (memsize - sizeof(ControlBlock)) / 2);
-
-	// set the begin of the send sequence number for the test to work properly
-	// set the negotiated receive window parameter
-	pSCB->recvWindowFirstSN = pSCB->recvWindowNextSN = FIRST_SN;
-
-	pSCB->SetSendWindowWithHeadReserved(FIRST_SN);
-	ControlBlock::PFSP_SocketBuf skb = pSCB->HeadSend();
-	skb->SetFlag<IS_COMPLETED>();
-	Assert::IsTrue(pSCB->sendBufferNextSN == FIRST_SN + 1);
-
-	skb = pSCB->GetSendBuf();
-	skb->SetFlag<IS_COMPLETED>();
-	Assert::IsTrue(pSCB->sendBufferNextSN == FIRST_SN + 2);
-
-	skb = pSCB->GetSendBuf();
-	skb->SetFlag<IS_COMPLETED>();
-	Assert::IsTrue(pSCB->sendBufferNextSN == FIRST_SN + 3);
-
-	skb = pSCB->GetSendBuf();
-	skb->SetFlag<IS_COMPLETED>();
-	Assert::IsTrue(pSCB->sendBufferNextSN == FIRST_SN + 4);
-
-	skb = pSCB->GetSendBuf();
-	Assert::IsNull(skb);	// as we knew there're only 4 packet slots 
-
-	//skb = pSCB->PeekNextToSend();
-	//Assert::IsTrue(skb == pSCB->HeadSend());
-
-	++(pSCB->sendWindowNextSN);
-	//skb = pSCB->PeekNextToSend();
-	//Assert::IsTrue(skb == pSCB->HeadSend() + 1);
-
-	++(pSCB->sendWindowNextSN);
-	//skb = pSCB->PeekNextToSend();
-	//Assert::IsTrue(skb == pSCB->HeadSend() + 2);
-
-	++(pSCB->sendWindowNextSN);
-	//skb = pSCB->PeekNextToSend();
-	//Assert::IsTrue(skb == pSCB->HeadSend() + 3);
-
-	++(pSCB->sendWindowNextSN);
-	//skb = pSCB->PeekNextToSend();
-	//Assert::IsNull(skb);
-
-	skb =  pSCB->HeadSend();
-	//skb->SetFlag<IS_ACKNOWLEDGED>();
-
-	//skb = pSCB->HeadSend() + 1;
-	//skb->SetFlag<IS_ACKNOWLEDGED>();
-
-	// emulate received the first data packet
-	ControlBlock::PFSP_SocketBuf skb5 = pSCB->AllocRecvBuf(FIRST_SN);
-	Assert::IsNotNull(skb5);
-	skb5->SetFlag<IS_FULFILLED>();
-
-	// emulate a received message that crosses two packet
-	skb5 = pSCB->AllocRecvBuf(FIRST_SN + 1);
-	Assert::IsNotNull(skb5);
-	Assert::IsTrue(pSCB->recvWindowNextSN == FIRST_SN + 2);
-
-	skb5->SetFlag<IS_FULFILLED>();
-
-	skb5 = pSCB->AllocRecvBuf(FIRST_SN + 3);
-	Assert::IsNotNull(skb5);
-	Assert::IsTrue(pSCB->recvWindowNextSN == FIRST_SN + 4);
-
-	skb5->SetFlag<IS_FULFILLED>();
-
-	skb5 = pSCB->AllocRecvBuf(FIRST_SN + 4);
-	Assert::IsNull(skb5);	// No more space in the receive buffer
-
-	// what is the content of the selective negative acknowledgement?
-	FSP_SelectiveNACK::GapDescriptor snack[4];
-	ControlBlock::seq_t seq4;
-	int m4 = pSCB->GetSelectiveNACK(seq4, snack, 4);
-	Assert::IsTrue(m4 == 1 && snack[0].dataLength == 1 && snack[0].gapWidth == 1);
-	Assert::IsTrue(seq4 == FIRST_SN + 4);
-
-	lowSocket.RespondSNACK(seq4, snack, 1);
-	Assert::IsTrue(skb->flags == 0);	// GetFlag<IS_ACKNOWLEDGED>()
-	Assert::IsTrue((skb + 1)->flags == 0);	// GetFlag<IS_ACKNOWLEDGED>()
-	Assert::IsTrue((skb + 3)->GetFlag<IS_ACKNOWLEDGED>());
-	Assert::IsTrue(lowSocket.pControlBlock->sendWindowFirstSN == FIRST_SN + 2);
-
-	// TODO: Test round-robin, by slide one...
-	// TODO: change resend window size, test receive max expected SN
-	// TODO: change send window initial size, slow-start? [slide-window based flow control/rate-control?]
-
-	// free(pSCB);	// clean up work done by the destroyer of CSocketItemExDbg
 }
 
 
@@ -435,9 +146,9 @@ void UnitTestCommandQuasiQ()
 	sprintf_s(linebuf, sizeof(linebuf), "Added sequence number: %u\n", n);
 	Logger::WriteMessage(linebuf);
 	//
-	b = cqq.SetReturned((UINT32)n, (FSPIPC::SRVNotice)2);
+	b = cqq.SetReturned((uint32_t)n, (FSPIPC::SRVNotice)2);
 	Assert::IsTrue(b);
-	b = cqq.Fetch((UINT32)n, & r);
+	b = cqq.Fetch((uint32_t)n, & r);
 	Assert::IsTrue(b);
 	Assert::AreEqual(2, (int)r);
 
@@ -471,10 +182,10 @@ void UnitTestCommandQuasiQ()
 	sprintf_s(linebuf, sizeof(linebuf), "Added sequence number: %u\n", n);
 	Logger::WriteMessage(linebuf);
 	//
-	b = cqq.SetReturned((UINT32)n, (FSPIPC::SRVNotice)3);
+	b = cqq.SetReturned((uint32_t)n, (FSPIPC::SRVNotice)3);
 	Assert::IsTrue(b);
 
-	b = cqq.Fetch((UINT32)n, & r);
+	b = cqq.Fetch((uint32_t)n, & r);
 	Assert::IsTrue(b);
 	Assert::AreEqual(3, (int)r);
 	// TODO: test time-out, and more set/fetch value by sequence number[boundary check...]
@@ -655,48 +366,71 @@ void UnitTestCubicRoot()
 }
 
 
-#if 0	// now we make our mind to exploit VMAC
-void UnitTestGMAC()
+void UnitTestGCM_AES()
 {
-	FSP_InitiateRequest request;
-	FSP_Challenge responseZero;	// zero hint no state
-	FSP_AffirmToConnect affirmedRequest;
-	CtrlMsgHdr nearEnd;
+	BYTE samplekey[16] = { 0, 0xB1, 0xC2, 3, 4, 5, 6, 7, 8, 0xD9, 10, 11, 12, 13, 14, 15 };
+	ALIGN(MAC_ALIGNMENT) BYTE payload[80];
+	GCM_AES_CTX ctx;
+	uint64_t IV = 1;
+	BYTE tag[8];
 
-	timestamp_t t0 = GetCurrentTimeIn100Nano();
-	request.timeStamp = htonll(t0);
-	rand_s((unsigned int *)& request.initCheckCode);
-	rand_s((unsigned int *)& request.initCheckCode + 1);
-	rand_s(& request.salt);
-	request.hs.Set<FSP_InitiateRequest, INIT_CONNECT>();
+	memset(payload, 0, sizeof(payload));
 
-	timestamp_t t1 = GetCurrentTimeIn100Nano();
-	responseZero.initCheckCode = request.initCheckCode;
-	(ALFID_T &)responseZero.timeDelta = htonl(LAST_WELL_KNOWN_ALFID); 
-	EvaluateCookie(responseZero, t1, & nearEnd);
+	GCM_AES_SetKey(& ctx, samplekey, sizeof(samplekey));
 
-	responseZero.timeDelta = htonl((u_long)(t1 - t0)); 
-	responseZero.cookie ^= ((UINT64)request.salt << 32) | request.salt;
-	responseZero.hs.Set<FSP_Challenge, ACK_INIT_CONNECT>();
+	GCM_AES_AuthenticatedEncrypt(& ctx, IV, NULL, 0, (uint64_t *)payload, 12, NULL, tag, sizeof(tag));
+	int r = GCM_AES_AuthenticateAndDecrypt(& ctx, IV, NULL, 0, (uint64_t *)payload, 12, tag, sizeof(tag), NULL); 
+	Assert::IsTrue(r == 0);
 
-	affirmedRequest.cookie = responseZero.cookie ^ (((UINT64)request.salt << 32) | request.salt);
-	affirmedRequest.initCheckCode = request.initCheckCode;
-	affirmedRequest.idALF = htonl(LAST_WELL_KNOWN_ALFID);
-	affirmedRequest.hs.Set<CONNECT_REQUEST>(sizeof(affirmedRequest));
-	affirmedRequest.exTimeStamp.timeStamp = htonll(t0);
-	affirmedRequest.exTimeStamp.timeDelta = htonl((u_long)(t1 - t0));
-	affirmedRequest.exTimeStamp.hs.Set<FSP_Challenge, TIMESTAMP_DELTA>();
-	bool b = ValidateCookie(affirmedRequest, & nearEnd);
-	Assert::IsTrue(b == true);
+	for(register int i = 0; i < sizeof(payload); i++)
+	{
+		payload[i] = (BYTE )i;
+	}
+
+	GCM_AES_AuthenticatedEncrypt(& ctx, IV, NULL, 0, (uint64_t *)payload, 31, NULL, tag, sizeof(tag));
+	r = GCM_AES_AuthenticateAndDecrypt(& ctx, IV, NULL, 0, (uint64_t *)payload, 31, tag, sizeof(tag), NULL); 
+	Assert::IsTrue(r == 0);
+
+	GCM_AES_AuthenticatedEncrypt(& ctx, IV, payload + 32, 17, (uint64_t *)payload, 31, (uint64_t *)payload + 4, tag, sizeof(tag));
+	r = GCM_AES_AuthenticateAndDecrypt(& ctx, IV, payload + 32, 17, (uint64_t *)payload, 31, tag, sizeof(tag), (uint64_t *)payload + 4); 
+	Assert::IsTrue(r == 0);
+
+	for(register int i = 0; i < sizeof(payload); i++)
+	{
+		Assert::IsTrue(payload[i] == i);
+	}
+
+	for(register int i = 0; i < 17; i++)
+	{
+		payload[i] ^= 0xFF;
+	}
+
+	GCM_AES_AuthenticatedEncrypt(& ctx, IV, payload + 32, 17, (uint64_t *)payload, 31, (uint64_t *)payload + 4, tag, sizeof(tag));
+	for(register int i = 0; i < sizeof(payload); i++)
+	{
+		sprintf_s(linebuf, sizeof(linebuf), "%d ", payload[i]);
+		Logger::WriteMessage(linebuf);
+	}
+	sprintf_s(linebuf, sizeof(linebuf), "\n");
+	Logger::WriteMessage(linebuf);
+
+	r = GCM_AES_AuthenticateAndDecrypt(& ctx, IV, payload + 32, 17, (uint64_t *)payload, 31, tag, sizeof(tag), (uint64_t *)payload + 4); 
+	Assert::IsTrue(r == 0);
+
+	for(register int i = 17; i < sizeof(payload); i++)
+	{
+		Assert::IsTrue(payload[i] == i);
+	}
 }
-#endif
+
+
 
 
 
 void UnitTestVMAC()
 {
 #if 0
-			// as VMAC_AE failed unit test we remove VMAC support
+	// as VMAC_AE failed unit test we remove VMAC support
 	FSP_InitiateRequest request;
 	FSP_Challenge responseZero;	// zero hint no state
 	FSP_AckConnectRequest acknowledgement;
@@ -706,25 +440,25 @@ void UnitTestVMAC()
 	int32_t r = 1;
 	r = htobe32(r);
 	memset(&nearEnd, 0, sizeof(nearEnd));
-	request.timeStamp = htonll(t0);
+	request.timeStamp = htobe64(t0);
 	// initCheckCode, salt should be random, but remain as-is for test purpose
 	request.hs.Set<FSP_InitiateRequest, INIT_CONNECT>();
 
 	timestamp_t t1 = NowUTC();
 	struct _CookieMaterial cm;
 	cm.idALF = nearEnd.u.idALF;
-	cm.idListener = htonl(LAST_WELL_KNOWN_ALFID);
+	cm.idListener = htobe32(LAST_WELL_KNOWN_ALFID);
 	// the cookie depends on the listening session ID AND the responding session ID
 	cm.salt = request.salt;
 	responseZero.initCheckCode = request.initCheckCode;
 	responseZero.cookie = CalculateCookie((BYTE *) & cm, sizeof(cm), t1);
-	responseZero.timeDelta = htonl((u_long)(t1 - t0)); 
-	responseZero.cookie ^= ((UINT64)request.salt << 32) | request.salt;
+	responseZero.timeDelta = htobe32((u_long)(t1 - t0)); 
+	responseZero.cookie ^= ((uint64_t)request.salt << 32) | request.salt;
 	responseZero.hs.Set<FSP_Challenge, ACK_INIT_CONNECT>();
 
 	acknowledgement.expectedSN = 1;
 	acknowledgement.sequenceNo = 1;
-	acknowledgement.integrity.id.peer = htonl(LAST_WELL_KNOWN_ALFID); 
+	acknowledgement.integrity.id.peer = htobe32(LAST_WELL_KNOWN_ALFID); 
 	acknowledgement.integrity.id.source = nearEnd.u.idALF;
 
 	// should the connect parameter header. but it doesn't matter
@@ -736,10 +470,10 @@ void UnitTestVMAC()
 
 	socket.SetIntegrityCheckCodeP1(& acknowledgement);
 
-	UINT64 savedICC = acknowledgement.integrity.code;
+	uint64_t savedICC = acknowledgement.integrity.code;
 	acknowledgement.integrity.id = savedId;
 	socket.SetIntegrityCheckCodeP1(& acknowledgement);
-	Assert::AreEqual<UINT64>(savedICC, acknowledgement.integrity.code);
+	Assert::AreEqual<uint64_t>(savedICC, acknowledgement.integrity.code);
 
 	BYTE ackbuf[sizeof(acknowledgement) + 5];
 	// suppose a misalignment found..
@@ -748,7 +482,7 @@ void UnitTestVMAC()
 
 	ack2.integrity.id = savedId;
 	socket.SetIntegrityCheckCodeP1(& ack2);
-	Assert::AreEqual<UINT64>(savedICC, ack2.integrity.code);
+	Assert::AreEqual<uint64_t>(savedICC, ack2.integrity.code);
 #endif
 }
 
@@ -781,16 +515,11 @@ void UnitTestQuasibitfield()
 	Assert::AreEqual<int>(acknowledgement.GetFlag<ToBeContinued>(), 1);
 	acknowledgement.SetFlag<Compressed>();
 	Assert::IsTrue(acknowledgement.flags_ws[3] == 3);
-	acknowledgement.SetFlag<ExplicitCongestion>();
-	Assert::IsTrue(acknowledgement.flags_ws[3] == 131);
 	Assert::AreEqual<int>(acknowledgement.GetFlag<Compressed>(), 2);
-	Assert::AreEqual<int>(acknowledgement.GetFlag<ExplicitCongestion>(), 128);
 	//
 	acknowledgement.ClearFlag<ToBeContinued>();
-	Assert::IsTrue(acknowledgement.flags_ws[3] == 130);
+	Assert::IsTrue(acknowledgement.flags_ws[3] == 2);
 	acknowledgement.ClearFlag<Compressed>();
-	Assert::IsTrue(acknowledgement.flags_ws[3] == 128);
-	acknowledgement.ClearFlag<ExplicitCongestion>();
 	Assert::IsTrue(acknowledgement.flags_ws[3] == 0);
 }
 
@@ -801,234 +530,6 @@ void UnitTestTestSetFlag()
 	static ControlBlock::FSP_SocketBuf buf;
 	buf.SetFlag<IS_COMPLETED>();
 	Assert::IsTrue(buf.flags == 1 << IS_COMPLETED);
-}
-
-
-void UnitTestGenerateSNACK()
-{
-	static const ControlBlock::seq_t FIRST_SN = 12;
-	static const int MAX_GAPS_NUM = 2;
-	static const int MAX_BLOCK_NUM = 0x20000;	// 65536 * 2
-
-	CSocketItemExDbg socket(MAX_BLOCK_NUM, MAX_BLOCK_NUM);
-	ControlBlock *pSCB = socket.GetControlBlock();
-	pSCB->SetRecvWindowHead(FIRST_SN);
-
-	FSP_SelectiveNACK::GapDescriptor gaps[MAX_GAPS_NUM];
-	ControlBlock::seq_t seq0;
-
-	// firstly, without a gap
-	int r = pSCB->GetSelectiveNACK(seq0, gaps, MAX_GAPS_NUM);
-	Assert::IsTrue(r == 0 && seq0 == FIRST_SN);
-
-	// secondly, one gap only
-	ControlBlock::PFSP_SocketBuf skb1 = socket.AllocRecvBuf(FIRST_SN);
-	Assert::IsNotNull(skb1);
-	Assert::IsTrue(pSCB->recvWindowNextSN == FIRST_SN + 1);
-	skb1->SetFlag<IS_FULFILLED>();
-
-	skb1 = socket.AllocRecvBuf(FIRST_SN + 2);
-	Assert::IsNotNull(skb1);
-	Assert::IsTrue(pSCB->recvWindowNextSN == FIRST_SN + 3);
-	skb1->SetFlag<IS_FULFILLED>();
-
-	r = pSCB->GetSelectiveNACK(seq0, gaps, MAX_GAPS_NUM);
-	Assert::IsTrue(r == 1 && seq0 == FIRST_SN + 3);
-
-	// when a very large gap among small continuous data segments found
-	skb1 = socket.AllocRecvBuf(FIRST_SN + 0x10003);
-	skb1->SetFlag<IS_FULFILLED>();
-	Assert::IsNotNull(skb1);
-	Assert::IsTrue(pSCB->recvWindowNextSN == FIRST_SN + 0x10004);
-
-	r = pSCB->GetSelectiveNACK(seq0, gaps, MAX_GAPS_NUM);
-	Assert::IsTrue(r == 1 && seq0 == FIRST_SN + 3);
-
-	// when gap descriptors overflow
-	skb1 = socket.AllocRecvBuf(FIRST_SN + 0x8003);
-	skb1->SetFlag<IS_FULFILLED>();
-	Assert::IsNotNull(skb1);
-	Assert::IsTrue(pSCB->recvWindowNextSN == FIRST_SN + 0x10004);
-
-	r = pSCB->GetSelectiveNACK(seq0, gaps, MAX_GAPS_NUM);
-	Assert::IsTrue(r == 2 && seq0 == FIRST_SN + 0x8004);
-
-	// when a very large continuous data segment among small gaps
-	for(int i = 4; i < 0x10003; i++)
-	{
-		skb1 = socket.AllocRecvBuf(FIRST_SN + i);
-		Assert::IsNotNull(skb1);
-		skb1->SetFlag<IS_FULFILLED>();
-	}
-
-	r = pSCB->GetSelectiveNACK(seq0, gaps, MAX_GAPS_NUM);
-	Assert::IsTrue(r == 1 && seq0 == FIRST_SN + 3);
-
-	bool b;
-	pSCB->InquireRecvBuf(r, b);
-	Assert::IsFalse(b);
-	Assert::IsTrue(pSCB->recvWindowHeadPos == 1 && pSCB->recvWindowFirstSN == (FIRST_SN + 1));
-
-	skb1 = socket.AllocRecvBuf(FIRST_SN + 1);
-	skb1->SetFlag<IS_FULFILLED>();
-
-	ControlBlock::PFSP_SocketBuf p = pSCB->HeadRecv();
-	for(int i = 0; i < 0x10001; i++)
-	{
-		p->len = MAX_BLOCK_SIZE;
-		(p++)->SetFlag<TO_BE_CONTINUED>();
-	}
-
-	pSCB->InquireRecvBuf(r, b);
-	Assert::IsTrue(b && r == MAX_BLOCK_SIZE * 2);
-
-	skb1 = socket.AllocRecvBuf(FIRST_SN + 3);
-	skb1->SetFlag<IS_FULFILLED>();
-	skb1->SetFlag<TO_BE_CONTINUED>();
-
-	pSCB->InquireRecvBuf(r, b);
-	Assert::IsFalse(b);
-	Assert::IsTrue(pSCB->recvWindowHeadPos == 0x10002 && pSCB->recvWindowFirstSN == (FIRST_SN + 0x10002));
-
-	//
-	skb1 = socket.AllocRecvBuf(FIRST_SN + 0x20001);
-	skb1->SetFlag<IS_FULFILLED>();
-	Assert::IsTrue(pSCB->recvWindowNextSN == FIRST_SN + 0x20002);
-
-	r = pSCB->GetSelectiveNACK(seq0, gaps, MAX_GAPS_NUM);
-	// there's a continuous data block which is not delivered yet. however, it is not considered needing a gap descriptor
-	Assert::IsTrue(r == 1 && seq0 == FIRST_SN + 0x20002);
-}
-
-
-
-void UnitTestAcknowledge()
-{
-	static const ControlBlock::seq_t FIRST_SN = 12;
-	static const int MAX_GAPS_NUM = 2;
-	static const int MAX_BLOCK_NUM = 0x20000;	// 65536 * 2
-
-	CSocketItemExDbg socket(MAX_BLOCK_NUM, MAX_BLOCK_NUM);
-	ControlBlock *pSCB = socket.GetControlBlock();
-	FSP_SelectiveNACK::GapDescriptor gaps[MAX_GAPS_NUM];
-
-	pSCB->welcomedNextSNtoSend = pSCB->sendWindowFirstSN = FIRST_SN;
-	pSCB->sendBufferNextSN = pSCB->sendWindowNextSN = FIRST_SN + 1;
-	// Pretend that the first packet has been sent and is waiting acknowledgement...
-	// A NULL acknowledgement, Keep-Alive
-	int r = socket.RespondSNACK(FIRST_SN + 1, NULL, 0);
-	Assert::IsTrue(r == 0 && pSCB->sendBufferNextSN == pSCB->sendWindowFirstSN);
-	Assert::IsTrue(pSCB->sendWindowFirstSN == FIRST_SN + 1);
-	Assert::IsTrue(pSCB->sendWindowNextSN == FIRST_SN + 1);
-
-
-	pSCB->SetSendWindowWithHeadReserved(FIRST_SN);
-	ControlBlock::PFSP_SocketBuf skb = pSCB->HeadSend();
-	Assert::IsNotNull(skb);
-	Assert::IsTrue(pSCB->sendWindowSize == 1);	// set by GetVeryFirstSendBuf
-	Assert::IsTrue(pSCB->sendBufferNextSN == FIRST_SN + 1);
-	skb->SetFlag<IS_COMPLETED>();
-	skb->Lock();
-
-	skb = pSCB->GetSendBuf();
-	skb->SetFlag<IS_COMPLETED>();
-	skb->Lock();
-	pSCB->GetSendBuf();
-	skb->SetFlag<IS_COMPLETED>();
-	skb->Lock();
-	Assert::IsTrue(pSCB->sendBufferNextSN == FIRST_SN + 3);
-
-	// emulate sending, together with setting skb->timeOut
-	// assume 3 packets sent
-	pSCB->sendWindowNextSN += 3;
-	pSCB->sendWindowSize = MAX_BLOCK_NUM;	// don't let size of send window limit the test
-	Assert::IsTrue(pSCB->sendWindowNextSN == FIRST_SN + 3);
-
-	// acknowledge the first two
-	r = socket.RespondSNACK(FIRST_SN + 2, NULL, 0);
-	Assert::IsTrue(r == 0 && pSCB->sendWindowFirstSN == FIRST_SN + 2);
-	Assert::IsTrue(pSCB->CountUnacknowledged() >= 0);
-	Assert::IsTrue(pSCB->sendWindowSize == MAX_BLOCK_NUM - 2);
-
-	// Now, more test...
-	for(int i = 3; i < MAX_BLOCK_NUM; i++)
-	{
-		skb = pSCB->GetSendBuf();
-		Assert::IsTrue(skb != NULL);
-		skb->SetFlag<IS_COMPLETED>();
-		skb->Lock();
-	}
-	pSCB->sendWindowNextSN += MAX_BLOCK_NUM - 3;
-	Assert::IsTrue(pSCB->sendWindowNextSN == FIRST_SN + MAX_BLOCK_NUM);
-
-	// All buffer blocks should have been consumed after the two acknowledged have been allocated
-	// [however, sendWindowSize is not reduced yet]
-	skb = pSCB->GetSendBuf();	// the two acknowledged
-	skb->SetFlag<IS_COMPLETED>();
-	skb = pSCB->GetSendBuf();
-	skb->SetFlag<IS_COMPLETED>();
-	skb = pSCB->GetSendBuf();	// no space in the send buffer.
-	Assert::IsTrue(skb == NULL);
-	Assert::IsTrue(pSCB->sendWindowSize == MAX_BLOCK_NUM - 2);
-
-	// assume the third is a gap...
-	gaps[0].dataLength = 1;
-	gaps[0].gapWidth = 1;
-	// this is an illegal one
-	r = socket.RespondSNACK(FIRST_SN, gaps, 1);
-	Assert::IsTrue(r == -EBADF && pSCB->sendWindowFirstSN == FIRST_SN + 2);
-	Assert::IsTrue(pSCB->CountUnacknowledged() >= 0);
-	// again, an outdated one
-	r = socket.RespondSNACK(FIRST_SN + 2, gaps, 1);
-	Assert::IsTrue(r == -EDOM && pSCB->sendWindowFirstSN == FIRST_SN + 2);
-	Assert::IsTrue(pSCB->CountUnacknowledged() >= 0);
-
-	// this is a legal one
-	r = socket.RespondSNACK(FIRST_SN + 5, gaps, 1);
-	Assert::IsTrue(r == 0 && pSCB->sendWindowFirstSN == FIRST_SN + 3);
-	Assert::IsTrue(pSCB->CountUnacknowledged() >= 0);
-
-	// this is a legal but redundant two gaps
-	gaps[1].dataLength = 1;
-	gaps[1].gapWidth = 1;
-	r = socket.RespondSNACK(FIRST_SN + 5, gaps, 2);
-	Assert::IsTrue(r == 0 && pSCB->sendWindowFirstSN == FIRST_SN + 3);
-	Assert::IsTrue(pSCB->CountUnacknowledged() >= 0);
-
-	// two gaps, overlap with previous one [only to urge retransmission of those negatively acknowledged]
-	r = socket.RespondSNACK(FIRST_SN + 7, gaps, 2);
-	Assert::IsTrue(r == 0 && pSCB->sendWindowFirstSN == FIRST_SN + 3);
-	Assert::IsTrue(pSCB->CountUnacknowledged() >= 0);
-
-	// two gaps, do real new acknowledgement
-	r = socket.RespondSNACK(FIRST_SN + 9, gaps, 2);
-	Assert::IsTrue(r == 0 && pSCB->sendWindowFirstSN == FIRST_SN + 5);
-	Assert::IsTrue(pSCB->CountUnacknowledged() >= 0);
-
-	// a very large continuous data segment is acknowledged
-	r = socket.RespondSNACK(FIRST_SN + 0x1000A, gaps, 2);
-	Assert::IsTrue(r == 0 && pSCB->sendWindowFirstSN == FIRST_SN + 0x10006);
-	Assert::IsTrue(pSCB->sendWindowSize == MAX_BLOCK_NUM - 0x10006);
-	Assert::IsTrue(pSCB->CountUnacknowledged() >= 0);
-
-	// Test round-robin...
-	for(int i = MAX_BLOCK_NUM + 2; i < MAX_BLOCK_NUM + 0x10000; i++)
-	{
-		skb = pSCB->GetSendBuf();
-		Assert::IsTrue(skb != NULL);
-		skb->SetFlag<IS_COMPLETED>();
-		skb->Lock();
-	}
-	pSCB->sendWindowNextSN += 0x10000;	// queuing to send is not the same as sending
-
-	// an even larger continuous data segment is acknowledged
-	r = socket.RespondSNACK(FIRST_SN + MAX_BLOCK_NUM + 0xF000, gaps, 2);
-	Assert::IsTrue(r == 0 && pSCB->sendWindowHeadPos == 0xEFFC);
-	Assert::IsTrue(pSCB->sendWindowSize == - 0xEFFC);	// overflow, but don't care!
-	Assert::IsTrue(pSCB->sendWindowFirstSN == FIRST_SN + MAX_BLOCK_NUM + 0xEFFC);
-	Assert::IsTrue(pSCB->CountUnacknowledged() >= 0);
-
-	// TODO: Test calculation of RTT and Keep alive timeout 
 }
 
 
@@ -1129,15 +630,6 @@ void UnitTestDerivedClass()
 
 
 
-class CLowerInterfaceDbg: public CLowerInterface
-{
-public:
-	PktBufferBlock *CurrentHead() { return freeBufferHead; }
-	friend	void UnitTestReceiveQueue();
-};
-
-
-
 void UnitTestReceiveQueue()
 {
 	CLowerInterfaceDbg *pLowerSrv = (CLowerInterfaceDbg *)CLowerInterface::Singleton();
@@ -1202,65 +694,17 @@ void UnitTestConnectQueue()
 }
 
 
+
 void UnitTestHeaderManager()
 {
-#if 0
-	CSocketItemExDbg 
-
-	FSP_SelectiveNACK snack(sizeof(FSP_NormalPacketHeader));
-	skb->opCode = ADJOURN;
-	skb->len = hdrManager.PushExtHeader<FSP_SelectiveNACK>(& snack);
-	welcome.hs.Set<ADJOURN>(skb->len);
-
-
-	FSP_Header_Manager hdrManager((FSP_Header *) & response);
-	UINT16 spFull = ntohs(response.hs.hsp);
-	FSP_ConnectParam *pVarParams;
-	hdrManager.PopExtHeader<FSP_ConnectParam>(& pVarParams);
-
-	memset(rIPS.allowedPrefixes, 0, sizeof(rIPS.allowedPrefixes));
-	// assert(sizeof(rIPS.allowedPrefixes) >= sizeof(pVarParams->subnets));
-	memcpy(rIPS.allowedPrefixes, pVarParams->subnets, sizeof(pVarParams->subnets));
-
-	FSP_Header_Manager hdrManager((FSP_Header *) & pkt);
-	PFSP_HeaderSignature optHdr = hdrManager.PopExtHeader();
-	if(optHdr->opCode == SELECTIVE_NACK)
-	{
-		FSP_SelectiveNACK::GapDescriptor *gaps = (FSP_SelectiveNACK::GapDescriptor *)((BYTE *) & pkt + ntohs(optHdr->hsp));
-		FSP_SelectiveNACK *pHdr = (FSP_SelectiveNACK *)((BYTE *)optHdr + sizeof(*optHdr) - sizeof(*pHdr));
-		int n = int((BYTE *)gaps - (BYTE *)pHdr);
-		if(n < 0)
-			return;	// this is a malformed packet. UNRESOLVED! Just silently discard it?	
-		n /= sizeof(FSP_SelectiveNACK::GapDescriptor);
-		if(pHdr->lastGap != 0)
-			n ++;
-		for(register int i = n - 1; i >= 0; i --)
-		{
-			gaps[i].gapWidth = ntohs(gaps[i].gapWidth);
-			gaps[i].dataLength = ntohs(gaps[i].dataLength);
-		}
-		//
-		pSocket->Acknowledge(ackSeqNo, gaps, n);
-		optHdr = hdrManager.PopExtHeader();
-	}
-
-	// Conver the FSP header stack pointer to a data block pointer
-	void * TopAsDataBlock() const { return pHdr + pStackPointer; }
-
-	void PushDataBlock(BYTE *buf, int len)
-#endif
-}
-
-
-// TODO...
-static void pbuf(void *p, int len, char *s)
-{
-	int i;
-	if (s)
-		printf("%s", s);
-	for (i = 0; i < len; i++)
-		printf("%02x", ((unsigned char *)p)[i]);
-	printf("\n");
+	// FSP_Header_Manager(void *p1, int len);
+	// template<typename THdr> uint16_t PushExtHeader(THdr *pExtHdr)
+	// void PushDataBlock(BYTE *buf, int len)
+	//
+	// FSP_Header_Manager(void *p1);
+	// template<typename THdr>	THdr * PopExtHeader()
+	// void * TopAsDataBlock() const { return pHdr + pStackPointer; }
+	// int	NextHeaderOffset() const { return (int)pStackPointer; }
 }
 
 
@@ -1357,6 +801,7 @@ void UnitTestVMAC_AE()
 
 void UnitTestOCB_MAC()
 {
+#if 0	// due to patent issue OCB mode is just a comparable
 	FSP_InitiateRequest request;
 	FSP_Challenge responseZero;	// zero hint no state
 	FSP_AckConnectRequest acknowledgement;
@@ -1366,20 +811,20 @@ void UnitTestOCB_MAC()
 	int32_t r = 1;
 	r = htobe32(r);
 	memset(&nearEnd, 0, sizeof(nearEnd));
-	request.timeStamp = htonll(t0);
+	request.timeStamp = htobe64(t0);
 	// initCheckCode, salt should be random, but remain as-is for test purpose
 	request.hs.Set<FSP_InitiateRequest, INIT_CONNECT>();
 
 	timestamp_t t1 = NowUTC();
 	struct _CookieMaterial cm;
 	cm.idALF = nearEnd.u.idALF;
-	cm.idListener = htonl(LAST_WELL_KNOWN_ALFID);
+	cm.idListener = htobe32(LAST_WELL_KNOWN_ALFID);
 	// the cookie depends on the listening session ID AND the responding session ID
 	cm.salt = request.salt;
 	responseZero.initCheckCode = request.initCheckCode;
 	responseZero.cookie = CalculateCookie((BYTE *) & cm, sizeof(cm), t1);
-	responseZero.timeDelta = htonl((u_long)(t1 - t0)); 
-	responseZero.cookie ^= ((UINT64)request.salt << 32) | request.salt;
+	responseZero.timeDelta = htobe32((u_long)(t1 - t0)); 
+	responseZero.cookie ^= ((uint64_t)request.salt << 32) | request.salt;
 	responseZero.hs.Set<FSP_Challenge, ACK_INIT_CONNECT>();
 
 	acknowledgement.expectedSN = 1;
@@ -1389,22 +834,47 @@ void UnitTestOCB_MAC()
 
 	BYTE samplekey[16] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
 	CSocketItemExDbg socket;
-	socket.SetPairOfFiberID(nearEnd.u.idALF, htonl(LAST_WELL_KNOWN_ALFID));
+	socket.SetPairOfFiberID(nearEnd.u.idALF, htobe32(LAST_WELL_KNOWN_ALFID));
 
 	socket.InstallSessionKey(samplekey);
 	socket.SetIntegrityCheckCode(& acknowledgement);
 
 	// ValidateICC validates the received packet, the source and sink ID should be exchanged for the receiver
-	socket.SetPairOfFiberID(htonl(LAST_WELL_KNOWN_ALFID), nearEnd.u.idALF);
+	socket.SetPairOfFiberID(htobe32(LAST_WELL_KNOWN_ALFID), nearEnd.u.idALF);
 
 	bool checked = socket.ValidateICC(& acknowledgement);
 	Assert::IsTrue(checked);
 
 	socket.SetIntegrityCheckCode(& acknowledgement, 9);	// arbitrary length in the stack
 
-	socket.SetPairOfFiberID(nearEnd.u.idALF, htonl(LAST_WELL_KNOWN_ALFID));
+	socket.SetPairOfFiberID(nearEnd.u.idALF, htobe32(LAST_WELL_KNOWN_ALFID));
 	checked = socket.ValidateICC(& acknowledgement, 9);
 	Assert::IsTrue(checked);
+#endif
+}
+
+
+
+
+void UnitTestReplaceSendQueueHead()
+{
+	int memsize = sizeof(ControlBlock) + (sizeof ControlBlock::FSP_SocketBuf + MAX_BLOCK_SIZE) * 8;
+	const ControlBlock::seq_t FIRST_SN = 12;
+
+	CSocketItemExDbg socket;
+	ControlBlockDbg *pSCB = socket.GetControlBlock();
+	pSCB->Init((memsize - sizeof(ControlBlock))/ 2, (memsize - sizeof(ControlBlock)) / 2);
+
+	pSCB->SetRecvWindowHead(FIRST_SN);
+	pSCB->SetSendWindowHead(FIRST_SN);
+
+	socket.ReplaceSendQueueHead(PERSIST);
+	ControlBlock::PFSP_SocketBuf skb = pSCB->GetSendQueueHead();
+	Assert::IsTrue(skb->opCode == PERSIST);
+
+	socket.ReplaceSendQueueHead(COMMIT);
+	skb = pSCB->GetSendQueueHead();
+	Assert::IsTrue(skb->opCode == COMMIT);
 }
 
 
@@ -1440,12 +910,10 @@ namespace UnitTestFSP
 			UnitTestCubicRoot();
 		}
 
-#if 0
-		TEST_METHOD(TestGMAC)
+		TEST_METHOD(TestGCM_AES)
 		{
-			UnitTestGMAC();
+			UnitTestGCM_AES();
 		}
-#endif
 
 		TEST_METHOD(TestVMAC)
 		{
@@ -1500,24 +968,22 @@ namespace UnitTestFSP
 			UnitTestDerivedClass();
 		}
 #endif
-		TEST_METHOD(TestSendRecvWnd)
-		{
-			UnitTestSendRecvWnd();
-		}
-
-		TEST_METHOD(TestResendQueue)
-		{
-			UnitTestResendQueue();
-		}
 
 		TEST_METHOD(TestGenerateSNACK)
 		{
 			UnitTestGenerateSNACK();
 		}
 
-		TEST_METHOD(TestAcknowledge)
+
+		TEST_METHOD(TestSendRecvWnd)
 		{
-			UnitTestAcknowledge();
+			UnitTestSendRecvWnd();
+		}
+
+
+		TEST_METHOD(TestReplaceSendQueueHead)
+		{
+			UnitTestReplaceSendQueueHead();
 		}
 
 

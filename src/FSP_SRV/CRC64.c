@@ -74,36 +74,10 @@ const uint64_t TableCRC64[256] = {
 	0x5DEDC41A34BBEEB2,0x1F1D25F19D51D821,0xD80C07CD676F8394,0x9AFCE626CE85B507
 };
 
-/**
-|
-void BuildTable64()    
-{    
-	register int i, j;
-	uint64_t nData = 0;
-	uint64_t nAccum;    
-	for(i = 0; i < 256; i++ )    
-	{
-		nAccum = 0;
-		nData = (uint64_t)i << 56;
-		for (j = 0; j < 8; j++ )    
-		{    
-			if ((nData ^ nAccum) & (1ULL << 63))
-				nAccum = (nAccum << 1) ^ CRC_64_I64;
-			else
-				nAccum <<= 1;
-			nData <<= 1;
-		}
-		TableCRC64[i] = nAccum;    
-	}    
-}    
-  |
-**/
 
 
-
-uint64_t CalculateCRC64(uint8_t *buf, size_t len)    
+uint64_t CalculateCRC64(register uint64_t nAccum, register uint8_t *buf, size_t len)
 {
-	register uint64_t nAccum = 0;
 	register size_t i;
 
 	for (i = 0; i < len; i++ )
@@ -113,17 +87,3 @@ uint64_t CalculateCRC64(uint8_t *buf, size_t len)
 
 	return nAccum;    
 }  
-
-/**
-71.    public static ulong Compute(byte[] data)  
-72.    {  
-73.        ulong crc = 0xffffffffffffffff;  
-74.        for (int i = 0; i < data.Length; i++)  
-75.        {  
-76.            uint tableIndex = (((uint)(crc >> 56)) ^ data[i]) & 0xff;  
-77.            crc = s_CRC64Table[tableIndex] ^ (crc << 8);  
-78.        }  
-79.        return (crc ^ 0xffffffffffffffff);  
-80.    }  
-81.  
-**/

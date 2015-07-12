@@ -150,7 +150,6 @@ protected:
 	void ProcessPendingSend();
 	void ProcessReceiveBuffer();
 	//
-	void ToConcludeAccept();
 	void ToConcludeCommit();
 	void ToConcludeConnect();
 	//
@@ -239,6 +238,8 @@ public:
 		return Call(cmd, sizeof(cmd));
 	}
 	CSocketItemDl * LOCALAPI CallCreate(CommandNewSession &, FSP_ServiceCode);
+
+	int LOCALAPI InstallKey(BYTE *, int, int32_t);
 
 	int LOCALAPI AcquireSendBuf(int);
 	int LOCALAPI SendInplace(void *, int, bool);

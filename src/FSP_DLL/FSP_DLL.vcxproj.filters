@@ -7,10 +7,11 @@
     <ClCompile Include="Disconnect.cpp" />
     <ClCompile Include="DllEntry.cpp" />
     <ClCompile Include="Establish.cpp" />
-    <ClCompile Include="Multihome.cpp" />
     <ClCompile Include="Multiplex.cpp" />
     <ClCompile Include="Receive.cpp" />
     <ClCompile Include="Send.cpp" />
+    <ClCompile Include="tweetnacl.c" />
+    <ClCompile Include="CryptoStub.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\FSP.h">

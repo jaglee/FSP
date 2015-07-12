@@ -207,24 +207,30 @@ inline
 int CSocketItemDl::FetchReceived()
 {
 	int m = 0;	// note that left border of the receive window slided in the loop body
-	for(ControlBlock::PFSP_SocketBuf p = pControlBlock->GetFirstReceived();
-		!p->GetFlag<IS_DELIVERED>();
-		p = pControlBlock->GetFirstReceived())
+	// firstly, skip those already delivered
+	ControlBlock::PFSP_SocketBuf p = pControlBlock->GetFirstReceived();
+	while(p->GetFlag<IS_DELIVERED>())
+	{
+		pControlBlock->SlideRecvWindowByOne();
+		p = pControlBlock->GetFirstReceived();
+	}
+	//
+	while(p->GetFlag<IS_FULFILLED>() && !p->GetFlag<IS_DELIVERED>())
 	{
 		if(p->len > MAX_BLOCK_SIZE || p->len < 0)
 			return -EFAULT;
-
-		if (!p->GetFlag<IS_FULFILLED>())
-			break;	// The buffer block happened to be not ready yet. See CSocketItemEx::PlacePayload()
-
+		//
 		if(DeliverData(GetRecvPtr(p), p->len) < 0)
 			break;
-		p->SetFlag<IS_DELIVERED>();	// so that it would not be re-delivered
+		//
+		p->SetFlag<IS_FULFILLED>(false);	// release the buffer
+		p->SetFlag<IS_DELIVERED>();			// so that it would not be re-delivered
+		// but keep the TO_BE_CONTINUED flag
 		m += p->len;
-
+		//
 		// Slide the left border of the receive window before possibly set the flag 'end of received message'
 		pControlBlock->SlideRecvWindowByOne();
-		if(!p->GetFlag<TO_BE_CONTINUED>())
+		if(!p->GetFlag<TO_BE_CONTINUED>() && (p->opCode != PERSIST || p->len != 0))
 		{
 			SetEndOfRecvMsg();
 			break;
@@ -232,10 +238,13 @@ int CSocketItemDl::FetchReceived()
 		// What? An imcomplete 'to be continued' intermediate packet received?
 		if(p->len != MAX_BLOCK_SIZE)
 			return -EFAULT;
+		//
+		p = pControlBlock->GetFirstReceived();
 	}
 	//
 	return m;
 }
+
 
 
 // Remark
@@ -295,12 +304,9 @@ void CSocketItemDl::ProcessReceiveBuffer()
 		return;
 	}
 
+	// it is possible that data is buffered and waiting to be delivered to ULA
 	if(waitingRecvBuf == NULL || waitingRecvSize <= 0 || fpRecept == NULL)
 	{
-#ifdef TRACE
-		printf_s("When ULA have called neither RecvInline() nor ReadFrom(),\n"
-			"what received should be buffered as is\n");
-#endif
 		SetMutexFree();
 		return;
 	}

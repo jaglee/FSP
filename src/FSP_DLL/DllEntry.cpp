@@ -1,17 +1,19 @@
 /*
- * DLL to service FSP upper layer application
- * the DLL entry point, the top-level control structure
+ * DLL to service FSP upper layer application, the DLL entry point and the top-level control structure
  * How does it work
- * - it assumes a micro-kernel environment, where system services are called by IPC
- * - hereby message passing(mailslot) and shared memory are exploited
- * - The ULA and the service process shared the FSP socket state information via the shared memory.
+ * - combines of micro-kernel message-passing IPC metaphor and hardware interrupt vector mechanism
+ * - The ULA and the service process shared the FSP socket state information via the shared memory
  * - For Windows:
- * -- When the DLL is attached, a mailslot handle is obstained. the handle is closed when the DLL is detached
- * -- When the ULA called a FSP API function, the function module construct a command structure object,
- * --   and pass it via mailslot to the service process via the mailslot
- * -- For each FSP socket, a reverse mailslot is allocated for each passive or initiative connection reqeust
- * -- Return value, if desired, is placed into the mailslot asynchronously. The return value is fetched by OVERLAPPED read.
- * -- Data packets are placed into the shared memory directly.
+ * -- When LLS is created the global shared FSP mailslot is created
+ * -- When DLL is attached, a handle to the global FSP mailslot is obstained
+ * -- For each FSP socket a block of shared memory is allocated by DLL
+ *    preferably with address space layout randomiation applied
+ * -- When ULA called an FSP API the corresponding function module construct a command structure object
+ *    and pass it via the uni-direction mailslot to the service process
+ * -- A limited-size notice queue is allocated by DLL in the shared memory for LLS to 'interrupt' ULA through DLL callback
+ * -- Return value, if desired, is placed into some rendezvous location in the shared memory block
+ * -- Data packets either sent or received are placed into the shared memory directly
+ * -- The handle of the global FSP mailslot is released when the DLL is detached
  *
     Copyright (c) 2012, Jason Gao
     All rights reserved.
@@ -46,6 +48,7 @@
 // access control is centralized managed in the 'main' source file
 #include <Accctrl.h>
 #include <Aclapi.h>
+
 
 HANDLE _mdService = NULL;	// the mailslot descriptor of the service
 DWORD nBytesReadWrite;		// number of bytes read/write last time
@@ -219,27 +222,28 @@ bool CSocketItemDl::WaitSetMutex()
 // The asynchronous, multi-thread friendly soft interrupt handler
 void CSocketItemDl::WaitEventToDispatch()
 {
-	if(! WaitSetMutex())
-		return;
-#ifdef TRACE_PACKET
-	printf_s("\nIn local fiber#%u, state %s\n", fidPair.source, stateNames[pControlBlock->state]);
-#endif
+	// mutex is free in the subroutines such as ProcessPendingSend, ProcessReceiveBuffer
 	FSP_ServiceCode notice;
-	while((notice = PopNotice()) != NullCommand)
+	while(WaitSetMutex())
 	{
-#ifdef TRACE_PACKET
-		printf_s("\tnotice: %s\n", noticeNames[notice]);
-#endif
-		if(InState(NON_EXISTENT))
+		if(!IsInUse() || InState(NON_EXISTENT))
 		{
-			SetMutexFree();
-			NotifyError(notice, -EBADF);
+			// it doesn't matter SetMutexFree();
+			NotifyError(FSP_NotifyReset, -EBADF);
 			return;
 		}
+		//
+		notice = PopNotice();
+		if(notice == NullCommand)
+			break;
+#ifdef TRACE_PACKET
+		printf_s("\nIn local fiber#%u, state %s\tnotice: %s\n", fidPair.source, stateNames[pControlBlock->state], noticeNames[notice]);
+#endif
+		//
 		switch(notice)
 		{
 		case FSP_NotifyAccepting:
-			// case SynConection:
+			// case SynConection: // overloaded as callback for INIT_CONNECT, CONNECT_REQUEST and ACK_CONNECT_REQUEST
 			if(pControlBlock->HasBacklog())
 				ProcessBacklog();
 			if(InState(CONNECT_AFFIRMING))
@@ -254,7 +258,13 @@ void CSocketItemDl::WaitEventToDispatch()
 			NotifyError(notice);
 			return;
 		case FSP_NotifyAccepted:
-			ToConcludeAccept();			// SetMutexFree();
+			if(fpAccepted != NULL)
+			{
+				SetMutexFree();
+				fpAccepted(this, &context);
+				WaitSetMutex();
+			}
+			ProcessReceiveBuffer();		// if any; SetMutexFree();
 			break;
 		case FSP_NotifyDataReady:
 			ProcessReceiveBuffer();
@@ -305,9 +315,6 @@ void CSocketItemDl::WaitEventToDispatch()
 			NotifyError(notice, -EINTR);
 			return;
 		}
-		// mutex is free in the subroutines such as ProcessPendingSend, ProcessReceiveBuffer
-		if(! WaitSetMutex())
-			return;
 	}
 }
 

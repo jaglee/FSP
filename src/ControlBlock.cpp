@@ -711,12 +711,11 @@ void * LOCALAPI ControlBlock::InquireRecvBuf(int & nIO, bool & toBeContinued)
 
 
 // Given
-//	seq_t &			[_Out_]	the sequence number of the mostly expected packet
+//	seq_t &			[_Out_]	the accumulatively acknowledged sequence number
 //	GapDescriptor *	output buffer of gap descriptors
 //	int				capacity of the buffer, in number of GapDescriptors
 // Return
 //	positive integer: number of gaps found
-//	0: no data available
 //	-EDOM		input parameter error
 //	-EFAULT		session control block is corrupted (e.g.illegal sequence number)
 // Remark
@@ -724,94 +723,86 @@ void * LOCALAPI ControlBlock::InquireRecvBuf(int & nIO, bool & toBeContinued)
 //	return value may not exceed given capicity of the gaps buffer,
 //	so the sequence number of the mostly expected packet might be calibrated to a value less than recvWindowNextSN
 //	it is assumed that it is unnecessary to worry about atomicity of (recvWindowNextPos, recvWindowNextSN)
+// Acknowledged are
+//	[..., snExpect),
+//	[snExpect + gapWidth[0], snExpect + gapWidth[0] + datalength[0]), 
+//	[snExpect + gapWidth[0] + datalength[0] + gapWidth[1], snExpect + gapWidth[0] + datalength[0] + gapWidth[1] + datalength[1]) бнбн
 int LOCALAPI ControlBlock::GetSelectiveNACK(seq_t & snExpect, FSP_SelectiveNACK::GapDescriptor * buf, int n) const
 {
 	if(n <= 0)
 		return -EDOM;
 	//
-	snExpect = recvWindowNextSN;
-	if(CountReceived() <= 0)
-		return 0;
-	//
-	register int tail = recvWindowNextPos - 1;
-	if(tail < 0)
-		tail = recvBufferBlockN - 1;
-	PFSP_SocketBuf p = HeadRecv() + tail;
-	if(! p->GetFlag<IS_FULFILLED>())
+	int nRcv = CountReceived();	// gaps included, however
+	if(nRcv <= 0)
 	{
-		TRACE_HERE("lock error?");
-		return -EFAULT;
+		snExpect = recvWindowNextSN;
+		return 0;
 	}
+	//
+	register int iHead = recvWindowNextPos - nRcv;
+	if(iHead < 0)
+		iHead += recvBufferBlockN;
+	PFSP_SocketBuf p = HeadRecv() + iHead;
+	// it is possible that the head packet is the gap because of delivery
 
 	// To make life easier we have not taken into account of possibility of larger continuous data with much smaller gap
 	// If a 'very large' gap or continuous received area appeared (exceed USHRT_MAX) it would be adjusted
-	seq_t	seq0 = recvWindowFirstSN;
-	seq_t	seq1 = snExpect - 1;
-	UINT32	dataLength;
-	UINT32	gapWidth;
-	int		m = 0;
-	do
+	seq_t		seq0 = recvWindowNextSN - nRcv;	// Because of parallism it is not necessarily recvWindowFirstSN now
+	uint32_t	dataLength;
+	uint32_t	gapWidth;
+	int			m = 0;
+	for(buf[0].dataLength = 0; ; ++m)	// termination condition is embedded in the loop body
 	{
-		if(m >= n && allowedDelay > 0)
-			break;	// overflow for milky payload: simply discard stale packets
-		// the continuous received area
-		dataLength = 0;
-		do
+		for(dataLength = 0; int(seq0 - recvWindowNextSN) < 0 && p->GetFlag<IS_FULFILLED>(); seq0++)
 		{
 			dataLength++;
-			seq1--;
-			tail--;
-			if(tail < 0)
+			iHead++;
+			if(iHead - recvBufferBlockN >= 0)
 			{
-				tail += recvBufferBlockN;
-				p = HeadRecv() + tail;
+				iHead = 0;
+				p = HeadRecv();
 			}
 			else
 			{
-				p--;
+				p++;
 			}
-			//
-		} while(int(seq1 - seq0) >= 0 && p->GetFlag<IS_FULFILLED>());
+		}
 		//
-		if(int(seq1 - seq0) < 0)
-			break;	// the first (and possibly the last) continuous receive area
-		// the previous gap
-		gapWidth = 0;
-		do
+		// the gap
+		for(gapWidth = 0; int(seq0 - recvWindowNextSN) < 0 && !p->GetFlag<IS_FULFILLED>(); seq0++)
 		{
 			gapWidth++;
-			seq1--;
-			tail--;
-			if(tail < 0)
+			//
+			iHead++;
+			if(iHead - recvBufferBlockN >= 0)
 			{
-				tail += recvBufferBlockN;
-				p = HeadRecv() + tail;
+				iHead = 0;
+				p = HeadRecv();
 			}
 			else
 			{
-				p--;
+				p++;
 			}
-		} while(int(seq1 - seq0) >= 0 && ! p->GetFlag<IS_FULFILLED>());
+		}
 		//
-		if(dataLength > USHRT_MAX || gapWidth > USHRT_MAX)
+		if(m == 0)
 		{
-			snExpect = seq1 + 1;
-			m = 0;
+			snExpect = seq0 - gapWidth;	// the accumulative acknowledgment
+			buf[0].gapWidth = gapWidth;
+			if(gapWidth == 0)
+				break;
+		}
+		else if(m >= n || gapWidth == 0)
+		{
+			buf[m - 1].dataLength = dataLength;
+			break;
 		}
 		else
 		{
-			if(m >= n)  // && allowedDelay == 0 // overflow for wine-style payload
-			{
-				snExpect -= buf[0].dataLength;
-				snExpect -= buf[0].gapWidth;
-				m = n - 1;
-				memmove(& buf[0], & buf[1], sizeof(buf[0]) * m);
-			}
-			buf[m].dataLength = (UINT16)dataLength;
-			buf[m].gapWidth = (UINT16)gapWidth;			 
-			m++;
+			buf[m].gapWidth = gapWidth;
+			buf[m - 1].dataLength = dataLength;
 		}
-	} while(int(seq1 - seq0) >= 0);
+	}
 	//
 	return m;
 }
@@ -821,13 +812,10 @@ int LOCALAPI ControlBlock::GetSelectiveNACK(seq_t & snExpect, FSP_SelectiveNACK:
 // Slide the left border of the send window and mark the acknowledged buffer block free
 void ControlBlock::SlideSendWindow()
 {
-	if (CountSendBuffered() <= 0)
-		return;
-		
-	PFSP_SocketBuf p = HeadSend() + sendWindowHeadPos;
-	while(p->GetFlag<IS_ACKNOWLEDGED>())
+	for(PFSP_SocketBuf p = HeadSend() + sendWindowHeadPos;
+		int(sendWindowNextSN - sendWindowFirstSN) > 0 && p->GetFlag<IS_ACKNOWLEDGED>();
+		sendWindowFirstSN++)
 	{
-		// don't care len and seq
 		p->flags = 0;
 		sendWindowSize--;
 		//
@@ -840,10 +828,66 @@ void ControlBlock::SlideSendWindow()
 		{
 			p++;
 		}
-		//
-		if (int(sendWindowNextSN - ++sendWindowFirstSN) <= 0)	// it is noticibly different with CountSendBuffered()
-			break;
 	}
+}
+
+
+
+// Given
+//	ControlBlock::seq_t		the maximum sequence number expected by the remote end, without gaps
+//	const GapDescriptor *	array of the gap descriptors
+//	int						number of gap descriptors
+// Do
+//	Make acknowledgement, maybe accumulatively if number of gap descriptors is 0
+// Return
+//	the number of packets that are positively acknowledged
+int LOCALAPI ControlBlock::DealWithSNACK(seq_t expectedSN, const FSP_SelectiveNACK::GapDescriptor *gaps, int n)
+{
+	// Check validity of the control block descriptors to prevent memory corruption propagation
+	const int32_t & capacity = sendBufferBlockN;
+	int32_t	iHead = sendWindowHeadPos;
+	register seq_t seq0 = sendWindowFirstSN;
+	int sentWidth = CountUnacknowledged();
+
+	//
+	PFSP_SocketBuf p = HeadSend() + iHead;
+	int	countAck = 0;
+
+	register int nAck = int(expectedSN - seq0);
+	for(int	k = 0; ; k++)
+	{
+		// Make acknowledgement
+		while(--nAck >= 0)
+		{
+			if(! p->GetFlag<IS_ACKNOWLEDGED>())
+			{
+				p->SetFlag<IS_ACKNOWLEDGED>();
+				countAck++;
+			}
+			//
+			if(++iHead - capacity >= 0)
+			{
+				iHead = 0;
+				p = HeadSend();
+			}
+			else
+			{
+				p++;
+			}
+		}
+
+		if(k >= n)
+			break;
+		//
+		iHead += gaps[k].gapWidth;
+		if(iHead - capacity >= 0)
+			iHead -= capacity;
+		p = HeadSend() + iHead;
+		//
+		nAck = gaps[k].dataLength;
+	}
+
+	return countAck;
 }
 
 
@@ -905,10 +949,42 @@ bool LOCALAPI ControlBlock::ResizeSendWindow(seq_t seq1, unsigned int adRecvWin)
 
 bool ControlBlock::FSP_SocketBuf::Lock()
 {
-#if VMAC_ARCH_BIG_ENDIAN
+#if ARCH_BIG_ENDIAN
 	// we knew 'flags' is of type uint16_t
 	return InterlockedBitTestAndSet((LONG *) & flags, EXCLUSIVE_LOCK + 16) == 0;
 #else
 	return InterlockedBitTestAndSet((LONG *) & flags, EXCLUSIVE_LOCK) == 0;
 #endif
+}
+
+
+
+
+// Peek the packet rightly in front of COMMIT
+ControlBlock::PFSP_SocketBuf ControlBlock::PeekAnteCommit() const
+{
+	register seq_t seq = sendWindowNextSN;
+	register int d = int(seq - sendWindowFirstSN);
+	register PFSP_SocketBuf skb;
+	if (d < 0)
+		return NULL;
+
+	while (int(seq - sendBufferNextSN) < 0)
+	{
+		d += sendWindowHeadPos;
+		//
+		skb = HeadSend() + (d - sendBufferBlockN >= 0 ? d - sendBufferBlockN : d);
+		if(skb->opCode == COMMIT)
+		{
+			if(seq + 1 - sendBufferNextSN >= 0)
+				return NULL;
+			d++;
+			return HeadSend() + (d - sendBufferBlockN >= 0 ? d - sendBufferBlockN : d);
+		}
+
+		seq++;
+		d = int(seq - sendWindowFirstSN);
+	}
+	//
+	return NULL;
 }

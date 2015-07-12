@@ -225,7 +225,7 @@ void CSocketItemEx::KeepAlive()
 		// it is waste of time if the packet is already acknowledged however it do little harm
 		// and it doesn't worth the trouble to handle low-possibility situation
 		// prefer productivity over code elegancy
-		ControlBlock::PFSP_SocketBuf skb = pControlBlock->GetFirstBufferedSend();
+		ControlBlock::PFSP_SocketBuf skb = pControlBlock->GetSendQueueHead();
 		//
 		uint8_t	headOpCode = skb->opCode;
 		if (headOpCode == PERSIST)
@@ -237,51 +237,48 @@ void CSocketItemEx::KeepAlive()
 			pControlBlock->DumpSendRecvWindowInfo();
 #endif
 			// PERSIST/COMMIT packet in the head of the receive queue is the accumulative acknowledgment as well 
-			EmitWithICC(skb, pControlBlock->GetSendWindowFirstSN());
+			EmitWithICC(skb, pControlBlock->sendWindowFirstSN);
 			return;
 		}
 		//
 		if (headOpCode == COMMIT)	// assert(skb->len > 0); // not necessarily
-			EmitWithICC(skb, pControlBlock->GetSendWindowFirstSN());
+			EmitWithICC(skb, pControlBlock->sendWindowFirstSN);
 	}
 
 	// Send COMMIT or KEEP_ALIVE in heartbeat interval
-	BYTE buf[sizeof(FSP_NormalPacketHeader) + MAX_BLOCK_SIZE];
 	ControlBlock::seq_t seqExpected;
-	int spFull = GenerateSNACK(buf, seqExpected);
+	FSP_PreparedKEEP_ALIVE buf;
+
+	int32_t len = GenerateSNACK(buf, seqExpected);
 #ifdef TRACE_PACKET
 	printf_s("Keep-alive local fiber#%u\n"
 		"\tAcknowledged seq#%u, keep-alive header size = %d\n"
 		, fidPair.source
 		, seqExpected
-		, spFull);
+		, len);
 #endif
-
-	if(spFull < 0)
+	if(len < sizeof(FSP_SelectiveNACK))
 	{
-		printf_s("Fatal error %d encountered when generate SNACK\n", spFull);
-		return;
-	}
-	if(spFull - sizeof(FSP_NormalPacketHeader) < 0)
-	{
-		TRACE_HERE("HandleMemoryCorruption");
-		HandleMemoryCorruption();
+		printf_s("Fatal error %d encountered when generate SNACK\n", len);
 		return;
 	}
 
-	register FSP_NormalPacketHeader *pHdr = (FSP_NormalPacketHeader *)buf;
-	pHdr->hs.Set<KEEP_ALIVE>(spFull);
-	pControlBlock->SetSequenceFlags(pHdr, seqExpected);
-	SetIntegrityCheckCode(pHdr);
+	// take the network-order acknowledgement timestamp as the salt to SetIntegrityCheckCode for KEEP_ALIVE
+	// UNRESOLVED! TODO: EmitWithICC may get abnormal headers!
+	buf.hdr.hs.Set<KEEP_ALIVE>(len + sizeof(FSP_NormalPacketHeader));
+	pControlBlock->SetSequenceFlags(& buf.hdr, seqExpected);
+	SetIntegrityCheckCode(& buf.hdr, NULL, 0, buf.GetSaltValue());
 #ifdef TRACE_PACKET
-	printf_s("To send KEEP_ALIVE seq#%u, acknowledge#%u\n", ntohl(pHdr->sequenceNo), seqExpected);
+	printf_s("To send KEEP_ALIVE seq #%u, acknowledge #%u, source ALFID = %u\n", be32toh(buf.hdr.sequenceNo), seqExpected, fidPair.source);
+	printf_s("KEEP_ALIVE total header length: %d, should be payloadless\n", be16toh(buf.hdr.hs.hsp));
+	DumpNetworkUInt16((uint16_t *) & buf, be16toh(buf.hdr.hs.hsp) / 2);
 #endif
-	SendPacket(1, ScatteredSendBuffers(pHdr, spFull));
+	SendPacket(1, ScatteredSendBuffers(& buf.hdr, len));
 }
 
 
 // Given
-//	ControlBlock::seq_t		the maximum sequence number expected by the remote end, without gaps
+//	ControlBlock::seq_t		the accumulatedly acknowledged sequence number
 //	const GapDescriptor *	array of the gap descriptors
 //	int						number of gap descriptors
 // Do
@@ -291,213 +288,83 @@ void CSocketItemEx::KeepAlive()
 //  -EBADF	if gap description insane
 //	-EDOM	if parameter error
 //	-EFAULT if memory corrupted
-//	0 if no error
+//	>=0		the number of packets positively acknowledged
 // Remark
 //	An FSP makes retransmission passively in the sense that it only retransmits those explicitly negatively acknowledged
 //	FSP is conservative in retransmission in the sense that it treats the KEEP-ALIVE signal as if
 //	it were a timer and the interrupt rate should be considerably lower than predefined timer
-//	FSP node simply retransmits lost packets of stream payload while ignores milky payload,
-//	though we know newer packet are of high priority in retransmission for milky payload
-//	while older packets are of higher value for stream payload
-//  if n == 0 it is an accumulative acknowledgment
-int LOCALAPI CSocketItemEx::RespondSNACK(ControlBlock::seq_t expectedSN, const FSP_SelectiveNACK::GapDescriptor *gaps, int n)
+//	and is active optimistic in the sense that retransmission would NOT be withheld by congestion control
+//	FSP node simply retransmits lost packets of stream payload while ignores milky payload
+//  It is an accumulative acknowledgment if n == 0
+int LOCALAPI CSocketItemEx::RespondToSNACK(ControlBlock::seq_t expectedSN, const FSP_SelectiveNACK::GapDescriptor *gaps, int n)
 {
-	// Check validity of the control block descriptors to prevent memory corruption propagation
-	register int32_t	capacity;
-	register int32_t	iHead;
-	register int32_t	tail;
-	ControlBlock::seq_t seqHead = pControlBlock->GetSendWindowFirstSN(capacity, iHead);
-	int sentWidth = pControlBlock->CountUnacknowledged();
-	int ackSendWidth = int(expectedSN - seqHead);
-	if(ackSendWidth == 0 && n != 0)
-	{
-		TRACE_HERE("ackSendWidth == 0 && n != 0");
-		return -EDOM;
-	}
-	if(ackSendWidth < 0 || ackSendWidth > sentWidth)
-	{
-		TRACE_HERE("ackSendWidth < 0 || ackSendWidth > sentWidth");
-		return -EBADF;
-	}
-	// if the send window width < 0, it will return -EFAULT: fatal error, maybe memory corruption caused by ULA
-
-	tail = iHead;
-	if(tail < 0 || tail >= capacity || sentWidth > capacity)	// here tail is still the head
-		return -EFAULT;
+	const int32_t & capacity = pControlBlock->sendBufferBlockN;
+	int32_t	iHead = pControlBlock->sendWindowHeadPos;
+	ControlBlock::seq_t seq0 = pControlBlock->sendWindowFirstSN;
 	if(sizeof(ControlBlock) + sizeof(ControlBlock::FSP_SocketBuf) * capacity > dwMemorySize)
 		return -EFAULT;
 
-	//
-	ControlBlock::PFSP_SocketBuf p0 = pControlBlock->HeadSend();
+	int sentWidth = pControlBlock->CountUnacknowledged();
+	int nAck = pControlBlock->DealWithSNACK(expectedSN, gaps, n);
+	if(nAck < 0)
+		return nAck;
+
+	ControlBlock::PFSP_SocketBuf p = pControlBlock->HeadSend() + iHead;
 	timestamp_t	tNow = NowUTC();
 	uint64_t	rtt64_us = tNow - tEarliestSend;
-	bool		acknowledged = false;	// whether the head packet of the send queue is acknowledged 
-	uint32_t	countAck = 0;
+	bool acknowledged = nAck > 0 ? p->GetFlag<IS_ACKNOWLEDGED>() : false;
+	// here is the key point that SNACK may make retransmission more efficient than time-outed retransmission
+	uint32_t largestOffset = int64_t(tRecentSend - tEarliestSend) > 0
+		? uint32_t((rtt64_us - tRoundTrip_us * 2) * sentWidth / (tRecentSend - tEarliestSend))
+		: uint32_t(rtt64_us > tRoundTrip_us * 2);	// exploit the fact that boolean true == 1, false == 0
 
-	retransTail = retransHead = 0;
-
-	if(ackSendWidth == 0)
-		goto l_success;
-
-	tail += ackSendWidth - 1;
-	if(tail >= capacity)
-		tail -= capacity;
-
-	ControlBlock::PFSP_SocketBuf p = p0 + tail;
-	ControlBlock::seq_t	seqTail = expectedSN;
-	int			k = 0;
-	int			nAck;
-	bool		lessRecent = false;
-	do
-	{
-		// when n == 0 gaps[k] would not be tested, and it is treated as accumulative acknowledgment
-		if(k < n && (gaps[k].dataLength < 0 || gaps[k].gapWidth < 0 || gaps[k].dataLength == 0 && gaps[k].gapWidth == 0))
-			return -EBADF;
-
-		nAck = int(seqTail - seqHead);
-		if(k < n && nAck > gaps[k].dataLength)
-			nAck = gaps[k].dataLength;
-		//
-		// Make acknowledgement
-		while(--nAck >= 0)
-		{
-			--seqTail;
-			// don't care len
-			if(! p->GetFlag<IS_ACKNOWLEDGED>())
-			{
-				p->SetFlag<IS_ACKNOWLEDGED>();
-				countAck++;
-				if(seqTail == seqHead)
-					acknowledged = true;
-			}
-			//
-			if(--tail < 0)
-			{
-				tail += capacity;
-				p = p0 + tail;
-			}
-			else
-			{
-				p--;
-			}
-		}
-		// the first (and possibly last) group of continuous acknowledged packets when k == n
-		if(k >= n)
-			break;
-	
-		// the gap might cross over the first packet in the send window, as out-of-order NACK might be received
-		nAck = min(gaps[k].gapWidth, int32_t(seqTail - seqHead));
-		while(nAck-- > 0)
-		{
-			seqTail--;
-			//
-			if(! lessRecent)
-				lessRecent
-				= rtt64_us - (tRecentSend - tEarliestSend) * (seqTail - seqHead) / sentWidth >= tRoundTrip_us * 2;
-			if(! p->GetFlag<IS_ACKNOWLEDGED>() && lessRecent)
-				retransBackLog[--retransHead] = seqTail;
-			//
-			if(--tail < 0)
-			{
-				tail += capacity;
-				p = p0 + tail;
-			}
-			else
-			{
-				p--;
-			}
-		}
-		//
-		k++;
-	} while(int(seqTail - seqHead) > 0);
-
-l_success:
-	if(congestCtrl.dMin <= 0 || congestCtrl.dMin > rtt64_us)
-		congestCtrl.dMin = rtt64_us;
+	if(largestOffset <= 0)
+		goto l_retransmitted;
 	//
-	// Cubic congestion control; additive increase
-	//
-	while(countAck > 0)	// it is an if. just to avoid goto
+	ControlBlock::seq_t headSN = seq0; 
+	seq0 = expectedSN;
+	for(register int k = 0; k < n - 1; k++)
 	{
-		const int SCALE = (1 << 24);
-		int ii;
-		if(congestCtrl.cwnd < congestCtrl.ssthresh)
+		if(int(seq0 - headSN + iHead - capacity) >= 0)
+			p = pControlBlock->HeadSend() + int(seq0 - headSN + iHead - capacity);
+		else
+			p = pControlBlock->HeadSend() + int(seq0 - headSN + iHead);
+		for(register uint32_t j = 0; j < gaps[k].gapWidth; seq0++, j++)
 		{
-			ii = min(countAck, congestCtrl.ssthresh - congestCtrl.cwnd);
-			congestCtrl.cwnd += ii;
-			if( (countAck -= ii) <= 0)
-				break;
-		}
-
-		float f = congestCtrl.Update(tNow) * countAck;
-		ii = uint32_t(floor(f));
-		congestCtrl.cwnd += ii;
-		congestCtrl.cwndFraction += uint32_t((f - ii) * SCALE);
-		if(congestCtrl.cwndFraction > SCALE)
-		{
-			congestCtrl.cwnd ++;
-			congestCtrl.cwndFraction -= SCALE;
-		}
-		break;	// 'while' is an if
-	}
-
-	// negatively acknowledged in the send queue tail:
-	nAck = pControlBlock->CountUnacknowledged(expectedSN);
-
-	// Clearly we're quite relunctant to assume that loss of packet were caused by congestion
-	if(nAck > 1 && (tNow - tRecentSend) > tRoundTrip_us)
-		congestCtrl.OnCongested();
-	else
-		congestCtrl.CheckTimeout(tNow);
-
-	// for testability and differentiated transmission policy we do not make real retransmissin yet
-	// register retransmission of those sent but not acknowledged after expectedSN
-	if(nAck > 0 && retransTail - retransHead < MAX_RETRANSMISSION)
-	{
-		tail = iHead + ackSendWidth;	// recalibrate it
-		if(tail >= capacity)
-			tail -= capacity;
-		p = p0 + tail;
-		seqTail = expectedSN;	// seqHead + ackSendWidth;
-		do
-		{
-			if(rtt64_us - (tRecentSend - tEarliestSend) * (seqTail - seqHead) / sentWidth < tRoundTrip_us * 2)
-				break;
+			if(uint32_t(seq0 - headSN) > largestOffset)
+				goto l_retransmitted;
+			// Attention please! If you try to trace the packet it would not be retransmitted, for sake of testability
+#ifdef TRACE_PACKET
+			printf_s("Meant to retransmit: SN = %u\n", seq0);
+#else
+			if(! EmitWithICC(p, seq0))
+				goto l_retransmitted;
+#endif
 			//
-			if(! p->GetFlag<IS_ACKNOWLEDGED>())
+			if(++iHead - capacity >= 0)
 			{
-				if(retransTail - retransHead >= MAX_RETRANSMISSION)
-					break;	// for stream payload no further retransmission is possible
-				else
-					retransBackLog[retransTail++] = seqTail;
-			}
-			//
-			++seqTail;
-			if(++tail >= capacity)
-			{
-				tail -= capacity;
-				p = p0 + tail;
+				iHead = 0;
+				p = pControlBlock->HeadSend();
 			}
 			else
 			{
 				p++;
 			}
-		} while(--nAck > 0);
-	}
-	else while(retransTail - retransHead > MAX_RETRANSMISSION)
-	{
-		retransHead = retransTail - MAX_RETRANSMISSION;
+		}
+		//
+		seq0 += gaps[k].dataLength;
 	}
 
-	//	ONLY when the first packet in the send window is acknowledged may round-trip time re-calibrated
-	if(acknowledged)
+l_retransmitted:
+	//	ONLY when the first packet in the send window is acknowledged and retransmission queue has been built may round-trip time re-calibrated
+	if(acknowledged)	// assert(sentWidth > 0);
 	{
 		// UNRESOLVED! to be studied: does RTT increment linearly?
 		_InterlockedExchange8(& toUpdateTimer, 1);
 		// We assume that after sliding send window the number of unacknowledged was reduced
 		pControlBlock->SlideSendWindow();
 		RecalibrateKeepAlive(rtt64_us);
-#ifdef TRACE
+#ifdef TRACE_PACKET
 		printf_s("We guess new tEarliestSend based on relatively tRecentSend = %lld\n"
 			"\ttEarliestSend = %lld, sendWidth = %d, packets on flight = %d\n"
 			, (tNow - tRecentSend)
@@ -510,7 +377,7 @@ l_success:
 #endif
 		// assert(int64_t(tRecentSend - tEarliestSend) >= 0 && sentWidth > pControlBlock->CountUnacknowledged());
 		tEarliestSend += (tRecentSend - tEarliestSend) * (sentWidth - pControlBlock->CountUnacknowledged()) / sentWidth;
-#ifdef TRACE
+#ifdef TRACE_PACKET
 		printf_s("\ttRecentSend - tEarliestSend = %lluus, about %llums\n"
 			, (tRecentSend - tEarliestSend)
 			, (tRecentSend - tEarliestSend) >> 10
@@ -518,42 +385,43 @@ l_success:
 #endif
 	}
 
-	return 0;
+	return nAck;
 }
 
 
 
-// TODO: testability: output the SNACK structure
-// TODO: UNRESOLVED! Just silently discard the malformed packet?
-int LOCALAPI CSocketItemEx::RespondSNACK(ControlBlock::seq_t ackSeqNo, const PFSP_HeaderSignature optHdr)
+// return number of packets acknowledged
+int LOCALAPI CSocketItemEx::RespondToSNACK(ControlBlock::seq_t ackSeqNo, const PFSP_HeaderSignature pHdr)
 {
-	if (optHdr == NULL || optHdr->opCode != SELECTIVE_NACK)
+	if (pHdr == NULL || pHdr->opCode != SELECTIVE_NACK)
 	{
 #ifdef TRACE_PACKET
 		TRACE_HERE("accumulative acknowledgement");
 #endif
-		return RespondSNACK(ackSeqNo, NULL, 0);
+		return RespondToSNACK(ackSeqNo, NULL, 0);
 	}
 
-	FSP_SelectiveNACK::GapDescriptor *gaps
-		= (FSP_SelectiveNACK::GapDescriptor *)((BYTE *)headPacket->GetHeaderFSP() + ntohs(optHdr->hsp));
-	FSP_SelectiveNACK *pHdr = (FSP_SelectiveNACK *)((BYTE *)optHdr + sizeof(*optHdr) - sizeof(*pHdr));
-	int n = int((BYTE *)gaps - (BYTE *)pHdr);
+	int len = be16toh(pHdr->hsp) - sizeof(FSP_NormalPacketHeader);
+	FSP_SelectiveNACK *pRightEdge = (FSP_SelectiveNACK *)((BYTE *)pHdr + sizeof(FSP_HeaderSignature) - sizeof(FSP_SelectiveNACK));
+
+	if(int(pRightEdge->ackTime - tLastAck) <= 0)
+		return 0;
+	tLastAck = pRightEdge->ackTime;
+
+	FSP_SelectiveNACK::GapDescriptor *gaps = (FSP_SelectiveNACK::GapDescriptor *)((BYTE *)pHdr + sizeof(FSP_HeaderSignature) - len);
+	int n = len - sizeof(FSP_SelectiveNACK);
 	if (n < 0)
 		return -EBADF;	// this is a malformed packet.
 
 	n /= sizeof(FSP_SelectiveNACK::GapDescriptor);
-	if (pHdr->lastGap != 0)
-		n++;
-	for (register int i = n - 1; i >= 0; i--)
+	for(register int i = 0; i < n; i++)
 	{
-		gaps[i].gapWidth = ntohs(gaps[i].gapWidth);
-		gaps[i].dataLength = ntohs(gaps[i].dataLength);
+		gaps[i].gapWidth = be32toh(gaps[n].gapWidth);
+		gaps[i].dataLength = be32toh(gaps[n].dataLength);
 	}
 
-	return RespondSNACK(ackSeqNo, gaps, n);
+	return RespondToSNACK(ackSeqNo, gaps, n);
 }
-
 
 
 
@@ -572,69 +440,12 @@ void CSocketItemEx::RecalibrateKeepAlive(uint64_t rtt64_us)
 	uint64_t rttRaw = (rtt64_us + 3) >> 2;
 	rttRaw += tRoundTrip_us >> 1;
 	tKeepAlive_ms >>= 1;
-	tKeepAlive_ms += UINT32(rttRaw >> 9);	// Aproximate 1000/2 with 512
-	tRoundTrip_us = UINT32(min(rttRaw, UINT32_MAX));
+	tKeepAlive_ms += uint32_t(rttRaw >> 9);	// Aproximate 1000/2 with 512
+	tRoundTrip_us = uint32_t(min(rttRaw, UINT32_MAX));
 	// make sure tKeepAlive is not insanely small after calibration
-	tKeepAlive_ms = max(tKeepAlive_ms, UINT32(min((rtt64_us + KEEP_ALIVE_TIMEOUT_MIN_us) >> 10, UINT32_MAX)));
+	tKeepAlive_ms = max(tKeepAlive_ms, uint32_t(min((rtt64_us + KEEP_ALIVE_TIMEOUT_MIN_us) >> 10, UINT32_MAX)));
 
 #ifdef TRACE
 	printf_s("\tCalibrated round trip time = %uus, keep-alive timeout = %ums\n\n", tRoundTrip_us,  tKeepAlive_ms);
 #endif
-}
-
-void CSocketItemEx::CubicRate::CheckTimeout(timestamp_t t1)
-{
-	if(T0 > 0 && t1 - T0 > (TRASIENT_STATE_TIMEOUT_ms << 10))
-		Reset();
-}
-
-
-
-void CSocketItemEx::CubicRate::OnCongested()
-{
-	T0 = 0;
-	Wmax = cwnd < Wmax	// fast convergence is always applied
-		? cwnd * (2 - CONGEST_CONTROL_BETA) / 2
-		: cwnd;
-	cwnd = max(cwndMin, uint32_t(cwnd * (1 - CONGEST_CONTROL_BETA)));
-	ssthresh = cwnd;
-	cwndFraction = 0;
-}
-
-
-
-void CSocketItemEx::CubicRate::Reset()
-{
-	Wmax = 0;
-	T0 = 0;	// the epoch of last congestion
-	originPoint = 0;
-	K = 0;
-	dMin = 0;
-	cwnd = cwndMin = INITIAL_CONGESTION_WINDOW;	// UNRESOLVED! minimum rate guarantee...
-	ssthresh = cwnd;
-	cwndFraction = 0;
-}
-
-
-// brute-force float-point calculation of increase delta
-float CSocketItemEx::CubicRate::Update(timestamp_t t1)
-{
-	if (T0 <= 0)
-	{
-		T0 = t1;
-		if (cwnd < Wmax)
-		{
-			K = CubicRoot((Wmax - cwnd) / CONGEST_CONTROL_C);
-			originPoint = uint32_t(Wmax);
-		}
-		else
-		{
-			K = 0;
-			originPoint = cwnd;
-		}
-	}
-	// The unit of the time
-	double W = CONGEST_CONTROL_C * CubicPower((t1 + dMin - T0) * 1e-6) + originPoint;
-	// some anti-alias measure should be taken by the caller
-	return float(W > cwnd ? W / cwnd - 1 : 0.01); 
 }

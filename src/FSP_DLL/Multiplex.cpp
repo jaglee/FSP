@@ -105,25 +105,10 @@ FSPHANDLE FSPAPI ConnectMU(FSPHANDLE hFSP, PFSP_Context psp1)
 //	|-->[{Return Commit}]-->{new context}COMMITTING
 //		-->[Send COMMIT]{enable retry}
 //	|-->[{Return}:Reject]-->[Send RESET] {abort creating new context}
-// 情形1：(PERSIST, ICC, 流控参数, 半连接参数，载荷)
-// 情形2：(COMMIT, ICC, 流控参数, SNACK, 载荷)
-// 情形3：RESET...
 bool LOCALAPI CSocketItemDl::ToWelcomeMultiply(BackLogItem & backLog)
 {
 	// Multiply: but the upper layer application may still throttle it...fpRequested CANNOT read or write anything!
 	PFSP_IN6_ADDR remoteAddr = (PFSP_IN6_ADDR) & pControlBlock->peerAddr.ipFSP.allowedPrefixes[MAX_PHY_INTERFACES-1];
-
-	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend();
-	FSP_AckConnectRequest & welcome = *(FSP_AckConnectRequest *)GetSendPtr(skb);
-	FSP_ConnectParam & varParams = welcome.params;
-
-	varParams.listenerID = pControlBlock->idParent;
-	varParams.hs.Set<MOBILE_PARAM>(sizeof(FSP_NormalPacketHeader));
-	welcome.hs.Set<PERSIST>(sizeof(welcome));
-	//
-	skb->opCode = PERSIST;	// unlike in CHALLENGING state
-	skb->len = sizeof(welcome);
-	skb->Unlock();
 
 	int r;
 	if( fpRequested == NULL	// This is NOT the same policy as ToWelcomeConnect
@@ -132,7 +117,7 @@ bool LOCALAPI CSocketItemDl::ToWelcomeMultiply(BackLogItem & backLog)
 		// UNRESOLVED! report that the upper layer application reject it?
 		return false;
 	}
-	// UNRESOLVED! To change the opcode of the last payload packet to COMMIT...
+
 	SetState(r == 0 ? ESTABLISHED : COMMITTING);
 
 	return true;

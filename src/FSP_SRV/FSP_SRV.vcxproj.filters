@@ -11,8 +11,8 @@
     <ClCompile Include="remote.cpp" />
     <ClCompile Include="socket.cpp" />
     <ClCompile Include="timers.cpp" />
-    <ClCompile Include="ocb.c" />
     <ClCompile Include="..\gcm-aes.c" />
+    <ClCompile Include="CRC64.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\FSP.h">
@@ -25,9 +25,6 @@
       <Filter>Headers</Filter>
     </ClInclude>
     <ClInclude Include="fsp_srv.h">
-      <Filter>Headers</Filter>
-    </ClInclude>
-    <ClInclude Include="ae.h">
       <Filter>Headers</Filter>
     </ClInclude>
     <ClInclude Include="..\gcm-aes.h">
