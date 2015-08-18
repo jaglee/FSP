@@ -199,11 +199,8 @@ void CSocketItemEx::InstallEphemeralKey()
 
 
 
-// TODO: (see also ValidateICC)
-// Install session key might be quick, e.g. a pre-shared key installed as soon as CHALLENGE
-// If there's no data in flight, the send key is installed immediately
-// But only in CHALLENGING, PEER_COMMIT, COMMITTING2 or CLOSABLE state
-// may the first receive sequence number of the packet that exploited the new key set
+// If there is no data in flight from perspect of ULA's point of view, the send key is installed immediately
+// If the receive buffer is empty, it is assume that the peer has been ready to apply the new key
 void CSocketItemEx::InstallSessionKey()
 {
 #ifndef NDEBUG
@@ -215,10 +212,11 @@ void CSocketItemEx::InstallSessionKey()
 #endif
 	contextOfICC.savedCRC = (contextOfICC.keyLife == 0);
 	contextOfICC.prev = contextOfICC.curr;
-	contextOfICC.keyLife = pControlBlock->connectParams.timeDelta;
-	contextOfICC.firstSendSNewKey = pControlBlock->sendWindowNextSN;
+	contextOfICC.keyLife = pControlBlock->connectParams.initialSN;
+
+	contextOfICC.firstSendSNewKey = pControlBlock->sendBufferNextSN;
 	contextOfICC.firstRecvSNewKey = pControlBlock->recvWindowNextSN;
-	
+
 	GCM_AES_SetKey(& contextOfICC.curr.gcm_aes, (uint8_t *) & pControlBlock->connectParams, pControlBlock->connectParams.keyLength);
 }
 
@@ -271,9 +269,6 @@ void LOCALAPI CSocketItemEx::SetIntegrityCheckCode(FSP_NormalPacketHeader *p1, v
 		if(byteA < sizeof(FSP_NormalPacketHeader) || byteA > MAX_LLS_BLOCK_SIZE || (byteA & (sizeof(uint64_t) - 1)) != 0)
 			return;
 
-		// Synchronize the session key
-		if(seqNo == contextOfICC.firstSendSNewKey)
-			p1->SetFlag<Encrypted>();
 		p1->integrity.id = fidPair;
 		GCM_AES_XorSalt(pCtx, salt);
 		if(GCM_AES_AuthenticatedEncrypt(pCtx, *(uint64_t *)p1
@@ -310,11 +305,6 @@ void LOCALAPI CSocketItemEx::SetIntegrityCheckCode(FSP_NormalPacketHeader *p1, v
 bool CSocketItemEx::ValidateICC(FSP_NormalPacketHeader *p1, int32_t ctLen, uint32_t salt)
 {
 	ALIGN(MAC_ALIGNMENT) uint64_t tag[FSP_TAG_SIZE / sizeof(uint64_t)];
-
-	// UNRESOLVED! But if out-of-order packet which set the sequence number continually received within the receive window?
-	// synchronize the session key
-	//if(p1->GetFlag<Encrypted>())
-	//	contextOfICC.firstRecvSNewKey = headPacket->pktSeqNo;
 
 	tag[0] = p1->integrity.code;
 #ifdef TRACE_PACKET
@@ -426,10 +416,6 @@ bool CSocketItemEx::EmitStart()
 		result = SendPacket(2, ScatteredSendBuffers(pHdr, sizeof(FSP_NormalPacketHeader), payload, skb->len));
 		break;
 	case PERSIST:	// PERSIST is an in-band control packet with optional payload that confirms a connection
-		if(! skb->GetFlag<TO_BE_CONTINUED>())	// which mean it has not been chained with sending
-			skb->SetFlag<IS_COMPLETED>();
-		if(InState(COMMITTING) || InState(COMMITTING2))
-			skb->opCode = COMMIT;
 	case RESUME:	// RESUME is an in-band control packet that try re-established a broken/paused connection
 	case COMMIT:	// COMMIT is always in the queue
 	case MULTIPLY:
@@ -481,12 +467,17 @@ bool LOCALAPI CSocketItemEx::EmitWithICC(ControlBlock::PFSP_SocketBuf skb, Contr
 
 	//
 	if(contextOfICC.keyLife > 0)
-	{
 		contextOfICC.keyLife--;
-	}
-	else if(_InterlockedCompareExchange8(& pControlBlock->newKeyPending, 0, 1) != 0)
+	// The COMMIT packet, if any, is the last one that applied CRC64 or the old transmission key
+	if(skb->opCode == COMMIT && _InterlockedCompareExchange8(& pControlBlock->hasPendingKey, 0, 1) != 0)
 	{
-		// but only in some limit state may a new key installed!
+		InstallSessionKey();
+		contextOfICC.firstSendSNewKey = seq + 1;
+	}
+	else if(skb->opCode == RESUME && _InterlockedCompareExchange8(& pControlBlock->hasPendingKey, 0, 1) != 0)
+	{
+		InstallSessionKey();
+		contextOfICC.firstSendSNewKey = seq;
 	}
 
 	void  *payload = (FSP_NormalPacketHeader *)this->GetSendPtr(skb);
@@ -542,17 +533,11 @@ bool LOCALAPI CSocketItemEx::HandleMobileParam(PFSP_HeaderSignature optHdr)
 // To make life easier assume it has gain unique access to the LLS socket
 // See also HandleEmitQ, HandleFullICC
 // TODO: rate-control/quota control
-// To be checked: atomicity of sendWindowFirstSN and sendWindowHeadPos...
 void ControlBlock::EmitQ(CSocketItem *context)
 {
 	while (int(sendWindowNextSN - sendBufferNextSN) < 0 && CheckSendWindowLimit())
 	{
-		register int d = int(sendWindowNextSN - sendWindowFirstSN);
-		if (d < 0)
-			break;
-		d += sendWindowHeadPos;
-		//
-		register PFSP_SocketBuf skb = HeadSend() + (d - sendBufferBlockN >= 0 ? d - sendBufferBlockN : d);
+		register PFSP_SocketBuf skb = HeadSend() + sendWindowNextPos;
 		// The flag IS_COMPLETED is for double-stage commit of send buffer, for sake of sending online compressed stream
 		if (!skb->GetFlag<IS_COMPLETED>())
 		{
@@ -563,10 +548,10 @@ void ControlBlock::EmitQ(CSocketItem *context)
 		}
 		if (!skb->Lock())
 		{
-//#ifdef TRACE
+#ifdef TRACE
 			printf_s("Should be rare: cannot get the exclusive lock on the packet to send SN#%u\n", sendWindowNextSN);
-//#endif
-			++sendWindowNextSN;
+#endif
+			SlideNextToSend();
 			continue;
 		}
 
@@ -576,7 +561,7 @@ void ControlBlock::EmitQ(CSocketItem *context)
 			break;
 		}
 		//
-		if (sendWindowNextSN++ == sendWindowFirstSN) // note that the side-effect is a requirement
+		if (SlideNextToSend() == sendWindowFirstSN)
 			((CSocketItemEx *)context)->SetEarliestSendTime();
 	}
 }

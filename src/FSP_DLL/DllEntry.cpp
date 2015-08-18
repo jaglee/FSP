@@ -76,7 +76,7 @@ BOOL WINAPI DllMain(HINSTANCE hInstance, DWORD dwReason, LPVOID lpvReserved)
 #ifdef TRACE
 		AllocConsole();
 #endif
-		_mdService = CreateFile(SERVICE_MAILSLOT_NAME
+		_mdService = CreateFileA(SERVICE_MAILSLOT_NAME
 				, GENERIC_WRITE	
 				// no GENERIC_READ needed, but MUST shared read, because LLS create the mailslot for read
 				, FILE_SHARE_WRITE | FILE_SHARE_READ
@@ -155,12 +155,12 @@ int LOCALAPI CSocketItemDl::Initialize(PFSP_Context psp1, char szEventName[MAX_N
 	}
 
 	// make the event name. the control block address, together with the process id, uniquely identify the event
-	sprintf_s(szEventName, MAX_NAME_LENGTH, REVERSE_EVENT_NAME "%08X%08X", idThisProcess, (uint32_t)pControlBlock);
+	sprintf_s(szEventName, MAX_NAME_LENGTH, REVERSE_EVENT_PREFIX "%08X%08X", idThisProcess, (uint32_t)pControlBlock);
 	// system automatically resets the event state to nonsignaled after a single waiting thread has been released
-	hEvent = CreateEvent(& attrSecurity
+	hEvent = CreateEventA(& attrSecurity
 		, FALSE // not manual-reset
 		, FALSE // the initial state of the event object is nonsignaled
-		, (LPCTSTR )szEventName);
+		, szEventName);	// (LPCTSTR)
 
 #ifdef TRACE
 	printf_s("ID of current process is %d, handle of the event is %08X\n", idThisProcess, hEvent);
@@ -179,7 +179,7 @@ int LOCALAPI CSocketItemDl::Initialize(PFSP_Context psp1, char szEventName[MAX_N
 		pControlBlock->Init(psp1->sendSize, psp1->recvSize);
 
 	pControlBlock->notices[0] = FSP_IPC_CannotReturn;
-	//^only after the control block is successfully mapped into the memory space of LLS may it be cleared by SetReturned()
+	//^only after the control block is successfully mapped into the memory space of LLS may it be cleared by SetCallable()
 
 	// could be exploited by ULA to make distinguishment of services
 	memcpy(&context, psp1, sizeof(FSP_SocketParameter));
@@ -276,13 +276,6 @@ void CSocketItemDl::WaitEventToDispatch()
 			SetMutexFree();
 			NotifyError(notice, -EINTR);
 			return;
-		case FSP_NotifyToCommit:
-			// UNRESOLVED! Callback ULA?
-			if (IsRecvBufferEmpty())
-				SetMutexFree();
-			else
-				ProcessReceiveBuffer();
-			break;
 		case FSP_NotifyFlushed:
 			ToConcludeCommit();		// SetMutexFree();
 			break;

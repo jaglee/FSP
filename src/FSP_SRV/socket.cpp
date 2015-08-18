@@ -62,10 +62,8 @@ CSocketSrvTLB::CSocketSrvTLB()
 CSocketItemEx * CSocketSrvTLB::AllocItem()
 {
 	// TODO: UNRESOLVED!? Make sure it is multi-thread/muti-core safe
-	while(_InterlockedCompareExchange8(& this->mutex, 1, 0))
-	{
-		Sleep(0);	// just yield out the CPU time slice
-	}
+	if(! WaitSetMutex())
+		return NULL;
 
 	CSocketItemEx *p = headFreeSID;
 	if(p != NULL)
@@ -442,16 +440,17 @@ void CSocketItemEx::InitiateConnect()
 	TRACE_HERE("called");
 	SetState(CONNECT_BOOTSTRAP);
 
+	// Note tht we cannot put initial SN into ephemeral session key as the peers do not have the same initial SN
 	SConnectParam & initState = pControlBlock->connectParams;
 	rand_w32((uint32_t *) & initState,
-		( sizeof(initState.cookie)
-		+ sizeof(initState.initCheckCode)
-		+ sizeof(initState.salt)
-		+ sizeof(initState.initialSN) ) / sizeof(uint32_t) );
-	initState.timeStamp = NowUTC();
+		( sizeof(initState.initCheckCode)
+		+ sizeof(initState.cookie)
+		+ sizeof(initState.salt) ) / sizeof(uint32_t) );
+	initState.nboTimeStamp = htobe64(NowUTC());
+	rand_w32(& initState.initialSN, 1);
 	// Remote fiber ID was set when the control block was created
 	// for calculation of the initial round-trip time
-	pControlBlock->connectParams.timeStamp = initState.timeStamp;
+	pControlBlock->connectParams.nboTimeStamp = initState.nboTimeStamp;
 	pControlBlock->SetSendWindowHead(initState.initialSN);
 
 	// INIT_CONNECT can only be the very first packet
@@ -470,7 +469,7 @@ void CSocketItemEx::InitiateConnect()
 	q->salt = initState.salt;
 	q->hs.Set<FSP_InitiateRequest, INIT_CONNECT>();	// See also AffirmConnect()
 
-	q->timeStamp = htobe64(initState.timeStamp);
+	q->timeStamp = initState.nboTimeStamp;
 	skb->SetFlag<IS_COMPLETED>();	// for resend
 	// it neednot be unlocked
 	SendPacket(1, ScatteredSendBuffers(q, sizeof(FSP_InitiateRequest)));
@@ -505,14 +504,17 @@ void LOCALAPI CSocketItemEx::AffirmConnect(const SConnectParam & initState, ALFI
 
 	SetState(CONNECT_AFFIRMING);
 
-	FSP_ConnectParam & varParams = pkt->params;
-	pkt->cookie = initState.cookie;
-	pkt->timeDelta = htobe32(initState.timeDelta);
+	// Because CONNECT_REQUEST overlay INIT_CONNECT these three fields are reused
+	//pkt->timeStamp = initState.nboTimeStamp;
+	//pkt->initCheckCode = initState.initCheckCode;
+	//pkt->salt = initState.salt;
 	pkt->initialSN = htobe32(initState.initialSN);
+	pkt->timeDelta = htobe32(initState.timeDelta);
+	pkt->cookie = initState.cookie;
 	// assert(sizeof(initState.allowedPrefixes) >= sizeof(varParams.subnets));
-	memcpy(varParams.subnets , initState.allowedPrefixes, sizeof(varParams.subnets));
-	varParams.listenerID = idListener;
-	varParams.hs.Set<MOBILE_PARAM>(sizeof(FSP_ConnectRequest) - sizeof(FSP_ConnectParam));
+	memcpy(pkt->params.subnets , initState.allowedPrefixes, sizeof(pkt->params.subnets));
+	pkt->params.listenerID = idListener;
+	pkt->params.hs.Set<MOBILE_PARAM>(sizeof(FSP_ConnectRequest) - sizeof(FSP_ConnectParam));
 	pkt->hs.Set<FSP_ConnectRequest, CONNECT_REQUEST>();
 
 	// while version remains as the same as the very beginning INIT_CONNECT
@@ -531,27 +533,34 @@ void LOCALAPI CSocketItemEx::AffirmConnect(const SConnectParam & initState, ALFI
 
 
 
-// Given
-//	FSPOperationCode		the opCode of the new inserted or updated to
 // Do
-//	Update the opCode of the head packet in the send queue to designated, or
-//	insert a new packet of the designated opCode if the queue is still empty
+//	Update the opCode of the head packet in the send queue to PERSIST, or
+//	insert a new PERSIST packet if the send queue is still empty
 // Remark
+//	If the end queue is not empty, only the starting PURE_DATA may be replaced by PERSIST
 //	It is assumed that DLL/ULA is waiting for LLS when this subroutine is eventually called
-void LOCALAPI CSocketItemEx::ReplaceSendQueueHead(FSPOperationCode opCode)
+bool CSocketItemEx::PersistConnect()
 {
 	ControlBlock::PFSP_SocketBuf skb;
 	if(pControlBlock->CountSendBuffered() <= 0)
 	{
 		skb = pControlBlock->GetSendBuf();
 		skb->len = 0;
+		skb->SetFlag<IS_COMPLETED>();
 	}
 	else
 	{
 		skb = pControlBlock->GetSendQueueHead();
+		if(skb->opCode == PERSIST)
+			return true;
+		if(skb->opCode != PURE_DATA)
+			return false;
 	}
-	skb->opCode = opCode;
+	//
+	skb->opCode = PERSIST;
+	return true;
 }
+
 
 
 // Remark
@@ -565,16 +574,15 @@ void CSocketItemEx::SynConnect()
 	InitAssociation();
 
 	// See also CSocketItemEx::Start()
-	if(lowState == ESTABLISHED)
-		ReplaceSendQueueHead(PERSIST);
-	else if(lowState == COMMITTING || lowState == COMMITTING2)
-		ReplaceSendQueueHead(COMMIT);
-	else // It MUST be in CHALLENGING state
+	lowState = pControlBlock->state;
+	if(lowState == CHALLENGING)
 		InstallEphemeralKey();
+	else
+		PersistConnect();
 	//^ ephemeral session key material was ready when CSocketItemDl::PrepareToAccept
 
 	EmitStart();
-	pControlBlock->MoveNextToSend();
+	pControlBlock->sendWindowNextSN++;
 
 	if(timer != NULL)
 	{
@@ -586,7 +594,7 @@ void CSocketItemEx::SynConnect()
 	tKeepAlive_ms = TRASIENT_STATE_TIMEOUT_ms;
 	AddTimer();
 
-	SetReturned();	// The success or failure signal is delayed until PERSIST, COMMIT or RESET received
+	SetCallable();	// The success or failure signal is delayed until PERSIST, COMMIT or RESET received
 }
 
 
@@ -646,19 +654,34 @@ void CSocketItemEx::DisposeOnReset()
 // See also ~::TimeOut case NON_EXISTENT
 void CSocketItemEx::Extinguish()
 {
-	SetState(NON_EXISTENT);
-	RemoveTimer();
-	CSocketItem::Destroy();
-	inUse = 0;	// FreeItem does not reset it
-	(CLowerInterface::Singleton())->FreeItem(this);
+	try
+	{
+		lowState = NON_EXISTENT;	// SetState(NON_EXISTENT);
+		RemoveTimer();
+		CSocketItem::Destroy();
+		inUse = 0;	// FreeItem does not reset it
+		(CLowerInterface::Singleton())->FreeItem(this);
+	}
+	catch(...)
+	{
+		// UNRESOLVED! trap run-time exception and trace the calling stack, write error log
+	}
 }
+
 
 
 // Do
 //	Commit the receive-side half-session on request of the remote end
 //	Send ACK_FLUSH to the remote peer if not in CLOSED state and notify the near end ULA
-void CSocketItemEx::PeerCommit()
+void CSocketItemEx::CheckPeerCommit()
 {
+	int r = pControlBlock->HasBeenCommitted();
+	//
+	// But, if multiple COMMIT? ACK_FLUSH is out-of-band. It is unnecessary to reply to each COMMIT
+	//
+	if(r <= 0)
+		return;
+
 	if (lowState == COMMITTING)
 	{
 		SetState(COMMITTING2);
@@ -674,9 +697,7 @@ void CSocketItemEx::PeerCommit()
 		SetState(PEER_COMMIT);
 	}
 	//
-	SendPacket<ACK_FLUSH>();
-
-	Notify(FSP_NotifyToCommit);
+	SendSNACK();
 }
 
 

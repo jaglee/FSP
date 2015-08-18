@@ -465,15 +465,14 @@ void * LOCALAPI ControlBlock::InquireSendBuf(int & m)
 	}
 	// and no memory overwritten even it happens that sendBufferNextPos == sendWindowHeadPos
 	register int i = sendBufferNextPos;
-	if(i == sendWindowHeadPos)
+	register int k = sendWindowHeadPos;	// get the snap value
+	if(i == k)
 	{
-		m = MAX_BLOCK_SIZE * ClearSendWindow();
+		m = MAX_BLOCK_SIZE * ResetSendWindow();
 		return (BYTE *)this + sendBuffer;
 	}
 
-	m = (i > sendWindowHeadPos)
-		? MAX_BLOCK_SIZE * (sendBufferBlockN - i) 
-		: MAX_BLOCK_SIZE * (sendWindowHeadPos - i);
+	m = ((i > k ? sendBufferBlockN : k) - i) * MAX_BLOCK_SIZE;
 	return (BYTE *)this + sendBuffer + i * MAX_BLOCK_SIZE;
 }
 
@@ -503,7 +502,8 @@ int ControlBlock::MarkSendQueue(void * buf, int n, bool toBeContinued)
 	if(m < n)
 		return -ENOMEM;
 
-	register PFSP_SocketBuf p = HeadSend() + ((BYTE *)buf - (BYTE *)this - sendBuffer) / MAX_BLOCK_SIZE;
+	assert(sendBufferNextPos == ((BYTE *)buf - (BYTE *)this - sendBuffer) / MAX_BLOCK_SIZE);
+	register PFSP_SocketBuf p = HeadSend() + sendBufferNextPos;
 	// p now is the descriptor of the first available buffer block
 	m = (n - 1) / MAX_BLOCK_SIZE;
 	for(int j = 0; j < m; j++)
@@ -812,22 +812,19 @@ int LOCALAPI ControlBlock::GetSelectiveNACK(seq_t & snExpect, FSP_SelectiveNACK:
 // Slide the left border of the send window and mark the acknowledged buffer block free
 void ControlBlock::SlideSendWindow()
 {
-	for(PFSP_SocketBuf p = HeadSend() + sendWindowHeadPos;
-		int(sendWindowNextSN - sendWindowFirstSN) > 0 && p->GetFlag<IS_ACKNOWLEDGED>();
-		sendWindowFirstSN++)
+	while(CountUnacknowledged() > 0)
 	{
+		register PFSP_SocketBuf p = GetSendQueueHead();
+		if(! p->GetFlag<IS_ACKNOWLEDGED>())
+			break;
+
 		p->flags = 0;
 		sendWindowSize--;
+
+		if(++sendWindowHeadPos - sendBufferBlockN >= 0)
+			sendWindowHeadPos -= sendBufferBlockN;
 		//
-		if(++sendWindowHeadPos >= sendBufferBlockN)
-		{
-			p = HeadSend();
-			sendWindowHeadPos = 0;
-		}
-		else
-		{
-			p++;
-		}
+		sendWindowFirstSN++;
 	}
 }
 
@@ -892,16 +889,24 @@ int LOCALAPI ControlBlock::DealWithSNACK(seq_t expectedSN, const FSP_SelectiveNA
 
 
 
-// Return whether it is in the CLOSABLE state or a COMMIT packet has already been received
-bool ControlBlock::IsClosable() const
+// Return
+//	0 if there is no COMMIT packet in the queue, or there is some gap before the COMMIT packet
+//	positive if the last packet in the queue is a COMMIT and there is no gap before the COMMIT packet AND no packet after the COMMIT packet
+//	negative if there is at least one COMMIT packet in the queue and there is no gap before the COMMIT packet but there is some packet after it as well
+int ControlBlock::HasBeenCommitted() const
 {
 	register int k = recvWindowHeadPos;
 	register PFSP_SocketBuf skb = HeadRecv() + k;
+	int r = 0;
+	int i;
 	// Check the packet before COMMIT
-	for (int i = 0; i < CountReceived() - 1; i++)
+	for(i = 0; i < CountReceived() - 1; i++)
 	{
 		if (!skb->GetFlag<IS_FULFILLED>())
-			return false;
+			break;
+		//
+		if(skb->opCode == COMMIT)
+			r++;
 		//
 		if (++k - recvBufferBlockN >= 0)
 		{
@@ -913,8 +918,11 @@ bool ControlBlock::IsClosable() const
 			skb++;
 		}
 	}
-	// Check the last receive: it should be COMMIT
-	return (skb->opCode == COMMIT);
+	//
+	if(i == CountReceived() - 1 && skb->opCode == COMMIT)
+		return r + 1;
+	else
+		return -r;
 }
 
 
@@ -955,36 +963,4 @@ bool ControlBlock::FSP_SocketBuf::Lock()
 #else
 	return InterlockedBitTestAndSet((LONG *) & flags, EXCLUSIVE_LOCK) == 0;
 #endif
-}
-
-
-
-
-// Peek the packet rightly in front of COMMIT
-ControlBlock::PFSP_SocketBuf ControlBlock::PeekAnteCommit() const
-{
-	register seq_t seq = sendWindowNextSN;
-	register int d = int(seq - sendWindowFirstSN);
-	register PFSP_SocketBuf skb;
-	if (d < 0)
-		return NULL;
-
-	while (int(seq - sendBufferNextSN) < 0)
-	{
-		d += sendWindowHeadPos;
-		//
-		skb = HeadSend() + (d - sendBufferBlockN >= 0 ? d - sendBufferBlockN : d);
-		if(skb->opCode == COMMIT)
-		{
-			if(seq + 1 - sendBufferNextSN >= 0)
-				return NULL;
-			d++;
-			return HeadSend() + (d - sendBufferBlockN >= 0 ? d - sendBufferBlockN : d);
-		}
-
-		seq++;
-		d = int(seq - sendWindowFirstSN);
-	}
-	//
-	return NULL;
 }

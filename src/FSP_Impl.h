@@ -133,9 +133,9 @@ extern CStringizeNotice noticeNames;
 /**
  * IPC
  */
-#define SERVICE_MAILSLOT_NAME "\\\\.\\mailslot\\flexible\\session\\protocol"
+#define SERVICE_MAILSLOT_NAME	"\\\\.\\mailslot\\flexible\\session\\protocol"
 #define MAX_CTRLBUF_LEN		424	// maximum message passing structure/mailslot size
-#define REVERSE_EVENT_NAME	"Global\\FlexibleSessionProtocolEvent"
+#define REVERSE_EVENT_PREFIX	"Global\\FlexibleSessionProtocolEvent"
 #define MAX_NAME_LENGTH		64	// considerably less than MAX_PATH
 
 #ifdef _DEBUG
@@ -217,7 +217,7 @@ enum FSP_FlagPosition: UINT8
 {
 	ToBeContinued = 0,
 	Compressed = 1,
-	Encrypted = 2,
+	RESERVED_AT_2,
 	RESERVED_AT_3,
 	FirstInFirstDrop = 4,
 };
@@ -269,7 +269,7 @@ struct FSP_InitiateRequest
 // to be followed by the certificate optional header
 struct FSP_Challenge
 {
-	uint64_t		cookie;
+	uint64_t	cookie;
 	uint64_t	initCheckCode;
 	int32_t		timeDelta;
 	$FSP_HeaderSignature hs;
@@ -289,7 +289,7 @@ struct FSP_ConnectParam
 	__declspec(property(get=getHostID, put=setHostID))
 	uint32_t	idHostALF;
 	uint32_t	getHostID() const { return listenerID; }
-	void	setHostID(uint32_t value) { listenerID = value; }
+	void		setHostID(uint32_t value) { listenerID = value; }
 	//
 	$FSP_HeaderSignature hs;
 };
@@ -426,11 +426,11 @@ struct SConnectParam	// MUST be aligned on 64-bit words!
 	uint64_t	initCheckCode;
 	uint64_t	cookie;
 	uint32_t	salt;
-	uint32_t	initialSN;	// the initial sequence number of the packet to send
-	// together with the first four fields, totally 256 bits, could be overlaid
-	timestamp_t timeStamp;
-	//
 	int32_t		timeDelta;	// delay of peer to peer timestamp, delta of clock 
+	timestamp_t nboTimeStamp;
+	//^ Timestamp in network byte order, together with the first four fields, totally 256 bits could be overlaid
+	//
+	uint32_t	initialSN;	// the initial sequence number of the packet to send
 	int32_t		keyLength;	// by default 16 bytes
 	ALFID_T		idRemote;	// ID of the listener or the new forked, depending on context
 	uint32_t	remoteHostID;
@@ -446,6 +446,9 @@ struct BackLogItem: SConnectParam
 	ALFID_T		idParent;
 	//^ 0 if it is the 'root' acceptor, otherwise the local fiber ID of the cloned connection
 	uint32_t	expectedSN;	// the expected sequence number of the packet to receive by order
+	//
+	BackLogItem() { } // default constructor
+	BackLogItem(ALFID_T id1, uint32_t salt1) { idRemote = id1; salt = salt1; } 
 };
 
 
@@ -503,7 +506,8 @@ struct ControlBlock
 {
 	ALIGN(8)
 	volatile FSP_Session_State state;
-	char			newKeyPending;
+	char			hasPendingKey;
+
 	ALFID_T			idParent;
 
 	ALIGN(8)	// 64-bit aligment
@@ -540,25 +544,27 @@ struct ControlBlock
 	//
 	// BEGIN REGION: buffer descriptors 
 	//
+	// (head position, send window first sn), (send window next posistion, send window next sequence nuber)
+	// and (buffer next position, send buffer next sequence number) are managed independently
+	// for maximum parallism in DLL and LLS
+	// the send queue is empty when sendWindowFirstSN == sendWindowNextSN
 	seq_t		sendWindowFirstSN;	// left-border of the send window
-	seq_t		sendWindowNextSN;	// the sequence number of the next packet to send
-	// it means that the send queue is empty when sendWindowFirstSN == sendWindowSN2Recv
-	int32_t		sendWindowSize;		// in blocks, width of the send window
-	// (next position, send buffer next sn) (head position, send window first sn)
-	// are managed independently for maximum parallism in DLL and LLS
 	int32_t		sendWindowHeadPos;	// the index number of the block with sendWindowFirstSN
+	seq_t		sendWindowNextSN;	// the sequence number of the next packet to send
+	int32_t		sendWindowNextPos;	// the index number of the block with sendWindowNextSN
 	seq_t		sendBufferNextSN;
 	int32_t		sendBufferNextPos;	// the index number of the block with sendBufferNextSN
 	//
-	int32_t		sendBufferBlockN;	// capacity of the send buffer
+	int32_t		sendWindowSize;		// width of the send window in blocks
+	int32_t		sendBufferBlockN;	// capacity of the send buffer in blocks
 
+	// (head position, receive window first sn) (next position, receive buffer maximum sn)
+	// are managed independently for maximum parallism in DLL and LLS
+	// the receive queue is empty when recvWindowFirstSN == recvWindowNextSN
+	seq_t		recvWindowFirstSN;	// left-border of the receive window (receive queue), may be empty or may be filled but not delivered
+	int32_t		recvWindowHeadPos;	// the index number of the block with recvWindowFirstSN
 	seq_t		recvWindowNextSN;	// the next to the right-border of the received area
 	int32_t		recvWindowNextPos;	// the index number of the block with recvWindowNextSN
-	seq_t		recvWindowFirstSN;	// left-border of the receive window (receive queue), may be empty or may be filled but not delivered
-	// it means that the receive queue is empty when recvWindowFirstSN == recvWindowNextSN
-	// (next position, receive buffer maximum sn) (head position, receive window first sn)
-	// are managed independently for maximum parallism in DLL and LLS
-	int32_t		recvWindowHeadPos;	// the index number of the block with recvWindowFirstSN
 	//
 	seq_t		welcomedNextSNtoSend;
 	//
@@ -635,19 +641,13 @@ struct ControlBlock
 	int DumpSendRecvWindowInfo() const
 	{
 		return printf_s("\tSend[head, tail] = [%d, %d], packets on flight = %d\n"
-			"\tSN next to send = %u, welcomedNextSNtoSend = %u\n"
+			"\tSN next to send = %u(@%d), welcomedNextSNtoSend = %u\n"
 			"\tRecv[head, tail] = [%d, %d], receive window size = %d\n"
 			"\tSN first received = %u, max expected = %u\n"
-			, sendWindowHeadPos
-			, sendBufferNextPos
-			, int(sendWindowNextSN - sendWindowFirstSN)
-			, sendWindowNextSN
-			, welcomedNextSNtoSend
-			, recvWindowHeadPos
-			, recvWindowNextPos
-			, int(recvWindowNextSN - recvWindowFirstSN)
-			, recvWindowFirstSN
-			, recvWindowNextSN);
+			, sendWindowHeadPos, sendBufferNextPos, int(sendWindowNextSN - sendWindowFirstSN)
+			, sendWindowNextSN, sendWindowNextPos, welcomedNextSNtoSend
+			, recvWindowHeadPos, recvWindowNextPos, int(recvWindowNextSN - recvWindowFirstSN)
+			, recvWindowFirstSN, recvWindowNextSN);
 	}
 #else
 	int DumpSendRecvWindowInfo() const { return 0; }
@@ -659,30 +659,25 @@ struct ControlBlock
 	// Return the head packet even if the send queue is empty
 	PFSP_SocketBuf GetSendQueueHead() const { return HeadSend() + sendWindowHeadPos; }
 	// Return the descriptor of the last buffered packet in the send buffer, NULL if the send queue is empty
-	PFSP_SocketBuf GetLastBufferedSend() const
+	// The imcomplete last buffered packet, if any, is implictly locked
+	// but a complete packet MUST be explicitly locked at first here to make the send queue stable enough
+	PFSP_SocketBuf LockLastBufferedSend() const
 	{
-		if (CountSendBuffered() <= 0)
-			return NULL;
-		//
 		register int i = sendBufferNextPos - 1;
-		return HeadSend() + (i < 0 ? sendBufferBlockN - 1 : i);
+		register PFSP_SocketBuf p = HeadSend() + (i < 0 ? sendBufferBlockN - 1 : i);
+		p->Lock();
+		// An invalid packet buffer might be locked
+		return CountSendBuffered() <= 0 ? NULL : p;
 	}
 	// Allocate a new send buffer
 	PFSP_SocketBuf	GetSendBuf();
-	PFSP_SocketBuf	GetNextToSend() const
-	{
-		register int i = sendWindowHeadPos + (sendWindowNextSN - sendWindowFirstSN);
-		if(i - sendBufferBlockN >= 0)
-			i -= sendBufferBlockN;
-		return HeadSend() + i;
-	}
-	PFSP_SocketBuf	PeekAnteCommit() const;
+	PFSP_SocketBuf	GetNextToSend() const { return HeadSend() + sendWindowNextPos; }
 	bool CheckSendWindowLimit() const { return int(sendWindowNextSN - sendWindowFirstSN) <= sendWindowSize; }
 
 	void RoundSendBufferNextPos() { int32_t m = sendBufferNextPos - sendBufferBlockN; if(m >= 0) sendBufferNextPos = m; }
 
 	// UNRESOLVED! Do we have to maintain the last buffered send packet, however?
-	int ClearSendWindow() { sendWindowHeadPos = sendBufferNextPos = 0; return sendBufferBlockN; }
+	int ResetSendWindow() { sendWindowHeadPos = sendWindowNextPos = sendBufferNextPos = 0; return sendBufferBlockN; }
 
 	int CountReceived() const { return int(recvWindowNextSN - recvWindowFirstSN); }
 	seq_t GetRecvWindowFirstSN() const { return recvWindowFirstSN; }
@@ -730,35 +725,40 @@ struct ControlBlock
 	}
 	void SetSendWindowHead(seq_t initialSN)
 	{
-		sendBufferNextSN = sendWindowNextSN = sendWindowFirstSN = initialSN;
-		welcomedNextSNtoSend = initialSN;
-		sendWindowHeadPos = sendBufferNextPos = 0;
+		welcomedNextSNtoSend = sendBufferNextSN = sendWindowNextSN = sendWindowFirstSN = initialSN;
+		sendBufferNextPos = sendWindowNextPos = sendWindowHeadPos = 0;
 	}
 	void SetSendWindowWithHeadReserved(seq_t initialSN)
 	{
 		PFSP_SocketBuf skb = HeadSend();
 		skb->InitFlags(); // and locked
 		skb->version = THIS_FSP_VERSION;
-		sendWindowHeadPos = 0;
 		welcomedNextSNtoSend = sendWindowNextSN = sendWindowFirstSN = initialSN;
-		sendBufferNextSN = initialSN + 1;
+		sendBufferNextSN = initialSN + 1;	// prevent the head packet from being overlaid
+		sendWindowNextPos = sendWindowHeadPos = 0;
 		sendBufferNextPos = 1;
 		sendWindowSize = 1;
 	}
 	void SetSendWindowSize(int32_t sz1) { sendWindowSize = min(sendBufferBlockN, sz1); }
 
-	// Check the receive queue to test whether it could migrate to the CLOSABLE state
-	bool IsClosable() const;
+	// there is a COMMIT packet in the receive queue and there is no gap before the COMMIT packet
+	int HasBeenCommitted() const;
 
-	seq_t MoveNextToSend() { return sendWindowNextSN++; }
 	// Slide the send window to skip all of the acknowledged
 	void SlideSendWindow();
 	// Slide the send window to skip the head slot, supposing that it has been acknowledged
 	void SlideSendWindowByOne()	// shall be atomic!
 	{
-		sendWindowFirstSN++;
 		if(++sendWindowHeadPos - sendBufferBlockN >= 0)
 			sendWindowHeadPos -= sendBufferBlockN;
+		sendWindowFirstSN++;
+	}
+	// return old value of sendWindowNextSN
+	seq_t SlideNextToSend()
+	{
+		if(++sendWindowNextPos - sendBufferBlockN >= 0)
+			sendWindowNextPos -= sendBufferBlockN;
+		return sendWindowNextSN++;
 	}
 	//
 	bool LOCALAPI ResizeSendWindow(seq_t, unsigned int);
@@ -793,7 +793,7 @@ protected:
 	DWORD	dwMemorySize;	// size of the shared memory, in the mapped view
 	ControlBlock *pControlBlock;
 
-	void SetReturned() { _InterlockedExchange8((char *)pControlBlock->notices, NullCommand); }	// clear the 'NOT-returned' notice
+	void SetCallable() { _InterlockedExchange8((char *)pControlBlock->notices, NullCommand); }	// clear the 'NOT-returned' notice
 
 	~CSocketItem() { Destroy(); }
 	void Destroy()
@@ -818,7 +818,7 @@ protected:
 class FSP_Header_Manager
 {
 	BYTE		*pHdr;
-	uint16_t		pStackPointer;
+	uint16_t	pStackPointer;
 public:
 	// Initialize the FSP_Header manager for pushing operations
 	// Given
@@ -840,21 +840,6 @@ public:
 		pHdr = (BYTE *)p1;
 		pStackPointer = be16toh(((FSP_Header *)p1)->hs.hsp);
 	}
-	//
-	// Push an extension header
-	// Given
-	//	THdr *	the pointer to the buffer that holds the extension header
-	// Return
-	//	The value of the new top of the last header
-	// Remark
-	//	THdr is a template class/struct type that must be 64-bit aligned
-	//	If the first header is not the fixed header, what returned may not be treated as the final stack pointer
-	template<typename THdr> uint16_t PushExtHeader(THdr *pExtHdr)
-	{
-		memcpy(pHdr + pStackPointer, pExtHdr, sizeof(THdr));
-		pStackPointer += sizeof(THdr);
-		return pStackPointer;
-	}
 	// Pop an extension header
 	// Return
 	//	The pointer to the optional header
@@ -868,23 +853,6 @@ public:
 			return NULL;
 		return (THdr *)(pHdr + pStackPointer - sizeof(THdr));
 	}
-	//
-	// Push a data block, does not change the value of the top of the last header
-	// Given
-	//	BYTE *	the data buffer
-	//	int		the length of the data block to be pushed
-	// Remark
-	//	the given length is not necessary 64-bit aligned,
-	//	but the pointer to the stack header pointer would be aligned automatically
-	void PushDataBlock(BYTE *buf, int len)
-	{
-		memcpy(pHdr + pStackPointer, buf, len);
-		pStackPointer += (len + 7) & 0xFFF8;
-	}
-	// Conver the FSP header stack pointer to a data block pointer
-	void * TopAsDataBlock() const { return pHdr + pStackPointer; }
-	//
-	int	NextHeaderOffset() const { return (int)pStackPointer; }
 };
 
 #endif

@@ -246,11 +246,11 @@ static void LOCALAPI ProcessCommand(HANDLE md)
 			case FSP_Urge:
 				pSocket->UrgeCommit();
 				break;
-			case FSP_Resume:
-				pSocket->Resume();
-				break;
 			case FSP_Shutdown:
 				pSocket->Shutdown();
+				break;
+			case FSP_InstallKey:
+				pSocket->InstallSessionKey();
 				break;
 			default:
 	#ifndef NDEUBG

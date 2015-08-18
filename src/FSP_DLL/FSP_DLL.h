@@ -156,6 +156,7 @@ protected:
 	void HitResumableDisconnectedSessionCache();
 
 	int LOCALAPI BufferData(int);
+	int CommitSendQueue();
 	int LOCALAPI DeliverData(void *, int);
 	int FetchReceived();
 	void FinalizeRead();
@@ -170,7 +171,8 @@ protected:
 public:
 	enum FlushingFlag
 	{
-		NOT_FLUSHING = 0,
+		// NOT_FLUSHING == 0, and '0' is self-explanatory
+		REVERT_TO_RESUME = -1,
 		ONLY_FLUSHING = 1,
 		FLUSHING_SHUTDOWN = 2
 	};
@@ -200,6 +202,7 @@ public:
 
 	FSP_Session_State GetState() const { return pControlBlock->state; }
 	bool InState(FSP_Session_State s) const { return pControlBlock->state == s; }
+	bool IsIllegalState() const { return pControlBlock->state <= 0 || pControlBlock->state > LARGEST_FSP_STATE; }
 	void SetState(FSP_Session_State s) { _InterlockedExchange8((char *) & pControlBlock->state, s); }
 	// For _MSC_ only, as long is considered compatible with enum
 	bool TestSetState(FSP_Session_State s0, FSP_Session_State s2)
@@ -243,15 +246,26 @@ public:
 
 	int LOCALAPI AcquireSendBuf(int);
 	int LOCALAPI SendInplace(void *, int, bool);
-	int LOCALAPI FinalizeSend(int);
 
 	ControlBlock::PFSP_SocketBuf GetSendBuf() { return pControlBlock->GetSendBuf(); }
+	ControlBlock::PFSP_SocketBuf AppendCommit();
 
 	int LOCALAPI PrepareToSend(void *, int, bool);
 	int LOCALAPI SendStream(void *, int, char);
 	bool TestSetSendReturn(PVOID fp1)
 	{
 		return InterlockedCompareExchangePointer((PVOID *) & fpSent, fp1, NULL) == NULL; 
+	}
+	int CheckedRevertToResume();
+	//
+	int LOCALAPI CSocketItemDl::FinalizeSend(int r)
+	{
+		SetMutexFree();
+		// Prevent premature FSP_Send
+		if (r < 0 || InState(CONNECT_AFFIRMING) || InState(CLONING) || InState(RESUMING) || InState(QUASI_ACTIVE) || InState(CHALLENGING))
+			return r;
+		//
+		return (Call<FSP_Send>() ? r : -EIO);
 	}
 
 	int	LOCALAPI RecvInline(PVOID);

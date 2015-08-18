@@ -92,7 +92,10 @@ FSPHANDLE FSPAPI ConnectMU(FSPHANDLE hFSP, PFSP_Context psp1)
 		return NULL;
 	}
 	// TODO: SHOULD constuct the MULTIPLY command packet
+
 	// TODO: SHOULD install a new, derived session key!
+	// socketItem->pControlBlock->connectParams = ...;
+
 	return socketItem->CallCreate(objCommand, SynConnection);
 }
 
@@ -118,7 +121,22 @@ bool LOCALAPI CSocketItemDl::ToWelcomeMultiply(BackLogItem & backLog)
 		return false;
 	}
 
-	SetState(r == 0 ? ESTABLISHED : COMMITTING);
+	// UNRESOLVED! But if the committed send stream is too long to be held in the queue wholely?
+	if(r == 0 && pControlBlock->hasPendingKey == 0)
+	{
+#ifdef TRACE
+		printf_s("Acknowledgement of connection cloning: to PERSIST the connection.\n");
+#endif
+		SetState(ESTABLISHED);
+	}
+	else
+	{
+#ifdef TRACE
+		printf_s("Acknowledgement of connection cloning, to COMMIT as ULA responded transactionally.\n");
+#endif
+		SetState(COMMITTING);
+		CommitSendQueue();
+	}
 
 	return true;
 }

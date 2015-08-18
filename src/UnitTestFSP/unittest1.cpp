@@ -11,7 +11,7 @@ using namespace Microsoft::VisualStudio::CppUnitTestFramework;
 // 
 void UnitTestGenerateSNACK();
 void UnitTestSendRecvWnd();
-
+void UnitTestHasBeenCommitted();
 
 // for line output
 static char linebuf[200];
@@ -856,7 +856,7 @@ void UnitTestOCB_MAC()
 
 
 
-void UnitTestReplaceSendQueueHead()
+void UnitTestPersistConnect()
 {
 	int memsize = sizeof(ControlBlock) + (sizeof ControlBlock::FSP_SocketBuf + MAX_BLOCK_SIZE) * 8;
 	const ControlBlock::seq_t FIRST_SN = 12;
@@ -868,13 +868,25 @@ void UnitTestReplaceSendQueueHead()
 	pSCB->SetRecvWindowHead(FIRST_SN);
 	pSCB->SetSendWindowHead(FIRST_SN);
 
-	socket.ReplaceSendQueueHead(PERSIST);
+	socket.PersistConnect();
 	ControlBlock::PFSP_SocketBuf skb = pSCB->GetSendQueueHead();
-	Assert::IsTrue(skb->opCode == PERSIST);
+	Assert::IsTrue(skb->opCode == PERSIST && pSCB->CountSendBuffered() == 1);
 
-	socket.ReplaceSendQueueHead(COMMIT);
+	// PersistConnect is itempotent
+	socket.PersistConnect();
 	skb = pSCB->GetSendQueueHead();
-	Assert::IsTrue(skb->opCode == COMMIT);
+	Assert::IsTrue(skb->opCode == PERSIST && pSCB->CountSendBuffered() == 1);
+
+	skb->opCode = PURE_DATA;
+	socket.PersistConnect();
+	skb = pSCB->GetSendQueueHead();
+	Assert::IsTrue(skb->opCode == PERSIST && pSCB->CountSendBuffered() == 1);
+
+	skb->opCode = COMMIT;
+	socket.PersistConnect();
+	skb = pSCB->GetSendQueueHead();
+	Assert::IsFalse(skb->opCode == PERSIST);
+	Assert::IsTrue(pSCB->CountSendBuffered() == 1);
 }
 
 
@@ -981,9 +993,15 @@ namespace UnitTestFSP
 		}
 
 
-		TEST_METHOD(TestReplaceSendQueueHead)
+		TEST_METHOD(TestHasBeenCommitted)
 		{
-			UnitTestReplaceSendQueueHead();
+			UnitTestHasBeenCommitted();
+		}
+
+
+		TEST_METHOD(TestPersistConnect)
+		{
+			UnitTestPersistConnect();
 		}
 
 

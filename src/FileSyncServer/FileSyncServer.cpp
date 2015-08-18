@@ -11,6 +11,7 @@
 const char		*defaultWelcome = "File synchronizer based on Flexible Session Protocol, version 0.1";
 // assume that address space layout randomization keep the secret hard to find
 static unsigned char bufPrivateKey[CRYPTO_NACL_KEYBYTES];
+static unsigned char bufPeerPublicKey[CRYPTO_NACL_KEYBYTES];
 
 volatile static bool finished = false;
 static FSPHANDLE hFspListen;
@@ -38,8 +39,9 @@ static void FSPAPI onReturn(FSPHANDLE h, FSP_ServiceCode code, int value)
 }
 
 
-
-static int	FSPAPI onAccepted(FSPHANDLE h, PFSP_Context);
+static int	FSPAPI onAccepting(FSPHANDLE, void *, PFSP_IN6_ADDR);
+static int	FSPAPI onAccepted(FSPHANDLE, PFSP_Context);
+static void FSPAPI onPublicKeyReceived(FSPHANDLE, FSP_ServiceCode, int);
 static void FSPAPI onFileNameSent(FSPHANDLE, FSP_ServiceCode, int);
 static int	FSPAPI toSendNextBlock(FSPHANDLE, void *, int32_t);
 
@@ -78,7 +80,7 @@ int main(int argc, char * argv[])
 	FSP_SocketParameter params;
 	FSP_IN6_ADDR atAddress;
 	memset(& params, 0, sizeof(params));
-	params.beforeAccept = NULL;
+	params.beforeAccept = onAccepting;
 	params.afterAccept = onAccepted;
 	params.onError = onReturn;
 	params.welcome = thisWelcome;
@@ -110,25 +112,45 @@ int main(int argc, char * argv[])
 }
 
 
+// This function is for tracing purpose
+static int	FSPAPI onAccepting(FSPHANDLE h, void *p, PFSP_IN6_ADDR remoteAddr)
+{
+	printf_s("\nTo accept handle of FSP session: 0x%08X\n", h);
+	const FSP_PKTINFO & pktInfo = *(FSP_PKTINFO *)p;
+	printf_s("Interface: %d, session Id: %u\n", pktInfo.ipi6_ifindex, pktInfo.idALF);
+	printf_s("Remote address: 0x%llX::%X::%X\n", remoteAddr->u.subnet, remoteAddr->idHost, remoteAddr->idALF);
+	return 0;	// no opposition
+}
+
+
 
 static int FSPAPI onAccepted(FSPHANDLE h, PFSP_Context ctx)
 {
 	printf_s("\nHandle of FSP session: 0x%08X\n", h);
+	// TODO: check connection context
 
-	// peer's first message is placed into welcome part of the ctx
-	unsigned char bufPublicKey[CRYPTO_NACL_KEYBYTES];
+	ReadFrom(h, bufPeerPublicKey, sizeof(bufPeerPublicKey), onPublicKeyReceived);
+	return 0;
+}
+
+
+
+static void FSPAPI onPublicKeyReceived(FSPHANDLE h, FSP_ServiceCode c, int r)
+{
+	if(r < 0)
+	{
+		finished = true;
+		Dispose(h);
+		return;
+	}
+
 	unsigned char bufSharedKey[CRYPTO_NACL_KEYBYTES];
-	memset(bufPublicKey, 0, CRYPTO_NACL_KEYBYTES);
-	memcpy_s(bufPublicKey, CRYPTO_NACL_KEYBYTES, ctx->welcome, ctx->len);
-	CryptoNaClGetSharedSecret(bufSharedKey, bufPublicKey, bufPrivateKey);
-
+	CryptoNaClGetSharedSecret(bufSharedKey, bufPeerPublicKey, bufPrivateKey);
 	printf_s("\tTo install the negotiated shared key...\n");
 	InstallAuthEncKey(h, bufSharedKey, CRYPTO_NACL_KEYBYTES, INT32_MAX); 
 
 	printf_s("\tTo send filename to the remote end...\n");
-	// TODO: check connection context
 	WriteTo(h, fileName, (int)strlen(fileName) + 1, END_OF_MESSAGE, onFileNameSent);
-	return 0;
 }
 
 

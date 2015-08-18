@@ -309,6 +309,7 @@ int FSPAPI ReadFrom(FSPHANDLE, void *, int, NotifyOrReturn);
 //	FSPHANDLE		the FSP socket
 //	NotifyOrReturn	the callback function
 // Return
+//	EAGAIN if the session is already in committed state
 //	-EBADF if the connection is not in valid context
 //	-EDOM if the connection is not in proper state
 //	-EIO if the COMMIT packet cannot be sent

@@ -245,7 +245,16 @@ void CSocketItemEx::KeepAlive()
 			EmitWithICC(skb, pControlBlock->sendWindowFirstSN);
 	}
 
-	// Send COMMIT or KEEP_ALIVE in heartbeat interval
+	SendSNACK(KEEP_ALIVE);
+}
+
+
+
+// Take the network-order acknowledgement timestamp as the salt to SetIntegrityCheckCode for KEEP_ALIVE/ACK_FLUSH
+// Send KEEP_ALIVE or it special norm, ACK_FLUSH
+bool CSocketItemEx::SendSNACK(FSPOperationCode opCode)
+{
+
 	ControlBlock::seq_t seqExpected;
 	FSP_PreparedKEEP_ALIVE buf;
 
@@ -260,12 +269,13 @@ void CSocketItemEx::KeepAlive()
 	if(len < sizeof(FSP_SelectiveNACK))
 	{
 		printf_s("Fatal error %d encountered when generate SNACK\n", len);
-		return;
+		return false;
 	}
 
-	// take the network-order acknowledgement timestamp as the salt to SetIntegrityCheckCode for KEEP_ALIVE
-	// UNRESOLVED! TODO: EmitWithICC may get abnormal headers!
-	buf.hdr.hs.Set<KEEP_ALIVE>(len + sizeof(FSP_NormalPacketHeader));
+	buf.hdr.hs.version = THIS_FSP_VERSION;
+	buf.hdr.hs.opCode = opCode;
+	buf.hdr.hs.hsp = htobe16(uint16_t(len + sizeof(FSP_NormalPacketHeader)));
+
 	pControlBlock->SetSequenceFlags(& buf.hdr, seqExpected);
 	SetIntegrityCheckCode(& buf.hdr, NULL, 0, buf.GetSaltValue());
 #ifdef TRACE_PACKET
@@ -273,7 +283,8 @@ void CSocketItemEx::KeepAlive()
 	printf_s("KEEP_ALIVE total header length: %d, should be payloadless\n", be16toh(buf.hdr.hs.hsp));
 	DumpNetworkUInt16((uint16_t *) & buf, be16toh(buf.hdr.hs.hsp) / 2);
 #endif
-	SendPacket(1, ScatteredSendBuffers(& buf.hdr, len));
+
+	return SendPacket(1, ScatteredSendBuffers(& buf.hdr, len)) > 0;
 }
 
 

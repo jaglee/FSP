@@ -9,8 +9,9 @@
 // #define REMOTE_APPLAYER_NAME "E000:AAAA::1"
 
 static int	FSPAPI onConnected(FSPHANDLE, PFSP_Context);
-static int	FSPAPI onReceiveNextBlock(FSPHANDLE, void *, int32_t, bool);
+static void FSPAPI onPublicKeySent(FSPHANDLE, FSP_ServiceCode, int);
 static void FSPAPI onReceiveFileNameReturn(FSPHANDLE, FSP_ServiceCode, int);
+static int	FSPAPI onReceiveNextBlock(FSPHANDLE, void *, int32_t, bool);
 
 static unsigned char bufPrivateKey[CRYPTO_NACL_KEYBYTES];
 static unsigned char bufPublicKey[CRYPTO_NACL_KEYBYTES];
@@ -125,19 +126,32 @@ int FSPAPI onConnected(FSPHANDLE h, PFSP_Context ctx)
 
 	CryptoNaClGetSharedSecret(bufSharedKey, bufPeersKey, bufPrivateKey);
 
+	// Actually install authenc key would commit the stream because send is pending
+	WriteTo(h, bufPublicKey, CRYPTO_NACL_KEYBYTES, END_OF_MESSAGE, onPublicKeySent);
 	InstallAuthEncKey(h, bufSharedKey, CRYPTO_NACL_KEYBYTES, INT32_MAX);
 
-	// UNRESOLVED! Should put into the reverse 'welcome' message!
-	WriteTo(h, bufPublicKey, CRYPTO_NACL_KEYBYTES, END_OF_MESSAGE, NULL);
+	return 0;
+}
+
+
+
+static void FSPAPI onPublicKeySent(FSPHANDLE h, FSP_ServiceCode c, int r)
+{
+	printf_s("Result of sending public key: %d\n", r);
+	if(r < 0)
+	{
+		finished = true;
+		Dispose(h);
+		return;
+	}
 
 	printf_s("\nTo read filename...\t");
 	if(ReadFrom(h, fileName, sizeof(fileName), onReceiveFileNameReturn) < 0)
 	{
 		finished = true;
 		Dispose(h);
-		return -1;
+		return;
 	}
-	return 0;
 }
 
 
@@ -149,9 +163,9 @@ static void FSPAPI onReceiveFileNameReturn(FSPHANDLE h, FSP_ServiceCode resultCo
 		printf("\nUnknown result code %d returned by FSP LLS, returned = %\n", resultCode, resultValue);
 		finished = true;
 		Dispose(h);
-		DebugBreak();
 		return;
 	}
+
 	// try to create a new file of the same name. if failed on error file already exists, 
 	// try to change the filename by append a 'C'[if it does not have suffix].
 	// if the new filename exceed MAX_PATH, confuscate the last character

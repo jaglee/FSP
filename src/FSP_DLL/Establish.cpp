@@ -116,7 +116,7 @@ void CSocketItemDl::ProcessBacklog()
 {
 	// TODO: set the default interface to non-zero?
 	CommandNewSession objCommand;
-	BackLogItem backLog;
+	BackLogItem		backLog;
 	CSocketItemDl * socketItem;
 	// firstly, fetch the backlog item
 	while(pControlBlock->PopBacklog(& backLog) >= 0)
@@ -275,12 +275,27 @@ void CSocketItemDl::ToConcludeConnect()
 		return;
 	}
 
-	SetState(r == 0 ? ESTABLISHED : COMMITTING);
+	// UNRESOLVED! But if the committed send stream is too long to be held in the queue wholely?
+	// It is reasonably assumed that when just start a session 
+	if(r == 0 && pControlBlock->hasPendingKey == 0)
+	{
 #ifdef TRACE
-	printf_s("Acknowledgement of connection request received, to PERSIST the connection.\n");
+		printf_s("Acknowledgement of connection request received, to PERSIST the connection.\n");
 #endif
+		SetState(ESTABLISHED);
+	}
+	else
+	{
+#ifdef TRACE
+		printf_s("Acknowledgement of connection request received, to COMMIT as ULA responded transactionally.\n");
+#endif
+		SetState(COMMITTING);
+		CommitSendQueue();
+	}
+	//
 	Call<FSP_Start>();
 }
+
 
 
 // Given
@@ -326,18 +341,67 @@ int FSPAPI InstallAuthEncKey(FSPHANDLE h, BYTE * key, int keySize, int32_t keyLi
 //	int			length of the key, should be multiplication of 8
 //	int32_t		life of the key, maximum number of packets that may utilize the key
 // Return
-//	-EGAIN if installation of a new key is not yet synchronized with the peer
-//	0 if no failure
+//	-EGAIN	if installation of previous key was not yet synchronized with the peer
+//	-EDOM	if domain error: either send queue or receive buffer should be empty
+//	-EINTR	if gaining mutex is interrupted (timed out)
+//	-EIO	if cannot trigger LLS to do the installation work through I/O
+//	0		if no failure
+// Remark
+//	Installation of the new session key is usually asymmetric in the sense that one side
+//	can figure out the shared secret before its peer have collected enough information
+//	It is assumed that for security reason the key material exchanged should be of limited length
+//	and only after the key material has been buffered to send or received thoroughly may InstallKey be called
+//	See also CSocketItemDl::Commit
 int LOCALAPI CSocketItemDl::InstallKey(BYTE *key, int keySize, int32_t keyLife)
 {
-	if(_InterlockedCompareExchange8(& pControlBlock->newKeyPending, 1, 0) != 0)
+	if(_InterlockedCompareExchange8(& pControlBlock->hasPendingKey, 1, 0) != 0)
 		return -EAGAIN;
 	//
 	memcpy(& pControlBlock->connectParams, key, keySize);
 	pControlBlock->connectParams.keyLength = keySize;
-	pControlBlock->connectParams.timeDelta = keyLife;
-	//
-	return 0;
+	pControlBlock->connectParams.initialSN = keyLife;
+
+	if(! WaitSetMutex())
+		return -EINTR;
+
+	if(pControlBlock->CountSendBuffered() > 0 && pControlBlock->CountReceived() > 0)
+	{
+		SetMutexFree();
+		return -EDOM;
+	}
+
+	if (InState(CHALLENGING) || InState(RESUMING) || InState(CLONING) || InState(QUASI_ACTIVE) || InState(ESTABLISHED))
+	{
+		SetState(COMMITTING);
+		// And COMMIT is to be appended
+	}
+	else if (InState(PEER_COMMIT))
+	{
+		SetState(COMMITTING2);
+		// And COMMIT is to be appended
+	}
+	else if(InState(COMMITTING) || InState(COMMITTING2) || InState(COMMITTED) || InState(CLOSABLE))
+	{
+		// There is either already a COMMIT PACKET in the queue or has been COMMITed
+		goto l_callsrv;
+	}
+	else
+	{
+		SetMutexFree();
+		return -EDOM;
+	}
+	// UNRESOLVED! The state machine MUST be carefully reviewed. How about CONNECT_AFFIRMING? It is a temporal state.
+
+	if(CommitSendQueue() < 0)
+	{
+		SetMutexFree();
+		return -EDOM;
+	}
+
+l_callsrv:
+	int r = Call<FSP_InstallKey>() ? 0 : -EIO;
+	SetMutexFree();
+	return r;
 }
 
 

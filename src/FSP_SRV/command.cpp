@@ -46,7 +46,7 @@ static ConnectRequestQueue connectRequests;
 //	NON_EXISTENT-->LISTENING
 void LOCALAPI Listen(CommandNewSessionSrv &cmd)
 {
-	if (!cmd.isValid())
+	if(cmd.hEvent == NULL)
 	{
 		REPORT_ERROR_ON_TRACE();
 		return;
@@ -72,7 +72,7 @@ void LOCALAPI Listen(CommandNewSessionSrv &cmd)
 //	Nothing
 void LOCALAPI Connect(CommandNewSessionSrv &cmd)
 {
-	if (!cmd.isValid())
+	if(cmd.hEvent == NULL)
 		return;		// Do not trace, in case logging is overwhelmed
 
 	if( (cmd.index = connectRequests.Push(&cmd)) < 0)
@@ -106,7 +106,7 @@ l_return:
 //	and go on to emit the command and optional data packets in the send queue
 void LOCALAPI SyncSession(CommandNewSessionSrv &cmd)
 {
-	if(! cmd.isValid())
+	if(cmd.hEvent == NULL)
 	{
 		REPORT_ERROR_ON_TRACE();
 		return;
@@ -144,7 +144,7 @@ void LOCALAPI CSocketItemEx::Listen(CommandNewSessionSrv &cmd)
 	fidPair.source = cmd.fiberID;
 	InitAssociation();
 
-	SetReturned();
+	SetCallable();
 	// everyting run smoothly. no interrupt raised
 }
 
@@ -224,25 +224,25 @@ void CSocketItemEx::Shutdown()
 //	Operation code in the given command context would be cleared if send is pending
 void CSocketItemEx::Start()
 {
-	TRACE_HERE("called");
-	// synchronize the state in the 'cache' and the real state
-	if (_InterlockedExchange8((char *) & lowState, pControlBlock->state) != pControlBlock->state)
-	{
 #ifdef TRACE
-		printf_s("To send first packet in %s [%d]\n", stateNames[lowState], lowState);
+	printf_s("To send first packet in %s[%d], firstSN = %u, nextSN = %u\n"
+		, stateNames[lowState]
+		, lowState
+		, pControlBlock->sendWindowFirstSN
+		, pControlBlock->sendWindowNextSN);
 #endif
-		if (lowState == CLONING || lowState == RESUMING)
-			tKeepAlive_ms = CONNECT_INITIATION_TIMEOUT_ms;
-		else if(lowState == ESTABLISHED)
-			ReplaceSendQueueHead(PERSIST);
-		else if(lowState == COMMITTING || lowState == COMMITTING2)
-			ReplaceSendQueueHead(COMMIT);
-		//
-		RestartKeepAlive();
-	}
+	// synchronize the state in the 'cache' and the real state
+	lowState = pControlBlock->state;
+	if (lowState == CLONING || lowState == RESUMING)
+		tKeepAlive_ms = CONNECT_INITIATION_TIMEOUT_ms;
+	else
+		PersistConnect();
 	//
 	EmitStart();
-	pControlBlock->MoveNextToSend();
+	pControlBlock->sendWindowNextSN++;
+	// assert that Start() is called at most once for a session
+	RestartKeepAlive();
+	//^Sometimes it is redundant but does little harm anyway
 }
 
 
@@ -262,47 +262,7 @@ void CSocketItemEx::UrgeCommit()
 	//
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->GetNextToSend();
 	if(skb->Lock())
-		EmitWithICC(skb, pControlBlock->MoveNextToSend());
-}
-
-
-
-// Remark
-//	Scan the send queue replace the unsent COMMIT or the head packet to RESUME
-void CSocketItemEx::Resume()
-{
-	if(pControlBlock->CountSendBuffered() <= 0)
-	{
-		TRACE_HERE("Only active send may resume an adjourned connection or cancel the adjourment"); 
-		return;
-	}
-	//
-	ControlBlock::PFSP_SocketBuf skb;
-	if (InState(COMMITTED) || InState(CLOSABLE))
-	{
-		skb = pControlBlock->GetNextToSend();
-	}
-	else if(InState(COMMITTING) || InState(COMMITTING2))
-	{
-		skb = pControlBlock->PeekAnteCommit();
-		if(skb == NULL)
-			return;
-	}
-	else
-	{
-		return;
-	}
-
-	if(! skb->GetFlag<IS_COMPLETED>())
-	{
-		TRACE_HERE("Not ready to resume, for example, incomplete compression");
-		return;
-	}
-	// UNRESOLVED! But should piggyback the mobility header?
-	skb->Lock();
-	skb->opCode = RESUME;
-	pControlBlock->state = RESUMING;
-	EmitStart();
+		EmitWithICC(skb, pControlBlock->sendWindowNextSN++);
 }
 
 

@@ -164,7 +164,6 @@ static const int MAX_GAPS_NUM = 2;
 static const int MAX_BLOCK_NUM = 0x20000;	// 65536 * 2
 void UnitTestGenerateSNACK()
 {
-
 	CSocketItemExDbg socket(MAX_BLOCK_NUM, MAX_BLOCK_NUM);
 	ControlBlockDbg *pSCB = socket.GetControlBlock();
 	pSCB->SetRecvWindowHead(FIRST_SN);
@@ -254,4 +253,20 @@ void UnitTestGenerateSNACK()
 	// there's a continuous data block which is not delivered yet. however, it is not considered needing a gap descriptor
 	Assert::IsTrue(r == 1 && seq0 == FIRST_SN + 0x10004);	// because +0x10003 has been assumed received
 	// Dump the descriptor in the flow test which attaches a console.
+}
+
+
+
+void UnitTestHasBeenCommitted()
+{
+	CSocketItemExDbg socket(MAX_BLOCK_NUM, MAX_BLOCK_NUM);
+	ControlBlockDbg *pSCB = socket.GetControlBlock();
+	pSCB->SetRecvWindowHead(FIRST_SN);
+	//
+	// TODO: put test data...
+	ControlBlock::PFSP_SocketBuf skb = pSCB->AllocRecvBuf(FIRST_SN);
+
+	//
+	pSCB->HasBeenCommitted();
+	// Assert::
 }

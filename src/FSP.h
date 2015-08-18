@@ -172,18 +172,17 @@ typedef enum: char
 	SynConnection,		// make SCB entry of the DLL and the LLS synchronized
 	FSP_Reject,			// a forward command, explicitly reject some request
 	FSP_Recycle,		// a forward command, connection might be aborted
-	FSP_Start,			// send a start packet such as MULTIPLY, PERSIST and transactional COMMIT
+	FSP_Start,			// send a start packet, MULTIPLY or PERSIST
 	FSP_Send,			// send a packet/a group of packets
 	FSP_Urge,			// send a packet urgently, mean to urge COMMIT
-	FSP_Resume,			// cancel COMMIT(unilateral adjourn) or send RESUME
 	FSP_Shutdown,		// close the connection
+	FSP_InstallKey,		// install the authenticated encryption key
 	// 16~23: LLS to DLL in the backlog
 	FSP_NotifyAccepting = SynConnection,	// a reverse command to make context ready
 	FSP_NotifyAccepted = 16,
 	FSP_NotifyDataReady,
 	FSP_NotifyBufferReady,
 	FSP_NotifyReset,
-	FSP_NotifyToCommit,
 	FSP_NotifyFlushed,
 	FSP_NotifyFinish,
 	FSP_NotifyRecycled,	// = 23

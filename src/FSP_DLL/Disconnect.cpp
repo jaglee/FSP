@@ -28,7 +28,6 @@
     POSSIBILITY OF SUCH DAMAGE.
  */
 #include "FSP_DLL.h"
-#include <time.h>
 
 // return 0 if no error, negative if error, positive if warning
 DllExport
@@ -60,44 +59,6 @@ int CSocketItemDl::Recycle()
 	// So every time a control block is re-used, it MUST be re-initialized
 	socketsTLB.FreeItem(this);
 	return Call<FSP_Recycle>() ? 0 : -EIO;
-}
-
-
-// Given
-//	FSPHANDLE		the FSP socket
-//	NotifyOrReturn	the callback function
-// Return
-//	-EBADF if the connection is not in valid context
-//	-EDOM if the connection is not in proper state
-//	-EIO if the COMMIT packet cannot be sent
-//	0 if no immediate error
-// Remark
-//	the callback function may return delayed error such as Commit rejected the remote end
-//	The connection would remain in the COMMITTED, CLOSABLE or CLOSED state,
-//	or be set to the COMMITTING or COMMITTING2 state immediately.
-DllSpec
-int FSPAPI Commit(FSPHANDLE hFSPSocket, NotifyOrReturn fp1)
-{
-	TRACE_HERE("called");
-
-	register CSocketItemDl * p = (CSocketItemDl *)hFSPSocket;
-	try
-	{
-		if (p == NULL || p->InState(NON_EXISTENT))
-			return -EBADF;
-		//
-		if(! p->SetFlushing(fp1))
-			return -EDOM;
-		//
-		if(p->InState(COMMITTED) || p->InState(CLOSABLE) || p->InState(PRE_CLOSED) || p->InState(CLOSED))
-			return EBADF;	// warning that the socket has already been committed
-		//
-		return p->Commit();
-	}
-	catch(...)
-	{
-		return -EFAULT;
-	}
 }
 
 
@@ -169,75 +130,6 @@ int FSPAPI Shutdown(FSPHANDLE hFSPSocket)
 	{
 		return -EFAULT;
 	}
-}
-
-
-
-//[API: Commit]
-//	{ACTIVE, RESUMING}-->COMMITTING-->[Urge COMMIT]
-//	PEER_COMMIT-->COMMITTING2-->[Urge COMMIT]{restart keep-alive}
-// Return
-//	-EINTR if cannot gain the exclusive lock
-//	-EDOM if in erraneous state
-//	-ETIMEDOUT if blocked due to lack of buffer 
-// Remark
-//	It might be blocking to wait the send buffer slot to buffer the COMMIT packet
-int CSocketItemDl::Commit()
-{
-	eomSending = EndOfMessageFlag::END_OF_SESSION;
-	//
-	if(! WaitSetMutex())
-		return -EINTR;
-
-	if (InState(ESTABLISHED) || InState(RESUMING))
-	{
-		SetState(COMMITTING);
-	}
-	else if (InState(PEER_COMMIT))
-	{
-		SetState(COMMITTING2);
-	}
-	else if (!InState(COMMITTING) && !InState(COMMITTING2))
-	{
-		SetMutexFree();
-		return -EDOM;
-	}
-	//
-	ControlBlock::PFSP_SocketBuf skb = pControlBlock->GetLastBufferedSend();
-	if(skb != NULL && skb->Lock())
-	{
-		if(skb->opCode == PURE_DATA || skb->opCode == RESUME || skb->opCode == PERSIST)
-		{
-			skb->SetFlag<TO_BE_CONTINUED>(false);
-		}
-		else
-		{
-			skb->Unlock();
-			skb = NULL;
-		}
-	}
-	// allocate new slot to hold the COMMIT packet
-	if(skb == NULL)
-	{
-		time_t t0 = time(NULL);
-		while((skb = pControlBlock->GetSendBuf()) == NULL)
-		{
-			SetMutexFree();
-			Sleep(1);
-			if(time(NULL) - t0 > TRASIENT_STATE_TIMEOUT_ms)
-				return -ETIMEDOUT;
-			if(! WaitSetMutex())
-				return -EINTR;
-		}
-		skb->len = 0;
-	}
-	// UNRESOLVED! The IS_COMPLETED flag of COMMIT is reused for accumulative acknowledgment?
-	skb->opCode = COMMIT;
-	skb->SetFlag<IS_COMPLETED>();
-	//
-	skb->Unlock();
-	SetMutexFree();
-	return (Call<FSP_Urge>() ? 0 : -EIO);
 }
 
 

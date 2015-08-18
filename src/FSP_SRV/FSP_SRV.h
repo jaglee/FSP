@@ -124,8 +124,6 @@ class CommandNewSessionSrv: CommandToLLS
 	UINT	index;
 	CSocketItemEx *pSocket;
 
-	bool	isValid() const { return (hEvent != NULL); }
-
 	// defined in command.cpp
 	friend void LOCALAPI Listen(CommandNewSessionSrv &);
 	friend void LOCALAPI Connect(CommandNewSessionSrv &);
@@ -308,6 +306,7 @@ protected:
 
 	int	 SendPacket(register ULONG, ScatteredSendBuffers);
 	bool EmitStart();
+	bool LOCALAPI SendSNACK(FSPOperationCode = ACK_FLUSH);
 	bool LOCALAPI EmitWithICC(ControlBlock::PFSP_SocketBuf, ControlBlock::seq_t);
 
 	void Extinguish();
@@ -381,7 +380,7 @@ public:
 	void OnResurrect();
 	void HandleMemoryCorruption() {	Extinguish(); }
 	void LOCALAPI AffirmConnect(const SConnectParam &, ALFID_T);
-	void LOCALAPI ReplaceSendQueueHead(FSPOperationCode);
+	bool PersistConnect();
 
 	bool IsValidSequence(ControlBlock::seq_t seq1) { return pControlBlock->IsValidSequence(seq1); }
 
@@ -413,6 +412,7 @@ public:
 	// Solid input,  the payload, if any, is copied later
 	bool LOCALAPI ValidateICC(FSP_NormalPacketHeader *, int32_t = 0, uint32_t = 0);
 	bool ValidateICC() { return ValidateICC(headPacket->GetHeaderFSP(), headPacket->lenData); }
+	bool LOCALAPI ValidateSNACK(ControlBlock::seq_t &);
 	//	On got valid ICC automatically register source IP address as the favorite returning IP address
 	void ChangeRemoteValidatedIP()
 	{
@@ -429,7 +429,7 @@ public:
 	}
 
 	void EmitQ() { pControlBlock->EmitQ(this); }
-	void PeerCommit();
+	void CheckPeerCommit();
 	void KeepAlive();
 	void ScheduleEmitQ();
 	void ScheduleConnect(CommandNewSessionSrv *);
@@ -463,7 +463,6 @@ public:
 	void Connect();
 	void Start();
 	void UrgeCommit();
-	void Resume();
 	void SynConnect();
 	void LOCALAPI Listen(CommandNewSessionSrv &);
 
@@ -506,7 +505,18 @@ public:
 	CSocketItemEx * AllocItem(ALFID_T);
 	CSocketItemEx * AllocItem();
 	void FreeItem(CSocketItemEx *r);
+
+	// UNRESOLVED! Avoid deadlock by assigning a time-out clock?
+	bool WaitSetMutex()
+	{
+		while(_InterlockedCompareExchange8(& this->mutex, 1, 0))
+		{
+			Sleep(0);	// just yield out the CPU time slice
+		}
+		return true;
+	}
 	void SetMutexFree() { _InterlockedExchange8(& mutex, 0); }
+
 	CSocketItemEx * operator[](ALFID_T);
 };
 
