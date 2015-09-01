@@ -458,26 +458,21 @@ bool LOCALAPI CSocketItemEx::EmitWithICC(ControlBlock::PFSP_SocketBuf skb, Contr
 		return false;
 	}
 #endif
-	// UNRESOLVED! retransmission consume key life? of course?
 	if(contextOfICC.keyLife == 1)
 	{
 		TRACE_HERE("Session key run out of life");
 		return false;
 	}
 
-	//
+	// UNRESOLVED! retransmission consume key life? of course?
 	if(contextOfICC.keyLife > 0)
 		contextOfICC.keyLife--;
+
 	// The COMMIT packet, if any, is the last one that applied CRC64 or the old transmission key
 	if(skb->opCode == COMMIT && _InterlockedCompareExchange8(& pControlBlock->hasPendingKey, 0, 1) != 0)
 	{
 		InstallSessionKey();
 		contextOfICC.firstSendSNewKey = seq + 1;
-	}
-	else if(skb->opCode == RESUME && _InterlockedCompareExchange8(& pControlBlock->hasPendingKey, 0, 1) != 0)
-	{
-		InstallSessionKey();
-		contextOfICC.firstSendSNewKey = seq;
 	}
 
 	void  *payload = (FSP_NormalPacketHeader *)this->GetSendPtr(skb);
@@ -488,7 +483,7 @@ bool LOCALAPI CSocketItemEx::EmitWithICC(ControlBlock::PFSP_SocketBuf skb, Contr
 		return false;
 	}
 
-	register FSP_NormalPacketHeader * const pHdr = & pControlBlock->tmpHeader;
+	register FSP_NormalPacketHeader *pHdr = & pControlBlock->tmpHeader;
 	int result;
 	// ICC, if required, is always set just before being sent
 	if (skb->GetFlag<TO_BE_CONTINUED>() && skb->len != MAX_BLOCK_SIZE)
@@ -535,6 +530,9 @@ bool LOCALAPI CSocketItemEx::HandleMobileParam(PFSP_HeaderSignature optHdr)
 // TODO: rate-control/quota control
 void ControlBlock::EmitQ(CSocketItem *context)
 {
+	if(sendWindowNextSN == sendBufferNextSN && _InterlockedCompareExchange8(& shouldAppendCommit, 0, 1) != 0)
+		SetNextToSendToCommit();
+	//
 	while (int(sendWindowNextSN - sendBufferNextSN) < 0 && CheckSendWindowLimit())
 	{
 		register PFSP_SocketBuf skb = HeadSend() + sendWindowNextPos;
@@ -546,6 +544,7 @@ void ControlBlock::EmitQ(CSocketItem *context)
 #endif
 			break;
 		}
+
 		if (!skb->Lock())
 		{
 #ifdef TRACE
@@ -553,6 +552,21 @@ void ControlBlock::EmitQ(CSocketItem *context)
 #endif
 			SlideNextToSend();
 			continue;
+		}
+
+		// It is obviously less efficient/clever than pre-cache or loop-unrolling but much more reliable and comprehensible?
+		if(sendWindowNextSN + 1 == sendBufferNextSN  && _InterlockedCompareExchange8(& shouldAppendCommit, 0, 1) != 0)
+		{
+			// assert(skb->GetFlag<TO_BE_CONTINUED>() == false	// See also @DLL::Commit @DLL::ProcessPendingSend
+			if(skb->opCode == PURE_DATA || skb->opCode == PERSIST)
+			{
+				skb->SetFlag<IS_COMPLETED>();
+				skb->opCode = COMMIT;
+			}
+			else if(skb->opCode != COMMIT)
+			{
+				SetNextToSendToCommit();
+			}
 		}
 
 		if (!CSocketItemEx::Emit((CSocketItemEx *)context, skb, sendWindowNextSN))

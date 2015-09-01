@@ -121,22 +121,10 @@ bool LOCALAPI CSocketItemDl::ToWelcomeMultiply(BackLogItem & backLog)
 		return false;
 	}
 
-	// UNRESOLVED! But if the committed send stream is too long to be held in the queue wholely?
 	if(r == 0 && pControlBlock->hasPendingKey == 0)
-	{
-#ifdef TRACE
-		printf_s("Acknowledgement of connection cloning: to PERSIST the connection.\n");
-#endif
 		SetState(ESTABLISHED);
-	}
 	else
-	{
-#ifdef TRACE
-		printf_s("Acknowledgement of connection cloning, to COMMIT as ULA responded transactionally.\n");
-#endif
 		SetState(COMMITTING);
-		CommitSendQueue();
-	}
 
 	return true;
 }

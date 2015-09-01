@@ -400,7 +400,7 @@ l_bailout:
 //	FSP_SelectiveNACK::GapDescriptor *	the placeholder for the returned gap descriptors, shall be at of at least MAX_BLOCK_SIZE bytes
 //	seq_t &								the placeholder for the returned maximum expected sequence number
 // Return
-//	Number of bytes taken by the gap descriptors, including the suffix fields of the SNACK header
+//	Number of bytes taken by the gap descriptors, including the suffix fields of the SNACK header, excluding the FSP fixed header
 //	negative indicates that some error occurred
 // Remark
 //	For milky payload this function should never be called
@@ -417,6 +417,7 @@ int32_t LOCALAPI CSocketItemEx::GenerateSNACK(FSP_PreparedKEEP_ALIVE &buf, Contr
 		return n;
 	}
 
+	// Suffix the effective gap descriptors block with the FSP_SelectiveNACK struct
 	// built-in rule: an optional header MUST be 64-bit aligned
 	buf.n = n;
 	FSP_SelectiveNACK *pSNACK = (FSP_SelectiveNACK *)(pGaps + n);
@@ -534,12 +535,12 @@ void LOCALAPI CSocketItemEx::AffirmConnect(const SConnectParam & initState, ALFI
 
 
 // Do
-//	Update the opCode of the head packet in the send queue to PERSIST, or
-//	insert a new PERSIST packet if the send queue is still empty
+//	Update the opCode of the head packet in the send queue to PERSIST or COMMIT, or
+//	insert a new PERSIST/COMMIT packet if the send queue is still empty
 // Remark
 //	If the end queue is not empty, only the starting PURE_DATA may be replaced by PERSIST
 //	It is assumed that DLL/ULA is waiting for LLS when this subroutine is eventually called
-bool CSocketItemEx::PersistConnect()
+bool CSocketItemEx::ConfirmConnect()
 {
 	ControlBlock::PFSP_SocketBuf skb;
 	if(pControlBlock->CountSendBuffered() <= 0)
@@ -551,13 +552,13 @@ bool CSocketItemEx::PersistConnect()
 	else
 	{
 		skb = pControlBlock->GetSendQueueHead();
-		if(skb->opCode == PERSIST)
+		if(skb->opCode == COMMIT)
 			return true;
-		if(skb->opCode != PURE_DATA)
+		if(skb->opCode != PURE_DATA && skb->opCode != PERSIST)
 			return false;
 	}
-	//
-	skb->opCode = PERSIST;
+
+	skb->opCode = InState(COMMITTING) && pControlBlock->CountSendBuffered() == 1 ? COMMIT : PERSIST;
 	return true;
 }
 
@@ -578,11 +579,12 @@ void CSocketItemEx::SynConnect()
 	if(lowState == CHALLENGING)
 		InstallEphemeralKey();
 	else
-		PersistConnect();
+		ConfirmConnect();
 	//^ ephemeral session key material was ready when CSocketItemDl::PrepareToAccept
 
 	EmitStart();
-	pControlBlock->sendWindowNextSN++;
+	pControlBlock->SlideNextToSend();
+	// assert that SynConnect() is called at most once for a session
 
 	if(timer != NULL)
 	{

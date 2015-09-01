@@ -1,5 +1,5 @@
 #include <stdio.h>
-#include <stdint.h>
+#include "../gcm-aes.h"
 // POLY   
 // the highest bit is one
 #define CRC_64_I64	0x42F0E1EBA9EA3693ULL   

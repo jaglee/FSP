@@ -520,6 +520,8 @@ void LOCALAPI CSocketItemEx::OnConnectRequestAck(FSP_AckConnectRequest & respons
 // PERSIST is the acknowledgement to ACK_CONNECT_REQ, RESUME or MULTIPLY
 //	{CHALLENING, CLONING}-->/PERSIST/-->ACTIVE{start keep-alive}-->[Notify]
 //	{RESUMING, QUASI_ACTIVE}-->/PERSIST/-->ACTIVE{restart keep-alive}-->[Notify]
+// Remark
+//	PERSIST is instantly acknowledged to avoid possible dead-lock. See also KeepAlive()
 void CSocketItemEx::OnGetPersist()
 {
 	TRACE_SOCKET();
@@ -552,7 +554,7 @@ void CSocketItemEx::OnGetPersist()
 
 	if (InState(ESTABLISHED))
 	{
-		EarlierKeepAlive();
+		SendSNACK(KEEP_ALIVE);
 		return;
 	}
 
@@ -588,7 +590,8 @@ void CSocketItemEx::OnGetPersist()
 	printf_s("\nPERSIST received. Acknowledged SN\t = %u\n", ackSeqNo);
 #endif
 	pControlBlock->SlideSendWindowByOne();	// See also RespondToSNACK
-	EarlierKeepAlive();
+
+	SendSNACK(KEEP_ALIVE);
 
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->AllocRecvBuf(headPacket->pktSeqNo);
 	if(skb == NULL)
@@ -921,13 +924,6 @@ void CSocketItemEx::OnGetResume()
 	}
 
 	tLastRecv = NowUTC();	// tLastRecv should not be modified? UNRESOLVED!
-
-	// See also OnGetCommit(), EmitICC() and InstallSessionKey()
-	if(_InterlockedCompareExchange8(& pControlBlock->hasPendingKey, 0, 1) != 0)
-	{
-		InstallSessionKey();
-		contextOfICC.firstRecvSNewKey = headPacket->pktSeqNo;
-	}
 
 	// UNRESOLVED! should signal to resume the connection...
 	SignalEvent();

@@ -507,6 +507,7 @@ struct ControlBlock
 	ALIGN(8)
 	volatile FSP_Session_State state;
 	char			hasPendingKey;
+	char			shouldAppendCommit;
 
 	ALFID_T			idParent;
 
@@ -658,20 +659,34 @@ struct ControlBlock
 
 	// Return the head packet even if the send queue is empty
 	PFSP_SocketBuf GetSendQueueHead() const { return HeadSend() + sendWindowHeadPos; }
-	// Return the descriptor of the last buffered packet in the send buffer, NULL if the send queue is empty
+	// Return the descriptor of the last buffered packet in the send buffer, NULL if the send queue is empty or cannot obtain the lock
 	// The imcomplete last buffered packet, if any, is implictly locked
 	// but a complete packet MUST be explicitly locked at first here to make the send queue stable enough
 	PFSP_SocketBuf LockLastBufferedSend() const
 	{
 		register int i = sendBufferNextPos - 1;
 		register PFSP_SocketBuf p = HeadSend() + (i < 0 ? sendBufferBlockN - 1 : i);
-		p->Lock();
+		if(! p->Lock())
+			return NULL;
 		// An invalid packet buffer might be locked
 		return CountSendBuffered() <= 0 ? NULL : p;
 	}
+	// Return 0 if there is no COMMIT packet at the tail and there is no error on appending one
+	//	1 if there is already a COMMIT packet at the tail of the send queue
+	//	-1 if failed
+	int ReplaceSendQueueTailToCommit();
+
 	// Allocate a new send buffer
 	PFSP_SocketBuf	GetSendBuf();
 	PFSP_SocketBuf	GetNextToSend() const { return HeadSend() + sendWindowNextPos; }
+	PFSP_SocketBuf	SetNextToSendToCommit()
+	{
+		register PFSP_SocketBuf skb2 = GetSendBuf();
+		skb2->opCode = COMMIT;
+		skb2->SetFlag<IS_COMPLETED>();
+		skb2->Unlock();
+		return skb2;
+	}
 	bool CheckSendWindowLimit() const { return int(sendWindowNextSN - sendWindowFirstSN) <= sendWindowSize; }
 
 	void RoundSendBufferNextPos() { int32_t m = sendBufferNextPos - sendBufferBlockN; if(m >= 0) sendBufferNextPos = m; }
@@ -747,12 +762,8 @@ struct ControlBlock
 	// Slide the send window to skip all of the acknowledged
 	void SlideSendWindow();
 	// Slide the send window to skip the head slot, supposing that it has been acknowledged
-	void SlideSendWindowByOne()	// shall be atomic!
-	{
-		if(++sendWindowHeadPos - sendBufferBlockN >= 0)
-			sendWindowHeadPos -= sendBufferBlockN;
-		sendWindowFirstSN++;
-	}
+	void SlideSendWindowByOne();
+
 	// return old value of sendWindowNextSN
 	seq_t SlideNextToSend()
 	{

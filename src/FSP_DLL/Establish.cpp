@@ -275,23 +275,10 @@ void CSocketItemDl::ToConcludeConnect()
 		return;
 	}
 
-	// UNRESOLVED! But if the committed send stream is too long to be held in the queue wholely?
-	// It is reasonably assumed that when just start a session 
 	if(r == 0 && pControlBlock->hasPendingKey == 0)
-	{
-#ifdef TRACE
-		printf_s("Acknowledgement of connection request received, to PERSIST the connection.\n");
-#endif
 		SetState(ESTABLISHED);
-	}
 	else
-	{
-#ifdef TRACE
-		printf_s("Acknowledgement of connection request received, to COMMIT as ULA responded transactionally.\n");
-#endif
 		SetState(COMMITTING);
-		CommitSendQueue();
-	}
 	//
 	Call<FSP_Start>();
 }
@@ -319,7 +306,7 @@ uint32_t * TranslateFSPoverIPv4(PFSP_IN6_ADDR p, uint32_t dwIPv4, uint32_t fiber
 
 
 DllSpec
-int FSPAPI InstallAuthEncKey(FSPHANDLE h, BYTE * key, int keySize, int32_t keyLife)
+int FSPAPI InstallAuthenticKey(FSPHANDLE h, BYTE * key, int keySize, int32_t keyLife)
 {
 	if(keySize < FSP_MIN_KEY_SIZE || keySize > FSP_MAX_KEY_SIZE || keySize % sizeof(uint64_t) != 0 || keyLife <= 0)
 		return -EDOM;
@@ -352,6 +339,7 @@ int FSPAPI InstallAuthEncKey(FSPHANDLE h, BYTE * key, int keySize, int32_t keyLi
 //	It is assumed that for security reason the key material exchanged should be of limited length
 //	and only after the key material has been buffered to send or received thoroughly may InstallKey be called
 //	See also CSocketItemDl::Commit
+// UNRESOLVED! The state machine MUST be carefully reviewed. How about CONNECT_AFFIRMING? It is a temporal state.
 int LOCALAPI CSocketItemDl::InstallKey(BYTE *key, int keySize, int32_t keyLife)
 {
 	if(_InterlockedCompareExchange8(& pControlBlock->hasPendingKey, 1, 0) != 0)
@@ -364,44 +352,41 @@ int LOCALAPI CSocketItemDl::InstallKey(BYTE *key, int keySize, int32_t keyLife)
 	if(! WaitSetMutex())
 		return -EINTR;
 
-	if(pControlBlock->CountSendBuffered() > 0 && pControlBlock->CountReceived() > 0)
+	// Install the new session key immediately if it is already in a definitely stable state
+	// It is assumed that all data with old key have been buffered
+	// when InstallAuthenticKey is called
+	// It is also supposed that in the CLOSABLE state the receive buffer must be empty
+	// so does it in CHALLENGING, CLONING, QUASI_ACTIVE or RESUMING state
+	if(pControlBlock->CountReceived() == 0 || InState(PEER_COMMIT) || InState(COMMITTING2))
 	{
+		int r = Call<FSP_InstallKey>() ? 0 : -EIO;
+		pControlBlock->hasPendingKey = 0;
 		SetMutexFree();
-		return -EDOM;
+		return r;
 	}
 
-	if (InState(CHALLENGING) || InState(RESUMING) || InState(CLONING) || InState(QUASI_ACTIVE) || InState(ESTABLISHED))
+	if (InState(ESTABLISHED) ||	InState(COMMITTED))
 	{
 		SetState(COMMITTING);
-		// And COMMIT is to be appended
 	}
-	else if (InState(PEER_COMMIT))
-	{
-		SetState(COMMITTING2);
-		// And COMMIT is to be appended
-	}
-	else if(InState(COMMITTING) || InState(COMMITTING2) || InState(COMMITTED) || InState(CLOSABLE))
-	{
-		// There is either already a COMMIT PACKET in the queue or has been COMMITed
-		goto l_callsrv;
-	}
-	else
-	{
-		SetMutexFree();
-		return -EDOM;
-	}
-	// UNRESOLVED! The state machine MUST be carefully reviewed. How about CONNECT_AFFIRMING? It is a temporal state.
-
-	if(CommitSendQueue() < 0)
+	else if (! InState(COMMITTING))
 	{
 		SetMutexFree();
 		return -EDOM;
 	}
 
-l_callsrv:
-	int r = Call<FSP_InstallKey>() ? 0 : -EIO;
+	// Automatically terminate the last message. Unlike Commit() the function fails if overflow occurred
+	int r = pControlBlock->ReplaceSendQueueTailToCommit();
+	_InterlockedCompareExchange8(& eomSending, END_OF_MESSAGE, 0);
+	// END_OF_SESSION is not replaced
+
 	SetMutexFree();
-	return r;
+	if(r < 0)
+		return -EDOM;
+	else if(r > 0)
+		return 0;
+	else // if(r == 0)
+		return Call<FSP_Urge>() ? 0 : -EIO;
 }
 
 

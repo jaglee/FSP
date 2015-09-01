@@ -156,7 +156,6 @@ protected:
 	void HitResumableDisconnectedSessionCache();
 
 	int LOCALAPI BufferData(int);
-	int CommitSendQueue();
 	int LOCALAPI DeliverData(void *, int);
 	int FetchReceived();
 	void FinalizeRead();
@@ -248,7 +247,6 @@ public:
 	int LOCALAPI SendInplace(void *, int, bool);
 
 	ControlBlock::PFSP_SocketBuf GetSendBuf() { return pControlBlock->GetSendBuf(); }
-	ControlBlock::PFSP_SocketBuf AppendCommit();
 
 	int LOCALAPI PrepareToSend(void *, int, bool);
 	int LOCALAPI SendStream(void *, int, char);

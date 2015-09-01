@@ -826,6 +826,34 @@ void ControlBlock::SlideSendWindow()
 		//
 		sendWindowFirstSN++;
 	}
+
+	if(int(sendWindowNextSN - sendWindowFirstSN) < 0)
+	{
+#ifdef TRACE
+		printf_s("sendWindowNextSN(%u) out of sync on SlideSendWindow, set to %u\n", sendWindowNextSN, sendWindowFirstSN);
+#endif
+		sendWindowNextSN = sendWindowFirstSN;
+		sendWindowNextPos = sendWindowHeadPos;
+	}
+}
+
+
+
+// Normally synchronize sendWindowFirstSN with sendWindowNextSN is unnecessary but it does little harm
+void ControlBlock::SlideSendWindowByOne()	// shall be atomic!
+{
+	if(++sendWindowHeadPos - sendBufferBlockN >= 0)
+		sendWindowHeadPos -= sendBufferBlockN;
+	sendWindowFirstSN++;
+	//
+	if(int(sendWindowNextSN - sendWindowFirstSN) < 0)
+	{
+#ifdef TRACE
+		printf_s("sendWindowNextSN(%u) out of sync on SlideSendWindowByOne, set to %u\n", sendWindowNextSN, sendWindowFirstSN);
+#endif
+		sendWindowNextSN = sendWindowFirstSN;
+		sendWindowNextPos = sendWindowHeadPos;
+	}
 }
 
 
@@ -925,6 +953,34 @@ int ControlBlock::HasBeenCommitted() const
 		return -r;
 }
 
+
+
+// Return
+//	0 if there is no COMMIT packet at the tail and there is no error on appending one
+//	1 if there is already a COMMIT packet at the tail of the send queue
+//	-1 if failed
+int ControlBlock::ReplaceSendQueueTailToCommit()
+{
+	register int i = sendBufferNextPos - 1;
+	register int n = CountSendBuffered();
+	register PFSP_SocketBuf p = HeadSend() + (i < 0 ? sendBufferBlockN - 1 : i);
+
+	// make it idempotent, no matter whether last packet has been sent
+	if(p->opCode == COMMIT && n > 0)
+		return 1;
+
+	if(n <= 0 || p->opCode != PURE_DATA || ! p->Lock())
+	{
+		p = GetSendBuf();
+		if(p == NULL)
+			return -1;
+	}
+
+	p->opCode = COMMIT;
+	p->SetFlag<IS_COMPLETED>();
+	p->Unlock();
+	return 0;
+}
 
 
 

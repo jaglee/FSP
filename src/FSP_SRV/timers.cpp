@@ -254,7 +254,6 @@ void CSocketItemEx::KeepAlive()
 // Send KEEP_ALIVE or it special norm, ACK_FLUSH
 bool CSocketItemEx::SendSNACK(FSPOperationCode opCode)
 {
-
 	ControlBlock::seq_t seqExpected;
 	FSP_PreparedKEEP_ALIVE buf;
 
@@ -271,17 +270,18 @@ bool CSocketItemEx::SendSNACK(FSPOperationCode opCode)
 		printf_s("Fatal error %d encountered when generate SNACK\n", len);
 		return false;
 	}
+	len += sizeof(FSP_NormalPacketHeader);
 
 	buf.hdr.hs.version = THIS_FSP_VERSION;
 	buf.hdr.hs.opCode = opCode;
-	buf.hdr.hs.hsp = htobe16(uint16_t(len + sizeof(FSP_NormalPacketHeader)));
+	buf.hdr.hs.hsp = htobe16(uint16_t(len));
 
 	pControlBlock->SetSequenceFlags(& buf.hdr, seqExpected);
 	SetIntegrityCheckCode(& buf.hdr, NULL, 0, buf.GetSaltValue());
 #ifdef TRACE_PACKET
 	printf_s("To send KEEP_ALIVE seq #%u, acknowledge #%u, source ALFID = %u\n", be32toh(buf.hdr.sequenceNo), seqExpected, fidPair.source);
-	printf_s("KEEP_ALIVE total header length: %d, should be payloadless\n", be16toh(buf.hdr.hs.hsp));
-	DumpNetworkUInt16((uint16_t *) & buf, be16toh(buf.hdr.hs.hsp) / 2);
+	printf_s("KEEP_ALIVE total header length: %d, should be payloadless\n", len);
+	DumpNetworkUInt16((uint16_t *) & buf, len / 2);
 #endif
 
 	return SendPacket(1, ScatteredSendBuffers(& buf.hdr, len)) > 0;

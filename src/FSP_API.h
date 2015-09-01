@@ -218,7 +218,7 @@ FSPHANDLE FSPAPI ConnectMU(FSPHANDLE, PFSP_Context);
 //	-EFAULT if unexpected exception
 //	-EIO if I/O interface error between the message layer and the packet layer
 DllSpec
-int FSPAPI InstallAuthEncKey(FSPHANDLE, uint8_t *, int, int32_t);
+int FSPAPI InstallAuthenticKey(FSPHANDLE, uint8_t *, int, int32_t);
 
 
 

@@ -380,7 +380,7 @@ public:
 	void OnResurrect();
 	void HandleMemoryCorruption() {	Extinguish(); }
 	void LOCALAPI AffirmConnect(const SConnectParam &, ALFID_T);
-	bool PersistConnect();
+	bool ConfirmConnect();
 
 	bool IsValidSequence(ControlBlock::seq_t seq1) { return pControlBlock->IsValidSequence(seq1); }
 
@@ -435,10 +435,11 @@ public:
 	void ScheduleConnect(CommandNewSessionSrv *);
 
 	//
+	void EarlierKeepAlive();
 	bool AddTimer();
 	bool RemoveTimer();
-	void EarlierKeepAlive();
 	bool LOCALAPI ReplaceTimer(uint32_t);
+
 #ifdef TRACE
 	int DumpTimerInfo(timestamp_t t1) const
 	{

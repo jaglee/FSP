@@ -1022,7 +1022,6 @@ void CSocketItemEx::EarlierKeepAlive()
 
 
 
-
 bool CSocketItemEx::RemoveTimer()
 {
 	if(::DeleteTimerQueueTimer(TimerWheel::Singleton(), timer, NULL))

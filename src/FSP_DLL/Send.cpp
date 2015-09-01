@@ -184,11 +184,6 @@ int LOCALAPI CSocketItemDl::AcquireSendBuf(int n)
 }
 
 
-//[API: Send]
-//	{ACTIVE, PEER_COMMIT}<-->[Send PURE_DATA]
-//	{COMMITTING, COMMITTING2, COMMITTED}-->RESUMING-->[Send RESUME]
-//	CLOSABLE-->RESUMING-->[Send RESUME]{enable retry}
-//	{CONNECT_AFFIRMING, CHALLENGING, CLONING, RESUMING, QUASI_ACTIVE}<-->{just prebuffer}
 // Given
 //	void *		the buffer pointer
 //	int			the number of octets to send
@@ -216,11 +211,6 @@ int LOCALAPI CSocketItemDl::SendInplace(void * buffer, int len, bool toBeContinu
 }
 
 
-//[API: Send]
-//	{ACTIVE, PEER_COMMIT}<-->[Send PURE_DATA]
-//	{COMMITTING, COMMITTING2, COMMITTED}-->RESUMING-->[Send RESUME]
-//	CLOSABLE-->RESUMING-->[Send RESUME]{enable retry}
-//	{CONNECT_AFFIRMING, CHALLENGING, CLONING, RESUMING, QUASI_ACTIVE}<-->{just prebuffer}
 // Given
 //	void * 	the pointer to the source data buffer
 //	int		the size of the source data in bytes
@@ -260,15 +250,16 @@ int LOCALAPI CSocketItemDl::SendStream(void * buffer, int len, char flag)
 //	{ACTIVE, RESUMING}-->COMMITTING-->[Urge COMMIT]
 //	PEER_COMMIT-->COMMITTING2-->[Urge COMMIT]{restart keep-alive}
 // Return
-//	-EINTR if cannot gain the exclusive lock
 //	-EDOM if in erraneous state
-//	-ETIMEDOUT if blocked due to lack of buffer 
+//	-EINTR if cannot gain the exclusive lock
+//	0 if no error
 // Remark
-//	It might be blocking to wait the send buffer slot to buffer the COMMIT packet
+//	Automatically terminate previous message, if any when called
 int CSocketItemDl::Commit()
 {
-	eomSending = EndOfMessageFlag::END_OF_SESSION;
-	//
+	if(_InterlockedCompareExchange8(& eomSending, END_OF_SESSION, END_OF_MESSAGE) != END_OF_MESSAGE)
+		return -EDOM;
+
 	if(! WaitSetMutex())
 		return -EINTR;
 
@@ -286,104 +277,21 @@ int CSocketItemDl::Commit()
 		return -EDOM;
 	}
 
-	if(AppendCommit() == NULL)
-	{
-		SetMutexFree();
-		return -ETIMEDOUT;
-	}
+	// If the last packet happened to have been sent by @LLS::EmitQ append a COMMIT and FSP_Urge would activate @LLS::EmitQ again 
+	int r = pControlBlock->ReplaceSendQueueTailToCommit();
+	if(r < 0)	// EmitQ() is busy and we count on it
+		pControlBlock->shouldAppendCommit = 1;
 
 	SetMutexFree();
-	return (Call<FSP_Urge>() ? 0 : -EIO);
+	return (r == 0 ? (Call<FSP_Urge>() ? 0 : -EIO) : 0);
 }
 
 
 
-// Append the COMMIT packet to the end of the message in the send queue.
-ControlBlock::PFSP_SocketBuf CSocketItemDl::AppendCommit()
-{
-	//
-	ControlBlock::PFSP_SocketBuf skb = pControlBlock->LockLastBufferedSend();
-	if(skb != NULL)
-	{
-		if(skb->opCode == PURE_DATA || skb->opCode == PERSIST)
-		{
-			skb->SetFlag<TO_BE_CONTINUED>(false);
-		}
-		else if(skb->opCode != COMMIT)
-		{
-			skb->Unlock();
-			skb = NULL;
-		}
-	}
-	// allocate new slot to hold the COMMIT packet
-	if(skb == NULL)
-	{
-		time_t t0 = time(NULL);
-		while((skb = pControlBlock->GetSendBuf()) == NULL)
-		{
-			SetMutexFree();
-			Sleep(1);
-			if(time(NULL) - t0 > TRASIENT_STATE_TIMEOUT_ms)
-				return NULL;
-			if(! WaitSetMutex())
-				return NULL;
-		}
-		skb->len = 0;
-	}
-	// UNRESOLVED! The IS_COMPLETED flag of COMMIT is reused for accumulative acknowledgment?
-	skb->opCode = COMMIT;
-	skb->SetFlag<IS_COMPLETED>();
-	//
-	skb->Unlock();
-	return skb;
-}
-
-
-
-
-// Return
-//	-ENOENT	if no buffer entry for the COMMIT packet (fatal error!)
-//	0		if no error
-// Remark
-//	It is non-blocking unlike AppendCommit()
-int CSocketItemDl::CommitSendQueue()
-{
-	ControlBlock::PFSP_SocketBuf skb = pControlBlock->LockLastBufferedSend();
-	if(skb != NULL)
-	{
-		// skb->SetFlag<TO_BE_CONTINUED>(false); skb->SetFlag<IS_COMPLETED>();
-		if(skb->opCode == COMMIT)
-		{			
-			skb->Unlock();
-			return 0;
-		}
-
-		if(skb->opCode != PURE_DATA && skb->opCode != PERSIST)
-		{
-			skb->Unlock();
-			skb = NULL;
-		}
-		// or else the packet is to be replaced and terminating
-	}
-
-	if(skb == NULL)
-	{
-		if((skb = pControlBlock->GetSendBuf()) == NULL)
-			return -ENOENT;
-		//
-		skb->len = 0;
-	}
-	//
-	skb->SetFlag<TO_BE_CONTINUED>(false);
-	skb->SetFlag<IS_COMPLETED>();
-	skb->opCode = COMMIT;
-	//
-	skb->Unlock();
-	return 0;
-}
-
-
-
+//[API: Send]
+//	{ACTIVE, PEER_COMMIT}<-->[Send PURE_DATA]
+//	{COMMITTED, CLOSABLE}-->RESUMING-->[Send RESUME]{enable retry}
+//	{CONNECT_AFFIRMING, CHALLENGING, CLONING, RESUMING, QUASI_ACTIVE}<-->{just prebuffer}
 // Return
 //	1 if revert to RESUMING state
 //	0 if no state change
@@ -408,6 +316,7 @@ int CSocketItemDl::CheckedRevertToResume()
 #ifdef TRACE
 	printf_s("Data requested to be sent in %s state. Migrate to RESUMING state\n", stateNames[GetState()]);
 #endif
+	pControlBlock->shouldAppendCommit = 0;	// just ignore it if the COMMIT packet has already been put into the send queue
 	isFlushing = REVERT_TO_RESUME;
 	SetState(RESUMING);
 	return 1;
@@ -451,7 +360,6 @@ void CSocketItemDl::ProcessPendingSend()
 		return;
 	}
 
-	//	SetMutexFree() is splitted because of calling back
 	if(pendingSendSize <= 0)	// pending WriteTo()
 	{
 		pendingSendBuf = NULL;	// So that WriteTo() chaining is possible, see also BufferData()
@@ -602,6 +510,7 @@ l_finish:
 int LOCALAPI CSocketItemDl::PrepareToSend(void * buf, int len, bool toBeContinued)
 {
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->LockLastBufferedSend();
+	eomSending = toBeContinued ? NOT_END_ANYWAY : END_OF_MESSAGE;
 	// Automatically mark the previous last packet as completed. See also BufferData()
 	if (skb != NULL)
 	{

@@ -47,6 +47,7 @@ public:
 	//{
 	//	vhash_reset(& pControlBlock->mac_ctx);	// vmac_set_key
 	//}
+	void SetState(FSP_Session_State s) { CSocketItemEx::SetState(s); }
 
 	ControlBlockDbg *GetControlBlock() const { return (ControlBlockDbg *)pControlBlock; }
 	ControlBlock::PFSP_SocketBuf AllocRecvBuf(ControlBlock::seq_t seq1) { return pControlBlock->AllocRecvBuf(seq1); }

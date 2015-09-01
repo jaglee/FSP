@@ -128,7 +128,7 @@ int FSPAPI onConnected(FSPHANDLE h, PFSP_Context ctx)
 
 	// Actually install authenc key would commit the stream because send is pending
 	WriteTo(h, bufPublicKey, CRYPTO_NACL_KEYBYTES, END_OF_MESSAGE, onPublicKeySent);
-	InstallAuthEncKey(h, bufSharedKey, CRYPTO_NACL_KEYBYTES, INT32_MAX);
+	InstallAuthenticKey(h, bufSharedKey, CRYPTO_NACL_KEYBYTES, INT32_MAX);
 
 	return 0;
 }

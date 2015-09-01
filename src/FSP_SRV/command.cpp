@@ -236,11 +236,12 @@ void CSocketItemEx::Start()
 	if (lowState == CLONING || lowState == RESUMING)
 		tKeepAlive_ms = CONNECT_INITIATION_TIMEOUT_ms;
 	else
-		PersistConnect();
+		ConfirmConnect();
 	//
 	EmitStart();
-	pControlBlock->sendWindowNextSN++;
+	pControlBlock->SlideNextToSend();
 	// assert that Start() is called at most once for a session
+
 	RestartKeepAlive();
 	//^Sometimes it is redundant but does little harm anyway
 }
@@ -262,7 +263,7 @@ void CSocketItemEx::UrgeCommit()
 	//
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->GetNextToSend();
 	if(skb->Lock())
-		EmitWithICC(skb, pControlBlock->sendWindowNextSN++);
+		EmitWithICC(skb, pControlBlock->SlideNextToSend());
 }
 
 
