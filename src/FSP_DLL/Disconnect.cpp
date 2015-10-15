@@ -84,12 +84,11 @@ int FSPAPI Shutdown(FSPHANDLE hFSPSocket)
 	register CSocketItemDl * p = (CSocketItemDl *)hFSPSocket;
 	try
 	{
-		if (p == NULL || !p->IsInUse())
+		if (p == NULL)
 			return -EBADF;
 		//
 		// ALWAYS assume shutdown is only called after it has finished receiving
-		// UNRESOLVED! TODO: timeout management?
-		if(! p->WaitSetMutex())
+		if(! p->WaitUseMutex())
 			return -EINTR;
 
 		if(p->InState(CLOSED) || p->InState(NON_EXISTENT))
@@ -139,7 +138,6 @@ int FSPAPI Shutdown(FSPHANDLE hFSPSocket)
 void CSocketItemDl::ToConcludeCommit()
 {
 	char isFlushing = GetResetFlushing();
-	SetMutexFree();
 	if(isFlushing == ONLY_FLUSHING)
 	{
 #ifdef TRACE

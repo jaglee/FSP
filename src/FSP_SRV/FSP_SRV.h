@@ -150,8 +150,9 @@ public:
 	// ConnectRequestQueue() { head = tail = 0; mayFull = 0; mutex = SHARED_FREE; }
 	int Push(const CommandNewSessionSrv *);
 	int Remove(int);
+	// Connect to remote end might be time-consuming
+	void WaitSetMutex() { while(_InterlockedCompareExchange8(& mutex, 1, 0)) Sleep(1); }
 	void SetMutexFree() { _InterlockedExchange8(& mutex, 0); }
-
 };
 
 
@@ -233,6 +234,12 @@ class CSocketItemEx: public CSocketItem
 {
 	friend class CLowerInterface;
 	friend class CSocketSrvTLB;
+	//
+	SRWLOCK	rtSRWLock;
+	DWORD	idSrcProcess;
+	HANDLE	hSrcMemory;
+	//
+protected:
 	PktBufferBlock * volatile headPacket;
 	PktBufferBlock * volatile tailPacket;
 
@@ -244,17 +251,9 @@ class CSocketItemEx: public CSocketItem
 	// the extra one is for saving temporary souce address
 	SOCKADDR_INET	sockAddrTo[MAX_PHY_INTERFACES + 1];
 
-protected:
-	DWORD	idSrcProcess;
-	HANDLE	hSrcMemory;
-	//
-	ALIGN(2)
-	volatile char	inUse;
+	volatile char	inUse;	// assert ALIGN(2)
 	volatile char	isReady;
-
-	volatile char	mutex;
 	volatile char	toUpdateTimer;
-
 	FSP_Session_State lowState;
 
 	CSocketItemEx * volatile next;
@@ -268,20 +267,22 @@ protected:
 	timestamp_t	tLastRecv;
 	timestamp_t tEarliestSend;
 
-	uint32_t	tLastAck;
+	uint32_t	nextNAckSN;	// host byte order for near end. if it overflow the session MUST be terminated
+	uint32_t	lastNAckSN;	// host byte order, the serial number of peer's last SNACK
+	ALIGN(8)
+	ControlBlock::seq_t	seqLastAck;
+
 	//
 	struct
 	{
 		timestamp_t tMigrate;
-		timestamp_t tKeepAlive;
 	}	clockCheckPoint;
 
 	ICC_Context		contextOfICC;
 
-	void SetMutexFree() { _InterlockedExchange8(& mutex, 0); }
-
 	void RestartKeepAlive() { ReplaceTimer(tKeepAlive_ms); }
 	void StopKeepAlive() { ReplaceTimer(SCAVENGE_THRESHOLD_ms); }
+	void CalibrateKeepAlive();
 	void RecalibrateKeepAlive(timestamp_t);
 
 	bool IsPassive() const { return lowState == LISTENING; }
@@ -300,7 +301,7 @@ protected:
 	PktBufferBlock *PushPacketBuffer(PktBufferBlock *);
 	FSP_NormalPacketHeader *PeekLockPacketBuffer();
 	void PopUnlockPacketBuffer();
-	void UnlockPacketBuffer() { _InterlockedExchange8(& mutex, 0); }
+	void UnlockPacketBuffer() { ReleaseSRWLockShared(& rtSRWLock); }
 
 	int  LOCALAPI PlacePayload(ControlBlock::PFSP_SocketBuf);
 
@@ -362,12 +363,11 @@ public:
 	int LOCALAPI ResolveToIPv6(const char *);
 	int LOCALAPI ResolveToFSPoverIPv4(const char *, const char *);
 
-	bool Notify(FSP_ServiceCode);
+	bool LOCALAPI Notify(FSP_ServiceCode);
 	void SignalEvent() { ::SetEvent(hEvent); }
-	void SignalReturned() { _InterlockedExchange8((char *)pControlBlock->notices, FSP_NotifyAccepting); SignalEvent(); }
+	void SignalReturned() { pControlBlock->notices.SetHead(FSP_NotifyAccepting); SignalEvent(); }
 	//
-	int LOCALAPI RespondToSNACK(ControlBlock::seq_t, const FSP_SelectiveNACK::GapDescriptor *, int);
-	int LOCALAPI RespondToSNACK(ControlBlock::seq_t, const PFSP_HeaderSignature);
+	int LOCALAPI RespondToSNACK(ControlBlock::seq_t, FSP_SelectiveNACK::GapDescriptor *, int);
 	int32_t LOCALAPI GenerateSNACK(FSP_PreparedKEEP_ALIVE &, ControlBlock::seq_t &);
 	//
 	void InitiateConnect();
@@ -412,7 +412,7 @@ public:
 	// Solid input,  the payload, if any, is copied later
 	bool LOCALAPI ValidateICC(FSP_NormalPacketHeader *, int32_t = 0, uint32_t = 0);
 	bool ValidateICC() { return ValidateICC(headPacket->GetHeaderFSP(), headPacket->lenData); }
-	bool LOCALAPI ValidateSNACK(ControlBlock::seq_t &);
+	bool LOCALAPI ValidateSNACK(ControlBlock::seq_t &, FSP_SelectiveNACK::GapDescriptor * &, int &);
 	//	On got valid ICC automatically register source IP address as the favorite returning IP address
 	void ChangeRemoteValidatedIP()
 	{
@@ -429,13 +429,12 @@ public:
 	}
 
 	void EmitQ() { pControlBlock->EmitQ(this); }
-	void CheckPeerCommit();
 	void KeepAlive();
 	void ScheduleEmitQ();
 	void ScheduleConnect(CommandNewSessionSrv *);
 
 	//
-	void EarlierKeepAlive();
+	bool CheckPeerCommit();
 	bool AddTimer();
 	bool RemoveTimer();
 	bool LOCALAPI ReplaceTimer(uint32_t);
@@ -445,11 +444,9 @@ public:
 	{
 		return printf_s("\tRound Trip Time = %uus, Keep-alive period = %ums\n"
 			"\tTime elapsed since earlist sent = %lluus\n"
-			"\tNext relative keep-alive shot time=%lluus\n"
 			, tRoundTrip_us
 			, tKeepAlive_ms
-			, t1 - tEarliestSend
-			, clockCheckPoint.tKeepAlive - t1);
+			, t1 - tEarliestSend);
 	}
 #else
 	int DumpTimerInfo(timestamp_t) const { return 0; }
@@ -491,6 +488,8 @@ public:
 class CSocketSrvTLB
 {
 protected:
+	SRWLOCK rtSRWLock;	// runtime Slim-Read-Write Lock
+
 	ALIGN(MAC_ALIGNMENT)
 	CSocketItemEx listenerSlots[MAX_LISTENER_NUM];
 	ALIGN(MAC_ALIGNMENT)
@@ -498,25 +497,17 @@ protected:
 	//
 	CSocketItemEx *poolFiberID[MAX_CONNECTION_NUM];
 	CSocketItemEx *headFreeSID, *tailFreeSID;
-	volatile char mutex;
+
 public:
 	CSocketSrvTLB();
+	void InitMutex() { InitializeSRWLock(& rtSRWLock); } 
+	void AcquireMutex() { AcquireSRWLockExclusive(& rtSRWLock); }
+	void SetMutexFree() { ReleaseSRWLockExclusive(& rtSRWLock); }
 
 	CSocketItemEx * AllocItem(const CommandNewSessionSrv &);
 	CSocketItemEx * AllocItem(ALFID_T);
 	CSocketItemEx * AllocItem();
 	void FreeItem(CSocketItemEx *r);
-
-	// UNRESOLVED! Avoid deadlock by assigning a time-out clock?
-	bool WaitSetMutex()
-	{
-		while(_InterlockedCompareExchange8(& this->mutex, 1, 0))
-		{
-			Sleep(0);	// just yield out the CPU time slice
-		}
-		return true;
-	}
-	void SetMutexFree() { _InterlockedExchange8(& mutex, 0); }
 
 	CSocketItemEx * operator[](ALFID_T);
 };
@@ -547,7 +538,6 @@ private:
 	DWORD	interfaces[FD_SETSIZE];
 	SOCKADDR_IN6 addresses[FD_SETSIZE];	// by default IPv6 addresses, but an entry might be a UDP over IPv4 address
 	int		nAddress;
-	volatile char	mutex;		// Utilize _InterlockedCompareExchange8 to manage critical resource
 
 	// intermediate buffer to hold the fixed packet header, the optional header and the data
 	DWORD	countRecv;
@@ -577,7 +567,6 @@ protected:
 	ALIGN(8) PktBufferBlock bufferMemory[MAX_BUFFER_BLOCKS];
 
 	// OS-dependent
-	void	SetMutexFree() { _InterlockedExchange8(& mutex, 0); }
 	void	InitBuffer();
 	PktBufferBlock	*GetBuffer();
 	void	LOCALAPI FreeBuffer(PktBufferBlock *);

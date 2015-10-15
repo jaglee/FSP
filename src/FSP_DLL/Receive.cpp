@@ -94,13 +94,8 @@ int FSPAPI ReadFrom(FSPHANDLE hFSPSocket, void *buf, int capacity, NotifyOrRetur
 // See ::RecvInline()
 int CSocketItemDl::RecvInline(PVOID fp1)
 {
-	TRACE_HERE("BEFORE WaitSetMutex");
-	if(!WaitSetMutex())
-	{
-		TRACE_HERE("deadlock encountered?");
+	if(! WaitUseMutex())
 		return -EINTR;
-	}
-	TRACE_HERE("AFTER WaitSetMutex");
 
 	if(waitingRecvBuf != NULL)
 	{
@@ -141,12 +136,9 @@ int LOCALAPI CSocketItemDl::ReadFrom(void * buffer, int capacity, PVOID fp1)
 #ifdef TRACE
 	printf_s("ReadFrom the FSP pipe to 0x%08X: byte[%d]\n", (LONG)buffer,  capacity);
 #endif
-	if(!WaitSetMutex())
-	{
-		TRACE_HERE("deadlock encountered?");
+	if(! WaitUseMutex())
 		return -EINTR;
-	}
-
+	//
 	if(InterlockedCompareExchangePointer((PVOID *) & fpRecept, fp1, NULL) != NULL)
 	{
 		TRACE_HERE("calling convention error: cannot read the stream before previous ReadFrom called back");
@@ -250,14 +242,19 @@ int CSocketItemDl::FetchReceived()
 // Remark
 //	fpRecept would not be reset if internal memeory allocation error detected
 //	If RecvInline() failed (say, due to compression and/or encryption), data may be picked up by ReadFrom()
-//	SetMutexFree() is splitted because of calling back
 //	ULA should make sure that the socket is freed in the callback function (if recycling is notified)
 void CSocketItemDl::ProcessReceiveBuffer()
 {
-#ifdef TRACE_PACKET
+#ifdef TRACE
 	printf_s("Process receive buffer in state %s\n", stateNames[pControlBlock->state]);
 #endif
-	if (InState(NON_EXISTENT) || InState(CONNECT_BOOTSTRAP) || InState(PRE_CLOSED) || InState(CLOSED))
+	if(! WaitUseMutex())
+	{
+		TRACE_HERE("deadlock encountered!?");
+		return;
+	}
+	// See also @LLS::OnGetPersist() and @LLS:OnGetCommit()
+	if (!InState(ESTABLISHED) && !InState(COMMITTING)  && !InState(COMMITTED)  && !InState(PEER_COMMIT) && !InState(COMMITTING2) && !InState(CLOSABLE))
 	{
 #ifdef TRACE
 		printf_s("Is it illegal to ProcessReceiveBuffer in state %s\n", stateNames[pControlBlock->state]);
@@ -298,9 +295,9 @@ void CSocketItemDl::ProcessReceiveBuffer()
 		//
 		SetMutexFree();
 		if(n < 0)
-			fp1(this, NULL, (size_t) n, false);
+			fp1(this, NULL, (int32_t)n, false);
 		else
-			fp1(this, p, n, b);
+			fp1(this, p, (int32_t)n, b);
 		return;
 	}
 

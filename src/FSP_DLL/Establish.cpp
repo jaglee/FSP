@@ -85,7 +85,7 @@ FSPHANDLE FSPAPI ListenAt(const PFSP_IN6_ADDR listenOn, PFSP_Context psp1)
 //	CallbackConnected() function whose pointer was given in the structure pointed by PSP_SocketParameter
 //  would report later error by passing a NULL FSP handle as the first parameter
 //	and a negative integer, which is the error number, as the second parameter if connection failed
-// TODO: UNRESOLVED! RDSC management!?
+// TODO: UNRESOLVED! RDSC management!? Timed out for Connect2 and ListenAt
 DllSpec
 FSPHANDLE FSPAPI Connect2(const char *peerName, PFSP_Context psp1)
 {
@@ -110,18 +110,19 @@ FSPHANDLE FSPAPI Connect2(const char *peerName, PFSP_Context psp1)
 }
 
 
+
 // Fetch each of the backlog item in the listening socket, create new socket, prepare the acknowledgement
 // and call LLS to send the acknowledgement to the connnection request or multiplication request
 void CSocketItemDl::ProcessBacklog()
 {
 	// TODO: set the default interface to non-zero?
 	CommandNewSession objCommand;
-	BackLogItem		backLog;
+	BackLogItem		logItem;
 	CSocketItemDl * socketItem;
 	// firstly, fetch the backlog item
-	while(pControlBlock->PopBacklog(& backLog) >= 0)
+	while(pControlBlock->backLog.Pop(& logItem) >= 0)
 	{
-		socketItem = PrepareToAccept(backLog, objCommand);
+		socketItem = PrepareToAccept(logItem, objCommand);
 		if(socketItem == NULL)
 		{
 			TRACE_HERE("Process listening backlog: insufficient system resource?");
@@ -130,8 +131,8 @@ void CSocketItemDl::ProcessBacklog()
 			return;
 		}
 		// lost some possibility of code reuse, gain flexibility (and reliability)
-		if(backLog.idParent == 0 && ! socketItem->ToWelcomeConnect(backLog)
-		|| backLog.idParent != 0 && ! socketItem->ToWelcomeMultiply(backLog))
+		if(logItem.idParent == 0 && ! socketItem->ToWelcomeConnect(logItem)
+		|| logItem.idParent != 0 && ! socketItem->ToWelcomeMultiply(logItem))
 		{
 			this->InitCommand<FSP_Reject>(objCommand);
 			this->Call(objCommand, sizeof(objCommand));
@@ -242,6 +243,9 @@ bool LOCALAPI CSocketItemDl::ToWelcomeConnect(BackLogItem & backLog)
 //	|-->{Return Reject}-->NON_EXISTENT-->[Send RESET]
 void CSocketItemDl::ToConcludeConnect()
 {
+	if(! WaitUseMutex())
+		return;
+
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadRecv();
 	BYTE *payload = GetRecvPtr(skb);
 
@@ -306,14 +310,14 @@ uint32_t * TranslateFSPoverIPv4(PFSP_IN6_ADDR p, uint32_t dwIPv4, uint32_t fiber
 
 
 DllSpec
-int FSPAPI InstallAuthenticKey(FSPHANDLE h, BYTE * key, int keySize, int32_t keyLife)
+int FSPAPI InstallAuthenticKey(FSPHANDLE h, BYTE * key, int keySize, int32_t keyLife, FlagEndOfMessage eotFlag)
 {
 	if(keySize < FSP_MIN_KEY_SIZE || keySize > FSP_MAX_KEY_SIZE || keySize % sizeof(uint64_t) != 0 || keyLife <= 0)
 		return -EDOM;
 	try
 	{
 		CSocketItemDl *pSocket = (CSocketItemDl *)h;
-		return pSocket->InstallKey(key, keySize, keyLife);
+		return pSocket->InstallKey(key, keySize, keyLife, eotFlag);
 	}
 	catch(...)
 	{
@@ -328,65 +332,41 @@ int FSPAPI InstallAuthenticKey(FSPHANDLE h, BYTE * key, int keySize, int32_t key
 //	int			length of the key, should be multiplication of 8
 //	int32_t		life of the key, maximum number of packets that may utilize the key
 // Return
-//	-EGAIN	if installation of previous key was not yet synchronized with the peer
-//	-EDOM	if domain error: either send queue or receive buffer should be empty
-//	-EINTR	if gaining mutex is interrupted (timed out)
+//	-EINTR	if cannot obtain the right lock
 //	-EIO	if cannot trigger LLS to do the installation work through I/O
 //	0		if no failure
-// Remark
-//	Installation of the new session key is usually asymmetric in the sense that one side
-//	can figure out the shared secret before its peer have collected enough information
-//	It is assumed that for security reason the key material exchanged should be of limited length
-//	and only after the key material has been buffered to send or received thoroughly may InstallKey be called
-//	See also CSocketItemDl::Commit
-// UNRESOLVED! The state machine MUST be carefully reviewed. How about CONNECT_AFFIRMING? It is a temporal state.
-int LOCALAPI CSocketItemDl::InstallKey(BYTE *key, int keySize, int32_t keyLife)
+// The protocol is:
+//	The final responder install the new session key immediately
+//	The final initiator install the new session key for send direction as soon as the COMMIT packet is transmitted
+//	The final initiator install the new session key for receive direction as soon as the ACK_FLUSH packet is received
+//	The final initiator is not necessarily the initial initiator.
+int LOCALAPI CSocketItemDl::InstallKey(BYTE *key, int keySize, int32_t keyLife, FlagEndOfMessage eotFlag)
 {
-	if(_InterlockedCompareExchange8(& pControlBlock->hasPendingKey, 1, 0) != 0)
+	if(! WaitUseMutex())
+		return -EINTR;
+
+	if(_InterlockedCompareExchange8(& pControlBlock->hasPendingKey, HAS_PENDING_KEY_FOR_SEND | HAS_PENDING_KEY_FOR_RECV, 0) != 0)
+	{
+		SetMutexFree();
 		return -EAGAIN;
+	}
 	//
 	memcpy(& pControlBlock->connectParams, key, keySize);
 	pControlBlock->connectParams.keyLength = keySize;
 	pControlBlock->connectParams.initialSN = keyLife;
 
-	if(! WaitSetMutex())
-		return -EINTR;
-
-	// Install the new session key immediately if it is already in a definitely stable state
-	// It is assumed that all data with old key have been buffered
-	// when InstallAuthenticKey is called
-	// It is also supposed that in the CLOSABLE state the receive buffer must be empty
-	// so does it in CHALLENGING, CLONING, QUASI_ACTIVE or RESUMING state
-	if(pControlBlock->CountReceived() == 0 || InState(PEER_COMMIT) || InState(COMMITTING2))
-	{
-		int r = Call<FSP_InstallKey>() ? 0 : -EIO;
-		pControlBlock->hasPendingKey = 0;
-		SetMutexFree();
-		return r;
-	}
-
-	if (InState(ESTABLISHED) ||	InState(COMMITTED))
-	{
-		SetState(COMMITTING);
-	}
-	else if (! InState(COMMITTING))
+	// It is the final initiator in key establishment
+	if(eotFlag == NOT_END_ANYWAY)
 	{
 		SetMutexFree();
-		return -EDOM;
-	}
-
-	// Automatically terminate the last message. Unlike Commit() the function fails if overflow occurred
-	int r = pControlBlock->ReplaceSendQueueTailToCommit();
-	_InterlockedCompareExchange8(& eomSending, END_OF_MESSAGE, 0);
-	// END_OF_SESSION is not replaced
-
-	SetMutexFree();
-	if(r < 0)
-		return -EDOM;
-	else if(r > 0)
 		return 0;
-	else // if(r == 0)
-		return Call<FSP_Urge>() ? 0 : -EIO;
+	}
+
+	// It is the final responder in key establishment
+	int r = Call<FSP_InstallKey>() ? 0 : -EIO;
+	pControlBlock->hasPendingKey = 0;
+	SetMutexFree();
+	return r;
 }
 
 

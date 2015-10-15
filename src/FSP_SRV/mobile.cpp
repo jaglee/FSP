@@ -199,8 +199,7 @@ void CSocketItemEx::InstallEphemeralKey()
 
 
 
-// If there is no data in flight from perspect of ULA's point of view, the send key is installed immediately
-// If the receive buffer is empty, it is assume that the peer has been ready to apply the new key
+// See @DLL::InstallKey
 void CSocketItemEx::InstallSessionKey()
 {
 #ifndef NDEBUG
@@ -213,11 +212,10 @@ void CSocketItemEx::InstallSessionKey()
 	contextOfICC.savedCRC = (contextOfICC.keyLife == 0);
 	contextOfICC.prev = contextOfICC.curr;
 	contextOfICC.keyLife = pControlBlock->connectParams.initialSN;
+	GCM_AES_SetKey(& contextOfICC.curr.gcm_aes, (uint8_t *) & pControlBlock->connectParams, pControlBlock->connectParams.keyLength);
 
 	contextOfICC.firstSendSNewKey = pControlBlock->sendBufferNextSN;
 	contextOfICC.firstRecvSNewKey = pControlBlock->recvWindowNextSN;
-
-	GCM_AES_SetKey(& contextOfICC.curr.gcm_aes, (uint8_t *) & pControlBlock->connectParams, pControlBlock->connectParams.keyLength);
 }
 
 
@@ -469,10 +467,13 @@ bool LOCALAPI CSocketItemEx::EmitWithICC(ControlBlock::PFSP_SocketBuf skb, Contr
 		contextOfICC.keyLife--;
 
 	// The COMMIT packet, if any, is the last one that applied CRC64 or the old transmission key
-	if(skb->opCode == COMMIT && _InterlockedCompareExchange8(& pControlBlock->hasPendingKey, 0, 1) != 0)
+	// assume the receive direction is not ready yet
+	// See also OnAckFlush and @DLL::InstallKey 
+	if(skb->opCode == COMMIT && (pControlBlock->hasPendingKey & HAS_PENDING_KEY_FOR_SEND) != 0)
 	{
 		InstallSessionKey();
-		contextOfICC.firstSendSNewKey = seq + 1;
+		pControlBlock->hasPendingKey = HAS_PENDING_KEY_FOR_RECV;
+		contextOfICC.firstRecvSNewKey = pControlBlock->recvWindowNextSN + INT32_MAX;
 	}
 
 	void  *payload = (FSP_NormalPacketHeader *)this->GetSendPtr(skb);
@@ -530,6 +531,10 @@ bool LOCALAPI CSocketItemEx::HandleMobileParam(PFSP_HeaderSignature optHdr)
 // TODO: rate-control/quota control
 void ControlBlock::EmitQ(CSocketItem *context)
 {
+#ifdef TRACE
+	TRACE_HERE("Sending data...");
+#endif
+
 	if(sendWindowNextSN == sendBufferNextSN && _InterlockedCompareExchange8(& shouldAppendCommit, 0, 1) != 0)
 		SetNextToSendToCommit();
 	//
@@ -555,7 +560,7 @@ void ControlBlock::EmitQ(CSocketItem *context)
 		}
 
 		// It is obviously less efficient/clever than pre-cache or loop-unrolling but much more reliable and comprehensible?
-		if(sendWindowNextSN + 1 == sendBufferNextSN  && _InterlockedCompareExchange8(& shouldAppendCommit, 0, 1) != 0)
+		if(sendWindowNextSN + 1 == sendBufferNextSN && _InterlockedCompareExchange8(& shouldAppendCommit, 0, 1) != 0)
 		{
 			// assert(skb->GetFlag<TO_BE_CONTINUED>() == false	// See also @DLL::Commit @DLL::ProcessPendingSend
 			if(skb->opCode == PURE_DATA || skb->opCode == PERSIST)

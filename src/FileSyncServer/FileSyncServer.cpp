@@ -22,14 +22,14 @@ static int		fd;
 
 static void FSPAPI onReturn(FSPHANDLE h, FSP_ServiceCode code, int value)
 {
-	printf_s("Notify 0x%08X service code = %d, returned %d\n", (uint32_t)(intptr_t)h, code, value);
+	printf_s("Notify: Fiber ID = %u, service code = %d, returned %d\n", (uint32_t)(intptr_t)h, code, value);
 	if(value < 0)
 	{
 		Dispose(h);
 		finished = true;
 		return;
 	}
-	if(code == FSP_NotifyFinish || code == FSP_NotifyRecycled)
+	if(code == FSP_NotifyFinish)
 	{
 		printf_s("Session was shut down.\n");
 		Dispose(h);
@@ -126,7 +126,7 @@ static int	FSPAPI onAccepting(FSPHANDLE h, void *p, PFSP_IN6_ADDR remoteAddr)
 
 static int FSPAPI onAccepted(FSPHANDLE h, PFSP_Context ctx)
 {
-	printf_s("\nHandle of FSP session: 0x%08X\n", h);
+	printf_s("\nHandle of FSP session: Fiber ID = %u\n", (uint32_t)(intptr_t)h);
 	// TODO: check connection context
 
 	ReadFrom(h, bufPeerPublicKey, sizeof(bufPeerPublicKey), onPublicKeyReceived);
@@ -147,7 +147,7 @@ static void FSPAPI onPublicKeyReceived(FSPHANDLE h, FSP_ServiceCode c, int r)
 	unsigned char bufSharedKey[CRYPTO_NACL_KEYBYTES];
 	CryptoNaClGetSharedSecret(bufSharedKey, bufPeerPublicKey, bufPrivateKey);
 	printf_s("\tTo install the negotiated shared key...\n");
-	InstallAuthenticKey(h, bufSharedKey, CRYPTO_NACL_KEYBYTES, INT32_MAX); 
+	InstallAuthenticKey(h, bufSharedKey, CRYPTO_NACL_KEYBYTES, INT32_MAX, END_OF_TRANSACTION); 
 
 	printf_s("\tTo send filename to the remote end...\n");
 	WriteTo(h, fileName, (int)strlen(fileName) + 1, END_OF_MESSAGE, onFileNameSent);
@@ -166,7 +166,7 @@ static void FSPAPI onFileNameSent(FSPHANDLE h, FSP_ServiceCode c, int r)
 	}
 
 	printf("Filename has been sent to remote end,\n"
-		"to get send buffer for reading and sending inline...\n");
+		"to get send buffer for reading file and sending inline...\n");
 	//UNRESOLVED! spawn an implicit thread to receive remote feed-back
 
 	// We insisted on sending even if only a small buffer of 1 octet is available
@@ -217,7 +217,7 @@ static int FSPAPI toSendNextBlock(FSPHANDLE h, void * batchBuffer, int32_t capac
 
 	printf_s("To send %d bytes to the remote end\n", bytesRead);
 
-	SendInline(h, batchBuffer, bytesRead, ! r);
+	SendInline(h, batchBuffer, bytesRead, r ? END_OF_MESSAGE : NOT_END_ANYWAY);
 	if(r)
 	{
 		printf("All content has been sent. To shutdown.\n");

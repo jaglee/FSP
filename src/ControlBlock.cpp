@@ -116,13 +116,13 @@ const char * CStringizeNotice::names[LARGEST_FSP_NOTICE + 1] =
 	"FSP_Listen",		// register a passive socket
 	"InitConnection",	// register an initiative socket
 	"FSP_NotifyAccepting",	//  = SynConnection,	// a reverse command to make context ready
-	"FSP_Reject",		// a reverse command. used to be FSP_Preclose/FSP_Timeout, forward command is FSP_Reject
-	"FSP_Dispose",		// AKA Reset. dispose the socket. connection might be aborted
+	"FSP_Reject",		// a forward command, explicitly reject some request
+	"FSP_Recycle",		// a forward command, connection might be aborted
 	"FSP_Start",		// send a start packet such as MULTIPLY, PERSIST and transactional COMMIT
 	"FSP_Send",			// send a packet/a group of packets
 	"FSP_Urge",			// send a packet urgently, mean to urge COMMIT
-	"FSP_Resume",		// cancel COMMIT(unilateral adjourn) or send RESUME
 	"FSP_Shutdown",		// close the connection
+	"FSP_InstallKey",	// install the authenticated encryption key
 	// 11-15, 5 reserved
 	"Reserved11",
 	"Reserved12",
@@ -134,10 +134,10 @@ const char * CStringizeNotice::names[LARGEST_FSP_NOTICE + 1] =
 	"FSP_NotifyDataReady",
 	"FSP_NotifyBufferReady",
 	"FSP_NotifyReset",
-	"FSP_NotifyToCommit",
 	"FSP_NotifyFlushed",
 	"FSP_NotifyFinish",
-	"FSP_NotifyRecycled",
+	"FSP_Dispose",		// a reverse command from LLS to DLL meant to synchonize DLL and LLS
+	"Reserved23",
 	// 24~31: near end error status
 	"FSP_IPC_CannotReturn",	// LLS cannot return to DLL for some reason
 	"FSP_MemoryCorruption",
@@ -183,16 +183,17 @@ const char * CStringizeNotice::operator[](int i)
 	return CStringizeNotice::names[i];
 }
 
-CStringizeOpCode opCodeStrings;
-CStringizeState stateNames;
-CStringizeNotice noticeNames;
+
+
+CStringizeOpCode	opCodeStrings;
+CStringizeState		stateNames;
+CStringizeNotice	noticeNames;
 
 
 
 // Remark
 //	There would be at least two item in the queue
-template<typename TLogItem>
-int TSingleProviderMultipleConsumerQ<TLogItem>::InitSize(int n)
+int LLSBackLog::InitSize(int n)
 {
 	if(n <= 1)
 		return 0;
@@ -201,8 +202,10 @@ int TSingleProviderMultipleConsumerQ<TLogItem>::InitSize(int n)
 		m++;
 	// assume memory has been zeroed
 	capacity = 1 << m;
+	mutex = 0;
 	return capacity;
 }
+
 
 
 // Given
@@ -211,17 +214,13 @@ int TSingleProviderMultipleConsumerQ<TLogItem>::InitSize(int n)
 //	non-negative on success, or negative on failure
 // Remark
 //	capacity must be some power of 2
-template<typename TLogItem>
-int LOCALAPI TSingleProviderMultipleConsumerQ<TLogItem>::Push(const TLogItem *p)
+int LOCALAPI LLSBackLog::Put(const BackLogItem *p)
 {
-	if(InterlockedIncrementAcquire(& nProvider) > 1)
+	WaitSetMutex();
+
+	if(count >= capacity)
 	{
-		InterlockedDecrementRelease(& nProvider);
-		return -EBUSY;
-	}
-	if(count >= capacity || nProvider > 1)
-	{
-		InterlockedDecrementRelease(& nProvider);
+		SetMutexFree();
 		return -ENOMEM;
 	}
 
@@ -230,9 +229,10 @@ int LOCALAPI TSingleProviderMultipleConsumerQ<TLogItem>::Push(const TLogItem *p)
 	tailQ = (i + 1) & (capacity - 1);
 
 	count++;
-	InterlockedDecrementRelease(& nProvider);
+	SetMutexFree();
 	return i;
 }
+
 
 
 // Given
@@ -242,33 +242,22 @@ int LOCALAPI TSingleProviderMultipleConsumerQ<TLogItem>::Push(const TLogItem *p)
 // Remark
 //	capacity must be some power of 2
 //	It is assumed that there is only one producer(optimistic push) but may be multiple consumer(conservative pop)
-template<typename TLogItem>
-int LOCALAPI TSingleProviderMultipleConsumerQ<TLogItem>::Pop(TLogItem *p)
+int LOCALAPI LLSBackLog::Pop(BackLogItem *p)
 {
-	while(_InterlockedCompareExchange8(& mutex, 1, 0))
-	{
-		Sleep(0);	// just yield out the CPU time slice
-	}
+	WaitSetMutex();
 
 	register int i = headQ;
 	if(count == 0)
 	{
-		i = -ENOENT;
-		goto l_bailout;
-	}
-
-	while(count - 1 == 0 && nProvider)
-	{
-		Sleep(0);
-		// See also TSingleProviderMultipleConsumerQ::Push, should be very rare
+		SetMutexFree();
+		return -ENOENT;
 	}
 
 	*p = q[i];
 	headQ = (i + 1) & (capacity - 1);
 	count--;
 
-l_bailout:
-	_InterlockedExchange8(& mutex, 0);	// with memory barrier release semantics assumed
+	SetMutexFree();
 	return i;
 }
 
@@ -279,90 +268,97 @@ l_bailout:
 //	here we rely on a conservative memory model to make sure q[i] is written before tailQ is set
 //	UNRESOLVED!? disable certain compiler optimization, out-of-order execution may break the assumption
 //	If provider lock could not be obtained it will return true ('collision found') instead of raising an 'EBUSY' exception
-bool LOCALAPI ControlBlock::HasBacklog(const BackLogItem *p)
+bool LOCALAPI LLSBackLog::Has(const BackLogItem *p)
 {
-	if(InterlockedIncrementAcquire(& backLog.nProvider) > 1)
-	{
-		InterlockedDecrementRelease(& backLog.nProvider);
-		return true;
-	}
+	WaitSetMutex();
 
-	if(backLog.count <= 0)
+	if(count <= 0)
 	{
-		InterlockedDecrementRelease(& backLog.nProvider);
+		SetMutexFree();
 		return false;	// empty queue
 	}
 
 	// it is possible that phantom read occurred
-	register int i = backLog.headQ;
-	register int k = backLog.tailQ;
-	BackLogItem *pQ = backLog.q;
+	register int i = headQ;
+	register int k = tailQ;
 	do
 	{
-		if(pQ[i].idRemote == p->idRemote && pQ[i].salt == p->salt)
+		if(q[i].idRemote == p->idRemote && q[i].salt == p->salt)
 		{
-			InterlockedDecrementRelease(& backLog.nProvider);
+			SetMutexFree();
 			return true;
 		}
-		i = (i + 1) & (backLog.capacity - 1);
+		i = (i + 1) & (capacity - 1);
 	} while(i != k);
 	//
-	InterlockedDecrementRelease(& backLog.nProvider);
+	SetMutexFree();
 	return false;
 }
 
-
-
-// these functions may not implemented nor declared inline, or else linkage error might occur
-int LOCALAPI ControlBlock::PushBacklog(const BackLogItem *p)
-{
-	return backLog.Push(p); 
-}
-
-
-
-int LOCALAPI ControlBlock::PopBacklog(BackLogItem *p) 
-{
-	return backLog.Pop(p);
-}
 
 
 // Given
 //	FSP_ServiceCode	the notice code, shall not be NullCommand(0)
 // Return
 //	0 if no error
-//	1 if success with warning 'duplicated'
-//	-ENOMEM if no space on the queue (should never happen!)
+//	negative if failed, most likely because of overflow
+//	positive if with warning, most likely because of duplicate tail notice
 // Remark
-//	ULA should know that duplicate notices are merged
-int LOCALAPI ControlBlock::PushNotice(FSP_ServiceCode c)
+//	Duplicate tail notice is merged
+//	NullCommand cannot be put
+int LOCALAPI LLSNotice::Put(FSP_ServiceCode c)
 {
-	register char r;
-	for(register int i = 0; i < FSP_MAX_NUM_NOTICE; i++)
+	while(_InterlockedCompareExchange8(& mutex, 1, 0) != 0)
+		Sleep(1);
+	//
+	register char *p = (char *) & q[FSP_MAX_NUM_NOTICE - 1];
+	if(*p != NullCommand)
 	{
-		r = _InterlockedCompareExchange8((char *)(notices + i), c, NullCommand);
-		if(r == NullCommand)
-			return 0;
-		if(r == c)
-			return 1;
+		_InterlockedExchange8(& mutex, 0);
+		return -ENOMEM;
 	}
-	return -ENOMEM;
+
+	if(c == NullCommand)
+	{
+		_InterlockedExchange8(& mutex, 0);
+		return -EDOM;
+	}
+
+	--p;
+	//
+	do
+	{
+		if(*p == c)
+		{
+			_InterlockedExchange8(& mutex, 0);
+			return EAGAIN;
+		}
+	} while(*p == NullCommand && --p - (char *)q >= 0);
+	_InterlockedExchange8(p + 1, c);
+	//
+	_InterlockedExchange8(& mutex, 0);
+	return 0;
 }
+
 
 
 // Return the notice code on success, or NullCommand(0) on empty
 // Remark
 //	ULA should know that notices are out-of-band, emergent messages which might be processed out-of-order
-FSP_ServiceCode ControlBlock::PopNotice()
+FSP_ServiceCode LLSNotice::Pop()
 {
-	register char r;
-	for(register int i = 0; i < FSP_MAX_NUM_NOTICE; i++)
+	while(_InterlockedCompareExchange8(& mutex, 1, 0) != 0)
+		Sleep(1);
+	//
+	register char *p = (char *) & q[FSP_MAX_NUM_NOTICE - 1];
+	register char c = NullCommand;
+	do
 	{
-		r = _InterlockedExchange8((char *)(notices + i), NullCommand);
-		if(r != 0)
-			return FSP_ServiceCode(r);
-	}
-	return NullCommand;
+		c = _InterlockedExchange8(p, c);
+	} while(--p - (char *)q >= 0);
+	//
+	_InterlockedExchange8(& mutex, 0);
+	return FSP_ServiceCode(c);
 }
 
 
@@ -474,63 +470,6 @@ void * LOCALAPI ControlBlock::InquireSendBuf(int & m)
 
 	m = ((i > k ? sendBufferBlockN : k) - i) * MAX_BLOCK_SIZE;
 	return (BYTE *)this + sendBuffer + i * MAX_BLOCK_SIZE;
-}
-
-
-// Given
-//	buf: the buffer pointer, which should be returned by InquireSendBuf
-//	n: the size of the buffer, which should be no greater than that returned by InquireSendBuf
-// Do
-//	put the inplace send buffer(get by InquireSendBuf) into the send queue
-//	update 'len', flags, timeOut and sequence number
-// Return
-//	number of block split
-//	-EFAULT if the first parameter is illegal (buf is not that returned by InquireSendBuf)
-//	-ENOMEM if too larger size requested
-//	-EDOM if the second or third parameter is illegal
-// Remark
-//	would check parameters. the caller should check the returned value
-//	toBeContinued would be ignored (set to false) if len is not a multiple of MAX_BLOCK_SIZE
-int ControlBlock::MarkSendQueue(void * buf, int n, bool toBeContinued)
-{
-	if(n <= 0 || n % MAX_BLOCK_SIZE != 0 && toBeContinued)
-		return -EDOM;
-
-	register int m = n;
-	if(InquireSendBuf(m) != buf)
-		return -EFAULT;
-	if(m < n)
-		return -ENOMEM;
-
-	assert(sendBufferNextPos == ((BYTE *)buf - (BYTE *)this - sendBuffer) / MAX_BLOCK_SIZE);
-	register PFSP_SocketBuf p = HeadSend() + sendBufferNextPos;
-	// p now is the descriptor of the first available buffer block
-	m = (n - 1) / MAX_BLOCK_SIZE;
-	for(int j = 0; j < m; j++)
-	{
-		p->InitFlags();	// and locked
-		p->version = THIS_FSP_VERSION;
-		p->opCode = PURE_DATA;
-		p->len = MAX_BLOCK_SIZE;
-		p->SetFlag<TO_BE_CONTINUED>();
-		p->SetFlag<IS_COMPLETED>();
-		p->Unlock();	// so it could be send
-		p++;
-	}
-	//
-	p->InitFlags();	// and locked
-	p->version = THIS_FSP_VERSION;
-	p->opCode = PURE_DATA;
-	p->len = n - MAX_BLOCK_SIZE * m;
-	p->SetFlag<TO_BE_CONTINUED>(toBeContinued && p->len == MAX_BLOCK_SIZE);
-	p->SetFlag<IS_COMPLETED>();
-	p->Unlock();
-	//
-	sendBufferNextPos += m + 1;
-	sendBufferNextSN += m + 1;
-	RoundSendBufferNextPos();
-	// assert(sendBufferNextPos <= sendBufferBlockN);	// See also InquireSendBuf
-	return (m + 1);
 }
 
 
@@ -866,7 +805,11 @@ void ControlBlock::SlideSendWindowByOne()	// shall be atomic!
 //	Make acknowledgement, maybe accumulatively if number of gap descriptors is 0
 // Return
 //	the number of packets that are positively acknowledged
-int LOCALAPI ControlBlock::DealWithSNACK(seq_t expectedSN, const FSP_SelectiveNACK::GapDescriptor *gaps, int n)
+// Remark
+//	As the receiver has nothing to know about the tail packets the sender MUST append a gap.
+//	It's destructive! Endian conversion is also destructive.
+//	UNRESOLVED!? For big endian architecture it is unnecessary to transform the descriptor: let's the compiler/optimizer handle it
+int LOCALAPI ControlBlock::DealWithSNACK(seq_t expectedSN, FSP_SelectiveNACK::GapDescriptor *gaps, int & n)
 {
 	// Check validity of the control block descriptors to prevent memory corruption propagation
 	const int32_t & capacity = sendBufferBlockN;
@@ -881,6 +824,7 @@ int LOCALAPI ControlBlock::DealWithSNACK(seq_t expectedSN, const FSP_SelectiveNA
 	register int nAck = int(expectedSN - seq0);
 	for(int	k = 0; ; k++)
 	{
+		seq0 += nAck;
 		// Make acknowledgement
 		while(--nAck >= 0)
 		{
@@ -904,12 +848,22 @@ int LOCALAPI ControlBlock::DealWithSNACK(seq_t expectedSN, const FSP_SelectiveNA
 		if(k >= n)
 			break;
 		//
+		gaps[k].gapWidth = be32toh(gaps[k].gapWidth);
+		seq0 += gaps[k].gapWidth;
 		iHead += gaps[k].gapWidth;
 		if(iHead - capacity >= 0)
 			iHead -= capacity;
 		p = HeadSend() + iHead;
 		//
-		nAck = gaps[k].dataLength;
+		nAck = gaps[k].dataLength = be32toh(gaps[k].dataLength);
+	}
+
+	// Here the SNACK suffix may be destroyed: the gapWidth overlay with 'serialNo' of the SNACK suffix
+	// However the header signature is kept.
+	if(int(sendWindowNextSN - seq0) > 0 && gaps != NULL)
+	{
+		gaps[n].gapWidth = int(sendWindowNextSN - seq0);
+		n++;
 	}
 
 	return countAck;
@@ -957,7 +911,8 @@ int ControlBlock::HasBeenCommitted() const
 
 // Return
 //	0 if there is no COMMIT packet at the tail and there is no error on appending one
-//	1 if there is already a COMMIT packet at the tail of the send queue
+//	1 if there is already an unsent COMMIT packet at the tail of the send queue
+//	2 if there is already a COMMIT packet at the tail but it has been sent
 //	-1 if failed
 int ControlBlock::ReplaceSendQueueTailToCommit()
 {
@@ -966,8 +921,15 @@ int ControlBlock::ReplaceSendQueueTailToCommit()
 	register PFSP_SocketBuf p = HeadSend() + (i < 0 ? sendBufferBlockN - 1 : i);
 
 	// make it idempotent, no matter whether last packet has been sent
-	if(p->opCode == COMMIT && n > 0)
-		return 1;
+	if(p->opCode == COMMIT)
+	{
+		if(n > 0 && p->Lock())
+		{
+			p->Unlock();
+			return 1;
+		}
+		return 2;
+	}
 
 	if(n <= 0 || p->opCode != PURE_DATA || ! p->Lock())
 	{

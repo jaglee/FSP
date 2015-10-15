@@ -22,14 +22,14 @@ volatile static bool finished = false;
 
 static void FSPAPI onReturn(FSPHANDLE h, FSP_ServiceCode code, int value)
 {
-	printf_s("Notify 0x%08X service code = %d, returned %d\n", (uint32_t)(intptr_t)h, code, value);
+	printf_s("Notify: Fiber ID = %u, service code = %d, returned %d\n", (uint32_t)(intptr_t)h, code, value);
 	if(value < 0)
 	{
 		Dispose(h);
 		finished = true;
 		return;
 	}
-	if(code == FSP_NotifyFinish || code == FSP_NotifyRecycled)
+	if(code == FSP_NotifyFinish)
 	{
 		printf_s("Session was shut down.\n");
 		Dispose(h);
@@ -100,7 +100,7 @@ int main()
 
 int FSPAPI onConnected(FSPHANDLE h, PFSP_Context ctx)
 {
-	printf_s("\nHandle of FSP session: 0x%08X", (uint32_t)(intptr_t)h);
+	printf_s("\nHandle of FSP session: Fiber ID = %u", (uint32_t)(intptr_t)h);
 	if(h == NULL)
 	{
 		printf_s("\nConnection failure.\n");
@@ -126,9 +126,8 @@ int FSPAPI onConnected(FSPHANDLE h, PFSP_Context ctx)
 
 	CryptoNaClGetSharedSecret(bufSharedKey, bufPeersKey, bufPrivateKey);
 
-	// Actually install authenc key would commit the stream because send is pending
+	InstallAuthenticKey(h, bufSharedKey, CRYPTO_NACL_KEYBYTES, INT32_MAX, NOT_END_ANYWAY);
 	WriteTo(h, bufPublicKey, CRYPTO_NACL_KEYBYTES, END_OF_MESSAGE, onPublicKeySent);
-	InstallAuthenticKey(h, bufSharedKey, CRYPTO_NACL_KEYBYTES, INT32_MAX);
 
 	return 0;
 }

@@ -137,8 +137,10 @@ void CSocketItemEx::TimeOut()
 			ReplaceTimer(TRASIENT_STATE_TIMEOUT_ms);
 			TIMED_OUT();
 		}
-		//
-		if (lowState != COMMITTED)
+		// If the peer has committed an ACK_FLUSH has accumulatively acknowledged it.
+		// The near end needn't send periodical KEEP_ALIVE anymore
+		// UNRESOLVED! TODO: but a lower frequence KEEP_ALIVE is a MUST?
+		if (lowState != PEER_COMMIT)
 			KeepAlive();
 		break;
 	case PRE_CLOSED:
@@ -201,9 +203,6 @@ void CSocketItemEx::TimeOut()
 	if (_InterlockedExchange8(& toUpdateTimer, 0))
 		RestartKeepAlive();
 
-	// but if we could possibly query it from the internal information of the timer!
-	clockCheckPoint.tKeepAlive = t1 + tKeepAlive_ms * 1000ULL;
-
 	SetReady();
 }
 
@@ -220,31 +219,31 @@ void CSocketItemEx::TimeOut()
 */
 void CSocketItemEx::KeepAlive()
 {
+#if defined(TRACE_HEARTBEAT) || defined(TRACE_PACKET)
+	printf_s("Keep-alive local fiber#%u\n", fidPair.source);
+	DumpTimerInfo(NowUTC());
+#endif
+	// It is waste of time if the packet is already acknowledged. However it does little harm
+	// and it doesn't worth the trouble to handle low-possibility situation
+	// Prefer productivity over code elegancy
 	if (pControlBlock->CountUnacknowledged() > 0)
 	{
-		// it is waste of time if the packet is already acknowledged however it do little harm
-		// and it doesn't worth the trouble to handle low-possibility situation
-		// prefer productivity over code elegancy
 		ControlBlock::PFSP_SocketBuf skb = pControlBlock->GetSendQueueHead();
 		//
 		uint8_t	headOpCode = skb->opCode;
-		if (headOpCode == PERSIST)
+		if (headOpCode == PERSIST || headOpCode == COMMIT)
 		{
-#ifdef TRACE_PACKET
+#if defined(TRACE_HEARTBEAT) || defined(TRACE_PACKET)
 			printf_s("Keep-alive local fiber#%u, head packet in the queue is happened to be %s\n"
 				, fidPair.source
 				, opCodeStrings[headOpCode]);
 			pControlBlock->DumpSendRecvWindowInfo();
 #endif
-			// PERSIST/COMMIT packet in the head of the receive queue is the accumulative acknowledgment as well 
 			EmitWithICC(skb, pControlBlock->sendWindowFirstSN);
-			return;
 		}
-		//
-		if (headOpCode == COMMIT)	// assert(skb->len > 0); // not necessarily
-			EmitWithICC(skb, pControlBlock->sendWindowFirstSN);
 	}
 
+	// Only in ESTABLISHED, COMMITTING, COMMITTING2 or COMMITTED state may KEEP_ALIVE be sent
 	SendSNACK(KEEP_ALIVE);
 }
 
@@ -276,7 +275,13 @@ bool CSocketItemEx::SendSNACK(FSPOperationCode opCode)
 	buf.hdr.hs.opCode = opCode;
 	buf.hdr.hs.hsp = htobe16(uint16_t(len));
 
-	pControlBlock->SetSequenceFlags(& buf.hdr, seqExpected);
+	// Both KEEP_ALIVE and ACK_FLUSH are payloadless out-of-band control block which always apply current session key
+	// See also ControlBlock::SetSequenceFlags
+	buf.hdr.sequenceNo = htobe32(pControlBlock->sendWindowNextSN - 1);
+	buf.hdr.expectedSN = htobe32(seqExpected);
+	buf.hdr.ClearFlags();
+	buf.hdr.SetRecvWS(pControlBlock->RecvWindowSize());
+
 	SetIntegrityCheckCode(& buf.hdr, NULL, 0, buf.GetSaltValue());
 #ifdef TRACE_PACKET
 	printf_s("To send KEEP_ALIVE seq #%u, acknowledge #%u, source ALFID = %u\n", be32toh(buf.hdr.sequenceNo), seqExpected, fidPair.source);
@@ -307,54 +312,106 @@ bool CSocketItemEx::SendSNACK(FSPOperationCode opCode)
 //	and is active optimistic in the sense that retransmission would NOT be withheld by congestion control
 //	FSP node simply retransmits lost packets of stream payload while ignores milky payload
 //  It is an accumulative acknowledgment if n == 0
-int LOCALAPI CSocketItemEx::RespondToSNACK(ControlBlock::seq_t expectedSN, const FSP_SelectiveNACK::GapDescriptor *gaps, int n)
+int LOCALAPI CSocketItemEx::RespondToSNACK(ControlBlock::seq_t expectedSN, FSP_SelectiveNACK::GapDescriptor *gaps, int n)
 {
-	const int32_t & capacity = pControlBlock->sendBufferBlockN;
-	int32_t	iHead = pControlBlock->sendWindowHeadPos;
-	ControlBlock::seq_t seq0 = pControlBlock->sendWindowFirstSN;
+	const int32_t capacity = pControlBlock->sendBufferBlockN;
 	if(sizeof(ControlBlock) + sizeof(ControlBlock::FSP_SocketBuf) * capacity > dwMemorySize)
 		return -EFAULT;
 
 	int sentWidth = pControlBlock->CountUnacknowledged();
+	if(sentWidth < 0)
+		return -EFAULT;
+	if(sentWidth == 0)
+		return 0;	// there is nothing to be acknowledged
+
 	int nAck = pControlBlock->DealWithSNACK(expectedSN, gaps, n);
+#if defined(TRACE_HEARTBEAT) || defined(TRACE_PACKET)
+	printf_s("Accumulatively acknowledged SN = %u, %d packet(s) acknowledged.\n", expectedSN, nAck);
+#endif
 	if(nAck < 0)
 		return nAck;
+	// Shall not return on nAck == 0: we care about implicitly negatively acknowledged tail packets as well
+	// here is the key point that SNACK may make retransmission more efficient than per-packet timed-out(?)
 
-	ControlBlock::PFSP_SocketBuf p = pControlBlock->HeadSend() + iHead;
-	timestamp_t	tNow = NowUTC();
-	uint64_t	rtt64_us = tNow - tEarliestSend;
-	bool acknowledged = nAck > 0 ? p->GetFlag<IS_ACKNOWLEDGED>() : false;
-	// here is the key point that SNACK may make retransmission more efficient than time-outed retransmission
-	uint32_t largestOffset = int64_t(tRecentSend - tEarliestSend) > 0
-		? uint32_t((rtt64_us - tRoundTrip_us * 2) * sentWidth / (tRecentSend - tEarliestSend))
-		: uint32_t(rtt64_us > tRoundTrip_us * 2);	// exploit the fact that boolean true == 1, false == 0
-
-	if(largestOffset <= 0)
+	// pre-calculate whether the first packet on flight is acknowledged
+	bool acknowledged = pControlBlock->GetSendQueueHead()->GetFlag<IS_ACKNOWLEDGED>();
+	// pre-calculate, for they're volatile
+	uint64_t	tdiff64_us = uint64_t(tRecentSend - tEarliestSend);
+	uint64_t	rtt64_us = NowUTC() - tEarliestSend;
+	if(gaps == NULL)
 		goto l_retransmitted;
-	//
-	ControlBlock::seq_t headSN = seq0; 
-	seq0 = expectedSN;
-	for(register int k = 0; k < n - 1; k++)
+
+	int64_t		rtt_delta = int64_t(rtt64_us - tRoundTrip_us * 2);
+	if(rtt_delta <= 0)
+		goto l_retransmitted;
+
+	register uint32_t	largestOffset;
+	if(int64_t(rtt_delta - tdiff64_us) >= 0)
 	{
-		if(int(seq0 - headSN + iHead - capacity) >= 0)
-			p = pControlBlock->HeadSend() + int(seq0 - headSN + iHead - capacity);
-		else
-			p = pControlBlock->HeadSend() + int(seq0 - headSN + iHead);
-		for(register uint32_t j = 0; j < gaps[k].gapWidth; seq0++, j++)
+		largestOffset = sentWidth;
+		// if the unsigned tdiff64_us == 0, it falled into this category
+	}
+	else
+	{
+		// partially unrolled loop
+		uint64_t hiqword = (rtt_delta >> 32) * sentWidth;	// The initial remainder, actually;
+		uint32_t lodword = ((rtt_delta & 0xFFFFFFFF) * sentWidth) & 0xFFFFFFFF;
+		hiqword += ((rtt_delta & 0xFFFFFFFF) * sentWidth) >> 32;
+		// We are sure 31st bit of sendWidth is 0 thus 63rd bit of hiqword is 0
+		largestOffset = 0;
+		for(register int i = 31; i >= 0; i--)
 		{
-			if(uint32_t(seq0 - headSN) > largestOffset)
+			hiqword <<= 1;
+			hiqword |= BitTest((LONG *) & lodword, i);
+			if(hiqword > tdiff64_us)
+			{
+				hiqword -= tdiff64_us;
+				BitTestAndSet((LONG *) & largestOffset, i);
+			}
+		}
+		//
+		if(largestOffset == 0)
+			goto l_retransmitted;
+	}
+
+	const ControlBlock::seq_t headSN = pControlBlock->sendWindowFirstSN;
+	register ControlBlock::seq_t seq0 = expectedSN;
+	register int32_t index1 = pControlBlock->sendWindowHeadPos + (seq0 - headSN);
+	register ControlBlock::PFSP_SocketBuf p;
+	for(int k = 0; k < n; k++)
+	{
+		if(int32_t(index1 - capacity) >= 0)
+			index1 = int32_t(index1 - capacity);
+		p = pControlBlock->HeadSend() + index1;
+		//
+		for(uint32_t j = 0; j < gaps[k].gapWidth; j++)
+		{
+			if(! p->GetFlag<IS_COMPLETED>())	// due to parallism the last 'gap' may include imcomplete buffered data
+			{
+#if defined(TRACE_PACKET) || defined(TRACE_HEARTBEAT)
+				printf_s("Imcomplete packet: SN = %u, index position = %d\n", seq0, index1);
+#endif
 				goto l_retransmitted;
+			}
+			if(uint32_t(seq0 - headSN) > largestOffset)
+			{
+#if defined(TRACE_HEARTBEAT) || defined(TRACE_PACKET)
+				printf_s("NACK largest offset = %u\n", largestOffset);
+#endif
+				goto l_retransmitted;
+			}
 			// Attention please! If you try to trace the packet it would not be retransmitted, for sake of testability
-#ifdef TRACE_PACKET
-			printf_s("Meant to retransmit: SN = %u\n", seq0);
+#if defined(TRACE_PACKET) || defined(TRACE_HEARTBEAT)
+			printf_s("Meant to retransmit: SN = %u, index position = %d\n", seq0, index1);
 #else
-			if(! EmitWithICC(p, seq0))
+			if(! p->GetFlag<IS_ACKNOWLEDGED>() && ! EmitWithICC(p, seq0))
 				goto l_retransmitted;
 #endif
 			//
-			if(++iHead - capacity >= 0)
+			++seq0;
+			if(++index1 - capacity >= 0)
 			{
-				iHead = 0;
+				index1 = 0;
 				p = pControlBlock->HeadSend();
 			}
 			else
@@ -364,7 +421,9 @@ int LOCALAPI CSocketItemEx::RespondToSNACK(ControlBlock::seq_t expectedSN, const
 		}
 		//
 		seq0 += gaps[k].dataLength;
+		index1 += gaps[k].dataLength;
 	}
+	// seq0 is out of life when the loop terminated, so that the last 'dataLength', which may be overlaid by the SNACK head signature, is just ignored.
 
 l_retransmitted:
 	//	ONLY when the first packet in the send window is acknowledged and retransmission queue has been built may round-trip time re-calibrated
@@ -375,20 +434,20 @@ l_retransmitted:
 		// We assume that after sliding send window the number of unacknowledged was reduced
 		pControlBlock->SlideSendWindow();
 		RecalibrateKeepAlive(rtt64_us);
-#ifdef TRACE_PACKET
+#ifdef TRACE
 		printf_s("We guess new tEarliestSend based on relatively tRecentSend = %lld\n"
 			"\ttEarliestSend = %lld, sendWidth = %d, packets on flight = %d\n"
-			, (tNow - tRecentSend)
-			, (tNow - tEarliestSend)
+			, (rtt64_us + tEarliestSend - tRecentSend)	// Equal saved 'NowUTC()' - tRecentSend
+			, rtt64_us	// Saved 'NowUTC()' - tEarliestSend
 			, sentWidth
 			, pControlBlock->CountUnacknowledged()
 			);
-		if(int64_t(tRecentSend - tEarliestSend) < 0 || sentWidth <= pControlBlock->CountUnacknowledged())
+		if(int64_t(tdiff64_us) < 0 || sentWidth <= pControlBlock->CountUnacknowledged())
 			TRACE_HERE("function domain error in guess tEarliestSend");
-#endif
 		// assert(int64_t(tRecentSend - tEarliestSend) >= 0 && sentWidth > pControlBlock->CountUnacknowledged());
-		tEarliestSend += (tRecentSend - tEarliestSend) * (sentWidth - pControlBlock->CountUnacknowledged()) / sentWidth;
-#ifdef TRACE_PACKET
+#endif
+		tEarliestSend += tdiff64_us * (sentWidth - pControlBlock->CountUnacknowledged()) / sentWidth;
+#ifdef TRACE
 		printf_s("\ttRecentSend - tEarliestSend = %lluus, about %llums\n"
 			, (tRecentSend - tEarliestSend)
 			, (tRecentSend - tEarliestSend) >> 10
@@ -397,41 +456,6 @@ l_retransmitted:
 	}
 
 	return nAck;
-}
-
-
-
-// return number of packets acknowledged
-int LOCALAPI CSocketItemEx::RespondToSNACK(ControlBlock::seq_t ackSeqNo, const PFSP_HeaderSignature pHdr)
-{
-	if (pHdr == NULL || pHdr->opCode != SELECTIVE_NACK)
-	{
-#ifdef TRACE_PACKET
-		TRACE_HERE("accumulative acknowledgement");
-#endif
-		return RespondToSNACK(ackSeqNo, NULL, 0);
-	}
-
-	int len = be16toh(pHdr->hsp) - sizeof(FSP_NormalPacketHeader);
-	FSP_SelectiveNACK *pRightEdge = (FSP_SelectiveNACK *)((BYTE *)pHdr + sizeof(FSP_HeaderSignature) - sizeof(FSP_SelectiveNACK));
-
-	if(int(pRightEdge->ackTime - tLastAck) <= 0)
-		return 0;
-	tLastAck = pRightEdge->ackTime;
-
-	FSP_SelectiveNACK::GapDescriptor *gaps = (FSP_SelectiveNACK::GapDescriptor *)((BYTE *)pHdr + sizeof(FSP_HeaderSignature) - len);
-	int n = len - sizeof(FSP_SelectiveNACK);
-	if (n < 0)
-		return -EBADF;	// this is a malformed packet.
-
-	n /= sizeof(FSP_SelectiveNACK::GapDescriptor);
-	for(register int i = 0; i < n; i++)
-	{
-		gaps[i].gapWidth = be32toh(gaps[n].gapWidth);
-		gaps[i].dataLength = be32toh(gaps[n].dataLength);
-	}
-
-	return RespondToSNACK(ackSeqNo, gaps, n);
 }
 
 
@@ -458,5 +482,18 @@ void CSocketItemEx::RecalibrateKeepAlive(uint64_t rtt64_us)
 
 #ifdef TRACE
 	printf_s("\tCalibrated round trip time = %uus, keep-alive timeout = %ums\n\n", tRoundTrip_us,  tKeepAlive_ms);
+#endif
+}
+
+
+
+void CSocketItemEx::CalibrateKeepAlive()
+{
+	tLastRecv = NowUTC();
+	// The timer was already started for transient state management when SynConnect() or sending MULTIPLY/RESUME
+	tRoundTrip_us = (uint32_t)min(UINT32_MAX, tLastRecv - tRecentSend);
+	tKeepAlive_ms = tRoundTrip_us >> 8;
+#ifndef NDEBUG
+	DumpTimerInfo(tLastRecv);
 #endif
 }

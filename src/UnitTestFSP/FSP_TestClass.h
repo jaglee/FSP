@@ -7,16 +7,7 @@
 
 #define MAX_PHY_INTERFACES	4
 
-
-
-class ControlBlockDbg: public ControlBlock
-{
-	friend void UnitTestGenerateSNACK();
-	friend void UnitTestAcknowledge();
-	friend void UnitTestSendRecvWnd();
-	friend void UnitTestResendQueue();
-};
-
+typedef ControlBlock * PControlBlock;
 
 class CSocketItemExDbg: public CSocketItemEx
 {
@@ -49,20 +40,21 @@ public:
 	//}
 	void SetState(FSP_Session_State s) { CSocketItemEx::SetState(s); }
 
-	ControlBlockDbg *GetControlBlock() const { return (ControlBlockDbg *)pControlBlock; }
+	PControlBlock GetControlBlock() const { return PControlBlock(pControlBlock); }
 	ControlBlock::PFSP_SocketBuf AllocRecvBuf(ControlBlock::seq_t seq1) { return pControlBlock->AllocRecvBuf(seq1); }
 	void InstallSessionKey(BYTE key[FSP_MIN_KEY_SIZE])
 	{
 		memcpy(& pControlBlock->connectParams, key, FSP_MIN_KEY_SIZE);
 		pControlBlock->connectParams.keyLength = FSP_MIN_KEY_SIZE;
-		pControlBlock->connectParams.timeDelta = UINT16_MAX;
+		pControlBlock->connectParams.initialSN = UINT16_MAX;
 		CSocketItemEx::InstallSessionKey();	// with a quite short life
 	}
 	void SetPairOfFiberID(ALFID_T src, ALFID_T dst) { fidPair.source = src; fidPair.peer = dst; }
 
 	friend void UnitTestSocketInState();
 	friend void UnitTestReceiveQueue();
-	friend void UnitTestResendQueue();
+	friend void FlowTestRetransmission();
+	friend void PrepareFlowTestResend(CSocketItemExDbg &, PControlBlock &);
 };
 
 

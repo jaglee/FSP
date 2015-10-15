@@ -204,73 +204,73 @@ void UnitTestBackLogs()
 	int n;
 
 	cqq.Init(MAX_BACKLOG_SIZE);
-	n = cqq.PopBacklog(& item);
+	n = cqq.backLog.Pop(& item);
 	Assert::IsTrue(n < 0, L"There should be no item to be popped");
 
 	item.idRemote = 1234;
 	item.salt = 4321;	// item.sessionKey[0] = 0xAA; // used to exploit session key
 	for(i = 0; i < MAX_BACKLOG_SIZE; i++)
 	{
-		n = cqq.PushBacklog(& item);
+		n = cqq.backLog.Put(& item);
 		//
 		sprintf_s(linebuf, sizeof(linebuf), "Insert at position %d\n", n);
 		Logger::WriteMessage(linebuf);
 	}
-	n = cqq.PushBacklog(& item);
+	n = cqq.backLog.Put(& item);
 	Assert::IsTrue(n < 0, L"Cannot push into backlog when overflow");
 	
-	bool b = cqq.HasBacklog(& item);
+	bool b = cqq.backLog.Has(& item);
 	Assert::IsTrue(b, L"Cannot find the backlog item just put into the queue");
 
 	item.salt = 3412;	// item.sessionKey[0] = 0xBB; // used to exploit session key
-	b = cqq.HasBacklog(& item);
+	b = cqq.backLog.Has(& item);
 	Assert::IsFalse(b, L"Nonexistent backlog item should not be found");
 
 	for(i = 0; i < MAX_BACKLOG_SIZE; i++)
 	{
-		n = cqq.PopBacklog(& item);
+		n = cqq.backLog.Pop(& item);
 		//
 		Assert::IsTrue(n >= 0, L"There should be log item popped");
 		sprintf_s(linebuf, sizeof(linebuf), "Position at %d popped\n", n);
 		Logger::WriteMessage(linebuf);
 	}
-	n = cqq.PopBacklog(& item);
+	n = cqq.backLog.Pop(& item);
 	Assert::IsTrue(n < 0, L"Cannot popped when it is empty");
 	//
 	// change the length of the backlog queue on the fly
 	//
 	cqq.Init(MIN_QUEUED_INTR);
-	n = cqq.PopBacklog(& item);
+	n = cqq.backLog.Pop(& item);
 	Assert::IsTrue(n < 0, L"There should be no item to be popped");
 
 	item.idRemote = 1234;
 	item.salt = 4321;	// item.sessionKey[0] = 0xAA; // used to exploit session key
 	for(i = 0; i < MIN_QUEUED_INTR; i++)
 	{
-		n = cqq.PushBacklog(& item);
+		n = cqq.backLog.Put(& item);
 		//
 		sprintf_s(linebuf, sizeof(linebuf), "Insert at position %d\n", n);
 		Logger::WriteMessage(linebuf);
 	}
-	n = cqq.PushBacklog(& item);
+	n = cqq.backLog.Put(& item);
 	Assert::IsTrue(n < 0, L"Cannot push into backlog when overflow");
 	
-	b = cqq.HasBacklog(& item);
+	b = cqq.backLog.Has(& item);
 	Assert::IsTrue(b, L"Cannot find the backlog item just put into the queue");
 
 	item.salt = 3412;	// item.sessionKey[0] = 0xBB; // used to exploit session key
-	b = cqq.HasBacklog(& item);
+	b = cqq.backLog.Has(& item);
 	Assert::IsFalse(b, L"Nonexistent backlog item should not be found");
 
 	for(i = 0; i < MIN_QUEUED_INTR; i++)
 	{
-		n = cqq.PopBacklog(& item);
+		n = cqq.backLog.Pop(& item);
 		//
 		Assert::IsTrue(n >= 0, L"There should be log item popped");
 		sprintf_s(linebuf, sizeof(linebuf), "Position at %d popped\n", n);
 		Logger::WriteMessage(linebuf);
 	}
-	n = cqq.PopBacklog(& item);
+	n = cqq.backLog.Pop(& item);
 	Assert::IsTrue(n < 0, L"Cannot popped when it is empty");
 }
 
@@ -280,78 +280,84 @@ void UnitTestNoticeQ()
 {
 	ControlBlock *buf = (ControlBlock *)_alloca(sizeof(ControlBlock));
 	ControlBlock & cqq = *buf;
-	int n;
+	int r;
 
 	memset(buf, 0, sizeof(ControlBlock));
 
-	FSP_ServiceCode c = cqq.PopNotice();
+	FSP_ServiceCode c = cqq.notices.Pop();
 	Assert::IsTrue(c == NullCommand, L"Nothing should be popped out from an empty queue");
 
-	n = cqq.PushNotice(FSP_NotifyTimeout);		// 1
-	Assert::IsFalse(n < 0, L"FSP_NotifyTimeout should have been pushed onto an empty queue");
+	r = cqq.notices.Put(FSP_NotifyTimeout);		// 1
+	Assert::IsTrue(r == 0, L"FSP_NotifyTimeout should have been put on an empty queue");
 
-	n = cqq.PushNotice(FSP_NotifyReset);		// 2
-	Assert::IsFalse(n < 0, L"FSP_NotifyReset should have been pushed onto an un-fulfilled queue");
+	r = cqq.notices.Put(FSP_NotifyReset);		// 2
+	Assert::IsTrue(r == 0, L"FSP_NotifyReset should have been put on an un-fulfilled queue");
 
-	n = cqq.PushNotice(FSP_NotifyDataReady);	// 3
-	Assert::IsFalse(n < 0, L"FSP_NotifyDataReady should have been pushed onto an un-fulfilled queue");
+	r = cqq.notices.Put(FSP_NotifyDataReady);	// 3
+	Assert::IsTrue(r == 0, L"FSP_NotifyDataReady should have been put on an un-fulfilled queue");
 
-	n = cqq.PushNotice(FSP_NotifyDataReady);
-	Assert::IsFalse(n <= 0, L"Duplicated FSP_NotifyDataReady should be pushed onto queue with warning");
+	r = cqq.notices.Put(FSP_NotifyDataReady);
+	Assert::IsTrue(r > 0, L"Duplicated FSP_NotifyDataReady should be put on queue merged");
 
-	n = cqq.PushNotice(FSP_NotifyReset);
-	Assert::IsFalse(n <= 0, L"Duplicated FSP_NotifyReset should be pushed onto queue with warning");
+	r = cqq.notices.Put(FSP_NotifyReset);		// 4, no, it cannot be merged with previous, uncontinuous duplicate notification
+	Assert::IsTrue(r == 0, L"FSP_NotifyReset should be put on an un-fulfilled queue");
 
-	n = cqq.PushNotice(FSP_NotifyRecycled);		// 4
-	Assert::IsFalse(n < 0, L"FSP_NotifyRecycled should have been pushed onto an un-fulfilled queue");
+	r = cqq.notices.Put(FSP_NotifyFinish);		// 5
+	Assert::IsTrue(r == 0, L"FSP_NotifyRecycled should have been put on an un-fulfilled queue");
 
-	n = cqq.PushNotice(FSP_NotifyAccepted);		// 5
-	Assert::IsFalse(n < 0, L"FSP_NotifyAccepted should have been pushed onto an un-fulfilled queue");
+	r = cqq.notices.Put(FSP_NotifyAccepted);		// 6
+	Assert::IsTrue(r == 0, L"FSP_NotifyAccepted should have been put on an un-fulfilled queue");
 
-	n = cqq.PushNotice(FSP_NotifyFlushed);		// 6
-	Assert::IsFalse(n < 0, L"FSP_NotifyFlushed should have been pushed onto an un-fulfilled queue");
+	r = cqq.notices.Put(FSP_NotifyFlushed);		// 7
+	Assert::IsTrue(r == 0, L"FSP_NotifyFlushed should have been put on an un-fulfilled queue");
 
-	n = cqq.PushNotice(FSP_NotifyBufferReady);	// 7
-	Assert::IsFalse(n < 0, L"FSP_NotifyBufferReady should have been pushed onto an un-fulfilled queue");
+	r = cqq.notices.Put(FSP_NotifyBufferReady);	// 8
+	Assert::IsTrue(r == 0, L"FSP_NotifyBufferReady should have been put on an un-fulfilled queue");
 
-	n = cqq.PushNotice(FSP_NotifyTimeout);
-	Assert::IsFalse(n <= 0, L"Duplicated FSP_NotifyTimeout should be pushed onto queue with warning");
+	r = cqq.notices.Put(FSP_NotifyTimeout);	// 9, no, it cannot be merged with previous, uncontinuous duplicate notification
+	Assert::IsTrue(r == 0, L"FSP_NotifyTimeout should be put on an un-fulfilled queue");
 
-	n = cqq.PushNotice(FSP_IPC_CannotReturn);		// 8
-	Assert::IsFalse(n < 0, L"FSP_IPC_CannotReturn should have been pushed onto an un-fulfilled queue");
+	r = cqq.notices.Put(FSP_IPC_CannotReturn);		// 10
+	Assert::IsTrue(r == 0, L"FSP_IPC_CannotReturn should have been put on an un-fulfilled queue");
 
-	n = cqq.PushNotice(FSP_NotifyOverflow);
-	Assert::IsTrue(n < 0, L"FSP_NotifyOverflow should have failed to be pushed onto a fulfilled queue");
-
-	n = cqq.PushNotice(FSP_NotifyNameResolutionFailed);
-	Assert::IsTrue(n < 0, L"FSP_NotifyNameResolutionFailed should have failed to be pushed onto a fulfilled queue");
+	////the queue is too large to raise such an error
+	//r = cqq.notices.Put(FSP_NotifyOverflow);
+	//Assert::IsTrue(r < 0, L"FSP_NotifyOverflow should have failed to be put on a fulfilled queue");
+	//r = cqq.notices.Put(FSP_NotifyNameResolutionFailed);
+	//Assert::IsFalse(r < 0, L"FSP_NotifyNameResolutionFailed should have failed to be put on a fulfilled queue");
 
 	// 
-	c = cqq.PopNotice();	// 1
+	c = cqq.notices.Pop();	// 1
 	Assert::IsTrue(c == FSP_NotifyTimeout, L"What is popped should be what was pushed 1st");
 
-	c = cqq.PopNotice();	// 2
+	c = cqq.notices.Pop();	// 2
 	Assert::IsTrue(c == FSP_NotifyReset, L"What is popped should be what was pushed 2nd");
 
-	c = cqq.PopNotice();	// 3
+	c = cqq.notices.Pop();	// 3
 	Assert::IsTrue(c == FSP_NotifyDataReady, L"What is popped should be what was pushed 3rd");
 
-	c = cqq.PopNotice();	// 4
-	Assert::IsTrue(c == FSP_NotifyRecycled, L"What is popped should be what was pushed 4th");
+	c = cqq.notices.Pop();	// 4
+	Assert::IsTrue(c == FSP_NotifyReset, L"What is popped should be what was pushed 2nd");
 
-	c = cqq.PopNotice();	// 5
+	c = cqq.notices.Pop();	// 5
+	Assert::IsTrue(c == FSP_NotifyFinish, L"What is popped should be what was pushed 4th");
+
+	c = cqq.notices.Pop();	// 6
 	Assert::IsTrue(c == FSP_NotifyAccepted, L"What is popped should be what was pushed 5th");
 
-	c = cqq.PopNotice();	// 6
+	c = cqq.notices.Pop();	// 7
 	Assert::IsTrue(c == FSP_NotifyFlushed, L"What is popped should be what was pushed 6th");
 
-	c = cqq.PopNotice();	// 7
+	c = cqq.notices.Pop();	// 8
 	Assert::IsTrue(c == FSP_NotifyBufferReady, L"What is popped should be what was pushed 7th");
 
-	c = cqq.PopNotice();	// 8
+	c = cqq.notices.Pop();	// 9
+	Assert::IsTrue(c == FSP_NotifyTimeout, L"What is popped should be what was pushed 1st");
+
+	c = cqq.notices.Pop();	// 10
 	Assert::IsTrue(c == FSP_IPC_CannotReturn, L"What is popped should be what was pushed 8th");
 
-	c = cqq.PopNotice();
+	c = cqq.notices.Pop();
 	Assert::IsTrue(c == NullCommand, L"NullCommand should be popped from an empty queue");
 }
 
@@ -862,7 +868,7 @@ void UnitTestConfirmConnect()
 	const ControlBlock::seq_t FIRST_SN = 12;
 
 	CSocketItemExDbg socket;
-	ControlBlockDbg *pSCB = socket.GetControlBlock();
+	ControlBlock *pSCB = socket.GetControlBlock();
 	pSCB->Init((memsize - sizeof(ControlBlock))/ 2, (memsize - sizeof(ControlBlock)) / 2);
 
 	pSCB->SetRecvWindowHead(FIRST_SN);

@@ -185,8 +185,8 @@ typedef enum: char
 	FSP_NotifyReset,
 	FSP_NotifyFlushed,
 	FSP_NotifyFinish,
-	FSP_NotifyRecycled,	// = 23
-	FSP_Dispose = FSP_Recycle,		// a reverse command from LLS to DLL meant to synchonize DLL and LLS
+	FSP_Dispose,		// a reverse command from LLS to DLL meant to synchonize DLL and LLS
+	// 23: Reserved
 	// 24~31: near end error status
 	FSP_IPC_CannotReturn = 24,
 	FSP_MemoryCorruption,

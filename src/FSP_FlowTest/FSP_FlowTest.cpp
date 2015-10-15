@@ -6,7 +6,7 @@
 
 static const ControlBlock::seq_t FIRST_SN = 12;
 static const int MAX_GAPS_NUM = 2;
-static const int MAX_BLOCK_NUM = 0x20000;	// 65536 * 2
+static const int MAX_BLOCK_NUM = 16;
 
 
 void UnitTestCRC()
@@ -20,8 +20,8 @@ void UnitTestCRC()
 	CSocketItemExDbg socket;
 	CSocketItemExDbg socketR2;
 
-	ControlBlockDbg *pCB2 = socketR2.GetControlBlock();
-	ControlBlockDbg *pCB = socket.GetControlBlock();
+	ControlBlock *pCB2 = socketR2.GetControlBlock();
+	ControlBlock *pCB = socket.GetControlBlock();
 	for(register int i = 0; i < sizeof(pCB->connectParams); i++)
 	{
 		((uint8_t *) & pCB->connectParams)[i] = i;
@@ -93,8 +93,10 @@ void UnitTestICC()
 	pCBR->SetRecvWindowHead(FIRST_SN);
 	socketR2.SetPairOfFiberID(htobe32(LAST_WELL_KNOWN_ALFID), nearFID);
 	socketR2.InstallEphemeralKey();	// initializtion
+	pCBR->recvWindowNextSN++;		// == FIRST_SN + 1
 	socketR2.InstallSessionKey(samplekey);
 
+	// So, the packet with FIRST_SN shall be calculated with CRC64
 	// firstly, test recorded CRC mode
 	// packet with sequence number less than FIRST_SN should be applied with CRC64
 	FSP_NormalPacketHeader &request = storage.hdr;
@@ -174,11 +176,12 @@ void UnitTestICC()
 /**
  * Emulate acknowledgement
  */
-void UnitTestAcknowledge()
+void FlowTestAcknowledge()
 {
 	CSocketItemExDbg socket(MAX_BLOCK_NUM, MAX_BLOCK_NUM);
-	ControlBlockDbg *pSCB = socket.GetControlBlock();
-	FSP_SelectiveNACK::GapDescriptor gaps[MAX_GAPS_NUM];
+	ControlBlock *pSCB = socket.GetControlBlock();
+	FSP_SelectiveNACK::GapDescriptor gaps[MAX_GAPS_NUM + 1];
+	// the last descriptor place holder is for the sentinel/tail gap descriptor appended later
 
 	pSCB->welcomedNextSNtoSend = pSCB->sendWindowFirstSN = FIRST_SN;
 	pSCB->sendBufferNextSN = pSCB->sendWindowNextSN = FIRST_SN + 1;
@@ -241,8 +244,8 @@ void UnitTestAcknowledge()
 	assert(pSCB->sendWindowSize == MAX_BLOCK_NUM - 2);
 
 	// assume the third is a gap...
-	gaps[0].dataLength = 1;
-	gaps[0].gapWidth = 1;
+	gaps[0].dataLength = htobe32(1);
+	gaps[0].gapWidth = htobe32(1);
 	//// this is an illegal one	// now it is perfectly OK
 	//r = socket.RespondToSNACK(FIRST_SN, gaps, 1);
 	//assert(r == -EBADF && pSCB->sendWindowFirstSN == FIRST_SN + 2);
@@ -258,30 +261,46 @@ void UnitTestAcknowledge()
 	assert(pSCB->CountUnacknowledged() >= 0);
 
 	// this is a legal but one gap is redundant, one is additional
-	gaps[1].dataLength = 1;
-	gaps[1].gapWidth = 1;
+	gaps[0].dataLength = htobe32(1);
+	gaps[0].gapWidth = htobe32(1);
+	gaps[1].dataLength = htobe32(1);
+	gaps[1].gapWidth = htobe32(1);
 	r = socket.RespondToSNACK(FIRST_SN + 3, gaps, 2);
 	assert(r == 1 && pSCB->sendWindowFirstSN == FIRST_SN + 3);
 	assert(pSCB->CountUnacknowledged() >= 0);
 
 	// two gaps, overlap with previous one [only to urge retransmission of those negatively acknowledged]
+	gaps[0].dataLength = htobe32(1);
+	gaps[0].gapWidth = htobe32(1);
+	gaps[1].dataLength = htobe32(1);
+	gaps[1].gapWidth = htobe32(1);
 	r = socket.RespondToSNACK(FIRST_SN + 3, gaps, 2);
 	assert(r == 0 && pSCB->sendWindowFirstSN == FIRST_SN + 3);
 	assert(pSCB->CountUnacknowledged() >= 0);
 
 	// two gaps, do real new acknowledgement: the 4th (the 5th has been acknowledged) and the 7th
+	gaps[0].dataLength = htobe32(1);
+	gaps[0].gapWidth = htobe32(1);
+	gaps[1].dataLength = htobe32(1);
+	gaps[1].gapWidth = htobe32(1);
 	r = socket.RespondToSNACK(FIRST_SN + 5, gaps, 2);
 	assert(r == 2 && pSCB->sendWindowFirstSN == FIRST_SN + 5);
 	assert(pSCB->CountUnacknowledged() >= 0);
 
+#if 0
+	static const int MAX_BLOCK_NUM_L = 0x20000;	// 65536 * 2
 	// a very large continuous data segment is acknowledged
+	gaps[0].dataLength = htobe32(1);
+	gaps[0].gapWidth = htobe32(1);
+	gaps[1].dataLength = htobe32(1);
+	gaps[1].gapWidth = htobe32(1);
 	r = socket.RespondToSNACK(FIRST_SN + 0x1000A, gaps, 2);
 	assert(r == 0x1000A - 5 && pSCB->sendWindowFirstSN == FIRST_SN + 0x1000A);
-	assert(pSCB->sendWindowSize == MAX_BLOCK_NUM - 0x1000A);
+	assert(pSCB->sendWindowSize == MAX_BLOCK_NUM_L - 0x1000A);
 	assert(pSCB->CountUnacknowledged() >= 0);
 
 	// Test round-robin...
-	for(int i = MAX_BLOCK_NUM + 2; i < MAX_BLOCK_NUM + 0x10000; i++)
+	for(int i = MAX_BLOCK_NUM_L + 2; i < MAX_BLOCK_NUM_L + 0x10000; i++)
 	{
 		skb = pSCB->GetSendBuf();
 		assert(skb != NULL);
@@ -291,13 +310,17 @@ void UnitTestAcknowledge()
 	pSCB->sendWindowNextSN += 0x10000;	// queuing to send is not the same as sending
 
 	// an even larger continuous data segment is acknowledged
-	r = socket.RespondToSNACK(FIRST_SN + MAX_BLOCK_NUM + 0xF000, gaps, 2);
-	assert(r ==  MAX_BLOCK_NUM + 0xF000 - 0x1000A && pSCB->sendWindowHeadPos == 0xF000);
+	gaps[0].dataLength = htobe32(1);
+	gaps[0].gapWidth = htobe32(1);
+	gaps[1].dataLength = htobe32(1);
+	gaps[1].gapWidth = htobe32(1);
+	r = socket.RespondToSNACK(FIRST_SN + MAX_BLOCK_NUM_L + 0xF000, gaps, 2);
+	assert(r ==  MAX_BLOCK_NUM_L + 0xF000 - 0x1000A && pSCB->sendWindowHeadPos == 0xF000);
 	assert(pSCB->sendWindowSize == - 0xF000);	// overflow, but don't care!
-	assert(pSCB->sendWindowFirstSN == FIRST_SN + MAX_BLOCK_NUM + 0xF000);
+	assert(pSCB->sendWindowFirstSN == FIRST_SN + MAX_BLOCK_NUM_L + 0xF000);
 	assert(pSCB->CountUnacknowledged() >= 0);
+#endif
 }
-
 
 
 //// TODO: explicity remove/avoid congest control at the session layer
@@ -318,24 +341,14 @@ void UnitTestAcknowledge()
 //}
 
 
-
-/**
- * Unit Test of:
- * GetSendBuf
- * AllocRecvBuf
- * GetSelectiveNACK
- * RespondToSNACK
- */
-void UnitTestResendQueue()
+void PrepareFlowTestResend(CSocketItemExDbg & dbgSocket, PControlBlock & pSCB)
 {
-	const ControlBlock::seq_t FIRST_SN = 12;
-	CSocketItemExDbg lowSocket;
 	int memsize = sizeof(ControlBlock) + (sizeof ControlBlock::FSP_SocketBuf + MAX_BLOCK_SIZE) * 8;
-	memset(& lowSocket, 0, sizeof(CSocketItemExDbg));
-	lowSocket.dwMemorySize = memsize;
+	memset(& dbgSocket, 0, sizeof(CSocketItemExDbg));
+	dbgSocket.dwMemorySize = memsize;
 
-	ControlBlockDbg *pSCB = (ControlBlockDbg *)malloc(lowSocket.dwMemorySize);
-	lowSocket.pControlBlock = pSCB;
+	pSCB = (ControlBlock *)malloc(dbgSocket.dwMemorySize);
+	dbgSocket.pControlBlock = pSCB;
 
 	pSCB->Init((memsize - sizeof(ControlBlock)) / 2, (memsize - sizeof(ControlBlock)) / 2);
 
@@ -371,7 +384,7 @@ void UnitTestResendQueue()
 
 	++(pSCB->sendWindowNextSN);
 
-	skb =  pSCB->HeadSend();
+	skb = pSCB->HeadSend();
 
 	// emulate received the first data packet
 	ControlBlock::PFSP_SocketBuf skb5 = pSCB->AllocRecvBuf(FIRST_SN);
@@ -393,33 +406,78 @@ void UnitTestResendQueue()
 
 	skb5 = pSCB->AllocRecvBuf(FIRST_SN + 4);
 	assert(skb5 == NULL);	// No more space in the receive buffer
-
-	// what is the content of the selective negative acknowledgement?
-	FSP_SelectiveNACK::GapDescriptor snack[4];
-	ControlBlock::seq_t seq4;
-	int m4 = pSCB->GetSelectiveNACK(seq4, snack, 4);
-	assert(m4 == 1 && snack[0].dataLength == 1 && snack[0].gapWidth == 1);
-	assert(seq4 == FIRST_SN + 2);
-
-	lowSocket.RespondToSNACK(seq4, snack, 1);
-	assert(skb->flags == 0);	// GetFlag<IS_ACKNOWLEDGED>()
-	assert((skb + 1)->flags == 0);	// GetFlag<IS_ACKNOWLEDGED>()
-	assert((skb + 3)->GetFlag<IS_ACKNOWLEDGED>());
-	assert(lowSocket.GetControlBlock()->sendWindowFirstSN == FIRST_SN + 2);
-
-	// TODO: Test round-robin, by slide one...
-
-	// TODO: Test calculation of RTT and Keep alive timeout 
-
-	// free(pSCB);	// clean up work done by the destroyer of CSocketItemExDbg
 }
 
 
 
-const unsigned int BITS_COUNT = 1536;
-const char *U = "FSP_FlowTest";
-const char *S = "FSP_Srv";
-const char *password = "Passw0rd";
+
+
+/**
+ * Emulate acknowledgement
+ */
+/**
+ * Unit Test of:
+ * GetSendBuf
+ * AllocRecvBuf
+ * GetSelectiveNACK
+ * RespondToSNACK
+ */
+void FlowTestRetransmission()
+{
+	CSocketItemExDbg dbgSocket;
+	PControlBlock pSCB;
+	
+	PrepareFlowTestResend(dbgSocket, pSCB);
+
+	// what is the content of the selective negative acknowledgement?
+	// See also CSocketItemEx::SendSNACK
+	PktBufferBlock pktBuffer;
+	FSP_PreparedKEEP_ALIVE & buf = *(FSP_PreparedKEEP_ALIVE *) & pktBuffer.hdr;
+	ControlBlock::seq_t seq4;
+	int32_t len = dbgSocket.GenerateSNACK(buf, seq4);
+	len += sizeof(FSP_NormalPacketHeader);
+
+	buf.hdr.hs.version = THIS_FSP_VERSION;
+	buf.hdr.hs.opCode = KEEP_ALIVE;
+	buf.hdr.hs.hsp = htobe16(uint16_t(len));
+
+	// Both KEEP_ALIVE and ACK_FLUSH are payloadless out-of-band control block which always apply current session key
+	// See also ControlBlock::SetSequenceFlags
+	buf.hdr.sequenceNo = htobe32(pSCB->sendWindowNextSN - 1);
+	buf.hdr.expectedSN = htobe32(seq4);
+	buf.hdr.ClearFlags();
+	buf.hdr.SetRecvWS(pSCB->RecvWindowSize());
+
+	dbgSocket.SetIntegrityCheckCode(& buf.hdr, NULL, 0, buf.GetSaltValue());
+
+	// Firstly emulate receive the packet before emulate OnGetKeepAlive
+	dbgSocket.headPacket = & pktBuffer;
+	dbgSocket.headPacket->pktSeqNo = FIRST_SN + 3;
+	dbgSocket.headPacket->lenData = 0;
+	dbgSocket.tRoundTrip_us = 1;
+	dbgSocket.tEarliestSend = NowUTC();
+	dbgSocket.tRecentSend = dbgSocket.tEarliestSend + 1;
+
+	// See also CSocketItemEx::OnGetKeepAlive
+	FSP_SelectiveNACK::GapDescriptor *snack;
+	int n;
+	ControlBlock::seq_t seq5;
+	dbgSocket.ValidateSNACK(seq5, snack, n);
+
+	assert(seq5 == seq4 && n == 1);
+
+	dbgSocket.RespondToSNACK(seq5, snack, n);
+
+	ControlBlock::PFSP_SocketBuf skb = pSCB->HeadSend();
+	assert(skb->flags == 0);	// GetFlag<IS_ACKNOWLEDGED>()
+	assert((skb + 1)->flags == 0);	// GetFlag<IS_ACKNOWLEDGED>()
+	assert((skb + 3)->GetFlag<IS_ACKNOWLEDGED>());
+	assert(dbgSocket.GetControlBlock()->sendWindowFirstSN == FIRST_SN + 2);
+
+	// TODO: Test round-robin, by slide one...
+	// TODO: Test calculation of RTT and Keep alive timeout 
+	// free(pSCB);	// clean up work done by the destroyer of CSocketItemExDbg
+}
 
 
 
@@ -444,6 +502,11 @@ const char *password = "Passw0rd";
 //	K = H(S)			K = H(S)
 void TrySRP6()
 {
+	const unsigned int BITS_COUNT = 1536;
+	const char *U = "FSP_FlowTest";
+	const char *S = "FSP_Srv";
+	const char *password = "Passw0rd";
+	//
 	mpz_t p;
 	mpz_t g;
 	mpz_t t;
@@ -574,8 +637,8 @@ void UnitTestTweetNacl()
 int _tmain(int argc, _TCHAR* argv[])
 {
 	////UnitTestCongestControl();
-	UnitTestAcknowledge();
-	UnitTestResendQueue();
+	FlowTestAcknowledge();
+	FlowTestRetransmission();
 	UnitTestCRC();
 	UnitTestICC();
 

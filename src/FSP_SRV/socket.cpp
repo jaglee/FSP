@@ -54,16 +54,14 @@ CSocketSrvTLB::CSocketSrvTLB()
 	}
 	tailFreeSID->next = NULL;	// reset last 'next' pointer
 	//
-	SetMutexFree();
+	InitMutex();
 }
 
 
 
 CSocketItemEx * CSocketSrvTLB::AllocItem()
 {
-	// TODO: UNRESOLVED!? Make sure it is multi-thread/muti-core safe
-	if(! WaitSetMutex())
-		return NULL;
+	AcquireMutex();
 
 	CSocketItemEx *p = headFreeSID;
 	if(p != NULL)
@@ -90,11 +88,7 @@ CSocketItemEx * CSocketSrvTLB::AllocItem()
 // allocate in the listner space
 CSocketItemEx * CSocketSrvTLB::AllocItem(ALFID_T idListener)
 {
-	// TODO: UNRESOLVED!? Make sure it is multi-thread/muti-core safe
-	while(_InterlockedCompareExchange8(& this->mutex, 1, 0))
-	{
-		Sleep(0);	// just yield out the CPU time slice
-	}
+	AcquireMutex();
 
 	CSocketItemEx *p = NULL;
 	// registeration of passive socket: it is assumed that performance is seldom a concern, at least initially
@@ -153,11 +147,7 @@ CSocketItemEx * CSocketSrvTLB::AllocItem(ALFID_T idListener)
 
 void CSocketSrvTLB::FreeItem(CSocketItemEx *p)
 {
-	// TODO: UNRESOLVED!? Make sure it is multi-thread/muti-core safe
-	while(_InterlockedCompareExchange8(& this->mutex, 1, 0))
-	{
-		Sleep(0);	// just yield out the CPU time slice
-	}
+	AcquireMutex();
 	//
 	// It is deliberate to keep 'isReady'
 	//
@@ -224,10 +214,7 @@ CSocketItemEx * CSocketSrvTLB::operator[](ALFID_T id)
 
 CSocketItemEx * CSocketSrvTLB::AllocItem(const CommandNewSessionSrv & cmd)
 {
-	while(_InterlockedCompareExchange8(& this->mutex, 1, 0))
-	{
-		Sleep(0);	// just yield out the CPU time slice
-	}
+	AcquireMutex();
 	//
 	CSocketItemEx *p = (*this)[cmd.fiberID];
 	if(p != NULL)
@@ -305,7 +292,9 @@ void CSocketItemEx::InitAssociation()
 		, fidPair.source
 		, fidPair.peer);
 #endif
+
 	lowState = pControlBlock->state;
+	InitializeSRWLock(& rtSRWLock);
 	SetReady();
 }
 
@@ -412,11 +401,14 @@ int32_t LOCALAPI CSocketItemEx::GenerateSNACK(FSP_PreparedKEEP_ALIVE &buf, Contr
 	if (n < 0)
 	{
 #ifdef TRACE
-		printf_s("GetSelectiveNACK return -0x%X\n", n);
+		printf_s("GetSelectiveNACK return -0x%X\n", -n);
 #endif
 		return n;
 	}
-
+#ifdef TRACE
+	if(n > 0)
+		printf_s("GetSelectiveNACK reported there were %d gap blocks.\n", n);
+#endif
 	// Suffix the effective gap descriptors block with the FSP_SelectiveNACK struct
 	// built-in rule: an optional header MUST be 64-bit aligned
 	buf.n = n;
@@ -428,7 +420,8 @@ int32_t LOCALAPI CSocketItemEx::GenerateSNACK(FSP_PreparedKEEP_ALIVE &buf, Contr
 		pGaps[n].gapWidth = htobe32(pGaps[n].gapWidth);
 	}
 
-	pSNACK->ackTime = htobe32((uint32_t)NowUTC());
+	pSNACK->serialNo = htobe32(nextNAckSN);
+	nextNAckSN++;
 	return int32_t((uint8_t *)pSNACK + sizeof(FSP_SelectiveNACK) - (uint8_t *)pGaps);
 }
 
@@ -503,8 +496,6 @@ void LOCALAPI CSocketItemEx::AffirmConnect(const SConnectParam & initState, ALFI
 		return;
 	}
 
-	SetState(CONNECT_AFFIRMING);
-
 	// Because CONNECT_REQUEST overlay INIT_CONNECT these three fields are reused
 	//pkt->timeStamp = initState.nboTimeStamp;
 	//pkt->initCheckCode = initState.initCheckCode;
@@ -525,8 +516,8 @@ void LOCALAPI CSocketItemEx::AffirmConnect(const SConnectParam & initState, ALFI
 	// TODO: UNRESOLVED! For FSP over IPv6, attach inititator's resource reservation...
 
 	// Safely suppose that internal processing takes orders of magnitude less time than network propagation
+	SetState(CONNECT_AFFIRMING);
 	SendPacket(1, ScatteredSendBuffers(pkt, skb->len));	// it would set tRecentSend
-	//
 	tRoundTrip_us = uint32_t(min(UINT32_MAX, tRecentSend - tEarliestSend));
 	// after ACK_CONNECT_REQ would 'tKeepAlive_ms = tRoundTrip_us >> 8';
 }
@@ -540,6 +531,7 @@ void LOCALAPI CSocketItemEx::AffirmConnect(const SConnectParam & initState, ALFI
 // Remark
 //	If the end queue is not empty, only the starting PURE_DATA may be replaced by PERSIST
 //	It is assumed that DLL/ULA is waiting for LLS when this subroutine is eventually called
+//	If hasPendingKey the head message shall be committed, so shall it in the COMMITING state
 bool CSocketItemEx::ConfirmConnect()
 {
 	ControlBlock::PFSP_SocketBuf skb;
@@ -558,7 +550,17 @@ bool CSocketItemEx::ConfirmConnect()
 			return false;
 	}
 
-	skb->opCode = InState(COMMITTING) && pControlBlock->CountSendBuffered() == 1 ? COMMIT : PERSIST;
+	if(pControlBlock->CountSendBuffered() == 1)
+	{
+		skb->opCode = pControlBlock->hasPendingKey != 0 || InState(COMMITTING) ? COMMIT : PERSIST;
+	}
+	else
+	{
+		skb->opCode = PERSIST;
+		if(pControlBlock->hasPendingKey != 0)
+			pControlBlock->ReplaceSendQueueTailToCommit();
+	}
+
 	return true;
 }
 
@@ -581,6 +583,8 @@ void CSocketItemEx::SynConnect()
 	else
 		ConfirmConnect();
 	//^ ephemeral session key material was ready when CSocketItemDl::PrepareToAccept
+
+	seqLastAck = pControlBlock->recvWindowFirstSN;
 
 	EmitStart();
 	pControlBlock->SlideNextToSend();
@@ -642,7 +646,7 @@ void CSocketItemEx::OnResurrect()
 // See also Extinguish() and *::TimeOut() {case NON_EXISTENT}
 void CSocketItemEx::DisposeOnReset()
 {
-	_InterlockedExchange8((char *)pControlBlock->notices, FSP_NotifyReset);
+	pControlBlock->notices.SetHead(FSP_NotifyReset);
 	SetState(NON_EXISTENT);
 	// It is somewhat an NMI to ULA
 	SignalEvent();
@@ -672,17 +676,22 @@ void CSocketItemEx::Extinguish()
 
 
 
-// Do
-//	Commit the receive-side half-session on request of the remote end
-//	Send ACK_FLUSH to the remote peer if not in CLOSED state and notify the near end ULA
-void CSocketItemEx::CheckPeerCommit()
+// Return
+//	true if it is in commitable situation
+//	false if there is some gap or there is no tail COMMIT packet in the receive queue
+// Remark
+//	Side-effect: might change state of the FSP node
+bool CSocketItemEx::CheckPeerCommit()
 {
+	if(lowState == PEER_COMMIT || lowState == COMMITTING2 || lowState == CLOSABLE)
+		return true;
+
 	int r = pControlBlock->HasBeenCommitted();
 	//
 	// But, if multiple COMMIT? ACK_FLUSH is out-of-band. It is unnecessary to reply to each COMMIT
 	//
 	if(r <= 0)
-		return;
+		return false;
 
 	if (lowState == COMMITTING)
 	{
@@ -693,13 +702,13 @@ void CSocketItemEx::CheckPeerCommit()
 		StopKeepAlive();
 		SetState(CLOSABLE);
 	}
-	else // if (lowState == ESTABLISHED, CHALLENGING, CLONING, RESUMING, QUASI_ACTIVE)
+	else // if (InStates(ESTABLISHED, CHALLENGING, CLONING, RESUMING, QUASI_ACTIVE))
 	{
 		StopKeepAlive();
 		SetState(PEER_COMMIT);
 	}
-	//
-	SendSNACK();
+
+	return true;
 }
 
 
@@ -732,7 +741,7 @@ void CSocketItemEx::CloseToNotify()
 	ReplaceTimer(SCAVENGE_THRESHOLD_ms);
 	SetState(CLOSED);
 	(CLowerInterface::Singleton())->FreeItem(this);
-	Notify(FSP_NotifyRecycled);
+	Notify(FSP_NotifyFinish);	//FSP_NotifyRecycled
 }
 
 

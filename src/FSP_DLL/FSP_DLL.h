@@ -82,14 +82,20 @@ typedef CSocketItem * PSocketItem;
 // per-session connection limit. thereotically any connectable socket might be listener
 #define MAX_CONNECTION_NUM	16	// 256	// must be some power value of 2
 
+#define MAX_LOCK_WAIT_ms	60000	// one minute. for very large buffer compression or de-compression it may be too small
+
+
 class CSocketItemDl: public CSocketItem
 {
+	SRWLOCK			rtSRWLock;
+	//
 	CSocketItemDl	*next;
 	CSocketItemDl	*prev;
 	// for sake of incarnating new accepted connection
 	FSP_SocketParameter context;
 	char			isFlushing;
 	char			eomSending;
+	char			inUse;
 protected:
 	ALIGN(8)		HANDLE theWaitObject;
 
@@ -106,9 +112,6 @@ protected:
 	// to support surveillance RecvInline() over ReadFrom() make CallbackPeeked an independent function
 	CallbackPeeked	fpPeeked;
 	CallbackBufferReady fpSent;
-
-	volatile bool	inUse;
-	volatile char	mutex;	// Utilize _InterlockedCompareExchange8 to manage critical resource
 
 	BYTE * volatile	pendingSendBuf;
 	int				pendingSendSize;
@@ -138,7 +141,6 @@ protected:
 	}
 
 	void WaitEventToDispatch();
-	FSP_ServiceCode PopNotice() { return pControlBlock->PopNotice(); }
 
 	// in Establish.cpp
 	void ProcessBacklog();
@@ -176,7 +178,7 @@ public:
 		FLUSHING_SHUTDOWN = 2
 	};
 
-	CSocketItemDl() { }	// and lazily initialized
+	CSocketItemDl() { InitializeSRWLock(& rtSRWLock); }	// and lazily initialized
 	~CSocketItemDl()
 	{
 		if(theWaitObject != NULL)
@@ -213,10 +215,13 @@ public:
 		return (FSP_Session_State)_InterlockedCompareExchange((long *)& pControlBlock->state, s2, s0);
 	}
 
-	void SetMutexFree() { _InterlockedExchange8(& mutex, 0); }
-	bool TestSetMutexBusy() { return !_InterlockedCompareExchange8(& mutex, 1, 0); }
-	bool WaitSetMutex();
-	bool IsInUse() const { return inUse; }
+#ifdef NDEBUG
+	bool CSocketItemDl::WaitUseMutex() { if(inUse == 0) return false; AcquireSRWLockExclusive(& rtSRWLock); return (inUse != 0); }
+#else
+	bool WaitUseMutex();
+#endif
+	void SetMutexFree() { ReleaseSRWLockExclusive(& rtSRWLock); }
+	bool IsInUse() const { return inUse != 0; }
 
 	void SetPeerName(const char *cName, size_t len)
 	{
@@ -241,20 +246,20 @@ public:
 	}
 	CSocketItemDl * LOCALAPI CallCreate(CommandNewSession &, FSP_ServiceCode);
 
-	int LOCALAPI InstallKey(BYTE *, int, int32_t);
+	int LOCALAPI InstallKey(BYTE *, int, int32_t, FlagEndOfMessage);
 
 	int LOCALAPI AcquireSendBuf(int);
-	int LOCALAPI SendInplace(void *, int, bool);
+	int LOCALAPI SendInplace(void *, int, FlagEndOfMessage);
 
 	ControlBlock::PFSP_SocketBuf GetSendBuf() { return pControlBlock->GetSendBuf(); }
 
-	int LOCALAPI PrepareToSend(void *, int, bool);
-	int LOCALAPI SendStream(void *, int, char);
+	int LOCALAPI PrepareToSend(void *, int, FlagEndOfMessage);
+	int LOCALAPI SendStream(void *, int, FlagEndOfMessage);
 	bool TestSetSendReturn(PVOID fp1)
 	{
 		return InterlockedCompareExchangePointer((PVOID *) & fpSent, fp1, NULL) == NULL; 
 	}
-	int CheckedRevertToResume();
+	int LOCALAPI CheckedRevertToResume(FlagEndOfMessage);
 	//
 	int LOCALAPI CSocketItemDl::FinalizeSend(int r)
 	{
@@ -284,18 +289,7 @@ public:
 	}
 	void SetFlushing(char value) { isFlushing = value; }
 
-	int SelfNotify(FSP_ServiceCode c)
-	{
-		if(pControlBlock->PushNotice(c) < 0)
-		{
-			return -EBUSY;
-		}
-		else
-		{
-			::SetEvent(hEvent);
-			return 0;
-		}
-	}
+	int SelfNotify(FSP_ServiceCode c);
 	void NotifyError(FSP_ServiceCode c, int e = 0) { if (context.onError != NULL) context.onError(this, c, e); }
 
 	// defined in DllEntry.cpp:

@@ -198,8 +198,7 @@ void CSocketItemEx::Connect()
 	// bind to the interface as soon as the control block mapped into server's memory space
 	InitAssociation();
 	InitiateConnect();
-
-	SignalReturned();
+	// To avoid race condition disable 'SignalReturned();' here!
 }
 
 

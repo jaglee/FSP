@@ -99,7 +99,6 @@ inline int GetPointerOfWSARecvMsg(SOCKET sd)
 
 VOID NETIOAPI_API_ OnUnicastIpChanged(PVOID, PMIB_UNICASTIPADDRESS_ROW, MIB_NOTIFICATION_TYPE);
 
-
 //
 // TODO: local interface sharing...
 //
@@ -149,7 +148,6 @@ CLowerInterface::CLowerInterface()
 	mesgInfo.Control.len = sizeof(nearInfo);
 
 	InitBuffer();
-	SetMutexFree();
 	pSingleInstance = this;
 
 	// only after the required fields initialized may the listener thread started
@@ -608,17 +606,14 @@ inline void CLowerInterface::ProcessRemotePacket()
 		}
 		for(i = 0; i < (int) readFDs.fd_count; i++)
 		{
-			while(_InterlockedCompareExchange8(& this->mutex, 1, 0))
-			{
-				Sleep(0);	// just yield out the CPU time slice
-			}
+			AcquireMutex();
 			// Unfortunately, it was proven that no matter whether there is MSG_PEEK
 			// MSG_PARTIAL is not supported by the underlying raw socket service
 			mesgInfo.dwFlags = 0;
 			sdRecv = readFDs.fd_array[i];
 			r = AcceptAndProcess();
-			SetMutexFree();
 			//
+			SetMutexFree();
 			if(r == E_ABORT)
 				return;
 		}
@@ -1004,24 +999,6 @@ bool CSocketItemEx::AddTimer()
 
 
 
-// Remark
-//	Timestamp arithmetic is rendered in the Galois feild
-//	clockCheckPoint and tLastRecv must be well defined
-void CSocketItemEx::EarlierKeepAlive()
-{
-#ifdef TRACE_PACKET
-	TRACE_HERE("keep alive earlier");
-	DumpTimerInfo(tLastRecv);
-#endif
-	if (clockCheckPoint.tKeepAlive - tLastRecv < tRoundTrip_us)
-		return;
-	//
-	clockCheckPoint.tKeepAlive = tLastRecv + tRoundTrip_us;
-	::ChangeTimerQueueTimer(TimerWheel::Singleton(), timer, tRoundTrip_us / 1000, tKeepAlive_ms);
-}
-
-
-
 bool CSocketItemEx::RemoveTimer()
 {
 	if(::DeleteTimerQueueTimer(TimerWheel::Singleton(), timer, NULL))
@@ -1043,7 +1020,6 @@ bool CSocketItemEx::RemoveTimer()
 //	true if the timer was set, false if it failed.
 bool LOCALAPI CSocketItemEx::ReplaceTimer(uint32_t period)
 {
-	clockCheckPoint.tKeepAlive = NowUTC() + period * 1000;
 	tKeepAlive_ms = period;
 	return ( timer == NULL 
 		&&	::CreateTimerQueueTimer(& timer, TimerWheel::Singleton()
@@ -1061,6 +1037,9 @@ bool LOCALAPI CSocketItemEx::ReplaceTimer(uint32_t period)
 
 void CSocketItemEx::ScheduleEmitQ()
 {
+#ifdef TRACE
+	TRACE_HERE("It is scheduled to send data in the queue");
+#endif
 	QueueUserWorkItem(HandleSendQ, this, WT_EXECUTELONGFUNCTION);
 }
 
@@ -1082,10 +1061,7 @@ void CSocketItemEx::ScheduleConnect(CommandNewSessionSrv *pCmd)
 inline
 PktBufferBlock * CSocketItemEx::PushPacketBuffer(PktBufferBlock *pNext)
 {
-	while(_InterlockedCompareExchange8(& mutex, 1, 0))
-	{
-		Sleep(0);	// just yield out the CPU time slice
-	}
+	AcquireSRWLockExclusive(& rtSRWLock);
 
 	PktBufferBlock *p = tailPacket;
 	pNext->next = NULL;
@@ -1099,25 +1075,23 @@ PktBufferBlock * CSocketItemEx::PushPacketBuffer(PktBufferBlock *pNext)
 		tailPacket = pNext;
 	}
 
-	SetMutexFree();
+	ReleaseSRWLockExclusive(& rtSRWLock);
 	return p;
 }
 
 
 
-// only if there is some packet in the queue would it be locked
+// PeekLockPacketBuffer MUST be paired with UnlockPacketBuffer/PopUnlockPacketBuffer
+// only if there is some packet in the queue would the socket descriptor be locked
 inline
 FSP_NormalPacketHeader * CSocketItemEx::PeekLockPacketBuffer()
 {
-	while(_InterlockedCompareExchange8(& mutex, 1, 0))
-	{
-		Sleep(0);	// just yield out the CPU time slice
-	}
+	AcquireSRWLockExclusive(& rtSRWLock);
 
 	if(headPacket == NULL)
 	{
+		ReleaseSRWLockExclusive(& rtSRWLock);
 		// assert(tailPacket == NULL);
-		SetMutexFree();
 		return NULL;
 	}
 
@@ -1130,12 +1104,9 @@ FSP_NormalPacketHeader * CSocketItemEx::PeekLockPacketBuffer()
 inline
 void CSocketItemEx::PopUnlockPacketBuffer()
 {
+	// UNRESOLVED!? Can the packet buffer be exclusively locked?
 	if(headPacket == NULL)
-	{
-		// assert(tailPacket == NULL);
-		SetMutexFree();
-		return;
-	}
+		return;		// assert(tailPacket == NULL);
 
 	PktBufferBlock *p = headPacket->next;	// MUST put before FreeBuffer or else it may be overwritten
 	CLowerInterface::Singleton()->FreeBuffer(headPacket);
@@ -1143,7 +1114,7 @@ void CSocketItemEx::PopUnlockPacketBuffer()
 	if((headPacket = p) == NULL)
 		tailPacket = NULL;
 
-	SetMutexFree();
+	ReleaseSRWLockExclusive(& rtSRWLock);
 }
 
 
@@ -1251,7 +1222,7 @@ bool CSocketItemEx::TestAndWaitReady()
 	time_t t0 = time(NULL);
 	while(! TestAndLockReady())
 	{
-		Sleep(1);
+		Sleep(0);	// just yield out the CPU
 		if(time(NULL) - t0 > TRASIENT_STATE_TIMEOUT_ms)
 		{
 			TRACE_HERE("TestAndWaitReady timeout");
@@ -1330,10 +1301,7 @@ int CSocketItemEx::SendPacket(register ULONG n1, ScatteredSendBuffers s)
 
 int ConnectRequestQueue::Push(const CommandNewSessionSrv *p)
 {
-	while(_InterlockedCompareExchange8(& mutex, 1, 0))
-	{
-		Sleep(0);
-	}
+	WaitSetMutex();
 	//
 	if(mayFull != 0 && tail == head)
 	{
@@ -1360,10 +1328,6 @@ int ConnectRequestQueue::Push(const CommandNewSessionSrv *p)
 //	-1	if no item could be removed
 int ConnectRequestQueue::Remove(int i)
 {
-	while(_InterlockedCompareExchange8(& mutex, 1, 0))
-	{
-		Sleep(0);
-	}
 	// 
 	if(tail < 0 || tail >= CONNECT_BACKLOG_SIZE)
 		REPORT_ERRMSG_ON_TRACE("check tail in case of falling into dead loop");

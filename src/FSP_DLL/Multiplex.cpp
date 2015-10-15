@@ -146,5 +146,11 @@ bool LOCALAPI CSocketItemDl::ToWelcomeMultiply(BackLogItem & backLog)
 // Auxiliary function that is called when an existing closed connection context is hit in the cache
 void CSocketItemDl::HitResumableDisconnectedSessionCache()
 {
+	if(! WaitUseMutex())
+	{
+		TRACE_HERE("deadlock encountered!?");
+		return;
+	}
+	//...
 	SetMutexFree();
 }

@@ -12,7 +12,6 @@ using namespace Microsoft::VisualStudio::CppUnitTestFramework;
 /**
  * Unit Test of:
  * InquireSendBuf
- * MarkSendQueue
  * InquireRecvBuf
  * FetchReceived
  * AllocRecvBuf
@@ -23,7 +22,7 @@ void UnitTestSendRecvWnd()
 	int memsize = sizeof(ControlBlock) + (sizeof ControlBlock::FSP_SocketBuf + MAX_BLOCK_SIZE) * 8;
 	const ControlBlock::seq_t FIRST_SN = 12;
 
-	ControlBlockDbg *pSCB = (ControlBlockDbg *)malloc(memsize);
+	ControlBlock *pSCB = (ControlBlock *)malloc(memsize);
 	pSCB->Init((memsize - sizeof(ControlBlock))/ 2, (memsize - sizeof(ControlBlock)) / 2);
 	//pSCB->sendWindowSize = pSCB->sendBufferSize;	// shall do nothing with send buffer management
 	//^ shall set to min(sendBufferSize, remoteReceiveWindowSize);
@@ -46,13 +45,7 @@ void UnitTestSendRecvWnd()
 	if(m < MAX_BLOCK_SIZE * 2)
 		return;
 
-	m = MAX_BLOCK_SIZE * 2 - 13;	// deliberate take use of less than maximum capacity
-	memset(inplaceBuf, 'F', m);
-	int k = pSCB->MarkSendQueue(inplaceBuf, m, true);
-	Assert::IsFalse(k > 0);
-	k = pSCB->MarkSendQueue(inplaceBuf, m, false);
-	Assert::IsTrue(k > 0);
-	Assert::IsTrue(pSCB->sendBufferNextSN == FIRST_SN + 3);
+	// TODO: UnitTest of SendInplace, SendStream
 
 	ControlBlock::PFSP_SocketBuf skb3 = pSCB->HeadSend() + 2;
 	skb->SetFlag<IS_ACKNOWLEDGED>();
@@ -165,7 +158,7 @@ static const int MAX_BLOCK_NUM = 0x20000;	// 65536 * 2
 void UnitTestGenerateSNACK()
 {
 	CSocketItemExDbg socket(MAX_BLOCK_NUM, MAX_BLOCK_NUM);
-	ControlBlockDbg *pSCB = socket.GetControlBlock();
+	ControlBlock *pSCB = socket.GetControlBlock();
 	pSCB->SetRecvWindowHead(FIRST_SN);
 
 	FSP_SelectiveNACK::GapDescriptor gaps[MAX_GAPS_NUM];
@@ -260,7 +253,7 @@ void UnitTestGenerateSNACK()
 void UnitTestHasBeenCommitted()
 {
 	CSocketItemExDbg socket(MAX_BLOCK_NUM, MAX_BLOCK_NUM);
-	ControlBlockDbg *pSCB = socket.GetControlBlock();
+	ControlBlock *pSCB = socket.GetControlBlock();
 	pSCB->SetRecvWindowHead(FIRST_SN);
 	//
 	// TODO: put test data...

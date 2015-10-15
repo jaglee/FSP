@@ -166,6 +166,19 @@ struct FSP_SocketParameter
 
 
 
+//	Choice of the flag:
+//		0: not finshed more data to follow
+//		1: it is the trail of the containing message
+//		2: it is the last message of the transaction on the particular transmit direction
+enum FlagEndOfMessage
+{
+	NOT_END_ANYWAY = 0,
+	END_OF_MESSAGE = 1,
+	END_OF_TRANSACTION = 2
+};
+
+
+
 #ifdef __cplusplus
 	extern "C" {
 #endif
@@ -212,13 +225,14 @@ FSPHANDLE FSPAPI ConnectMU(FSPHANDLE, PFSP_Context);
 //	the buffer of the key
 //	the length of the key in bytes
 //	the life of the key in terms of number of packets allowed to send or resend
+//	FlagEndOfMessage, NOT_END_ANYWAY if it is the final initiator, END_OF_TRANSACTION the final responder
 // return
 //	0 if no error
 //	-EDOM if parameter domain error
 //	-EFAULT if unexpected exception
 //	-EIO if I/O interface error between the message layer and the packet layer
 DllSpec
-int FSPAPI InstallAuthenticKey(FSPHANDLE, uint8_t *, int, int32_t);
+int FSPAPI InstallAuthenticKey(FSPHANDLE, uint8_t *, int, int32_t, FlagEndOfMessage);
 
 
 
@@ -236,7 +250,7 @@ int FSPAPI GetSendBuffer(FSPHANDLE, int, CallbackBufferReady);
 //	FSPHANDLE	the socket handle
 //	void *		the buffer pointer
 //	int			the number of octets to send
-//	bool		whether it is to be continued
+//	FlagEndOfMessage
 // Return
 //	number of octets really scheduled to send
 // Remark
@@ -245,14 +259,14 @@ int FSPAPI GetSendBuffer(FSPHANDLE, int, CallbackBufferReady);
 //	if the buffer is to be continued, its size MUST be multiplier of MAX_BLOCK_SIZE
 //	SendInline could be chained in tandem with GetSendBuffer
 DllSpec
-int FSPAPI SendInline(FSPHANDLE, void *, int, bool);
+int FSPAPI SendInline(FSPHANDLE, void *, int, enum FlagEndOfMessage);
 
 
 // Given
 //	FSPHANDLE	the socket handle
 //	void *		the buffer pointer
 //	int			the number of octets to send
-//	char		the flags to indicate whether it is transactional
+//	FlagEndOfMessage
 //	NotifyOrReturn	the callback function pointer
 // Return
 //	0 if no immediate error, negative if it failed, or positive it was warned (I/O pending)
@@ -260,18 +274,8 @@ int FSPAPI SendInline(FSPHANDLE, void *, int, bool);
 //	Return value passed in NotifyOrReturn is the number of octets really scheduled to send
 //	which may be less or greater than requested because of compression and/or encryption
 //	Only all data have been buffered may be NotifyOrReturn called.
-//	Choice of the flag:
-//		0: not finshed more data to follow
-//		1: it is the trail of the containing message
-//		2: it is the last message of the session of the particular transmit direction
-enum EndOfMessageFlag
-{
-	NOT_END_ANYWAY = 0,
-	END_OF_MESSAGE = 1,
-	END_OF_SESSION = 2
-};
 DllSpec
-int FSPAPI WriteTo(FSPHANDLE, void *, int, char, NotifyOrReturn);
+int FSPAPI WriteTo(FSPHANDLE, void *, int, enum FlagEndOfMessage, NotifyOrReturn);
 
 
 // given
@@ -303,8 +307,7 @@ DllSpec
 int FSPAPI ReadFrom(FSPHANDLE, void *, int, NotifyOrReturn);
 
 
-
-// Commit sendin by managing to flush all data-in-flight to the remote peer
+// Commit sending by managing to flush all data-in-flight to the remote peer
 // Given
 //	FSPHANDLE		the FSP socket
 //	NotifyOrReturn	the callback function
@@ -316,8 +319,9 @@ int FSPAPI ReadFrom(FSPHANDLE, void *, int, NotifyOrReturn);
 //	0 if no immediate error
 // Remark
 //	the callback function may return delayed error such as Commit rejected the remote end
-DllSpec
-int FSPAPI Commit(FSPHANDLE, NotifyOrReturn);
+//	Explicit Commit is unnecessary
+////DllSpec
+////int FSPAPI Commit(FSPHANDLE, NotifyOrReturn);
 
 
 // Try to terminate the session gracefully, automatically commit if not yet 
@@ -357,11 +361,6 @@ uint32_t * TranslateFSPoverIPv4(PFSP_IN6_ADDR, uint32_t, ALFID_T);
 DllSpec
 int FSPControl(FSPHANDLE hFSPSocket, unsigned controlCode, ulong_ptr value);
 
-//
-//DllSpec
-//bool EOMReceived(FSPHANDLE);
-
-
 
 // Given
 //	pointer to the buffer of exported public key
@@ -387,7 +386,6 @@ int FSPAPI CryptoNaClGetSharedSecret(unsigned char *bufSharedSecret, const unsig
 
 
 
-
 // Given
 //	pointer to the buffer of the output hash, 32 bytes
 //	the input byte string to calculate the hash
@@ -401,20 +399,11 @@ int FSPAPI CryptoNaClHash(unsigned char *buf, const unsigned char *input, unsign
 
 
 
-
-// Given
-//	pointer to the buffer of the output hash, 32 bytes
-//	the input byte string of the 32 bytes exponent
-//	the input byte string of the 32 bytes base
-// Do
-//	get the SHA256 result
-// Return
-//	0 (always succeed in presumed constant time)
-DllSpec
-int FSPAPI CryptoNaClScalarMult(unsigned char *buf, const unsigned char *exp, const unsigned char *base);
-
-DllSpec
-int FSPAPI CryptoNaClScalarMultBase(unsigned char *buf, const unsigned char *exp);
+////DllSpec
+////int FSPAPI CryptoNaClScalarMult(unsigned char *buf, const unsigned char *exp, const unsigned char *base);
+////
+////DllSpec
+////int FSPAPI CryptoNaClScalarMultBase(unsigned char *buf, const unsigned char *exp);
 
 #ifdef __cplusplus
 	}

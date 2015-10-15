@@ -172,14 +172,11 @@ extern CStringizeNotice noticeNames;
 #define MAX_PHY_INTERFACES	4	// maximum number of physical interfaces that might be multihomed
 #define MIN_QUEUED_INTR		2	// minimum number of queued (soft) interrupt, must be some power value of 2
 #define FSP_BACKLOG_SIZE	4	// shall be some power of 2
-#define FSP_MAX_NUM_NOTICE	8	// shall be some multiple of 8
+#define FSP_MAX_NUM_NOTICE	15	// should be a reasonable value, shall be some multiple of 8 minus 1
 #define	MIN_RESERVED_BUF	(MAX_BLOCK_SIZE * 2)
 
 #define LOCALAPI __fastcall
 
-// This implement's congestion control parameters
-#define CONGEST_CONTROL_C	0.4
-#define CONGEST_CONTROL_BETA 0.2
 
 /**
  * platform-dependent fundamental utility functions
@@ -253,6 +250,24 @@ struct FSP_NormalPacketHeader
 	template<FSP_FlagPosition pos> void SetFlag() { flags_ws[3] |= (1 << pos); }
 	template<FSP_FlagPosition pos> void ClearFlag() { flags_ws[3] &= ~(1 << pos); }
 	template<FSP_FlagPosition pos> int GetFlag() const { return flags_ws[3] & (1 << pos); }
+
+	// Get the first extension header
+	PFSP_HeaderSignature PFirstExtHeader() const { return (PFSP_HeaderSignature)((uint8_t *)this + be16toh(hs.hsp) - sizeof(FSP_HeaderSignature)); }
+
+	// Get next extension header
+	// Given
+	//	The pointer to the current extension header
+	// Return
+	//	The pointer to the next optional header, NULL if it is illegal
+	// Remark
+	//	The caller should check that pStackPointer does not fall into dead-loop
+	template<typename THdr>	PFSP_HeaderSignature PHeaderNextTo(void *p0) const
+	{
+		uint16_t sp = be16toh(((THdr *)p0)->hs.hsp);
+		if(sp < sizeof(FSP_NormalPacketHeader) || sp > (uint8_t *)p0 - (uint8_t *)this)
+			return NULL;
+		return (PFSP_HeaderSignature)((uint8_t *)this + sp - sizeof(FSP_HeaderSignature));
+	}
 };
 
 
@@ -323,7 +338,7 @@ struct FSP_SelectiveNACK
 		uint32_t	gapWidth;	// in packets
 		uint32_t	dataLength;	// in packets
 	};
-	uint32_t		ackTime;	// in micro-seconds. Interval of KEEP_ALIVE cannot exceed an hour
+	uint32_t		serialNo;
 	$FSP_HeaderSignature hs;
 };
 
@@ -337,7 +352,7 @@ struct FSP_PreparedKEEP_ALIVE
 	$FSP_HeaderSignature hs;	// sentinel, actually
 	uint32_t		n;	// n >= 0, number of (gapWidth, dataLength) tuples
 	//
-	uint32_t		GetSaltValue() const { return gaps[n].gapWidth; }	// it overlays on ackTime
+	uint32_t		GetSaltValue() const { return gaps[n].gapWidth; }	// it overlays on serialNo
 };
 
 
@@ -452,13 +467,27 @@ struct BackLogItem: SConnectParam
 };
 
 
+class LLSNotice
+{
+protected:
+	// 4: The (very short, roll-out) queue of returned notices
+	FSP_ServiceCode q[FSP_MAX_NUM_NOTICE];
+	volatile char	mutex;
+	//
+	friend struct ControlBlock;
+public:
+	void SetHead(FSP_ServiceCode c) { q[0] = c; }
+	// put a new notice at the tail of the queue
+	int LOCALAPI	Put(FSP_ServiceCode);
+	// pop the notice from the top
+	FSP_ServiceCode Pop();
+};
 
-// 
-template<typename TLogItem> class TSingleProviderMultipleConsumerQ
+
+
+class LLSBackLog
 {
 	volatile char		mutex;
-	ALIGN(4)
-	volatile LONG		nProvider;
 	ALIGN(8)
 	int32_t				capacity;
 	volatile int32_t	headQ;
@@ -466,15 +495,19 @@ template<typename TLogItem> class TSingleProviderMultipleConsumerQ
 	volatile int32_t	count;
 	//
 	ALIGN(8)
-	TLogItem			q[MIN_QUEUED_INTR];
+	BackLogItem			q[MIN_QUEUED_INTR];
 	//
-	void InitSize() { capacity = MIN_QUEUED_INTR; }	// assume memory has been zeroized
-	int InitSize(int);
+	void InitSize() { capacity = MIN_QUEUED_INTR; mutex = 0; }	// assume memory has been zeroized
+	int	InitSize(int);
+
+	void WaitSetMutex() { while(_InterlockedCompareExchange8(& mutex, 1, 0)) Sleep(1); }
+	void SetMutexFree() { _InterlockedExchange8(& mutex, 0); }
 
 	friend struct ControlBlock;
 public:
-	int LOCALAPI Push(const TLogItem *p);
-	int LOCALAPI Pop(TLogItem *p);
+	bool LOCALAPI Has(const BackLogItem *p);
+	int LOCALAPI Put(const BackLogItem *p);
+	int LOCALAPI Pop(BackLogItem *p);
 };
 
 
@@ -495,6 +528,12 @@ enum SocketBufFlagBitPosition
 	TO_BE_CONTINUED = 7
 };
 
+
+enum PendingKeyMask
+{
+	HAS_PENDING_KEY_FOR_SEND = 1,
+	HAS_PENDING_KEY_FOR_RECV = 2
+};
 
 
 class CSocketItem;	// forward declaration for sake of declaring ControlBlock
@@ -534,10 +573,10 @@ struct ControlBlock
 	ALIGN(8)	// 64-bit aligment, make sure that the session key overlays 'initCheckCode' and 'cookie' only
 	SConnectParam connectParams;
 
-	// 4: The (very short, roll-out) queue of returned notices
-	FSP_ServiceCode notices[FSP_MAX_NUM_NOTICE];
+	// 4: The queue of returned notices
+	LLSNotice	notices;
 	// Backlog for listening/connected socket [for client it could be an alternate of Web Socket]
-	TSingleProviderMultipleConsumerQ<BackLogItem>	backLog;
+	LLSBackLog	backLog;
 
 	// 5, 6: Send window and receive window descriptor
 	typedef uint32_t seq_t;
@@ -720,7 +759,7 @@ struct ControlBlock
 
 	PFSP_SocketBuf GetFirstReceived() const { return HeadRecv() + recvWindowHeadPos; }
 	int LOCALAPI GetSelectiveNACK(seq_t &, FSP_SelectiveNACK::GapDescriptor *, int) const;
-	int LOCALAPI DealWithSNACK(seq_t, const FSP_SelectiveNACK::GapDescriptor *, int n);
+	int LOCALAPI DealWithSNACK(seq_t, FSP_SelectiveNACK::GapDescriptor *, int & n);
 
 	// Return the last received packet, which might be already delivered
 	PFSP_SocketBuf LOCALAPI AllocRecvBuf(seq_t);
@@ -782,11 +821,6 @@ struct ControlBlock
 	}
 
 	bool HasBacklog() const { return backLog.count > 0; }
-	bool LOCALAPI	HasBacklog(const BackLogItem *p);
-	int LOCALAPI	PushBacklog(const BackLogItem *p);
-	int LOCALAPI	PopBacklog(BackLogItem *p);
-	int LOCALAPI	PushNotice(FSP_ServiceCode);
-	FSP_ServiceCode PopNotice();
 
 	int LOCALAPI	Init(int32_t, int32_t);
 	int	LOCALAPI	Init(uint16_t);
@@ -804,7 +838,7 @@ protected:
 	DWORD	dwMemorySize;	// size of the shared memory, in the mapped view
 	ControlBlock *pControlBlock;
 
-	void SetCallable() { _InterlockedExchange8((char *)pControlBlock->notices, NullCommand); }	// clear the 'NOT-returned' notice
+	void SetCallable() { pControlBlock->notices.SetHead(NullCommand); }	// clear the 'NOT-returned' notice
 
 	~CSocketItem() { Destroy(); }
 	void Destroy()
@@ -821,48 +855,6 @@ protected:
 			::CloseHandle(hEvent);
 			hEvent = NULL;
 		}
-	}
-};
-
-
-
-class FSP_Header_Manager
-{
-	BYTE		*pHdr;
-	uint16_t	pStackPointer;
-public:
-	// Initialize the FSP_Header manager for pushing operations
-	// Given
-	//	void *		point to the fixed part of FSP header
-	//	int			length of the header
-	FSP_Header_Manager(void *p1, int len)
-	{
-		pHdr = (BYTE *)p1;
-		pStackPointer = (len + 7) & 0xFFF8;
-		// header of stack pointer to be set in the future
-	}
-	// Tnitialize the FSP_Header manager for popping operations
-	// Given
-	//	void *	pointer to the fixed part of FSP header in the receiving buffer
-	// Remark
-	//	The caller should check validity of pStackPointer with calling 'NextHeaderOffset'
-	FSP_Header_Manager(void *p1)
-	{
-		pHdr = (BYTE *)p1;
-		pStackPointer = be16toh(((FSP_Header *)p1)->hs.hsp);
-	}
-	// Pop an extension header
-	// Return
-	//	The pointer to the optional header
-	// Remark
-	//	The caller should check that pStackPointer does not fall into dead-loop
-	template<typename THdr>	THdr * PopExtHeader()
-	{
-		uint16_t prevOffset = pStackPointer - sizeof(FSP_HeaderSignature);
-		pStackPointer = be16toh( ( (PFSP_HeaderSignature)(pHdr + prevOffset) )->hsp );
-		if(pStackPointer < sizeof(FSP_NormalPacketHeader) || pStackPointer >= prevOffset)
-			return NULL;
-		return (THdr *)(pHdr + pStackPointer - sizeof(THdr));
 	}
 };
 
