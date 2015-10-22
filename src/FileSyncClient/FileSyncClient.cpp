@@ -20,22 +20,43 @@ static HANDLE hFile;
 static char fileName[MAX_PATH];
 volatile static bool finished = false;
 
+
+
 static void FSPAPI onReturn(FSPHANDLE h, FSP_ServiceCode code, int value)
 {
-	printf_s("Notify: Fiber ID = %u, service code = %d, returned %d\n", (uint32_t)(intptr_t)h, code, value);
+	printf_s("Notify: Fiber ID = %u, service code = %d, return %d\n", (uint32_t)(intptr_t)h, code, value);
 	if(value < 0)
 	{
 		Dispose(h);
 		finished = true;
 		return;
 	}
-	if(code == FSP_NotifyFinish)
+}
+
+
+
+static void FSPAPI onError2(FSPHANDLE h, FSP_ServiceCode code, int value)
+{
+	printf_s("Notify2: fiber ID = %u, service code = %d, return %d\n", (uint32_t)(intptr_t)h, code, value);
+	Dispose(h);
+	finished = true;
+	return;
+}
+
+
+
+static void FSPAPI onFinished(FSPHANDLE h, FSP_ServiceCode code, int value)
+{
+	printf_s("Fiber ID = %u, session was to shut down.\n", (uint32_t)(intptr_t)h);
+	if(code != FSP_NotifyFinish)
 	{
-		printf_s("Session was shut down.\n");
-		Dispose(h);
-		finished = true;
+		printf_s("Should got onFinished, but service code = %d, return %d\n", code, value);
 		return;
 	}
+
+	Dispose(h);
+	finished = true;
+	return;
 }
 
 
@@ -66,10 +87,19 @@ static int ReportLastError()
 
 
 
+int CompareMemoryPattern(char	*fileName);
+
+
+
 // the server would send the filename in the first message. the client should change the name
 // in case it is in the same directory of the same machine 
-int main()
+int main(int argc, char *argv[])
 {
+	if(argc == 2)
+	{
+		return CompareMemoryPattern(argv[1]);
+	}
+
 	Sleep(2000);	// wait the server up when debug simultaneously
 
 	FSP_SocketParameter parms;
@@ -108,14 +138,20 @@ int FSPAPI onConnected(FSPHANDLE h, PFSP_Context ctx)
 		return -1;
 	}
 
+	int mLen = strlen((const char *)ctx->welcome) + 1;
 	printf_s("\tWelcome message length: %d\n", ctx->len);
-	if(ctx->len <= 0)
+	printf_s("%s\n", ctx->welcome);
+	if(ctx->len <= 0 || mLen >= ctx->len)
 	{
 		printf_s("Security context is not fulfilled: the peer did not provide the public key.\n");
+		printf_s("To read the filename directly...\t");
+		if(ReadFrom(h, fileName, sizeof(fileName), onReceiveFileNameReturn) < 0)
+		{
+			finished = true;
+			return -1;
+		}
+		return 0;
 	}
-
-	int mLen = strlen((const char *)ctx->welcome) + 1;
-	printf_s("%s\n", ctx->welcome);
 
 	CryptoNaClKeyPair(bufPublicKey, bufPrivateKey);
 
@@ -127,6 +163,7 @@ int FSPAPI onConnected(FSPHANDLE h, PFSP_Context ctx)
 	CryptoNaClGetSharedSecret(bufSharedKey, bufPeersKey, bufPrivateKey);
 
 	InstallAuthenticKey(h, bufSharedKey, CRYPTO_NACL_KEYBYTES, INT32_MAX, NOT_END_ANYWAY);
+	FSPControl(h, FSP_SET_CALLBACK_ON_ERROR, (ulong_ptr)onError2);
 	WriteTo(h, bufPublicKey, CRYPTO_NACL_KEYBYTES, END_OF_MESSAGE, onPublicKeySent);
 
 	return 0;
@@ -225,6 +262,7 @@ static void FSPAPI onReceiveFileNameReturn(FSPHANDLE h, FSP_ServiceCode resultCo
 		//
 		printf_s("To read content with inline buffering...\n");
 		//
+		FSPControl(h, FSP_SET_CALLBACK_ON_FINISH, (ulong_ptr)onFinished);
 		RecvInline(h, onReceiveNextBlock);
 	}
 	catch(...)
@@ -266,7 +304,7 @@ static int FSPAPI onReceiveNextBlock(FSPHANDLE h, void *buf, int32_t len, bool t
 	if(! toBeContinued)
 	{
 		printf_s("All data have been received, to shutdown...\n");
-		if(Shutdown(h) != 0)
+		if(Shutdown(h, onFinished) != 0)
 		{
 			Dispose(h);
 			finished = true;

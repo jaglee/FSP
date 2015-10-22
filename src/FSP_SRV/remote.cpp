@@ -34,7 +34,18 @@
 
 #pragma intrinsic(_InterlockedCompareExchange16)
 
-#ifdef TRACE
+
+// 'Package' internal use only
+struct _CookieMaterial
+{
+	uint32_t	salt;
+	ALFID_T	idALF;
+	ALFID_T	idListener;
+};
+
+
+
+#if defined(TRACE) || defined(TRACE_HEARTBEAT)
 #define TRACE_SOCKET()	\
 	(printf_s("%s local fiber#%u in state %s\n", __FUNCTION__	\
 		, fidPair.source		\

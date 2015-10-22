@@ -257,7 +257,7 @@ bool CSocketItemEx::SendSNACK(FSPOperationCode opCode)
 	FSP_PreparedKEEP_ALIVE buf;
 
 	int32_t len = GenerateSNACK(buf, seqExpected);
-#ifdef TRACE_PACKET
+#if defined(TRACE_PACKET) || defined(TRACE_HEARTBEAT)
 	printf_s("Keep-alive local fiber#%u\n"
 		"\tAcknowledged seq#%u, keep-alive header size = %d\n"
 		, fidPair.source
@@ -341,7 +341,7 @@ int LOCALAPI CSocketItemEx::RespondToSNACK(ControlBlock::seq_t expectedSN, FSP_S
 	if(gaps == NULL)
 		goto l_retransmitted;
 
-	int64_t		rtt_delta = int64_t(rtt64_us - tRoundTrip_us * 2);
+	int64_t		rtt_delta = int64_t(rtt64_us - ((uint64_t)tRoundTrip_us << 1));
 	if(rtt_delta <= 0)
 		goto l_retransmitted;
 
@@ -363,7 +363,7 @@ int LOCALAPI CSocketItemEx::RespondToSNACK(ControlBlock::seq_t expectedSN, FSP_S
 		{
 			hiqword <<= 1;
 			hiqword |= BitTest((LONG *) & lodword, i);
-			if(hiqword > tdiff64_us)
+			if(hiqword >= tdiff64_us)
 			{
 				hiqword -= tdiff64_us;
 				BitTestAndSet((LONG *) & largestOffset, i);
@@ -403,7 +403,8 @@ int LOCALAPI CSocketItemEx::RespondToSNACK(ControlBlock::seq_t expectedSN, FSP_S
 			// Attention please! If you try to trace the packet it would not be retransmitted, for sake of testability
 #if defined(TRACE_PACKET) || defined(TRACE_HEARTBEAT)
 			printf_s("Meant to retransmit: SN = %u, index position = %d\n", seq0, index1);
-#else
+#endif
+#ifndef TRACE_PACKET
 			if(! p->GetFlag<IS_ACKNOWLEDGED>() && ! EmitWithICC(p, seq0))
 				goto l_retransmitted;
 #endif

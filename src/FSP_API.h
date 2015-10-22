@@ -52,15 +52,23 @@
 #define MAX_FSP_SHM_SIZE		0x400000	// 4MB
 #define CRYPTO_NACL_KEYBYTES	32
 
-typedef union
-{
-	unsigned long value;
-	unsigned long *p;
-}	ulong_ptr;
-
+#if defined(_M_X64) || defined(_M_IA64)
+    typedef unsigned __int64 ulong_ptr;
+#else
+    typedef unsigned long ulong_ptr;
+#endif
 
 
 typedef struct FSP_SocketParameter *PFSP_Context;
+
+enum
+{
+	FSP_GET_SIGNATURE,			// pointer to the placeholder of the 64-bit signature
+	FSP_SET_COMPRESSION,		// 0: disable, 1: lz4, others: reserved
+	FSP_SET_CALLBACK_ON_ERROR,	// NotifyOrReturn
+	FSP_SET_CALLBACK_ON_FINISH,	// NotifyOrReturn
+};
+
 
 
 #ifdef __cplusplus
@@ -331,7 +339,7 @@ int FSPAPI ReadFrom(FSPHANDLE, void *, int, NotifyOrReturn);
 //	The onError function whose pointer was passed in the socket context parameter would be called
 //	with the final result of shutdown: 0 if no error/shutdown gracefully, negative if abnormal
 DllSpec
-int FSPAPI Shutdown(FSPHANDLE hFSPSocket);
+int FSPAPI Shutdown(FSPHANDLE hFSPSocket, NotifyOrReturn);
 
 
 // return 0 if no zero, negative if error, positive if warning
@@ -356,10 +364,8 @@ uint32_t * TranslateFSPoverIPv4(PFSP_IN6_ADDR, uint32_t, ALFID_T);
 // and the 'ipi6_ifindex' field of the first element should store the size of the array
 // return number of availabe interfaces with configured IPv4/IPv6 address
 // which might be zero. negative if error.
-
-// TODO: enumerate control code and its parameter type
 DllSpec
-int FSPControl(FSPHANDLE hFSPSocket, unsigned controlCode, ulong_ptr value);
+int FSPControl(FSPHANDLE, unsigned, ulong_ptr);
 
 
 // Given

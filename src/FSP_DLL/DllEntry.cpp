@@ -106,12 +106,14 @@ BOOL WINAPI DllMain(HINSTANCE hInstance, DWORD dwReason, LPVOID lpvReserved)
 }
 
 
-#ifndef NDEBUG
+
+// Remark
+//	Exploit _InterlockedXor8 to keep memory access order as the coded order
 bool CSocketItemDl::WaitUseMutex()
 {
-	if(inUse == 0)
+	if(_InterlockedXor8(& inUse, 0) == 0)
 		return false;
-	//
+#ifndef NDEBUG
 	uint64_t t0 = GetTickCount64();
 	while(!TryAcquireSRWLockExclusive(& rtSRWLock))
 	{
@@ -122,10 +124,11 @@ bool CSocketItemDl::WaitUseMutex()
 		}
 		Sleep(1);
 	}
-	//
-	return (inUse != 0); 
-}
+#else
+	AcquireSRWLockExclusive(& rtSRWLock);
 #endif
+	return (_InterlockedXor8(& inUse, 0) != 0); 
+}
 
 
 
@@ -153,6 +156,41 @@ int CSocketItemDl::SelfNotify(FSP_ServiceCode c)
 	::SetEvent(hEvent);
 	return 0;
 }
+
+
+
+DllExport
+int FSPControl(FSPHANDLE hFSPSocket, unsigned controlCode, ULONG_PTR value)
+{
+	try
+	{
+		CSocketItemDl *pSocket = (CSocketItemDl *)hFSPSocket;
+		switch(controlCode)
+		{
+		case FSP_GET_SIGNATURE:
+			*(uint64_t *)value = pSocket->GetULASignature();
+			break;
+		case FSP_SET_COMPRESSION:
+			pSocket->SetCompression(value);
+			break;
+		case FSP_SET_CALLBACK_ON_ERROR:
+			pSocket->SetCallbackOnError((NotifyOrReturn)value);
+			break;
+		case FSP_SET_CALLBACK_ON_FINISH:
+			pSocket->SetFlushingFP((NotifyOrReturn)value);
+			break;
+		default:
+			return -EDOM;
+		}
+		return 0;
+	}
+	catch(...)
+	{
+		return -EINTR;
+	}
+}
+
+
 
 
 // Given
@@ -308,10 +346,23 @@ void CSocketItemDl::WaitEventToDispatch()
 			return;
 		case FSP_NotifyFlushed:
 			ProcessPendingSend();
-			ToConcludeCommit();
+			{
+				char isFlushing = GetResetFlushing();
+#ifdef TRACE
+				printf_s("isFlushing = %d. (FLUSHING_SHUTDOWN == 2)\n", isFlushing);
+#endif
+				if(isFlushing == FLUSHING_SHUTDOWN)
+					Call<FSP_Shutdown>();
+			}
 			break;
 		case FSP_NotifyFinish:
-			NotifyError(notice);
+			{
+				NotifyOrReturn fp1 = GetResetFlushingFP();
+				if(fp1 != NULL)
+					fp1(this, FSP_NotifyFinish, 0);
+				else
+					NotifyError(FSP_NotifyFinish, -EINTR);	// Unexpected RELEASE. As if RESET
+			}
 			return;
 		case FSP_IPC_CannotReturn:
 			if (pControlBlock->state == LISTENING)
@@ -321,8 +372,7 @@ void CSocketItemDl::WaitEventToDispatch()
 #ifdef TRACE
 			else	// else just ignore the dist
 				printf_s("Get FSP_IPC_CannotReturn in the state %s\n", stateNames[pControlBlock->state]);
-#endif // TRACE
-		//
+#endif
 			return;
 		case FSP_MemoryCorruption:	//
 			NotifyError(notice, -EINTR);
@@ -398,12 +448,43 @@ bool LOCALAPI CSocketItemDl::Call(const CommandToLLS & cmd, int size)
 
 
 
-//
-//DllSpec
-//bool EOMReceived(FSPHANDLE hFSPSocket)
-//{
-//	return ((CSocketItemDl *)hFSPSocket)->IsEndOfRecvMsg();
-//}
+bool LOCALAPI CSocketItemDl::AddOneShotTimer(uint32_t dueTime)
+{
+	return (
+		::CreateTimerQueueTimer(& timer, ::timerQueue
+			, WaitOrTimeOutCallBack
+			, this		// LPParameter
+			, dueTime
+			, 0
+			, WT_EXECUTEINTIMERTHREAD
+			) != FALSE
+		);
+}
+
+
+
+bool CSocketItemDl::CancelTimer()
+{
+	if(::DeleteTimerQueueTimer(::timerQueue, timer, NULL))
+	{
+		timer = NULL;
+		return true;
+	}
+	else
+	{
+		return false;
+	}
+}
+
+
+
+void CSocketItemDl::TimeOut()
+{
+	if(pControlBlock->notices.GetHead() != FSP_IPC_CannotReturn) 
+		return;
+	//
+	Recycle();
+}
 
 
 
@@ -441,20 +522,22 @@ CSocketItemDl * CSocketDLLTLB::AllocItem()
 	}
 
 	pSockets[sizeOfSet++] = item;
-	item->inUse = 1;
+	_InterlockedExchange8(& item->inUse, 1);
 	return item;
 }
 
 
+
 void CSocketDLLTLB::FreeItem(CSocketItemDl *r)
 {
-	r->inUse = 0;
+	_InterlockedExchange8(& r->inUse, 0);
 	r->prev = NULL;
 	r->next = header;
 	if(header != NULL)
 		header->prev = r;
 	header = r;
 }
+
 
 
 // The caller should check whether it's really a working connection by check inUse flag

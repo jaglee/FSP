@@ -88,6 +88,7 @@ typedef CSocketItem * PSocketItem;
 class CSocketItemDl: public CSocketItem
 {
 	SRWLOCK			rtSRWLock;
+	HANDLE			timer;
 	//
 	CSocketItemDl	*next;
 	CSocketItemDl	*prev;
@@ -124,7 +125,7 @@ protected:
 	{
 		if(isTimeout)
 		{
-			TRACE_HERE("isTimeout == TRUE");
+			((CSocketItemDl *)param)->TimeOut();
 			return;
 		}
 		((CSocketItemDl *)param)->WaitEventToDispatch();
@@ -140,6 +141,10 @@ protected:
 			, 0);
 	}
 
+	bool LOCALAPI AddOneShotTimer(uint32_t);
+	bool CancelTimer();
+	void TimeOut();
+
 	void WaitEventToDispatch();
 
 	// in Establish.cpp
@@ -152,7 +157,6 @@ protected:
 	void ProcessPendingSend();
 	void ProcessReceiveBuffer();
 	//
-	void ToConcludeCommit();
 	void ToConcludeConnect();
 	//
 	void HitResumableDisconnectedSessionCache();
@@ -215,13 +219,14 @@ public:
 		return (FSP_Session_State)_InterlockedCompareExchange((long *)& pControlBlock->state, s2, s0);
 	}
 
-#ifdef NDEBUG
-	bool CSocketItemDl::WaitUseMutex() { if(inUse == 0) return false; AcquireSRWLockExclusive(& rtSRWLock); return (inUse != 0); }
-#else
+	// return value ? _interlockedbittestandset((LONG *) & context.u.flags, 3) : _interlockedbittestandreset((LONG *) & context.u.flags, 3)
+	int SetCompression(int value) { int r = context.u.st.compressing; context.u.st.compressing = value; return r; }
+
+	uint64_t GetULASignature() const { return context.signatureULA; }
+
 	bool WaitUseMutex();
-#endif
 	void SetMutexFree() { ReleaseSRWLockExclusive(& rtSRWLock); }
-	bool IsInUse() const { return inUse != 0; }
+	bool IsInUse() { return (_InterlockedXor8(& inUse, 0) != 0); }
 
 	void SetPeerName(const char *cName, size_t len)
 	{
@@ -281,15 +286,12 @@ public:
 	int	Commit();
 
 	char GetResetFlushing() { return _InterlockedExchange8(& isFlushing, 0);}
-	bool SetFlushing(NotifyOrReturn fp1) 
-	{
-		if(_InterlockedCompareExchange8(& isFlushing, ONLY_FLUSHING, 0) != 0)
-			return false;
-		return InterlockedCompareExchangePointer((PVOID *)& fpCommit, fp1, NULL) == NULL;
-	}
 	void SetFlushing(char value) { isFlushing = value; }
+	NotifyOrReturn GetResetFlushingFP() { return (NotifyOrReturn)InterlockedExchangePointer((PVOID *) & fpCommit, NULL); }
+	bool SetFlushingFP(NotifyOrReturn fp1) { return InterlockedCompareExchangePointer((PVOID *)& fpCommit, fp1, NULL) == NULL; }
 
 	int SelfNotify(FSP_ServiceCode c);
+	void SetCallbackOnError(NotifyOrReturn fp1) { context.onError = fp1; }
 	void NotifyError(FSP_ServiceCode c, int e = 0) { if (context.onError != NULL) context.onError(this, c, e); }
 
 	// defined in DllEntry.cpp:

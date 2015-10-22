@@ -335,5 +335,5 @@ void CSocketItemDl::FinalizeRead()
 	SetMutexFree();
 	// due to multi-task nature although fpRecept has been checked in the caller it could be already reset
 	if(fp1 != NULL)
-		fp1(this, FSP_NotifyDataReady, 0);
+		fp1(this, FSP_NotifyDataReady, bytesReceived);
 }

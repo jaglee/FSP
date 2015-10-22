@@ -64,11 +64,12 @@ FSPHANDLE FSPAPI ListenAt(const PFSP_IN6_ADDR listenOn, PFSP_Context psp1)
 	if(socketItem == NULL)
 		return NULL;
 
+	socketItem->AddOneShotTimer(TRASIENT_STATE_TIMEOUT_ms);
 	socketItem->SetState(LISTENING);
 	// MUST set the state before calling LLS so that event-driven state transition may work properly
-
 	return socketItem->CallCreate(objCommand, FSP_Listen);
 }
+
 
 
 //[API: Connect]
@@ -104,8 +105,9 @@ FSPHANDLE FSPAPI Connect2(const char *peerName, PFSP_Context psp1)
 		psp1->u.flags = EBADF;	// E_HANDLE;
 		return NULL;
 	}
-	socketItem->SetPeerName(peerName, strlen(peerName));
 
+	socketItem->AddOneShotTimer(CONNECT_INITIATION_TIMEOUT_ms * 2);
+	socketItem->SetPeerName(peerName, strlen(peerName));
 	return socketItem->CallCreate(objCommand, InitConnection);
 }
 

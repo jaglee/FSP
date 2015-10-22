@@ -362,6 +362,7 @@ void UnitTestNoticeQ()
 }
 
 
+
 void UnitTestCubicRoot()
 {
 	Assert::IsTrue(fabs(CubicRoot(0)) < DBL_EPSILON);
@@ -370,6 +371,74 @@ void UnitTestCubicRoot()
 	Assert::IsTrue(fabs(CubicRoot(0.001) - 0.1) < DBL_EPSILON);
 	Assert::IsTrue(fabs(CubicRoot(8) - 2) < DBL_EPSILON);
 }
+
+
+
+// 'Big' int division, see also CSocketItemEx::RespondToSNACK@timers.cpp
+int32_t CalculateLargestOffset(uint64_t tdiff64_us, uint64_t rtt64_us, uint32_t tRoundTrip_us, int32_t sentWidth)
+{
+	// Source code embedded, copied and pasted here; declaration of largestOffset moved to top
+	register uint32_t	largestOffset = -1;
+	int64_t		rtt_delta = int64_t(rtt64_us - ((uint64_t)tRoundTrip_us << 1));
+	if(rtt_delta <= 0)
+		goto l_retransmitted;
+
+	if(int64_t(rtt_delta - tdiff64_us) >= 0)
+	{
+		largestOffset = sentWidth;
+		// if the unsigned tdiff64_us == 0, it falled into this category
+	}
+	else
+	{
+		// partially unrolled loop
+		uint64_t hiqword = (rtt_delta >> 32) * sentWidth;	// The initial remainder, actually;
+		uint32_t lodword = ((rtt_delta & 0xFFFFFFFF) * sentWidth) & 0xFFFFFFFF;
+		hiqword += ((rtt_delta & 0xFFFFFFFF) * sentWidth) >> 32;
+		// We are sure 31st bit of sendWidth is 0 thus 63rd bit of hiqword is 0
+		largestOffset = 0;
+		for(register int i = 31; i >= 0; i--)
+		{
+			hiqword <<= 1;
+			hiqword |= BitTest((LONG *) & lodword, i);
+			if(hiqword >= tdiff64_us)
+			{
+				hiqword -= tdiff64_us;
+				BitTestAndSet((LONG *) & largestOffset, i);
+			}
+		}
+		//
+		if(largestOffset == 0)
+			goto l_retransmitted;
+	}
+	// suffix code added here
+l_retransmitted:
+	return largestOffset;
+}
+
+
+
+void UnitTestBIDivision()
+{
+	int32_t r = CalculateLargestOffset(0, 0, 0, 5);
+	Assert::IsTrue(r == -1);	// because rtt_delta = 0
+	// lastest sent time - earlist sent time  = 2us
+	// this RTT instance: 5us
+	// Round trip time: 1us
+	r =  CalculateLargestOffset(2, 5, 1, 5);
+	Assert::IsTrue(r == 5);
+	// lastest sent time - earlist sent time  = 5us
+	// this RTT instance: 4us
+	// Round trip time: 1us
+	r =  CalculateLargestOffset(5, 4, 1, 5);
+	Assert::IsTrue(r == 2);
+	//
+	// lastest sent time - earlist sent time  = 0x5,0000,0000us
+	// this RTT instance: 0x4,0000,0000us
+	// Round trip time: 0x8000,0000us
+	r =  CalculateLargestOffset( 0x500000000LL, 0x400000000LL, 0x80000000, 5);
+	Assert::IsTrue(r == 3);
+}
+
 
 
 void UnitTestGCM_AES()
@@ -654,8 +723,6 @@ void UnitTestReceiveQueue()
 	CLowerInterfaceDbg & lowerSrv = *pLowerSrv;
 	CSocketItemExDbg socket(2, 2);
 
-	lowerSrv.InitBuffer();	// initialize the chained list of the free blocks
-
 	PktBufferBlock *p0 = lowerSrv.GetBuffer();
 	PktBufferBlock *p = p0;
 	for(int i = 0; i < MAX_BUFFER_BLOCKS; i++)
@@ -697,20 +764,6 @@ void UnitTestConnectQueue()
 	Assert::IsTrue(i >= 0);
 	i = commandRequests.Remove(i);
 	Assert::IsTrue(i >= 0);
-}
-
-
-
-void UnitTestHeaderManager()
-{
-	// FSP_Header_Manager(void *p1, int len);
-	// template<typename THdr> uint16_t PushExtHeader(THdr *pExtHdr)
-	// void PushDataBlock(BYTE *buf, int len)
-	//
-	// FSP_Header_Manager(void *p1);
-	// template<typename THdr>	THdr * PopExtHeader()
-	// void * TopAsDataBlock() const { return pHdr + pStackPointer; }
-	// int	NextHeaderOffset() const { return (int)pStackPointer; }
 }
 
 
@@ -971,6 +1024,11 @@ namespace UnitTestFSP
 			UnitTestCubicRoot();
 		}
 
+		TEST_METHOD(TestBigIntDivision)
+		{
+			UnitTestBIDivision();
+		}
+
 		TEST_METHOD(TestGCM_AES)
 		{
 			UnitTestGCM_AES();
@@ -1057,12 +1115,6 @@ namespace UnitTestFSP
 		TEST_METHOD(TestSocketInState)
 		{
 			UnitTestSocketInState();
-		}
-
-
-		TEST_METHOD(TestHeaderManager)
-		{
-			UnitTestHeaderManager();
 		}
 	};
 }

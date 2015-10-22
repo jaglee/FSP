@@ -226,19 +226,23 @@ void CSocketItemEx::InstallSessionKey()
 //	uint32_t					The xor'ed salt
 // Do
 //	Set ICC value
+// Return
+//	The pointer to the ciphertext. == content if CRC64 applied, == internal buffer if GCM_AES applied.
 // Remark
 //	IV = (sequenceNo, expectedSN)
 //	AAD = (source fiber ID, destination fiber ID, flags, receive window free pages
 //		 , version, OpCode, header stack pointer, optional headers)
-void LOCALAPI CSocketItemEx::SetIntegrityCheckCode(FSP_NormalPacketHeader *p1, void *content, int32_t ptLen, uint32_t salt)
+//	This function is NOT multi-thread safe
+void * LOCALAPI CSocketItemEx::SetIntegrityCheckCode(FSP_NormalPacketHeader *p1, void *content, int32_t ptLen, uint32_t salt)
 {
 	ALIGN(MAC_ALIGNMENT) uint64_t tag[FSP_TAG_SIZE / sizeof(uint64_t)];
-	
+	void * buf;
+	uint32_t seqNo = be32toh(p1->sequenceNo);
 #ifdef TRACE_PACKET
 	printf_s("\nBefore GCM_AES_AuthenticatedEncrypt: ptLen = %d\n", ptLen);
 	DumpNetworkUInt16((uint16_t *)p1, sizeof(FSP_NormalPacketHeader) / 2);
 #endif
-	uint32_t seqNo = be32toh(p1->sequenceNo);
+
 	// CRC64
 	if(contextOfICC.keyLife == 0)
 	{
@@ -248,6 +252,7 @@ void LOCALAPI CSocketItemEx::SetIntegrityCheckCode(FSP_NormalPacketHeader *p1, v
 #endif
 		p1->integrity.code = contextOfICC.curr.precomputedICC[0];
 		tag[0] = CalculateCRC64(0, (uint8_t *)p1, sizeof(FSP_NormalPacketHeader));
+		buf = content;
 	}
 	else if(int32_t(seqNo - contextOfICC.firstSendSNewKey) < 0 && contextOfICC.savedCRC)
 	{
@@ -257,6 +262,7 @@ void LOCALAPI CSocketItemEx::SetIntegrityCheckCode(FSP_NormalPacketHeader *p1, v
 #endif
 		p1->integrity.code = contextOfICC.prev.precomputedICC[0];
 		tag[0] = CalculateCRC64(0, (uint8_t *)p1, sizeof(FSP_NormalPacketHeader));
+		buf = content;
 	}
 	else
 	{
@@ -265,28 +271,30 @@ void LOCALAPI CSocketItemEx::SetIntegrityCheckCode(FSP_NormalPacketHeader *p1, v
 			: & contextOfICC.curr.gcm_aes;
 		uint32_t byteA = be16toh(p1->hs.hsp);
 		if(byteA < sizeof(FSP_NormalPacketHeader) || byteA > MAX_LLS_BLOCK_SIZE || (byteA & (sizeof(uint64_t) - 1)) != 0)
-			return;
+			return NULL;
 
 		p1->integrity.id = fidPair;
 		GCM_AES_XorSalt(pCtx, salt);
 		if(GCM_AES_AuthenticatedEncrypt(pCtx, *(uint64_t *)p1
 			, (const uint8_t *)content, ptLen
 			, (const uint64_t *)p1 + 1, byteA - sizeof(uint64_t)
-			, (uint64_t *)content
+			, (uint64_t *)this->cipherText
 			, (uint8_t *)tag, FSP_TAG_SIZE)
 			!= 0)
 		{
 			TRACE_HERE("Encryption error?");
 			GCM_AES_XorSalt(pCtx, salt);
-			return;
+			return NULL;
 		}
 		GCM_AES_XorSalt(pCtx, salt);
+		buf = this->cipherText;
 	}
 
 	p1->integrity.code = tag[0];
 #ifdef TRACE_PACKET
 	printf_s("After GCM_AES_AuthenticatedEncrypt:\n");	DumpNetworkUInt16((uint16_t *)p1, sizeof(FSP_NormalPacketHeader) / 2);
 #endif
+	return buf;
 }
 
 
@@ -503,9 +511,12 @@ bool LOCALAPI CSocketItemEx::EmitWithICC(ControlBlock::PFSP_SocketBuf skb, Contr
 	pHdr->hs.opCode = skb->opCode;
 	pHdr->hs.version = THIS_FSP_VERSION;
 	pHdr->hs.hsp = htobe16(sizeof(FSP_NormalPacketHeader));
-	SetIntegrityCheckCode(pHdr, (BYTE *)payload, skb->len);
+
+	void * paidLoad = SetIntegrityCheckCode(pHdr, (BYTE *)payload, skb->len);
+	if(paidLoad == NULL)
+		return false;
 	if (skb->len > 0)
-		result = SendPacket(2, ScatteredSendBuffers(pHdr, sizeof(FSP_NormalPacketHeader), payload, skb->len));
+		result = SendPacket(2, ScatteredSendBuffers(pHdr, sizeof(FSP_NormalPacketHeader), paidLoad, skb->len));
 	else
 		result = SendPacket(1, ScatteredSendBuffers(pHdr, sizeof(FSP_NormalPacketHeader)));
 

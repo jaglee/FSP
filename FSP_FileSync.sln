@@ -14,6 +14,8 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "FSP_DLL", "src\FSP_DLL\FSP_
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "FSP_SRV", "src\FSP_SRV\FSP_SRV.vcxproj", "{EB22DAD8-523E-4FED-88F3-F0647110BE7F}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "FSP_Web", "src\FSP_Web\FSP_Web.vcxproj", "{9176FBD3-2B93-4B86-882D-997D51C89FE0}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Win32 = Debug|Win32
@@ -35,6 +37,8 @@ Global
 		{EB22DAD8-523E-4FED-88F3-F0647110BE7F}.Debug|Win32.ActiveCfg = Debug|Win32
 		{EB22DAD8-523E-4FED-88F3-F0647110BE7F}.Release|Win32.ActiveCfg = Release|Win32
 		{EB22DAD8-523E-4FED-88F3-F0647110BE7F}.Release|Win32.Build.0 = Release|Win32
+		{9176FBD3-2B93-4B86-882D-997D51C89FE0}.Debug|Win32.ActiveCfg = Debug|Win32
+		{9176FBD3-2B93-4B86-882D-997D51C89FE0}.Release|Win32.ActiveCfg = Release|Win32
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

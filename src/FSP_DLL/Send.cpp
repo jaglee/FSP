@@ -121,47 +121,6 @@ int FSPAPI WriteTo(FSPHANDLE hFSPSocket, void * buffer, int len, FlagEndOfMessag
 
 
 
-
-// Given
-//	FSPHANDLE		the FSP socket
-//	NotifyOrReturn	the callback function
-// Return
-//	EGAIN if the session is already in committed state
-//	-EBADF if the connection is not in valid context
-//	-EDOM if the connection is not in proper state
-//	-EIO if the COMMIT packet cannot be sent
-//	0 if no immediate error
-// Remark
-//	the callback function may return delayed error such as Commit rejected the remote end
-//	The connection would remain in the COMMITTED, CLOSABLE or CLOSED state,
-//	or be set to the COMMITTING or COMMITTING2 state immediately.
-DllSpec
-int FSPAPI Commit(FSPHANDLE hFSPSocket, NotifyOrReturn fp1)
-{
-	TRACE_HERE("called");
-
-	register CSocketItemDl * p = (CSocketItemDl *)hFSPSocket;
-	try
-	{
-		if (p == NULL || p->IsIllegalState())
-			return -EBADF;
-		//
-		if(p->InState(COMMITTED) || p->InState(CLOSABLE) || p->InState(PRE_CLOSED) || p->InState(CLOSED))
-			return EAGAIN;	// warning that the socket has already been committed
-		//
-		if(! p->SetFlushing(fp1))
-			return -EDOM;
-		//
-		return p->Commit();
-	}
-	catch(...)
-	{
-		return -EFAULT;
-	}
-}
-
-
-
 // Return
 //	Size of currently available free send buffer
 int LOCALAPI CSocketItemDl::AcquireSendBuf(int n)
@@ -296,6 +255,8 @@ int CSocketItemDl::Commit()
 	if(r < 0)	// EmitQ() is busy and we count on it
 		pControlBlock->shouldAppendCommit = 1;
 
+	CancelTimer();	// if any
+	AddOneShotTimer(TRASIENT_STATE_TIMEOUT_ms);
 	SetMutexFree();
 	return (r == 0 ? (Call<FSP_Urge>() ? 0 : -EIO) : 0);
 }

@@ -1,37 +1,42 @@
 #include <stdlib.h>
-#include <iostream>
+#include <stdio.h>
+#include <string.h>
 #include <io.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <share.h>
 
 #include "../FSP_API.h"
 
 #define MAX_FILENAME_WITH_PATH_LEN	260
 
 const char		*defaultWelcome = "File synchronizer based on Flexible Session Protocol, version 0.1";
-// assume that address space layout randomization keep the secret hard to find
-static unsigned char bufPrivateKey[CRYPTO_NACL_KEYBYTES];
-static unsigned char bufPeerPublicKey[CRYPTO_NACL_KEYBYTES];
 
-volatile static bool finished = false;
-static FSPHANDLE hFspListen;
+volatile bool	finished = false;
+FSPHANDLE		hFspListen;
 
 static char		fileName[MAX_FILENAME_WITH_PATH_LEN];
 static int		fd;
 
+// assume that address space layout randomization keep the secret hard to find
+static unsigned char bufPrivateKey[CRYPTO_NACL_KEYBYTES];
+static unsigned char bufPeerPublicKey[CRYPTO_NACL_KEYBYTES];
 
-static void FSPAPI onReturn(FSPHANDLE h, FSP_ServiceCode code, int value)
+static int	FSPAPI onAccepted(FSPHANDLE, PFSP_Context);
+static void FSPAPI onPublicKeyReceived(FSPHANDLE, FSP_ServiceCode, int);
+static void FSPAPI onFileNameSent(FSPHANDLE, FSP_ServiceCode, int);
+static int	FSPAPI toSendNextBlock(FSPHANDLE, void *, int32_t);
+
+extern int	FSPAPI onAccepting(FSPHANDLE, void *, PFSP_IN6_ADDR);
+extern void SendMemoryPattern();
+extern void SendMemoryPatternEncyrpted();
+
+
+void FSPAPI onReturn(FSPHANDLE h, FSP_ServiceCode code, int value)
 {
-	printf_s("Notify: Fiber ID = %u, service code = %d, returned %d\n", (uint32_t)(intptr_t)h, code, value);
+	printf_s("Notify: Fiber ID = %u, service code = %d, return %d\n", (uint32_t)(intptr_t)h, code, value);
 	if(value < 0)
 	{
-		Dispose(h);
-		finished = true;
-		return;
-	}
-	if(code == FSP_NotifyFinish)
-	{
-		printf_s("Session was shut down.\n");
 		Dispose(h);
 		finished = true;
 		return;
@@ -39,44 +44,25 @@ static void FSPAPI onReturn(FSPHANDLE h, FSP_ServiceCode code, int value)
 }
 
 
-static int	FSPAPI onAccepting(FSPHANDLE, void *, PFSP_IN6_ADDR);
-static int	FSPAPI onAccepted(FSPHANDLE, PFSP_Context);
-static void FSPAPI onPublicKeyReceived(FSPHANDLE, FSP_ServiceCode, int);
-static void FSPAPI onFileNameSent(FSPHANDLE, FSP_ServiceCode, int);
-static int	FSPAPI toSendNextBlock(FSPHANDLE, void *, int32_t);
 
-/**
- *
- *
- */
-int main(int argc, char * argv[])
+void FSPAPI onFinished(FSPHANDLE h, FSP_ServiceCode code, int value)
 {
-	errno_t	err;
-
-	if(argc != 2 || strlen(argv[1]) >= MAX_FILENAME_WITH_PATH_LEN)
+	printf_s("Fiber ID = %u, session was to shut down.\n", (uint32_t)(intptr_t)h);
+	if(code != FSP_NotifyFinish)
 	{
-		printf_s("Usage: %s <filename>\n", argv[0]);
-		return -1;
-	}
-	strcpy_s(fileName, sizeof(fileName), argv[1]);
-
-	err = _sopen_s(& fd
-		, fileName
-		, _O_BINARY | _O_RDONLY | _O_SEQUENTIAL
-		, _SH_DENYWR
-		, 0);
-	if(err != 0)
-	{
-		printf_s("Error number = %d: cannot open file %s\n", err, fileName);
-		return -2;
+		printf_s("Should got onFinished, but service code = %d, return %d\n", code, value);
+		return;
 	}
 
-	unsigned short mLen = (unsigned short)strlen(defaultWelcome) + 1;
-	unsigned char *thisWelcome = (unsigned char *)_alloca(mLen + CRYPTO_NACL_KEYBYTES);
-	unsigned char *bufPublicKey = (unsigned char *)thisWelcome + mLen;;
-	memcpy(thisWelcome, defaultWelcome, mLen);	//+\000012345678901234567890123456789012
-	CryptoNaClKeyPair(bufPublicKey, bufPrivateKey);
+	Dispose(h);
+	finished = true;
+	return;
+}
 
+
+
+void FSPAPI WaitConnection(const char *thisWelcome, unsigned short mLen, CallbackConnected onAccepted)
+{
 	FSP_SocketParameter params;
 	FSP_IN6_ADDR atAddress;
 	memset(& params, 0, sizeof(params));
@@ -84,7 +70,7 @@ int main(int argc, char * argv[])
 	params.afterAccept = onAccepted;
 	params.onError = onReturn;
 	params.welcome = thisWelcome;
-	params.len = mLen + CRYPTO_NACL_KEYBYTES;
+	params.len = mLen;
 	params.sendSize = MAX_FSP_SHM_SIZE;
 	params.recvSize = 0;	// minimal receiving for download server
 
@@ -99,21 +85,73 @@ int main(int argc, char * argv[])
 	while(! finished)
 		_sleep(1);	// yield CPU out for at least 1ms/one time slice
 
-	if(fd != 0 && fd != -1)
-		_close(fd);
-
 	//_sleep(300000);	// for debug purpose
 	if(hFspListen != NULL)
 		Dispose(hFspListen);
+}
 
+
+
+int main(int argc, char * argv[])
+{
+	errno_t	err = 0;
+
+	if(argc != 1 && (argc != 2 || strlen(argv[1]) >= MAX_FILENAME_WITH_PATH_LEN))
+	{
+		printf_s("Usage: %s <filename>\n", argv[0]);
+		err = -1;
+		goto l_bailout;
+	}
+
+	if(argc == 1)
+	{
+		strcpy_s(fileName, sizeof(fileName), "$memory.^");
+		SendMemoryPattern();
+		goto l_bailout;
+	}
+	
+	if(_stricmp(argv[1], "$memory.^") == 0)
+	{
+		strcpy_s(fileName, sizeof(fileName), argv[1]);
+		SendMemoryPatternEncyrpted();
+		goto l_bailout;
+	}
+
+	strcpy_s(fileName, sizeof(fileName), argv[1]);
+
+	err = _sopen_s(& fd
+		, fileName
+		, _O_BINARY | _O_RDONLY | _O_SEQUENTIAL
+		, _SH_DENYWR
+		, 0);
+	if(err != 0)
+	{
+		printf_s("Error number = %d: cannot open file %s\n", err, fileName);
+		printf("\n\nPress Enter to exit...");
+		err = -2;
+		goto l_bailout;
+	}
+
+	unsigned short mLen = (unsigned short)strlen(defaultWelcome) + 1;
+	char *thisWelcome = (char *)_alloca(mLen + CRYPTO_NACL_KEYBYTES);
+	unsigned char *bufPublicKey = (unsigned char *)thisWelcome + mLen;;
+	memcpy(thisWelcome, defaultWelcome, mLen);	//+\000012345678901234567890123456789012
+	CryptoNaClKeyPair(bufPublicKey, bufPrivateKey);
+
+	WaitConnection(thisWelcome, mLen + CRYPTO_NACL_KEYBYTES, onAccepted);
+
+	if(fd != 0 && fd != -1)
+		_close(fd);
+
+l_bailout:
 	printf("\n\nPress Enter to exit...");
 	getchar();
-	return 0;
+	return err;
 }
 
 
 // This function is for tracing purpose
-static int	FSPAPI onAccepting(FSPHANDLE h, void *p, PFSP_IN6_ADDR remoteAddr)
+int	FSPAPI onAccepting(FSPHANDLE h, void *p, PFSP_IN6_ADDR remoteAddr)
 {
 	printf_s("\nTo accept handle of FSP session: 0x%08X\n", h);
 	const FSP_PKTINFO & pktInfo = *(FSP_PKTINFO *)p;
@@ -221,7 +259,7 @@ static int FSPAPI toSendNextBlock(FSPHANDLE h, void * batchBuffer, int32_t capac
 	if(r)
 	{
 		printf("All content has been sent. To shutdown.\n");
-		if(Shutdown(h) != 0)
+		if(Shutdown(h, onFinished) != 0)
 		{
 			Dispose(h);
 			finished = true;

@@ -199,7 +199,6 @@ struct ScatteredSendBuffers
 
 
 
-
 // Context management of 
 struct ICC_Context
 {
@@ -238,6 +237,8 @@ class CSocketItemEx: public CSocketItem
 	SRWLOCK	rtSRWLock;
 	DWORD	idSrcProcess;
 	HANDLE	hSrcMemory;
+	//
+	uint8_t	cipherText[MAX_BLOCK_SIZE];
 	//
 protected:
 	PktBufferBlock * volatile headPacket;
@@ -323,7 +324,7 @@ public:
 	bool MapControlBlock(const CommandNewSessionSrv &);
 	void InitAssociation();
 
-	bool IsInUse() const { return inUse != 0; }
+	bool IsInUse() { return (_InterlockedXor8(& inUse, 0) != 0); }
 	void SetReady() { _InterlockedExchange8(& isReady, 1); }
 	// It is assumed that the socket is set ready only after it is put into use
 	// though inUse may be cleared before isReady is cleared
@@ -408,7 +409,7 @@ public:
 	}
 
 	// Given the fixed header, the content (plaintext), the length of the context and the xor-value of salt
-	void LOCALAPI SetIntegrityCheckCode(FSP_NormalPacketHeader *, void * = NULL, int32_t = 0, uint32_t = 0);
+	void * LOCALAPI SetIntegrityCheckCode(FSP_NormalPacketHeader *, void * = NULL, int32_t = 0, uint32_t = 0);
 	// Solid input,  the payload, if any, is copied later
 	bool LOCALAPI ValidateICC(FSP_NormalPacketHeader *, int32_t = 0, uint32_t = 0);
 	bool ValidateICC() { return ValidateICC(headPacket->GetHeaderFSP(), headPacket->lenData); }
@@ -439,7 +440,7 @@ public:
 	bool RemoveTimer();
 	bool LOCALAPI ReplaceTimer(uint32_t);
 
-#ifdef TRACE
+#if defined(TRACE) || defined(TRACE_HEARBEAT)
 	int DumpTimerInfo(timestamp_t t1) const
 	{
 		return printf_s("\tRound Trip Time = %uus, Keep-alive period = %ums\n"
@@ -513,17 +514,37 @@ public:
 };
 
 
-struct _CookieMaterial
+
+// Dual stack support: FSP over UDP/IPv4 and FSP over IPv6 require buffer block of different size
+struct CPacketBuffers
 {
-	uint32_t	salt;
-	ALFID_T	idALF;
-	ALFID_T	idListener;
+	PktBufferBlock *freeBufferHead;
+	ALIGN(8) PktBufferBlock bufferMemory[MAX_BUFFER_BLOCKS];
+
+	PktBufferBlock	*GetBuffer()
+	{
+		register PktBufferBlock *p = freeBufferHead;
+		if(p == NULL)
+			return NULL;
+		//
+		freeBufferHead = p->next;
+		return p;
+	}
+
+	void	FreeBuffer(PktBufferBlock *p)
+	{
+		p->next = freeBufferHead;
+		freeBufferHead = p;
+	}
+
+	// OS-dependent
+	CPacketBuffers();
 };
 
 
 
 // A singleton
-class CLowerInterface: public CSocketSrvTLB
+class CLowerInterface: public CSocketSrvTLB, protected CPacketBuffers
 {
 private:
 	struct FSPoverUDP_Header: PairALFID, FSP_Header { };
@@ -544,9 +565,9 @@ private:
 	PktBufferBlock *pktBuf;
 
 	// remote-end address and near-end address
-	SOCKADDR_INET		addrFrom;
-	CtrlMsgHdr			nearInfo;
-	WSAMSG				mesgInfo;	// descriptor of what is received
+	SOCKADDR_INET	addrFrom;
+	CtrlMsgHdr		nearInfo;
+	WSAMSG			mesgInfo;	// descriptor of what is received
 
 	template<typename THdr> THdr * FSP_OperationHeader() { return (THdr *) & pktBuf->hdr; }
 
@@ -562,14 +583,6 @@ private:
 
 protected:
 	static DWORD WINAPI ProcessRemotePacket(LPVOID lpParameter);
-
-	PktBufferBlock *freeBufferHead;
-	ALIGN(8) PktBufferBlock bufferMemory[MAX_BUFFER_BLOCKS];
-
-	// OS-dependent
-	void	InitBuffer();
-	PktBufferBlock	*GetBuffer();
-	void	LOCALAPI FreeBuffer(PktBufferBlock *);
 
 	// defined in remote.cpp
 	// processing individual type of packet header

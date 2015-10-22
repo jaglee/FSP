@@ -147,7 +147,6 @@ CLowerInterface::CLowerInterface()
 	mesgInfo.Control.buf = (char *) & nearInfo;
 	mesgInfo.Control.len = sizeof(nearInfo);
 
-	InitBuffer();
 	pSingleInstance = this;
 
 	// only after the required fields initialized may the listener thread started
@@ -526,7 +525,7 @@ inline void CLowerInterface::PoolingALFIDs()
 
 
 // multi-threaded buffer meant to keep busy receivers from starving occasional network users
-inline void CLowerInterface::InitBuffer()
+CPacketBuffers::CPacketBuffers()
 {
 	memset(bufferMemory, 0, sizeof(bufferMemory));
 
@@ -537,25 +536,6 @@ inline void CLowerInterface::InitBuffer()
 		p = & bufferMemory[i];
 	}
 
-	freeBufferHead = p;
-}
-
-
-inline PktBufferBlock * CLowerInterface::GetBuffer()
-{
-	register PktBufferBlock *p = freeBufferHead;
-	if(p == NULL)
-		return NULL;
-	//
-	freeBufferHead = p->next;
-	return p;
-}
-
-
-// UNRESOLVED! Check validity of the buffer block signature?
-inline void LOCALAPI CLowerInterface::FreeBuffer(PktBufferBlock *p)
-{
-	p->next = freeBufferHead;
 	freeBufferHead = p;
 }
 

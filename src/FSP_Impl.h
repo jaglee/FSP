@@ -477,6 +477,7 @@ protected:
 	friend struct ControlBlock;
 public:
 	void SetHead(FSP_ServiceCode c) { q[0] = c; }
+	FSP_ServiceCode GetHead() { return q[0]; }
 	// put a new notice at the tail of the queue
 	int LOCALAPI	Put(FSP_ServiceCode);
 	// pop the notice from the top
@@ -623,18 +624,31 @@ struct ControlBlock
 		volatile uint8_t		version;	// should be the same as in the FSP fixed header
 		volatile uint8_t		opCode;		// should be the same as in the FSP fixed header
 		//
+#if ARCH_BIG_ENDIAN
 		template<SocketBufFlagBitPosition i>
-		void SetFlag(bool value = true)
+		bool SetFlag(bool value = true)
 		{
-			if(value)
-				_InterlockedOr16((SHORT *) & flags, 1 << i);
-			else
-				_InterlockedAnd16((SHORT *) & flags, ~(uint16_t)(1 << i)); 
+			return (value
+				? InterlockedBitTestAndSet((LONG *) & flags, i + 16) 
+				: InterlockedBitTestAndReset((LONG *) & flags, i + 16)
+				) != 0;
 		}
 		template<SocketBufFlagBitPosition i>
-		bool GetFlag() const { return (flags & (1 << i)) != 0; }
+		bool GetFlag() { return BitTest((LONG *) & flags, i + 16) != 0; }
+#else
+		template<SocketBufFlagBitPosition i>
+		bool SetFlag(bool value = true)
+		{
+			return (value
+				? InterlockedBitTestAndSet((LONG *) & flags, i) 
+				: InterlockedBitTestAndReset((LONG *) & flags, i)
+				) != 0;
+		}
 		//
-		bool Lock();
+		template<SocketBufFlagBitPosition i>
+		bool GetFlag() { return BitTest((LONG *) & flags, i) != 0; }
+#endif
+		bool Lock()	{ return ! SetFlag<EXCLUSIVE_LOCK>(); }
 		void Unlock() { SetFlag<EXCLUSIVE_LOCK>(false); }
 		//
 		void InitFlags() { _InterlockedExchange16((SHORT *) & flags, 1 << EXCLUSIVE_LOCK); }
@@ -677,7 +691,7 @@ struct ControlBlock
 	int CountSendBuffered() const { return int(sendBufferNextSN - sendWindowFirstSN); }
 	int CountUnacknowledged() const { return int(sendWindowNextSN - sendWindowFirstSN); }
 	int CountUnacknowledged(seq_t expectedSN) const { return int(sendWindowNextSN - expectedSN); }
-#ifdef TRACE
+#if defined(TRACE) || defined(TRACE_HEARTBEAT)
 	int DumpSendRecvWindowInfo() const
 	{
 		return printf_s("\tSend[head, tail] = [%d, %d], packets on flight = %d\n"

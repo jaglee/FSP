@@ -66,6 +66,7 @@ int CSocketItemDl::Recycle()
 
 // Given
 //	FSPHANDLE		the FSP socket
+//	NotifyOrReturn	the function pointer for call back
 // Return
 //	-EBADF if the connection is not in proper state
 //	-EINTR if locking of the socket was interrupted
@@ -78,7 +79,7 @@ int CSocketItemDl::Recycle()
 //	The caller should make sure Shutdown is not carelessly called more than once
 //	in a multi-thread continual communication context or else connection reuse(resurrection) may be broken
 DllSpec
-int FSPAPI Shutdown(FSPHANDLE hFSPSocket)
+int FSPAPI Shutdown(FSPHANDLE hFSPSocket, NotifyOrReturn fp1)
 {
 	TRACE_HERE("called");
 	register CSocketItemDl * p = (CSocketItemDl *)hFSPSocket;
@@ -97,17 +98,17 @@ int FSPAPI Shutdown(FSPHANDLE hFSPSocket)
 			return EBADF;	// A warning saying that the socket has already been closed
 		}
 
+		if (p->InState(PRE_CLOSED))
+		{
+			p->SetMutexFree();
+			return EAGAIN;	// A warning saying that the socket is already in graceful shutdown process
+		}
+
 		if (p->InState(COMMITTED) || p->InState(CLOSABLE))
 		{
 			// Send RELEASE and wait peer's RELEASE. LLS to signal NotifyFinish, NotifyReset or NotifyTimeout
 			p->SetMutexFree();
 			return (p->Call<FSP_Shutdown>() ? 0 : -EIO);
-		}
-
-		if (p->InState(PRE_CLOSED))
-		{
-			p->SetMutexFree();
-			return EAGAIN;	// A warning saying that the socket is already in graceful shutdown process
 		}
 
 		if(! p->TestSetState(ESTABLISHED, COMMITTING)
@@ -121,6 +122,12 @@ int FSPAPI Shutdown(FSPHANDLE hFSPSocket)
 			return EDOM;	// A warning say that the connection is aborted, actually
 		}
 
+		if(! p->SetFlushingFP(fp1))
+		{
+			p->SetMutexFree();
+			return -EAGAIN;
+		}
+
 		p->SetFlushing(CSocketItemDl::FlushingFlag::FLUSHING_SHUTDOWN);
 		p->SetMutexFree();
 		return p->Commit();
@@ -128,30 +135,5 @@ int FSPAPI Shutdown(FSPHANDLE hFSPSocket)
 	catch(...)
 	{
 		return -EFAULT;
-	}
-}
-
-
-// Remark
-//	Assume [API:Commit] has been called if it is not in CLOSABLE state
-// TODO: End of Message shall be delivered to ULA
-void CSocketItemDl::ToConcludeCommit()
-{
-	char isFlushing = GetResetFlushing();
-	if(isFlushing == ONLY_FLUSHING)
-	{
-#ifdef TRACE
-		printf_s("ONLY_FLUSHING\n");
-#endif
-		NotifyOrReturn fp1 = (NotifyOrReturn)InterlockedExchangePointer((PVOID *)& fpCommit, NULL);
-		if (fp1 != NULL)
-			fp1(this, FSP_NotifyFlushed, 0);
-	}
-	else if(isFlushing == FLUSHING_SHUTDOWN)
-	{
-#ifdef TRACE
-		printf_s("FLUSHING_SHUTDOWN\n");
-#endif
-		Call<FSP_Shutdown>();
 	}
 }

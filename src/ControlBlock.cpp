@@ -970,15 +970,3 @@ bool LOCALAPI ControlBlock::ResizeSendWindow(seq_t seq1, unsigned int adRecvWin)
 	sendWindowSize = min(sendBufferBlockN, int32_t(d + adRecvWin));
 	return true;
 }
-
-
-
-bool ControlBlock::FSP_SocketBuf::Lock()
-{
-#if ARCH_BIG_ENDIAN
-	// we knew 'flags' is of type uint16_t
-	return InterlockedBitTestAndSet((LONG *) & flags, EXCLUSIVE_LOCK + 16) == 0;
-#else
-	return InterlockedBitTestAndSet((LONG *) & flags, EXCLUSIVE_LOCK) == 0;
-#endif
-}

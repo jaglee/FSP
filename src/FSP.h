@@ -63,8 +63,6 @@ typedef uint32_t ALFID_T;
 #define FSP_MIN_KEY_SIZE	16	// in bytes
 #define FSP_TAG_SIZE		8	// in bytes
 
-#define INITIAL_CONGESTION_WINDOW	2 // a protocol default congestion control parameter
-
 /**
   error number may appear as REJECT packet 'reason code' where it is unsigned or near-end API return value where it is negative
   standard C	FSP error meaning
