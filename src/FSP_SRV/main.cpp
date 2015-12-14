@@ -216,6 +216,12 @@ static void LOCALAPI ProcessCommand(HANDLE md)
 		case SynConnection:
 			SyncSession(CommandNewSessionSrv(pCmd));
 			break;
+		case FSP_Resurrect:
+			pSocket = (CSocketItemEx *)(*CLowerInterface::Singleton())[pCmd->fiberID];
+			// UNRESOLVED!? TODO: review the code, make sure resources are not wasted 
+			if(pSocket == NULL || !pSocket->Resurrect(pCmd->idProcess))
+				Connect(CommandNewSessionSrv(pCmd));
+			break;
 		default:
 			pSocket = (CSocketItemEx *)(*CLowerInterface::Singleton())[pCmd->fiberID];
 			if(pSocket == NULL || !pSocket->IsInUse())
@@ -235,7 +241,7 @@ static void LOCALAPI ProcessCommand(HANDLE md)
 				pSocket->Disconnect();
 				break;
 			case FSP_Recycle:
-				pSocket->CloseSocket();
+				pSocket->Recycle();
 				break;
 			case FSP_Start:
 				pSocket->Start();

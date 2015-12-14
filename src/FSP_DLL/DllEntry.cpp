@@ -160,7 +160,7 @@ int CSocketItemDl::SelfNotify(FSP_ServiceCode c)
 
 
 DllExport
-int FSPControl(FSPHANDLE hFSPSocket, unsigned controlCode, ULONG_PTR value)
+int FSPControl(FSPHANDLE hFSPSocket, FSP_ControlCode controlCode, ULONG_PTR value)
 {
 	try
 	{
@@ -177,7 +177,10 @@ int FSPControl(FSPHANDLE hFSPSocket, unsigned controlCode, ULONG_PTR value)
 			pSocket->SetCallbackOnError((NotifyOrReturn)value);
 			break;
 		case FSP_SET_CALLBACK_ON_FINISH:
-			pSocket->SetFlushingFP((NotifyOrReturn)value);
+			pSocket->SetCallbackOnFinish((NotifyOrReturn)value);
+			break;
+		case FSP_SET_CALLBACK_ON_CONNECT:
+			pSocket->SetCallbackOnAccept((CallbackConnected)value);
 			break;
 		default:
 			return -EDOM;
@@ -194,8 +197,10 @@ int FSPControl(FSPHANDLE hFSPSocket, unsigned controlCode, ULONG_PTR value)
 
 
 // Given
-//	uint32_t	the limit of the size of the control block. set to 0 to minimize
+//	PFSP_Context
 //	char []		the buffer to hold the name of the event
+// Do
+//	Create and initialize the shared memory struction of the Session Control Block
 // Return
 //	0 if no error, negative is the error code
 int LOCALAPI CSocketItemDl::Initialize(PFSP_Context psp1, char szEventName[MAX_NAME_LENGTH])
@@ -283,6 +288,35 @@ int LOCALAPI CSocketItemDl::Initialize(PFSP_Context psp1, char szEventName[MAX_N
 
 
 
+// Only for non-passive socket
+int LOCALAPI CSocketItemDl::Reinitialize(PFSP_Context psp1)
+{
+	if(psp1->u.st.passive)
+		return -EDOM;
+
+	if(psp1->sendSize < MIN_RESERVED_BUF)
+		psp1->sendSize = MIN_RESERVED_BUF;
+	if(psp1->recvSize < MIN_RESERVED_BUF)
+		psp1->recvSize = MIN_RESERVED_BUF;
+
+	int n = (psp1->sendSize - 1) / MAX_BLOCK_SIZE + (psp1->recvSize - 1) / MAX_BLOCK_SIZE + 2;
+	if(dwMemorySize < ((sizeof(ControlBlock) + 7) >> 3 << 3)
+		+ ((n * sizeof(ControlBlock::FSP_SocketBuf) + 7) >> 3 << 3)
+		+ n * MAX_BLOCK_SIZE)
+	{
+		return -EOVERFLOW;
+	}
+
+	// could be exploited by ULA to make distinguishment of services
+	memcpy(&context, psp1, sizeof(FSP_SocketParameter));
+	pendingSendBuf = (BYTE *)psp1->welcome;
+	pendingSendSize = psp1->len;
+
+	return 0;
+}
+
+
+
 CSocketItemDl * LOCALAPI CSocketItemDl::CallCreate(CommandNewSession & objCommand, FSP_ServiceCode cmdCode)
 {
 	objCommand.fiberID = fidPair.source;
@@ -304,7 +338,7 @@ CSocketItemDl * LOCALAPI CSocketItemDl::CallCreate(CommandNewSession & objComman
 // The asynchronous, multi-thread friendly soft interrupt handler
 void CSocketItemDl::WaitEventToDispatch()
 {
-	if(! IsInUse() || pControlBlock->state <= 0 || pControlBlock->state > LARGEST_FSP_STATE)
+	if(! IsInUse() && pControlBlock->state != CLOSED || InIllegalState())
 	{
 		NotifyError(FSP_NotifyReset, -EBADF);
 		this->Recycle();		// Tell LLS to recycle the session context mapping
@@ -320,16 +354,14 @@ void CSocketItemDl::WaitEventToDispatch()
 		switch(notice)
 		{
 		case FSP_NotifyAccepting:	// overloaded as callback for CONNECT_REQUEST and ACK_CONNECT_REQUEST
+			CancelTimer();			// If any
 			if(pControlBlock->HasBacklog())
 				ProcessBacklog();
-			if(InState(CONNECT_AFFIRMING))
+			if(InState(CONNECT_AFFIRMING) || InState(QUASI_ACTIVE))
 				ToConcludeConnect();
 			else if(InState(CLOSABLE) || InState(CLOSED))
-				HitResumableDisconnectedSessionCache();
+				OnDSRCHitted();
 			break;
-		case FSP_Dispose:// a reverse command meant to synchronize DLL and LLS
-			NotifyError(notice);
-			return;
 		case FSP_NotifyAccepted:
 			if(fpAccepted != NULL)
 				fpAccepted(this, &context);
@@ -343,26 +375,19 @@ void CSocketItemDl::WaitEventToDispatch()
 			break;
 		case FSP_NotifyReset:
 			NotifyError(notice, -EINTR);
+			if(_InterlockedCompareExchange8(& inUse, 0, 1) != 0)
+				socketsTLB.FreeItem(this);	// No, no 'this->Destroy();' as the handle and the memory space might be reused!
 			return;
 		case FSP_NotifyFlushed:
 			ProcessPendingSend();
-			{
-				char isFlushing = GetResetFlushing();
-#ifdef TRACE
-				printf_s("isFlushing = %d. (FLUSHING_SHUTDOWN == 2)\n", isFlushing);
-#endif
-				if(isFlushing == FLUSHING_SHUTDOWN)
-					Call<FSP_Shutdown>();
-			}
+			if(GetResetFlushing() == FLUSHING_SHUTDOWN)
+				Call<FSP_Shutdown>();
 			break;
 		case FSP_NotifyFinish:
-			{
-				NotifyOrReturn fp1 = GetResetFlushingFP();
-				if(fp1 != NULL)
-					fp1(this, FSP_NotifyFinish, 0);
-				else
-					NotifyError(FSP_NotifyFinish, -EINTR);	// Unexpected RELEASE. As if RESET
-			}
+			RespondToFinish();
+			return;
+		case FSP_NotifyRecycled:
+			RespondToRecycle();
 			return;
 		case FSP_IPC_CannotReturn:
 			if (pControlBlock->state == LISTENING)
@@ -388,6 +413,18 @@ void CSocketItemDl::WaitEventToDispatch()
 	}
 }
 
+
+
+// Given
+//	const char *	The name of the peer application, might including the host name and the ALFID/'port-number'
+// Return
+//	A session control block in the disconnected session recyling cache that match the given peer name.
+// Remark
+//	Here we utilize Linear search to find the right match
+CSocketItemDl * CSocketItemDl::FindDisconnectedSession(const char *peerName)
+{
+	return socketsTLB.FindRecycledSCB(peerName);
+}
 
 
 
@@ -490,39 +527,65 @@ void CSocketItemDl::TimeOut()
 
 CSocketItemDl * CSocketDLLTLB::AllocItem()
 {
-	CSocketItemDl * item = header;
-	if(item == NULL)
+	AcquireSRWLockExclusive(& srwLock);
+
+	CSocketItemDl * item = NULL;
+	// Firstly, make it easy to be searched linearly
+	if(sizeOfWorkSet >= MAX_CONNECTION_NUM)
+	{
+		for(register int i = 0; i < sizeOfWorkSet; i++)
+		{
+			register int j = 0;
+			while(! pSockets[i + j]->IsInUse())
+				j++;
+			if(j == 0)
+				continue;
+			//
+			sizeOfWorkSet -= j;
+			for(register int k = i; k < sizeOfWorkSet; k++)
+			{
+				pSockets[k] = pSockets[k + j];
+			}
+		}
+		//
+		if(sizeOfWorkSet >= MAX_CONNECTION_NUM)
+			goto l_bailout;
+	}
+
+	// UNRESOLVED!? Maximum Capcity of Disconnected Session Recyling Cache /Resumable Disconnected Session Cache
+	if(countAllItems < MAX_CONNECTION_NUM * 3)
 	{
 		item = new CSocketItemDl();
 		if(item == NULL)
-			return NULL;
-		// assert: header == NULL);
+			goto l_bailout;	// return NULL; // assert: header == NULL);
+		//
+		countAllItems++;
 	}
 	else
 	{
-		header = item->next;
-		if(header != NULL)
-			header->prev = NULL;
+		item = head;
+		if(item == NULL)
+			goto l_bailout;	// return NULL; // assert: header == NULL);
+		//
+		head = item->next;
+		if(head != NULL)
+			head->prev = NULL;
+		else
+			tail = NULL;
+		// Make it impossible to be improperly reused
+		memset((BYTE *)item->pControlBlock, 0, (BYTE *) & item->pControlBlock->backLog - (BYTE *)item->pControlBlock);
+		item->pControlBlock->backLog.Clear();	// UNRESOLVED! Is clear backlog safe!?
 	}
 
 	memset((BYTE *)item + sizeof(CSocketItem)
 		, 0
 		, sizeof(CSocketItemDl) - sizeof(CSocketItem));
 	// item->prev = item->next = NULL;	// so does other connection state pointers and flags
-
-	// sizeof(pSockets) / sizeof(CSocketItem *) == MAX_CONNECTION_NUM
-	if(sizeOfSet >= MAX_CONNECTION_NUM)
-	{
-		Compress();
-		if(sizeOfSet >= MAX_CONNECTION_NUM)
-		{
-			FreeItem(item);
-			return NULL;
-		}
-	}
-
-	pSockets[sizeOfSet++] = item;
+	pSockets[sizeOfWorkSet++] = item;
 	_InterlockedExchange8(& item->inUse, 1);
+
+l_bailout:
+	ReleaseSRWLockExclusive( & srwLock);
 	return item;
 }
 
@@ -530,21 +593,82 @@ CSocketItemDl * CSocketDLLTLB::AllocItem()
 
 void CSocketDLLTLB::FreeItem(CSocketItemDl *r)
 {
+	AcquireSRWLockExclusive(& srwLock);
+
 	_InterlockedExchange8(& r->inUse, 0);
-	r->prev = NULL;
-	r->next = header;
-	if(header != NULL)
-		header->prev = r;
-	header = r;
+	r->next = NULL;
+	r->prev = tail;
+	if(tail == NULL)
+	{
+		head = tail = r;
+	}
+	else
+	{
+		tail->next = r;
+		tail = r;
+	}
+
+	ReleaseSRWLockExclusive( & srwLock);
+}
+
+
+
+bool CSocketDLLTLB::ReuseItem(CSocketItemDl *item)
+{
+	AcquireSRWLockExclusive(& srwLock);
+	if(_InterlockedCompareExchange8(& item->inUse, 1, 0) != 0)
+	{
+		ReleaseSRWLockExclusive( & srwLock);
+		return false;
+	}
+
+	if(item->prev != NULL)
+		item->prev = item->prev->prev;
+	else
+		head = item->next;
+	//
+	if(item->next != NULL)
+		item->next = item->next->next;
+	else
+		tail = item->prev;
+
+	ReleaseSRWLockExclusive( & srwLock);
+	return true;
+}
+
+
+
+// Find the free item in the DSRC that satisfies:
+//	i. In CLOSABLE or CLOSED state, while the local Session ID/ALFID is still available
+//	ii.Matches PeerName
+// Inform LLS to try to reuse the mapped SCB and send the RESUME packet
+// Linear Search (LRU):
+//	If there are more than one SCB matches the given peerName, the least recent used one
+//	with the session key that has remaining life time is selected
+// UNRESOLVED! But the one whose keyLife is less than some threshold should be thoroughly released on CLOSED?
+CSocketItemDl * CSocketDLLTLB::FindRecycledSCB(const char *peerName)
+{
+	for(register CSocketItemDl * item = tail; item != NULL; item = item->prev)
+	{
+		if((item->InState(CLOSED) || item->InState(CLOSABLE))
+		&& item->ComparePeerName(peerName) == 0
+		&& item->pControlBlock->connectParams.keyLife > 0)
+		{
+			return (ReuseItem(item) ? item : NULL);
+		}
+	}
+
+	return NULL;
 }
 
 
 
 // The caller should check whether it's really a working connection by check inUse flag
 // connection reusable.
+// Performance of linear search is acceptable for small set
 CSocketItemDl * CSocketDLLTLB::operator[](ALFID_T fiberID)
 {
-	for(int i = 0; i < sizeOfSet; i++)
+	for(int i = 0; i < sizeOfWorkSet; i++)
 	{
 		if(pSockets[i]->fidPair.source == fiberID)
 			return pSockets[i];
@@ -552,25 +676,6 @@ CSocketItemDl * CSocketDLLTLB::operator[](ALFID_T fiberID)
 	return NULL;
 }
 
-
-// make it easy to be searched linearly
-void CSocketDLLTLB::Compress()
-{
-	for(register int i = 0; i < sizeOfSet; i++)
-	{
-		register int j = 0;
-		while(! pSockets[i + j]->IsInUse())
-			j++;
-		if(j == 0)
-			continue;
-		//
-		sizeOfSet -= j;
-		for(register int k = i; k < sizeOfSet; k++)
-		{
-			pSockets[k] = pSockets[k + j];
-		}
-	}
-}
 
 
 // LLS MUST RunAs NT AUTHORITY\NETWORK SERVICE account 
@@ -665,6 +770,7 @@ Cleanup:
 }
 
 
+
 // a security attribute depends on a security descriptor
 // while a security descriptor depends on an ACL
 // while an ACL contains at least one explicit access entry (ACL entry) [if it is NULL, by default everyone access]
@@ -739,8 +845,6 @@ Cleanup:
 	// if(pACL)
 	//	  LocalFree(pACL);
 }
-
-
 
 
 

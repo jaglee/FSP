@@ -373,6 +373,7 @@ bool CSocketItemEx::MapControlBlock(const CommandNewSessionSrv &cmd)
 	CloseHandle(hThatProcess);
 	// this->fiberID == cmd.fiberID, provided it is a passive/welcome socket, not a initiative socket
 	// assert: the queue of the returned value has been initialized by the caller already
+	idSrcProcess = cmd.idProcess;
 	hEvent = cmd.hEvent;
 	return true;
 
@@ -531,7 +532,6 @@ void LOCALAPI CSocketItemEx::AffirmConnect(const SConnectParam & initState, ALFI
 // Remark
 //	If the end queue is not empty, only the starting PURE_DATA may be replaced by PERSIST
 //	It is assumed that DLL/ULA is waiting for LLS when this subroutine is eventually called
-//	If hasPendingKey the head message shall be committed, so shall it in the COMMITING state
 bool CSocketItemEx::ConfirmConnect()
 {
 	ControlBlock::PFSP_SocketBuf skb;
@@ -550,14 +550,16 @@ bool CSocketItemEx::ConfirmConnect()
 			return false;
 	}
 
+
+	//	Assume that if hasPendingKey shall it already be in the COMMITING state
 	if(pControlBlock->CountSendBuffered() == 1)
 	{
-		skb->opCode = pControlBlock->hasPendingKey != 0 || InState(COMMITTING) ? COMMIT : PERSIST;
+		skb->opCode = InState(COMMITTING) ? COMMIT : PERSIST;
 	}
 	else
 	{
 		skb->opCode = PERSIST;
-		if(pControlBlock->hasPendingKey != 0)
+		if(InState(COMMITTING))
 			pControlBlock->ReplaceSendQueueTailToCommit();
 	}
 
@@ -573,6 +575,12 @@ bool CSocketItemEx::ConfirmConnect()
 void CSocketItemEx::SynConnect()
 {
 	TRACE_HERE("called");
+	if(timer != NULL)
+	{
+		TRACE_HERE ("\nInternal panic! Unclean connection reuse?\n"
+					"Timer to acknowledge connect request is not cleared beforehand.");
+		return;
+	}
 	// bind to the interface as soon as the control block mapped into server's memory space
 	InitAssociation();
 
@@ -583,20 +591,9 @@ void CSocketItemEx::SynConnect()
 	else
 		ConfirmConnect();
 	//^ ephemeral session key material was ready when CSocketItemDl::PrepareToAccept
+	EmitStartAndSlide();
 
 	seqLastAck = pControlBlock->recvWindowFirstSN;
-
-	EmitStart();
-	pControlBlock->SlideNextToSend();
-	// assert that SynConnect() is called at most once for a session
-
-	if(timer != NULL)
-	{
-		TRACE_HERE ("\nInternal panic! Unclean connection reuse?\n"
-					"Timer to acknowledge connect request is not cleared beforehand.");
-		return;
-	}
-
 	tKeepAlive_ms = TRASIENT_STATE_TIMEOUT_ms;
 	AddTimer();
 
@@ -609,36 +606,11 @@ void CSocketItemEx::SynConnect()
 //      |<-->[{no listener}: Send {out-of-band} RESET]
 //      |-->[API{Callback}{new context}]-->ACTIVE{new context}
 //         |-->[{Return}:Accept]-->[Send PERSIST]
-//         |-->[{Return}:Commit]-->[Send COMMIT]-->COMMITTING{new context}
 //         |-->[{Return}:Reject]-->[Send RESET]-->NON_EXISTENT
 void CSocketItemEx::OnMultiply()
 {
 }
 
-
-
-//PEER_COMMIT-->/RESUME/-->ACTIVE-->[Send PERSIST]{restart keep-alive}
-//COMMITTING2-->/RESUME/-->ACTIVE-->[Send PERSIST]
-//CLOSABLE-->/RESUME/-->[API{callback}]
-//	|-->[{Return Accept}]-->ACTIVE-->[Send PERSIST]{restart keep-alive}
-//	|-->[{Return Commit}]-->COMMITTING-->[Send COMMIT]{enable retry}
-//	|-->[{Return Reject}]-->NON_EXISTENT-->[Send RESET]
-void CSocketItemEx::OnResume()
-{
-	// TODO: re-allocate send buffer/window and receive buffer/window
-}
-
-
-
-//CLOSED<-->/RESUME/{RDSC missed}<-->[Send ACK_INIT_CONNECT]
-//	|-->/RESUME/{RDSC hit}-->[API{callback}]
-//	|-->[{Return Accept}]-->ACTIVE-->[Send PERSIST]{start keep-alive}
-//	|-->[{Return Commit}]-->COMMITTING-->[Send COMMIT]{enable retry}
-//	|-->[{Return Reject}]-->NON_EXISTENT-->[Send RESET]
-void CSocketItemEx::OnResurrect()
-{
-	// TODO: re-allocate buffers
-}
 
 
 
@@ -712,37 +684,38 @@ bool CSocketItemEx::CheckPeerCommit()
 }
 
 
+
 // Do
 //	Recycle the socket
 //	Send RESET to the remote peer if not in CLOSED state
-void CSocketItemEx::CloseSocket()
+void CSocketItemEx::Recycle()
 {
 	if(!IsInUse())
 		return;
-
 	if(lowState == CLOSABLE)
-		SetState(CLOSED);
-
-	if (lowState != CLOSED)
-	{
+		CloseSocket();
+	else if (lowState != CLOSED)
 		Disconnect();
+}
+
+
+
+// See also AllocItem, FreeItem
+void CSocketItemEx::CloseSocket()
+{
+	// Copy keyLife for DLL access for sake of SCB reuse, but only when worthful
+	if(contextOfICC.keyLife < MINIMUM_LIFETIME_RESUMABLE)
+	{
+		Extinguish();
 		return;
 	}
 
-	ReplaceTimer(SCAVENGE_THRESHOLD_ms);
-	(CLowerInterface::Singleton())->FreeItem(this);
-}
-
-
-// Do
-//	Shutdown the socket
-void CSocketItemEx::CloseToNotify()
-{
-	ReplaceTimer(SCAVENGE_THRESHOLD_ms);
+	pControlBlock->connectParams.keyLife = contextOfICC.keyLife;
 	SetState(CLOSED);
+	StopKeepAlive();
 	(CLowerInterface::Singleton())->FreeItem(this);
-	Notify(FSP_NotifyFinish);	//FSP_NotifyRecycled
 }
+
 
 
 // Do

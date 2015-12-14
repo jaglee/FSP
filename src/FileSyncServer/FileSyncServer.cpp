@@ -27,12 +27,16 @@ static void FSPAPI onPublicKeyReceived(FSPHANDLE, FSP_ServiceCode, int);
 static void FSPAPI onFileNameSent(FSPHANDLE, FSP_ServiceCode, int);
 static int	FSPAPI toSendNextBlock(FSPHANDLE, void *, int32_t);
 
-extern int	FSPAPI onAccepting(FSPHANDLE, void *, PFSP_IN6_ADDR);
+static int	FSPAPI onResurrected(FSPHANDLE, PFSP_Context);
+static void FSPAPI onResponseReceived(FSPHANDLE, FSP_ServiceCode, int);
+
+
+extern int	FSPAPI onAccepting(FSPHANDLE, PFSP_SINKINF, PFSP_IN6_ADDR);
 extern void SendMemoryPattern();
 extern void SendMemoryPatternEncyrpted();
 
 
-void FSPAPI onReturn(FSPHANDLE h, FSP_ServiceCode code, int value)
+void FSPAPI onNotice(FSPHANDLE h, FSP_ServiceCode code, int value)
 {
 	printf_s("Notify: Fiber ID = %u, service code = %d, return %d\n", (uint32_t)(intptr_t)h, code, value);
 	if(value < 0)
@@ -48,9 +52,9 @@ void FSPAPI onReturn(FSPHANDLE h, FSP_ServiceCode code, int value)
 void FSPAPI onFinished(FSPHANDLE h, FSP_ServiceCode code, int value)
 {
 	printf_s("Fiber ID = %u, session was to shut down.\n", (uint32_t)(intptr_t)h);
-	if(code != FSP_NotifyFinish)
+	if(code != FSP_NotifyFinish && code != FSP_NotifyRecycled)
 	{
-		printf_s("Should got onFinished, but service code = %d, return %d\n", code, value);
+		printf_s("Should got ON_FINISHED or ON_RECYCLED, but service code = %d, return %d\n", code, value);
 		return;
 	}
 
@@ -68,7 +72,8 @@ void FSPAPI WaitConnection(const char *thisWelcome, unsigned short mLen, Callbac
 	memset(& params, 0, sizeof(params));
 	params.beforeAccept = onAccepting;
 	params.afterAccept = onAccepted;
-	params.onError = onReturn;
+	// params.afterClose = NULL;
+	params.onError = onNotice;
 	params.welcome = thisWelcome;
 	params.len = mLen;
 	params.sendSize = MAX_FSP_SHM_SIZE;
@@ -151,11 +156,10 @@ l_bailout:
 
 
 // This function is for tracing purpose
-int	FSPAPI onAccepting(FSPHANDLE h, void *p, PFSP_IN6_ADDR remoteAddr)
+int	FSPAPI onAccepting(FSPHANDLE h, PFSP_SINKINF p, PFSP_IN6_ADDR remoteAddr)
 {
 	printf_s("\nTo accept handle of FSP session: 0x%08X\n", h);
-	const FSP_PKTINFO & pktInfo = *(FSP_PKTINFO *)p;
-	printf_s("Interface: %d, session Id: %u\n", pktInfo.ipi6_ifindex, pktInfo.idALF);
+	printf_s("Interface: %d, session Id: %u\n", p->ipi6_ifindex, p->idALF);
 	printf_s("Remote address: 0x%llX::%X::%X\n", remoteAddr->u.subnet, remoteAddr->idHost, remoteAddr->idALF);
 	return 0;	// no opposition
 }
@@ -216,6 +220,8 @@ static void FSPAPI onFileNameSent(FSPHANDLE h, FSP_ServiceCode c, int r)
 		Dispose(h);
 		return;
 	}
+	// Actually listen for response in resumed connection segment.
+	FSPControl(h, FSP_SET_CALLBACK_ON_CONNECT, (ulong_ptr)onResurrected);
 }
 
 
@@ -256,16 +262,36 @@ static int FSPAPI toSendNextBlock(FSPHANDLE h, void * batchBuffer, int32_t capac
 	printf_s("To send %d bytes to the remote end\n", bytesRead);
 
 	SendInline(h, batchBuffer, bytesRead, r ? END_OF_MESSAGE : NOT_END_ANYWAY);
-	if(r)
+	return (r ? -1 : 0);	// if EOF, tell DLL to terminate send
+}
+
+
+
+static char linebuf[80];
+static int FSPAPI onResurrected(FSPHANDLE h, PFSP_Context ctx)
+{
+	printf_s("\nResurrected handle of FSP session: Fiber ID = %u\n", (uint32_t)(intptr_t)h);
+
+	ReadFrom(h, linebuf, sizeof(linebuf), onResponseReceived);
+	return 0;
+}
+
+
+
+static void FSPAPI onResponseReceived(FSPHANDLE h, FSP_ServiceCode c, int r)
+{
+	if(r < 0)
 	{
-		printf("All content has been sent. To shutdown.\n");
-		if(Shutdown(h, onFinished) != 0)
-		{
-			Dispose(h);
-			finished = true;
-		}
-		return -1;
+		finished = true;
+		Dispose(h);
+		return;
 	}
 
-	return 0;
+	printf_s("Response received: %s. To shutdown.\n", linebuf);
+	if(Shutdown(h, onFinished) != 0)
+	{
+		printf_s("Cannot shutdown gracefully.\n");
+		Dispose(h);
+		finished = true;
+	}
 }

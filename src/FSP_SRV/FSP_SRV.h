@@ -48,6 +48,12 @@
 #define NOT_READY_USE 0x0001
 #endif
 
+#pragma intrinsic(_InterlockedCompareExchange, _InterlockedCompareExchange16, _InterlockedCompareExchange8)
+#pragma intrinsic(_InterlockedExchange, _InterlockedExchange16, _InterlockedExchange8)
+#pragma intrinsic(_InterlockedIncrement, _InterlockedOr, _InterlockedOr8)
+
+
+
 // Return the number of microseconds elapsed since Jan 1, 1970 (unix epoch time)
 timestamp_t NowUTC();	// it seems that a global property 'Now' is not as clear as this function format
 
@@ -69,7 +75,7 @@ struct CtrlMsgHdr
 #else
 	WSACMSGHDR	pktHdr;
 #endif
-	FSP_PKTINFO	u;
+	FSP_SINKINF	u;
 
 	bool IsIPv6() const { return (pktHdr.cmsg_level == IPPROTO_IPV6); }
 };
@@ -118,16 +124,16 @@ class CommandNewSessionSrv: CommandToLLS
 	friend class CSocketItemEx;
 	friend class CSocketSrvTLB;
 
+	// defined in command.cpp
+	friend void LOCALAPI Listen(CommandNewSessionSrv &);
+	friend void LOCALAPI Connect(CommandNewSessionSrv &);
+	friend void LOCALAPI SyncSession(CommandNewSessionSrv &);
+
 	HANDLE	hMemoryMap;		// pass to LLS by ULA, should be duplicated by the server
 	DWORD	dwMemorySize;	// size of the shared memory, in the mapped view
 	HANDLE	hEvent;
 	UINT	index;
 	CSocketItemEx *pSocket;
-
-	// defined in command.cpp
-	friend void LOCALAPI Listen(CommandNewSessionSrv &);
-	friend void LOCALAPI Connect(CommandNewSessionSrv &);
-	friend void LOCALAPI SyncSession(CommandNewSessionSrv &);
 
 public:
 	CommandNewSessionSrv(const CommandToLLS *);
@@ -233,7 +239,10 @@ class CSocketItemEx: public CSocketItem
 {
 	friend class CLowerInterface;
 	friend class CSocketSrvTLB;
-	//
+
+	// any packet with full-weight integrity-check-code except aforementioned
+	friend DWORD WINAPI HandleFullICC(LPVOID);
+
 	SRWLOCK	rtSRWLock;
 	DWORD	idSrcProcess;
 	HANDLE	hSrcMemory;
@@ -308,23 +317,30 @@ protected:
 
 	int	 SendPacket(register ULONG, ScatteredSendBuffers);
 	bool EmitStart();
+	void EmitStartAndSlide()
+	{
+		ControlBlock::seq_t k = pControlBlock->sendWindowFirstSN;
+		if(EmitStart() 
+		&& _InterlockedCompareExchange((LONG *) & pControlBlock->sendWindowNextSN, k + 1, k) == k)
+		{
+			++pControlBlock->sendWindowNextPos;
+			pControlBlock->RoundSendWindowNextPos();
+		}
+	}
 	bool LOCALAPI SendSNACK(FSPOperationCode = ACK_FLUSH);
 	bool LOCALAPI EmitWithICC(ControlBlock::PFSP_SocketBuf, ControlBlock::seq_t);
 
 	void Extinguish();
 	void TimeOut();
 
-	static VOID NTAPI TimeOut(PVOID c, BOOLEAN) { ((CSocketItemEx *)c)->TimeOut(); } 
-
-	// any packet with full-weight integrity-check-code except aforementioned
-	friend DWORD WINAPI HandleFullICC(LPVOID p);
-
+	static VOID NTAPI TimeOut(PVOID c, BOOLEAN) { ((CSocketItemEx *)c)->TimeOut(); }
+	//
 public:
 	//
 	bool MapControlBlock(const CommandNewSessionSrv &);
 	void InitAssociation();
 
-	bool IsInUse() { return (_InterlockedXor8(& inUse, 0) != 0); }
+	bool IsInUse() { return (_InterlockedOr8(& inUse, 0) != 0); }
 	void SetReady() { _InterlockedExchange8(& isReady, 1); }
 	// It is assumed that the socket is set ready only after it is put into use
 	// though inUse may be cleared before isReady is cleared
@@ -373,12 +389,16 @@ public:
 	//
 	void InitiateConnect();
 	void CloseSocket();
-	void CloseToNotify();
+	void CloseToNotify()
+	{
+		Notify(FSP_NotifyRecycled);
+		CloseSocket();
+	}
 	void Disconnect();
 	void DisposeOnReset();
 	void OnMultiply();
-	void OnResume();
-	void OnResurrect();
+	void Recycle();
+
 	void HandleMemoryCorruption() {	Extinguish(); }
 	void LOCALAPI AffirmConnect(const SConnectParam &, ALFID_T);
 	bool ConfirmConnect();
@@ -429,7 +449,7 @@ public:
 		sockAddrTo[0] = sockAddrTo[MAX_PHY_INTERFACES];
 	}
 
-	void EmitQ() { pControlBlock->EmitQ(this); }
+	void EmitQ();
 	void KeepAlive();
 	void ScheduleEmitQ();
 	void ScheduleConnect(CommandNewSessionSrv *);
@@ -455,7 +475,6 @@ public:
 
 	// Command of ULA
 	void Shutdown();
-	//
 	// Connect and Send are special in the sense that it may take such a long time to complete that
 	// if it gains exclusive access of the socket too many packets might be lost
 	// when there are too many packets in the send queue
@@ -463,6 +482,7 @@ public:
 	void Start();
 	void UrgeCommit();
 	void SynConnect();
+	bool LOCALAPI Resurrect(DWORD);
 	void LOCALAPI Listen(CommandNewSessionSrv &);
 
 	// Event triggered by the remote peer
@@ -475,12 +495,6 @@ public:
 	void OnGetRelease();	// RELEASE may not carry payload
 	void OnGetMultiply();	// MULTIPLY is treated out-of-band
 	void OnGetKeepAlive();	// KEEP_ALIVE is usually out-of-band
-
-	// A public accessible method of emitting the specified packet in the given LLS socket context
-	static bool LOCALAPI Emit(CSocketItemEx *context, ControlBlock::PFSP_SocketBuf skb, ControlBlock::seq_t seq1)
-	{
-		return context->EmitWithICC(skb, seq1);
-	}
 };
 
 #include <poppack.h>
@@ -547,7 +561,7 @@ struct CPacketBuffers
 class CLowerInterface: public CSocketSrvTLB, protected CPacketBuffers
 {
 private:
-	struct FSPoverUDP_Header: PairALFID, FSP_Header { };
+	friend class CSocketItemEx;
 
 	static CLowerInterface *pSingleInstance;
 
@@ -582,8 +596,6 @@ private:
 	CSocketItemEx	*MapSocket() { return (*this)[GetLocalFiberID()]; }
 
 protected:
-	static DWORD WINAPI ProcessRemotePacket(LPVOID lpParameter);
-
 	// defined in remote.cpp
 	// processing individual type of packet header
 	void LOCALAPI OnGetInitConnect();
@@ -595,9 +607,9 @@ protected:
 	int LOCALAPI EnumEffectiveAddresses(uint64_t *);
 	int	AcceptAndProcess();
 
-	friend class CSocketItemEx;
+	static DWORD WINAPI ProcessRemotePacket(LPVOID);
+
 public:
-	static CLowerInterface * Singleton() { return pSingleInstance; }
 	CLowerInterface();
 	~CLowerInterface();
 
@@ -612,6 +624,8 @@ public:
 	inline void PoolingALFIDs();
 	inline void ProcessRemotePacket();
 	//^ the thread entry function for processing packet sent from the remote-end peer
+
+	static CLowerInterface * Singleton() { return pSingleInstance; }
 };
 
 

@@ -105,52 +105,59 @@ FSPHANDLE FSPAPI ConnectMU(FSPHANDLE hFSP, PFSP_Context psp1)
 //	|-->/MULTIPLY/-->[API{Callback}]
 //	|-->[{Return Accept}]-->{new context}ACTIVE
 //		-->[Send PERSIST]{start keep-alive}
-//	|-->[{Return Commit}]-->{new context}COMMITTING
-//		-->[Send COMMIT]{enable retry}
 //	|-->[{Return}:Reject]-->[Send RESET] {abort creating new context}
 bool LOCALAPI CSocketItemDl::ToWelcomeMultiply(BackLogItem & backLog)
 {
 	// Multiply: but the upper layer application may still throttle it...fpRequested CANNOT read or write anything!
 	PFSP_IN6_ADDR remoteAddr = (PFSP_IN6_ADDR) & pControlBlock->peerAddr.ipFSP.allowedPrefixes[MAX_PHY_INTERFACES-1];
-
-	int r;
+	SetState(ESTABLISHED);
 	if( fpRequested == NULL	// This is NOT the same policy as ToWelcomeConnect
-	|| (r = fpRequested(this, & backLog.acceptAddr, remoteAddr)) < 0 )
+	 || fpRequested(this, & backLog.acceptAddr, remoteAddr) < 0 )
 	{
 		// UNRESOLVED! report that the upper layer application reject it?
 		return false;
 	}
 
-	if(r == 0 && pControlBlock->hasPendingKey == 0)
-		SetState(ESTABLISHED);
-	else
-		SetState(COMMITTING);
-
 	return true;
 }
+
 
 
 //[{return}Accept]
 //	{CLOSABLE, CLOSED}-->[Rcv.RESUME]-->[API{callback}]-->/return Accept/
 //		-->ACTIVE-->[Send PERSIST]{restart keep-alive}
-//[{return}Commit]
-//	CLOSABLE-->[Rcv.RESUME]-->[API{callback}]
-//		-->/return Commit/-->COMMITTING-->[Send COMMIT]{enable retry}
-//	CLOSED-->[Rcv.RESUME]-->[API{callback}]
-//		-->/return Commit/-->COMMITTING-->[Send COMMIT]{enable retry}
 //[{return}Reject]
 //	CLOSABLE-->[Rcv.RESUME]-->[API{callback}]-->/return Reject/
 //		-->[Send RESET]-->NON_EXISTENT
 //	CLOSED-->[Rcv.RESUME]-->[API{callback}]-->/return Reject/
 //		-->[Send RESET]-->NON_EXISTENT
 // Auxiliary function that is called when an existing closed connection context is hit in the cache
-void CSocketItemDl::HitResumableDisconnectedSessionCache()
+// Remark
+//	TODO:UNRESOLVED! Chained send should NOT be prepared in the callback function
+// See also
+//	ProcessBacklog, PrepareToAccept, ToWelcomeConnect and ToConcludeConnect
+//	CSocketDLLTLB::AllocItem, FindRecycledSCB
+void CSocketItemDl::OnDSRCHitted()
 {
-	if(! WaitUseMutex())
+	// Firstly, make it reused // UNRESOLVED! But it is as if a normal backlog item?
+	// Reuse is not the same in CLOSED as in CLOSABLE state
+	if(! IsInUse() && ! socketsTLB.ReuseItem(this))
 	{
-		TRACE_HERE("deadlock encountered!?");
+		TRACE_HERE("A cached disconnected session shall be reusable");
 		return;
 	}
-	//...
-	SetMutexFree();
+
+	PFSP_IN6_ADDR remoteAddr = (PFSP_IN6_ADDR) & pControlBlock->peerAddr.ipFSP.allowedPrefixes[MAX_PHY_INTERFACES-1];
+	SetState(ESTABLISHED);
+	if(fpAccepted != NULL && fpAccepted(this, &context) < 0)
+	{
+		CommandNewSession objCommand;
+		InitCommand<FSP_Reject>(objCommand);
+		Call(objCommand, sizeof(objCommand));
+		socketsTLB.FreeItem(this);	// LLS should and would eventually set the state to NON_EXISTENT
+		return;
+	}
+
+	BeginSubSession();
+	ProcessReceiveBuffer();
 }

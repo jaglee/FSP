@@ -91,6 +91,7 @@ __inline uint64_t htobe64(uint64_t v)
 }
 #else
 
+#include <memory.h>
 #include <intrin.h>
 #pragma intrinsic(memset, memcpy)
 #pragma intrinsic(_byteswap_ushort, _byteswap_ulong, _byteswap_uint64)

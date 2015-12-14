@@ -87,6 +87,13 @@ typedef CSocketItem * PSocketItem;
 
 class CSocketItemDl: public CSocketItem
 {
+	friend class	CSocketDLLTLB;
+	friend struct	CommandToLLS;
+
+	friend FSPHANDLE FSPAPI ListenAt(const PFSP_IN6_ADDR, PFSP_Context);
+	friend FSPHANDLE FSPAPI Connect2(const char *, PFSP_Context);
+	friend FSPHANDLE FSPAPI ConnectMU(FSPHANDLE, PFSP_Context);
+
 	SRWLOCK			rtSRWLock;
 	HANDLE			timer;
 	//
@@ -104,10 +111,11 @@ protected:
 	__declspec(property(get = GetOnRequested))	CallbackRequested fpRequested;
 	CallbackRequested GetOnRequested() const { return context.beforeAccept; }
 
-	__declspec(property(get = GetOnAccepted))		CallbackConnected fpAccepted;
+	__declspec(property(get = GetOnAccepted))	CallbackConnected fpAccepted;
 	CallbackConnected GetOnAccepted() const { return context.afterAccept; }
 
-	NotifyOrReturn	fpCommit;
+	NotifyOrReturn	fpRecycled;	// Callback for SHUT_DOWN
+
 	// to support full-duplex send and receive does not share the same call back function
 	NotifyOrReturn	fpRecept;
 	// to support surveillance RecvInline() over ReadFrom() make CallbackPeeked an independent function
@@ -158,20 +166,15 @@ protected:
 	void ProcessReceiveBuffer();
 	//
 	void ToConcludeConnect();
+	void RespondToFinish();
+	void RespondToRecycle();
 	//
-	void HitResumableDisconnectedSessionCache();
+	void OnDSRCHitted();
 
 	int LOCALAPI BufferData(int);
 	int LOCALAPI DeliverData(void *, int);
 	int FetchReceived();
 	void FinalizeRead();
-
-	friend struct CommandToLLS;
-	friend class CSocketDLLTLB;
-
-	friend FSPHANDLE FSPAPI ListenAt(const PFSP_IN6_ADDR, PFSP_Context);
-	friend FSPHANDLE FSPAPI Connect2(const char *, PFSP_Context);
-	friend FSPHANDLE FSPAPI ConnectMU(FSPHANDLE, PFSP_Context);
 
 public:
 	enum FlushingFlag
@@ -193,6 +196,7 @@ public:
 		}
 	}
 	int LOCALAPI Initialize(PFSP_Context, char *);
+	int LOCALAPI Reinitialize(PFSP_Context);
 	int Recycle();
 
 	// Convert the relative address in the control block to the address in process space, unchecked
@@ -207,17 +211,13 @@ public:
 
 	FSP_Session_State GetState() const { return pControlBlock->state; }
 	bool InState(FSP_Session_State s) const { return pControlBlock->state == s; }
-	bool IsIllegalState() const { return pControlBlock->state <= 0 || pControlBlock->state > LARGEST_FSP_STATE; }
 	void SetState(FSP_Session_State s) { _InterlockedExchange8((char *) & pControlBlock->state, s); }
 	// For _MSC_ only, as long is considered compatible with enum
 	bool TestSetState(FSP_Session_State s0, FSP_Session_State s2)
 	{
 		return (_InterlockedCompareExchange((long *)& pControlBlock->state, s2, s0) == s0);
 	}
-	FSP_Session_State CompareSetState(FSP_Session_State s0, FSP_Session_State s2)
-	{
-		return (FSP_Session_State)_InterlockedCompareExchange((long *)& pControlBlock->state, s2, s0);
-	}
+	bool InIllegalState() const { return pControlBlock->state <= 0 || pControlBlock->state > LARGEST_FSP_STATE; }
 
 	// return value ? _interlockedbittestandset((LONG *) & context.u.flags, 3) : _interlockedbittestandreset((LONG *) & context.u.flags, 3)
 	int SetCompression(int value) { int r = context.u.st.compressing; context.u.st.compressing = value; return r; }
@@ -233,6 +233,7 @@ public:
 		size_t n = min(len, sizeof(pControlBlock->peerAddr.name));
 		memcpy(pControlBlock->peerAddr.name, cName, n);	// assume memory space has been zeroed
 	}
+	int ComparePeerName(const char *cName) { return _strnicmp(pControlBlock->peerAddr.name, cName, sizeof(pControlBlock->peerAddr.name)); }
 
 	template<FSP_ServiceCode cmd> void InitCommand(CommandToLLS & objCommand)
 	{
@@ -264,14 +265,17 @@ public:
 	{
 		return InterlockedCompareExchangePointer((PVOID *) & fpSent, fp1, NULL) == NULL; 
 	}
-	int LOCALAPI CheckedRevertToResume(FlagEndOfMessage);
+	int LOCALAPI CheckCommitOrResume(FlagEndOfMessage);
 	//
-	int LOCALAPI CSocketItemDl::FinalizeSend(int r)
+	int LOCALAPI FinalizeSend(int r)
 	{
 		SetMutexFree();
 		// Prevent premature FSP_Send
-		if (r < 0 || InState(CONNECT_AFFIRMING) || InState(CLONING) || InState(RESUMING) || InState(QUASI_ACTIVE) || InState(CHALLENGING))
+		if (r < 0 || InState(CONNECT_AFFIRMING) || InState(CHALLENGING))
 			return r;
+		//
+		if (InState(QUASI_ACTIVE) || InState(CLONING) || InState(RESUMING))
+			return (Call<FSP_Start>() ? r : -EIO);
 		//
 		return (Call<FSP_Send>() ? r : -EIO);
 	}
@@ -283,18 +287,30 @@ public:
 	void SetEndOfRecvMsg(bool value = true) { context.u.st.eom = value ? 1 : 0; }
 	bool IsRecvBufferEmpty()  { return pControlBlock->CountReceived() <= 0; }
 
+	// See also CheckCommitOrResume@Send.cpp
+	void BeginSubSession()
+	{
+		if(_InterlockedOr8(& pControlBlock->hasPendingKey, 0) != 0 && InState(ESTABLISHED))
+			SetState(COMMITTING);
+		//
+		Call<FSP_Start>();
+	}
 	int	Commit();
+	int LOCALAPI Shutdown(NotifyOrReturn);
+
+	void SetCallbackOnAccept(CallbackConnected fp1) { context.afterAccept = fp1; }
+	void SetCallbackOnFinish(NotifyOrReturn fp1) { context.afterClose = fp1; }
+	void SetCallbackOnRecyle(NotifyOrReturn fp1) { fpRecycled = fp1; }
 
 	char GetResetFlushing() { return _InterlockedExchange8(& isFlushing, 0);}
 	void SetFlushing(char value) { isFlushing = value; }
-	NotifyOrReturn GetResetFlushingFP() { return (NotifyOrReturn)InterlockedExchangePointer((PVOID *) & fpCommit, NULL); }
-	bool SetFlushingFP(NotifyOrReturn fp1) { return InterlockedCompareExchangePointer((PVOID *)& fpCommit, fp1, NULL) == NULL; }
 
 	int SelfNotify(FSP_ServiceCode c);
 	void SetCallbackOnError(NotifyOrReturn fp1) { context.onError = fp1; }
 	void NotifyError(FSP_ServiceCode c, int e = 0) { if (context.onError != NULL) context.onError(this, c, e); }
 
 	// defined in DllEntry.cpp:
+	static CSocketItemDl * LOCALAPI FindDisconnectedSession(const char *);
 	static CSocketItemDl * LOCALAPI CreateControlBlock(const PFSP_IN6_ADDR, PFSP_Context, CommandNewSession &);
 };
 
@@ -302,35 +318,34 @@ public:
 
 class CSocketDLLTLB
 {
+	SRWLOCK	srwLock;
+	int		countAllItems;
+	int		sizeOfWorkSet;
 	CSocketItemDl * pSockets[MAX_CONNECTION_NUM];
-	CSocketItemDl *header;
-	int sizeOfSet;
+	CSocketItemDl * head;
+	CSocketItemDl * tail;
 public:
 	CSocketItemDl * AllocItem();
-	void FreeItem(CSocketItemDl *r);
-	void Compress();
+	void FreeItem(CSocketItemDl *);
+	bool ReuseItem(CSocketItemDl *);
+	CSocketItemDl * FindRecycledSCB(const char *);
 
-	int Count() { return sizeOfSet; }
 	// Application Layer Fiber ID (ALFID) === fiberID
 	CSocketItemDl * operator [] (ALFID_T fiberID);
 	CSocketItemDl * operator [] (int i) { return pSockets[i]; }
 
 	CSocketDLLTLB()
 	{
-		header = NULL;
-		sizeOfSet = 0;
+		InitializeSRWLock(& srwLock);
+		countAllItems = 0;
+		sizeOfWorkSet = 0;
+		head = tail = NULL;
 	}
 
-	//~CSocketDLLTLB()
-	//{
-	//	CSocketItemDl *r = header;
-	//	while(r != NULL)
-	//	{
-	//		header = r->next;
-	//		delete r;
-	//		r = header;
-	//	}
-	//}
+	~CSocketDLLTLB()
+	{
+		//
+	}
 };
 
 

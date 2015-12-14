@@ -61,7 +61,7 @@
 			/>
 			<Tool
 				Name="VCLinkerTool"
-				AdditionalDependencies="ws2_32.lib $(OutDir)\cryptlib.lib"
+				AdditionalDependencies="ws2_32.lib"
 				OutputFile="$(OutDir)/FSP_SRV.exe"
 				LinkIncremental="2"
 				GenerateDebugInformation="true"
@@ -119,7 +119,7 @@
 			/>
 			<Tool
 				Name="VCCLCompilerTool"
-				PreprocessorDefinitions="_WIN32_WINNT=0x0600"
+				PreprocessorDefinitions="OVER_UDP_IPv4;_WIN32_WINNT=0x0600"
 				RuntimeLibrary="0"
 				UsePrecompiledHeader="0"
 				WarningLevel="3"
@@ -137,7 +137,7 @@
 			/>
 			<Tool
 				Name="VCLinkerTool"
-				AdditionalDependencies="ws2_32.lib $(OutDir)\cryptlib.lib"
+				AdditionalDependencies="ws2_32.lib"
 				OutputFile="$(OutDir)/FSP_SRV.exe"
 				LinkIncremental="1"
 				GenerateDebugInformation="true"

@@ -10,7 +10,7 @@ extern volatile bool	finished;
 extern FSPHANDLE		hFspListen;
 
 extern void FSPAPI WaitConnection(const char *, unsigned short, CallbackConnected);
-extern int	FSPAPI onAccepting(FSPHANDLE, void *, PFSP_IN6_ADDR);
+extern int	FSPAPI onAccepting(FSPHANDLE, PFSP_SINKINF, PFSP_IN6_ADDR);
 extern void FSPAPI onReturn(FSPHANDLE h, FSP_ServiceCode code, int value);
 extern void FSPAPI onFinished(FSPHANDLE h, FSP_ServiceCode code, int value);
 
@@ -46,11 +46,10 @@ void SendMemoryPatternEncyrpted()
 
 
 // This function is for tracing purpose
-static int	FSPAPI onAccepting(FSPHANDLE h, void *p, PFSP_IN6_ADDR remoteAddr)
+static int	FSPAPI onAccepting(FSPHANDLE h, PFSP_SINKINF p, PFSP_IN6_ADDR remoteAddr)
 {
 	printf_s("\nTo accept handle of FSP session: 0x%08X\n", h);
-	const FSP_PKTINFO & pktInfo = *(FSP_PKTINFO *)p;
-	printf_s("Interface: %d, session Id: %u\n", pktInfo.ipi6_ifindex, pktInfo.idALF);
+	printf_s("Interface: %d, session Id: %u\n", p->ipi6_ifindex, p->idALF);
 	printf_s("Remote address: 0x%llX::%X::%X\n", remoteAddr->u.subnet, remoteAddr->idHost, remoteAddr->idALF);
 	return 0;	// no opposition
 }

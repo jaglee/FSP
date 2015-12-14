@@ -205,7 +205,7 @@ void CSocketItemEx::Connect()
 
 //[API: Shutdown]
 //	COMMITTED-->[Send RELEASE]-->PRE_CLOSED
-//	CLOSABLE-->[Send RELEASE]-->CLOSED
+//	CLOSABLE-->[Send RELEASE]-->CLOSED-->[Notify]
 void CSocketItemEx::Shutdown()
 {
 	TRACE_HERE("called");
@@ -218,9 +218,32 @@ void CSocketItemEx::Shutdown()
 }
 
 
+
+// CLOSED
+//	---[API: Connect]{&& DSRC hit}-->QUASI_ACTIVE
+//	  -->[Send RESUME]{enable retry}
+// UNRESOLVED! Should check access right of the ULA process more strictly
+// Remark
+//	For sake of transactional data transfer resume may piggyback payload
+//	Because the FlushingFlag is set to REVERT_TO_RESUME in DL data would be piggybacked
+bool LOCALAPI CSocketItemEx::Resurrect(DWORD idProcess)
+{
+	if(! IsInUse() || ! InState(CLOSED) || this->idSrcProcess != idProcess)
+		return false;
+
+	SetState(QUASI_ACTIVE);
+	RestartKeepAlive();
+	SignalReturned();
+	return true;
+}
+
+
+
 // Start sending queued packet(s) in the session control block
 // Remark
 //	Operation code in the given command context would be cleared if send is pending
+// See also
+//	DLL::FinalizeSend, DLL::ToConcludeConnect
 void CSocketItemEx::Start()
 {
 #ifdef TRACE
@@ -232,23 +255,19 @@ void CSocketItemEx::Start()
 #endif
 	// synchronize the state in the 'cache' and the real state
 	lowState = pControlBlock->state;
-	if (lowState == CLONING || lowState == RESUMING)
+	if (lowState == QUASI_ACTIVE || lowState == CLONING || lowState == RESUMING)
 		tKeepAlive_ms = CONNECT_INITIATION_TIMEOUT_ms;
 	else
 		ConfirmConnect();
 	//
-	EmitStart();
-	pControlBlock->SlideNextToSend();
-	// assert that Start() is called at most once for a session
-
+	EmitStartAndSlide();
+	//
 	RestartKeepAlive();
 	//^Sometimes it is redundant but does little harm anyway
 }
 
 
 
-// Non-conformative DLL/ULA may exploit it to send data out of the congestion control
-// However, context switch would limit the throughput
 // Mean to urge sending of the COMMIT packet
 void CSocketItemEx::UrgeCommit()
 {
@@ -260,9 +279,7 @@ void CSocketItemEx::UrgeCommit()
 			RestartKeepAlive();
 	}
 	//
-	ControlBlock::PFSP_SocketBuf skb = pControlBlock->GetNextToSend();
-	if(skb->Lock())
-		EmitWithICC(skb, pControlBlock->SlideNextToSend());
+	EmitQ();
 }
 
 

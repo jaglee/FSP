@@ -63,16 +63,15 @@ int CSocketItemDl::Recycle()
 
 
 
-
 // Given
 //	FSPHANDLE		the FSP socket
 //	NotifyOrReturn	the function pointer for call back
 // Return
-//	-EBADF if the connection is not in proper state
 //	-EINTR if locking of the socket was interrupted
 //	-EIO if the shutdown packet cannot be sent
-//	EDOM if the connection is shutdown down prematurely, i.e.it is a RESET actually
-//	EBADF if the connection is already closed
+//	EAGAIN if the connection is already in the progress of shutdown
+//	EBADF if the connection is already released
+//	EDOM if the connection could ony be shutdown prematurely, i.e.it is a RESET actually
 //	0 if no error
 // Remark
 //	It is assumed that when Shutdown was called ULA did not expect further data from the remote end
@@ -85,55 +84,86 @@ int FSPAPI Shutdown(FSPHANDLE hFSPSocket, NotifyOrReturn fp1)
 	register CSocketItemDl * p = (CSocketItemDl *)hFSPSocket;
 	try
 	{
-		if (p == NULL)
-			return -EBADF;
-		//
-		// ALWAYS assume shutdown is only called after it has finished receiving
-		if(! p->WaitUseMutex())
-			return -EINTR;
-
-		if(p->InState(CLOSED) || p->InState(NON_EXISTENT))
-		{
-			p->SetMutexFree();
-			return EBADF;	// A warning saying that the socket has already been closed
-		}
-
-		if (p->InState(PRE_CLOSED))
-		{
-			p->SetMutexFree();
-			return EAGAIN;	// A warning saying that the socket is already in graceful shutdown process
-		}
-
-		if (p->InState(COMMITTED) || p->InState(CLOSABLE))
-		{
-			// Send RELEASE and wait peer's RELEASE. LLS to signal NotifyFinish, NotifyReset or NotifyTimeout
-			p->SetMutexFree();
-			return (p->Call<FSP_Shutdown>() ? 0 : -EIO);
-		}
-
-		if(! p->TestSetState(ESTABLISHED, COMMITTING)
-		&& ! p->TestSetState(RESUMING, COMMITTING)
-		&& ! p->InState(COMMITTING)
-		&& ! p->TestSetState(PEER_COMMIT, COMMITTING2)
-		&& ! p->InState(COMMITTING2))
-		{
-			p->SetMutexFree();
-			p->Recycle();
-			return EDOM;	// A warning say that the connection is aborted, actually
-		}
-
-		if(! p->SetFlushingFP(fp1))
-		{
-			p->SetMutexFree();
-			return -EAGAIN;
-		}
-
-		p->SetFlushing(CSocketItemDl::FlushingFlag::FLUSHING_SHUTDOWN);
-		p->SetMutexFree();
-		return p->Commit();
+		return p->Shutdown(fp1);
 	}
 	catch(...)
 	{
 		return -EFAULT;
 	}
+}
+
+
+
+// ALWAYS assume shutdown is only called after it has finished receiving
+int LOCALAPI CSocketItemDl::Shutdown(NotifyOrReturn fp1)
+{
+	if(! WaitUseMutex())
+		return -EINTR;
+
+	if(InState(NON_EXISTENT))
+	{
+		SetMutexFree();
+		return EBADF;	// A warning saying that the socket has already been closed thoroughly
+	}
+
+	SetCallbackOnRecyle(fp1);
+
+	if (InState(CLOSED))
+	{
+		SetMutexFree();
+		SelfNotify(FSP_NotifyRecycled);
+		return 0;
+	}
+
+	if (InState(PRE_CLOSED))
+	{
+		SetMutexFree();
+		return EAGAIN;	// A warning saying that the socket is already in graceful shutdown process
+	}
+
+	// Send RELEASE and wait ACK_FLUSH. LLS to signal FSP_NotifyRecycled, NotifyReset or NotifyTimeout
+	if (InState(COMMITTED) || InState(CLOSABLE))
+	{
+		SetMutexFree();
+		return (Call<FSP_Shutdown>() ? 0 : -EIO);
+	}
+
+	// The last resort: flush sending stream if it has not yet been committed
+	if(! TestSetState(ESTABLISHED, COMMITTING) && ! TestSetState(RESUMING, COMMITTING) && ! InState(COMMITTING)
+	&& ! TestSetState(PEER_COMMIT, COMMITTING2) && ! InState(COMMITTING2))
+	{
+		SetMutexFree();
+		Recycle();
+		return EDOM;	// A warning say that the connection is aborted actually, for it is not in the proper state
+	}
+
+	SetFlushing(CSocketItemDl::FlushingFlag::FLUSHING_SHUTDOWN);
+	SetMutexFree();
+	return Commit();
+}
+
+
+
+// Tiggered by the remote end 'RELEASE'(FIN) packet.
+// Important! ULA should not dispose the socket
+void CSocketItemDl::RespondToFinish()
+{
+	if(context.afterClose != NULL)
+		context.afterClose(this, FSP_NotifyFinish, 0);
+	else
+		NotifyError(FSP_NotifyFinish, EINTR);	// Just a warning
+	//
+	Recycle();
+}
+
+
+
+// Callback for SHUTDOWN, triggered by the near end, to recycle the socket
+// Important! ULA should not access the socket itself anyway
+void CSocketItemDl::RespondToRecycle()
+{
+	Recycle();
+	//
+	if(fpRecycled != NULL)
+		fpRecycled(this,  FSP_NotifyRecycled, 0);
 }

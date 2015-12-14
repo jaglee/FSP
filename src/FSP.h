@@ -159,8 +159,7 @@ typedef enum _FSP_Operation_Code: char
 
 
 
-
-
+// Somewhat 'paravirtualization' protocol for DLL to 'hyper-call' LLS and vice-versa
 typedef enum: char
 {
 	NullCommand = 0,
@@ -175,15 +174,17 @@ typedef enum: char
 	FSP_Urge,			// send a packet urgently, mean to urge COMMIT
 	FSP_Shutdown,		// close the connection
 	FSP_InstallKey,		// install the authenticated encryption key
+	FSP_Resurrect,		// Resurrect a closable/closed connection in the recyling cache
 	// 16~23: LLS to DLL in the backlog
 	FSP_NotifyAccepting = SynConnection,	// a reverse command to make context ready
+	FSP_NotifyRecycled = FSP_Recycle,		// a reverse command to inform DLL to release resource passively
 	FSP_NotifyAccepted = 16,
 	FSP_NotifyDataReady,
 	FSP_NotifyBufferReady,
 	FSP_NotifyReset,
 	FSP_NotifyFlushed,
 	FSP_NotifyFinish,
-	FSP_Dispose,		// a reverse command from LLS to DLL meant to synchonize DLL and LLS
+	// 22: used to be FSP_Dispose
 	// 23: Reserved
 	// 24~31: near end error status
 	FSP_IPC_CannotReturn = 24,
@@ -193,6 +194,7 @@ typedef enum: char
 	FSP_NotifyNameResolutionFailed,
 	LARGEST_FSP_NOTICE = FSP_NotifyNameResolutionFailed
 } FSP_ServiceCode;
+
 
 
 // the number of microsecond elapsed since Midnight January 1, 1970 UTC (unix epoch)
@@ -205,7 +207,7 @@ typedef uint64_t timestamp_t;
  */
 #define CONNECT_INITIATION_TIMEOUT_ms	30000	// half a minute
 #define TRASIENT_STATE_TIMEOUT_ms		300000	// 5 minutes
-
+#define MINIMUM_LIFETIME_RESUMABLE		3		// One for RESUME, one for ACK_FLUSH, and one for RELEASE
 
 #include <pshpack1.h>
 
@@ -233,14 +235,14 @@ typedef struct FSP_IN6_ADDR
 
 
 
-typedef	struct FSP_PKTINFO 
+typedef	struct FSP_SINKINF
 {
 	uint32_t	ipi_addr;
 	uint32_t	ipi_ifindex;
 	uint32_t	idHost;
 	ALFID_T		idALF;
 	uint32_t	ipi6_ifindex;
-} *PFSP_PKTINFO;
+} *PFSP_SINKINF;
 
 
 

@@ -2,8 +2,6 @@
 <Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup>
     <ClCompile Include="..\ControlBlock.cpp" />
-    <ClCompile Include="..\gcm-aes.c" />
-    <ClCompile Include="..\rijndael-alg-fst.c" />
     <ClCompile Include="Disconnect.cpp" />
     <ClCompile Include="DllEntry.cpp" />
     <ClCompile Include="Establish.cpp" />

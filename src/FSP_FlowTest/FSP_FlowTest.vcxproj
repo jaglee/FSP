@@ -105,6 +105,8 @@
     <ClCompile Include="..\rijndael-alg-fst.c" />
     <ClCompile Include="FSP_FlowTest.cpp" />
     <ClCompile Include="stdafx.cpp" />
+    <ClCompile Include="Test_FlowControl.cpp" />
+    <ClCompile Include="Test_TrySRP.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

@@ -74,7 +74,6 @@ FORCEINLINE char _InterlockedExchange8(volatile char * a, char b)
 	__asm xchg	AL, byte ptr[ecx];
 }
 
-
 FORCEINLINE char _InterlockedExchange16(volatile short * a, short b)
 {
 	__asm mov	ecx, a;
@@ -82,6 +81,7 @@ FORCEINLINE char _InterlockedExchange16(volatile short * a, short b)
 	__asm xchg	AX, word ptr[ecx];
 }
 #endif
+
 
 
 /**
@@ -100,35 +100,7 @@ void TraceLastError(char * fileName, int lineNo, char *funcName, char *s1);
 # define REPORT_ERRMSG_ON_TRACE(s) (s)
 #endif
 
-// Reflexing string representation of operation code, for debug purpose
-class CStringizeOpCode
-{
-	static const char * names[LARGEST_OP_CODE + 1];
-public:
-	const char * operator[](int);
-};
 
-
-// Reflexing string representation of FSP_Session_State and FSP_ServiceCode, for debug purpose
-class CStringizeState
-{
-	static const char * names[LARGEST_FSP_STATE + 1];
-public:
-	const char * operator[](int);
-};
-
-class CStringizeNotice
-{
-	static const char * names[LARGEST_FSP_NOTICE + 1];
-public:
-	const char * operator[](int);
-};
-
-extern CStringizeOpCode opCodeStrings;
-
-extern CStringizeState stateNames;
-
-extern CStringizeNotice noticeNames;
 
 /**
  * IPC
@@ -144,6 +116,8 @@ extern CStringizeNotice noticeNames;
 #define	CONNECT_BACKLOG_SIZE	512
 #endif
 
+
+
 /**
  * Implementation defined timeout
  */
@@ -156,6 +130,16 @@ extern CStringizeNotice noticeNames;
 # define KEEP_ALIVE_TIMEOUT_MIN_us	500		// 0.5 millisecond
 # define SCAVENGE_THRESHOLD_ms		1800000	// 30 minutes
 #endif
+
+
+
+#if defined(_MSC_VER) || defined(_MSC_EXTENSIONS)
+  #define DELTA_EPOCH_IN_MICROSECS  11644473600000000Ui64
+#else
+  #define DELTA_EPOCH_IN_MICROSECS  11644473600000000ULL
+#endif
+
+
 
 /**
  * Implemented system limit
@@ -175,17 +159,50 @@ extern CStringizeNotice noticeNames;
 #define FSP_MAX_NUM_NOTICE	15	// should be a reasonable value, shall be some multiple of 8 minus 1
 #define	MIN_RESERVED_BUF	(MAX_BLOCK_SIZE * 2)
 
-#define LOCALAPI __fastcall
+
+
+/**
+ * Reflexing string representation of operation code, for debug purpose
+ */
+class CStringizeOpCode
+{
+	static const char * names[LARGEST_OP_CODE + 1];
+public:
+	const char * operator[](int);
+};
+
+
+
+// Reflexing string representation of FSP_Session_State and FSP_ServiceCode, for debug purpose
+class CStringizeState
+{
+	static const char * names[LARGEST_FSP_STATE + 1];
+public:
+	const char * operator[](int);
+};
+
+// Reflexing string 
+class CStringizeNotice
+{
+	static const char * names[LARGEST_FSP_NOTICE + 1];
+public:
+	const char * operator[](int);
+};
+
+extern CStringizeOpCode opCodeStrings;
+
+extern CStringizeState	stateNames;
+
+extern CStringizeNotice noticeNames;
+
 
 
 /**
  * platform-dependent fundamental utility functions
  */
-#if defined(_MSC_VER) || defined(_MSC_EXTENSIONS)
-  #define DELTA_EPOCH_IN_MICROSECS  11644473600000000Ui64
-#else
-  #define DELTA_EPOCH_IN_MICROSECS  11644473600000000ULL
-#endif
+#define LOCALAPI __fastcall
+
+
 
 /**
  * Parameter data-structure and Session Control Block data-structure
@@ -218,6 +235,7 @@ enum FSP_FlagPosition: UINT8
 	RESERVED_AT_3,
 	FirstInFirstDrop = 4,
 };
+
 
 
 struct FSP_NormalPacketHeader
@@ -271,6 +289,7 @@ struct FSP_NormalPacketHeader
 };
 
 
+
 struct FSP_InitiateRequest
 {
 	timestamp_t timeStamp;
@@ -278,6 +297,7 @@ struct FSP_InitiateRequest
 	uint32_t	salt;
 	$FSP_HeaderSignature hs;
 };
+
 
 
 // acknowledgement to the connect bootstrap request, works as a challenge against the initiator
@@ -400,6 +420,7 @@ struct CommandToLLS
 };
 
 
+
 struct CommandNewSession: CommandToLLS
 {
 	HANDLE			hMemoryMap;		// pass to LLS by ULA, should be duplicated by the server
@@ -412,20 +433,20 @@ struct CommandNewSession: CommandToLLS
 
 
 
-struct FSP_PKTINFO_EX : FSP_PKTINFO
+struct FSP_PKTINFO_EX : FSP_SINKINF
 {
 	int32_t	cmsg_level;
 	//
 	void InitUDPoverIPv4(ULONG if1)
 	{
-		memset(this, 0, sizeof(FSP_PKTINFO));		// inaddr_any
+		memset(this, 0, sizeof(FSP_SINKINF));		// inaddr_any
 		ipi_ifindex = if1;
 		cmsg_level = IPPROTO_IP;	/* originating protocol */
 	}
 	//
 	void InitNativeIPv6(ULONG if1)
 	{
-		memset(this, 0, sizeof(FSP_PKTINFO));		// in6addr_any;
+		memset(this, 0, sizeof(FSP_SINKINF));		// in6addr_any;
 		ipi6_ifindex = if1;
 		cmsg_level = IPPROTO_IPV6;	/* originating protocol */
 	}
@@ -445,6 +466,13 @@ struct SConnectParam	// MUST be aligned on 64-bit words!
 	timestamp_t nboTimeStamp;
 	//^ Timestamp in network byte order, together with the first four fields, totally 256 bits could be overlaid
 	//
+
+	// For sake of SCB reuse we arranged to save remained key life in the timeDelta field
+	__declspec(property(get = getKeyLife, put = setKeyLife))
+		int32_t	keyLife;
+	int32_t getKeyLife() const { return timeDelta; }
+	void setKeyLife(int32_t value) { timeDelta = value; } 
+
 	uint32_t	initialSN;	// the initial sequence number of the packet to send
 	int32_t		keyLength;	// by default 16 bytes
 	ALFID_T		idRemote;	// ID of the listener or the new forked, depending on context
@@ -457,7 +485,7 @@ struct SConnectParam	// MUST be aligned on 64-bit words!
 
 struct BackLogItem: SConnectParam
 {
-	FSP_PKTINFO	acceptAddr;	// including the interface number AND the local fiber ID
+	FSP_SINKINF	acceptAddr;	// including the interface number AND the local fiber ID
 	ALFID_T		idParent;
 	//^ 0 if it is the 'root' acceptor, otherwise the local fiber ID of the cloned connection
 	uint32_t	expectedSN;	// the expected sequence number of the packet to receive by order
@@ -467,14 +495,14 @@ struct BackLogItem: SConnectParam
 };
 
 
+
 class LLSNotice
 {
+	friend struct ControlBlock;
 protected:
 	// 4: The (very short, roll-out) queue of returned notices
 	FSP_ServiceCode q[FSP_MAX_NUM_NOTICE];
 	volatile char	mutex;
-	//
-	friend struct ControlBlock;
 public:
 	void SetHead(FSP_ServiceCode c) { q[0] = c; }
 	FSP_ServiceCode GetHead() { return q[0]; }
@@ -488,6 +516,8 @@ public:
 
 class LLSBackLog
 {
+	friend struct ControlBlock;
+
 	volatile char		mutex;
 	ALIGN(8)
 	int32_t				capacity;
@@ -503,9 +533,8 @@ class LLSBackLog
 
 	void WaitSetMutex() { while(_InterlockedCompareExchange8(& mutex, 1, 0)) Sleep(1); }
 	void SetMutexFree() { _InterlockedExchange8(& mutex, 0); }
-
-	friend struct ControlBlock;
 public:
+	void Clear() { count = 0; headQ = tailQ; mutex = 0; }
 	bool LOCALAPI Has(const BackLogItem *p);
 	int LOCALAPI Put(const BackLogItem *p);
 	int LOCALAPI Pop(BackLogItem *p);
@@ -530,6 +559,7 @@ enum SocketBufFlagBitPosition
 };
 
 
+
 enum PendingKeyMask
 {
 	HAS_PENDING_KEY_FOR_SEND = 1,
@@ -537,7 +567,9 @@ enum PendingKeyMask
 };
 
 
+
 class CSocketItem;	// forward declaration for sake of declaring ControlBlock
+
 
 
 // It heavily depends on Address Space Layout Randomization and user-space memory segment isolation
@@ -559,14 +591,14 @@ struct ControlBlock
 	// for security reason the remote addresses were moved to LLS
 	char			nearEndName[INET6_ADDRSTRLEN + 7];	// 72 bytes, in UTF-8
 	FSP_PKTINFO_EX	nearEnd[MAX_PHY_INTERFACES];
-	union
+	struct
 	{
 		char		name[INET6_ADDRSTRLEN + 7];	// 72 bytes
 		struct
 		{
 			uint64_t	allowedPrefixes[MAX_PHY_INTERFACES];
 			uint32_t	hostID;
-			ALFID_T fiberID;
+			ALFID_T		fiberID;
 		} ipFSP;
 	} peerAddr;
 
@@ -611,18 +643,18 @@ struct ControlBlock
 	//
 	int32_t		recvBufferBlockN;	// capacity of the receive buffer
 
-	volatile	long	sendBufDescriptors;	// relative to start of the control block, may be updated via memory map
-	volatile	long	recvBufDescriptors;	// relative to start of the control block, may be updated via memory map
-	volatile	long	sendBuffer;			// relative to start of the control block
-	volatile	long	recvBuffer;			// relative to start of the control block
+	int32_t		sendBufDescriptors;	// relative to start of the control block, may be updated via memory map
+	int32_t		recvBufDescriptors;	// relative to start of the control block, may be updated via memory map
+	int32_t		sendBuffer;			// relative to start of the control block
+	int32_t		recvBuffer;			// relative to start of the control block
 
 	// Total size of FSP_SocketBuf (descriptor): 8 bytes (a 64-bit word)
 	typedef struct FSP_SocketBuf
 	{
-		volatile int32_t		len;
-		volatile uint16_t		flags;
-		volatile uint8_t		version;	// should be the same as in the FSP fixed header
-		volatile uint8_t		opCode;		// should be the same as in the FSP fixed header
+		int32_t		len;
+		uint16_t	flags;
+		uint8_t		version;	// should be the same as in the FSP fixed header
+		uint8_t		opCode;		// should be the same as in the FSP fixed header
 		//
 #if ARCH_BIG_ENDIAN
 		template<SocketBufFlagBitPosition i>
@@ -689,8 +721,7 @@ struct ControlBlock
 
 	//
 	int CountSendBuffered() const { return int(sendBufferNextSN - sendWindowFirstSN); }
-	int CountUnacknowledged() const { return int(sendWindowNextSN - sendWindowFirstSN); }
-	int CountUnacknowledged(seq_t expectedSN) const { return int(sendWindowNextSN - expectedSN); }
+	int CountSentInFlight() const { return int(sendWindowNextSN - sendWindowFirstSN); }
 #if defined(TRACE) || defined(TRACE_HEARTBEAT)
 	int DumpSendRecvWindowInfo() const
 	{
@@ -731,34 +762,20 @@ struct ControlBlock
 
 	// Allocate a new send buffer
 	PFSP_SocketBuf	GetSendBuf();
-	PFSP_SocketBuf	GetNextToSend() const { return HeadSend() + sendWindowNextPos; }
-	PFSP_SocketBuf	SetNextToSendToCommit()
-	{
-		register PFSP_SocketBuf skb2 = GetSendBuf();
-		skb2->opCode = COMMIT;
-		skb2->SetFlag<IS_COMPLETED>();
-		skb2->Unlock();
-		return skb2;
-	}
-	bool CheckSendWindowLimit() const { return int(sendWindowNextSN - sendWindowFirstSN) <= sendWindowSize; }
 
 	void RoundSendBufferNextPos() { int32_t m = sendBufferNextPos - sendBufferBlockN; if(m >= 0) sendBufferNextPos = m; }
+	void RoundSendWindowNextPos() { int32_t m = sendWindowNextPos - sendBufferBlockN; if(m >= 0) sendWindowNextPos = m; }
 
-	// UNRESOLVED! Do we have to maintain the last buffered send packet, however?
-	int ResetSendWindow() { sendWindowHeadPos = sendWindowNextPos = sendBufferNextPos = 0; return sendBufferBlockN; }
-
-	int CountReceived() const { return int(recvWindowNextSN - recvWindowFirstSN); }
-	seq_t GetRecvWindowFirstSN() const { return recvWindowFirstSN; }
-
+	int32_t CountReceived() const { return int32_t(recvWindowNextSN - recvWindowFirstSN); }
 	bool IsValidSequence(seq_t seq1) const
 	{
-		register int d = int(seq1 - recvWindowFirstSN);
+		register int32_t d = int32_t(seq1 - recvWindowFirstSN);
 		// somewhat 'be free to accept' as we didnot enforce 'announced receive window size'
 		return (0 <= d) && (d < recvBufferBlockN);
 	}
 	bool IsRetriableStale(seq_t seq1) const
 	{
-		register int d = int(seq1 - recvWindowFirstSN);
+		register int32_t d = int32_t(seq1 - recvWindowFirstSN);
 		// somewhat 'be free to accept' as we didnot enforce 'announced receive window size'
 		return (d < -1) || (d >= recvBufferBlockN);
 	}
@@ -767,9 +784,7 @@ struct ControlBlock
 	void LOCALAPI SetSequenceFlags(FSP_NormalPacketHeader *, seq_t);
 	void LOCALAPI SetSequenceFlags(FSP_NormalPacketHeader *);
 
-	void LOCALAPI EmitQ(CSocketItem *);	// ONLY implemented in LLS
 	void * LOCALAPI InquireSendBuf(int &);
-	int	LOCALAPI MarkSendQueue(void *, int, bool);
 
 	PFSP_SocketBuf GetFirstReceived() const { return HeadRecv() + recvWindowHeadPos; }
 	int LOCALAPI GetSelectiveNACK(seq_t &, FSP_SelectiveNACK::GapDescriptor *, int) const;
@@ -780,9 +795,9 @@ struct ControlBlock
 	// Slide the left border of the receive window by one slot
 	void SlideRecvWindowByOne()	// shall be atomic!
 	{
-		recvWindowFirstSN++;
 		if(++recvWindowHeadPos - recvBufferBlockN >= 0)
 			recvWindowHeadPos -= recvBufferBlockN;
+		InterlockedIncrement((LONG *) & recvWindowFirstSN);
 	}
 	void * LOCALAPI InquireRecvBuf(int &, bool &);
 
@@ -795,6 +810,7 @@ struct ControlBlock
 	{
 		welcomedNextSNtoSend = sendBufferNextSN = sendWindowNextSN = sendWindowFirstSN = initialSN;
 		sendBufferNextPos = sendWindowNextPos = sendWindowHeadPos = 0;
+		sendWindowSize = 1;
 	}
 	void SetSendWindowWithHeadReserved(seq_t initialSN)
 	{
@@ -817,21 +833,21 @@ struct ControlBlock
 	// Slide the send window to skip the head slot, supposing that it has been acknowledged
 	void SlideSendWindowByOne();
 
-	// return old value of sendWindowNextSN
+	// return new value of sendWindowNextSN
 	seq_t SlideNextToSend()
 	{
 		if(++sendWindowNextPos - sendBufferBlockN >= 0)
 			sendWindowNextPos -= sendBufferBlockN;
-		return sendWindowNextSN++;
+		return _InterlockedIncrement((LONG *) & sendWindowNextSN);
 	}
 	//
 	bool LOCALAPI ResizeSendWindow(seq_t, unsigned int);
 
 	// Width of the advertisable receive window (i.e. free receive buffers to advertize), in blocks
-	INT32 RecvWindowSize() const
+	int32_t RecvWindowSize() const
 	{
-		int d = CountReceived();
-		return (d < 0 ? -1 : recvBufferBlockN - d);
+		int32_t d = CountReceived();
+		return (d < 0 ? 0 : recvBufferBlockN - d);
 	}
 
 	bool HasBacklog() const { return backLog.count > 0; }
@@ -841,6 +857,7 @@ struct ControlBlock
 };
 
 #include <poppack.h>
+
 
 
 class CSocketItem

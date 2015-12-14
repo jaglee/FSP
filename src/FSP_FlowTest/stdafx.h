@@ -23,3 +23,12 @@
 
 #pragma comment(lib, "Ws2_32.lib")
 #pragma comment(lib, "ntdll.lib")
+
+void UnitTestCRC();
+void UnitTestICC();
+void UnitTestTweetNacl();
+
+void FlowTestAcknowledge();
+void FlowTestRetransmission();
+
+void TrySRP6();

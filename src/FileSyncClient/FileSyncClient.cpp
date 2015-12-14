@@ -13,6 +13,12 @@ static void FSPAPI onPublicKeySent(FSPHANDLE, FSP_ServiceCode, int);
 static void FSPAPI onReceiveFileNameReturn(FSPHANDLE, FSP_ServiceCode, int);
 static int	FSPAPI onReceiveNextBlock(FSPHANDLE, void *, int32_t, bool);
 
+//
+static void FSPAPI toResurrect(FSPHANDLE, FSP_ServiceCode, int);
+static int	FSPAPI onResurrected(FSPHANDLE, PFSP_Context);
+static void FSPAPI onAcknowledgeSent(FSPHANDLE, FSP_ServiceCode, int);
+
+
 static unsigned char bufPrivateKey[CRYPTO_NACL_KEYBYTES];
 static unsigned char bufPublicKey[CRYPTO_NACL_KEYBYTES];
 
@@ -22,7 +28,7 @@ volatile static bool finished = false;
 
 
 
-static void FSPAPI onReturn(FSPHANDLE h, FSP_ServiceCode code, int value)
+static void FSPAPI onNotice(FSPHANDLE h, FSP_ServiceCode code, int value)
 {
 	printf_s("Notify: Fiber ID = %u, service code = %d, return %d\n", (uint32_t)(intptr_t)h, code, value);
 	if(value < 0)
@@ -45,12 +51,13 @@ static void FSPAPI onError2(FSPHANDLE h, FSP_ServiceCode code, int value)
 
 
 
+//
 static void FSPAPI onFinished(FSPHANDLE h, FSP_ServiceCode code, int value)
 {
 	printf_s("Fiber ID = %u, session was to shut down.\n", (uint32_t)(intptr_t)h);
-	if(code != FSP_NotifyFinish)
+	if(code != FSP_NotifyFinish && code != FSP_NotifyRecycled)
 	{
-		printf_s("Should got onFinished, but service code = %d, return %d\n", code, value);
+		printf_s("Should got ON_FINISHED or ON_RECYCLED, but service code = %d, return %d\n", code, value);
 		return;
 	}
 
@@ -95,24 +102,28 @@ int CompareMemoryPattern(char	*fileName);
 // in case it is in the same directory of the same machine 
 int main(int argc, char *argv[])
 {
+	int result = 0;
 	if(argc == 2)
 	{
-		return CompareMemoryPattern(argv[1]);
+		result = CompareMemoryPattern(argv[1]);
+		goto l_bailout;
 	}
 
 	Sleep(2000);	// wait the server up when debug simultaneously
 
 	FSP_SocketParameter parms;
 	memset(& parms, sizeof(parms), 0);
-	parms.beforeAccept = NULL;
+	// parms.beforeAccept = NULL;
 	parms.afterAccept = onConnected;
-	parms.onError = onReturn;
+	// parms.afterClose = NULL;	// onFinished;	// no, no passive exit for the initiator
+	parms.onError = onNotice;
 	parms.recvSize = MAX_FSP_SHM_SIZE;	// 4MB
 	parms.sendSize = 0;	// the underlying service would give the minimum, however
 	if(Connect2(REMOTE_APPLAYER_NAME, & parms) == NULL)
 	{
 		printf("Failed to initialize the connection in the very beginning\n");
-		return -1;
+		result = -1;
+		goto l_bailout;
 	}
 
 	while(! finished)
@@ -121,9 +132,10 @@ int main(int argc, char *argv[])
 	if(hFile != NULL && hFile != INVALID_HANDLE_VALUE)
 		CloseHandle(hFile);
 
+l_bailout:
 	printf("\n\nPress Enter to exit...");
 	getchar(); // Sleep(3000);	// so that the other thread may send RESET successfully
-	return 0;
+	exit(result);
 }
 
 
@@ -260,9 +272,8 @@ static void FSPAPI onReceiveFileNameReturn(FSPHANDLE h, FSP_ServiceCode resultCo
 			}
 		}
 		//
+		FSPControl(h, FSP_SET_CALLBACK_ON_FINISH, (ulong_ptr)toResurrect);
 		printf_s("To read content with inline buffering...\n");
-		//
-		FSPControl(h, FSP_SET_CALLBACK_ON_FINISH, (ulong_ptr)onFinished);
 		RecvInline(h, onReceiveNextBlock);
 	}
 	catch(...)
@@ -304,12 +315,73 @@ static int FSPAPI onReceiveNextBlock(FSPHANDLE h, void *buf, int32_t len, bool t
 	if(! toBeContinued)
 	{
 		printf_s("All data have been received, to shutdown...\n");
-		if(Shutdown(h, onFinished) != 0)
+		if(Shutdown(h, toResurrect) != 0)
 		{
+			printf_s("Cannot shutdown gracefully in the resurrectable stage.\n");
 			Dispose(h);
 			finished = true;
 		}
 	}
 
 	return 1;
+}
+
+
+
+// Session was not really shut down, but to resurrect here
+static void FSPAPI toResurrect(FSPHANDLE h, FSP_ServiceCode code, int value)
+{
+	printf_s("Fiber ID = %u, session was to disconnect and resurrect.\n", (uint32_t)(intptr_t)h);
+	printf_s("Should get FSP_NotifyRecycled, got service code %d, return %d\n", code, value);
+
+	// The same as in main()
+	FSP_SocketParameter parms;
+	memset(& parms, sizeof(parms), 0);
+	// parms.beforeAccept = NULL;
+	parms.afterAccept = onResurrected;
+	parms.afterClose = onFinished;	// yes, passive release is accepted by the client now
+	parms.onError = onNotice;
+	parms.recvSize = MAX_FSP_SHM_SIZE;	// 4MB
+	parms.sendSize = 0;	// the underlying service would give the minimum, however
+	if(Connect2(REMOTE_APPLAYER_NAME, & parms) == NULL)
+	{
+		printf("Failed to initialize the connection in the very beginning\n");
+		return;
+	}
+}
+
+
+int FSPAPI onResurrected(FSPHANDLE h, PFSP_Context ctx)
+{
+	printf_s("\nResurrected: handle of FSP session/Fiber ID = %u\n", (uint32_t)(intptr_t)h);
+	if(h == NULL)
+	{
+		printf_s("\nResurrection failure.\n");
+		finished = true;
+		return -1;
+	}
+
+	// Respond with a code saying no error
+	WriteTo(h, "0000", 4, END_OF_MESSAGE, onAcknowledgeSent);
+	return 0;
+}
+
+
+// This time it is really shutdown
+static void FSPAPI onAcknowledgeSent(FSPHANDLE h, FSP_ServiceCode c, int r)
+{
+	printf_s("Result of sending the acknowledgement: %d\n", r);
+	if(r < 0)
+	{
+		finished = true;
+		Dispose(h);
+		return;
+	}
+
+	if(Shutdown(h, onFinished) != 0)
+	{
+		printf_s("Cannot shutdown gracefully in the final stage.\n");
+		Dispose(h);
+		finished = true;
+	}
 }

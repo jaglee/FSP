@@ -162,7 +162,7 @@ void CSocketItemEx::TimeOut()
 		{
 			ReplaceTimer(TRASIENT_STATE_TIMEOUT_ms);
 			if(lowState == CLOSABLE)
-				Notify(FSP_Dispose);
+				SendPacket<RESET>();	// See also Disconnect
 			lowState = NON_EXISTENT;
 			SetReady();
 			return;	// let calling of Extingush() in the NON_EXISTENT state to do cleanup 
@@ -190,10 +190,9 @@ void CSocketItemEx::TimeOut()
 		}
 		else if(t1 - clockCheckPoint.tMigrate > (TRASIENT_STATE_TIMEOUT_ms << 10))
 		{
-			ReplaceTimer(SCAVENGE_THRESHOLD_ms);
 			Notify(FSP_NotifyTimeout);
-			lowState = CLOSED;
 			SetReady();
+			CloseSocket();
 			return;
 		}
 		EmitStart();
@@ -226,7 +225,7 @@ void CSocketItemEx::KeepAlive()
 	// It is waste of time if the packet is already acknowledged. However it does little harm
 	// and it doesn't worth the trouble to handle low-possibility situation
 	// Prefer productivity over code elegancy
-	if (pControlBlock->CountUnacknowledged() > 0)
+	if (pControlBlock->CountSentInFlight() > 0)
 	{
 		ControlBlock::PFSP_SocketBuf skb = pControlBlock->GetSendQueueHead();
 		//
@@ -315,16 +314,16 @@ bool CSocketItemEx::SendSNACK(FSPOperationCode opCode)
 int LOCALAPI CSocketItemEx::RespondToSNACK(ControlBlock::seq_t expectedSN, FSP_SelectiveNACK::GapDescriptor *gaps, int n)
 {
 	const int32_t capacity = pControlBlock->sendBufferBlockN;
-	if(sizeof(ControlBlock) + sizeof(ControlBlock::FSP_SocketBuf) * capacity > dwMemorySize)
+	if(sizeof(ControlBlock) + (sizeof(ControlBlock::FSP_SocketBuf) + MAX_BLOCK_SIZE) * capacity > dwMemorySize)
 		return -EFAULT;
 
-	int sentWidth = pControlBlock->CountUnacknowledged();
+	const int sentWidth = pControlBlock->CountSentInFlight();
 	if(sentWidth < 0)
 		return -EFAULT;
 	if(sentWidth == 0)
 		return 0;	// there is nothing to be acknowledged
 
-	int nAck = pControlBlock->DealWithSNACK(expectedSN, gaps, n);
+	const int nAck = pControlBlock->DealWithSNACK(expectedSN, gaps, n);
 #if defined(TRACE_HEARTBEAT) || defined(TRACE_PACKET)
 	printf_s("Accumulatively acknowledged SN = %u, %d packet(s) acknowledged.\n", expectedSN, nAck);
 #endif
@@ -402,7 +401,7 @@ int LOCALAPI CSocketItemEx::RespondToSNACK(ControlBlock::seq_t expectedSN, FSP_S
 			}
 			// Attention please! If you try to trace the packet it would not be retransmitted, for sake of testability
 #if defined(TRACE_PACKET) || defined(TRACE_HEARTBEAT)
-			printf_s("Meant to retransmit: SN = %u, index position = %d\n", seq0, index1);
+			printf_s("Meant to retransmit: SN = %u, index position = %d\n", seq0, p - pControlBlock->HeadSend());
 #endif
 #ifndef TRACE_PACKET
 			if(! p->GetFlag<IS_ACKNOWLEDGED>() && ! EmitWithICC(p, seq0))
@@ -441,13 +440,13 @@ l_retransmitted:
 			, (rtt64_us + tEarliestSend - tRecentSend)	// Equal saved 'NowUTC()' - tRecentSend
 			, rtt64_us	// Saved 'NowUTC()' - tEarliestSend
 			, sentWidth
-			, pControlBlock->CountUnacknowledged()
+			, pControlBlock->CountSentInFlight()
 			);
-		if(int64_t(tdiff64_us) < 0 || sentWidth <= pControlBlock->CountUnacknowledged())
+		if(int64_t(tdiff64_us) < 0 || sentWidth <= pControlBlock->CountSentInFlight())
 			TRACE_HERE("function domain error in guess tEarliestSend");
-		// assert(int64_t(tRecentSend - tEarliestSend) >= 0 && sentWidth > pControlBlock->CountUnacknowledged());
+		// assert(int64_t(tRecentSend - tEarliestSend) >= 0 && sentWidth > pControlBlock->CountSentInFlight());
 #endif
-		tEarliestSend += tdiff64_us * (sentWidth - pControlBlock->CountUnacknowledged()) / sentWidth;
+		tEarliestSend += tdiff64_us * (sentWidth - pControlBlock->CountSentInFlight()) / sentWidth;
 #ifdef TRACE
 		printf_s("\ttRecentSend - tEarliestSend = %lluus, about %llums\n"
 			, (tRecentSend - tEarliestSend)

@@ -61,13 +61,14 @@
 
 typedef struct FSP_SocketParameter *PFSP_Context;
 
-enum
+typedef enum
 {
 	FSP_GET_SIGNATURE,			// pointer to the placeholder of the 64-bit signature
 	FSP_SET_COMPRESSION,		// 0: disable, 1: lz4, others: reserved
 	FSP_SET_CALLBACK_ON_ERROR,	// NotifyOrReturn
 	FSP_SET_CALLBACK_ON_FINISH,	// NotifyOrReturn
-};
+	FSP_SET_CALLBACK_ON_CONNECT	// CallbackConnected
+} FSP_ControlCode;
 
 
 
@@ -78,14 +79,14 @@ enum
 // The call back function through which ULA tells FSP service whether to accept connection request
 // Given
 //	FSPHANDLE		the handle of the listener's socket
-//	void *			the context	point to the RFC2292 packet control structure (local IPv4 address NOT converted)
+//	PFSP_SINKINF	the context	point to the RFC2292 packet control structure (local IPv4 address NOT converted)
 //					exploit CMSG_FIRSTHDR, CMSG_NXTHDR and WSA_CMSG_DATA (CMSG_DATA) to access the header
 //	PFSP_IN6_ADDR	the remote address that make the connection (address has been converted if IPv4)
 // Return
 //	unity (positive integer) is to do a transactional send-receive),
 //	zero if to continue,
 //	negative if to abort
-typedef int (FSPAPI *CallbackRequested)(FSPHANDLE, void *, PFSP_IN6_ADDR);
+typedef int (FSPAPI *CallbackRequested)(FSPHANDLE, PFSP_SINKINF, PFSP_IN6_ADDR);
 
 
 // The callback function through which the new FSP socket handle and the remote address are passed to ULA
@@ -147,9 +148,9 @@ struct FSP_SocketParameter
 {
 	CallbackRequested	beforeAccept;	// may be NULL
 	CallbackConnected	afterAccept;	// cannot be NULL
-	NotifyOrReturn	onError;
-	//^the function pointer of the multiplexer called back on notification or when async-read/write returns
-	// which should process negatives and non-negative FSP_NotifyFinish, FSP_NotifyRecycled and FSP_Dispose
+	NotifyOrReturn		afterClose;		// may be NULL
+	NotifyOrReturn		onError;		// should be non-NULL
+	//
 	const void *	welcome;		// default welcome message, may be NULL
 	unsigned short	len;			// length of the default welcome message
 	union USocketFlags
@@ -165,9 +166,10 @@ struct FSP_SocketParameter
 		} st;
 		unsigned short flags; //[_In_] the requested features [_Out] the error reason
 	} u;
-	int	ifDefault;	// default interface, only for send
-	int recvSize;	// default size of the receive window
-	int sendSize;	// default size of the send window
+	int32_t		ifDefault;	// default interface, only for send
+	//
+	int32_t		recvSize;	// default size of the receive window
+	int32_t		sendSize;	// default size of the send window
 	//
 	uint64_t	signatureULA;
 };
@@ -315,23 +317,6 @@ DllSpec
 int FSPAPI ReadFrom(FSPHANDLE, void *, int, NotifyOrReturn);
 
 
-// Commit sending by managing to flush all data-in-flight to the remote peer
-// Given
-//	FSPHANDLE		the FSP socket
-//	NotifyOrReturn	the callback function
-// Return
-//	EAGAIN if the session is already in committed state
-//	-EBADF if the connection is not in valid context
-//	-EDOM if the connection is not in proper state
-//	-EIO if the COMMIT packet cannot be sent
-//	0 if no immediate error
-// Remark
-//	the callback function may return delayed error such as Commit rejected the remote end
-//	Explicit Commit is unnecessary
-////DllSpec
-////int FSPAPI Commit(FSPHANDLE, NotifyOrReturn);
-
-
 // Try to terminate the session gracefully, automatically commit if not yet 
 // Return 0 if no immediate error, or else the error number
 // The callback function might return code of delayed error
@@ -365,7 +350,7 @@ uint32_t * TranslateFSPoverIPv4(PFSP_IN6_ADDR, uint32_t, ALFID_T);
 // return number of availabe interfaces with configured IPv4/IPv6 address
 // which might be zero. negative if error.
 DllSpec
-int FSPControl(FSPHANDLE, unsigned, ulong_ptr);
+int FSPControl(FSPHANDLE, FSP_ControlCode, ulong_ptr);
 
 
 // Given

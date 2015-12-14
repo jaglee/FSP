@@ -193,8 +193,6 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="..\ControlBlock.cpp" />
-    <ClCompile Include="..\gcm-aes.c" />
-    <ClCompile Include="..\rijndael-alg-fst.c" />
     <ClCompile Include="CryptoStub.c" />
     <ClCompile Include="Disconnect.cpp" />
     <ClCompile Include="DllEntry.cpp" />

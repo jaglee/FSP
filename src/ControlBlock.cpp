@@ -38,7 +38,7 @@
 #include "FSP.h"
 #include "FSP_Impl.h"
 
-
+#ifndef NDEBUG
 // Reflexing string representation of operation code, for debug purpose
 const char * CStringizeOpCode::names[LARGEST_OP_CODE + 1] =
 {
@@ -123,20 +123,22 @@ const char * CStringizeNotice::names[LARGEST_FSP_NOTICE + 1] =
 	"FSP_Urge",			// send a packet urgently, mean to urge COMMIT
 	"FSP_Shutdown",		// close the connection
 	"FSP_InstallKey",	// install the authenticated encryption key
-	// 11-15, 5 reserved
-	"Reserved11",
+	"FSP_Resurrect",	// Resurrect a closable/closed connection in the recyling cach
+	// 12-15, 4 reserved
 	"Reserved12",
 	"Reserved13",
 	"Reserved14",
 	"Reserved15",
 	// 16~23: LLS to DLL in the backlog
+	//FSP_NotifyAccepting = SynConnection,	// a reverse command to make context ready
+	//FSP_NotifyRecycled = FSP_Recycle,		// a reverse command to inform DLL to release resource passively
 	"FSP_NotifyAccepted",
 	"FSP_NotifyDataReady",
 	"FSP_NotifyBufferReady",
 	"FSP_NotifyReset",
 	"FSP_NotifyFlushed",
 	"FSP_NotifyFinish",
-	"FSP_Dispose",		// a reverse command from LLS to DLL meant to synchonize DLL and LLS
+	"Reserved22",
 	"Reserved23",
 	// 24~31: near end error status
 	"FSP_IPC_CannotReturn",	// LLS cannot return to DLL for some reason
@@ -163,7 +165,7 @@ const char * CStringizeOpCode::operator[](int i)
 const char * CStringizeState::operator[](int i)
 {
 	static char errmsg[] = "Unknown state: 0123467890123";
-	if (i < 0 || i > CLOSED)
+	if (i < 0 || i > LARGEST_FSP_STATE)
 	{
 		_itoa_s(i, &errmsg[15], 14, 10);
 		return &errmsg[0];
@@ -184,10 +186,11 @@ const char * CStringizeNotice::operator[](int i)
 }
 
 
-
 CStringizeOpCode	opCodeStrings;
 CStringizeState		stateNames;
 CStringizeNotice	noticeNames;
+
+#endif
 
 
 
@@ -389,10 +392,10 @@ int LOCALAPI ControlBlock::Init(int32_t sendSize, int32_t recvSize)
 	// here we let it interleaved:
 	// send buffer descriptors, receive buffer descriptors, receive buffer blocks and send buffer blocks
 	// we're sure that FSP_SocketBuf itself is 64-bit aligned. to make buffer block 64-bit aligned
-	_InterlockedExchange(& sendBufDescriptors, (sizeof(ControlBlock) + 7) & 0xFFFFFFF8);
-	_InterlockedExchange(& recvBufDescriptors, sendBufDescriptors + sizeof(FSP_SocketBuf) * sendBufferBlockN);
-	_InterlockedExchange(& recvBuffer, (sendBufDescriptors + sizeDescriptors + 7) & 0xFFFFFFF8);
-	_InterlockedExchange(& sendBuffer, recvBuffer + recvBufferBlockN * MAX_BLOCK_SIZE);
+	_InterlockedExchange((LONG *) & sendBufDescriptors, (sizeof(ControlBlock) + 7) & 0xFFFFFFF8);
+	_InterlockedExchange((LONG *) & recvBufDescriptors, sendBufDescriptors + sizeof(FSP_SocketBuf) * sendBufferBlockN);
+	_InterlockedExchange((LONG *) & recvBuffer, (sendBufDescriptors + sizeDescriptors + 7) & 0xFFFFFFF8);
+	_InterlockedExchange((LONG *) & sendBuffer, recvBuffer + recvBufferBlockN * MAX_BLOCK_SIZE);
 
 	memset((BYTE *)this + sendBufDescriptors, 0, sizeDescriptors);
 
@@ -430,9 +433,9 @@ ControlBlock::PFSP_SocketBuf ControlBlock::GetSendBuf()
 		return NULL;
 
 	register PFSP_SocketBuf p = HeadSend() + sendBufferNextPos++;
-	p->InitFlags();	// and locked
-	sendBufferNextSN++;
 	RoundSendBufferNextPos();
+	p->InitFlags();	// and locked
+	_InterlockedIncrement((LONG *) & sendBufferNextSN);
 
 	return p;
 }
@@ -460,11 +463,12 @@ void * LOCALAPI ControlBlock::InquireSendBuf(int & m)
 		return NULL;
 	}
 	// and no memory overwritten even it happens that sendBufferNextPos == sendWindowHeadPos
-	register int i = sendBufferNextPos;
-	register int k = sendWindowHeadPos;	// get the snap value
+	register int32_t i = sendBufferNextPos;
+	register int32_t k = _InterlockedCompareExchange((LONG *) & sendWindowHeadPos, 0, i);
 	if(i == k)
 	{
-		m = MAX_BLOCK_SIZE * ResetSendWindow();
+		sendWindowNextPos = sendBufferNextPos = 0;	// sendWindowHeadPos has been set to 0 
+		m = MAX_BLOCK_SIZE * sendBufferBlockN;
 		return (BYTE *)this + sendBuffer;
 	}
 
@@ -550,13 +554,13 @@ ControlBlock::PFSP_SocketBuf LOCALAPI ControlBlock::AllocRecvBuf(seq_t seq1)
 	if(d == 0)
 	{
 		p = HeadRecv() + recvWindowNextPos++;
-		recvWindowNextSN++;
 		if(recvWindowNextPos - recvBufferBlockN >= 0)
 			recvWindowNextPos -= recvBufferBlockN;
+		_InterlockedIncrement((LONG *) & recvWindowNextSN);
 	}
 	else
 	{
-		bool notOutOfOrder = (d > 0);
+		bool ordered = (d > 0);
 		d += recvWindowNextPos;
 		if(d - recvBufferBlockN >= 0)
 			d -= recvBufferBlockN;
@@ -564,10 +568,10 @@ ControlBlock::PFSP_SocketBuf LOCALAPI ControlBlock::AllocRecvBuf(seq_t seq1)
 			d += recvBufferBlockN;
 		p = HeadRecv() + d;
 		//
-		if(notOutOfOrder)
+		if(ordered)
 		{
-			recvWindowNextSN = seq1 + 1;
 			recvWindowNextPos = d + 1 >= recvBufferBlockN ? 0 : d + 1;
+			_InterlockedExchange((LONG *) & recvWindowNextSN, seq1 + 1);
 		}
 		else if(p->GetFlag<IS_FULFILLED>())
 		{
@@ -592,16 +596,20 @@ ControlBlock::PFSP_SocketBuf LOCALAPI ControlBlock::AllocRecvBuf(seq_t seq1)
 //	-EFAULT		the descriptor is corrupted (illegal payload length:
 //				payload length of an intermediate packet of a message should be MAX_BLOCK_SIZE,
 //				payload length of any packet should be no less than 0 and no greater than MAX_BLOCK_SIZE)
-//	It is assumed that the timeIn field of the descriptor of a free receive buffer block is 0
 void * LOCALAPI ControlBlock::InquireRecvBuf(int & nIO, bool & toBeContinued)
 {
 	PFSP_SocketBuf p = GetFirstReceived();
 	void * const pr = GetRecvPtr(p);	// the pointer value returned
 	//
 	const int tail = recvWindowNextPos;
-	int i, m;
-	// assert(tail < recvBufferBlockN);	// it may happen to be false because of parallism
-	if(tail < recvWindowHeadPos || tail > recvBufferBlockN)
+	if(tail > recvBufferBlockN)
+	{
+		nIO = -EFAULT;
+		return NULL;
+	}
+
+	register int i, m;
+	if(tail < recvWindowHeadPos)
 		m = recvBufferBlockN - recvWindowHeadPos;
 	else
 		m = tail - recvWindowHeadPos;
@@ -751,7 +759,7 @@ int LOCALAPI ControlBlock::GetSelectiveNACK(seq_t & snExpect, FSP_SelectiveNACK:
 // Slide the left border of the send window and mark the acknowledged buffer block free
 void ControlBlock::SlideSendWindow()
 {
-	while(CountUnacknowledged() > 0)
+	while(CountSentInFlight() > 0)
 	{
 		register PFSP_SocketBuf p = GetSendQueueHead();
 		if(! p->GetFlag<IS_ACKNOWLEDGED>())
@@ -783,7 +791,7 @@ void ControlBlock::SlideSendWindowByOne()	// shall be atomic!
 {
 	if(++sendWindowHeadPos - sendBufferBlockN >= 0)
 		sendWindowHeadPos -= sendBufferBlockN;
-	sendWindowFirstSN++;
+	_InterlockedIncrement((LONG *) & sendWindowFirstSN);
 	//
 	if(int(sendWindowNextSN - sendWindowFirstSN) < 0)
 	{
@@ -815,8 +823,7 @@ int LOCALAPI ControlBlock::DealWithSNACK(seq_t expectedSN, FSP_SelectiveNACK::Ga
 	const int32_t & capacity = sendBufferBlockN;
 	int32_t	iHead = sendWindowHeadPos;
 	register seq_t seq0 = sendWindowFirstSN;
-	int sentWidth = CountUnacknowledged();
-
+	int sentWidth = CountSentInFlight();
 	//
 	PFSP_SocketBuf p = HeadSend() + iHead;
 	int	countAck = 0;
@@ -961,12 +968,11 @@ bool LOCALAPI ControlBlock::ResizeSendWindow(seq_t seq1, unsigned int adRecvWin)
 		return true;
 	welcomedNextSNtoSend = seq1;
 
-	int32_t sentWidth = int32_t(sendWindowNextSN - sendWindowFirstSN);
+	assert((uint64_t)CountSentInFlight() + adRecvWin < INT32_MAX);
 	int32_t d = int(seq1 - sendWindowFirstSN);
-	if(d > sentWidth)
+	if(d > CountSentInFlight())
 		return false;	// you cannot acknowledge a packet not sent yet
 
-	assert((uint64_t)sentWidth + adRecvWin < INT32_MAX);
-	sendWindowSize = min(sendBufferBlockN, int32_t(d + adRecvWin));
+	SetSendWindowSize(int32_t(d + adRecvWin));
 	return true;
 }

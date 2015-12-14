@@ -35,7 +35,7 @@ ALFID_T CLowerInterface::SetLocalFiberID(ALFID_T value)
 {
 	if(nearInfo.IsIPv6())
 		nearInfo.u.idALF = value;
-	return InterlockedExchange((volatile LONG *) & pktBuf->idPair.peer, value);
+	return _InterlockedExchange((volatile LONG *) & pktBuf->idPair.peer, value);
 }
 
 
@@ -497,13 +497,12 @@ bool LOCALAPI CSocketItemEx::EmitWithICC(ControlBlock::PFSP_SocketBuf skb, Contr
 	// ICC, if required, is always set just before being sent
 	if (skb->GetFlag<TO_BE_CONTINUED>() && skb->len != MAX_BLOCK_SIZE)
 	{
-		// TODO: debug log failure of segmented and/or online-compressed send
-//#ifdef TRACE
+#ifdef TRACE
 		printf_s("\nImcomplete packet to send, opCode: %s(%d, len = %d)\n"
 			, opCodeStrings[skb->opCode]
 			, skb->opCode
 			, skb->len);
-//#endif
+#endif
 		return false;
 	}
 	// Which is the norm. Dynanically generate the fixed header.
@@ -540,58 +539,83 @@ bool LOCALAPI CSocketItemEx::HandleMobileParam(PFSP_HeaderSignature optHdr)
 // To make life easier assume it has gain unique access to the LLS socket
 // See also HandleEmitQ, HandleFullICC
 // TODO: rate-control/quota control
-void ControlBlock::EmitQ(CSocketItem *context)
+void CSocketItemEx::EmitQ()
 {
 #ifdef TRACE
 	TRACE_HERE("Sending data...");
 #endif
-
-	if(sendWindowNextSN == sendBufferNextSN && _InterlockedCompareExchange8(& shouldAppendCommit, 0, 1) != 0)
-		SetNextToSendToCommit();
+	ControlBlock::seq_t lastSN = _InterlockedOr((LONG *) & pControlBlock->sendBufferNextSN, 0);
+	ControlBlock::seq_t firstSN = pControlBlock->sendWindowFirstSN;
+	ControlBlock::seq_t & nextSN = pControlBlock->sendWindowNextSN;
+	int32_t winSize = _InterlockedOr((LONG *) & pControlBlock->sendWindowSize, 0);
 	//
-	while (int(sendWindowNextSN - sendBufferNextSN) < 0 && CheckSendWindowLimit())
+	bool inflightCommit = (nextSN == lastSN && _InterlockedOr8(& pControlBlock->shouldAppendCommit, 0) != 0);
+	register ControlBlock::PFSP_SocketBuf skb;
+	while (int(nextSN - lastSN) < 0 && int(nextSN - firstSN) <= winSize)
 	{
-		register PFSP_SocketBuf skb = HeadSend() + sendWindowNextPos;
+		skb = pControlBlock->HeadSend() + pControlBlock->sendWindowNextPos;
 		// The flag IS_COMPLETED is for double-stage commit of send buffer, for sake of sending online compressed stream
 		if (!skb->GetFlag<IS_COMPLETED>())
 		{
 #ifdef TRACE
-			printf_s("The packet SN#%u is not ready to send; buffered next SN#%u\n", sendWindowNextSN, sendBufferNextSN);
-#endif
+			printf_s("The packet SN#%u is not ready to send; buffered next SN#%u\n", nextSN, lastSN);
+#endif 
 			break;
 		}
 
 		if (!skb->Lock())
 		{
-#ifdef TRACE
-			printf_s("Should be rare: cannot get the exclusive lock on the packet to send SN#%u\n", sendWindowNextSN);
+#ifndef NDEBUG
+			printf_s("Should be rare: cannot get the exclusive lock on the packet to send SN#%u\n", nextSN);
 #endif
-			SlideNextToSend();
+			pControlBlock->SlideNextToSend();
 			continue;
 		}
 
 		// It is obviously less efficient/clever than pre-cache or loop-unrolling but much more reliable and comprehensible?
-		if(sendWindowNextSN + 1 == sendBufferNextSN && _InterlockedCompareExchange8(& shouldAppendCommit, 0, 1) != 0)
+		if(nextSN + 1 == lastSN && _InterlockedOr8(& pControlBlock->shouldAppendCommit, 0) != 0)
 		{
 			// assert(skb->GetFlag<TO_BE_CONTINUED>() == false	// See also @DLL::Commit @DLL::ProcessPendingSend
 			if(skb->opCode == PURE_DATA || skb->opCode == PERSIST)
 			{
 				skb->SetFlag<IS_COMPLETED>();
 				skb->opCode = COMMIT;
+				_InterlockedExchange8(& pControlBlock->shouldAppendCommit, 0);
 			}
 			else if(skb->opCode != COMMIT)
 			{
-				SetNextToSendToCommit();
+				inflightCommit = true;
 			}
 		}
 
-		if (!CSocketItemEx::Emit((CSocketItemEx *)context, skb, sendWindowNextSN))
+		if (!EmitWithICC(skb, nextSN))
 		{
 			skb->Unlock();
 			break;
 		}
 		//
-		if (SlideNextToSend() == sendWindowFirstSN)
-			((CSocketItemEx *)context)->SetEarliestSendTime();
+		if (pControlBlock->SlideNextToSend() == firstSN + 1)
+			SetEarliestSendTime();
+	}
+	// GetSendBuf expanded, note that lastSN is a snapshot value while nextSN is a reference
+	// We assume that when shouldAppendCommit is set the upper layer application is kept from put packet into the queue
+	if(inflightCommit 
+	&& _InterlockedCompareExchange((LONG *) & pControlBlock->sendBufferNextSN, lastSN, lastSN + 1) == lastSN)
+	{
+		skb = pControlBlock->HeadSend() + pControlBlock->sendBufferNextPos;
+		skb->InitFlags();	// and locked
+		skb->opCode = COMMIT;
+		skb->SetFlag<IS_COMPLETED>();
+		if (!EmitWithICC(skb, nextSN))
+			skb->Unlock();
+		else
+			pControlBlock->SlideNextToSend();
+		//
+		register int32_t k = ++pControlBlock->sendBufferNextPos - pControlBlock->sendBufferBlockN;
+		if(k >= 0)
+			pControlBlock->sendBufferNextPos = k;
+		_InterlockedIncrement((LONG *) & pControlBlock->sendBufferNextSN);
+		//
+		_InterlockedExchange8(& pControlBlock->shouldAppendCommit, 0);
 	}
 }

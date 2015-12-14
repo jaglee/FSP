@@ -77,5 +77,11 @@
     <ClCompile Include="..\FSP_DLL\tweetnacl.c">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="Test_FlowControl.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Test_TrySRP.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
 </Project>

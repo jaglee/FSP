@@ -73,7 +73,7 @@ FSPHANDLE FSPAPI ListenAt(const PFSP_IN6_ADDR listenOn, PFSP_Context psp1)
 
 
 //[API: Connect]
-//	CLOSED-->{when RDSC hit}-->QUASI_ACTIVE-->[Send RESUME]{enable retry}
+//	CLOSED-->{when DSRC hit}-->QUASI_ACTIVE-->[Send RESUME]{enable retry}
 //	NON_EXISTENT-->CONNECT_BOOTSTRAP
 // Given
 //	const char *	resolvable name (not necessarily domain name) of the remote end
@@ -86,11 +86,40 @@ FSPHANDLE FSPAPI ListenAt(const PFSP_IN6_ADDR listenOn, PFSP_Context psp1)
 //	CallbackConnected() function whose pointer was given in the structure pointed by PSP_SocketParameter
 //  would report later error by passing a NULL FSP handle as the first parameter
 //	and a negative integer, which is the error number, as the second parameter if connection failed
-// TODO: UNRESOLVED! RDSC management!? Timed out for Connect2 and ListenAt
+//
+// UNRESOLVED!? Firstly, try to resume what is in CLOSABLE. CLOSABLE is in the work set, CLOSED is in the recyling cache
+// item->InState(CLOSABLE) || item->InState(PRE_CLOSED)
+////QUASI_ACTIVE-->/ACK_INIT_CONNECT/ 
+////    -->[Send CONNECT_REQUEST]-->CONNECT_AFFIRMING
+//pSocket = MapSocket();
+//if(pSocket != NULL && pSocket->IsInUse())
+//{
+//	// initState
+//	pSocket->AffirmConnect();
+//	return;
+//}
+//(2)	DLL通过Disconnected Session Recycling Cache管理，尝试恢复匹配的已关闭连接
+// The event handle, memory address space, was kept to be reused.
+//	如果新建连接时发现有CLOSABLE或CLOSED状态的会话，会话密钥尚未过期而远端Canonical Name相同，则视为Disconnected Session Recycling Cache命中。
+//	DSRC命中时，LLS首先尝试使用SCB中所保存的地址建立连接，如果超时失败，则尝试重新解析远端地址，重试建立连接，并更新SCB。
+//	在关闭连接时，会话密钥可用的生命期限、关闭连接的时刻均保存在SCB的连接参数中。
+//	在CLOSED的SCB，当ULA通过DLL调用新建连接命令时，如果DSRC在中被命中，则转到QUASI_ACTIVE状态，DLL将RESUME命令报文排入发送队列，调用LLS向远端发送。
+//	在CLOSED状态，LLS接收进程在收到RESUME并且在命中DSRC的前提下，通知DLL回调ULA，若ULA指示“保持连接”，则DLL立即完成到ACTIVE状态的转移。
+//	所要回复的PERSIST命令报文由LLS根据SCB状态，在得到DLL指令时推到空的发送队列然后发送。
+//	从CLOSED状态到NON_EXISTENT，要么是由超时控制的会话密钥超时，要么是上述回调时ULA指示“拒绝”。
+//	在QUASI_ACTIVE状态，当LLS收到PERSIST时立即改为ACTIVE，并通知DLL收取数据。
+//	在QUASI_ACTIVE状态，当LLS按顺序收到的是COMMIT报文时立即改为PEER_COMMIT，并通知DLL收取数据。
+//	在QUASI_ACTIVE状态，当LLS收到ACK_INIT_CONNECT时，视为新建连接的连接响应，完成到CONNECT_AFFIRMING状态的转变。
+//	LLS此时回复以CONNECT_REQUEST报文。这种情形也是连接复活失败的一种，另一种是收到RESET，新建连接也被拒绝。
 DllSpec
 FSPHANDLE FSPAPI Connect2(const char *peerName, PFSP_Context psp1)
 {
 	TRACE_HERE("called");
+	if(psp1->sendSize < 0 || psp1->recvSize < 0 || psp1->sendSize + psp1->recvSize > MAX_FSP_SHM_SIZE + MIN_RESERVED_BUF)
+	{
+		psp1->u.flags = ENOMEM;
+		return NULL;
+	}
 
 	IN6_ADDR addrAny = IN6ADDR_ANY_INIT;
 	CommandNewSession objCommand;
@@ -99,7 +128,15 @@ FSPHANDLE FSPAPI Connect2(const char *peerName, PFSP_Context psp1)
 	psp1->welcome = NULL;	// an active connection request shall have no welcome message
 	psp1->len = 0;			// or else memory access exception may occur
 
-	CSocketItemDl * socketItem = CSocketItemDl::CreateControlBlock((PFSP_IN6_ADDR) & addrAny, psp1, objCommand);
+	CSocketItemDl * socketItem = CSocketItemDl::FindDisconnectedSession(peerName);
+	if(socketItem != NULL && socketItem->Reinitialize(psp1) >= 0)
+	{
+		socketItem->isFlushing = CSocketItemDl::FlushingFlag::REVERT_TO_RESUME;
+		socketItem->AddOneShotTimer(CONNECT_INITIATION_TIMEOUT_ms * 2);
+		return socketItem->CallCreate(objCommand, FSP_Resurrect);
+	}
+	
+	socketItem = CSocketItemDl::CreateControlBlock((PFSP_IN6_ADDR) & addrAny, psp1, objCommand);
 	if(socketItem == NULL)
 	{
 		psp1->u.flags = EBADF;	// E_HANDLE;
@@ -241,7 +278,6 @@ bool LOCALAPI CSocketItemDl::ToWelcomeConnect(BackLogItem & backLog)
 // Auxiliary function that is called when a new connection request is acknowledged by the responder
 // CONNECT_AFFIRMING-->[Rcv.ACK_CONNECT_REQ]-->[API{callback}]
 //	|-->{Return Accept}-->ACTIVE-->[Send PERSIST]{start keep-alive}
-//	|-->{Return Commit}-->COMMITTING-->[Send COMMIT]{enable retry}
 //	|-->{Return Reject}-->NON_EXISTENT-->[Send RESET]
 void CSocketItemDl::ToConcludeConnect()
 {
@@ -271,22 +307,14 @@ void CSocketItemDl::ToConcludeConnect()
 	TRACE_HERE("connection request has been accepted");
 	SetMutexFree();
 
-	int r = 0;
-	if(fpAccepted != NULL)
-		r = fpAccepted(this, &context);
-
-	if(r < 0)
+	SetState(ESTABLISHED);
+	if(fpAccepted != NULL && fpAccepted(this, &context) < 0)
 	{
 		Recycle();
 		return;
 	}
 
-	if(r == 0 && pControlBlock->hasPendingKey == 0)
-		SetState(ESTABLISHED);
-	else
-		SetState(COMMITTING);
-	//
-	Call<FSP_Start>();
+	BeginSubSession();
 }
 
 

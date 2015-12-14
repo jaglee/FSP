@@ -753,7 +753,7 @@ int LOCALAPI CLowerInterface::SendBack(char * buf, int len)
 #ifdef OVER_UDP_IPv4
 	// Store the local(near end) fiber ID as the source, the remote end fiber ID as
 	// the destination fiber ID in the given fiber ID association
-	pktBuf->idPair.peer = InterlockedExchange(& pktBuf->idPair.source, pktBuf->idPair.peer);
+	pktBuf->idPair.peer = _InterlockedExchange((LONG *) & pktBuf->idPair.source, pktBuf->idPair.peer);
 	wsaData[0].buf = (char *) & pktBuf->idPair;
 	wsaData[0].len = sizeof(pktBuf->idPair);
 #else
@@ -1027,8 +1027,6 @@ void CSocketItemEx::ScheduleEmitQ()
 
 void CSocketItemEx::ScheduleConnect(CommandNewSessionSrv *pCmd)
 {
-	// TODO: RDSC management
-	// Send RESUME when RDSC hit
 	pCmd->pSocket = this;
 	QueueUserWorkItem(HandleConnect, pCmd, WT_EXECUTELONGFUNCTION);
 }

@@ -31,6 +31,7 @@ void UnitTestSendRecvWnd()
 	// set the negotiated receive window parameter
 	pSCB->SetRecvWindowHead(FIRST_SN);
 	pSCB->SetSendWindowWithHeadReserved(FIRST_SN);
+
 	ControlBlock::PFSP_SocketBuf skb = pSCB->HeadSend();
 	Assert::IsNotNull(skb);
 	Assert::IsTrue(pSCB->sendBufferNextSN == FIRST_SN + 1);
@@ -45,15 +46,17 @@ void UnitTestSendRecvWnd()
 	if(m < MAX_BLOCK_SIZE * 2)
 		return;
 
-	// TODO: UnitTest of SendInplace, SendStream
-
 	ControlBlock::PFSP_SocketBuf skb3 = pSCB->HeadSend() + 2;
 	skb->SetFlag<IS_ACKNOWLEDGED>();
 	skb3->SetFlag<IS_ACKNOWLEDGED>();
 
 	// emulate received the first data packet
 	ControlBlock::PFSP_SocketBuf skb4 = pSCB->AllocRecvBuf(FIRST_SN);
+	uint8_t *recvBuf;
+
 	Assert::IsNotNull(skb4);
+	recvBuf = pSCB->GetRecvPtr(skb4);
+
 	Assert::IsTrue(pSCB->recvWindowFirstSN == FIRST_SN);
 	Assert::IsTrue(pSCB->recvWindowNextSN == FIRST_SN + 1);
 	// TODO: SCB buffer pointer to user space pointer
@@ -63,9 +66,10 @@ void UnitTestSendRecvWnd()
 
 	int m2;	// onReturn it should == skb4->len, i.e. MAX_BLOCK_SIZE - 13
 	bool toBeContinued;
-	void *inplaceBuf2 = pSCB->InquireRecvBuf(m2, toBeContinued);
-	Assert::IsNotNull(inplaceBuf2);
+	uint8_t *recvBuf2 = (uint8_t *)pSCB->InquireRecvBuf(m2, toBeContinued);
+	Assert::IsTrue(recvBuf2 == recvBuf);
 	Assert::IsTrue(m2 == MAX_BLOCK_SIZE - 13);
+	Assert::IsTrue(pSCB->recvWindowFirstSN == FIRST_SN + 1);
 
 	ControlBlock::PFSP_SocketBuf skb5 = pSCB->AllocRecvBuf(FIRST_SN);
 	Assert::IsTrue(skb5 != skb4);	// out of order, and it depends that IsNull(skb5)
@@ -74,21 +78,24 @@ void UnitTestSendRecvWnd()
 	Assert::IsNull(skb5);			// no more advertised window space
 
 	// emulate a received message that crosses two packet
-	skb5 = pSCB->AllocRecvBuf(FIRST_SN + 1);
-	Assert::IsNotNull(skb5);
-	Assert::IsTrue(pSCB->recvWindowNextSN == FIRST_SN + 2);
-
-	skb5->len = MAX_BLOCK_SIZE;
-	skb5->SetFlag<TO_BE_CONTINUED>();
-	skb5->SetFlag<IS_FULFILLED>();
-	skb5->Lock();
-
+	// assume the packets are received out of the order
 	skb5 = pSCB->AllocRecvBuf(FIRST_SN + 2);
 	Assert::IsNotNull(skb5);
 	Assert::IsTrue(pSCB->recvWindowNextSN == FIRST_SN + 3);
+	recvBuf2 = pSCB->GetRecvPtr(skb5);
+	Assert::IsTrue(recvBuf2 - recvBuf == MAX_BLOCK_SIZE * 2);
 
 	skb5->len = MAX_BLOCK_SIZE - 13;
 	skb5->SetFlag<TO_BE_CONTINUED>(false);
+	skb5->SetFlag<IS_FULFILLED>();
+	skb5->Lock();
+
+	skb5 = pSCB->AllocRecvBuf(FIRST_SN + 1);
+	Assert::IsNotNull(skb5);
+	//Assert::IsTrue(pSCB->recvWindowNextSN == FIRST_SN + 2);
+
+	skb5->len = MAX_BLOCK_SIZE;
+	skb5->SetFlag<TO_BE_CONTINUED>();
 	skb5->SetFlag<IS_FULFILLED>();
 	skb5->Lock();
 
@@ -96,6 +103,8 @@ void UnitTestSendRecvWnd()
 	skb5 = pSCB->AllocRecvBuf(FIRST_SN + 4);
 	Assert::IsNotNull(skb5);
 	Assert::IsTrue(pSCB->recvWindowNextSN == FIRST_SN + 5);
+	recvBuf2 = pSCB->GetRecvPtr(skb5);
+	Assert::IsTrue(recvBuf2 == recvBuf);	// because the size of the receive queue == MAX_BLOCK_SIZE * 4
 
 	skb5->len = MAX_BLOCK_SIZE - 13;
 	skb5->SetFlag<TO_BE_CONTINUED>(false);

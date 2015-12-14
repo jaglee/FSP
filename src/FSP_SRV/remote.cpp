@@ -32,8 +32,6 @@
 #include <assert.h>
 #include <stdarg.h>
 
-#pragma intrinsic(_InterlockedCompareExchange16)
-
 
 // 'Package' internal use only
 struct _CookieMaterial
@@ -230,12 +228,9 @@ l_return:
 //LISTENING-->/CONNECT_REQUEST/-->[API{new context, callback}]
 //	|-->[{return}Accept]
 //		-->{new context}CHALLENGING-->[Send ACK_CONNECT_REQ]
-//	|-->[{return}Commit{new context}]
-//		-->{new context}COMMITTING-->[Send COMMIT]{enable retry}
 //	|-->[{return}Reject]-->[Send RESET]{abort creating new context}
 //CLOSED-->/CONNECT_REQUEST/-->[API{callback}]
 //	|-->[{return}Accept]-->CHALLENGING-->[Send ACK_CONNECT_REQ]
-//	|-->[{return}Commit]-->COMMITTING-->[Send COMMIT]{enable retry}
 //	|-->[{return}Reject]-->NON_EXISTENT-->[Send RESET]
 void LOCALAPI CLowerInterface::OnGetConnectRequest()
 {
@@ -303,7 +298,7 @@ void LOCALAPI CLowerInterface::OnGetConnectRequest()
 	CtrlMsgHdr * const pHdr = (CtrlMsgHdr *)mesgInfo.Control.buf;
 	if (pHdr->IsIPv6())
 	{
-		memcpy(&backlogItem.acceptAddr, &pHdr->u, sizeof(FSP_PKTINFO));
+		memcpy(&backlogItem.acceptAddr, &pHdr->u, sizeof(FSP_SINKINF));
 	}
 	else
 	{	// FSP over UDP/IPv4
@@ -499,7 +494,6 @@ bool LOCALAPI CSocketItemEx::ValidateSNACK(ControlBlock::seq_t & ackSeqNo, FSP_S
 // Remark
 //	CONNECT_AFFIRMING-->/ACK_CONNECT_REQ/-->[API{callback}]
 //		|-->{Return Accept}-->ACTIVE-->[Send PERSIST]{start keep-alive}
-//		|-->{Return Commit}-->COMMITTING-->[Send COMMIT]{enable retry}
 //		|-->{Return Reject}-->NON_EXISTENT-->[Send RESET]
 // See also {FSP_DLL}CSocketItemDl::ToConcludeConnect()
 void LOCALAPI CSocketItemEx::OnConnectRequestAck(FSP_AckConnectRequest & response, int lenData)
@@ -620,8 +614,10 @@ void CSocketItemEx::OnGetPersist()
 		return;
 	}
 
-	ControlBlock::seq_t ackSeqNo = be32toh(headPacket->GetHeaderFSP()->expectedSN);
-	if (!ResizeSendWindow(ackSeqNo, headPacket->GetHeaderFSP()->GetRecvWS()))
+
+	FSP_NormalPacketHeader *p1 = headPacket->GetHeaderFSP();
+	ControlBlock::seq_t ackSeqNo = be32toh(p1->expectedSN);
+	if (!ResizeSendWindow(ackSeqNo, p1->GetRecvWS()))
 	{
 #ifdef TRACE
 		printf_s("Cannot resize send window. Acknowledged sequence number: %u\n", ackSeqNo);
@@ -755,17 +751,15 @@ void CSocketItemEx::OnGetPureData()
 	if (!ValidateICC())
 	{
 		TRACE_HERE("Invalid intergrity check code!?");
-#ifdef TRACE_PACKET
-		printf_s("PURE_DATA header length: %d, Data length: %d, peer ALFID = %u\n", (int)be16toh(headPacket->hdr.hs.hsp), headPacket->lenData, fidPair.peer);
-		DumpNetworkUInt16((uint16_t *) & headPacket->hdr, be16toh(headPacket->hdr.hs.hsp) / 2);
-#endif
 		return;
 	}
 
-	if (!ResizeSendWindow(be32toh(headPacket->GetHeaderFSP()->expectedSN), headPacket->GetHeaderFSP()->GetRecvWS()))
+	FSP_NormalPacketHeader *p1 = headPacket->GetHeaderFSP();
+	ControlBlock::seq_t ackSeqNo = be32toh(p1->expectedSN);	
+	if (!ResizeSendWindow(ackSeqNo, p1->GetRecvWS()))
 	{
 #ifdef TRACE
-		printf_s("An out of order acknowledgement? seq#%u\n", be32toh(headPacket->GetHeaderFSP()->expectedSN));
+		printf_s("An out of order acknowledgement? seq#%u\n",ackSeqNo);
 #endif
 		return;
 	}
@@ -853,10 +847,8 @@ void CSocketItemEx::OnGetCommit()
 		if(pControlBlock->HasBeenCommitted() <= 0)
 			return;	// just prebuffer; but the payload would be ignored in PRE_CLOSED state!
 		//
-		StopKeepAlive();
-		SetState(CLOSED);
 		SendPacket<RELEASE>();
-		Notify(FSP_NotifyFinish);
+		CloseToNotify();
 		return;	// Note the retransmitted RELEASE packet is to assure the peer that the session is deliberately terminated.
 	}
 
@@ -963,12 +955,19 @@ void CSocketItemEx::OnAckFlush()
 
 
 // RESUME may resume or resurrect a closable/closed connection
-// UNRESOLVED! If the socket itself has been free...
-// See OnResume() and OnResurrect()
+// PEER_COMMIT-->/RESUME/-->ACTIVE-->[Send PERSIST]{restart keep-alive}
+// COMMITTING2-->/RESUME/-->ACTIVE-->[Send PERSIST]
+// PRE_CLOSED-->/RESUME/-->CLOSABLE-->[API{callback}]
+// CLOSABLE-->/RESUME/-->[API{callback}]
+//	|-->[{Return Accept}]-->ACTIVE-->[Send PERSIST]{restart keep-alive}
+//	|-->[{Return Reject}]-->NON_EXISTENT-->[Send RESET]
+// CLOSED<-->/RESUME/{DSRC missed}<-->[Send ACK_INIT_CONNECT]
+//	|-->/RESUME/{DSRC hitted}-->[API{callback}]
+//	|-->[{Return Accept}]-->ACTIVE-->[Send PERSIST]{start keep-alive}
+//	|-->[{Return Reject}]-->NON_EXISTENT-->[Send RESET]
 void CSocketItemEx::OnGetResume()
 {
 	TRACE_SOCKET();
-	FSP_NormalPacketHeader *pHdr = headPacket->GetHeaderFSP();
 
 	// A CLOSED connnection may be resurrected, provide the session key is not out of life
 	// A replayed/redundant RESUME would be eventually acknowedged by a legitimate PERSIST
@@ -985,25 +984,16 @@ void CSocketItemEx::OnGetResume()
 		return;
 	}
 
-	if(! ResizeSendWindow(be32toh(pHdr->expectedSN), pHdr->GetRecvWS()))
+	FSP_NormalPacketHeader *p1 = headPacket->GetHeaderFSP();
+	if(! ResizeSendWindow(be32toh(p1->expectedSN), p1->GetRecvWS()))
 		return;
 
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->AllocRecvBuf(headPacket->pktSeqNo);
-	// UNRESOLVED! Should send window to be recalibrated?
-	// TODO: UNRESOLVED! if it return -EEXIST, should ULA be re-alerted?
 	if(skb == NULL)
 	{
 		// UNRESOLVED!? Just retransmit the acknowledgement...
 		return;
 	}
-
-	HandleMobileParam(pHdr->PFirstExtHeader());
-	// no more extension header expected for RESUME
-
-	if(InState(PRE_CLOSED) || InState(CLOSED))
-		OnResurrect();
-	else
-		OnResume();
 
 	int r = PlacePayload(skb);
 	if (r == -EFAULT)
@@ -1012,10 +1002,30 @@ void CSocketItemEx::OnGetResume()
 		return;
 	}
 
+	if(InState(PRE_CLOSED))
+		SetState(CLOSABLE);
+
+	HandleMobileParam(p1->PFirstExtHeader());
+	// no more extension header expected for RESUME
+
 	tLastRecv = NowUTC();	// tLastRecv should not be modified? UNRESOLVED!
 
-	// UNRESOLVED! should signal to resume the connection...
-	SignalEvent();
+	if(InState(CLOSED) || InState(CLOSABLE))
+	{
+		Notify(FSP_NotifyAccepting);
+		return;
+	}
+
+	SetState(ESTABLISHED);
+	ConfirmConnect();
+	EmitStartAndSlide();
+
+	if(InState(PEER_COMMIT))
+		RestartKeepAlive();
+#ifdef _DEBUG
+	else if(! InState(COMMITTING2))
+		TRACE_HERE("it can only resume from PEER_COMMIT, COMMITTING2 or CLOSABLE state");
+#endif
 }
 
 
@@ -1057,9 +1067,11 @@ void CSocketItemEx::OnGetRelease()
 	if(! InState(CLOSABLE)) //  InState(PEER_COMMIT, COMMITTING2, PRE_CLOSED)
 		SendSNACK();
 
-	SetState(CLOSED);
-	Notify(FSP_NotifyFinish);
-	(CLowerInterface::Singleton())->FreeItem(this);
+	Notify(InState(PRE_CLOSED) ? FSP_NotifyRecycled : FSP_NotifyFinish);
+	// NotifyRecyled is meant to be call-back of gracefully shutdown,
+	// while NotifyFinish is requested by the remote end
+	// See also CloseToNotify.
+	CloseSocket();
 }
 
 
