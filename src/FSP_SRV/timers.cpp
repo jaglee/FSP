@@ -1,10 +1,10 @@
 /*
  * FSP lower-layer service program, software time-wheel, might be accelerated by hardware
  * heartbeat callback and its related functions to
- * - retransmit INITIATE_CONNECT, CONNECT_REQUEST, RESUME or MULTIPLY
+ * - retransmit INITIATE_CONNECT, CONNECT_REQUEST or MULTIPLY
  * - send heartbeat signal PERSIST
- * - idle timeout of CONNECT_BOOTSTRAP, CONNECT_AFFIRMING, QUASI_ACTIVE, CLONING
- *	 or CHALLENGING, as well as ACTIVE, RESUMING or COMMITTING state
+ * - idle timeout of CONNECT_BOOTSTRAP, CONNECT_AFFIRMING, CLONING or CHALLENGING,
+ * - as well as ACTIVE, COMMITTING, COMMITTING2, or PRE_CLOSED state
  * - and finally, 'lazy' garbage collecting of CLOSABLE or CLOSED state
  *
     Copyright (c) 2012, Jason Gao
@@ -49,7 +49,6 @@
 	  {CONNECT_BOOTSTRAP, CHALLENGING, CONNECT_AFFIRMING}-->NON_EXISTENT
 	  {COMMITTING, COMMITTING2, PRE_CLOSED}-->NON_EXISTENT
 	  CLONING-->NON_EXISTENT
-	  {RESUMING, QUASI_ACTIVE}-->CLOSED
 
   Implementation should start garbage collecting as soon as it switches into NON_EXSISTENT state.
 
@@ -77,7 +76,6 @@
 
 // Timeout of initiation family retransmission, keep-alive transmission and Scanvenger activation
 // State idle timeout
-// A SCB in the CLOSABLE state could be RESUMEd while in the CLOSED state could be resurrected
 void CSocketItemEx::TimeOut()
 {
 	if(! this->TestAndLockReady())
@@ -179,24 +177,6 @@ void CSocketItemEx::TimeOut()
 		}
 		EmitStart();
 		break;
-	case RESUMING:
-	case QUASI_ACTIVE:
-		if (t1 - tSessionBegin >  (MAXIMUM_SESSION_LIFE_ms << 10) )
-		{
-#ifdef TRACE
-			printf_s("\nTransient state time out or key out of life in the %s state\n", stateNames[lowState]);
-#endif
-			TIMED_OUT();
-		}
-		else if(t1 - clockCheckPoint.tMigrate > (TRASIENT_STATE_TIMEOUT_ms << 10))
-		{
-			Notify(FSP_NotifyTimeout);
-			SetReady();
-			CloseSocket();
-			return;
-		}
-		EmitStart();
-		break;
 	}
 
 	if (_InterlockedExchange8(& toUpdateTimer, 0))
@@ -209,12 +189,11 @@ void CSocketItemEx::TimeOut()
 // Send heartbeart signal to the remote end, may trigger retransmission of the remote end
 /**
 -	Retransmission of PERSIST
-	An FSP node in the ESTABLISHED state MUST retransmit the unacknowledged PERSIST packet
+	An FSP node MUST retransmit the unacknowledged PERSIST packet at the head of the send queue
 	at the tempo of transmitting heartbeat signals.
 -	Retransmission of COMMIT
-	An FSP node in the COMMITTING or COMMITTING2 state MUST retransmit the unacknowledged COMMIT packet
+	An FSP node MUST retransmit the unacknowledged COMMIT packet at the head of the send queue
 	at the tempo of transmitting heartbeat signals. 
--	LLS should change PERSIST packet to COMMIT if it has migrated to the COMMITTING or COMMITTING2 state
 */
 void CSocketItemEx::KeepAlive()
 {
@@ -243,6 +222,7 @@ void CSocketItemEx::KeepAlive()
 	}
 
 	// Only in ESTABLISHED, COMMITTING, COMMITTING2 or COMMITTED state may KEEP_ALIVE be sent
+	// State might be changed during the inverval, however it does little harm
 	SendSNACK(KEEP_ALIVE);
 }
 
@@ -490,7 +470,7 @@ void CSocketItemEx::RecalibrateKeepAlive(uint64_t rtt64_us)
 void CSocketItemEx::CalibrateKeepAlive()
 {
 	tLastRecv = NowUTC();
-	// The timer was already started for transient state management when SynConnect() or sending MULTIPLY/RESUME
+	// The timer was already started for transient state management when SynConnect() or sending MULTIPLY
 	tRoundTrip_us = (uint32_t)min(UINT32_MAX, tLastRecv - tRecentSend);
 	tKeepAlive_ms = tRoundTrip_us >> 8;
 #ifndef NDEBUG

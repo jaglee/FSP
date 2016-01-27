@@ -579,8 +579,6 @@ struct ControlBlock
 	ALIGN(8)
 	volatile FSP_Session_State state;
 	char			hasPendingKey;
-	char			shouldAppendCommit;
-
 	ALFID_T			idParent;
 
 	ALIGN(8)	// 64-bit aligment

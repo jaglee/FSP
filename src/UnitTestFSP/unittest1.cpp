@@ -612,11 +612,11 @@ void UnitTestTestSetFlag()
 void UnitTestSocketInState()
 {
 	CSocketItemExDbg socket(2, 2);
-	socket.SetState(QUASI_ACTIVE);
-	bool r = socket.InStates(3, COMMITTING, RESUMING, QUASI_ACTIVE);
+	socket.SetState(CLONING);
+	bool r = socket.InStates(3, COMMITTING, CLONING, PRE_CLOSED);
 	Assert::IsTrue(r);
 	socket.SetState(CLOSABLE);
-	r = socket.InStates(4, COMMITTING2, RESUMING, QUASI_ACTIVE, CLOSED);
+	r = socket.InStates(4, COMMITTING2, CLONING, PRE_CLOSED, CLOSED);
 	Assert::IsFalse(r);
 }
 
@@ -914,85 +914,6 @@ void UnitTestOCB_MAC()
 
 
 
-
-void UnitTestConfirmConnect()
-{
-	int memsize = sizeof(ControlBlock) + (sizeof ControlBlock::FSP_SocketBuf + MAX_BLOCK_SIZE) * 8;
-	const ControlBlock::seq_t FIRST_SN = 12;
-
-	CSocketItemExDbg socket;
-	ControlBlock *pSCB = socket.GetControlBlock();
-	pSCB->Init((memsize - sizeof(ControlBlock))/ 2, (memsize - sizeof(ControlBlock)) / 2);
-
-	pSCB->SetRecvWindowHead(FIRST_SN);
-	pSCB->SetSendWindowHead(FIRST_SN);
-
-	socket.SetState(CONNECT_AFFIRMING);
-	bool b = socket.ConfirmConnect();
-	ControlBlock::PFSP_SocketBuf skb = pSCB->GetSendQueueHead();
-	Assert::IsTrue(b && skb->opCode == PERSIST && pSCB->CountSendBuffered() == 1);
-
-	// ConfirmConnect is itempotent
-	b = socket.ConfirmConnect();
-	skb = pSCB->GetSendQueueHead();
-	Assert::IsTrue(b && skb->opCode == PERSIST && pSCB->CountSendBuffered() == 1);
-
-	skb->opCode = PURE_DATA;
-	b = socket.ConfirmConnect();
-	skb = pSCB->GetSendQueueHead();
-	Assert::IsTrue(b && skb->opCode == PERSIST && pSCB->CountSendBuffered() == 1);
-
-	// A COMMIT packet is preserved even if it is not in COMMITING or COMMITTING2 state
-	skb->opCode = COMMIT;
-	b = socket.ConfirmConnect();
-	skb = pSCB->GetSendQueueHead();
-	Assert::IsTrue(b && skb->opCode == COMMIT && pSCB->CountSendBuffered() == 1);
-
-	// Reset, test committing
-	pSCB->SetRecvWindowHead(FIRST_SN);
-	pSCB->SetSendWindowHead(FIRST_SN);
-
-	socket.SetState(COMMITTING);
-	b = socket.ConfirmConnect();
-	skb = pSCB->GetSendQueueHead();
-	Assert::IsTrue(b && skb->opCode == COMMIT && pSCB->CountSendBuffered() == 1);
-
-	// ConfirmConnect is itempotent for COMMITTING as well
-	b = socket.ConfirmConnect();
-	skb = pSCB->GetSendQueueHead();
-	Assert::IsTrue(b && skb->opCode == COMMIT && pSCB->CountSendBuffered() == 1);
-
-	skb->opCode = PURE_DATA;
-	b = socket.ConfirmConnect();
-	skb = pSCB->GetSendQueueHead();
-	Assert::IsTrue(b && skb->opCode == COMMIT && pSCB->CountSendBuffered() == 1);
-
-	skb->opCode = PERSIST;
-	b = socket.ConfirmConnect();
-	skb = pSCB->GetSendQueueHead();
-	Assert::IsTrue(b && skb->opCode == COMMIT && pSCB->CountSendBuffered() == 1);
-
-	skb->opCode = ACK_CONNECT_REQ;
-	b = socket.ConfirmConnect();
-	Assert::IsFalse(b);
-
-	// Let's assume two packets in the send queue already
-	pSCB->sendBufferNextSN++;
-	pSCB->sendBufferNextPos++;
-
-	skb->opCode = PURE_DATA;
-	skb++;
-	skb->opCode = PURE_DATA;
-
-	// Still in COMMITING; but the opCode should be PERSIST
-	b = socket.ConfirmConnect();
-	Assert::IsTrue(b);
-	skb = pSCB->GetSendQueueHead();
-	Assert::IsTrue(skb->opCode == PERSIST && pSCB->CountSendBuffered() == 2);
-}
-
-
-
 namespace UnitTestFSP
 {		
 	TEST_CLASS(UnitTest1)
@@ -1103,12 +1024,6 @@ namespace UnitTestFSP
 		TEST_METHOD(TestHasBeenCommitted)
 		{
 			UnitTestHasBeenCommitted();
-		}
-
-
-		TEST_METHOD(TestConfirmConnect)
-		{
-			UnitTestConfirmConnect();
 		}
 
 

@@ -122,12 +122,8 @@ typedef enum _FSP_Session_State: char
 	CLOSED,
 	// context cloned/connection multiplying (ESTABLISHED:CLOSABLE)
 	CLONING,
-	// after sending RESUME, before RESUME acknowledged
-	RESUMING,
-	// resurrect from CLOSED:
-	QUASI_ACTIVE,
 	//
-	LARGEST_FSP_STATE = QUASI_ACTIVE
+	LARGEST_FSP_STATE = CLONING
 } FSP_Session_State;
 
 
@@ -144,7 +140,6 @@ typedef enum _FSP_Operation_Code: char
 	PURE_DATA,	// Without any optional header
 	COMMIT,		// A.K.A. FLUSH, used to be ADJOURN
 	ACK_FLUSH,
-	RESUME,		// RESUME or RESURRECT connection, may piggyback payload
 	RELEASE,
 	MULTIPLY,	// To clone connection, may piggyback payload
 	KEEP_ALIVE,
@@ -174,7 +169,6 @@ typedef enum: char
 	FSP_Urge,			// send a packet urgently, mean to urge COMMIT
 	FSP_Shutdown,		// close the connection
 	FSP_InstallKey,		// install the authenticated encryption key
-	FSP_Resurrect,		// Resurrect a closable/closed connection in the recyling cache
 	// 16~23: LLS to DLL in the backlog
 	FSP_NotifyAccepting = SynConnection,	// a reverse command to make context ready
 	FSP_NotifyRecycled = FSP_Recycle,		// a reverse command to inform DLL to release resource passively
@@ -207,7 +201,6 @@ typedef uint64_t timestamp_t;
  */
 #define CONNECT_INITIATION_TIMEOUT_ms	30000	// half a minute
 #define TRASIENT_STATE_TIMEOUT_ms		300000	// 5 minutes
-#define MINIMUM_LIFETIME_RESUMABLE		3		// One for RESUME, one for ACK_FLUSH, and one for RELEASE
 
 #include <pshpack1.h>
 

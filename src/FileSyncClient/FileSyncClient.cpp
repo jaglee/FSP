@@ -14,8 +14,6 @@ static void FSPAPI onReceiveFileNameReturn(FSPHANDLE, FSP_ServiceCode, int);
 static int	FSPAPI onReceiveNextBlock(FSPHANDLE, void *, int32_t, bool);
 
 //
-static void FSPAPI toResurrect(FSPHANDLE, FSP_ServiceCode, int);
-static int	FSPAPI onResurrected(FSPHANDLE, PFSP_Context);
 static void FSPAPI onAcknowledgeSent(FSPHANDLE, FSP_ServiceCode, int);
 
 
@@ -272,7 +270,6 @@ static void FSPAPI onReceiveFileNameReturn(FSPHANDLE h, FSP_ServiceCode resultCo
 			}
 		}
 		//
-		FSPControl(h, FSP_SET_CALLBACK_ON_FINISH, (ulong_ptr)toResurrect);
 		printf_s("To read content with inline buffering...\n");
 		RecvInline(h, onReceiveNextBlock);
 	}
@@ -314,56 +311,12 @@ static int FSPAPI onReceiveNextBlock(FSPHANDLE h, void *buf, int32_t len, bool t
 	// and return a non-zero would let the occupied receive buffer free
 	if(! toBeContinued)
 	{
-		printf_s("All data have been received, to shutdown...\n");
-		if(Shutdown(h, toResurrect) != 0)
-		{
-			printf_s("Cannot shutdown gracefully in the resurrectable stage.\n");
-			Dispose(h);
-			finished = true;
-		}
+		printf_s("All data have been received, to acknowledge...\n");
+		// Respond with a code saying no error
+		return WriteTo(h, "0000", 4, END_OF_MESSAGE, onAcknowledgeSent);
 	}
 
 	return 1;
-}
-
-
-
-// Session was not really shut down, but to resurrect here
-static void FSPAPI toResurrect(FSPHANDLE h, FSP_ServiceCode code, int value)
-{
-	printf_s("Fiber ID = %u, session was to disconnect and resurrect.\n", (uint32_t)(intptr_t)h);
-	printf_s("Should get FSP_NotifyRecycled, got service code %d, return %d\n", code, value);
-
-	// The same as in main()
-	FSP_SocketParameter parms;
-	memset(& parms, sizeof(parms), 0);
-	// parms.beforeAccept = NULL;
-	parms.afterAccept = onResurrected;
-	parms.afterClose = onFinished;	// yes, passive release is accepted by the client now
-	parms.onError = onNotice;
-	parms.recvSize = MAX_FSP_SHM_SIZE;	// 4MB
-	parms.sendSize = 0;	// the underlying service would give the minimum, however
-	if(Connect2(REMOTE_APPLAYER_NAME, & parms) == NULL)
-	{
-		printf("Failed to initialize the connection in the very beginning\n");
-		return;
-	}
-}
-
-
-int FSPAPI onResurrected(FSPHANDLE h, PFSP_Context ctx)
-{
-	printf_s("\nResurrected: handle of FSP session/Fiber ID = %u\n", (uint32_t)(intptr_t)h);
-	if(h == NULL)
-	{
-		printf_s("\nResurrection failure.\n");
-		finished = true;
-		return -1;
-	}
-
-	// Respond with a code saying no error
-	WriteTo(h, "0000", 4, END_OF_MESSAGE, onAcknowledgeSent);
-	return 0;
 }
 
 

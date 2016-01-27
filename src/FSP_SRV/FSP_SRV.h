@@ -374,7 +374,6 @@ public:
 		return (offset < sizeof(ControlBlock) || offset >= dwMemorySize) ? NULL : p;
 	}
 
-
 	void LOCALAPI SetRemoteFiberID(ALFID_T id);
 	char *PeerName() const { return (char *)pControlBlock->peerAddr.name; }
 	int LOCALAPI ResolveToIPv6(const char *);
@@ -382,7 +381,8 @@ public:
 
 	bool LOCALAPI Notify(FSP_ServiceCode);
 	void SignalEvent() { ::SetEvent(hEvent); }
-	void SignalReturned() { pControlBlock->notices.SetHead(FSP_NotifyAccepting); SignalEvent(); }
+	void SignalAccepted() { pControlBlock->notices.SetHead(FSP_NotifyAccepted); SignalEvent(); }
+	void SignalAccepting() { pControlBlock->notices.SetHead(FSP_NotifyAccepting); SignalEvent(); }
 	//
 	int LOCALAPI RespondToSNACK(ControlBlock::seq_t, FSP_SelectiveNACK::GapDescriptor *, int);
 	int32_t LOCALAPI GenerateSNACK(FSP_PreparedKEEP_ALIVE &, ControlBlock::seq_t &);
@@ -401,7 +401,6 @@ public:
 
 	void HandleMemoryCorruption() {	Extinguish(); }
 	void LOCALAPI AffirmConnect(const SConnectParam &, ALFID_T);
-	bool ConfirmConnect();
 
 	bool IsValidSequence(ControlBlock::seq_t seq1) { return pControlBlock->IsValidSequence(seq1); }
 
@@ -455,7 +454,6 @@ public:
 	void ScheduleConnect(CommandNewSessionSrv *);
 
 	//
-	bool CheckPeerCommit();
 	bool AddTimer();
 	bool RemoveTimer();
 	bool LOCALAPI ReplaceTimer(uint32_t);
@@ -482,7 +480,6 @@ public:
 	void Start();
 	void UrgeCommit();
 	void SynConnect();
-	bool LOCALAPI Resurrect(DWORD);
 	void LOCALAPI Listen(CommandNewSessionSrv &);
 
 	// Event triggered by the remote peer
@@ -491,7 +488,6 @@ public:
 	void OnGetPureData();	// PURE_DATA
 	void OnGetCommit();		// COMMIT packet might be apparently out-of-band/out-of-order as well
 	void OnAckFlush();		// ACK_FLUSH is always out-of-band
-	void OnGetResume();		// RESUME may resume or resurrect
 	void OnGetRelease();	// RELEASE may not carry payload
 	void OnGetMultiply();	// MULTIPLY is treated out-of-band
 	void OnGetKeepAlive();	// KEEP_ALIVE is usually out-of-band

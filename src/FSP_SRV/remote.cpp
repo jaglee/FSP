@@ -174,8 +174,6 @@ void LOCALAPI CLowerInterface::OnGetInitConnect()
 
 //CONNECT_BOOTSTRAP-->/ACK_INIT_CONNECT/
 //	-->CONNECT_AFFIRMING-->[Send CONNECT_REQUEST]
-//QUASI_ACTIVE-->/ACK_INIT_CONNECT/
-//	-->CONNECT_AFFIRMING-->[Send CONNECT_REQUEST]
 // Do
 //	Check the inititiator's cookie, make the formal connection request towards the responder
 void LOCALAPI CLowerInterface::OnInitConnectAck()
@@ -197,7 +195,7 @@ void LOCALAPI CLowerInterface::OnInitConnectAck()
 	SConnectParam & initState = pSocket->pControlBlock->connectParams;
 	ALFID_T idListener = initState.idRemote;
 
-	if(! pSocket->InState(CONNECT_BOOTSTRAP) && ! pSocket->InState(QUASI_ACTIVE))
+	if(! pSocket->InState(CONNECT_BOOTSTRAP))
 		goto l_return;
 
 	if(initState.initCheckCode != pkt->initCheckCode)
@@ -328,8 +326,8 @@ void LOCALAPI CLowerInterface::OnGetConnectRequest()
 	// lastly, put it into the backlog
 	pSocket->pControlBlock->backLog.Put(& backlogItem);
 	// TODO: handling resurrection failure -- just reuse?
-	// if (pSocket->InState(CLOSED)) //;
-	pSocket->SignalReturned();
+	// if (pSocket->InState(CLOSED));
+	pSocket->SignalAccepting();
 
 l_return:
 	pSocket->SetReady();
@@ -339,7 +337,7 @@ l_return:
 
 //{CONNECT_BOOTSTRAP, CONNECT_AFFIRMING, CHALLENGING, ACTIVE,
 // COMMITTING, PEER_COMMIT, COMMITTING2, COMMITTED, CLOSABLE,
-// PRE_CLOSED, CLONING, RESUMING, QUASI_ACTIVE}-->/RESET/
+// PRE_CLOSED, CLONING}-->/RESET/
 //    -->NON_EXISTENT-->[Notify]
 //{NON_EXISTENT, LISTENING, CLOSED, Otherwise}<-->/RESET/{Ignore}
 void LOCALAPI CLowerInterface::OnGetResetSignal()
@@ -362,6 +360,7 @@ void LOCALAPI CLowerInterface::OnGetResetSignal()
 		{
 			pSocket->DisposeOnReset();
 		}
+		// otherwise simply ignore
 	}
 	else if(pSocket->InState(CONNECT_AFFIRMING))
 	{
@@ -370,6 +369,7 @@ void LOCALAPI CLowerInterface::OnGetResetSignal()
 		{
 			pSocket->DisposeOnReset();
 		}
+		// otherwise simply ignore
 	}
 	else if(pSocket->InState(CHALLENGING))
 	{
@@ -378,19 +378,20 @@ void LOCALAPI CLowerInterface::OnGetResetSignal()
 		{
 			pSocket->DisposeOnReset();
 		}
+		// otherwise simply ignore
 	}
-	else if(pSocket->InStates(10, ESTABLISHED, COMMITTING, PEER_COMMIT, COMMITTING2, COMMITTED, CLOSABLE
-		, PRE_CLOSED, CLONING, RESUMING, QUASI_ACTIVE))
+	else if(! pSocket->InState(LISTENING) && ! pSocket->InState(CLOSED))
 	{
-		// besides, those states are recoverable.
 		if(pSocket->IsValidSequence(be32toh(reject.u.sn.initial))
 		&& pSocket->ValidateICC((FSP_NormalPacketHeader *) & reject))
 		{
 			pSocket->DisposeOnReset();
 		}
+		// otherwise simply ignore.
 	}
+	// InStates ESTABLISHED, COMMITTING, PEER_COMMIT, COMMITTING2, COMMITTED, CLOSABLE, PRE_CLOSED, CLONING
+	// besides, those states are recoverable.
 	// LISTENING state is not affected by reset signal
-	// And a CLOSED session responds to RESUME only
 }
 
 
@@ -493,7 +494,7 @@ bool LOCALAPI CSocketItemEx::ValidateSNACK(ControlBlock::seq_t & ackSeqNo, FSP_S
 
 // Remark
 //	CONNECT_AFFIRMING-->/ACK_CONNECT_REQ/-->[API{callback}]
-//		|-->{Return Accept}-->ACTIVE-->[Send PERSIST]{start keep-alive}
+//		|-->{Return Accept}-->PEER_COMMIT-->[Send PERSIST]{start keep-alive}
 //		|-->{Return Reject}-->NON_EXISTENT-->[Send RESET]
 // See also {FSP_DLL}CSocketItemDl::ToConcludeConnect()
 void LOCALAPI CSocketItemEx::OnConnectRequestAck(FSP_AckConnectRequest & response, int lenData)
@@ -556,9 +557,6 @@ void LOCALAPI CSocketItemEx::OnConnectRequestAck(FSP_AckConnectRequest & respons
 	// ephemeral session key material was ready OnInitConnectAck
 	InstallEphemeralKey();
 
-	SignalReturned();
-	TRACE_HERE("finally the connection request is accepted");
-
 #ifdef TRACE
 	TRACE_HERE("the initiator recalculate RTT");
 	DumpTimerInfo(tLastRecv);
@@ -570,19 +568,27 @@ void LOCALAPI CSocketItemEx::OnConnectRequestAck(FSP_AckConnectRequest & respons
 
 	seqLastAck = pktSeqNo - 1;
 	//^Because the sequence number of ACK_CONNECT_REQUEST might be reused to acknowledge PERSIST or COMMIT 
+
+	SignalAccepted();	// The initiator may cancel data transmission, however
+	TRACE_HERE("finally the connection request is accepted by the remote end");
 }
 
 
 
-// PERSIST is the acknowledgement to ACK_CONNECT_REQ, RESUME or MULTIPLY
-//	{CHALLENING, CLONING}-->/PERSIST/-->ACTIVE{start keep-alive}-->[Notify]
-//	{RESUMING, QUASI_ACTIVE}-->/PERSIST/-->ACTIVE{restart keep-alive}-->[Notify]
+//PERSIST is the acknowledgement to ACK_CONNECT_REQ or MULTIPLY, and/or start a new transmit transaction
+//	CHALLENGING-->/PERSIST/-->COMMITTED{start keep-alive}-->[Notify]
+//	ESTABLISHED-->/PERSIST/-->{KEEP_ALIVE}{keep state}
+//	PEER_COMMIT-->/PERSIST/-->ACTIVE{restart keep-alive}
+//	COMMITTING2-->/PERSIST/-->COMMITTING
+//	COMMITTED-->/PERSIST/-->{KEEP_ALIVE}
+//	CLOSABLE-->/PERSIST/-->COMMITTED{restart keep_alive}{KEEP_ALIVE}
+//  CLONING-->/PERSIST/-->ACTIVE-->{KEEP_ALIVE}
 // Remark
 //	PERSIST is instantly acknowledged to avoid possible dead-lock. See also KeepAlive()
 void CSocketItemEx::OnGetPersist()
 {
 	TRACE_SOCKET();
-	if (!InStates(5, CHALLENGING, ESTABLISHED, RESUMING, CLONING, QUASI_ACTIVE))
+	if (!InStates(8, CHALLENGING, ESTABLISHED, PEER_COMMIT, COMMITTING2, COMMITTED, CLOSABLE, CLONING))
 		return;
 
 	if (headPacket->lenData < 0 || headPacket->lenData > MAX_BLOCK_SIZE)
@@ -614,7 +620,6 @@ void CSocketItemEx::OnGetPersist()
 		return;
 	}
 
-
 	FSP_NormalPacketHeader *p1 = headPacket->GetHeaderFSP();
 	ControlBlock::seq_t ackSeqNo = be32toh(p1->expectedSN);
 	if (!ResizeSendWindow(ackSeqNo, p1->GetRecvWS()))
@@ -626,23 +631,24 @@ void CSocketItemEx::OnGetPersist()
 		return;
 	}
 
-	if (InState(CHALLENGING))
-		tSessionBegin = tRecentSend;
-	//^ session of a responsing socket start at the time ACK_CONNECT_REQ was sent
-	// while the start time of resuming or resurrecting the session
-	// remain the original for sake of key life-cycle management.
 
-	SetState(ESTABLISHED);	// only after timer recalibrated may it transit
+	bool isInitiativeState = InState(CHALLENGING) || InState(CLONING);
+	// PERSIST is always the accumulative acknowledgement to ACK_CONNECT_REQ or MULTIPLY
+	// ULA slide the receive window, no matter whether the packet has payload
+	if(isInitiativeState)
+	{
+		tSessionBegin = tRecentSend;
+#ifdef TRACE
+		printf_s("\nPERSIST received. Acknowledged SN\t = %u\n", ackSeqNo);
+#endif
+		pControlBlock->SlideSendWindowByOne();	// See also RespondToSNACK, OnGetCommit
+	}
+
+
 #ifdef TRACE
 	TRACE_HERE("the responder calculate RTT");
 #endif
 	CalibrateKeepAlive();
-
-	// PERSIST is always the accumulative acknowledgement to ACK_CONNECT_REQ, MULTIPLY or RESUME
-#ifdef TRACE
-	printf_s("\nPERSIST received. Acknowledged SN\t = %u\n", ackSeqNo);
-#endif
-	pControlBlock->SlideSendWindowByOne();	// See also RespondToSNACK
 
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->AllocRecvBuf(headPacket->pktSeqNo);
 	if(skb == NULL)
@@ -651,6 +657,7 @@ void CSocketItemEx::OnGetPersist()
 		Notify(FSP_NotifyOverflow);
 		return;
 	}
+
 	int countPlaced = PlacePayload(skb);
 	if (countPlaced == -EFAULT)
 	{
@@ -660,8 +667,56 @@ void CSocketItemEx::OnGetPersist()
 		return;
 	}
 
-	// It might be redundant, but make the protocol robust
-	SendSNACK(CheckPeerCommit() ? ACK_FLUSH : KEEP_ALIVE);
+	if(pControlBlock->HasBeenCommitted() > 0)
+	{
+		if (lowState == CHALLENGING)
+		{
+			SetState(CLOSABLE);
+		}
+		else if (lowState == COMMITTING)
+		{
+			SetState(COMMITTING2);
+		}
+		else if (lowState == COMMITTED)
+		{
+			StopKeepAlive();
+			SetState(CLOSABLE);
+		}
+		else // if (InStates(CLONING))
+		{
+			StopKeepAlive();
+			SetState(PEER_COMMIT);
+		}
+		SendSNACK(ACK_FLUSH);
+	}
+	else
+	{
+		if (lowState == CHALLENGING)
+		{
+			SetState(COMMITTED);
+			RestartKeepAlive();
+		}
+		else if (lowState == PEER_COMMIT)
+		{
+			SetState(ESTABLISHED);
+			RestartKeepAlive();
+		}
+		else if (lowState == COMMITTING2)
+		{
+			SetState(COMMITTING);
+		}
+		else if (lowState == CLOSABLE)
+		{
+			SetState(COMMITTED);
+			RestartKeepAlive();
+		}
+		else // if (InStates(CLONING))
+		{
+			SetState(ESTABLISHED);
+		}
+		// It might be redundant, but make the protocol robust
+		SendSNACK(KEEP_ALIVE);
+	}
 
 	if (countPlaced == -EEXIST)
 		return;
@@ -670,8 +725,8 @@ void CSocketItemEx::OnGetPersist()
 	if (countPlaced > 0)
 		printf_s("There is optional payload in the PERSIST packet, payload length = %d\n", countPlaced);
 #endif
-	// The ULA slide the receive window, whether it is payload-less
-	Notify(FSP_NotifyAccepted);
+	if (isInitiativeState)
+		SignalAccepted();
 }
 
 
@@ -723,15 +778,14 @@ void CSocketItemEx::OnGetKeepAlive()
 //	|-->{if the receive queue is closable}
 //		-->{stop keep-alive}CLOSABLE-->[Send ACK_FLUSH]-->[Notify]
 //	|-->{otherwise}-->{keep state}[Send SNACK]-->[Notify]
-//{CLONING, RESUMING}<-->/PURE_DATA/{just prebuffer}
+//CLONING<-->/PURE_DATA/{just prebuffer}
+// However ULA protocol designer must keep in mind that these prebuffered may be discarded
 void CSocketItemEx::OnGetPureData()
 {
 #ifdef TRACE_PACKET
 	TRACE_SOCKET();
 #endif
-	// It's OK to prebuffer received data in CLONING or RESUMING state (but NOT in QUASI_ACTIVE state)
-	// However ULA protocol designer must keep in mind that these prebuffered may be discarded
-	if (!InStates(5, ESTABLISHED, COMMITTING, COMMITTED, CLONING, RESUMING))
+	if (!InStates(4, ESTABLISHED, COMMITTING, COMMITTED, CLONING))
 	{
 #ifdef TRACE
 		printf_s("In state %s data may not be accepted.\n", stateNames[lowState]);
@@ -779,14 +833,37 @@ void CSocketItemEx::OnGetPureData()
 
 	tLastRecv = NowUTC();
 
-	// UNRESOLVED! Lazy acknowledgement might enhance efficiency
+	if(pControlBlock->HasBeenCommitted() > 0)
+	{
+		if (lowState == COMMITTING)
+		{
+			SetState(COMMITTING2);
+		}
+		else if (lowState == COMMITTED)
+		{
+			StopKeepAlive();
+			SetState(CLOSABLE);
+		}
+		else // if (InStates(ESTABLISHED, CLONING))
+		{
+			StopKeepAlive();
+			SetState(PEER_COMMIT);
+		}
+		SendSNACK(ACK_FLUSH);
+	}
+	else
+	{
+		// UNRESOLVED! Lazy acknowledgement might enhance efficiency
+		SendSNACK(KEEP_ALIVE);
+	}
 	// See also OnGetPersist()
-	SendSNACK(CheckPeerCommit() ? ACK_FLUSH : KEEP_ALIVE);
-	//
+
 	Notify(FSP_NotifyDataReady);
 }
 
 
+//CHALLENGING-->/COMMIT/
+//	|-->CLOSABLE-->[Send ACK_FLUSH]-->[Notify]
 //ACTIVE-->/COMMIT/
 //	|-->{if the receive queue is closable}
 //		-->{stop keep-alive}PEER_COMMIT-->[Send ACK_FLUSH]-->[Notify]
@@ -801,14 +878,14 @@ void CSocketItemEx::OnGetPureData()
 //	|-->{otherwise}-->{keep state}[Notify]
 //PRE_CLOSED<-->/COMMIT/[Retransmit RELEASE early]
 //{PEER_COMMIT, COMMITTING2, CLOSABLE}<-->/COMMIT/[Send ACK_FLUSH]
-//{CHALLENGING, CLONING, RESUMING, QUASI_ACTIVE}<-->/COMMIT/{if the receive queue is closable}
+//CLONING<-->/COMMIT/{if the receive queue is closable}
 //		-->{stop keep-alive}PEER_COMMIT-->[Send ACK_FLUSH]-->[Notify]
 // UNRESOLVED! fairness of adjourn? Anti-DoS-Attack?
 void CSocketItemEx::OnGetCommit()
 {
 	TRACE_SOCKET();
 
-	if (!InStates(11, CHALLENGING, CLONING, RESUMING, QUASI_ACTIVE
+	if (!InStates(9, CHALLENGING, CLONING
 		, ESTABLISHED, COMMITTING, COMMITTED, PEER_COMMIT, COMMITTING2, CLOSABLE, PRE_CLOSED))
 	{
 		return;
@@ -838,7 +915,7 @@ void CSocketItemEx::OnGetCommit()
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->AllocRecvBuf(headPacket->pktSeqNo);
 
 	// Connection close is asymmetric in the sense that one side may unilaterally terminate the session without accept all of its peer's packets
-	// The near end migrated from the COMMITTTED state to the PRE_CLOSED state by ULA's Shutdown, sending a RELEASE packet to its peer
+	// The near end migrated from the COMMITTED state to the PRE_CLOSED state by ULA's Shutdown, sending a RELEASE packet to its peer
 	// But if the peer happens to have sent a COMMIT packet before received the RELEASE packet?
 	// The near end should have migrated from the COMMITTED state to the CLOSABLE state
 	// if the COMMIT packet were received before ULA's Shutdown, so the near end should migrate to the CLOSED state
@@ -875,9 +952,34 @@ void CSocketItemEx::OnGetCommit()
 #endif
 	CalibrateKeepAlive();
 
+	bool peerCommitted = InState(PEER_COMMIT) || InState(COMMITTING2) || InState(CLOSABLE);
+	bool isInitiativeState = InState(CHALLENGING) || InState(CLONING);
+	// figure out whether it was in any initiative state before migration
+	if(! peerCommitted && pControlBlock->HasBeenCommitted() > 0)
+	{
+		if (lowState == CHALLENGING)
+		{
+			SetState(CLOSABLE);
+		}
+		else if (lowState == COMMITTING)
+		{
+			SetState(COMMITTING2);
+		}
+		else if (lowState == COMMITTED)
+		{
+			StopKeepAlive();
+			SetState(CLOSABLE);
+		}
+		else // if (InStates(ESTABLISHED, CLONING))
+		{
+			StopKeepAlive();
+			SetState(PEER_COMMIT);
+		}
+		peerCommitted = true;
+	}
+
 	// Transactional COMMIT packet carries accumulative acknowledgment
-	bool isInitiativeState = InState(CHALLENGING) || InState(CLONING) || InState(RESUMING) || InState(QUASI_ACTIVE);
-	if(CheckPeerCommit())
+	if(peerCommitted)
 	{
 		if(isInitiativeState)
 			pControlBlock->SlideSendWindowByOne();
@@ -886,7 +988,7 @@ void CSocketItemEx::OnGetCommit()
 		//
 		if(isInitiativeState)
 		{
-			Notify(FSP_NotifyAccepted);
+			SignalAccepted();
 			return;
 		}
 	}
@@ -901,15 +1003,13 @@ void CSocketItemEx::OnGetCommit()
 // ACK_FLUSH, now a pure out-of-band control packet. A special norm of KEEP_ALIVE
 //	COMMITTING-->/ACK_FLUSH/-->COMMITTED-->[Notify]
 //	COMMITTING2-->/ACK_FLUSH/-->{stop keep-alive}CLOSABLE-->[Notify]
-//	RESUMING-->/ACK_FLUSH/-->{keep state}[Notify]
 //	PRE_CLOSED-->/ACK_FLUSH/-->CLOSED
 void CSocketItemEx::OnAckFlush()
 {
 	// As ACK_FLUSH is rare we trace every appearance
 	TRACE_SOCKET();
 
-	// It's perfectly OK to receive an ACK_FLUSH in the RESUMING state which mean previous committed message was wholely acknowledged
-	if (!InState(COMMITTING) && !InState(COMMITTING2) && !InState(RESUMING) && !InState(PRE_CLOSED))
+	if (!InState(COMMITTING) && !InState(COMMITTING2) && !InState(PRE_CLOSED))
 		return;
 
 	FSP_SelectiveNACK::GapDescriptor *gaps;
@@ -950,82 +1050,6 @@ void CSocketItemEx::OnAckFlush()
 	// For ACK_FLUSH just accumulatively positively acknowledge
 	RespondToSNACK(ackSeqNo, NULL, 0);
 	Notify(FSP_NotifyFlushed);
-}
-
-
-
-// RESUME may resume or resurrect a closable/closed connection
-// PEER_COMMIT-->/RESUME/-->ACTIVE-->[Send PERSIST]{restart keep-alive}
-// COMMITTING2-->/RESUME/-->ACTIVE-->[Send PERSIST]
-// PRE_CLOSED-->/RESUME/-->CLOSABLE-->[API{callback}]
-// CLOSABLE-->/RESUME/-->[API{callback}]
-//	|-->[{Return Accept}]-->ACTIVE-->[Send PERSIST]{restart keep-alive}
-//	|-->[{Return Reject}]-->NON_EXISTENT-->[Send RESET]
-// CLOSED<-->/RESUME/{DSRC missed}<-->[Send ACK_INIT_CONNECT]
-//	|-->/RESUME/{DSRC hitted}-->[API{callback}]
-//	|-->[{Return Accept}]-->ACTIVE-->[Send PERSIST]{start keep-alive}
-//	|-->[{Return Reject}]-->NON_EXISTENT-->[Send RESET]
-void CSocketItemEx::OnGetResume()
-{
-	TRACE_SOCKET();
-
-	// A CLOSED connnection may be resurrected, provide the session key is not out of life
-	// A replayed/redundant RESUME would be eventually acknowedged by a legitimate PERSIST
-	// Or COMMIT. See also OnAckFlush()
-	if (!InStates(5, PEER_COMMIT, COMMITTING2, CLOSABLE, PRE_CLOSED, CLOSED))
-		return;
-
-	if (pControlBlock->IsRetriableStale(headPacket->pktSeqNo))
-		return;
-
-	if (!ValidateICC())
-	{
-		TRACE_HERE("Invalid intergrity check code!?");
-		return;
-	}
-
-	FSP_NormalPacketHeader *p1 = headPacket->GetHeaderFSP();
-	if(! ResizeSendWindow(be32toh(p1->expectedSN), p1->GetRecvWS()))
-		return;
-
-	ControlBlock::PFSP_SocketBuf skb = pControlBlock->AllocRecvBuf(headPacket->pktSeqNo);
-	if(skb == NULL)
-	{
-		// UNRESOLVED!? Just retransmit the acknowledgement...
-		return;
-	}
-
-	int r = PlacePayload(skb);
-	if (r == -EFAULT)
-	{
-		TRACE_HERE("cannot place optional payload in the RESUME packet");
-		return;
-	}
-
-	if(InState(PRE_CLOSED))
-		SetState(CLOSABLE);
-
-	HandleMobileParam(p1->PFirstExtHeader());
-	// no more extension header expected for RESUME
-
-	tLastRecv = NowUTC();	// tLastRecv should not be modified? UNRESOLVED!
-
-	if(InState(CLOSED) || InState(CLOSABLE))
-	{
-		Notify(FSP_NotifyAccepting);
-		return;
-	}
-
-	SetState(ESTABLISHED);
-	ConfirmConnect();
-	EmitStartAndSlide();
-
-	if(InState(PEER_COMMIT))
-		RestartKeepAlive();
-#ifdef _DEBUG
-	else if(! InState(COMMITTING2))
-		TRACE_HERE("it can only resume from PEER_COMMIT, COMMITTING2 or CLOSABLE state");
-#endif
 }
 
 
@@ -1080,7 +1104,7 @@ void CSocketItemEx::OnGetRelease()
 //	|<-->/MULTIPLY/{duplication detected: retransmit acknowledgement}
 //	|<-->/MULTIPLY/{collision detected}[Send RESET]
 //	|-->/MULTIPLY/-->[API{Callback}]
-//	{COMMITTING, RESUMING, CLOSABLE}<-->/MULTIPLY/[Send RESET]
+//	{COMMITTING, CLOSABLE}<-->/MULTIPLY/[Send RESET]
 // Remark
 //	It is assumed that ULA/DLL implements connection multiplication throttle control
 void CSocketItemEx::OnGetMultiply()

@@ -52,7 +52,6 @@ const char * CStringizeOpCode::names[LARGEST_OP_CODE + 1] =
 	"PURE_DATA",	// Without any optional header
 	"COMMIT",
 	"ACK_FLUSH",
-	"RESUME",		// RESUME or RESURRECT connection, may piggyback payload
 	"RELEASE",
 	"MULTIPLY",		// To clone connection, may piggyback payload
 	"KEEP_ALIVE",
@@ -103,10 +102,6 @@ const char * CStringizeState::names[LARGEST_FSP_STATE + 1] =
 	"CLOSED",
 	// context cloned by ConnectMU:
 	"CLONING",
-	// after sending RESUME, before RESUME acknowledged
-	"RESUMING",
-	// resurrect from CLOSED:
-	"QUASI_ACTIVE",
 };
 
 const char * CStringizeNotice::names[LARGEST_FSP_NOTICE + 1] =
@@ -123,8 +118,8 @@ const char * CStringizeNotice::names[LARGEST_FSP_NOTICE + 1] =
 	"FSP_Urge",			// send a packet urgently, mean to urge COMMIT
 	"FSP_Shutdown",		// close the connection
 	"FSP_InstallKey",	// install the authenticated encryption key
-	"FSP_Resurrect",	// Resurrect a closable/closed connection in the recyling cach
-	// 12-15, 4 reserved
+	// 11-15, 5 reserved
+	"Reserved11",
 	"Reserved12",
 	"Reserved13",
 	"Reserved14",
@@ -773,7 +768,17 @@ void ControlBlock::SlideSendWindow()
 		//
 		sendWindowFirstSN++;
 	}
+}
 
+
+
+void ControlBlock::SlideSendWindowByOne()	// shall be atomic!
+{
+	if(++sendWindowHeadPos - sendBufferBlockN >= 0)
+		sendWindowHeadPos -= sendBufferBlockN;
+	_InterlockedIncrement((LONG *) & sendWindowFirstSN);
+
+	// UNRESOLVED! But it shall never happen!?
 	if(int(sendWindowNextSN - sendWindowFirstSN) < 0)
 	{
 #ifdef TRACE
@@ -782,24 +787,14 @@ void ControlBlock::SlideSendWindow()
 		sendWindowNextSN = sendWindowFirstSN;
 		sendWindowNextPos = sendWindowHeadPos;
 	}
-}
-
-
-
-// Normally synchronize sendWindowFirstSN with sendWindowNextSN is unnecessary but it does little harm
-void ControlBlock::SlideSendWindowByOne()	// shall be atomic!
-{
-	if(++sendWindowHeadPos - sendBufferBlockN >= 0)
-		sendWindowHeadPos -= sendBufferBlockN;
-	_InterlockedIncrement((LONG *) & sendWindowFirstSN);
-	//
-	if(int(sendWindowNextSN - sendWindowFirstSN) < 0)
+	// UNRESOLVED! But it shall never happen!?
+	if(int(sendBufferNextSN - sendWindowFirstSN) < 0)
 	{
 #ifdef TRACE
-		printf_s("sendWindowNextSN(%u) out of sync on SlideSendWindowByOne, set to %u\n", sendWindowNextSN, sendWindowFirstSN);
+		printf_s("sendBufferNextSN(%u) out of sync on SlideSendWindow, set to %u\n", sendBufferNextSN, sendWindowFirstSN);
 #endif
-		sendWindowNextSN = sendWindowFirstSN;
-		sendWindowNextPos = sendWindowHeadPos;
+		sendBufferNextSN = sendWindowFirstSN;
+		sendBufferNextPos = sendWindowHeadPos;
 	}
 }
 

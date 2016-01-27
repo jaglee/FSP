@@ -525,49 +525,6 @@ void LOCALAPI CSocketItemEx::AffirmConnect(const SConnectParam & initState, ALFI
 
 
 
-
-// Do
-//	Update the opCode of the head packet in the send queue to PERSIST or COMMIT, or
-//	insert a new PERSIST/COMMIT packet if the send queue is still empty
-// Remark
-//	If the end queue is not empty, only the starting PURE_DATA may be replaced by PERSIST
-//	It is assumed that DLL/ULA is waiting for LLS when this subroutine is eventually called
-bool CSocketItemEx::ConfirmConnect()
-{
-	ControlBlock::PFSP_SocketBuf skb;
-	if(pControlBlock->CountSendBuffered() <= 0)
-	{
-		skb = pControlBlock->GetSendBuf();
-		skb->len = 0;
-		skb->SetFlag<IS_COMPLETED>();
-	}
-	else
-	{
-		skb = pControlBlock->GetSendQueueHead();
-		if(skb->opCode == COMMIT)
-			return true;
-		if(skb->opCode != PURE_DATA && skb->opCode != PERSIST)
-			return false;
-	}
-
-
-	//	Assume that if hasPendingKey shall it already be in the COMMITING state
-	if(pControlBlock->CountSendBuffered() == 1)
-	{
-		skb->opCode = InState(COMMITTING) ? COMMIT : PERSIST;
-	}
-	else
-	{
-		skb->opCode = PERSIST;
-		if(InState(COMMITTING))
-			pControlBlock->ReplaceSendQueueTailToCommit();
-	}
-
-	return true;
-}
-
-
-
 // Remark
 //	For sake of congestion control only one packet is sent presently
 // See also
@@ -586,15 +543,19 @@ void CSocketItemEx::SynConnect()
 
 	// See also CSocketItemEx::Start()
 	lowState = pControlBlock->state;
-	if(lowState == CHALLENGING)
+	if (lowState == CHALLENGING)
+	{
 		InstallEphemeralKey();
+		tKeepAlive_ms = TRASIENT_STATE_TIMEOUT_ms;
+	}
 	else
-		ConfirmConnect();
+	{
+		tKeepAlive_ms = CONNECT_INITIATION_TIMEOUT_ms;
+	}
 	//^ ephemeral session key material was ready when CSocketItemDl::PrepareToAccept
 	EmitStartAndSlide();
 
 	seqLastAck = pControlBlock->recvWindowFirstSN;
-	tKeepAlive_ms = TRASIENT_STATE_TIMEOUT_ms;
 	AddTimer();
 
 	SetCallable();	// The success or failure signal is delayed until PERSIST, COMMIT or RESET received
@@ -648,43 +609,6 @@ void CSocketItemEx::Extinguish()
 
 
 
-// Return
-//	true if it is in commitable situation
-//	false if there is some gap or there is no tail COMMIT packet in the receive queue
-// Remark
-//	Side-effect: might change state of the FSP node
-bool CSocketItemEx::CheckPeerCommit()
-{
-	if(lowState == PEER_COMMIT || lowState == COMMITTING2 || lowState == CLOSABLE)
-		return true;
-
-	int r = pControlBlock->HasBeenCommitted();
-	//
-	// But, if multiple COMMIT? ACK_FLUSH is out-of-band. It is unnecessary to reply to each COMMIT
-	//
-	if(r <= 0)
-		return false;
-
-	if (lowState == COMMITTING)
-	{
-		SetState(COMMITTING2);
-	}
-	else if (lowState == COMMITTED)
-	{
-		StopKeepAlive();
-		SetState(CLOSABLE);
-	}
-	else // if (InStates(ESTABLISHED, CHALLENGING, CLONING, RESUMING, QUASI_ACTIVE))
-	{
-		StopKeepAlive();
-		SetState(PEER_COMMIT);
-	}
-
-	return true;
-}
-
-
-
 // Do
 //	Recycle the socket
 //	Send RESET to the remote peer if not in CLOSED state
@@ -704,7 +628,7 @@ void CSocketItemEx::Recycle()
 void CSocketItemEx::CloseSocket()
 {
 	// Copy keyLife for DLL access for sake of SCB reuse, but only when worthful
-	if(contextOfICC.keyLife < MINIMUM_LIFETIME_RESUMABLE)
+	if(contextOfICC.keyLife < 4)	// hard-coded here for no reason
 	{
 		Extinguish();
 		return;
@@ -725,7 +649,7 @@ void CSocketItemEx::Disconnect()
 {
 	if(lowState == CHALLENGING || lowState == CONNECT_AFFIRMING)
 		CLowerInterface::Singleton()->SendPrematureReset(EINTR, this);
-	else if(InStates(7, ESTABLISHED, COMMITTING, PEER_COMMIT, COMMITTING2, COMMITTED, CLOSABLE, RESUMING))
+	else if(InStates(6, ESTABLISHED, COMMITTING, PEER_COMMIT, COMMITTING2, COMMITTED, CLOSABLE))
 		SendPacket<RESET>();
 	//
 	if(TestAndLockReady())
@@ -768,7 +692,7 @@ void LOCALAPI DumpCMsgHdr(CtrlMsgHdr & hdrInfo)
 {
 	// Level: [0 for IPv4, 41 for IPv6]]
 	printf("Len = %d, level = %d, type = %d, local interface address:\n"
-		, hdrInfo.pktHdr.cmsg_len
+		, (int)hdrInfo.pktHdr.cmsg_len
 		, hdrInfo.pktHdr.cmsg_level
 		, hdrInfo.pktHdr.cmsg_type);
 	DumpHexical((BYTE *) & hdrInfo.u, sizeof(hdrInfo.u));

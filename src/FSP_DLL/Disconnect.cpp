@@ -129,7 +129,7 @@ int LOCALAPI CSocketItemDl::Shutdown(NotifyOrReturn fp1)
 	}
 
 	// The last resort: flush sending stream if it has not yet been committed
-	if(! TestSetState(ESTABLISHED, COMMITTING) && ! TestSetState(RESUMING, COMMITTING) && ! InState(COMMITTING)
+	if(! TestSetState(ESTABLISHED, COMMITTING) && ! InState(COMMITTING)
 	&& ! TestSetState(PEER_COMMIT, COMMITTING2) && ! InState(COMMITTING2))
 	{
 		SetMutexFree();
@@ -137,15 +137,14 @@ int LOCALAPI CSocketItemDl::Shutdown(NotifyOrReturn fp1)
 		return EDOM;	// A warning say that the connection is aborted actually, for it is not in the proper state
 	}
 
-	SetFlushing(CSocketItemDl::FlushingFlag::FLUSHING_SHUTDOWN);
+	isFlushing = FlushingFlag::FLUSHING_SHUTDOWN;
 	SetMutexFree();
 	return Commit();
 }
 
 
 
-// Tiggered by the remote end 'RELEASE'(FIN) packet.
-// Important! ULA should not dispose the socket
+// Tiggered by the remote end RELEASE packet, and assume that ULA would not dispose the socket.
 void CSocketItemDl::RespondToFinish()
 {
 	if(context.afterClose != NULL)

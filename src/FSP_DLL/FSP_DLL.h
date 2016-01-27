@@ -101,8 +101,9 @@ class CSocketItemDl: public CSocketItem
 	CSocketItemDl	*prev;
 	// for sake of incarnating new accepted connection
 	FSP_SocketParameter context;
+	char			newTransaction;	// it may simultaneously start a transmit transaction and flush/commit it
 	char			isFlushing;
-	char			eomSending;
+	char			shouldAppendCommit;
 	char			inUse;
 protected:
 	ALIGN(8)		HANDLE theWaitObject;
@@ -168,8 +169,6 @@ protected:
 	void ToConcludeConnect();
 	void RespondToFinish();
 	void RespondToRecycle();
-	//
-	void OnDSRCHitted();
 
 	int LOCALAPI BufferData(int);
 	int LOCALAPI DeliverData(void *, int);
@@ -180,7 +179,7 @@ public:
 	enum FlushingFlag
 	{
 		// NOT_FLUSHING == 0, and '0' is self-explanatory
-		REVERT_TO_RESUME = -1,
+		END_MESSAGE_ONLY = -1,
 		ONLY_FLUSHING = 1,
 		FLUSHING_SHUTDOWN = 2
 	};
@@ -196,7 +195,6 @@ public:
 		}
 	}
 	int LOCALAPI Initialize(PFSP_Context, char *);
-	int LOCALAPI Reinitialize(PFSP_Context);
 	int Recycle();
 
 	// Convert the relative address in the control block to the address in process space, unchecked
@@ -265,7 +263,7 @@ public:
 	{
 		return InterlockedCompareExchangePointer((PVOID *) & fpSent, fp1, NULL) == NULL; 
 	}
-	int LOCALAPI CheckCommitOrResume(FlagEndOfMessage);
+	int LOCALAPI CheckCommitOrRevert(FlagEndOfMessage);
 	//
 	int LOCALAPI FinalizeSend(int r)
 	{
@@ -273,9 +271,8 @@ public:
 		// Prevent premature FSP_Send
 		if (r < 0 || InState(CONNECT_AFFIRMING) || InState(CHALLENGING))
 			return r;
-		//
-		if (InState(QUASI_ACTIVE) || InState(CLONING) || InState(RESUMING))
-			return (Call<FSP_Start>() ? r : -EIO);
+		if (InState(CLONING))	// Just prebuffer.
+			return r;
 		//
 		return (Call<FSP_Send>() ? r : -EIO);
 	}
@@ -287,14 +284,6 @@ public:
 	void SetEndOfRecvMsg(bool value = true) { context.u.st.eom = value ? 1 : 0; }
 	bool IsRecvBufferEmpty()  { return pControlBlock->CountReceived() <= 0; }
 
-	// See also CheckCommitOrResume@Send.cpp
-	void BeginSubSession()
-	{
-		if(_InterlockedOr8(& pControlBlock->hasPendingKey, 0) != 0 && InState(ESTABLISHED))
-			SetState(COMMITTING);
-		//
-		Call<FSP_Start>();
-	}
 	int	Commit();
 	int LOCALAPI Shutdown(NotifyOrReturn);
 
@@ -303,14 +292,16 @@ public:
 	void SetCallbackOnRecyle(NotifyOrReturn fp1) { fpRecycled = fp1; }
 
 	char GetResetFlushing() { return _InterlockedExchange8(& isFlushing, 0);}
-	void SetFlushing(char value) { isFlushing = value; }
+
+	bool CheckResetNewTransaction() { return _InterlockedCompareExchange8(& newTransaction, 0, 1) != 0; }
+	bool CheckToNewTransaction();
+	void SetNewTransaction() { newTransaction = 1; }
 
 	int SelfNotify(FSP_ServiceCode c);
 	void SetCallbackOnError(NotifyOrReturn fp1) { context.onError = fp1; }
 	void NotifyError(FSP_ServiceCode c, int e = 0) { if (context.onError != NULL) context.onError(this, c, e); }
 
 	// defined in DllEntry.cpp:
-	static CSocketItemDl * LOCALAPI FindDisconnectedSession(const char *);
 	static CSocketItemDl * LOCALAPI CreateControlBlock(const PFSP_IN6_ADDR, PFSP_Context, CommandNewSession &);
 };
 
@@ -328,7 +319,6 @@ public:
 	CSocketItemDl * AllocItem();
 	void FreeItem(CSocketItemDl *);
 	bool ReuseItem(CSocketItemDl *);
-	CSocketItemDl * FindRecycledSCB(const char *);
 
 	// Application Layer Fiber ID (ALFID) === fiberID
 	CSocketItemDl * operator [] (ALFID_T fiberID);

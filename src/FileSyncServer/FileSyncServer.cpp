@@ -17,6 +17,7 @@ FSPHANDLE		hFspListen;
 
 static char		fileName[MAX_FILENAME_WITH_PATH_LEN];
 static int		fd;
+static char		linebuf[80];
 
 // assume that address space layout randomization keep the secret hard to find
 static unsigned char bufPrivateKey[CRYPTO_NACL_KEYBYTES];
@@ -27,9 +28,7 @@ static void FSPAPI onPublicKeyReceived(FSPHANDLE, FSP_ServiceCode, int);
 static void FSPAPI onFileNameSent(FSPHANDLE, FSP_ServiceCode, int);
 static int	FSPAPI toSendNextBlock(FSPHANDLE, void *, int32_t);
 
-static int	FSPAPI onResurrected(FSPHANDLE, PFSP_Context);
 static void FSPAPI onResponseReceived(FSPHANDLE, FSP_ServiceCode, int);
-
 
 extern int	FSPAPI onAccepting(FSPHANDLE, PFSP_SINKINF, PFSP_IN6_ADDR);
 extern void SendMemoryPattern();
@@ -220,8 +219,9 @@ static void FSPAPI onFileNameSent(FSPHANDLE h, FSP_ServiceCode c, int r)
 		Dispose(h);
 		return;
 	}
-	// Actually listen for response in resumed connection segment.
-	FSPControl(h, FSP_SET_CALLBACK_ON_CONNECT, (ulong_ptr)onResurrected);
+
+	// And we expected success acknowledgement
+	ReadFrom(h, linebuf, sizeof(linebuf), onResponseReceived);
 }
 
 
@@ -267,31 +267,16 @@ static int FSPAPI toSendNextBlock(FSPHANDLE h, void * batchBuffer, int32_t capac
 
 
 
-static char linebuf[80];
-static int FSPAPI onResurrected(FSPHANDLE h, PFSP_Context ctx)
-{
-	printf_s("\nResurrected handle of FSP session: Fiber ID = %u\n", (uint32_t)(intptr_t)h);
-
-	ReadFrom(h, linebuf, sizeof(linebuf), onResponseReceived);
-	return 0;
-}
-
-
-
 static void FSPAPI onResponseReceived(FSPHANDLE h, FSP_ServiceCode c, int r)
 {
 	if(r < 0)
-	{
-		finished = true;
-		Dispose(h);
-		return;
-	}
+		goto l_bailout;
 
 	printf_s("Response received: %s. To shutdown.\n", linebuf);
 	if(Shutdown(h, onFinished) != 0)
-	{
 		printf_s("Cannot shutdown gracefully.\n");
-		Dispose(h);
-		finished = true;
-	}
+
+l_bailout:
+	Dispose(h);
+	finished = true;
 }

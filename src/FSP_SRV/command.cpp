@@ -104,6 +104,8 @@ l_return:
 //	was found (it is a rare but possible collision) return failure
 //	if a free item was found, map the control block into process space of LLS
 //	and go on to emit the command and optional data packets in the send queue
+// Remark
+//	An FSP socket is incarnated when a connection is cloned, or a listening socket is forked on CONNECT_REQUEST or MULTIPLY received
 void LOCALAPI SyncSession(CommandNewSessionSrv &cmd)
 {
 	if(cmd.hEvent == NULL)
@@ -198,7 +200,7 @@ void CSocketItemEx::Connect()
 	// bind to the interface as soon as the control block mapped into server's memory space
 	InitAssociation();
 	InitiateConnect();
-	// To avoid race condition disable 'SignalReturned();' here!
+	// Only after ACK_CONNECT_REQ received may it 'SignalReturned();'
 }
 
 
@@ -219,26 +221,6 @@ void CSocketItemEx::Shutdown()
 
 
 
-// CLOSED
-//	---[API: Connect]{&& DSRC hit}-->QUASI_ACTIVE
-//	  -->[Send RESUME]{enable retry}
-// UNRESOLVED! Should check access right of the ULA process more strictly
-// Remark
-//	For sake of transactional data transfer resume may piggyback payload
-//	Because the FlushingFlag is set to REVERT_TO_RESUME in DL data would be piggybacked
-bool LOCALAPI CSocketItemEx::Resurrect(DWORD idProcess)
-{
-	if(! IsInUse() || ! InState(CLOSED) || this->idSrcProcess != idProcess)
-		return false;
-
-	SetState(QUASI_ACTIVE);
-	RestartKeepAlive();
-	SignalReturned();
-	return true;
-}
-
-
-
 // Start sending queued packet(s) in the session control block
 // Remark
 //	Operation code in the given command context would be cleared if send is pending
@@ -255,11 +237,6 @@ void CSocketItemEx::Start()
 #endif
 	// synchronize the state in the 'cache' and the real state
 	lowState = pControlBlock->state;
-	if (lowState == QUASI_ACTIVE || lowState == CLONING || lowState == RESUMING)
-		tKeepAlive_ms = CONNECT_INITIATION_TIMEOUT_ms;
-	else
-		ConfirmConnect();
-	//
 	EmitStartAndSlide();
 	//
 	RestartKeepAlive();

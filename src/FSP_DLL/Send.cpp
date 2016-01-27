@@ -172,7 +172,7 @@ int LOCALAPI CSocketItemDl::SendInplace(void * buffer, int len, FlagEndOfMessage
 	if(! WaitUseMutex())
 		return -EINTR;
 	//
-	int r = CheckCommitOrResume(eomFlag);
+	int r = CheckCommitOrRevert(eomFlag);
 	if (r < 0)
 	{
 		SetMutexFree();
@@ -201,7 +201,7 @@ int LOCALAPI CSocketItemDl::SendStream(void * buffer, int len, FlagEndOfMessage 
 	if(! WaitUseMutex())
 		return -EINTR;
 
-	int r = CheckCommitOrResume(flag);
+	int r = CheckCommitOrRevert(flag);
 	if (r < 0)
 	{
 		SetMutexFree();
@@ -214,7 +214,6 @@ int LOCALAPI CSocketItemDl::SendStream(void * buffer, int len, FlagEndOfMessage 
 		return -EDEADLK;	//  EADDRINUSE
 	}
 	bytesBuffered = 0;
-	eomSending = flag;
 
 	return FinalizeSend(BufferData(len));	// pendingSendSize = len;
 }
@@ -229,16 +228,13 @@ int LOCALAPI CSocketItemDl::SendStream(void * buffer, int len, FlagEndOfMessage 
 //	Automatically terminate previous message, if any when called
 int CSocketItemDl::Commit()
 {
-	//if(_InterlockedCompareExchange8(& eomSending, END_OF_SESSION, END_OF_MESSAGE) != END_OF_MESSAGE)
-	//	return -EDOM;
-	// UNRESOLVED! Is COMMIT a MUST?
 	if(! WaitUseMutex())
 	{
 		TRACE_HERE("deadlock encountered? timed-out management?");
 		return -EINTR;
 	}
 
-	if (InState(ESTABLISHED) || InState(RESUMING))
+	if (InState(ESTABLISHED))
 	{
 		SetState(COMMITTING);
 	}
@@ -254,8 +250,7 @@ int CSocketItemDl::Commit()
 
 	// If the last packet happened to have been sent by @LLS::EmitQ append a COMMIT and FSP_Urge would activate @LLS::EmitQ again 
 	int r = pControlBlock->ReplaceSendQueueTailToCommit();
-	if(r < 0)	// EmitQ() is busy and we count on it
-		pControlBlock->shouldAppendCommit = 1;
+	shouldAppendCommit = (r < 0);	// true is 1
 
 	CancelTimer();	// if any
 	AddOneShotTimer(TRASIENT_STATE_TIMEOUT_ms);
@@ -266,71 +261,93 @@ int CSocketItemDl::Commit()
 
 
 //[API: Send]
-//	{ACTIVE, PEER_COMMIT}<-->[Send PURE_DATA]
-//	{COMMITTED, CLOSABLE}-->RESUMING-->[Send RESUME]{enable retry}
-//	{CONNECT_AFFIRMING, CHALLENGING, CLONING, RESUMING, QUASI_ACTIVE}<-->{just prebuffer}
+//	CLONING<-->[Send PERSIST]{enable retry}
+//	ACTIVE<-->[Send PURE_DATA]
+//	ACTIVE-->[Send transact]-->COMMITTING
+//	PEER_COMMIT<-->[Send PURE_DATA]
+//	PEER_COMMIT-->[Send transact]-->COMMITTING2
+//	COMMITTED-->ACTIVE-->[Send PERSIST]
+//	COMMITTED-->[Send transact]-->COMMITTING
+//	CLOSABLE-->PEER_COMMIT-->[Send PERSIST]{enable retry}
+//	CLOSABLE-->[Send transact]-->COMMITTING2{enable retry}
 // Return
-//	1 if revert to RESUMING state
+//	1 if revert to ACTIVE or PEER_COMMIT state
 //	0 if no state change
 //	-EBADF if the operation is prohibited because the control block is in unrevertible state
 //	-EBUSY if the control block is busy in committing a message
-// UNRESOLVED! But if PERSIST hasn't been received before COMMIT is sent?
-int LOCALAPI CSocketItemDl::CheckCommitOrResume(FlagEndOfMessage eomFlag)
+// Remark
+//	You may not send further packet when a transmit transaction commitment is pending
+//	It MIGHT change state in the ESTABLISHED state
+//	It may change indication 'isFlushing' as well
+//	See also FinalizeSend()
+int LOCALAPI CSocketItemDl::CheckCommitOrRevert(FlagEndOfMessage flag)
 {
-	if(_InterlockedOr8(& pControlBlock->shouldAppendCommit, 0) != 0)
-		return -EBUSY;
+	if(pControlBlock->hasPendingKey != 0)
+		flag = END_OF_TRANSACTION;
+	//
+	if (isFlushing == 0 && flag == END_OF_MESSAGE)
+		isFlushing = FlushingFlag::END_MESSAGE_ONLY;
+	else if (flag == END_OF_TRANSACTION && isFlushing != FlushingFlag::FLUSHING_SHUTDOWN)
+		isFlushing = FlushingFlag::ONLY_FLUSHING;
 
-	if(InState(CONNECT_AFFIRMING) || InState(CHALLENGING) || InState(CLONING) || InState(QUASI_ACTIVE) || InState(RESUMING))
-		return  0;	// In these states data could be sent without state migration
+	if(InState(CLONING) || InState(CONNECT_AFFIRMING) || InState(CHALLENGING))
+		return 0;	// Just prebuffer, data could be sent without state migration
+
+	if (_InterlockedOr8(& shouldAppendCommit, 0) != 0)
+		return -EBUSY;
 
 	if(InState(ESTABLISHED))
 	{
-		if(eomFlag == END_OF_TRANSACTION || pControlBlock->hasPendingKey != 0)
-		{
+		if(isFlushing > 0)
 			SetState(COMMITTING);
-			SetFlushing(true);
-		}
 		return 0;
 	}
 
 	if(InState(PEER_COMMIT))
 	{
-		if(eomFlag == END_OF_TRANSACTION)
-		{
+		if(isFlushing > 0)
 			SetState(COMMITTING2);
-			SetFlushing(true);
-		}
 		return 0;
 	}
 
 	if(InState(COMMITTING) || InState(COMMITTING2))
 		return -EBUSY;
 
-	if (InState(COMMITTED) && eomFlag == END_OF_TRANSACTION)
+	if (InState(COMMITTED))
 	{
-		SetState(COMMITTING);
-		SetFlushing(true);
-		return 0;
-	}
-
-	if (InState(CLOSABLE) && eomFlag == END_OF_TRANSACTION)
-	{
-		SetState(COMMITTING2);
-		SetFlushing(true);
-		return 0;
-	}
-
-	// if (InState(NON_EXISTENT) || InState(LISTENING) || InState(CONNECT_BOOTSTRAP) || InState(PRE_CLOSED) || InState(CLOSED))
-	if (!InState(COMMITTED) && !InState(CLOSABLE))
-		return -EBADF;
-
 #ifdef TRACE
-	printf_s("Data requested to be sent in %s state. Migrate to RESUMING state\n", stateNames[GetState()]);
+		printf_s("Data requested to be sent in %s state. Migrated\n", stateNames[GetState()]);
 #endif
-	pControlBlock->shouldAppendCommit = 0;	// just ignore it if the COMMIT packet has already been put into the send queue
-	isFlushing = REVERT_TO_RESUME;
-	SetState(RESUMING);
-	return 1;
+		if(isFlushing > 0)
+		{
+			SetState(COMMITTING);
+		}
+		else
+		{
+			SetState(ESTABLISHED);
+			SetNewTransaction();
+		}
+		return 1;
+	}
+
+	if (InState(CLOSABLE))
+	{
+#ifdef TRACE
+		printf_s("Data requested to be sent in %s state. Migrated\n", stateNames[GetState()]);
+#endif
+		if(isFlushing > 0)
+		{
+			SetState(COMMITTING2);
+		}
+		else
+		{
+			SetState(PEER_COMMIT);
+			SetNewTransaction();
+		}
+		return 1;
+	}
+
+	return -EBADF;
 }
 
 
@@ -340,6 +357,8 @@ int LOCALAPI CSocketItemDl::CheckCommitOrResume(FlagEndOfMessage eomFlag)
 //	may call back fpSent and clear the function pointer
 //	Here we have assumed that the underlying binary system does not change
 //	execution order of accessing volatile variables
+// UNRESOLVED!
+//	No matter what happpend if shouldAppendCommit a new COMMIT packet shall be appended and sent!
 void CSocketItemDl::ProcessPendingSend()
 {
 #ifdef TRACE_PACKET
@@ -361,6 +380,7 @@ void CSocketItemDl::ProcessPendingSend()
 			SetMutexFree();
 			return;
 		}
+		//
 #if defined(_DEBUG)
 		if (fpSent == NULL)
 			TRACE_HERE("Internal panic!Lost way to report WriteTo result");
@@ -369,28 +389,35 @@ void CSocketItemDl::ProcessPendingSend()
 
 	// Set fpSent to NULL BEFORE calling back so that chained send may set new value
 	CallbackBufferReady fp2 = (CallbackBufferReady)InterlockedExchangePointer((PVOID volatile *)& fpSent, NULL);
-	if (fp2 == NULL)
+
+	if (pendingSendSize > 0)	// while pendingSendBuf == NULL: pending GetSendBuffere()
 	{
+		int m = pendingSendSize;	// the size of the requested buffer
+		void * p = pControlBlock->InquireSendBuf(m);
 		SetMutexFree();
+		//
+		// If ULA hinted that sending was not finished yet, continue to use the saved pointer of the callback function
+		if (m < pendingSendSize || fp2 != NULL && fp2(this, p, m) == 0)
+			TestSetSendReturn(fp2);
+		//
 		return;
 	}
 
-	if(pendingSendSize <= 0)	// pending WriteTo()
-	{
-		pendingSendBuf = NULL;	// So that WriteTo() chaining is possible, see also BufferData()
-		SetMutexFree();
-		((NotifyOrReturn)fp2)(this, FSP_Send, bytesBuffered);
-		return;
-	}
-	//	if(pendingSendSize > 0)	// while pendingSendBuf == NULL
-	int m = pendingSendSize;	// the size of the requested buffer
-	void * p = pControlBlock->InquireSendBuf(m);
-	SetMutexFree();
+	// pending WriteTo(), or pending Commit()
+	pendingSendBuf = NULL;	// So that WriteTo() chaining is possible, see also BufferData()
 	//
-	if (m >= pendingSendSize && fp2(this, p, m) != 0)
-		return;
-	// If ULA hinted that sending was not finished yet, continue to use the saved pointer of the callback function
-	TestSetSendReturn(fp2);
+	if (_InterlockedExchange8(& shouldAppendCommit, 0) != 0)
+	{
+		int r = pControlBlock->ReplaceSendQueueTailToCommit();
+		if (r == 1)	// should be the norm
+			Call<FSP_Send>();
+		else if (r < 0)
+			shouldAppendCommit = 1;
+	}
+	//
+	SetMutexFree();
+	if (fp2 != NULL)
+		((NotifyOrReturn)fp2)(this, FSP_Send, bytesBuffered);
 }
 
 
@@ -468,19 +495,25 @@ int LOCALAPI CSocketItemDl::BufferData(int len)
 	p = p0;
 	//
 l_finish:
-	if(_InterlockedCompareExchange8(& isFlushing, 0, REVERT_TO_RESUME) == REVERT_TO_RESUME)
-		p->opCode = RESUME;
-	//
 	pendingSendSize = m;
-	// 	Depending on eomSending flag and the state set the last packet
+	//
+	if(p == NULL)
+	{
+		TRACE_HERE("no send buffer?");
+		return (len - m);
+	}
+	//
+	if(CheckResetNewTransaction())
+		p->opCode = PERSIST;
+	//
 	if (pendingSendSize == 0)
 	{
-		if (eomSending == FlagEndOfMessage::END_OF_MESSAGE)
+		if (isFlushing == FlushingFlag::END_MESSAGE_ONLY)
 		{
 			p->SetFlag<TO_BE_CONTINUED>(false);
 			p->SetFlag<IS_COMPLETED>();
 		}
-		else if (eomSending == FlagEndOfMessage::END_OF_TRANSACTION)
+		else if (isFlushing > 0)
 		{
 			p->SetFlag<TO_BE_CONTINUED>(false);
 			p->opCode = COMMIT;
@@ -545,7 +578,6 @@ int LOCALAPI CSocketItemDl::PrepareToSend(void * buf, int len, FlagEndOfMessage 
 		p++;
 	}
 	//
-	eomSending = eomFlag;
 	p->InitFlags();	// and locked
 	p->version = THIS_FSP_VERSION;
 	p->len = len - MAX_BLOCK_SIZE * m;
@@ -558,8 +590,8 @@ int LOCALAPI CSocketItemDl::PrepareToSend(void * buf, int len, FlagEndOfMessage 
 	pControlBlock->RoundSendBufferNextPos();
 	pControlBlock->sendBufferNextSN += m + 1;
 
-	if(_InterlockedCompareExchange8(& isFlushing, 0, REVERT_TO_RESUME) == REVERT_TO_RESUME && skb0->opCode != COMMIT)
-		skb0->opCode = RESUME;
+	if(CheckResetNewTransaction() && skb0->opCode != COMMIT)
+		skb0->opCode = PERSIST;
 
 	return (m + 1);
 }

@@ -171,7 +171,7 @@ int FSPControl(FSPHANDLE hFSPSocket, FSP_ControlCode controlCode, ULONG_PTR valu
 			*(uint64_t *)value = pSocket->GetULASignature();
 			break;
 		case FSP_SET_COMPRESSION:
-			pSocket->SetCompression(value);
+			pSocket->SetCompression((int)value);
 			break;
 		case FSP_SET_CALLBACK_ON_ERROR:
 			pSocket->SetCallbackOnError((NotifyOrReturn)value);
@@ -288,35 +288,6 @@ int LOCALAPI CSocketItemDl::Initialize(PFSP_Context psp1, char szEventName[MAX_N
 
 
 
-// Only for non-passive socket
-int LOCALAPI CSocketItemDl::Reinitialize(PFSP_Context psp1)
-{
-	if(psp1->u.st.passive)
-		return -EDOM;
-
-	if(psp1->sendSize < MIN_RESERVED_BUF)
-		psp1->sendSize = MIN_RESERVED_BUF;
-	if(psp1->recvSize < MIN_RESERVED_BUF)
-		psp1->recvSize = MIN_RESERVED_BUF;
-
-	int n = (psp1->sendSize - 1) / MAX_BLOCK_SIZE + (psp1->recvSize - 1) / MAX_BLOCK_SIZE + 2;
-	if(dwMemorySize < ((sizeof(ControlBlock) + 7) >> 3 << 3)
-		+ ((n * sizeof(ControlBlock::FSP_SocketBuf) + 7) >> 3 << 3)
-		+ n * MAX_BLOCK_SIZE)
-	{
-		return -EOVERFLOW;
-	}
-
-	// could be exploited by ULA to make distinguishment of services
-	memcpy(&context, psp1, sizeof(FSP_SocketParameter));
-	pendingSendBuf = (BYTE *)psp1->welcome;
-	pendingSendSize = psp1->len;
-
-	return 0;
-}
-
-
-
 CSocketItemDl * LOCALAPI CSocketItemDl::CallCreate(CommandNewSession & objCommand, FSP_ServiceCode cmdCode)
 {
 	objCommand.fiberID = fidPair.source;
@@ -353,16 +324,19 @@ void CSocketItemDl::WaitEventToDispatch()
 #endif
 		switch(notice)
 		{
-		case FSP_NotifyAccepting:	// overloaded as callback for CONNECT_REQUEST and ACK_CONNECT_REQUEST
-			CancelTimer();			// If any
+		case FSP_NotifyAccepting:	// overloaded callback for either CONNECT_REQUEST or MULTIPLY
 			if(pControlBlock->HasBacklog())
 				ProcessBacklog();
-			if(InState(CONNECT_AFFIRMING) || InState(QUASI_ACTIVE))
-				ToConcludeConnect();
-			else if(InState(CLOSABLE) || InState(CLOSED))
-				OnDSRCHitted();
 			break;
 		case FSP_NotifyAccepted:
+			CancelTimer();			// If any
+			// Asychronous return of Connect2, where the initiator may cancel data transmission
+			if(InState(CONNECT_AFFIRMING))
+			{
+				ToConcludeConnect();
+				return;
+			}
+			// InStates(ESTABLISHED, PEER_COMMIT) or (COMMITTED, CLOSABLE). Used to be InStates(CLONING, CHALLENGING)
 			if(fpAccepted != NULL)
 				fpAccepted(this, &context);
 			ProcessReceiveBuffer();
@@ -411,19 +385,6 @@ void CSocketItemDl::WaitEventToDispatch()
 			return;
 		}
 	}
-}
-
-
-
-// Given
-//	const char *	The name of the peer application, might including the host name and the ALFID/'port-number'
-// Return
-//	A session control block in the disconnected session recyling cache that match the given peer name.
-// Remark
-//	Here we utilize Linear search to find the right match
-CSocketItemDl * CSocketItemDl::FindDisconnectedSession(const char *peerName)
-{
-	return socketsTLB.FindRecycledSCB(peerName);
 }
 
 
@@ -634,31 +595,6 @@ bool CSocketDLLTLB::ReuseItem(CSocketItemDl *item)
 
 	ReleaseSRWLockExclusive( & srwLock);
 	return true;
-}
-
-
-
-// Find the free item in the DSRC that satisfies:
-//	i. In CLOSABLE or CLOSED state, while the local Session ID/ALFID is still available
-//	ii.Matches PeerName
-// Inform LLS to try to reuse the mapped SCB and send the RESUME packet
-// Linear Search (LRU):
-//	If there are more than one SCB matches the given peerName, the least recent used one
-//	with the session key that has remaining life time is selected
-// UNRESOLVED! But the one whose keyLife is less than some threshold should be thoroughly released on CLOSED?
-CSocketItemDl * CSocketDLLTLB::FindRecycledSCB(const char *peerName)
-{
-	for(register CSocketItemDl * item = tail; item != NULL; item = item->prev)
-	{
-		if((item->InState(CLOSED) || item->InState(CLOSABLE))
-		&& item->ComparePeerName(peerName) == 0
-		&& item->pControlBlock->connectParams.keyLife > 0)
-		{
-			return (ReuseItem(item) ? item : NULL);
-		}
-	}
-
-	return NULL;
 }
 
 

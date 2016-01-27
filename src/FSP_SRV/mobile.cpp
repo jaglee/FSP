@@ -385,7 +385,6 @@ bool CSocketItemEx::ValidateICC(FSP_NormalPacketHeader *p1, int32_t ctLen, uint3
 	PURE_DATA			separate payload/ separate payload: fixed header regenerated on retransmission
 	KEEP_ALIVE			temporary		/ temporary: KEEP_ALIVE is always generate on fly
 	ACK_FLUSH			temporary		/ temporary: ACK_FLUSH is always generate on fly
-	RESUME				payload buffer	/ payload buffer: initiator of RESUME operation may retransmit it actively
 	RELEASE				temporary		/ temporary: one-shot only
 	MULTIPLY			payload buffer	/ payload buffer: initiator of clone operation may retransmit it actively
  *
@@ -422,7 +421,6 @@ bool CSocketItemEx::EmitStart()
 		result = SendPacket(2, ScatteredSendBuffers(pHdr, sizeof(FSP_NormalPacketHeader), payload, skb->len));
 		break;
 	case PERSIST:	// PERSIST is an in-band control packet with optional payload that confirms a connection
-	case RESUME:	// RESUME is an in-band control packet that try re-established a broken/paused connection
 	case COMMIT:	// COMMIT is always in the queue
 	case MULTIPLY:
 		result = EmitWithICC(skb, pControlBlock->sendWindowFirstSN);
@@ -433,9 +431,6 @@ bool CSocketItemEx::EmitStart()
 		// Header has been included in the payload. See also InitiateConnect() and AffirmConnect()
 		result = SendPacket(1, ScatteredSendBuffers(payload, skb->len));
 		break;
-	// case PURE_DATA:
-		// it cannot be the first packet to send on connection established/resumed,
-		// nor can it be retransmitted separately
 	default:
 		TRACE_HERE("Unexpected socket buffer block");
 		result = 0;	// unrecognized packet type is simply ignored?!
@@ -549,7 +544,6 @@ void CSocketItemEx::EmitQ()
 	ControlBlock::seq_t & nextSN = pControlBlock->sendWindowNextSN;
 	int32_t winSize = _InterlockedOr((LONG *) & pControlBlock->sendWindowSize, 0);
 	//
-	bool inflightCommit = (nextSN == lastSN && _InterlockedOr8(& pControlBlock->shouldAppendCommit, 0) != 0);
 	register ControlBlock::PFSP_SocketBuf skb;
 	while (int(nextSN - lastSN) < 0 && int(nextSN - firstSN) <= winSize)
 	{
@@ -558,7 +552,7 @@ void CSocketItemEx::EmitQ()
 		if (!skb->GetFlag<IS_COMPLETED>())
 		{
 #ifdef TRACE
-			printf_s("The packet SN#%u is not ready to send; buffered next SN#%u\n", nextSN, lastSN);
+			printf_s("Not ready to send packet SN#%u; next to buffer SN#%u\n", nextSN, lastSN);
 #endif 
 			break;
 		}
@@ -572,22 +566,6 @@ void CSocketItemEx::EmitQ()
 			continue;
 		}
 
-		// It is obviously less efficient/clever than pre-cache or loop-unrolling but much more reliable and comprehensible?
-		if(nextSN + 1 == lastSN && _InterlockedOr8(& pControlBlock->shouldAppendCommit, 0) != 0)
-		{
-			// assert(skb->GetFlag<TO_BE_CONTINUED>() == false	// See also @DLL::Commit @DLL::ProcessPendingSend
-			if(skb->opCode == PURE_DATA || skb->opCode == PERSIST)
-			{
-				skb->SetFlag<IS_COMPLETED>();
-				skb->opCode = COMMIT;
-				_InterlockedExchange8(& pControlBlock->shouldAppendCommit, 0);
-			}
-			else if(skb->opCode != COMMIT)
-			{
-				inflightCommit = true;
-			}
-		}
-
 		if (!EmitWithICC(skb, nextSN))
 		{
 			skb->Unlock();
@@ -596,26 +574,5 @@ void CSocketItemEx::EmitQ()
 		//
 		if (pControlBlock->SlideNextToSend() == firstSN + 1)
 			SetEarliestSendTime();
-	}
-	// GetSendBuf expanded, note that lastSN is a snapshot value while nextSN is a reference
-	// We assume that when shouldAppendCommit is set the upper layer application is kept from put packet into the queue
-	if(inflightCommit 
-	&& _InterlockedCompareExchange((LONG *) & pControlBlock->sendBufferNextSN, lastSN, lastSN + 1) == lastSN)
-	{
-		skb = pControlBlock->HeadSend() + pControlBlock->sendBufferNextPos;
-		skb->InitFlags();	// and locked
-		skb->opCode = COMMIT;
-		skb->SetFlag<IS_COMPLETED>();
-		if (!EmitWithICC(skb, nextSN))
-			skb->Unlock();
-		else
-			pControlBlock->SlideNextToSend();
-		//
-		register int32_t k = ++pControlBlock->sendBufferNextPos - pControlBlock->sendBufferBlockN;
-		if(k >= 0)
-			pControlBlock->sendBufferNextPos = k;
-		_InterlockedIncrement((LONG *) & pControlBlock->sendBufferNextSN);
-		//
-		_InterlockedExchange8(& pControlBlock->shouldAppendCommit, 0);
 	}
 }

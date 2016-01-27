@@ -685,7 +685,6 @@ int CLowerInterface::AcceptAndProcess()
 	case PURE_DATA:
 	case COMMIT:
 	case ACK_FLUSH:
-	case RESUME:
 	case RELEASE:
 	case MULTIPLY:
 	case KEEP_ALIVE:
@@ -841,7 +840,7 @@ static int LOCALAPI ReportWSAError(char * msg)
 		0,
 		NULL )) 
 	{
-		printf("\tError: %s\n", lpMsgBuf);
+		printf("\tError: %s\n", (char *)lpMsgBuf);
 		LocalFree( lpMsgBuf );
 	}
 
@@ -1153,9 +1152,6 @@ DWORD WINAPI HandleFullICC(LPVOID p)
 				break;
 			case ACK_FLUSH:
 				p0->OnAckFlush();
-				break;
-			case RESUME:
-				p0->OnGetResume();
 				break;
 			case RELEASE:
 				p0->OnGetRelease();

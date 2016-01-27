@@ -154,9 +154,36 @@ $RECYCLE.BIN/
 
 # Mac desktop service store files
 .DS_Store
+
 FileSyncClientX64_Debug
 FileSyncServerX64_Debug
 FSP_DLL_Debug
 FSP_SRV_Debug
 KeccakReferenceAndOptimized
 UnitTestFSPx64_Debug
+FileSyncClient_Debug
+FileSyncClient_Release
+FileSyncServer.sln
+FileSyncServerX64.pch
+FileSyncServer_Debug
+FileSyncServer_Release
+FSP.sdf
+FSP_DLL
+FSP_DllTest_Debug
+FSP_DLL_Debug
+FSP_DLL_Win32Release
+FSP_DLL_x64Release
+FSP_FileSync.sdf
+FSP_FlowTest_Debug
+FSP_SRV_Debug
+FSP_SRV_Win32Release
+FSP_SRV_x64
+FSP_SRV_x64Release
+ipch
+randombytes
+SHA3
+TestSRP6e
+TestSRP6e.ilk
+UnitTestFSP_Debug
+UNITTEST_FSP.sdf
+x64
