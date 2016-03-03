@@ -92,7 +92,10 @@ bool LOCALAPI CSocketItemEx::Notify(FSP_ServiceCode n)
 	if(r > 0)
 	{
 #ifdef TRACE
-		printf_s("\nSession #%u, duplicate soft interrupt %s(%d) eliminated.\n", fidPair.source, noticeNames[n], n);
+		if(r == FSP_MAX_NUM_NOTICE)
+			printf_s("\nSession #%u, duplicate soft interrupt %s(%d) eliminated.\n", fidPair.source, noticeNames[n], n);
+		else
+			printf_s("\nSession #%u append soft interrupt %s(%d)\n", fidPair.source, noticeNames[n], n);
 #endif
 		return true;
 	}
@@ -644,7 +647,6 @@ void CSocketItemEx::OnGetPersist()
 		pControlBlock->SlideSendWindowByOne();	// See also RespondToSNACK, OnGetCommit
 	}
 
-
 #ifdef TRACE
 	TRACE_HERE("the responder calculate RTT");
 #endif
@@ -876,7 +878,7 @@ void CSocketItemEx::OnGetPureData()
 //	|-->{if the receive queue is closable}
 //		-->{stop keep-alive}CLOSABLE-->[Send ACK_FLUSH]-->[Notify]
 //	|-->{otherwise}-->{keep state}[Notify]
-//PRE_CLOSED<-->/COMMIT/[Retransmit RELEASE early]
+//PRE_CLOSED<-->/COMMIT/[Retransmit ACK_FLUSH, as in the CLOSABLE state]
 //{PEER_COMMIT, COMMITTING2, CLOSABLE}<-->/COMMIT/[Send ACK_FLUSH]
 //CLONING<-->/COMMIT/{if the receive queue is closable}
 //		-->{stop keep-alive}PEER_COMMIT-->[Send ACK_FLUSH]-->[Notify]
@@ -911,26 +913,33 @@ void CSocketItemEx::OnGetCommit()
 		return;
 	}
 
-	// Unlike PURE_DATA, a retransmitted COMMIT cannot be silent discarded
-	ControlBlock::PFSP_SocketBuf skb = pControlBlock->AllocRecvBuf(headPacket->pktSeqNo);
 
-	// Connection close is asymmetric in the sense that one side may unilaterally terminate the session without accept all of its peer's packets
-	// The near end migrated from the COMMITTED state to the PRE_CLOSED state by ULA's Shutdown, sending a RELEASE packet to its peer
-	// But if the peer happens to have sent a COMMIT packet before received the RELEASE packet?
-	// The near end should have migrated from the COMMITTED state to the CLOSABLE state
-	// if the COMMIT packet were received before ULA's Shutdown, so the near end should migrate to the CLOSED state
-	if(InState(PRE_CLOSED))
+	FSP_NormalPacketHeader *p1 = headPacket->GetHeaderFSP();
+	ControlBlock::seq_t ackSeqNo = be32toh(p1->expectedSN);
+	if (!ResizeSendWindow(ackSeqNo, p1->GetRecvWS()))
 	{
-		if(pControlBlock->HasBeenCommitted() <= 0)
-			return;	// just prebuffer; but the payload would be ignored in PRE_CLOSED state!
-		//
-		SendPacket<RELEASE>();
-		CloseToNotify();
-		return;	// Note the retransmitted RELEASE packet is to assure the peer that the session is deliberately terminated.
+#ifdef TRACE
+		printf_s("An out of order acknowledgement on COMMIT? seq#%u\n", ackSeqNo);
+		pControlBlock->DumpSendRecvWindowInfo();
+#endif
+		return;
 	}
 
+	// figure out whether it was in any initiative state before migration
+	// See also OnGetPersist()
+	bool isInitiativeState = InState(CHALLENGING) || InState(CLONING);
+	if (isInitiativeState)
+		tSessionBegin = tRecentSend;	// but only slide the send window when it is a singleton commit as well
+
+#ifdef TRACE
+	TRACE_HERE("the responder calculate RTT");
+#endif
+	CalibrateKeepAlive();
+
+	// Unlike PURE_DATA, a retransmitted COMMIT cannot be silent discarded
+	ControlBlock::PFSP_SocketBuf skb = pControlBlock->AllocRecvBuf(headPacket->pktSeqNo);
 	// Just retransmit ACK_FLUSH on duplicated COMMIT command
-	if (skb == NULL)	// InStates(3, PEER_COMMIT, COMMITTING2, CLOSABLE)
+	if (skb == NULL || InStates(4, PEER_COMMIT, COMMITTING2, CLOSABLE, PRE_CLOSED))
 	{
 #ifdef TRACE
 		printf_s("Duplicate COMMIT received in %s state\n", stateNames[lowState]);
@@ -938,7 +947,6 @@ void CSocketItemEx::OnGetCommit()
 		SendSNACK();
 		return;
 	}
-
 	// but it is well known if PlayPayload return < 0 it is either -EFAULT or -EEXIST
 	int r = PlacePayload(skb);
 	if (r == -EFAULT)	// r < 0 && r != -EEXIST
@@ -946,16 +954,8 @@ void CSocketItemEx::OnGetCommit()
 		TRACE_HERE("cannot place optional payload in the COMMIT packet");
 		return;
 	}
-	// See also OnGetPersist()
-#ifdef TRACE
-	TRACE_HERE("the responder calculate RTT");
-#endif
-	CalibrateKeepAlive();
 
-	bool peerCommitted = InState(PEER_COMMIT) || InState(COMMITTING2) || InState(CLOSABLE);
-	bool isInitiativeState = InState(CHALLENGING) || InState(CLONING);
-	// figure out whether it was in any initiative state before migration
-	if(! peerCommitted && pControlBlock->HasBeenCommitted() > 0)
+	if(pControlBlock->HasBeenCommitted() > 0)
 	{
 		if (lowState == CHALLENGING)
 		{
@@ -975,14 +975,14 @@ void CSocketItemEx::OnGetCommit()
 			StopKeepAlive();
 			SetState(PEER_COMMIT);
 		}
-		peerCommitted = true;
-	}
-
-	// Transactional COMMIT packet carries accumulative acknowledgment
-	if(peerCommitted)
-	{
+		//
 		if(isInitiativeState)
+		{
+#ifdef TRACE
+			printf_s("\nCOMMIT received. Acknowledged SN\t = %u\n", ackSeqNo);
+#endif
 			pControlBlock->SlideSendWindowByOne();
+		}
 		// MUST slide the send window BEFORE SendSNACK or else the sequence number of ACK_FLUSH or KEEP_ALIVE is wrong
 		SendSNACK();
 		//
@@ -993,9 +993,7 @@ void CSocketItemEx::OnGetCommit()
 		}
 	}
 
-	// But the data might be undeliverable, if there is some gap. However it do little harm
-	if (r > 0)	// if r == -EEXIST it should have already notify
-		Notify(FSP_NotifyDataReady);
+	Notify(FSP_NotifyFlushing);
 }
 
 
@@ -1003,13 +1001,12 @@ void CSocketItemEx::OnGetCommit()
 // ACK_FLUSH, now a pure out-of-band control packet. A special norm of KEEP_ALIVE
 //	COMMITTING-->/ACK_FLUSH/-->COMMITTED-->[Notify]
 //	COMMITTING2-->/ACK_FLUSH/-->{stop keep-alive}CLOSABLE-->[Notify]
-//	PRE_CLOSED-->/ACK_FLUSH/-->CLOSED
 void CSocketItemEx::OnAckFlush()
 {
 	// As ACK_FLUSH is rare we trace every appearance
 	TRACE_SOCKET();
 
-	if (!InState(COMMITTING) && !InState(COMMITTING2) && !InState(PRE_CLOSED))
+	if (!InState(COMMITTING) && !InState(COMMITTING2))
 		return;
 
 	FSP_SelectiveNACK::GapDescriptor *gaps;
@@ -1026,12 +1023,6 @@ void CSocketItemEx::OnAckFlush()
 #endif
 
 	tLastRecv = NowUTC();
-
-	if(InState(PRE_CLOSED))
-	{
-		CloseToNotify();
-		return;
-	}
 
 	if (InState(COMMITTING2))
 	{
@@ -1056,15 +1047,13 @@ void CSocketItemEx::OnAckFlush()
 
 // RELEASE, no payload but consuming sequence space to fight back play - back DoS attack(via ValidateICC())
 //	tLastRecv is not modified
-// CLOSABLE-->/RELEASE/-->CLOSED-->[Notify]
-// CLOSED-->/RELEASE/-->[Send ACK_FLUSH]
-// PEER_COMMIT-->/RELEASE/ [Send ACK_FLUSH]-->CLOSED-->[Notify]
+// CLOSABLE-->/RELEASE/-->CLOSED-->[Send RELEASE]-->[Notify]
 // {COMMITTING2, PRE_CLOSED}-->/RELEASE/
-//    -->{stop keep-alive}CLOSED-->[Send ACK_FLUSH]-->[Notify]
+//    -->{stop keep-alive}CLOSED-->[Send RELEASE]-->[Notify]
 void CSocketItemEx::OnGetRelease()
 {
 	TRACE_SOCKET();
-	if (!InStates(5, PEER_COMMIT, COMMITTING2, CLOSABLE, PRE_CLOSED, CLOSED))
+	if (!InState(COMMITTING2) && !InState(CLOSABLE) && !InState(PRE_CLOSED))
 		return;
 
 	if (headPacket->lenData != 0)
@@ -1079,28 +1068,33 @@ void CSocketItemEx::OnGetRelease()
 		return;
 	}
 
-	if(InState(CLOSED))
-	{
-		SendSNACK();
-		return;
-	}
+	// UNRESOLVED! When RespondToSNACK? But RELEASE is an In-band packet, to mark the termination!
+	FSP_NormalPacketHeader *p1 = headPacket->GetHeaderFSP();
+	ControlBlock::seq_t ackSeqNo = be32toh(p1->expectedSN);
+	RespondToSNACK(ackSeqNo, NULL, 0);
 
-	if(InState(COMMITTING2) || InState(PRE_CLOSED))
+	bool initiativeShutdown = InState(PRE_CLOSED);
+	if(InState(COMMITTING2))
 		StopKeepAlive();
-
-	if(! InState(CLOSABLE)) //  InState(PEER_COMMIT, COMMITTING2, PRE_CLOSED)
-		SendSNACK();
-
-	Notify(InState(PRE_CLOSED) ? FSP_NotifyRecycled : FSP_NotifyFinish);
+	// InState(PRE_CLOSED): CloseSocket would StopKeepAlive
+	SetState(CLOSED);
+	SendPacket<RELEASE>();
 	// NotifyRecyled is meant to be call-back of gracefully shutdown,
-	// while NotifyFinish is requested by the remote end
-	// See also CloseToNotify.
-	CloseSocket();
+	// while NotifyToFinish is requested by the remote end
+	if (initiativeShutdown)
+	{
+		Notify(FSP_NotifyRecycled);
+		CloseSocket();
+	}
+	else
+	{
+		Notify(FSP_NotifyToFinish);
+	}
 }
 
 
 
-//{ACTIVE, COMMITTING, PEER_COMMIT, COMMITTING2, COMMITTED, CLOSABLE}
+//{ACTIVE, COMMITTING, PEER_COMMIT, COMMITTING2, COMMITTED, CLOSABLE, PRE_CLOSED, CLOSED}
 //	|<-->/MULTIPLY/{duplication detected: retransmit acknowledgement}
 //	|<-->/MULTIPLY/{collision detected}[Send RESET]
 //	|-->/MULTIPLY/-->[API{Callback}]
@@ -1111,7 +1105,7 @@ void CSocketItemEx::OnGetMultiply()
 {
 	TRACE_SOCKET();
 
-	if (!InStates(6, ESTABLISHED, COMMITTING, PEER_COMMIT, COMMITTING2, COMMITTED, CLOSABLE))
+	if (!InStates(8, ESTABLISHED, COMMITTING, PEER_COMMIT, COMMITTING2, COMMITTED, CLOSABLE, PRE_CLOSED, CLOSED))
 		return;
 
 	if (pControlBlock->IsRetriableStale(headPacket->pktSeqNo))

@@ -132,8 +132,8 @@ const char * CStringizeNotice::names[LARGEST_FSP_NOTICE + 1] =
 	"FSP_NotifyBufferReady",
 	"FSP_NotifyReset",
 	"FSP_NotifyFlushed",
-	"FSP_NotifyFinish",
-	"Reserved22",
+	"FSP_NotifyToFinish",
+	"FSP_NotifyFlushing",	// used to be FSP_Dispose or Reserved22
 	"Reserved23",
 	// 24~31: near end error status
 	"FSP_IPC_CannotReturn",	// LLS cannot return to DLL for some reason
@@ -298,16 +298,15 @@ bool LOCALAPI LLSBackLog::Has(const BackLogItem *p)
 // Given
 //	FSP_ServiceCode	the notice code, shall not be NullCommand(0)
 // Return
-//	0 if no error
+//	position of new inserted notice, 0
 //	negative if failed, most likely because of overflow
-//	positive if with warning, most likely because of duplicate tail notice
 // Remark
-//	Duplicate tail notice is merged
+//	Duplicate tail notice is merged, return FSP_MAX_NUM_NOTICE
 //	NullCommand cannot be put
 int LOCALAPI LLSNotice::Put(FSP_ServiceCode c)
 {
 	while(_InterlockedCompareExchange8(& mutex, 1, 0) != 0)
-		Sleep(1);
+		Sleep(0);
 	//
 	register char *p = (char *) & q[FSP_MAX_NUM_NOTICE - 1];
 	if(*p != NullCommand)
@@ -329,13 +328,13 @@ int LOCALAPI LLSNotice::Put(FSP_ServiceCode c)
 		if(*p == c)
 		{
 			_InterlockedExchange8(& mutex, 0);
-			return EAGAIN;
+			return FSP_MAX_NUM_NOTICE;
 		}
 	} while(*p == NullCommand && --p - (char *)q >= 0);
 	_InterlockedExchange8(p + 1, c);
 	//
 	_InterlockedExchange8(& mutex, 0);
-	return 0;
+	return int(p + 1 - (char *)q);
 }
 
 
@@ -346,7 +345,7 @@ int LOCALAPI LLSNotice::Put(FSP_ServiceCode c)
 FSP_ServiceCode LLSNotice::Pop()
 {
 	while(_InterlockedCompareExchange8(& mutex, 1, 0) != 0)
-		Sleep(1);
+		Sleep(0);
 	//
 	register char *p = (char *) & q[FSP_MAX_NUM_NOTICE - 1];
 	register char c = NullCommand;

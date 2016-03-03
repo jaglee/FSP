@@ -160,7 +160,7 @@ int CSocketItemDl::SelfNotify(FSP_ServiceCode c)
 
 
 DllExport
-int FSPControl(FSPHANDLE hFSPSocket, FSP_ControlCode controlCode, ULONG_PTR value)
+int FSPAPI FSPControl(FSPHANDLE hFSPSocket, FSP_ControlCode controlCode, ULONG_PTR value)
 {
 	try
 	{
@@ -322,6 +322,7 @@ void CSocketItemDl::WaitEventToDispatch()
 #ifdef TRACE_PACKET
 		printf_s("\nIn local fiber#%u, state %s\tnotice: %s\n", fidPair.source, stateNames[pControlBlock->state], noticeNames[notice]);
 #endif
+		shouldChainTimeout = 1;
 		switch(notice)
 		{
 		case FSP_NotifyAccepting:	// overloaded callback for either CONNECT_REQUEST or MULTIPLY
@@ -344,6 +345,11 @@ void CSocketItemDl::WaitEventToDispatch()
 		case FSP_NotifyDataReady:
 			ProcessReceiveBuffer();
 			break;
+		case FSP_NotifyFlushing:
+			ProcessReceiveBuffer();	// See FSP_NotifyDataReady, FSP_NotifyFlushed and CSocketItemDl::Shutdown()
+			if(InState(CLOSABLE) && GetResetFlushing() == FLUSHING_SHUTDOWN)
+				Call<FSP_Shutdown>();
+			break;
 		case FSP_NotifyBufferReady:
 			ProcessPendingSend();
 			break;
@@ -354,13 +360,15 @@ void CSocketItemDl::WaitEventToDispatch()
 			return;
 		case FSP_NotifyFlushed:
 			ProcessPendingSend();
-			if(GetResetFlushing() == FLUSHING_SHUTDOWN)
+			if(InState(CLOSABLE) && GetResetFlushing() == FLUSHING_SHUTDOWN)
 				Call<FSP_Shutdown>();
 			break;
-		case FSP_NotifyFinish:
-			RespondToFinish();
+		case FSP_NotifyToFinish:
+			if(context.onFinish != NULL)
+				context.onFinish(this, FSP_NotifyToFinish, 0);
 			return;
 		case FSP_NotifyRecycled:
+			CancelTimer();	// If any; typically for Shutdown 
 			RespondToRecycle();
 			return;
 		case FSP_IPC_CannotReturn:
@@ -448,15 +456,17 @@ bool LOCALAPI CSocketItemDl::Call(const CommandToLLS & cmd, int size)
 
 bool LOCALAPI CSocketItemDl::AddOneShotTimer(uint32_t dueTime)
 {
-	return (
-		::CreateTimerQueueTimer(& timer, ::timerQueue
+	shouldChainTimeout = 0;
+	return (timer != NULL
+		? ::ChangeTimerQueueTimer(::timerQueue, timer, dueTime, 0)
+		: ::CreateTimerQueueTimer(& timer, ::timerQueue
 			, WaitOrTimeOutCallBack
 			, this		// LPParameter
 			, dueTime
 			, 0
 			, WT_EXECUTEINTIMERTHREAD
-			) != FALSE
-		);
+			)
+		) != FALSE;
 }
 
 
@@ -478,10 +488,14 @@ bool CSocketItemDl::CancelTimer()
 
 void CSocketItemDl::TimeOut()
 {
-	if(pControlBlock->notices.GetHead() != FSP_IPC_CannotReturn) 
+	if(pControlBlock->notices.GetHead() == FSP_IPC_CannotReturn)
+	{
+		Recycle();
 		return;
+	}
 	//
-	Recycle();
+	if(shouldChainTimeout)
+		AddOneShotTimer(TRASIENT_STATE_TIMEOUT_ms);
 }
 
 

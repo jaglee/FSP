@@ -531,7 +531,7 @@ class LLSBackLog
 	void InitSize() { capacity = MIN_QUEUED_INTR; mutex = 0; }	// assume memory has been zeroized
 	int	InitSize(int);
 
-	void WaitSetMutex() { while(_InterlockedCompareExchange8(& mutex, 1, 0)) Sleep(1); }
+	void WaitSetMutex() { while(_InterlockedCompareExchange8(& mutex, 1, 0)) Sleep(0); }
 	void SetMutexFree() { _InterlockedExchange8(& mutex, 0); }
 public:
 	void Clear() { count = 0; headQ = tailQ; mutex = 0; }

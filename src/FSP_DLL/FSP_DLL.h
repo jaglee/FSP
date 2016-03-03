@@ -103,8 +103,9 @@ class CSocketItemDl: public CSocketItem
 	FSP_SocketParameter context;
 	char			newTransaction;	// it may simultaneously start a transmit transaction and flush/commit it
 	char			isFlushing;
-	char			shouldAppendCommit;
 	char			inUse;
+	char			shouldAppendCommit:1;
+	char			shouldChainTimeout:1;
 protected:
 	ALIGN(8)		HANDLE theWaitObject;
 
@@ -167,7 +168,6 @@ protected:
 	void ProcessReceiveBuffer();
 	//
 	void ToConcludeConnect();
-	void RespondToFinish();
 	void RespondToRecycle();
 
 	int LOCALAPI BufferData(int);
@@ -180,7 +180,7 @@ public:
 	{
 		// NOT_FLUSHING == 0, and '0' is self-explanatory
 		END_MESSAGE_ONLY = -1,
-		ONLY_FLUSHING = 1,
+		FLUSHING_COMMIT = 1,
 		FLUSHING_SHUTDOWN = 2
 	};
 
@@ -284,11 +284,10 @@ public:
 	void SetEndOfRecvMsg(bool value = true) { context.u.st.eom = value ? 1 : 0; }
 	bool IsRecvBufferEmpty()  { return pControlBlock->CountReceived() <= 0; }
 
-	int	Commit();
 	int LOCALAPI Shutdown(NotifyOrReturn);
 
 	void SetCallbackOnAccept(CallbackConnected fp1) { context.afterAccept = fp1; }
-	void SetCallbackOnFinish(NotifyOrReturn fp1) { context.afterClose = fp1; }
+	void SetCallbackOnFinish(NotifyOrReturn fp1) { context.onFinish = fp1; }
 	void SetCallbackOnRecyle(NotifyOrReturn fp1) { fpRecycled = fp1; }
 
 	char GetResetFlushing() { return _InterlockedExchange8(& isFlushing, 0);}

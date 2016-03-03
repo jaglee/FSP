@@ -5,6 +5,7 @@
 
 #define REMOTE_APPLAYER_NAME "localhost:80"
 // #define REMOTE_APPLAYER_NAME "lt-x61t:80"
+// #define REMOTE_APPLAYER_NAME "lt-at4:80"
 // #define REMOTE_APPLAYER_NAME "lt-ux31e:80"
 // #define REMOTE_APPLAYER_NAME "E000:AAAA::1"
 
@@ -53,13 +54,30 @@ static void FSPAPI onError2(FSPHANDLE h, FSP_ServiceCode code, int value)
 static void FSPAPI onFinished(FSPHANDLE h, FSP_ServiceCode code, int value)
 {
 	printf_s("Fiber ID = %u, session was to shut down.\n", (uint32_t)(intptr_t)h);
-	if(code != FSP_NotifyFinish && code != FSP_NotifyRecycled)
+	if(code != FSP_NotifyRecycled)
 	{
-		printf_s("Should got ON_FINISHED or ON_RECYCLED, but service code = %d, return %d\n", code, value);
+		printf_s("Should got ON_RECYCLED, but service code = %d, return %d\n", code, value);
 		return;
 	}
 
 	Dispose(h);
+	finished = true;
+	return;
+}
+
+
+
+//
+static void FSPAPI onServerClose(FSPHANDLE h, FSP_ServiceCode code, int value)
+{
+	printf_s("Fiber ID = %u, the server shutdown the session.\n", (uint32_t)(intptr_t)h);
+	if(code != FSP_NotifyToFinish)
+	{
+		printf_s("Should got TO_FINISH, but service code = %d, return %d\n", code, value);
+		return;
+	}
+
+	Dispose(h);	// should be graceful 'close' socket
 	finished = true;
 	return;
 }
@@ -113,8 +131,8 @@ int main(int argc, char *argv[])
 	memset(& parms, sizeof(parms), 0);
 	// parms.beforeAccept = NULL;
 	parms.afterAccept = onConnected;
-	// parms.afterClose = NULL;	// onFinished;	// no, no passive exit for the initiator
 	parms.onError = onNotice;
+	parms.onFinish = onServerClose;
 	parms.recvSize = MAX_FSP_SHM_SIZE;	// 4MB
 	parms.sendSize = 0;	// the underlying service would give the minimum, however
 	if(Connect2(REMOTE_APPLAYER_NAME, & parms) == NULL)
@@ -242,12 +260,12 @@ static void FSPAPI onReceiveFileNameReturn(FSPHANDLE h, FSP_ServiceCode resultCo
 				}
 				else
 				{
-					fileName[n - 1] ++;	// it might be a illegal character, however
+					fileName[n - 1] ++;	// it might be an illegal character, however
 				}
 			}
 			else
 			{
-				(* --pDot) ++;			// it might be a illegal character, however
+				(* --pDot) ++;			// it might be an illegal character, however
 			}
 			// 
 			printf_s("It should be created in the near end,\n"
@@ -331,7 +349,7 @@ static void FSPAPI onAcknowledgeSent(FSPHANDLE h, FSP_ServiceCode c, int r)
 		return;
 	}
 
-	if(Shutdown(h, onFinished) != 0)
+	if(Shutdown(h, onFinished) < 0)
 	{
 		printf_s("Cannot shutdown gracefully in the final stage.\n");
 		Dispose(h);

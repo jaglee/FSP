@@ -31,7 +31,7 @@
 
 // See "FSP_DLL.h" and "FSP_API.h". But FSP_DLL.h is NOT C-compatible
 #ifdef _MSC_VER
-#define FSPAPI __fastcall
+#define FSPAPI __stdcall
 #else
 #define FSPAPI
 #endif

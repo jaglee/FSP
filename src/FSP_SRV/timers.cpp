@@ -113,25 +113,23 @@ void CSocketItemEx::TimeOut()
 		if(lowState != CHALLENGING)
 			EmitStart();
 		break;
-	case ESTABLISHED:
-		if(t1 - tLastRecv > (SCAVENGE_THRESHOLD_ms << 10))
-		{
-			ReplaceTimer(TRASIENT_STATE_TIMEOUT_ms);
-			TIMED_OUT();
-		}
-	case COMMITTING:
-	case COMMITTING2:
-		if((t1 - clockCheckPoint.tMigrate) > (TRASIENT_STATE_TIMEOUT_ms << 10))
+	case COMMITTING2:	// Normally more stringent than in ESTABLISHED, PPER_COMMIT or COMMITTED state
+	case COMMITTING:	// But in some rare case the session key might run out of life so fall through
+		if (t1 - tLastRecv > (TRASIENT_STATE_TIMEOUT_ms << 10) && t1 - tRecentSend > (TRASIENT_STATE_TIMEOUT_ms << 10))
 		{
 #ifdef TRACE
 			printf_s("\nTransient state time out in the %s state\n", stateNames[lowState]);
 #endif
 			TIMED_OUT();
 		}
+	case ESTABLISHED:
 	case PEER_COMMIT:
 	case COMMITTED:
 		if(t1 - tSessionBegin > (MAXIMUM_SESSION_LIFE_ms << 10))
 		{
+#ifdef TRACE
+			printf_s("\nSession time out in the %s state\n", stateNames[lowState]);
+#endif
 			ReplaceTimer(TRASIENT_STATE_TIMEOUT_ms);
 			TIMED_OUT();
 		}
@@ -294,12 +292,18 @@ bool CSocketItemEx::SendSNACK(FSPOperationCode opCode)
 int LOCALAPI CSocketItemEx::RespondToSNACK(ControlBlock::seq_t expectedSN, FSP_SelectiveNACK::GapDescriptor *gaps, int n)
 {
 	const int32_t capacity = pControlBlock->sendBufferBlockN;
-	if(sizeof(ControlBlock) + (sizeof(ControlBlock::FSP_SocketBuf) + MAX_BLOCK_SIZE) * capacity > dwMemorySize)
+	if (sizeof(ControlBlock) + (sizeof(ControlBlock::FSP_SocketBuf) + MAX_BLOCK_SIZE) * capacity > dwMemorySize)
+	{
+		TRACE_HERE("memory overflow");
 		return -EFAULT;
+	}
 
 	const int sentWidth = pControlBlock->CountSentInFlight();
-	if(sentWidth < 0)
+	if (sentWidth < 0)
+	{
+		TRACE_HERE("send queue internal state error");
 		return -EFAULT;
+	}
 	if(sentWidth == 0)
 		return 0;	// there is nothing to be acknowledged
 
@@ -307,8 +311,13 @@ int LOCALAPI CSocketItemEx::RespondToSNACK(ControlBlock::seq_t expectedSN, FSP_S
 #if defined(TRACE_HEARTBEAT) || defined(TRACE_PACKET)
 	printf_s("Accumulatively acknowledged SN = %u, %d packet(s) acknowledged.\n", expectedSN, nAck);
 #endif
-	if(nAck < 0)
+	if (nAck < 0)
+	{
+#ifdef TRACE
+		printf_s("DealWithSNACK error, erro code: %d\n", nAck);
+#endif
 		return nAck;
+	}
 	// Shall not return on nAck == 0: we care about implicitly negatively acknowledged tail packets as well
 	// here is the key point that SNACK may make retransmission more efficient than per-packet timed-out(?)
 

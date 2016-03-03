@@ -475,7 +475,7 @@ bool LOCALAPI CSocketItemEx::EmitWithICC(ControlBlock::PFSP_SocketBuf skb, Contr
 	if(skb->opCode == COMMIT && (pControlBlock->hasPendingKey & HAS_PENDING_KEY_FOR_SEND) != 0)
 	{
 		InstallSessionKey();
-		pControlBlock->hasPendingKey = HAS_PENDING_KEY_FOR_RECV;
+		pControlBlock->hasPendingKey &= ~HAS_PENDING_KEY_FOR_SEND;
 		contextOfICC.firstRecvSNewKey = pControlBlock->recvWindowNextSN + INT32_MAX;
 	}
 

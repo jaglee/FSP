@@ -34,7 +34,7 @@
 #include "FSP.h"
 
 #ifdef _MSC_VER
-#define FSPAPI __fastcall
+#define FSPAPI __stdcall
 #else
 #define FSPAPI
 #endif
@@ -148,8 +148,8 @@ struct FSP_SocketParameter
 {
 	CallbackRequested	beforeAccept;	// may be NULL
 	CallbackConnected	afterAccept;	// cannot be NULL
-	NotifyOrReturn		afterClose;		// may be NULL
 	NotifyOrReturn		onError;		// should be non-NULL
+	NotifyOrReturn		onFinish;		// on getting remote peer's RELEASE packet, may be NULL
 	//
 	const void *	welcome;		// default welcome message, may be NULL
 	unsigned short	len;			// length of the default welcome message
@@ -341,7 +341,7 @@ int FSPAPI Dispose(FSPHANDLE hFSPSocket);
 // Remark
 //	make the rule-adhered IPv6 address, the result is placed in the given pointed place holder
 DllSpec
-uint32_t * TranslateFSPoverIPv4(PFSP_IN6_ADDR, uint32_t, ALFID_T);
+uint32_t * FSPAPI TranslateFSPoverIPv4(PFSP_IN6_ADDR, uint32_t, ALFID_T);
 
 
 // When use FSPControl to enumerate interfaces,
@@ -350,7 +350,7 @@ uint32_t * TranslateFSPoverIPv4(PFSP_IN6_ADDR, uint32_t, ALFID_T);
 // return number of availabe interfaces with configured IPv4/IPv6 address
 // which might be zero. negative if error.
 DllSpec
-int FSPControl(FSPHANDLE, FSP_ControlCode, ulong_ptr);
+int FSPAPI FSPControl(FSPHANDLE, FSP_ControlCode, ulong_ptr);
 
 
 // Given

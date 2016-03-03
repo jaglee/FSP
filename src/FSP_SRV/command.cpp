@@ -205,22 +205,6 @@ void CSocketItemEx::Connect()
 
 
 
-//[API: Shutdown]
-//	COMMITTED-->[Send RELEASE]-->PRE_CLOSED
-//	CLOSABLE-->[Send RELEASE]-->CLOSED-->[Notify]
-void CSocketItemEx::Shutdown()
-{
-	TRACE_HERE("called");
-
-	SendPacket<RELEASE>();
-	if(InState(CLOSABLE))
-		CloseToNotify();
-	else if(InState(COMMITTED))
-		SetState(PRE_CLOSED);
-}
-
-
-
 // Start sending queued packet(s) in the session control block
 // Remark
 //	Operation code in the given command context would be cleared if send is pending

@@ -291,34 +291,34 @@ void UnitTestNoticeQ()
 	Assert::IsTrue(r == 0, L"FSP_NotifyTimeout should have been put on an empty queue");
 
 	r = cqq.notices.Put(FSP_NotifyReset);		// 2
-	Assert::IsTrue(r == 0, L"FSP_NotifyReset should have been put on an un-fulfilled queue");
+	Assert::IsTrue(r == 1, L"FSP_NotifyReset should have been put on an un-fulfilled queue");
 
 	r = cqq.notices.Put(FSP_NotifyDataReady);	// 3
-	Assert::IsTrue(r == 0, L"FSP_NotifyDataReady should have been put on an un-fulfilled queue");
+	Assert::IsTrue(r == 2, L"FSP_NotifyDataReady should have been put on an un-fulfilled queue");
 
 	r = cqq.notices.Put(FSP_NotifyDataReady);
-	Assert::IsTrue(r > 0, L"Duplicated FSP_NotifyDataReady should be put on queue merged");
+	Assert::IsTrue(r == FSP_MAX_NUM_NOTICE, L"Duplicated FSP_NotifyDataReady should be put on queue merged");
 
 	r = cqq.notices.Put(FSP_NotifyReset);		// 4, no, it cannot be merged with previous, uncontinuous duplicate notification
-	Assert::IsTrue(r == 0, L"FSP_NotifyReset should be put on an un-fulfilled queue");
+	Assert::IsTrue(r == 3, L"FSP_NotifyReset should be put on an un-fulfilled queue");
 
-	r = cqq.notices.Put(FSP_NotifyFinish);		// 5
-	Assert::IsTrue(r == 0, L"FSP_NotifyRecycled should have been put on an un-fulfilled queue");
+	r = cqq.notices.Put(FSP_NotifyRecycled);		// 5
+	Assert::IsTrue(r == 4, L"FSP_NotifyRecycled should have been put on an un-fulfilled queue");
 
 	r = cqq.notices.Put(FSP_NotifyAccepted);		// 6
-	Assert::IsTrue(r == 0, L"FSP_NotifyAccepted should have been put on an un-fulfilled queue");
+	Assert::IsTrue(r == 5, L"FSP_NotifyAccepted should have been put on an un-fulfilled queue");
 
 	r = cqq.notices.Put(FSP_NotifyFlushed);		// 7
-	Assert::IsTrue(r == 0, L"FSP_NotifyFlushed should have been put on an un-fulfilled queue");
+	Assert::IsTrue(r == 6, L"FSP_NotifyFlushed should have been put on an un-fulfilled queue");
 
 	r = cqq.notices.Put(FSP_NotifyBufferReady);	// 8
-	Assert::IsTrue(r == 0, L"FSP_NotifyBufferReady should have been put on an un-fulfilled queue");
+	Assert::IsTrue(r == 7, L"FSP_NotifyBufferReady should have been put on an un-fulfilled queue");
 
 	r = cqq.notices.Put(FSP_NotifyTimeout);	// 9, no, it cannot be merged with previous, uncontinuous duplicate notification
-	Assert::IsTrue(r == 0, L"FSP_NotifyTimeout should be put on an un-fulfilled queue");
+	Assert::IsTrue(r == 8, L"FSP_NotifyTimeout should be put on an un-fulfilled queue");
 
 	r = cqq.notices.Put(FSP_IPC_CannotReturn);		// 10
-	Assert::IsTrue(r == 0, L"FSP_IPC_CannotReturn should have been put on an un-fulfilled queue");
+	Assert::IsTrue(r == 9, L"FSP_IPC_CannotReturn should have been put on an un-fulfilled queue");
 
 	////the queue is too large to raise such an error
 	//r = cqq.notices.Put(FSP_NotifyOverflow);
@@ -337,25 +337,25 @@ void UnitTestNoticeQ()
 	Assert::IsTrue(c == FSP_NotifyDataReady, L"What is popped should be what was pushed 3rd");
 
 	c = cqq.notices.Pop();	// 4
-	Assert::IsTrue(c == FSP_NotifyReset, L"What is popped should be what was pushed 2nd");
+	Assert::IsTrue(c == FSP_NotifyReset, L"What is popped should be what was pushed 4th");
 
 	c = cqq.notices.Pop();	// 5
-	Assert::IsTrue(c == FSP_NotifyFinish, L"What is popped should be what was pushed 4th");
+	Assert::IsTrue(c == FSP_NotifyRecycled, L"What is popped should be what was pushed 5th");
 
 	c = cqq.notices.Pop();	// 6
-	Assert::IsTrue(c == FSP_NotifyAccepted, L"What is popped should be what was pushed 5th");
+	Assert::IsTrue(c == FSP_NotifyAccepted, L"What is popped should be what was pushed 6th");
 
 	c = cqq.notices.Pop();	// 7
-	Assert::IsTrue(c == FSP_NotifyFlushed, L"What is popped should be what was pushed 6th");
+	Assert::IsTrue(c == FSP_NotifyFlushed, L"What is popped should be what was pushed 7th");
 
 	c = cqq.notices.Pop();	// 8
-	Assert::IsTrue(c == FSP_NotifyBufferReady, L"What is popped should be what was pushed 7th");
+	Assert::IsTrue(c == FSP_NotifyBufferReady, L"What is popped should be what was pushed 8th");
 
 	c = cqq.notices.Pop();	// 9
-	Assert::IsTrue(c == FSP_NotifyTimeout, L"What is popped should be what was pushed 1st");
+	Assert::IsTrue(c == FSP_NotifyTimeout, L"What is popped should be what was pushed 9th");
 
 	c = cqq.notices.Pop();	// 10
-	Assert::IsTrue(c == FSP_IPC_CannotReturn, L"What is popped should be what was pushed 8th");
+	Assert::IsTrue(c == FSP_IPC_CannotReturn, L"What is popped should be what was pushed 10th");
 
 	c = cqq.notices.Pop();
 	Assert::IsTrue(c == NullCommand, L"NullCommand should be popped from an empty queue");

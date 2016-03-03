@@ -179,6 +179,7 @@ int LOCALAPI CSocketItemDl::SendInplace(void * buffer, int len, FlagEndOfMessage
 		return -EBADF;
 	}
 	//
+	bytesBuffered = 0;
 	return FinalizeSend(PrepareToSend(buffer, len, eomFlag));
 }
 
@@ -220,56 +221,16 @@ int LOCALAPI CSocketItemDl::SendStream(void * buffer, int len, FlagEndOfMessage 
 
 
 
-// Return
-//	-EDOM if in erraneous state
-//	-EINTR if cannot gain the exclusive lock
-//	0 if no error
-// Remark
-//	Automatically terminate previous message, if any when called
-int CSocketItemDl::Commit()
-{
-	if(! WaitUseMutex())
-	{
-		TRACE_HERE("deadlock encountered? timed-out management?");
-		return -EINTR;
-	}
-
-	if (InState(ESTABLISHED))
-	{
-		SetState(COMMITTING);
-	}
-	else if (InState(PEER_COMMIT))
-	{
-		SetState(COMMITTING2);
-	}
-	else if (!InState(COMMITTING) && !InState(COMMITTING2))
-	{
-		SetMutexFree();
-		return -EDOM;
-	}
-
-	// If the last packet happened to have been sent by @LLS::EmitQ append a COMMIT and FSP_Urge would activate @LLS::EmitQ again 
-	int r = pControlBlock->ReplaceSendQueueTailToCommit();
-	shouldAppendCommit = (r < 0);	// true is 1
-
-	CancelTimer();	// if any
-	AddOneShotTimer(TRASIENT_STATE_TIMEOUT_ms);
-	SetMutexFree();
-	return (r == 0 ? (Call<FSP_Urge>() ? 0 : -EIO) : 0);
-}
-
-
-
 //[API: Send]
 //	CLONING<-->[Send PERSIST]{enable retry}
-//	ACTIVE<-->[Send PURE_DATA]
-//	ACTIVE-->[Send transact]-->COMMITTING
-//	PEER_COMMIT<-->[Send PURE_DATA]
-//	PEER_COMMIT-->[Send transact]-->COMMITTING2
+//	ACTIVE<-->[Send{more data}]
+//	ACTIVE-->[Send flush]-->COMMITTING
+//	PEER_COMMIT<-->[Send{more data}]
+//	PEER_COMMIT-->[Send{flush}]-->COMMITTING2{enable retry}
 //	COMMITTED-->ACTIVE-->[Send PERSIST]
-//	COMMITTED-->[Send transact]-->COMMITTING
+//	COMMITTED-->[Send{flush}]-->COMMITTING
 //	CLOSABLE-->PEER_COMMIT-->[Send PERSIST]{enable retry}
-//	CLOSABLE-->[Send transact]-->COMMITTING2{enable retry}
+//	CLOSABLE-->[Send{flush}]-->COMMITTING2{enable retry}
 // Return
 //	1 if revert to ACTIVE or PEER_COMMIT state
 //	0 if no state change
@@ -286,14 +247,14 @@ int LOCALAPI CSocketItemDl::CheckCommitOrRevert(FlagEndOfMessage flag)
 		flag = END_OF_TRANSACTION;
 	//
 	if (isFlushing == 0 && flag == END_OF_MESSAGE)
-		isFlushing = FlushingFlag::END_MESSAGE_ONLY;
-	else if (flag == END_OF_TRANSACTION && isFlushing != FlushingFlag::FLUSHING_SHUTDOWN)
-		isFlushing = FlushingFlag::ONLY_FLUSHING;
+		isFlushing = END_MESSAGE_ONLY;
+	else if (flag == END_OF_TRANSACTION && isFlushing != FLUSHING_SHUTDOWN)
+		isFlushing = FLUSHING_COMMIT;
 
 	if(InState(CLONING) || InState(CONNECT_AFFIRMING) || InState(CHALLENGING))
 		return 0;	// Just prebuffer, data could be sent without state migration
 
-	if (_InterlockedOr8(& shouldAppendCommit, 0) != 0)
+	if (shouldAppendCommit != 0)
 		return -EBUSY;
 
 	if(InState(ESTABLISHED))
@@ -383,7 +344,7 @@ void CSocketItemDl::ProcessPendingSend()
 		//
 #if defined(_DEBUG)
 		if (fpSent == NULL)
-			TRACE_HERE("Internal panic!Lost way to report WriteTo result");
+			TRACE_HERE("Internal panic! Lost way to report WriteTo result");
 #endif
 	}
 
@@ -406,13 +367,15 @@ void CSocketItemDl::ProcessPendingSend()
 	// pending WriteTo(), or pending Commit()
 	pendingSendBuf = NULL;	// So that WriteTo() chaining is possible, see also BufferData()
 	//
-	if (_InterlockedExchange8(& shouldAppendCommit, 0) != 0)
+	if (shouldAppendCommit != 0)
 	{
 		int r = pControlBlock->ReplaceSendQueueTailToCommit();
-		if (r == 1)	// should be the norm
-			Call<FSP_Send>();
-		else if (r < 0)
-			shouldAppendCommit = 1;
+		if (r >= 0)
+		{
+			shouldAppendCommit = 0;
+			if (r == 1)	// should be the norm
+				Call<FSP_Send>();
+		}
 	}
 	//
 	SetMutexFree();

@@ -94,7 +94,9 @@ int FSPAPI Shutdown(FSPHANDLE hFSPSocket, NotifyOrReturn fp1)
 
 
 
-// ALWAYS assume shutdown is only called after it has finished receiving
+// PEER_COMMIT-->[API:Send{ flush }]-->COMMITTING2{ chain async - shutdown }
+// CLOSABLE-->[Send RELEASE]-->PRE_CLOSED
+// ALWAYS assume that only after it has finished receiving is shutdown called
 int LOCALAPI CSocketItemDl::Shutdown(NotifyOrReturn fp1)
 {
 	if(! WaitUseMutex())
@@ -106,6 +108,7 @@ int LOCALAPI CSocketItemDl::Shutdown(NotifyOrReturn fp1)
 		return EBADF;	// A warning saying that the socket has already been closed thoroughly
 	}
 
+	isFlushing = FLUSHING_SHUTDOWN;
 	SetCallbackOnRecyle(fp1);
 
 	if (InState(CLOSED))
@@ -121,14 +124,19 @@ int LOCALAPI CSocketItemDl::Shutdown(NotifyOrReturn fp1)
 		return EAGAIN;	// A warning saying that the socket is already in graceful shutdown process
 	}
 
-	// Send RELEASE and wait ACK_FLUSH. LLS to signal FSP_NotifyRecycled, NotifyReset or NotifyTimeout
-	if (InState(COMMITTED) || InState(CLOSABLE))
+	// Send RELEASE and wait echoed RELEASE. LLS to signal FSP_NotifyRecycled, NotifyReset or NotifyTimeout
+	if (InState(CLOSABLE))
 	{
+		SetState(PRE_CLOSED);
 		SetMutexFree();
 		return (Call<FSP_Shutdown>() ? 0 : -EIO);
 	}
 
 	// The last resort: flush sending stream if it has not yet been committed
+	int r = 0;
+	if(InState(COMMITTED))
+		goto l_finish;
+
 	if(! TestSetState(ESTABLISHED, COMMITTING) && ! InState(COMMITTING)
 	&& ! TestSetState(PEER_COMMIT, COMMITTING2) && ! InState(COMMITTING2))
 	{
@@ -137,22 +145,19 @@ int LOCALAPI CSocketItemDl::Shutdown(NotifyOrReturn fp1)
 		return EDOM;	// A warning say that the connection is aborted actually, for it is not in the proper state
 	}
 
-	isFlushing = FlushingFlag::FLUSHING_SHUTDOWN;
-	SetMutexFree();
-	return Commit();
-}
-
-
-
-// Tiggered by the remote end RELEASE packet, and assume that ULA would not dispose the socket.
-void CSocketItemDl::RespondToFinish()
-{
-	if(context.afterClose != NULL)
-		context.afterClose(this, FSP_NotifyFinish, 0);
+	// If the last packet happened to have been sent by @LLS::EmitQ append a COMMIT and FSP_Urge would activate @LLS::EmitQ again 
+	r = pControlBlock->ReplaceSendQueueTailToCommit();
+	if(r == 0)
+		r = (Call<FSP_Urge>() ? 0 : -EIO);
+	else if(r < 0)
+		shouldAppendCommit = 1, r = 0;
 	else
-		NotifyError(FSP_NotifyFinish, EINTR);	// Just a warning
-	//
-	Recycle();
+		r = EBUSY;	// a warning saying that it is COMMITTING
+
+l_finish:
+	AddOneShotTimer(TRASIENT_STATE_TIMEOUT_ms);
+	SetMutexFree();
+	return r;
 }
 
 

@@ -48,16 +48,36 @@ void FSPAPI onNotice(FSPHANDLE h, FSP_ServiceCode code, int value)
 
 
 
+//
 void FSPAPI onFinished(FSPHANDLE h, FSP_ServiceCode code, int value)
 {
 	printf_s("Fiber ID = %u, session was to shut down.\n", (uint32_t)(intptr_t)h);
-	if(code != FSP_NotifyFinish && code != FSP_NotifyRecycled)
+	if(code != FSP_NotifyRecycled)
 	{
-		printf_s("Should got ON_FINISHED or ON_RECYCLED, but service code = %d, return %d\n", code, value);
+		printf_s("Should got ON_RECYCLED, but service code = %d, return %d\n", code, value);
 		return;
 	}
 
 	Dispose(h);
+	finished = true;
+	return;
+}
+
+
+
+
+
+//
+void FSPAPI onClientClose(FSPHANDLE h, FSP_ServiceCode code, int value)
+{
+	printf_s("Fiber ID = %u, the client shutdown the session.\n", (uint32_t)(intptr_t)h);
+	if(code != FSP_NotifyToFinish)
+	{
+		printf_s("Should got TO_FINISH, but service code = %d, return %d\n", code, value);
+		return;
+	}
+
+	Dispose(h);	// should be graceful 'close' socket
 	finished = true;
 	return;
 }
@@ -71,8 +91,8 @@ void FSPAPI WaitConnection(const char *thisWelcome, unsigned short mLen, Callbac
 	memset(& params, 0, sizeof(params));
 	params.beforeAccept = onAccepting;
 	params.afterAccept = onAccepted;
-	// params.afterClose = NULL;
 	params.onError = onNotice;
+	params.onFinish = onClientClose;
 	params.welcome = thisWelcome;
 	params.len = mLen;
 	params.sendSize = MAX_FSP_SHM_SIZE;
@@ -270,13 +290,18 @@ static int FSPAPI toSendNextBlock(FSPHANDLE h, void * batchBuffer, int32_t capac
 static void FSPAPI onResponseReceived(FSPHANDLE h, FSP_ServiceCode c, int r)
 {
 	if(r < 0)
-		goto l_bailout;
+	{
+		printf_s("Wait response got error number %d. To abort.\n", r);
+l_bailout:
+		Dispose(h);
+		finished = true;
+		return;
+	}
 
 	printf_s("Response received: %s. To shutdown.\n", linebuf);
-	if(Shutdown(h, onFinished) != 0)
-		printf_s("Cannot shutdown gracefully.\n");
-
-l_bailout:
-	Dispose(h);
-	finished = true;
+	if(Shutdown(h, onFinished) < 0)
+	{
+		printf_s("What? Cannot shutdown gracefully!\n");
+		goto l_bailout;
+	}
 }

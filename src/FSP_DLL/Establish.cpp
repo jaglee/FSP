@@ -299,7 +299,7 @@ void CSocketItemDl::ToConcludeConnect()
 // Remark
 //	make the rule-adhered IPv6 address, the result is placed in the given pointed place holder
 DllSpec
-uint32_t * TranslateFSPoverIPv4(PFSP_IN6_ADDR p, uint32_t dwIPv4, uint32_t fiberID)
+uint32_t * FSPAPI TranslateFSPoverIPv4(PFSP_IN6_ADDR p, uint32_t dwIPv4, uint32_t fiberID)
 {
 	p->u.st.prefix = PREFIX_FSP_IP6to4;
 	p->u.st.ipv4 = dwIPv4;
@@ -346,7 +346,7 @@ int LOCALAPI CSocketItemDl::InstallKey(BYTE *key, int keySize, int32_t keyLife, 
 	if(! WaitUseMutex())
 		return -EINTR;
 
-	if(_InterlockedCompareExchange8(& pControlBlock->hasPendingKey, HAS_PENDING_KEY_FOR_SEND | HAS_PENDING_KEY_FOR_RECV, 0) != 0)
+	if(_InterlockedCompareExchange8(& pControlBlock->hasPendingKey, HAS_PENDING_KEY_FOR_SEND + HAS_PENDING_KEY_FOR_RECV, 0) != 0)
 	{
 		SetMutexFree();
 		return -EAGAIN;

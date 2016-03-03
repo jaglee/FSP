@@ -247,7 +247,7 @@ static void LOCALAPI ProcessCommand(HANDLE md)
 				pSocket->UrgeCommit();
 				break;
 			case FSP_Shutdown:
-				pSocket->Shutdown();
+				pSocket->SendPacket<RELEASE>();
 				break;
 			case FSP_InstallKey:
 				pSocket->InstallSessionKey();

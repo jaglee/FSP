@@ -177,8 +177,8 @@ typedef enum: char
 	FSP_NotifyBufferReady,
 	FSP_NotifyReset,
 	FSP_NotifyFlushed,
-	FSP_NotifyFinish,
-	// 22: used to be FSP_Dispose
+	FSP_NotifyToFinish,
+	FSP_NotifyFlushing, // 22: used to be FSP_Dispose
 	// 23: Reserved
 	// 24~31: near end error status
 	FSP_IPC_CannotReturn = 24,

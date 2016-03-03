@@ -616,10 +616,17 @@ void CSocketItemEx::Recycle()
 {
 	if(!IsInUse())
 		return;
-	if(lowState == CLOSABLE)
-		CloseSocket();
-	else if (lowState != CLOSED)
+	//
+	if (lowState != CLOSED && lowState != LISTENING)
+	{
+#ifdef TRACE
+		printf_s("Recycle called in %s(%d) state\n", stateNames[lowState], lowState);
+#endif
 		Disconnect();
+		return;
+	}
+	//
+	CloseSocket();
 }
 
 
@@ -635,7 +642,6 @@ void CSocketItemEx::CloseSocket()
 	}
 
 	pControlBlock->connectParams.keyLife = contextOfICC.keyLife;
-	SetState(CLOSED);
 	StopKeepAlive();
 	(CLowerInterface::Singleton())->FreeItem(this);
 }

@@ -157,7 +157,7 @@ public:
 	int Push(const CommandNewSessionSrv *);
 	int Remove(int);
 	// Connect to remote end might be time-consuming
-	void WaitSetMutex() { while(_InterlockedCompareExchange8(& mutex, 1, 0)) Sleep(1); }
+	void WaitSetMutex() { while(_InterlockedCompareExchange8(& mutex, 1, 0)) Sleep(0); }
 	void SetMutexFree() { _InterlockedExchange8(& mutex, 0); }
 };
 
@@ -389,11 +389,6 @@ public:
 	//
 	void InitiateConnect();
 	void CloseSocket();
-	void CloseToNotify()
-	{
-		Notify(FSP_NotifyRecycled);
-		CloseSocket();
-	}
 	void Disconnect();
 	void DisposeOnReset();
 	void OnMultiply();
@@ -472,7 +467,6 @@ public:
 #endif
 
 	// Command of ULA
-	void Shutdown();
 	// Connect and Send are special in the sense that it may take such a long time to complete that
 	// if it gains exclusive access of the socket too many packets might be lost
 	// when there are too many packets in the send queue
