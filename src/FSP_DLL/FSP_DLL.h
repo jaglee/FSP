@@ -292,7 +292,6 @@ public:
 
 	char GetResetFlushing() { return _InterlockedExchange8(& isFlushing, 0);}
 
-	bool CheckResetNewTransaction() { return _InterlockedCompareExchange8(& newTransaction, 0, 1) != 0; }
 	bool CheckToNewTransaction();
 	void SetNewTransaction() { newTransaction = 1; }
 

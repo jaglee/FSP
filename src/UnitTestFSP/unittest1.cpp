@@ -60,152 +60,19 @@ int LOCALAPI CallbackReceived(void *c, void *s, int n)
 }
 
 
-#if 0	// Absolutely obsolete
-/**
- * Auxilary test-stub class for test of session control block translate look aside buffer
- */
-class CommandSyncSessionTestSub: public CommandSyncSession
-{
-public:
-	CommandSyncSessionTestSub(ALFID_T id)
-	{
-		hMemoryMap = CreateFileMapping(INVALID_HANDLE_VALUE	// backed by the system paging file
-			, NULL	// not inheritable
-			, PAGE_READWRITE | SEC_COMMIT
-			, 0, MAX_SHM_SIZE	// file mapping size, we limit it to less than 4GB
-			, NULL);
-		if(hMemoryMap == INVALID_HANDLE_VALUE || hMemoryMap == NULL)
-		{
-			REPORT_ERRMSG_ON_TRACE("Cannot create shared memory object by CreateFileMapping");
-			throw E_ABORT;
-		}
-
-		szShMemory = MAX_SHM_SIZE;
-
-		hEvent = CreateEvent(NULL
-			, true // false // BOOL bManualReset
-			, false // not signaled
-			, NULL);	// "FlexibleSessionProtocolEvent"
-
-		if(hEvent == INVALID_HANDLE_VALUE || hEvent == NULL)
-		{
-			REPORT_ERRMSG_ON_TRACE("Cannot create event object for reverse synchronization");
-			CloseHandle(hMemoryMap);
-			throw E_HANDLE;
-		}
-
-		idProcess = GetCurrentProcessId();	// it's OK to map one's own memory space twice
-		idSession = id;
-	}
-};
-
-
-/*
- * Section: CommandQuasiQ is not strictly a type of queue.
- * Instead, its item value might be set and accessed freely, and removal of item is by make a marking
- * However, management of the tail which is the postion that the new item is added is of queue-flavor
- */
-void UnitTestCommandQuasiQ()
-{
-	CommandQuasiQ cqq;
-	register int i;
-	int n;
-	FSPIPC::SRVNotice r;
-	bool b;
-	cqq.Init();
-
-	b = cqq.SetReturned(FSPIPC::CallbackAccept, (FSPIPC::SRVNotice)0);
-	Assert::IsFalse(b, L"Cannot set returned value before an entry added");
-	b = cqq.Fetch(FSPIPC::CallbackAccept, & r);
-	Assert::IsFalse(b, L"Cannot fetch returned value before value set");
-
-	for(i = 0; i < MAX_BACKLOG_SIZE; i++)
-	{
-		n = cqq.Add(FSPIPC::CallbackAccept);
-		sprintf_s(linebuf, sizeof(linebuf), "Added sequence number: %u\n", n);
-		Logger::WriteMessage(linebuf);
-	}
-	n = cqq.Add(FSPIPC::CallbackAccept);
-	Assert::AreEqual(0, n, L"Add should fail if it overflow");
-
-	b = cqq.SetReturned(FSPIPC::CallbackAccept, (FSPIPC::SRVNotice)0);
-	Assert::IsTrue(b);
-	b = cqq.Fetch(FSPIPC::CallbackAccept, & r);
-	Assert::IsTrue(b);
-
-	sprintf_s(linebuf, sizeof(linebuf), "Returned value: %d\n", r);
-	Logger::WriteMessage(linebuf);
-
-	b = cqq.SetReturned(FSPIPC::InitConnection, (FSPIPC::SRVNotice)0);
-	Assert::IsFalse(b, L"It should be able to set return value for non-existent operation");
-	b = cqq.Fetch(FSPIPC::InitConnection, &r);
-	Assert::IsFalse(b, L"There should be no return value for non-existent operation");
-
-	n = cqq.Add(FSPIPC::InitConnection);
-
-	sprintf_s(linebuf, sizeof(linebuf), "Added sequence number: %u\n", n);
-	Logger::WriteMessage(linebuf);
-	//
-	b = cqq.SetReturned((uint32_t)n, (FSPIPC::SRVNotice)2);
-	Assert::IsTrue(b);
-	b = cqq.Fetch((uint32_t)n, & r);
-	Assert::IsTrue(b);
-	Assert::AreEqual(2, (int)r);
-
-	cqq.SetReturned(FSPIPC::CallbackAccept, (FSPIPC::SRVNotice)-1);
-	cqq.Fetch(FSPIPC::CallbackAccept, & r);
-
-	sprintf_s(linebuf, sizeof(linebuf), "Returned value: %u\n", r);
-	Logger::WriteMessage(linebuf);
-
-	Assert::IsTrue(cqq.IsCommandQHeadFree(), L"All entries in the queue should have been popped out.");
-	for(i = 0; i < MAX_BACKLOG_SIZE; i++)
-	{
-		n = cqq.Add(FSPIPC::CallbackAccept);
-		sprintf_s(linebuf, sizeof(linebuf), "Added sequence number: %u\n", n);
-		Logger::WriteMessage(linebuf);
-	}
-
-	for(i = 0; i < MAX_BACKLOG_SIZE; i++)
-	{
-		b = cqq.SetReturned(FSPIPC::CallbackAccept, (FSPIPC::SRVNotice)(i + 3));
-		Assert::IsTrue(b);
-		b = cqq.Fetch(FSPIPC::CallbackAccept, & r);
-		Assert::IsTrue(b);
-		Assert::AreEqual(i + 3, (int)r);
-		//
-		sprintf_s(linebuf, sizeof(linebuf), "Returned value: %u\n", r);
-		Logger::WriteMessage(linebuf);
-	}
-
-	n = cqq.Add(FSPIPC::InitConnection);
-	sprintf_s(linebuf, sizeof(linebuf), "Added sequence number: %u\n", n);
-	Logger::WriteMessage(linebuf);
-	//
-	b = cqq.SetReturned((uint32_t)n, (FSPIPC::SRVNotice)3);
-	Assert::IsTrue(b);
-
-	b = cqq.Fetch((uint32_t)n, & r);
-	Assert::IsTrue(b);
-	Assert::AreEqual(3, (int)r);
-	// TODO: test time-out, and more set/fetch value by sequence number[boundary check...]
-}
-#endif
-
-
 void UnitTestBackLogs()
 {
 	static const int MAX_BACKLOG_SIZE = 4;
 	static const int TEST_SIZE = sizeof(ControlBlock) + sizeof(BackLogItem) * MAX_BACKLOG_SIZE;
 	ControlBlock *buf = (ControlBlock *)_alloca(TEST_SIZE);
 	ControlBlock & cqq = *buf;
-	BackLogItem item;
+	BackLogItem item, *pItem;
 	register int i;
 	int n;
 
 	cqq.Init(MAX_BACKLOG_SIZE);
-	n = cqq.backLog.Pop(& item);
-	Assert::IsTrue(n < 0, L"There should be no item to be popped");
+	pItem = cqq.backLog.Peek();
+	Assert::IsNull(pItem, L"There should be no item to be popped");
 
 	item.idRemote = 1234;
 	item.salt = 4321;	// item.sessionKey[0] = 0xAA; // used to exploit session key
@@ -228,20 +95,22 @@ void UnitTestBackLogs()
 
 	for(i = 0; i < MAX_BACKLOG_SIZE; i++)
 	{
-		n = cqq.backLog.Pop(& item);
-		//
-		Assert::IsTrue(n >= 0, L"There should be log item popped");
+		pItem = cqq.backLog.Peek();
+		Assert::IsNotNull(pItem, L"There should be log item peekable");
+		n = cqq.backLog.Pop();
 		sprintf_s(linebuf, sizeof(linebuf), "Position at %d popped\n", n);
 		Logger::WriteMessage(linebuf);
 	}
-	n = cqq.backLog.Pop(& item);
-	Assert::IsTrue(n < 0, L"Cannot popped when it is empty");
+	pItem = cqq.backLog.Peek();
+	Assert::IsNull(pItem, L"Cannot peek anothing when it is empty");
+	n = cqq.backLog.Pop();
+	Assert::IsTrue(n < 0, L"Cannot pop when it is empty");
 	//
 	// change the length of the backlog queue on the fly
 	//
 	cqq.Init(MIN_QUEUED_INTR);
-	n = cqq.backLog.Pop(& item);
-	Assert::IsTrue(n < 0, L"There should be no item to be popped");
+	pItem = cqq.backLog.Peek();
+	Assert::IsNull(pItem, L"There should be no item peekable");
 
 	item.idRemote = 1234;
 	item.salt = 4321;	// item.sessionKey[0] = 0xAA; // used to exploit session key
@@ -264,14 +133,16 @@ void UnitTestBackLogs()
 
 	for(i = 0; i < MIN_QUEUED_INTR; i++)
 	{
-		n = cqq.backLog.Pop(& item);
-		//
-		Assert::IsTrue(n >= 0, L"There should be log item popped");
+		pItem = cqq.backLog.Peek();
+		Assert::IsNotNull(pItem, L"There should be log item peekable");
+		n = cqq.backLog.Pop();
 		sprintf_s(linebuf, sizeof(linebuf), "Position at %d popped\n", n);
 		Logger::WriteMessage(linebuf);
 	}
-	n = cqq.backLog.Pop(& item);
-	Assert::IsTrue(n < 0, L"Cannot popped when it is empty");
+	pItem = cqq.backLog.Peek();
+	Assert::IsNull(pItem, L"Cannot peek anothing when it is empty");
+	n = cqq.backLog.Pop();
+	Assert::IsTrue(n < 0, L"Cannot pop when it is empty");
 }
 
 
@@ -500,69 +371,6 @@ void UnitTestGCM_AES()
 
 
 
-
-
-void UnitTestVMAC()
-{
-#if 0
-	// as VMAC_AE failed unit test we remove VMAC support
-	FSP_InitiateRequest request;
-	FSP_Challenge responseZero;	// zero hint no state
-	FSP_AckConnectRequest acknowledgement;
-	CtrlMsgHdr nearEnd;
-	timestamp_t t0 = NowUTC();
-
-	int32_t r = 1;
-	r = htobe32(r);
-	memset(&nearEnd, 0, sizeof(nearEnd));
-	request.timeStamp = htobe64(t0);
-	// initCheckCode, salt should be random, but remain as-is for test purpose
-	request.hs.Set<FSP_InitiateRequest, INIT_CONNECT>();
-
-	timestamp_t t1 = NowUTC();
-	struct _CookieMaterial cm;
-	cm.idALF = nearEnd.u.idALF;
-	cm.idListener = htobe32(LAST_WELL_KNOWN_ALFID);
-	// the cookie depends on the listening session ID AND the responding session ID
-	cm.salt = request.salt;
-	responseZero.initCheckCode = request.initCheckCode;
-	responseZero.cookie = CalculateCookie((BYTE *) & cm, sizeof(cm), t1);
-	responseZero.timeDelta = htobe32((u_long)(t1 - t0)); 
-	responseZero.cookie ^= ((uint64_t)request.salt << 32) | request.salt;
-	responseZero.hs.Set<FSP_Challenge, ACK_INIT_CONNECT>();
-
-	acknowledgement.expectedSN = 1;
-	acknowledgement.sequenceNo = 1;
-	acknowledgement.integrity.id.peer = htobe32(LAST_WELL_KNOWN_ALFID); 
-	acknowledgement.integrity.id.source = nearEnd.u.idALF;
-
-	// should the connect parameter header. but it doesn't matter
-	acknowledgement.hs.Set<FSP_AckConnectRequest, ACK_CONNECT_REQ>();
-
-	PairALFID savedId = acknowledgement.integrity.id;
-	CSocketItemExDbg socket;
-	socket.ResetVMAC();
-
-	socket.SetIntegrityCheckCodeP1(& acknowledgement);
-
-	uint64_t savedICC = acknowledgement.integrity.code;
-	acknowledgement.integrity.id = savedId;
-	socket.SetIntegrityCheckCodeP1(& acknowledgement);
-	Assert::AreEqual<uint64_t>(savedICC, acknowledgement.integrity.code);
-
-	BYTE ackbuf[sizeof(acknowledgement) + 5];
-	// suppose a misalignment found..
-	memcpy(ackbuf + 3, & acknowledgement, sizeof(acknowledgement));
-	FSP_AckConnectRequest & ack2 = *(FSP_AckConnectRequest *)(ackbuf + 3);
-
-	ack2.integrity.id = savedId;
-	socket.SetIntegrityCheckCodeP1(& ack2);
-	Assert::AreEqual<uint64_t>(savedICC, ack2.integrity.code);
-#endif
-}
-
-
-
 void UnitTestQuasibitfield()
 {
 	FSP_AckConnectRequest acknowledgement;
@@ -682,29 +490,6 @@ void UnitTestSocketSrvTLB()
 
 
 
-
-
-#if 0	// obsolete
-void UnitTestDerivedClass()
-{
-	FSPoverUDP_Header hdr;
-	memset(& hdr, 0, sizeof(hdr));
-	hdr.srcSessionID = 1;
-	hdr.dstSessionID = 2;
-
-	sprintf(linebuf, "Size of derived struct: %d\n", sizeof(hdr));
-	Logger::WriteMessage(linebuf);
-
-	FSP_Header & r = (FSP_Header &)hdr;
-	sprintf(linebuf, "Size of base struct: %d\n", sizeof(r));
-	Logger::WriteMessage(linebuf);
-
-	Assert::IsFalse(sizeof(hdr) == sizeof((FSP_Header)hdr));
-};
-#endif
-
-
-
 void UnitTestReceiveQueue()
 {
 	CLowerInterfaceDbg *pLowerSrv = (CLowerInterfaceDbg *)CLowerInterface::Singleton();
@@ -764,96 +549,6 @@ void UnitTestConnectQueue()
 	Assert::IsTrue(i >= 0);
 	i = commandRequests.Remove(i);
 	Assert::IsTrue(i >= 0);
-}
-
-
-
-void UnitTestVMAC_AE()
-{
-#if 0
-	vmac_ae_ctx_t *ctx;
-	uint64_t tagh, tagh2, tagl, tagl2;
-	void *p;
-	unsigned char *m, *ct, *pt;
-	unsigned char key[] = "abcdefghijklmnop";
-	unsigned char nonce[] = "bcdefghi\0\0\0\0\0\0\0\0";
-	unsigned int  vector_lengths[] = {0, 3, 48, 300, 3000000};
-	#if (VMAC_TAG_LEN == 64)
-	char *should_be[] = {"4EDE4AE94EDD87E1","3E4DA5C2AAD72DD9",
-	                     "386A3E7B2867701B","48827AB2ABA0191D",
-	                     "400563BE24C6B88A"};
-	#else
-	char *should_be[] = {"E87569084EFF3E1CCA1500C5A6A89CE6",
-	                     "BE94EE5EF0B907A0917BCB8FE772AB08",
-	                     "DF371629033248692F31ABA01270DC05",
-	                     "17C9B2477A6B256F5B80B40292BE0E34",
-	                     "B9CCCE965D131DEF578CAC1CA56476B6"};
-	#endif
-	unsigned speed_lengths[] = {16, 32, 64, 128, 256, 512, 1024, 2048, 4096};
-	unsigned speed_iters[] = {1<<22, 1<<21, 1<<20, 1<<19, 1<<18,
-	                               1<<17, 1<<16, 1<<15, 1<<14};
-	unsigned int i, j;
-    clock_t ticks;
-    double cpb;
-	const unsigned int buf_len = 3 * (1 << 20);
-	
-	/* Initialize context and message buffer, all 16-byte aligned */
-	p = malloc(sizeof(vmac_ae_ctx_t) + 16);
-	ctx = (vmac_ae_ctx_t *)(((size_t)p + 16) & ~((size_t)15));
-	p = malloc(buf_len + 32);
-	m = (unsigned char *)(((size_t)p + 16) & ~((size_t)15));
-	p = malloc(buf_len + 32);
-	ct = (unsigned char *)(((size_t)p + 16) & ~((size_t)15));
-	p = malloc(buf_len + 32);
-	pt = (unsigned char *)(((size_t)p + 16) & ~((size_t)15));
-	/* memset(m, 0, buf_len + 16); */
-	vmac_ae_set_key(key, ctx);
-	vmac_ae_reset(ctx);
-	
-	/* Generate vectors */
-	for (i = 0; i < sizeof(vector_lengths)/sizeof(unsigned int); i++) {
-		for (j = 0; j < vector_lengths[i]; j++)
-			m[j] = (unsigned char)('a'+j%3);
-		vmac_ae_header(m, vector_lengths[i], ctx);
-		vmac_ae_encrypt(m, ct, vector_lengths[i], nonce, 8, ctx);
-		vmac_ae_footer(m, vector_lengths[i], ctx);
-		tagh = vmac_ae_finalize(&tagl, ctx);
-		vmac_ae_header(m, vector_lengths[i], ctx);
-		vmac_ae_decrypt(ct, pt, vector_lengths[i], nonce, 8, ctx);
-		vmac_ae_footer(m, vector_lengths[i], ctx);
-		tagh2 = vmac_ae_finalize(&tagl2, ctx);
-		#if (VMAC_TAG_LEN == 64)
-		printf("\'abc\' * %7u: %016llX Should be: %s\n",
-		      vector_lengths[i]/3,tagh,should_be[i]);
-		printf("Encrypt/decrypt %s, tags %s\n",
-		      (memcmp(pt, m, vector_lengths[i])  ? "mismatch" : "match"),
-		      (tagh == tagh2 ? "match" : "mismatch"));
-		#else
-		printf("\'abc\' * %7u: %016llX%016llX\nShould be      : %s\n",
-		      vector_lengths[i]/3,tagh,tagl,should_be[i]);
-		printf("Encrypt/decrypt %s, tags %s\n",
-		      (memcmp(pt, m, vector_lengths[i])  ? "mismatch" : "match"),
-		      ((tagh == tagh2) && (tagl == tagl2) ? "match" : "mismatch"));
-		#endif
-	}
-	
-	/* Speed test */
-#if 1
-#define VMAC_HZ  2e9	// 2Ghz
-	for (i = 0; i < sizeof(speed_lengths)/sizeof(unsigned int); i++) {
-		ticks = clock();
-		for (j = 0; j < speed_iters[i]; j++) {
-			vmac_ae_encrypt(m, ct, speed_lengths[i], nonce, 8, ctx);
-			tagh = vmac_ae_finalize(&tagl, ctx);
-			nonce[7]++;
-		}
-		ticks = clock() - ticks;
-		cpb = ((ticks*VMAC_HZ)/
-		      ((double)CLOCKS_PER_SEC*speed_lengths[i]*speed_iters[i]));
-		printf("%4u bytes, %2.2f cpb\n", speed_lengths[i], cpb);
-	}
-#endif
-#endif
 }
 
 
@@ -954,18 +649,6 @@ namespace UnitTestFSP
 		{
 			UnitTestGCM_AES();
 		}
-
-		TEST_METHOD(TestVMAC)
-		{
-			UnitTestVMAC();
-		}
-
-
-		TEST_METHOD(TestVMAC_AE)
-		{
-			UnitTestVMAC_AE();
-		}
-
 
 		TEST_METHOD(TestOCB_MAC)
 		{

@@ -123,26 +123,27 @@ void CSocketItemDl::ProcessBacklog()
 {
 	// TODO: set the default interface to non-zero?
 	CommandNewSession objCommand;
-	BackLogItem		logItem;
+	BackLogItem		*pLogItem;
 	CSocketItemDl * socketItem;
 	// firstly, fetch the backlog item
-	while(pControlBlock->backLog.Pop(& logItem) >= 0)
+	for(; (pLogItem = pControlBlock->backLog.Peek()) != NULL; pControlBlock->backLog.Pop())
 	{
-		socketItem = PrepareToAccept(logItem, objCommand);
+		socketItem = PrepareToAccept(*pLogItem, objCommand);
 		if(socketItem == NULL)
 		{
 			TRACE_HERE("Process listening backlog: insufficient system resource?");
 			this->InitCommand<FSP_Reject>(objCommand);
 			this->Call(objCommand, sizeof(struct CommandToLLS));
+			pControlBlock->backLog.Pop();
 			return;
 		}
 		// lost some possibility of code reuse, gain flexibility (and reliability)
-		if(logItem.idParent == 0 && ! socketItem->ToWelcomeConnect(logItem)
-		|| logItem.idParent != 0 && ! socketItem->ToWelcomeMultiply(logItem))
+		if(pLogItem->idParent == 0 && ! socketItem->ToWelcomeConnect(*pLogItem)
+		|| pLogItem->idParent != 0 && ! socketItem->ToWelcomeMultiply(*pLogItem))
 		{
 			this->InitCommand<FSP_Reject>(objCommand);
 			this->Call(objCommand, sizeof(objCommand));
-			socketsTLB.FreeItem(this);
+			socketsTLB.FreeItem(socketItem);
 			continue;
 		}
 		//
@@ -378,7 +379,7 @@ int LOCALAPI CSocketItemDl::InstallKey(BYTE *key, int keySize, int32_t keyLife, 
 //	Start a new transmit transaction, might be singleton packet message 
 bool CSocketItemDl::CheckToNewTransaction()
 {
-	if(! CheckResetNewTransaction())
+	if(_InterlockedCompareExchange8(& newTransaction, 0, 1) == 0)
 		return false;
 	//
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->GetSendBuf();
@@ -388,6 +389,7 @@ bool CSocketItemDl::CheckToNewTransaction()
 
 	return true;
 }
+
 
 // The sibling functions of Connect2() for 'fast reconnect', 'session resume'
 // and 'connection multiplication' (ConnectMU), is in Multiply.cpp

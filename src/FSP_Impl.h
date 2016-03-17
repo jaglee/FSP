@@ -536,8 +536,9 @@ class LLSBackLog
 public:
 	void Clear() { count = 0; headQ = tailQ; mutex = 0; }
 	bool LOCALAPI Has(const BackLogItem *p);
+	BackLogItem * Peek() { return count <= 0 ? NULL : q  + headQ; }
+	int Pop();
 	int LOCALAPI Put(const BackLogItem *p);
-	int LOCALAPI Pop(BackLogItem *p);
 };
 
 
@@ -552,8 +553,9 @@ enum SocketBufFlagBitPosition
 	IS_ACKNOWLEDGED = 1,
 	IS_COMPLETED = 2,
 	IS_DELIVERED = 3,
-	IS_FULFILLED = 4,	// IS_COMPLETED is for sending. Could reuse bit #2
-	// 5: reserved
+	IS_FULFILLED = IS_COMPLETED,// mutual-mirroring flags for send and receive
+	IS_SENT = IS_DELIVERED,		// IS_SENT is for send while IS_DELIVERED is for receive 
+	// 4, 5: reserved
 	IS_COMPRESSED = 6,
 	TO_BE_CONTINUED = 7
 };

@@ -257,7 +257,7 @@ void CSocketItemDl::ProcessReceiveBuffer()
 	if (!InState(ESTABLISHED) && !InState(COMMITTING)  && !InState(COMMITTED)  && !InState(PEER_COMMIT) && !InState(COMMITTING2) && !InState(CLOSABLE))
 	{
 #ifdef TRACE
-		printf_s("Is it illegal to ProcessReceiveBuffer in state %s\n", stateNames[pControlBlock->state]);
+		printf_s("Is it illegal to ProcessReceiveBuffer in state %s?!\n", stateNames[pControlBlock->state]);
 #endif
 		SetMutexFree();
 		return;

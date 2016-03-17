@@ -320,9 +320,6 @@ int FSPAPI ReadFrom(FSPHANDLE, void *, int, NotifyOrReturn);
 // Try to terminate the session gracefully, automatically commit if not yet 
 // Return 0 if no immediate error, or else the error number
 // The callback function might return code of delayed error
-// Remark
-//	The onError function whose pointer was passed in the socket context parameter would be called
-//	with the final result of shutdown: 0 if no error/shutdown gracefully, negative if abnormal
 DllSpec
 int FSPAPI Shutdown(FSPHANDLE hFSPSocket, NotifyOrReturn);
 
@@ -344,11 +341,6 @@ DllSpec
 uint32_t * FSPAPI TranslateFSPoverIPv4(PFSP_IN6_ADDR, uint32_t, ALFID_T);
 
 
-// When use FSPControl to enumerate interfaces,
-// 'value' is the pointer to the first element of an array of IN6_PKTINFO structure
-// and the 'ipi6_ifindex' field of the first element should store the size of the array
-// return number of availabe interfaces with configured IPv4/IPv6 address
-// which might be zero. negative if error.
 DllSpec
 int FSPAPI FSPControl(FSPHANDLE, FSP_ControlCode, ulong_ptr);
 
@@ -376,9 +368,8 @@ DllSpec
 int FSPAPI CryptoNaClGetSharedSecret(unsigned char *bufSharedSecret, const unsigned char *peersPublicKey, const unsigned char *nearPrivateKey);
 
 
-
 // Given
-//	pointer to the buffer of the output hash, 32 bytes
+//	pointer to the buffer of the output hash, 64 bytes
 //	the input byte string to calculate the hash
 //	the length of the byte string
 // Do
@@ -387,14 +378,6 @@ int FSPAPI CryptoNaClGetSharedSecret(unsigned char *bufSharedSecret, const unsig
 //	0 (always succeed in presumed constant time)
 DllSpec
 int FSPAPI CryptoNaClHash(unsigned char *buf, const unsigned char *input, unsigned long long len);
-
-
-
-////DllSpec
-////int FSPAPI CryptoNaClScalarMult(unsigned char *buf, const unsigned char *exp, const unsigned char *base);
-////
-////DllSpec
-////int FSPAPI CryptoNaClScalarMultBase(unsigned char *buf, const unsigned char *exp);
 
 #ifdef __cplusplus
 	}

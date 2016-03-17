@@ -634,7 +634,6 @@ void CSocketItemEx::OnGetPersist()
 		return;
 	}
 
-
 	bool isInitiativeState = InState(CHALLENGING) || InState(CLONING);
 	// PERSIST is always the accumulative acknowledgement to ACK_CONNECT_REQ or MULTIPLY
 	// ULA slide the receive window, no matter whether the packet has payload
@@ -736,12 +735,14 @@ void CSocketItemEx::OnGetPersist()
 // KEEP_ALIVE is out-of-band and carrying some special optional headers for mobility support
 //	{ACTIVE, COMMITTING, PEER_COMMIT, COMMITTING2}-->/KEEP_ALIVE/
 //		<-->{keep state}[Retransmit selectively]
+//	{COMMITTED, CLOSABLE, PRE_CLOSED}-->/KEEP_ALIVE/<-->{keep state}{Update Peer's Authorized Addresses}
 void CSocketItemEx::OnGetKeepAlive()
 {
 #if defined(TRACE_HEARTBEAT) || defined(TRACE_PACKET)
 	TRACE_SOCKET();
 #endif
-	if (!InStates(4, ESTABLISHED, COMMITTING, PEER_COMMIT, COMMITTING2))
+	bool acknowledgible = InStates(4, ESTABLISHED, COMMITTING, PEER_COMMIT, COMMITTING2);
+	if (!acknowledgible && !InState(COMMITTED) && !InState(CLOSABLE) && !InState(PRE_CLOSED))
 	{
 #ifdef TRACE
 		printf_s("Got KEEP_ALIVE unexpectedly in state %s(%d)\n", stateNames[lowState], lowState);
@@ -757,7 +758,7 @@ void CSocketItemEx::OnGetKeepAlive()
 #ifdef TRACE_HEARTBEAT
 	printf_s("Fiber#%u: SNACK packet with %d gap(s) advertised received\n", fidPair.source, n);
 #endif
-	if(RespondToSNACK(ackSeqNo, gaps, n) > 0)
+	if(acknowledgible && RespondToSNACK(ackSeqNo, gaps, n) > 0)
 		Notify(FSP_NotifyBufferReady);
 	//
 	// connection parameter may determine whether the payload is encrypted, however, let ULA handle it...
@@ -902,7 +903,7 @@ void CSocketItemEx::OnGetCommit()
 	if (pControlBlock->IsRetriableStale(headPacket->pktSeqNo))
 	{
 #ifdef TRACE
-		printf_s("Invalid sequence number:\t %u\n", headPacket->pktSeqNo);
+		printf_s("IsRetriableStale check sequence number:\t %u\n", headPacket->pktSeqNo);
 #endif
 		return;
 	}
@@ -912,7 +913,6 @@ void CSocketItemEx::OnGetCommit()
 		TRACE_HERE("Invalid intergrity check code!?");
 		return;
 	}
-
 
 	FSP_NormalPacketHeader *p1 = headPacket->GetHeaderFSP();
 	ControlBlock::seq_t ackSeqNo = be32toh(p1->expectedSN);

@@ -232,15 +232,16 @@ int LOCALAPI LLSBackLog::Put(const BackLogItem *p)
 }
 
 
-
-// Given
-//	TLogItem *		the place holder of store the value of the first item in the queue
+// Do
+//	Remove the head log item in the queue
 // Return
-//	non-negative on success, or negative on failure
+//	-ENOENT if the queue is empty
+//	non-negative on success
 // Remark
+//	should replace stack with real queue
 //	capacity must be some power of 2
 //	It is assumed that there is only one producer(optimistic push) but may be multiple consumer(conservative pop)
-int LOCALAPI LLSBackLog::Pop(BackLogItem *p)
+int LLSBackLog::Pop()
 {
 	WaitSetMutex();
 
@@ -251,7 +252,6 @@ int LOCALAPI LLSBackLog::Pop(BackLogItem *p)
 		return -ENOENT;
 	}
 
-	*p = q[i];
 	headQ = (i + 1) & (capacity - 1);
 	count--;
 
@@ -593,7 +593,7 @@ ControlBlock::PFSP_SocketBuf LOCALAPI ControlBlock::AllocRecvBuf(seq_t seq1)
 void * LOCALAPI ControlBlock::InquireRecvBuf(int & nIO, bool & toBeContinued)
 {
 	PFSP_SocketBuf p = GetFirstReceived();
-	void * const pr = GetRecvPtr(p);	// the pointer value returned
+	void *pMsg = GetRecvPtr(p);
 	//
 	const int tail = recvWindowNextPos;
 	if(tail > recvBufferBlockN)
@@ -607,12 +607,20 @@ void * LOCALAPI ControlBlock::InquireRecvBuf(int & nIO, bool & toBeContinued)
 		m = recvBufferBlockN - recvWindowHeadPos;
 	else
 		m = tail - recvWindowHeadPos;
+	//
+	if(m <= 0)
+	{
+		nIO = -EFAULT;	// Erraneous implementation / memory corruption
+		return NULL;
+	}
+	//
 	nIO = 0;
 	toBeContinued = true;
 	for(i = 0; i < m && p->GetFlag<IS_FULFILLED>(); i++)
 	{
 		if(p->len > MAX_BLOCK_SIZE || p->len < 0)
 		{
+			TRACE_HERE("Unrecoverable error! memory corruption might have occurred");
 			nIO = -EFAULT;
 			return NULL;
 		}
@@ -620,6 +628,7 @@ void * LOCALAPI ControlBlock::InquireRecvBuf(int & nIO, bool & toBeContinued)
 		if (p->GetFlag<IS_DELIVERED>())
 		{
 			TRACE_HERE("To double deliver a packet?");
+			recvWindowFirstSN -= i;
 			return NULL;
 		}
 		p->SetFlag<IS_DELIVERED>();
@@ -635,6 +644,7 @@ void * LOCALAPI ControlBlock::InquireRecvBuf(int & nIO, bool & toBeContinued)
 		}
 		if(p->len != MAX_BLOCK_SIZE)
 		{
+			TRACE_HERE("Unrecoverable error! Unconform to the protocol");
 			nIO = -EFAULT;
 			return NULL;
 		}
@@ -646,7 +656,7 @@ void * LOCALAPI ControlBlock::InquireRecvBuf(int & nIO, bool & toBeContinued)
 	if(recvWindowHeadPos - recvBufferBlockN >= 0)
 		recvWindowHeadPos -= recvBufferBlockN;
 	//
-	return pr;	// while nIO == 0 is legal
+	return pMsg;
 }
 
 

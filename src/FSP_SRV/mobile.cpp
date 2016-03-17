@@ -571,6 +571,7 @@ void CSocketItemEx::EmitQ()
 			skb->Unlock();
 			break;
 		}
+		skb->SetFlag<IS_SENT>();
 		//
 		if (pControlBlock->SlideNextToSend() == firstSN + 1)
 			SetEarliestSendTime();

@@ -4,7 +4,12 @@
 #include <errno.h>
 #include "../FSP_API.h"
 
-extern	const char		*defaultWelcome;
+#define TEST_MEM_SIZE	0x200		// 512B, only one block
+//#define TEST_MEM_SIZE	0x20000		// 128KB
+//#define TEST_MEM_SIZE	0x200000	// 2MB
+//#define TEST_MEM_SIZE	0x2000000	// 32MB
+
+extern const char		*defaultWelcome;
 
 extern volatile bool	finished;
 extern FSPHANDLE		hFspListen;
@@ -13,13 +18,15 @@ extern void FSPAPI WaitConnection(const char *, unsigned short, CallbackConnecte
 extern int	FSPAPI onAccepting(FSPHANDLE, PFSP_SINKINF, PFSP_IN6_ADDR);
 extern void FSPAPI onNotice(FSPHANDLE h, FSP_ServiceCode code, int value);
 extern void FSPAPI onFinished(FSPHANDLE h, FSP_ServiceCode code, int value);
+extern void FSPAPI onResponseReceived(FSPHANDLE, FSP_ServiceCode, int);
 
 static int	FSPAPI	onAccepted(FSPHANDLE, PFSP_Context);
 static void FSPAPI	onFileNameSent(FSPHANDLE, FSP_ServiceCode, int);
 static int	FSPAPI	toSendNextBlock(FSPHANDLE, void *, int32_t);
 
 static char		*fileName = "$memory.^";
-static	uint8_t	bytesToSend[0x20000];	// 128KB
+static char		linebuf[80];
+static uint8_t	bytesToSend[TEST_MEM_SIZE];
 
 void SendMemoryPattern()
 {
@@ -78,6 +85,9 @@ static void FSPAPI onFileNameSent(FSPHANDLE h, FSP_ServiceCode c, int r)
 		Dispose(h);
 		return;
 	}
+
+	// And we expected success acknowledgement
+	ReadFrom(h, linebuf, sizeof(linebuf), onResponseReceived);
 }
 
 

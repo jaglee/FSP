@@ -28,11 +28,10 @@ static void FSPAPI onPublicKeyReceived(FSPHANDLE, FSP_ServiceCode, int);
 static void FSPAPI onFileNameSent(FSPHANDLE, FSP_ServiceCode, int);
 static int	FSPAPI toSendNextBlock(FSPHANDLE, void *, int32_t);
 
-static void FSPAPI onResponseReceived(FSPHANDLE, FSP_ServiceCode, int);
-
 extern int	FSPAPI onAccepting(FSPHANDLE, PFSP_SINKINF, PFSP_IN6_ADDR);
 extern void SendMemoryPattern();
 extern void SendMemoryPatternEncyrpted();
+extern void FSPAPI onResponseReceived(FSPHANDLE, FSP_ServiceCode, int);
 
 
 void FSPAPI onNotice(FSPHANDLE h, FSP_ServiceCode code, int value)
@@ -62,8 +61,6 @@ void FSPAPI onFinished(FSPHANDLE h, FSP_ServiceCode code, int value)
 	finished = true;
 	return;
 }
-
-
 
 
 
@@ -161,7 +158,12 @@ int main(int argc, char * argv[])
 	unsigned char *bufPublicKey = (unsigned char *)thisWelcome + mLen;;
 	memcpy(thisWelcome, defaultWelcome, mLen);	//+\000012345678901234567890123456789012
 	CryptoNaClKeyPair(bufPublicKey, bufPrivateKey);
-
+#ifndef NDEBUG
+	printf("Public key generated: 0x");
+	for(register int i = 0; i < CRYPTO_NACL_KEYBYTES; i++)
+		printf_s("%X ", bufPublicKey[i]);
+	printf("\n");
+#endif
 	WaitConnection(thisWelcome, mLen + CRYPTO_NACL_KEYBYTES, onAccepted);
 
 	if(fd != 0 && fd != -1)
@@ -286,8 +288,8 @@ static int FSPAPI toSendNextBlock(FSPHANDLE h, void * batchBuffer, int32_t capac
 }
 
 
-
-static void FSPAPI onResponseReceived(FSPHANDLE h, FSP_ServiceCode c, int r)
+// non-static!
+void FSPAPI onResponseReceived(FSPHANDLE h, FSP_ServiceCode c, int r)
 {
 	if(r < 0)
 	{

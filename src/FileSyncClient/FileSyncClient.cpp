@@ -249,33 +249,20 @@ static void FSPAPI onReceiveFileNameReturn(FSPHANDLE h, FSP_ServiceCode resultCo
 		// | FILE_FLAG_NO_BUFFERING [require data block alignment which condition is too strict]
 		if(hFile == INVALID_HANDLE_VALUE && GetLastError() == ERROR_FILE_EXISTS)
 		{
-			char *pDot = strrchr(fileName, '.');
-			if(pDot == NULL)
+			printf_s("Overwrite existent file? Y/n: ");
+			int c = toupper(getchar());
+			if(c != 'Y')
 			{
-				int n = (int)strlen(fileName);
-				if(n < MAX_PATH - 1)
-				{
-					fileName[n] = 'C';
-					fileName[n + 1] = '\0';
-				}
-				else
-				{
-					fileName[n - 1] ++;	// it might be an illegal character, however
-				}
+				finished = true;
+				Dispose(h);
+				return;
 			}
-			else
-			{
-				(* --pDot) ++;			// it might be an illegal character, however
-			}
-			// 
-			printf_s("It should be created in the near end,\n"
-				"however it exists and the new file would be %s\n", fileName);
 			//
 			hFile = CreateFile(fileName
 				, GENERIC_WRITE
 				, 0	// shared none
 				, NULL
-				, CREATE_NEW
+				, CREATE_ALWAYS
 				, FILE_FLAG_POSIX_SEMANTICS | FILE_FLAG_WRITE_THROUGH
 				, NULL);
 			// | FILE_FLAG_NO_BUFFERING [require data block alignment which condition is too strict]

@@ -393,7 +393,7 @@ void CSocketItemDl::ProcessPendingSend()
 int LOCALAPI CSocketItemDl::BufferData(int len)
 {
 	ControlBlock::PFSP_SocketBuf p = pControlBlock->LockLastBufferedSend();
-	// UNRESOLVED!milky-payload: apply FIFD instead of FIFO
+	// UNRESOLVED! milky-payload: apply FIFD instead of FIFO
 	int m = len;
 	if (m <= 0)
 		return -EDOM;
@@ -429,7 +429,7 @@ int LOCALAPI CSocketItemDl::BufferData(int len)
 		p->Unlock();
 	}
 
-	ControlBlock::PFSP_SocketBuf p0 = p = GetSendBuf();
+	p = GetSendBuf();
 	// p->buf was set when the send buffer control structure itself was initialized
 	// flags are already initialized when GetSendBuf
 	while(p != NULL)
@@ -455,19 +455,28 @@ int LOCALAPI CSocketItemDl::BufferData(int len)
 		p = GetSendBuf();
 	}
 
-	p = p0;
-	//
 l_finish:
+	// assert:
+	// It somewhat overlaps with checking isFlushing, i.e. there is some redundancy, but it keeps code simple
+	if(_InterlockedCompareExchange8(& newTransaction, 0, 1) != 0)
+	{
+		ControlBlock::PFSP_SocketBuf skb0 = pControlBlock->HeadSend() + pControlBlock->sendWindowNextPos;
+#ifdef TRACE
+		if(skb0->GetFlag<IS_SENT>())
+			printf_s("Erraneous implementation!? Maynot start a new transaction");
+#endif
+		skb0->opCode = PERSIST;
+	}
+
 	pendingSendSize = m;
 	//
 	if(p == NULL)
 	{
-		TRACE_HERE("no send buffer?");
+#ifdef TRACE
+		printf_s("No enough send buffer to send the message in a batch. %d bytes left.\n", pendingSendSize);
+#endif
 		return (len - m);
 	}
-	//
-	if(CheckResetNewTransaction())
-		p->opCode = PERSIST;
 	//
 	if (pendingSendSize == 0)
 	{
@@ -507,15 +516,15 @@ int LOCALAPI CSocketItemDl::PrepareToSend(void * buf, int len, FlagEndOfMessage 
 		return -EDOM;
 
 	// Automatically mark the last unsent packet as completed. See also BufferData()
-	ControlBlock::PFSP_SocketBuf skb0 = pControlBlock->LockLastBufferedSend();
-	if (skb0 != NULL)
+	register ControlBlock::PFSP_SocketBuf p = pControlBlock->LockLastBufferedSend();
+	if(p != NULL)
 	{
 #ifdef TRACE
 		printf_s("SendInline automatically closes previous packet sent by WriteTo() or implicit welcome\n");
 #endif
-		skb0->SetFlag<IS_COMPLETED>();	// TO_BE_CONTINUED, if any, is kept, however
+		p->SetFlag<IS_COMPLETED>();	// TO_BE_CONTINUED, if any, is kept, however
 		//^it might be redundant, but do little harm
-		skb0->Unlock();
+		p->Unlock();
 	}
 
 	register int m = len;
@@ -523,10 +532,9 @@ int LOCALAPI CSocketItemDl::PrepareToSend(void * buf, int len, FlagEndOfMessage 
 		return -EFAULT;
 	if(m < len)
 		return -ENOMEM;
-	// assert(pControlBlock->sendBufferNextPos == ((BYTE *)buf - (BYTE *)this - pControlBlock->sendBuffer) / MAX_BLOCK_SIZE);
-	skb0 = pControlBlock->HeadSend() + pControlBlock->sendBufferNextPos;
 
-	register ControlBlock::PFSP_SocketBuf p = skb0;
+	ControlBlock::PFSP_SocketBuf skb0 = pControlBlock->HeadSend() + pControlBlock->sendWindowNextPos;
+	p = skb0;
 	// p now is the descriptor of the first available buffer block
 	m = (len - 1) / MAX_BLOCK_SIZE;
 	for(int j = 0; j < m; j++)
@@ -553,8 +561,16 @@ int LOCALAPI CSocketItemDl::PrepareToSend(void * buf, int len, FlagEndOfMessage 
 	pControlBlock->RoundSendBufferNextPos();
 	pControlBlock->sendBufferNextSN += m + 1;
 
-	if(CheckResetNewTransaction() && skb0->opCode != COMMIT)
-		skb0->opCode = PERSIST;
+	// Slightly differ from BufferData on when to set COMMIT or PERSIST
+	if(_InterlockedCompareExchange8(& newTransaction, 0, 1) != 0)
+	{
+#ifdef TRACE
+		if(skb0->GetFlag<IS_SENT>())
+			printf_s("Erraneous implementation!? Maynot start a new transaction");
+#endif
+		if(skb0->opCode != COMMIT)
+			skb0->opCode = PERSIST;
+	}
 
 	return (m + 1);
 }
