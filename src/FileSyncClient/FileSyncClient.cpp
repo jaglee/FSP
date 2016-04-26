@@ -3,11 +3,11 @@
 
 #include "stdafx.h"
 
-#define REMOTE_APPLAYER_NAME "localhost:80"
+//#define REMOTE_APPLAYER_NAME "localhost:80"
 // #define REMOTE_APPLAYER_NAME "lt-x61t:80"
 // #define REMOTE_APPLAYER_NAME "lt-at4:80"
 // #define REMOTE_APPLAYER_NAME "lt-ux31e:80"
-// #define REMOTE_APPLAYER_NAME "E000:AAAA::1"
+#define REMOTE_APPLAYER_NAME "E000:AAAA::1"
 
 static int	FSPAPI onConnected(FSPHANDLE, PFSP_Context);
 static void FSPAPI onPublicKeySent(FSPHANDLE, FSP_ServiceCode, int);
@@ -128,7 +128,7 @@ int main(int argc, char *argv[])
 	Sleep(2000);	// wait the server up when debug simultaneously
 
 	FSP_SocketParameter parms;
-	memset(& parms, sizeof(parms), 0);
+	memset(& parms, 0, sizeof(parms));
 	// parms.beforeAccept = NULL;
 	parms.afterAccept = onConnected;
 	parms.onError = onNotice;

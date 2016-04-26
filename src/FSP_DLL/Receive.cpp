@@ -195,6 +195,11 @@ int LOCALAPI CSocketItemDl::DeliverData(void *p, int n)
 }
 
 
+
+// Return
+//	-EDOM	(-33)	if the packet size does not comform to the protocol
+//	-EFAULT (-14)	if the packet buffer was broken
+//	positive or zero if no error
 inline
 int CSocketItemDl::FetchReceived()
 {
@@ -229,7 +234,7 @@ int CSocketItemDl::FetchReceived()
 		}
 		// What? An imcomplete 'to be continued' intermediate packet received?
 		if(p->len != MAX_BLOCK_SIZE)
-			return -EFAULT;
+			return -EDOM;
 		//
 		p = pControlBlock->GetFirstReceived();
 	}
@@ -313,7 +318,7 @@ void CSocketItemDl::ProcessReceiveBuffer()
 	{
 #ifdef TRACE
 		printf_s("FetchReceived() return %d\n"
-			"UNRESOLVED!Crash recovery? waitingRecvBuf or fpRecept is not reset yet.\n"
+			"UNRESOLVED! Crash recovery? waitingRecvBuf or fpRecept is not reset yet.\n"
 			, n);
 #endif
 		SetMutexFree();

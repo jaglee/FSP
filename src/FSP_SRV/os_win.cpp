@@ -17,34 +17,7 @@
 #pragma comment(lib, "Ws2_32.lib")
 #pragma comment(lib, "User32.lib")
 
-/*
-
-RFC 2460                   IPv6 Specification              December 1998
-
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|Version| Traffic Class |           Flow Label                  |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|         Payload Length        |  Next Header  |   Hop Limit   |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                                                               |
-+                                                               +
-|                                                               |
-+                         Source Address                        +
-|                                                               |
-+                                                               +
-|                                                               |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                                                               |
-+                                                               +
-|                                                               |
-+                      Destination Address                      +
-|                                                               |
-+                                                               +
-|                                                               |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-
-*/
-
+#if 0	// a reference declaration of packet header of IPv6 network layer, might be applicable in the kernel mode socket service
 #pragma pack(1)
 struct IPv6_HEADER
 {
@@ -63,10 +36,14 @@ struct IPv6_HEADER
 	unsigned char hopLimit;		// should be 255, the maximum
 	IN6_ADDR srcAddr;
 	IN6_ADDR dstAddr;
-
-	void Set(int m, PIN6_ADDR a0, PIN6_ADDR a1)
+	//
+	void Set(int m, const IN6_ADDR *a0, const IN6_ADDR *a1)
 	{
+#if ARCH_BIG_ENDIAN
+		version = 6;	// TODO: regres test under big-endian architecture
+#else
 		version_traffic_flow = 6 << 4;	// in network byte order, it would be correct
+#endif
 		payloadLenth = htobe16(m);
 		nextHeader = IPPROTO_FSP;
 		hopLimit = 255;		// hard-coded here
@@ -76,17 +53,32 @@ struct IPv6_HEADER
 };
 
 #pragma pack()
+#endif
 
+
+// The reference to the singleton instance of the lower service interface 
 CLowerInterface	* CLowerInterface::pSingleInstance;
+
+// The hanlde of the timer queue singleton instance
 HANDLE	TimerWheel::timerQueue;
 
-static LPFN_WSARECVMSG	WSARecvMsg;
+// The preconfigured ALFID, for FSP emulator with user-mode Windows socket only
+static ALFID_T preallocatedIDs[MAX_CONNECTION_NUM];
 
+// The function called by the macro REPORT_WSAERROR_TRACE
 static int LOCALAPI ReportWSAError(char * msg);
 
+// The function called directly or by ReportWSAError
+static void LOCALAPI ReportErrorAsMessage(int);
+
+// Forward declartion of the firewall manipulation function
 static int CreateFWRules();
 
-// abstract out for sake of testability
+/**
+ *	The function pointer of WSARecvMsg obtained from the run-time library
+ *	'GetPointerOfWSARecvMsg' was abstracted out for sake of testability
+ */
+static LPFN_WSARECVMSG	WSARecvMsg;
 inline int GetPointerOfWSARecvMsg(SOCKET sd)
 {
 	GUID funcID = WSAID_WSARECVMSG;
@@ -97,11 +89,39 @@ inline int GetPointerOfWSARecvMsg(SOCKET sd)
 }
 
 
+#if (_WIN32_WINNT < 0x0600)
+static LPFN_WSASENDMSG	WSASendMsg;
+inline int GetPointerOfWSASendMsg(SOCKET sock)
+{
+    GUID	guidWSASendMsg = WSAID_WSASENDMSG;
+    DWORD	dwBytes = 0;
+
+    return WSAIoctl(sock, 
+                SIO_GET_EXTENSION_FUNCTION_POINTER, 
+                &guidWSASendMsg, 
+                sizeof(guidWSASendMsg), 
+                &WSASendMsg, 
+                sizeof(WSASendMsg), 
+                &dwBytes, 
+                NULL, 
+                NULL
+                );
+}
+#endif
+
+
+// Forward declaration of the callback function for handling the event that some IPv6 inferface was changed
 VOID NETIOAPI_API_ OnUnicastIpChanged(PVOID, PMIB_UNICASTIPADDRESS_ROW, MIB_NOTIFICATION_TYPE);
 
-//
-// TODO: local interface sharing...
-//
+
+
+// The constructor of the lower service interface instance
+//	- Startup the socket service
+//	- Create rule entries in the firewall setting to enable FSP traffic
+//	- Bind the listening sockets besides the default sending socket
+//	- Pre-allocate Application Layer Fiber ID pool
+//	- Enable acception and processing of the remote FSP packets
+//	- Enable mobility detection
 CLowerInterface::CLowerInterface()
 {
 	WSADATA wsaData;
@@ -134,13 +154,27 @@ CLowerInterface::CLowerInterface()
 #endif
 
 	LearnAddresses();
-	PoolingALFIDs();
+	MakeALFIDsPool();
+	// This is a workaround (because of limitation under user-mode socket programming)
+#ifndef OVER_UDP_IPv4
+	for (register u_int i = 0; i < sdSet.fd_count; i++)
+	{
+		SetLocalApplicationLayerFiberIDs(i);
+	}
+#endif
 
 	if((r = GetPointerOfWSARecvMsg(sdSend)) != 0)
 	{
 		REPORT_WSAERROR_TRACE("Cannot get function pointer WSARecvMsg");
 		throw (HRESULT)r;
 	}
+#if (_WIN32_WINNT < 0x0600)
+	if((r = GetPointerOfWSASendMsg(sdSend)) != 0)
+	{
+		REPORT_WSAERROR_TRACE("Cannot get function pointer WSASendMsg");
+		throw (HRESULT)r;
+	}
+#endif
 
 	mesgInfo.name =  (struct sockaddr *) & addrFrom;
 	mesgInfo.namelen = sizeof(addrFrom);
@@ -164,14 +198,19 @@ CLowerInterface::CLowerInterface()
 		REPORT_ERROR_ON_TRACE();
 		throw E_ABORT;
 	}
+
+#ifndef OVER_UDP_IPv4
+	disableFlags = 0;
+	NotifyUnicastIpAddressChange(AF_INET6, OnUnicastIpChanged, NULL, FALSE, &hMobililty);
+#endif
 }
 
 
 
+// The destructor: kill the listening thread at first?
 CLowerInterface::~CLowerInterface()
 {
 	CancelMibChangeNotify2(hMobililty);
-	// kill the listening thread at first
 	TerminateThread(thReceiver, 0);
 
 	// close all of the listening socket
@@ -184,6 +223,32 @@ CLowerInterface::~CLowerInterface()
 	closesocket(sdSend);
 
 	WSACleanup();
+}
+
+
+
+// Preallocate a pool of re-usable random ALFIDs. Prealloction would later make the lower network interface to preconfigure the corresponding IP addresses
+// This is a workaround as we cannot receive a unicasted packet whose destination IPv6 address does not match any known unicast IP address on an NIC
+// even if it has been put to promiscuous mode
+inline void CLowerInterface::MakeALFIDsPool()
+{
+	register int k;
+	ALFID_T id;
+	//
+	// refuse to continue if the random number generator doesn't work
+	for (register int i = 0; i < MAX_CONNECTION_NUM; i++)
+	{
+		// Here 'id', as a random number, is generated as a 32-bit integer in network byte order
+		// while 'k' is a simple hash number derived in host byte order
+		// See also LearnAddresses, operator::[], AllocItem, FreeItem
+		do
+		{
+			rand_w32(&id, 1);
+			k = be32toh(id) & (MAX_CONNECTION_NUM - 1);
+		} while (be32toh(id) <= LAST_WELL_KNOWN_ALFID || tlbSockets[k]->fidPair.source != 0);
+		//
+		tlbSockets[k]->fidPair.source = preallocatedIDs[i] = id;
+	}
 }
 
 
@@ -222,34 +287,37 @@ int LOCALAPI CLowerInterface::EnumEffectiveAddresses(uint64_t *prefixes)
 
 
 
-
 #ifndef OVER_UDP_IPv4	// by default exploit IPv6
-/**
- the interface to bind might be configured but not started. in that case binding would fail. do
- netsh wlan start hostednetwork
- */
-// inline: only in the CLowerInterface constructor may it be called
-inline int BindInterface(SOCKET sd, PSOCKADDR_IN6 pAddrListen)
+// Given
+//	SOCKET			the handle of the socket to bind the designated listening address
+// Return
+//	0 if no error
+//	negative if it failed
+// Do
+//	Set valuable options
+// Remark
+//	inline: only in the CLowerInterface constructor may it be called
+//	It is useless to put it into promiscuous mode WSAIoctl(sd, SIO_RCVALL, ...) in user mode.
+inline int CLowerInterface::SetInterfaceOptions(SOCKET sd)
 {
-	DWORD isHeaderIncluded = TRUE;	// boolean
+	DWORD optRcvAll = RCVALL_IPLEVEL;	//  RCVALL_SOCKETLEVELONLY not implemented; RCVALL_ON let NIC enabled
+	DWORD wantPktInfo = TRUE;
 
-	if (bind(sd, (const struct sockaddr *)pAddrListen, sizeof(SOCKADDR_IN6)) != 0)
-	{
-		REPORT_WSAERROR_TRACE("Cannot bind to the selected address");
-		return -1;
-	}
-
-	// It is useless to put it into promiscuous mode WSAIoctl(sd, SIO_RCVALL, ...)
-
-	if (setsockopt(sd, IPPROTO_IPV6, IPV6_HDRINCL, (char *)& isHeaderIncluded, sizeof(isHeaderIncluded)) != 0)
-	{
-		REPORT_WSAERROR_TRACE("Cannot set socket option to send the IPv6 header");
-		return -1;
-	}
-
-	if (setsockopt(sd, IPPROTO_IPV6, IPV6_PKTINFO, (char *)& isHeaderIncluded, sizeof(isHeaderIncluded)) != 0)
+	if (setsockopt(sd, IPPROTO_IPV6, IPV6_PKTINFO, (char *)& wantPktInfo, sizeof(wantPktInfo)) != 0)
 	{
 		REPORT_WSAERROR_TRACE("Cannot set socket option to fetch the source IPv6 address");
+		return -1;
+	}
+	// Here we didn't set IPV6_V6ONLY, for we suppose that dual-stack support is not harmful, though neither benefical
+
+	// An IPv6 socket that was created with the address family set to AF_INET6, the socket type set to SOCK_RAW, and the protocol set to IPPROTO_IPV6.
+	// put it into promiscuous mode, here user-mode
+	// The socket handle passed to the WSAIoctl function must be of AF_INET address family, SOCK_RAW socket type, and IPPROTO_IP protocol
+	// There's the document glich when this code snippet was written: the output buffer MUST be specified
+	DWORD opt_size;
+	if (WSAIoctl(sd, SIO_RCVALL, &optRcvAll, sizeof(optRcvAll), NULL, 0, & opt_size, NULL, NULL) != 0)
+	{
+		REPORT_WSAERROR_TRACE("Cannot set it in promiscuous mode");
 		return -1;
 	}
 
@@ -257,23 +325,26 @@ inline int BindInterface(SOCKET sd, PSOCKADDR_IN6 pAddrListen)
 }
 
 
-
 // learn all configured IPv6 addresses
 // figure out the associated interface number of each address block(individual prefix)
 // and do house-keeping
 // (IPv6 addresses whose lower 32-bits are between 0 and 65535 are reserved, otherwise removed)
+// throws
+//	E_OUTOFMEMORY if no enough address buffer
+//	E_ABORT if bind failure in the middle way
+//	E_HANDLE if cannot allocate enough socket handle
 inline void CLowerInterface::LearnAddresses()
 {
 	PMIB_UNICASTIPADDRESS_TABLE table;
 	PIN6_ADDR p;
-	int k = 0;
+	u_int & k = sdSet.fd_count;
 	CHAR strIPv6Addr[INET6_ADDRSTRLEN];
 
-	nAddress = FD_SETSIZE;
 	FD_ZERO(&sdSet);
 	memset(addresses, 0, sizeof(addresses));
 
 	GetUnicastIpAddressTable(AF_INET6, &table);
+	k = 0;
 	for (register long i = table->NumEntries - 1; i >= 0; i--)
 	{
 		p = &table->Table[i].Address.Ipv6.sin6_addr;
@@ -289,29 +360,29 @@ inline void CLowerInterface::LearnAddresses()
 		//table->Table[i].PrefixOrigin;
 		//table->Table[i].OnLinkPrefixLength;
 
-		// UNRESOLVED!!	// only for unspecified/global scope:?
+		//Extensible link-local interface, where the value of ScopeId typically equals the interface number under Windows, should be acceptable?
 		if (table->Table[i].ScopeId.Value != 0)
 			continue;
-		//table->Table[i].DadState != IpDadStateTentative && 
+
 		if (table->Table[i].DadState != IpDadStatePreferred)
 			continue;
 
-		// Here it is compatible with single physical interfaced host in multi-homed site
-		bool found = false;
-		for (register int j = 0; j < k; j++)
-		{
-			if (interfaces[j] == table->Table[i].InterfaceIndex
-			&& *(uint64_t *)(addresses[j].sin6_addr.u.Byte) == *(uint64_t *)(p->u.Byte))
-			{
-				found = true;
-				break;
-			}
-		}
-		if (found)	// this interface has been enumerated
+		// Loopback, IPv4-compatible or IPv4-mapped IPv6 addresses are NOT compatible with FSP
+		if (*(int64_t *)& p->u == 0)
 			continue;
 
-		//
-		if (k >= nAddress)
+		// See also MakeALFIDsPool, operator::[], AllocItem, FreeItem
+		if (be32toh(*(ALFID_T *)& p->u.Byte[12]) > LAST_WELL_KNOWN_ALFID)
+		{
+			DeleteUnicastIpAddressEntry(&table->Table[i]);
+			continue;
+		}
+
+		// Here it is compatible with single physical interfaced host in multi-homed site
+		if (IsPrefixDuplicated(table->Table[i].InterfaceIndex, p))
+			continue;
+
+		if (k >= SD_SETSIZE)
 			throw E_OUTOFMEMORY;
 
 		interfaces[k] = table->Table[i].InterfaceIndex;
@@ -320,109 +391,145 @@ inline void CLowerInterface::LearnAddresses()
 		// port number and flowinfo are all zeroed already
 		addresses[k].sin6_scope_id = table->Table[i].ScopeId.Value;
 
-		if (::BindInterface(sdSend, &addresses[k]) != 0)
+		if (::bind(sdSend, (const struct sockaddr *)& addresses[k], sizeof(SOCKADDR_IN6)) != 0)
 		{
 			REPORT_WSAERROR_TRACE("Bind failure");
 			throw E_ABORT;
 		}
+		SetInterfaceOptions(sdSend);
 		FD_SET(sdSend, &sdSet);
-		k++;
+		// k++;	// When FD_SET, the alias target is already increased
 
 		sdSend = socket(AF_INET6, SOCK_RAW, IPPROTO_FSP);
 		if (sdSend == INVALID_SOCKET)
 			throw E_HANDLE;
 	}
-	nAddress = k;
+	if (k == 0)
+	{
+		printf_s("IPv6 not enabled?");
+		throw E_NOINTERFACE;
+	}
+	// note that k is alias of fd_count of the socket set for this instance
 	FreeMibTable(table);
-
-	NotifyUnicastIpAddressChange(AF_INET6, OnUnicastIpChanged, NULL, TRUE, &hMobililty);
 }
 
 
 
-// UNRESOLVED!? To be tested: for user-mode IPv6, configure contemporary IPv6 address for EVERY unicast interface
-inline void CLowerInterface::SetLocalApplicationLayerFiberID(ALFID_T id)
+// For FSP over IPv6 raw-socket, preconfigure an IPv6 interface with ALFID pool
+// Given
+//	int		The index of the address entry
+// Do
+//	Register the IPv6 addresses for EVERY ALFID at the specified IPv6 interface
+inline void CLowerInterface::SetLocalApplicationLayerFiberIDs(int iEntry)
 {
 	MIB_UNICASTIPADDRESS_ROW	row;
 	int r;
 	CHAR strIPv6Addr[INET6_ADDRSTRLEN];
+	DWORD ifNo = interfaces[iEntry];	// the interface number/index
+	SOCKADDR_IN6 addr = addresses[iEntry];
 
-	for (register int i = 0; i < nAddress; i++)
+	for (register u_int i = 0; i < MAX_CONNECTION_NUM; i++)
 	{
 		InitializeUnicastIpAddressEntry(&row);
 
-		// ALFIDs are processed 'as is'
-		*(ALFID_T *)&(addresses[i].sin6_addr.u.Byte[12]) = id;
-		row.InterfaceIndex = interfaces[i];
-		row.Address.Ipv6 = addresses[i];
+		row.InterfaceIndex = ifNo;
+		row.Address.Ipv6 = addr;
+		*(ALFID_T *) & (row.Address.Ipv6.sin6_addr.u.Byte[12]) = preallocatedIDs[i];
 
-		// UNRESOLVED! if creation failed?
 		r = CreateUnicastIpAddressEntry(&row);
-		inet_ntop(AF_INET6, &row.Address.Ipv6, strIPv6Addr, sizeof(strIPv6Addr));
-		printf_s("It returned %d to set IPv6 address to %s@%d\n", r, strIPv6Addr, interfaces[i]);
-	}
-}
-
-
-
-inline void CLowerInterface::PoolingALFIDs()
-{
-	register int k;
-	ALFID_T id;
-	//
-	// refuse to continue if the random number generator doesn't work
-	for (register int i = 0; i < MAX_CONNECTION_NUM; i++)
-	{
-		//
-		do
+		if (r != NO_ERROR)
 		{
-			rand_w32(&id, 1);
-			k = id & (MAX_CONNECTION_NUM - 1);
-		} while (id <= LAST_WELL_KNOWN_ALFID || poolFiberID[k]->fidPair.source != 0);
-		// for every valid interface, pre-configure the id
-		SetLocalApplicationLayerFiberID(id);
-		//
-		poolFiberID[k]->fidPair.source = id;
+			ReportErrorAsMessage(r);
+			continue;
+		}
+#ifdef TRACE
+		inet_ntop(AF_INET6, &row.Address.Ipv6.sin6_addr, strIPv6Addr, sizeof(strIPv6Addr));
+		printf_s("It returned %d to set IPv6 address to %s@%d\n", r, strIPv6Addr, interfaces[iEntry]);
+#endif
 	}
 }
 
+
+
+// Given
+//	int		The index of the interface to remove preallocated ALFID address. The index was originally reported by the network layer
+// Do
+//	Remove EVERY IPv6 address with some preallocated ALFID configured for the designated interface
+inline void CLowerInterface::RemoveALFIDAddressPool(int ifIndex)
+{
+	PMIB_UNICASTIPADDRESS_TABLE table;
+	PIN6_ADDR p;
+
+	GetUnicastIpAddressTable(AF_INET6, &table);
+	for (register long i = table->NumEntries - 1; i >= 0; i--)
+	{
+		// UNRESOLVED!!	// only for unspecified/global scope:?
+		// Filter MUST be the same as LearnAddresses
+		if (table->Table[i].ScopeId.Value != 0)
+			continue;
+		if (table->Table[i].DadState != IpDadStatePreferred)
+			continue;
+
+		p = &table->Table[i].Address.Ipv6.sin6_addr;
+		// See also LearnAddresses, MakeALFIDsPool, operator::[], AllocItem, FreeItem
+		if (table->Table[i].InterfaceIndex == ifIndex && be32toh(*(ALFID_T *)& p->u.Byte[12]) > LAST_WELL_KNOWN_ALFID)
+			DeleteUnicastIpAddressEntry(&table->Table[i]);
+	}
+	FreeMibTable(table);
+}
 #else
 // Given
-//	SOCKET		The UDP socket to be bound
+//	SOCKET		The UDP socket to set options
+// Return
+//	0 if no error
+//	negative, as the error number
+inline int CLowerInterface::SetInterfaceOptions(SOCKET sd)
+{
+	DWORD enablePktInfo = TRUE;
+
+	// enable return of packet information by WSARecvMsg, so that make difference between IPv4 and IPv6
+	if (setsockopt(sd, IPPROTO_IP, IP_PKTINFO, (char *)& enablePktInfo, sizeof(enablePktInfo)) != 0)
+	{
+		REPORT_WSAERROR_TRACE("Cannot set socket option to fetch the source IP address");
+		return -1;
+	}
+
+	return 0;
+}
+
+
+
+// Given
 //	PSOCKADDR_IN
 //	int			the position that the address is provisioned
 // Return
 //	0 if no error
 //	negative, as the error number
-int CLowerInterface::BindInterface(SOCKET sd, PSOCKADDR_IN pAddrListen, int k)
+int CLowerInterface::BindSendRecv(const SOCKADDR_IN *pAddrListen, int k)
 {
-	DWORD isHeaderIncluded = TRUE;	// boolean
-
+#ifdef TRACE
 	printf_s("Bind to listen at UDP socket address: %d.%d.%d.%d:%d\n"
 		, pAddrListen->sin_addr.S_un.S_un_b.s_b1
 		, pAddrListen->sin_addr.S_un.S_un_b.s_b2
 		, pAddrListen->sin_addr.S_un.S_un_b.s_b3
 		, pAddrListen->sin_addr.S_un.S_un_b.s_b4
 		, be16toh(pAddrListen->sin_port));
-
-	memcpy(& addresses[k], pAddrListen, sizeof(SOCKADDR_IN));
+#endif
+	memcpy(&addresses[k], pAddrListen, sizeof(SOCKADDR_IN));
 	interfaces[k] = 0;
 
-	if (bind(sd, (const struct sockaddr *)pAddrListen, sizeof(SOCKADDR_IN)) != 0)
+	if (bind(sdSend, (const struct sockaddr *)pAddrListen, sizeof(SOCKADDR_IN)) != 0)
 	{
 		REPORT_WSAERROR_TRACE("Cannot bind to the selected address");
 		return -1;
 	}
-	// header is needed as it is the way to differentiate IPv4 or IPv6
-	if (setsockopt(sd, IPPROTO_IP, IP_PKTINFO, (char *)& isHeaderIncluded, sizeof(isHeaderIncluded)) != 0)
-	{
-		REPORT_WSAERROR_TRACE("Cannot set socket option to fetch the source IP address");
-		return -1;
-	}
 
-	FD_SET(sd, & sdSet);
+	SetInterfaceOptions(sdSend);
+	FD_SET(sdSend, &sdSet);
 	return 0;
 }
+
+
 
 // learn all configured IPv4 address (for FSP over UDP)
 // throws
@@ -451,9 +558,8 @@ inline void CLowerInterface::LearnAddresses()
 	if (listAddress.iAddressCount < 0)
 		throw E_FAIL;
 
+	u_int & k = sdSet.fd_count;
 	register PSOCKADDR_IN p;
-	int k = 0;
-	nAddress = FD_SETSIZE;
 	FD_ZERO(& sdSet);
 	for (register int i = 0; i < listAddress.iAddressCount; i++)
 	{
@@ -461,21 +567,22 @@ inline void CLowerInterface::LearnAddresses()
 		if (p->sin_family != AF_INET)
 			throw E_UNEXPECTED;	// memory corruption!
 		//
-		if(k >= nAddress)
+		if (k >= SD_SETSIZE)
 			throw E_OUTOFMEMORY;
 		//
 		p->sin_port = DEFAULT_FSP_UDPPORT;
-		if(BindInterface(sdSend, p, k) != 0)
+		if(BindSendRecv(p, k) != 0)
 		{
 			REPORT_WSAERROR_TRACE("Bind failure");
 			throw E_ABORT;
 		}
+
 		sdSend = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 		if(sdSend == INVALID_SOCKET)
 			throw E_HANDLE;
-		k++;
+		// On BindInterface, k++; as k is the alias of sdSet.fd_count
 	}
-	if (k >= nAddress)
+	if (k >= SD_SETSIZE)
 		throw E_OUTOFMEMORY;
 
 	// Set the loopback address as the last resort of receiving
@@ -485,7 +592,7 @@ inline void CLowerInterface::LearnAddresses()
 	p->sin_port = DEFAULT_FSP_UDPPORT;
 	p->sin_addr.S_un.S_addr = IN4ADDR_LOOPBACK;
 	*(long long *)p->sin_zero = 0;
-	if (BindInterface(sdSend, p, k) != 0)
+	if (BindSendRecv(p, k) != 0)
 	{
 		REPORT_WSAERROR_TRACE("Fail to bind on loopback interface");
 		throw E_ABORT;
@@ -494,33 +601,12 @@ inline void CLowerInterface::LearnAddresses()
 	sdSend = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 	if (sdSend == INVALID_SOCKET)
 		throw E_HANDLE;
+	// SetInterfaceOptions(sdSend);
 	// Set the INADDR_ANY for transmission; reuse storage of loopback address
 	p->sin_addr.S_un.S_addr = INADDR_ANY;
-	r = bind(sdSend, (const sockaddr *)p, sizeof(SOCKADDR_IN));
-
-	nAddress = k + 1;
-}
-
-inline void CLowerInterface::PoolingALFIDs()
-{
-	register int k;
-	ALFID_T id;
-	//
-	// refuse to continue if the random number generator doesn't work
-	for (register int i = 0; i < MAX_CONNECTION_NUM; i++)
-	{
-		//
-		do
-		{
-			rand_w32(&id, 1);
-			k = id & (MAX_CONNECTION_NUM - 1);
-		} while (id <= LAST_WELL_KNOWN_ALFID || poolFiberID[k]->fidPair.source != 0);
-		//
-		poolFiberID[k]->fidPair.source = id;
-	}
+	::bind(sdSend, (const struct sockaddr *)p, sizeof(SOCKADDR_IN));
 }
 #endif
-
 
 
 
@@ -559,7 +645,7 @@ DWORD WINAPI CLowerInterface::ProcessRemotePacket(LPVOID lpParameter)
 }
 
 
-
+// the real top-level handler to accept and process the remote packets
 inline void CLowerInterface::ProcessRemotePacket()
 {
 	fd_set readFDs;
@@ -574,13 +660,41 @@ inline void CLowerInterface::ProcessRemotePacket()
 	{
 		// make it as compatible as possible...
 		FD_ZERO(& readFDs);
+		r = 0;
 		for(i = 0; i < (int)sdSet.fd_count; i++)		
+#ifndef OVER_UDP_IPv4
+		if(! BitTest(& disableFlags, i))
+#endif
 		{
 			FD_SET(sdSet.fd_array[i], & readFDs);
+			r++;
 		}
-		// select returns total number of sockets that are ready
+		// during hand-off there might be no IPv6 interface available
+		// for simplicity hard code the polling interval.
+		// a more sophisticated implementation should be event-driven - wait the IP change event instead
+		if (r <= 0)
+		{
+			Sleep(1000);
+			continue;
+		}
+		// It is documented that select returns total number of sockets that are ready, however, if one socket is closed
+		// 'select' success while following WSARecvMsg will fail
+		// Cannot receive packet information, error code = 10038
+		// Error: An operation was attempted on something that is not a socket.
 		if(select(sdSet.fd_count, & readFDs, NULL, NULL, NULL) <= 0)
 		{
+			int	err = WSAGetLastError();
+			if(err == WSAENETDOWN)
+			{
+				Sleep(1000);	// wait for the network service up again
+				continue;
+			}
+			else if (err = WSAENOTSOCK)
+			// One of the descriptor sets contains an entry that is not a socket. deliberately close a socket
+			{
+				Sleep(50);
+				continue;
+			}
 			REPORT_WSAERROR_TRACE("select failure");
 			break;	// TODO: crash recovery from select
 		}
@@ -596,12 +710,15 @@ inline void CLowerInterface::ProcessRemotePacket()
 			SetMutexFree();
 			if(r == E_ABORT)
 				return;
+			if (r == E_FAIL)
+				Disable_sdRecv();
 		}
 	} while(1, 1);
 }
 
 
-
+// The handler's mainbody to accept and process one particular remote packet
+// See also SendPacket
 int CLowerInterface::AcceptAndProcess()
 {
 	if((pktBuf = GetBuffer()) == NULL)
@@ -609,10 +726,9 @@ int CLowerInterface::AcceptAndProcess()
 
 	// Unfortunately, it was proven that no matter whether there is MSG_PEEK
 	// MSG_PARTIAL is not supported by the underlying raw socket service
-	// so scattered I/O is actually unutilized.
-	WSABUF	scatteredBuf[1];
 	// FSP is meant to optimize towards IPv6. OVER_UDP_IPv4 is just for conceptual test
 	// NO! We don't intend to support dual-stack in FSP.
+	WSABUF	scatteredBuf[1];
 #ifdef OVER_UDP_IPv4
 	scatteredBuf[0].buf = (CHAR *) & pktBuf->idPair;
 #else
@@ -622,12 +738,17 @@ int CLowerInterface::AcceptAndProcess()
 	mesgInfo.lpBuffers = scatteredBuf;
 	mesgInfo.dwBufferCount = 1;
 
-	int	r = WSARecvMsg(sdRecv, & mesgInfo, & countRecv, NULL, NULL);
-	if(r != 0)
+	if (WSARecvMsg(sdRecv, &mesgInfo, &countRecv, NULL, NULL) < 0)
 	{
-		REPORT_WSAERROR_TRACE("Cannot receive packet information");
+		int err = WSAGetLastError();
 		SetMutexFree();
-		return E_ABORT; // TO DO: crash recovery
+		if (err != WSAENOTSOCK)
+		{
+			ReportErrorAsMessage(err);
+			return E_ABORT;		// Unrecoverable error
+		}
+		// TO DO: other errors which could not undertake crash recovery
+		return E_FAIL;
 	}
 
 	// From the receiver's point of view the local fiber id was stored in the peer fiber id field of the received packet
@@ -717,22 +838,18 @@ int CLowerInterface::AcceptAndProcess()
 		}
 		// save the source address temporarily as it is not necessariy legitimate
 		pSocket->sockAddrTo[MAX_PHY_INTERFACES] = addrFrom;
-#ifdef TRACE_PACKET
-		printf_s("Socket : 0x%08X , buffer : 0x%08X queued\n", (LONG)pSocket, (LONG)pktBuf->GetHeaderFSP());
-#endif
 		// only if the queue has not started needs it queue HandleICC
 		if(pSocket->PushPacketBuffer(pktBuf) == NULL)
-			QueueUserWorkItem(HandleFullICC, pSocket, WT_EXECUTEDEFAULT);
+			QueueUserWorkItem(HandleFullICC, pSocket, WT_EXECUTELONGFUNCTION);
 		break;
-	default:
-		r = 0;	// UNRECOGNIZED packets are simply discarded
+		// UNRECOGNIZED packets are simply discarded
 	}
 
 	if(pSocket == NULL)
 		FreeBuffer(pktBuf);
 	// Or else it is in the working thread that the memory block free
 
-	return r;
+	return 0;
 }
 
 
@@ -749,31 +866,25 @@ int CLowerInterface::AcceptAndProcess()
 int LOCALAPI CLowerInterface::SendBack(char * buf, int len)
 {
 	WSABUF wsaData[2];
+	DWORD n = 0;
+	wsaData[1].buf = buf;
+	wsaData[1].len = len;
 #ifdef OVER_UDP_IPv4
 	// Store the local(near end) fiber ID as the source, the remote end fiber ID as
 	// the destination fiber ID in the given fiber ID association
 	pktBuf->idPair.peer = _InterlockedExchange((LONG *) & pktBuf->idPair.source, pktBuf->idPair.peer);
 	wsaData[0].buf = (char *) & pktBuf->idPair;
 	wsaData[0].len = sizeof(pktBuf->idPair);
-#else
-	IPv6_HEADER hdrIN6;
-	//
-	hdrIN6.Set(len, (PIN6_ADDR)& nearInfo.u, (PIN6_ADDR)& addrFrom.Ipv6.sin6_addr);
-	wsaData[0].buf = (char *)& hdrIN6;
-	wsaData[0].len = sizeof(hdrIN6);
-#endif
-	wsaData[1].buf = buf;
-	wsaData[1].len = len;
-#ifdef TRACE_PACKET
-	printf_s("Send back to (namelen = %d):\n", mesgInfo.namelen);
-	DumpNetworkUInt16((uint16_t *)& addrFrom, mesgInfo.namelen / 2);
-#endif
-	DWORD n = 0;
 	int r = WSASendTo(sdSend
 		, wsaData, 2, &n
 		, 0
 		, (const sockaddr *)& addrFrom, mesgInfo.namelen
 		, NULL, NULL);
+#else
+	mesgInfo.lpBuffers = & wsaData[1];
+	mesgInfo.dwBufferCount = 1;
+	int r = WSASendMsg(sdSend, &mesgInfo, 0, &n, NULL, NULL);
+#endif
 	if (r != 0)
 	{
 		ReportWSAError("CLowerInterface::SendBack");
@@ -781,13 +892,13 @@ int LOCALAPI CLowerInterface::SendBack(char * buf, int len)
 	}
 #ifdef TRACE_PACKET
 	printf("%s, line %d, %d bytes sent back.\n", __FILE__, __LINE__, n);
-	printf("Peer name length = %d, socket address:\n", mesgInfo.namelen);
-	DumpNetworkUInt16((uint16_t *)& addrFrom, sizeof(SOCKADDR_IN6) / 2);
+	printf_s("  Send from msghdr:\n\t");
+	DumpNetworkUInt16((uint16_t *)& nearInfo, sizeof(nearInfo) / 2);
+	printf_s("  Send back to (namelen = %d):\n\t", mesgInfo.namelen);
+	DumpNetworkUInt16((uint16_t *)& addrFrom, mesgInfo.namelen / 2);
 #endif
 	return n;
 }
-
-
 
 
 
@@ -821,34 +932,36 @@ void LOCALAPI CLowerInterface::SendPrematureReset(uint32_t reasons, CSocketItemE
 }
 
 
-
 // return the WSA error number, which is greater than zero. may be zero if no error at all.
 static int LOCALAPI ReportWSAError(char * msg)
 {
 	int	err = WSAGetLastError();
-	LPVOID lpMsgBuf;
 
 	printf("%s, error code = %d\n", msg, err);
-	if (FormatMessage( 
-		FORMAT_MESSAGE_ALLOCATE_BUFFER | 
-		FORMAT_MESSAGE_FROM_SYSTEM | 
-		FORMAT_MESSAGE_IGNORE_INSERTS,
-		NULL,
-		err,
-		MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), // Default language
-		(LPTSTR) &lpMsgBuf,
-		0,
-		NULL )) 
-	{
-		printf("\tError: %s\n", (char *)lpMsgBuf);
-		LocalFree( lpMsgBuf );
-	}
+	ReportErrorAsMessage(err);
 
 	return err;
 }
 
 
-
+static void LOCALAPI ReportErrorAsMessage(int err)
+{
+	LPVOID lpMsgBuf;
+	if (FormatMessage(
+		FORMAT_MESSAGE_ALLOCATE_BUFFER |
+		FORMAT_MESSAGE_FROM_SYSTEM |
+		FORMAT_MESSAGE_IGNORE_INSERTS,
+		NULL,
+		err,
+		MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), // Default language
+		(LPTSTR)&lpMsgBuf,
+		0,
+		NULL))
+	{
+		printf("\tError: %s\n", (char *)lpMsgBuf);
+		LocalFree(lpMsgBuf);
+	}
+}
 
 
 // Defined here only because this source file is shared across modules
@@ -883,7 +996,6 @@ timestamp_t NowUTC()
     
 
 
-
 // Given
 //	DWORD	the process ID
 // Return
@@ -905,46 +1017,9 @@ bool IsProcessAlive(DWORD idProcess)
 }
 
 
-
-
-//in linux, use high-resolution timers, jiffies 
-//				
-//#include <linux/kernel.h>
-//#include <linux/module.h>
-//#include <linux/hrtimer.h>
-//#include <linux/ktime.h>
-//
-//
-//#define MS_TO_NS(x)	(x * 1E6L)
-//
-//static struct hrtimer hr_timer;
-//enum hrtimer_restart my_hrtimer_callback( struct hrtimer *timer )
-//{
-//  printk( "my_hrtimer_callback called (%ld).\n", jiffies );
-//  return HRTIMER_NORESTART;
-//}
-//
-//int init_module( void )
-//{
-//  ktime_t ktime;
-//  unsigned long delay_in_ms = 200L;
-//  printk("HR Timer module installing\n");
-//  ktime = ktime_set( 0, MS_TO_NS(delay_in_ms) );
-//  hrtimer_init( &hr_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL );
-//  hr_timer.function = &my_hrtimer_callback;
-//  printk( "Starting timer to fire in %ldms (%ld)\n", delay_in_ms, jiffies );
-//  hrtimer_start( &hr_timer, ktime, HRTIMER_MODE_REL );
-//  return 0;
-//}
-//
-//void cleanup_module( void )
-//{
-//  int ret;
-//  ret = hrtimer_cancel( &hr_timer );
-//  if (ret) printk("The timer was still in use...\n");
-//  printk("HR Timer module uninstalling\n");
-//  return;
-//}
+/**
+ *	The timer queue
+ */
 TimerWheel::TimerWheel()
 {
 	if(timerQueue == NULL)
@@ -1014,6 +1089,7 @@ bool LOCALAPI CSocketItemEx::ReplaceTimer(uint32_t period)
 
 
 
+// The OS-depending implementation of scheduling transmission queue
 void CSocketItemEx::ScheduleEmitQ()
 {
 #ifdef TRACE
@@ -1024,6 +1100,7 @@ void CSocketItemEx::ScheduleEmitQ()
 
 
 
+// The OS-depending implementation of scheduling connection-request queue
 void CSocketItemEx::ScheduleConnect(CommandNewSessionSrv *pCmd)
 {
 	pCmd->pSocket = this;
@@ -1031,6 +1108,10 @@ void CSocketItemEx::ScheduleConnect(CommandNewSessionSrv *pCmd)
 }
 
 
+
+/**
+ *	The backlog of accepted remote packets
+ */
 // Given
 //	PktSignature *	the pointer to the next packe buffer to be put into the receive-process queue of the socket
 // Return
@@ -1096,6 +1177,10 @@ void CSocketItemEx::PopUnlockPacketBuffer()
 
 
 
+/**
+ *	The OS-depending callback functions of QueueUserWorkItem
+ */
+// For ScheduleEmitQ
 DWORD WINAPI HandleSendQ(LPVOID p)
 {
 	try
@@ -1103,9 +1188,9 @@ DWORD WINAPI HandleSendQ(LPVOID p)
 		CSocketItemEx *p0 = (CSocketItemEx *)p;
 		if(! p0->TestAndWaitReady())
 		{
-			//// UNRESOLVED! How to forceful reset the session if it is locked...
-			//if(p0->IsInUse())
-			//	CLowerInterface::Singleton()->FreeItem(p0);
+			if(p0->IsInUse())
+				QueueUserWorkItem(HandleSendQ, p0, WT_EXECUTELONGFUNCTION);
+			// This is a long function because of the waiting
 			return 0;
 		}
 		p0->EmitQ();
@@ -1120,7 +1205,7 @@ DWORD WINAPI HandleSendQ(LPVOID p)
 }
 
 
-
+// Directedly registered by AcceptAndProcess
 DWORD WINAPI HandleFullICC(LPVOID p)
 {
 	try
@@ -1131,11 +1216,11 @@ DWORD WINAPI HandleFullICC(LPVOID p)
 		{
 			if(! p0->TestAndWaitReady())
 			{
-				//// UNRESOLVED! How to forceful reset the session if it is locked...
-				//if(p0->IsInUse())
-				//	CLowerInterface::Singleton()->FreeItem(p0);
+				if(p0->IsInUse())
+					QueueUserWorkItem(HandleFullICC, p0, WT_EXECUTELONGFUNCTION);
+				// This is a long function because of the waiting
 				p0->UnlockPacketBuffer();
-				return 0;
+					return 0;
 			}
 			// synchronize the state in the 'cache' and the real state
 			p0->lowState = p0->pControlBlock->state;
@@ -1176,6 +1261,7 @@ DWORD WINAPI HandleFullICC(LPVOID p)
 
 
 
+// For ScheduleConnect
 DWORD WINAPI HandleConnect(LPVOID p)
 {
 	try
@@ -1190,18 +1276,21 @@ DWORD WINAPI HandleConnect(LPVOID p)
 }
 
 
-// It is assumed that inUse and isReady are stored compactly (octet by octet)
+
+/**
+ *	Some further OS-dependeng auxilary functions
+ */
 bool CSocketItemEx::TestAndWaitReady()
 {
 	time_t t0 = time(NULL);
 	while(! TestAndLockReady())
 	{
-		Sleep(0);	// just yield out the CPU
 		if(time(NULL) - t0 > TRASIENT_STATE_TIMEOUT_ms)
 		{
 			TRACE_HERE("TestAndWaitReady timeout");
 			return false;
 		}
+		Sleep(1);
 	}
 	//
 	return true;
@@ -1217,26 +1306,47 @@ bool CSocketItemEx::TestAndWaitReady()
 //	number of bytes sent, or 0 if error
 int CSocketItemEx::SendPacket(register ULONG n1, ScatteredSendBuffers s)
 {
-	register LPWSABUF lpBuffers = s.scattered;
-	IPv6_HEADER hdrIN6;
-	n1++;
+	DWORD n = 0;
+	int r;
 
 	// 'Prefer productivity over cleverness - if there is some cleverness'
-	if (pControlBlock->nearEnd->IsIPv6())
+	if (pControlBlock->nearEndInfo.IsIPv6())
 	{
-		int	d = 0;
-		for (register ULONG j = 1; j < n1; j++)
+		CtrlMsgHdr nearInfo;
+		WSAMSG wsaMsg;
+		//
+		wsaMsg.Control.buf = (CHAR *)& nearInfo;
+		wsaMsg.Control.len = sizeof(nearInfo);
+		nearInfo.pktHdr = CLowerInterface::Singleton()->nearInfo.pktHdr;
+		if(! CLowerInterface::Singleton()->SelectPath
+			(& nearInfo.u, fidPair.source, pControlBlock->nearEndInfo.ipi6_ifindex, sockAddrTo))
 		{
-			d += lpBuffers[j].len;
+			return 0;	// no selectable path
 		}
-		hdrIN6.Set(d, (PIN6_ADDR)& pControlBlock->nearEnd[0], &sockAddrTo->Ipv6.sin6_addr);
-		s.scattered[0].buf = (CHAR *)& hdrIN6;
-		s.scattered[0].len = sizeof(hdrIN6);
+		wsaMsg.dwBufferCount = n1;
+#ifdef TRACE_PACKET
+		s.scattered[0].buf = NULL;
+		s.scattered[0].len = 0;
+#endif
+		wsaMsg.lpBuffers = & s.scattered[1];
+		wsaMsg.name = (LPSOCKADDR)sockAddrTo;
+		wsaMsg.namelen = sizeof(sockAddrTo->Ipv6);
+		r = WSASendMsg(CLowerInterface::Singleton()->sdSend, & wsaMsg, 0, &n, NULL, NULL);
 	}
 	else
 	{
 		s.scattered[0].buf = (CHAR *)& fidPair;
 		s.scattered[0].len = sizeof(fidPair);
+		n1++;
+		//
+		r = WSASendTo(CLowerInterface::Singleton()->sdSend
+			, s.scattered, n1
+			, &n
+			, 0
+			, (const struct sockaddr *)sockAddrTo
+			, sizeof(sockAddrTo->Ipv4)
+			, NULL
+			, NULL);
 	}
 
 	tRecentSend = NowUTC();
@@ -1246,20 +1356,10 @@ int CSocketItemEx::SendPacket(register ULONG n1, ScatteredSendBuffers s)
 	printf_s("Data to sent:\n----\n");
 	for (register ULONG i = 0; i < n1; i++)
 	{
-		DumpNetworkUInt16((uint16_t *)lpBuffers[i].buf, lpBuffers[i].len / 2);
+		DumpNetworkUInt16((uint16_t *)s.scattered[i].buf, s.scattered[i].len / 2);
 		printf("----\n");
 	}
 #endif
-	DWORD n = 0;
-	// UNRESOLVED! Mixed IPv4/IPv6 network interface, i.e.dual hosted networks
-	int r = WSASendTo(CLowerInterface::Singleton()->sdSend
-		, lpBuffers, n1
-		, &n
-		, 0
-		, (const struct sockaddr *)sockAddrTo
-		, sockAddrTo->si_family == AF_INET6 ? sizeof(sockAddrTo->Ipv6) : sizeof(sockAddrTo->Ipv4)
-		, NULL
-		, NULL);
 	if (r != 0)
 	{
 		ReportWSAError("CSocketItemEx::SendPacket");
@@ -1273,6 +1373,15 @@ int CSocketItemEx::SendPacket(register ULONG n1, ScatteredSendBuffers s)
 
 
 
+/**
+ *	Manipulation of connection request queue
+ */
+
+// Given
+//	CommandNewSessionSrv		The request for new connection
+// Return
+//	non-negative is the position of the new request in the queue
+//	negative if error
 int ConnectRequestQueue::Push(const CommandNewSessionSrv *p)
 {
 	WaitSetMutex();
@@ -1326,64 +1435,13 @@ int ConnectRequestQueue::Remove(int i)
 }	
 
 
-/*
-mobility support...
-TODO: after configure the ALFIDs, listen to address change event
-TODO: on reconfiguration, refresh IPv6 end point of each FSP socket
 
-scan all configured FSP socket, modify the near end addresses accordingly
-*/
-//[Avoid dead loop here!]
-VOID NETIOAPI_API_ OnUnicastIpChanged(PVOID, PMIB_UNICASTIPADDRESS_ROW row, MIB_NOTIFICATION_TYPE notificationType)
-{
-	printf_s("MIB_NOTIFICATION_TYPE: %d\n", notificationType);
-	switch (notificationType)
-	{
-	case MibParameterNotification:
-		printf("//// ParameterChange.//\n");
-		break;
-	case MibAddInstance:
-		printf("//// Addition.//\n");
-		break;
-	case MibDeleteInstance:
-		printf("//// Deletion.//\n");
-		break;
-	case MibInitialNotification:
-		printf("//// Initial notification.//\n");
-		return;
-	default:
-		return;
-	}
-	if (row == NULL)
-	{
-		printf("Internal panic! Cannot guess which IP interface was changed\n");
-		return;
-	}
-
-	CHAR strIPv6Addr[INET6_ADDRSTRLEN];
-	// change from:
-	if (inet_ntop(AF_INET6, &(row->Address.Ipv6.sin6_addr), strIPv6Addr, sizeof(strIPv6Addr)) != NULL)
-		printf("\tIt is about %s\n", strIPv6Addr);
-	else
-		ReportWSAError("Cannot figuout out the string representation of the address?");
-
-	MIB_UNICASTIPADDRESS_ROW infoRow;	//SOCKADDR_IN6 addr = row->Address.Ipv6;
-	// InitializeUnicastIpAddressEntry(&infoRow);
-	infoRow.InterfaceLuid = row->InterfaceLuid;
-	infoRow.Address = row->Address;
-	GetUnicastIpAddressEntry(&infoRow);
-
-	// change to:
-	if (inet_ntop(AF_INET6, &(row->Address.Ipv6.sin6_addr), strIPv6Addr, sizeof(strIPv6Addr)) != NULL)
-		printf("\tIt is about %s\n", strIPv6Addr);
-	else
-		ReportWSAError("Cannot figuout out the string representation of the address?");
-}
-
-
-
-// return 0 if no error
-// positive if warning
+/**
+ *	Manipulation of the host firewall
+ *	Return
+ *		0 if no error
+ *		positive if warning
+ */
 static int CreateFWRules()
 {
 	HRESULT hrComInit = S_OK;
@@ -1641,3 +1699,324 @@ l_bailout:
 
 	return 0;
 }
+
+
+
+
+#ifndef OVER_UDP_IPv4
+// Mark sdRecv as disabled
+inline void	CLowerInterface::Disable_sdRecv()
+{
+	for (register u_int i = 0; i < sdSet.fd_count; i++)
+	{
+		if (sdRecv == sdSet.fd_array[i])
+		{
+			InterlockedBitTestAndSet(&disableFlags, i);
+			return;
+		}
+	}
+}
+
+
+// hard coded: when the 96-bit prefix are equal the two addresses are considered at the same interface
+inline bool CLowerInterface::IsPrefixDuplicated(int ifIndex, PIN6_ADDR p)
+{
+	for (register u_int j = 0; j < sdSet.fd_count; j++)
+	{
+		if (interfaces[j] == ifIndex
+		&& *(uint64_t *)(addresses[j].sin6_addr.u.Byte) == *(uint64_t *)(p->u.Byte)
+		&& *(uint32_t *) & (addresses[j].sin6_addr.u.Byte[8]) == *(uint32_t *) & (p->u.Byte[8])
+		)
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
+
+
+//
+// Given
+//	IPv6_HEADER *		[out] the header to be filled
+//	short				the message length
+//	int					the send-out interface
+//	const SOCKADDR_INET * the destination address
+// Do
+//	Fill in the IPv6 header's source and destination IP address by select the proper path
+//	A path is proper if the source IP is on the designated interface, or
+//	if there's no interface match try to match the scope.
+//	The last resort is the last enabled interface
+// Return
+//	true if there exists some path
+//	false if no path exists, typically because all interfaces were disabled
+/**
+ * Remark
+
+
+	Prefix/Precedence/Label/Usage
+	::1/128			50 0 Localhost 
+	::/0			40 1 Default unicast 
+	::ffff:0:0/96	35 4 IPv4-mapped IPv6 address 
+	2002::/16		30 2 6to4 
+	2001::/32		5 5 Teredo tunneling 
+	fc00::/7		3 13 Unique local address 
+	::/96 1			3 IPv4-compatible addresses (deprecated) 
+	fec0::/10		1 11 Site-local address (deprecated) 
+	3ffe::/16		1 12 6bone (returned) 
+
+	#define IN6ADDR_LINKLOCALPREFIX_INIT { 0xfe, 0x80, }
+	#define IN6ADDR_ULAPREFIX_INIT {0xfc }	// A unique local address (ULA) is an IPv6 address in the block fc00::/7
+
+	#define IN6ADDR_6TO4PREFIX_INIT { 0x20, 0x02, }
+	#define IN6ADDR_TEREDOPREFIX_INIT { 0x20, 0x01, 0x00, 0x00, }
+
+	extern CONST IN6_ADDR in6addr_linklocalprefix;
+	extern CONST IN6_ADDR in6addr_6to4prefix;
+	extern CONST IN6_ADDR in6addr_teredoprefix;
+ */
+
+bool LOCALAPI CLowerInterface::SelectPath(PFSP_SINKINF pNear, ALFID_T nearId, int ifIndex, const SOCKADDR_INET *sockAddrTo)
+{
+	register u_int i;
+	if(ifIndex > 0)
+	{
+		for (i = 0; i < sdSet.fd_count; i++)
+		{
+			if (!BitTest(&disableFlags, i) && interfaces[i] == ifIndex)
+				goto l_matched;
+		}
+	}
+
+	// Link-local first
+	if (*(int64_t *)& sockAddrTo->Ipv6.sin6_addr.u == *(int64_t *)& in6addr_linklocalprefix.u)	// hard coded 8 byte address prefix lenth
+	{
+		for (i = 0; i < sdSet.fd_count; i++)
+		{
+			if (!BitTest(&disableFlags, i) && *(int64_t *)& addresses[i].sin6_addr.u == *(int64_t *)& in6addr_linklocalprefix.u)
+				goto l_matched;
+		}
+	}
+	// then in6addr_6to4prefix
+	if (sockAddrTo->Ipv6.sin6_addr.u.Word[0] == in6addr_6to4prefix.u.Word[0])	// hard coded 2 byte address prefix lenth
+	{
+		for (i = 0; i < sdSet.fd_count; i++)
+		{
+			if (!BitTest(&disableFlags, i) && addresses[i].sin6_addr.u.Word[0] == in6addr_6to4prefix.u.Word[0])
+				goto l_matched;
+		}
+	}
+	// then match terodo tunnelling
+	if (*(int32_t *)& sockAddrTo->Ipv6.sin6_addr.u == *(int32_t *)& in6addr_teredoprefix.u)	// hard coded 4 byte address prefix lenth
+	{
+		for (i = 0; i < sdSet.fd_count; i++)
+		{
+			if (!BitTest(&disableFlags, i) && *(int32_t *)& addresses[i].sin6_addr.u == *(int32_t *)& in6addr_teredoprefix.u)
+				goto l_matched;
+		}
+	}
+	// then a ULA (but site-local is obsolete)
+	if ((sockAddrTo->Ipv6.sin6_addr.u.Byte[0] & 0xFE) == 0xFC)	// hard coded unique local address
+	{
+		for (i = 0; i < sdSet.fd_count; i++)
+		{
+			if (!BitTest(&disableFlags, i) && (addresses[i].sin6_addr.u.Byte[0] & 0xFE) == 0xFC)
+				goto l_matched;
+		}
+	}
+	// user-defined scope matching is the last resort (v4mapped, or arbitrary global IPv6 address)
+	int lastResort = -1;
+	for (i = 0; i < sdSet.fd_count; i++)
+	{
+		if (!BitTest(& disableFlags, i))
+		{
+			if(addresses[i].sin6_scope_id == sockAddrTo->Ipv6.sin6_scope_id
+				&& *(int64_t *)& addresses[i].sin6_addr.u != *(int64_t *)& in6addr_linklocalprefix.u
+				&& addresses[i].sin6_addr.u.Word[0] != in6addr_6to4prefix.u.Word[0]
+				&& *(int32_t *)& addresses[i].sin6_addr.u.Word[0] != *(int32_t *)& in6addr_teredoprefix.u
+				&& (addresses[i].sin6_addr.u.Byte[0] & 0xFE) != 0xFC	// ULA
+			)
+			{
+				goto l_matched;
+			}
+			//
+			lastResort = i;
+		}
+	}
+	// By default the last enabled interface is selected as the last resort for out-going interface
+	if(lastResort < 0)
+		return false;
+	//
+	i = lastResort;
+	//
+l_matched:
+	memcpy(& pNear->ipi_addr, addresses[i].sin6_addr.u.Byte, 12);	// hard-coded network prefix length, including the host id
+	pNear->idALF = nearId;
+	pNear->ipi6_ifindex = ifIndex;
+	//
+	return true;
+}
+
+
+
+// The ALFID part == 0 is reserved as the network identifier
+// == 1 TCP Port Service Multiplexer(TCPMUX)
+/**
+	The port numbers in the range from 0 to 1023 are the well - known ports or system ports.
+	0 UDP Reserved Official
+	1 TCP UDP TCP Port Service Multiplexer(TCPMUX) Official
+	7 TCP UDP Echo Protocol Official
+	13 TCP UDP Daytime Protocol(RFC 867) Official
+	22
+		TCP
+		SCTP
+		UDP Secure Shell(SSH), secure logins, file transfers(scp, sftp) and port forwarding Official
+	37 TCP UDP Time Protocol Official
+	39 TCP UDP Resource Location Protocol[10](RLP)
+		¡ªused for determining the location of higher level services from hosts on a network Official
+	42 TCP UDP ARPA Host Name Server Protocol Official
+	43 TCP UDP WHOIS protocol Official
+	53 TCP UDP Domain Name System(DNS) Official
+	67 TCP UDP Bootstrap Protocol(BOOTP) server; also used by Dynamic Host Configuration Protocol(DHCP) Official
+	68 TCP UDP Bootstrap Protocol(BOOTP) client; also used by Dynamic Host Configuration Protocol(DHCP) Official
+	69 TCP UDP Trivial File Transfer Protocol(TFTP) Official
+	70 TCP UDP Gopher protocol Official
+	79 TCP UDP Finger protocol Official
+	80
+		TCP
+		SCTP
+		UDP Hypertext Transfer Protocol(HTTP)[13] Official
+	80  UDP QUIC(from Chromium) for HTTP Unofficial
+	443
+		TCP
+		SCTP
+		UDP Hypertext Transfer Protocol over TLS / SSL(HTTPS) Official
+		UDP QUIC(from Chromium) for HTTPS Unofficial
+ **/
+inline void CLowerInterface::OnAddIPv6Address(int ifIndex, const SOCKADDR_IN6 & sin6Addr)
+{
+	// See also LearnAddresses, MakeALFIDsPool, operator::[], AllocItem, FreeItem
+	if (be32toh(*(ALFID_T *)& sin6Addr.sin6_addr.u.Byte[12]) > LAST_WELL_KNOWN_ALFID)
+		return;
+
+	register u_int i = 0;
+	while (i < sdSet.fd_count)
+	{
+		if (interfaces[i] == ifIndex && memcmp(addresses[i].sin6_addr.u.Byte, sin6Addr.sin6_addr.u.Byte, 12) == 0)
+		{
+			if (InterlockedBitTestAndReset(& disableFlags, i))
+				goto l_rebind;
+			return;
+		}
+		//
+		i++;
+	}
+	//
+	if (i >= SD_SETSIZE)
+		return;
+	//
+	//disable select of the new, not yet fully configured socke
+	InterlockedBitTestAndSet(& disableFlags, i);
+	sdSet.fd_count++;
+	addresses[i] = sin6Addr;
+	interfaces[i] = ifIndex;
+	//
+l_rebind:
+	SOCKET sdRecv = socket(AF_INET6, SOCK_RAW, IPPROTO_FSP);
+	if (sdRecv == INVALID_SOCKET)
+	{
+		if (i + 1 == sdSet.fd_count)
+			sdSet.fd_count = i;
+		return; // throw E_HANDLE;	//??
+	}
+	SetLocalApplicationLayerFiberIDs(i);
+	SetInterfaceOptions(sdRecv);
+	if (::bind(sdRecv, (const sockaddr *)& sin6Addr, sizeof(SOCKADDR_IN6)) < 0)
+	{
+		TRACE_HERE("cannot bind to new interface address");
+		return;
+	}
+	// reenable the new socket. if unnecessary, little harm is done
+	sdSet.fd_array[i] = sdRecv;
+	InterlockedBitTestAndReset(& disableFlags, i);
+
+	// The code is naive but simple enough to explain itself
+	for (i = 0; i < MAX_CONNECTION_NUM; i++)
+	{
+		itemStorage[i].OnLocalAddressChanged();
+	}
+}
+
+
+
+// Linear search and remove the entry. The set is too small to exploit more complicate search algorithm
+// hard coded: 96 bits == 12 bytes
+// We assume if ever one address is removed, all the remain address of the same 96-bit prefix, if any, would be eventually removed as well
+inline void CLowerInterface::OnRemoveIPv6Address(int ifIndex, const IN6_ADDR & in6Addr)
+{
+	for (register u_int i = 0; i < sdSet.fd_count; i++)
+	{
+		if (be32toh(*(ALFID_T *)& in6Addr.u.Byte[12]) <= LAST_WELL_KNOWN_ALFID
+		&& interfaces[i] == ifIndex
+		&& memcmp(in6Addr.u.Byte, addresses[i].sin6_addr.u.Byte, 12) == 0)
+		{
+			if (!InterlockedBitTestAndSet(&disableFlags, i))
+			{
+				RemoveALFIDAddressPool(ifIndex);
+				closesocket(sdSet.fd_array[i]);
+			}
+			return;
+		}
+	}
+}
+
+
+/**
+	mobility support, for IPv6 only...
+	scan all configured FSP socket, modify the near end addresses accordingly
+	0.There's no way to listen in a real promiscuous mode
+	1.There's no way to rebind a socket to a new IP address.
+	2.On Windows platform an interface change it IPv6 address by delete the old address then add the new address
+	On delete an address, if no prefix mapping to the address remained, the mapped bit is set 1 in the disableFlag, the socket is closed 
+	On add an address, firstly try to append new one if fd_count < SD_SETSIZE, else scan the bit to find the free entry
+	On select, 
+	// TODO: if one socket is closed, would select return? Sleep?
+ **/
+// The information returned in the MIB_UNICASTIPADDRESS_ROW structure is only enough information that an application can
+// call the GetUnicastIpAddressEntry function to query complete information on the IP address that changed. 
+VOID NETIOAPI_API_ OnUnicastIpChanged(PVOID, PMIB_UNICASTIPADDRESS_ROW row, MIB_NOTIFICATION_TYPE notificationType)
+{
+#if 0	// defined(TRACE_PACKET)
+	printf_s("MIB_NOTIFICATION_TYPE: %d\n", notificationType);
+	switch (notificationType)
+	{
+	case MibParameterNotification:
+		printf("//// ParameterChange.//\n");
+		break;
+	case MibAddInstance:
+		printf("//// Addition.//\n");
+		break;
+	case MibDeleteInstance:
+		printf("//// Deletion.//\n");
+		break;
+	case MibInitialNotification:
+		printf("//// Initial notification.//\n");
+		return;
+	default:
+		return;
+	}
+#endif
+	// As we have already filter out MibInitialNotification
+	if (row == NULL)
+	{
+		TRACE_HERE("Internal panic! Cannot guess which IP interface was changed\n");
+		return;
+	}
+
+	if (notificationType == MibAddInstance)
+		CLowerInterface::Singleton()->OnAddIPv6Address(row->InterfaceIndex, row->Address.Ipv6);
+	else if (notificationType == MibDeleteInstance)
+		CLowerInterface::Singleton()->OnRemoveIPv6Address(row->InterfaceIndex, row->Address.Ipv6.sin6_addr);
+	// else just ignore
+}
+#endif

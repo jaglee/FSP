@@ -207,6 +207,9 @@ void LOCALAPI CLowerInterface::OnInitConnectAck()
 	// TODO: UNRESOLVED!? get resource reservation requirement from IPv6 extension header
 	pSocket->SetRemoteFiberID(initState.idRemote = this->GetRemoteFiberID());
 	//^ set to new peer fiber ID: to support multihome it is necessary even for IPv6
+	pSocket->SetNearEndInfo(nearInfo);
+	// UNRESOLVED!? To check: the remote peer should register its own interface that made the connection in the backlog
+
 	initState.timeDelta = be32toh(pkt->timeDelta);
 	initState.cookie = pkt->cookie;
 	EnumEffectiveAddresses(initState.allowedPrefixes);
@@ -1050,11 +1053,12 @@ void CSocketItemEx::OnAckFlush()
 // CLOSABLE-->/RELEASE/-->CLOSED-->[Send RELEASE]-->[Notify]
 // {COMMITTING2, PRE_CLOSED}-->/RELEASE/
 //    -->{stop keep-alive}CLOSED-->[Send RELEASE]-->[Notify]
+// Because duplicate RELEASE might be received AFTER the control block has been released already, do not TRACE_PACKET before check state
 void CSocketItemEx::OnGetRelease()
 {
-	TRACE_SOCKET();
 	if (!InState(COMMITTING2) && !InState(CLOSABLE) && !InState(PRE_CLOSED))
 		return;
+	TRACE_SOCKET();
 
 	if (headPacket->lenData != 0)
 		return;
@@ -1153,8 +1157,8 @@ int LOCALAPI CSocketItemEx::PlacePayload(ControlBlock::PFSP_SocketBuf skb)
 #ifdef TRACE_PACKET
 	printf_s("Place %d payload bytes to 0x%08X (duplicated: %d)\n"
 		, headPacket->lenData
-		, (LONG)skb
-		, skb == 0 ? 0 : (int)skb->GetFlag<IS_DELIVERED>());
+		, (LONG)(UINT_PTR)skb
+		, skb == NULL ? 0 : (int)skb->GetFlag<IS_DELIVERED>());
 #endif
 	//UNRESOLVE!? TODO: warning the system administrator that possibly there is network intrusion?
 	if (!CheckMemoryBorder(skb))

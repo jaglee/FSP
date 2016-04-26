@@ -40,18 +40,9 @@
 #include "../FSP.h"
 #include "../FSP_Impl.h"
 
-#define READY_FOR_USE 0x0101
-
-#if ARCH_BIG_ENDIAN
-#define NOT_READY_USE 0x0100
-#else
-#define NOT_READY_USE 0x0001
-#endif
-
-#pragma intrinsic(_InterlockedCompareExchange, _InterlockedCompareExchange16, _InterlockedCompareExchange8)
+#pragma intrinsic(_InterlockedCompareExchange, _InterlockedCompareExchange8)
 #pragma intrinsic(_InterlockedExchange, _InterlockedExchange16, _InterlockedExchange8)
 #pragma intrinsic(_InterlockedIncrement, _InterlockedOr, _InterlockedOr8)
-
 
 
 // Return the number of microseconds elapsed since Jan 1, 1970 (unix epoch time)
@@ -81,6 +72,12 @@ struct CtrlMsgHdr
 };
 
 
+
+// Forward declaration; definition/implementation is placed in the OS-dependent source code file
+struct IPv6_HEADER;
+
+
+
 #if _WIN32_WINNT < 0x0602
 /**
  * Windows 8/Server 2012, with support of Visual Studio 2012, provide native support of htonll and ntohll
@@ -105,6 +102,7 @@ inline uint64_t ntohll(uint64_t h)
 /**
  * Get the application layer thread ID from the (IPv6 raw-)socket address
  */
+#define SOCKADDR_SUBNET(s)  (((PFSP_IN6_ADDR) & ((PSOCKADDR_IN6)(s))->sin6_addr)->u.subnet)
 #define SOCKADDR_ALFID(s)  (((PFSP_IN6_ADDR) & ((PSOCKADDR_IN6)(s))->sin6_addr)->idALF)
 #define SOCKADDR_HOST_ID(s)  (((PFSP_IN6_ADDR) & ((PSOCKADDR_IN6)(s))->sin6_addr)->idHost)
 
@@ -114,7 +112,6 @@ inline uint64_t ntohll(uint64_t h)
 #define MAX_LISTENER_NUM	4
 #define MAX_RETRANSMISSION	8
 #define	MAX_BUFFER_BLOCKS	64	// 65~66KiB, 64bit CPU consumes more // Implementation shall override this
-
 
 
 
@@ -163,7 +160,6 @@ public:
 
 
 
-
 #include <pshpack1.h>
 
 // we prefer productivity over 'cleverness': read buffer block itself is of fixed size
@@ -182,7 +178,7 @@ struct PktBufferBlock: PktSignature
 {
 	PairALFID	idPair;
 	FSP_NormalPacketHeader hdr;
-	BYTE	payload[MAX_LLS_BLOCK_SIZE];
+	BYTE	payload[MAX_BLOCK_SIZE];
 	//
 	FSP_NormalPacketHeader *GetHeaderFSP() { return &(this->hdr); }
 };
@@ -232,6 +228,7 @@ struct ICC_Context
 	ControlBlock::seq_t	firstSendSNewKey;
 	ControlBlock::seq_t	firstRecvSNewKey;
 };
+
 
 
 // Review it carefully!Only Interlock* operation may be applied on any volatile member variable
@@ -293,7 +290,7 @@ protected:
 	void RestartKeepAlive() { ReplaceTimer(tKeepAlive_ms); }
 	void StopKeepAlive() { ReplaceTimer(SCAVENGE_THRESHOLD_ms); }
 	void CalibrateKeepAlive();
-	void RecalibrateKeepAlive(timestamp_t);
+	void RecalibrateKeepAlive(uint64_t);
 
 	bool IsPassive() const { return lowState == LISTENING; }
 	void SetPassive() { lowState = LISTENING; }
@@ -341,11 +338,9 @@ public:
 	void InitAssociation();
 
 	bool IsInUse() { return (_InterlockedOr8(& inUse, 0) != 0); }
+	void SetInUse() { _InterlockedExchange8(& inUse, 1); }
 	void SetReady() { _InterlockedExchange8(& isReady, 1); }
-	// It is assumed that the socket is set ready only after it is put into use
-	// though inUse may be cleared before isReady is cleared
-	SHORT SetNotReadyUse() { return _InterlockedExchange16((SHORT *) & inUse, NOT_READY_USE); }
-	bool TestAndLockReady() { return _InterlockedCompareExchange16((SHORT *) & inUse, NOT_READY_USE, READY_FOR_USE) == READY_FOR_USE; }
+	bool TestAndLockReady() { return IsInUse() && _InterlockedCompareExchange8(& isReady, 0, 1) != 0; }
 	bool TestAndWaitReady();
 
 	void SetEarliestSendTime() { tEarliestSend = tRecentSend; }
@@ -374,8 +369,15 @@ public:
 		return (offset < sizeof(ControlBlock) || offset >= dwMemorySize) ? NULL : p;
 	}
 
+	void LOCALAPI SetNearEndInfo(const CtrlMsgHdr & nearInfo)
+	{
+		pControlBlock->nearEndInfo.cmsg_level = nearInfo.pktHdr.cmsg_level;
+		*(FSP_SINKINF *)& pControlBlock->nearEndInfo = nearInfo.u;
+	}
 	void LOCALAPI SetRemoteFiberID(ALFID_T id);
+
 	char *PeerName() const { return (char *)pControlBlock->peerAddr.name; }
+
 	int LOCALAPI ResolveToIPv6(const char *);
 	int LOCALAPI ResolveToFSPoverIPv4(const char *, const char *);
 
@@ -428,20 +430,10 @@ public:
 	bool LOCALAPI ValidateICC(FSP_NormalPacketHeader *, int32_t = 0, uint32_t = 0);
 	bool ValidateICC() { return ValidateICC(headPacket->GetHeaderFSP(), headPacket->lenData); }
 	bool LOCALAPI ValidateSNACK(ControlBlock::seq_t &, FSP_SelectiveNACK::GapDescriptor * &, int &);
-	//	On got valid ICC automatically register source IP address as the favorite returning IP address
-	void ChangeRemoteValidatedIP()
-	{
-		// TODO: automatically register remote address as the favorite contact address
-		// iff the integrity check code has passed the validation
-		//if(addrFrom.si_family == AF_INET)
-		//{
-		//}
-		//else if(addrFrom.si_family == AF_INET6)
-		//{
-		//}
-		//addrFrom.si_family = 0;	// AF_UNSPEC;	// as the flag
-		sockAddrTo[0] = sockAddrTo[MAX_PHY_INTERFACES];
-	}
+	// On near end's IPv6 address changed automatically send KEEP_ALIVE with MOBILE_HEADER
+	void OnLocalAddressChanged();
+	// On got valid ICC automatically register source IP address as the favorite returning IP address
+	inline void ChangeRemoteValidatedIP();
 
 	void EmitQ();
 	void KeepAlive();
@@ -499,8 +491,8 @@ protected:
 	CSocketItemEx listenerSlots[MAX_LISTENER_NUM];
 	ALIGN(MAC_ALIGNMENT)
 	CSocketItemEx itemStorage[MAX_CONNECTION_NUM];
-	//
-	CSocketItemEx *poolFiberID[MAX_CONNECTION_NUM];
+	// The translation look-aside buffer of the socket items
+	CSocketItemEx *tlbSockets[MAX_CONNECTION_NUM];
 	CSocketItemEx *headFreeSID, *tailFreeSID;
 
 public:
@@ -553,25 +545,38 @@ class CLowerInterface: public CSocketSrvTLB, protected CPacketBuffers
 private:
 	friend class CSocketItemEx;
 
+	static const u_int SD_SETSIZE = 32;	// hard-coded, bit number of LONG; assume FD_SETSIZE >= 32
 	static CLowerInterface *pSingleInstance;
 
 	HANDLE	thReceiver;	// the handle of the thread that listens
 	HANDLE	hMobililty;	// handling mobility, the handle of the address-changed event
+
 	SOCKET	sdSend;		// the socket descriptor, would at last be unbound for sending only
 	SOCKET	sdRecv;		// the socket that received message most recently
+
 	fd_set	sdSet;		// set of socket descriptor for listening, one element for each physical interface
 	DWORD	interfaces[FD_SETSIZE];
 	SOCKADDR_IN6 addresses[FD_SETSIZE];	// by default IPv6 addresses, but an entry might be a UDP over IPv4 address
-	int		nAddress;
+
+#ifndef OVER_UDP_IPv4
+	LONG	disableFlags;	// harf of the default FD_SETSIZE
+	inline	void Disable_sdRecv();
+#else
+	// For FSP over UDP/IPv4 bind the UDP-socket
+	void Disable_sdRecv() {}
+	int BindSendRecv(const SOCKADDR_IN *, int);
+#endif
 
 	// intermediate buffer to hold the fixed packet header, the optional header and the data
 	DWORD	countRecv;
 	PktBufferBlock *pktBuf;
 
+	// storage location part of the particular receipt of a remote packet, respectively
 	// remote-end address and near-end address
 	SOCKADDR_INET	addrFrom;
 	CtrlMsgHdr		nearInfo;
-	WSAMSG			mesgInfo;	// descriptor of what is received
+	// descriptor of what is received, i.e. the particular receipt of a remote packet
+	WSAMSG			mesgInfo;
 
 	template<typename THdr> THdr * FSP_OperationHeader() { return (THdr *) & pktBuf->hdr; }
 
@@ -579,10 +584,6 @@ private:
 	ALFID_T			SetLocalFiberID(ALFID_T);
 	ALFID_T			GetRemoteFiberID() const  { return SOCKADDR_ALFID(mesgInfo.name); }
 
-	// For FSP over IPv6 raw-socket, preconfigure IPv6 interfaces with ALFID pool
-	inline void SetLocalApplicationLayerFiberID(ALFID_T);
-	// For FSP over UDP/IPv4 bind the UDP-socket
-	inline int BindInterface(SOCKET, PSOCKADDR_IN, int);
 	CSocketItemEx	*MapSocket() { return (*this)[GetLocalFiberID()]; }
 
 protected:
@@ -593,10 +594,13 @@ protected:
 	void LOCALAPI OnGetConnectRequest();
 	void LOCALAPI OnGetResetSignal();
 
-	// define in mobile.cpp
+	// defined in mobile.cpp
 	int LOCALAPI EnumEffectiveAddresses(uint64_t *);
 	int	AcceptAndProcess();
 
+
+	// defined in os-dependent source file
+	inline int SetInterfaceOptions(SOCKET);
 	static DWORD WINAPI ProcessRemotePacket(LPVOID);
 
 public:
@@ -610,10 +614,27 @@ public:
 	// It might be necessary to send reset BEFORE a connection context is established
 	void LOCALAPI SendPrematureReset(uint32_t = 0, CSocketItemEx * = NULL);
 
+	inline bool IsPrefixDuplicated(int, PIN6_ADDR);
 	inline void LearnAddresses();
-	inline void PoolingALFIDs();
+	inline void MakeALFIDsPool();
 	inline void ProcessRemotePacket();
 	//^ the thread entry function for processing packet sent from the remote-end peer
+
+#ifndef OVER_UDP_IPv4
+	// For FSP over IPv6 raw-socket, preconfigure an IPv6 interface with ALFID pool
+	inline void SetLocalApplicationLayerFiberIDs(int);
+	//
+	inline void RemoveALFIDAddressPool(int);
+	// When an interface is removed/disabled, e.g. due to administrative shutdown at least one IPv6 address is unregistered
+	inline void OnRemoveIPv6Address(int, const IN6_ADDR &);
+	// When an interface is enabled, at least one new IPv6 address is added. More detail needed here than OnRemove
+	inline void OnAddIPv6Address(int, const SOCKADDR_IN6 &);
+	//
+	bool LOCALAPI SelectPath(PFSP_SINKINF, ALFID_T, int, const SOCKADDR_INET *);
+#else
+	// No, in IPv4 network FSP does not support multi-path
+	bool SelectPath(PFSP_SINKINF, ALFID_T, int, const SOCKADDR_INET *) { return false; }
+#endif
 
 	static CLowerInterface * Singleton() { return pSingleInstance; }
 };

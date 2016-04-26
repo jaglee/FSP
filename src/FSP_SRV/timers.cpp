@@ -1,8 +1,8 @@
 /*
  * FSP lower-layer service program, software time-wheel, might be accelerated by hardware
  * heartbeat callback and its related functions to
- * - retransmit INITIATE_CONNECT, CONNECT_REQUEST or MULTIPLY
- * - send heartbeat signal PERSIST
+ * - retransmit INITIATE_CONNECT, CONNECT_REQUEST, PERSIST or MULTIPLY
+ * - send heartbeat signal KEEP_ALIVE
  * - idle timeout of CONNECT_BOOTSTRAP, CONNECT_AFFIRMING, CLONING or CHALLENGING,
  * - as well as ACTIVE, COMMITTING, COMMITTING2, or PRE_CLOSED state
  * - and finally, 'lazy' garbage collecting of CLOSABLE or CLOSED state
@@ -39,7 +39,6 @@
 
 /**
   Continual KEEP_ALIVE packets are sent as heartbeat signals. PERSIST or COMMIT may be retransmitted in the heartbeat interval
-  RELEASE may be retransmitted in the heartbeat interval as well
   ACK_CONNECT_REQ, PURE_DATA or ACK_FLUSH is retransmitted on demand.
   ACK_INIT_CONNECT is never retransmitted.
 
@@ -80,6 +79,8 @@ void CSocketItemEx::TimeOut()
 {
 	if(! this->TestAndLockReady())
 	{
+		if (!IsInUse())	// Lazy garbage collection, in case of
+			Extinguish();
 #ifdef TRACE
 		printf_s("\nTimeout not executed due to lack of locks in state %s. InUse: %d, IsReady: %d\n"
 			, stateNames[lowState], IsInUse(), isReady);
@@ -295,6 +296,11 @@ int LOCALAPI CSocketItemEx::RespondToSNACK(ControlBlock::seq_t expectedSN, FSP_S
 	if (sizeof(ControlBlock) + (sizeof(ControlBlock::FSP_SocketBuf) + MAX_BLOCK_SIZE) * capacity > dwMemorySize)
 	{
 		TRACE_HERE("memory overflow");
+#if TRACE_PACKET
+		printf_s("Given memory size: %d, wanted limit: %zd\n"
+			, dwMemorySize
+			, sizeof(ControlBlock) + (sizeof(ControlBlock::FSP_SocketBuf) + MAX_BLOCK_SIZE) * capacity);
+#endif
 		return -EFAULT;
 	}
 
@@ -390,7 +396,7 @@ int LOCALAPI CSocketItemEx::RespondToSNACK(ControlBlock::seq_t expectedSN, FSP_S
 			}
 			// Attention please! If you try to trace the packet it would not be retransmitted, for sake of testability
 #if defined(TRACE_PACKET) || defined(TRACE_HEARTBEAT)
-			printf_s("Meant to retransmit: SN = %u, index position = %d\n", seq0, p - pControlBlock->HeadSend());
+			printf_s("Meant to retransmit: SN = %u, index position = %u\n", seq0, uint32_t(p - pControlBlock->HeadSend()));
 #endif
 #ifndef TRACE_PACKET
 			if(! p->GetFlag<IS_ACKNOWLEDGED>() && ! EmitWithICC(p, seq0))
@@ -476,6 +482,7 @@ void CSocketItemEx::RecalibrateKeepAlive(uint64_t rtt64_us)
 
 
 
+// Get the initial value of the round trip time and deduce the keep-alive interval, as well as the last receive time
 void CSocketItemEx::CalibrateKeepAlive()
 {
 	tLastRecv = NowUTC();

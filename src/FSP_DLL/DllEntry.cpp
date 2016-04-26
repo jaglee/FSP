@@ -219,8 +219,7 @@ int LOCALAPI CSocketItemDl::Initialize(PFSP_Context psp1, char szEventName[MAX_N
 		int n = (psp1->sendSize - 1) / MAX_BLOCK_SIZE + (psp1->recvSize - 1) / MAX_BLOCK_SIZE + 2;
 		// See also Init()
 		dwMemorySize = ((sizeof(ControlBlock) + 7) >> 3 << 3)
-			+ ((n * sizeof(ControlBlock::FSP_SocketBuf) + 7) >> 3 << 3)
-			+ n * MAX_BLOCK_SIZE;
+			+ n * (((sizeof(ControlBlock::FSP_SocketBuf) + 7) >> 3 << 3) + MAX_BLOCK_SIZE);
 	}
 	else
 	{
@@ -420,25 +419,17 @@ CSocketItemDl * CSocketItemDl::CreateControlBlock(const PFSP_IN6_ADDR nearAddr, 
 	//
 	socketItem->fidPair.source = nearAddr->idALF;
 	//
-	// TODO: UNRESOLVED! specifies 'ANY' address?
-	//
-	FSP_PKTINFO_EX *pNearEnd = socketItem->pControlBlock->nearEnd;
+	FSP_PKTINFO_EX & nearEnd = socketItem->pControlBlock->nearEndInfo;
 	if(nearAddr->u.st.prefix == PREFIX_FSP_IP6to4)
 	{
-		for(register int i = 0; i < MAX_PHY_INTERFACES; i++)
-		{
-			pNearEnd[i].InitUDPoverIPv4(psp1->ifDefault);
-		}
-		pNearEnd->idALF = nearAddr->idALF;
-		pNearEnd->ipi_addr = nearAddr->u.st.ipv4;
+		nearEnd.InitUDPoverIPv4(psp1->ifDefault);
+		nearEnd.idALF = nearAddr->idALF;
+		nearEnd.ipi_addr = nearAddr->u.st.ipv4;
 	}
 	else
 	{
-		for(register int i = 0; i < MAX_PHY_INTERFACES; i++)
-		{
-			pNearEnd[i].InitNativeIPv6(psp1->ifDefault);
-		}
-		*(PIN6_ADDR)pNearEnd = *(PIN6_ADDR)nearAddr;
+		nearEnd.InitNativeIPv6(psp1->ifDefault);
+		*(PIN6_ADDR) & nearEnd = *(PIN6_ADDR)nearAddr;
 	}
 	// Application Layer Thread ID other than the first default would be set in the LLS
 

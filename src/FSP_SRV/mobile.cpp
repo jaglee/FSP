@@ -57,7 +57,7 @@ ALFID_T LOCALAPI CLowerInterface::RandALFID(PIN6_ADDR addrList)
 	if(*(uint64_t *)addrList->u.Byte != 0)
 	{
 		bool isEffective = false;
-		for(register int j = 0; j < nAddress; j++)
+		for(register u_int j = 0; j < sdSet.fd_count; j++)
 		{
 			if(*(uint64_t *)s == *(uint64_t *)addresses[j].sin6_addr.u.Byte)
 			{
@@ -92,6 +92,8 @@ ALFID_T LOCALAPI CLowerInterface::RandALFID(PIN6_ADDR addrList)
 }
 
 
+
+// Return an available random ID. Here it is pre-calculated. Should be really random for better security
 ALFID_T LOCALAPI CLowerInterface::RandALFID()
 {
 	CSocketItemEx *p = headFreeSID;
@@ -114,6 +116,14 @@ ALFID_T LOCALAPI CLowerInterface::RandALFID()
 
 
 
+// Given
+//	BYTE *		pointer to the byte string of cookie material for the calculation
+//	int			the length of the cookie material
+//	timestamp_t	the time associated with the cookie, to deduce the life-span of the cookie
+// Do
+//	Calculate the cookie
+// Return
+//	The 64-bit cookie value
 uint64_t LOCALAPI CalculateCookie(BYTE *header, int sizeHdr, timestamp_t t0)
 {
 	static struct
@@ -171,7 +181,7 @@ uint64_t LOCALAPI CalculateCookie(BYTE *header, int sizeHdr, timestamp_t t0)
 
 
 
-
+// The ephemeral key is weakly securely established. It is a 64-bit value meant to make obfuscation in calcuate the CRC64 tag
 void CSocketItemEx::InstallEphemeralKey()
 {
 #ifdef TRACE
@@ -217,6 +227,41 @@ void CSocketItemEx::InstallSessionKey()
 	contextOfICC.firstSendSNewKey = pControlBlock->sendBufferNextSN;
 	contextOfICC.firstRecvSNewKey = pControlBlock->recvWindowNextSN;
 }
+
+
+
+// Given
+//	The peer's address obtained from the received and ICC-validated message has been saved in the sentinel place in sockAddrTo
+// DO
+//	Automatically register source IP address as the favorite returning IP address
+// Remark
+//	Currently not bothered to support mobility under IPv4 yet
+//	Target address selection/protocol related to network path selection is undetermined yet
+// See also SendPacket
+inline void CSocketItemEx::ChangeRemoteValidatedIP()
+{
+#ifndef OVER_UDP_IPv4
+	bool found = false;
+	for (register int i = MAX_PHY_INTERFACES; i >= 0; i--)
+	{
+		if (memcmp(sockAddrTo[i].Ipv6.sin6_addr.u.Byte, sockAddrTo[MAX_PHY_INTERFACES].Ipv6.sin6_addr.u.Byte, 12) == 0)
+		{
+			sockAddrTo[i] = sockAddrTo[0];
+			found = true;
+			break;
+		}
+	}
+	//^Let's the compiler do loop-unrolling, if it worthes
+	if(!found)
+	{
+		memcpy_s(&sockAddrTo[1], sizeof(sockAddrTo[1]) * (MAX_PHY_INTERFACES - 1)
+			, &sockAddrTo[0], sizeof(sockAddrTo[0]) * (MAX_PHY_INTERFACES - 1));
+	}
+	//
+	sockAddrTo[0] = sockAddrTo[MAX_PHY_INTERFACES];
+#endif
+}
+
 
 
 // Given
@@ -519,12 +564,104 @@ bool LOCALAPI CSocketItemEx::EmitWithICC(ControlBlock::PFSP_SocketBuf skb, Contr
 
 
 
+// On near end's IPv6 address changed automatically send KEEP_ALIVE with MOBILE_HEADER
+// See also CSocketItemEx::SendSNACK(), OnGetPureData, OnGetPersist
+#ifndef OVER_UDP_IPv4
+void CSocketItemEx::OnLocalAddressChanged()
+{
+	if(! IsInUse() || IsPassive())
+		return;
+
+	FSPOperationCode opCode = (pControlBlock->HasBeenCommitted() > 0) ? ACK_FLUSH : KEEP_ALIVE;
+
+	ControlBlock::seq_t seqExpected;
+	struct
+	{
+		FSP_PreparedKEEP_ALIVE	snack;
+		FSP_ConnectParam		_placeholder;
+	} buf2;
+	FSP_ConnectParam *pMobileParam;
+
+	int32_t len = GenerateSNACK(buf2.snack, seqExpected);
+#if defined(TRACE_PACKET) || defined(TRACE_HEARTBEAT)
+	printf_s("Keep-alive local fiber#%u\n"
+		"\tAcknowledged seq#%u, keep-alive header size = %d\n"
+		, fidPair.source
+		, seqExpected
+		, len);
+#endif
+	if (len < sizeof(FSP_SelectiveNACK))
+	{
+		printf_s("Fatal error %d encountered when generate SNACK\n", len);
+		return;
+	}
+	len += sizeof(FSP_NormalPacketHeader);
+
+	pMobileParam = (FSP_ConnectParam *)((uint8_t *)& buf2 + len);
+
+	u_int k = CLowerInterface::Singleton()->sdSet.fd_count;
+	u_int j = 0;
+	LONG w = CLowerInterface::Singleton()->disableFlags;
+	for (register u_int i = 0; i < k; i++)
+	{
+		if (!BitTest(&w, i))
+		{
+			pMobileParam->subnets[j++] = SOCKADDR_SUBNET(&CLowerInterface::Singleton()->addresses[i]);
+			if (j >= sizeof(pMobileParam->subnets) / sizeof(uint64_t))
+				break;
+		}
+	}
+	// temporarily there is no path to the local end:
+	if (j <= 0)
+		return;
+	// loop-rollout
+	if (j < 2)
+		pMobileParam->subnets[1] = pMobileParam->subnets[0];
+	if (j < 3)
+		pMobileParam->subnets[2] = pMobileParam->subnets[1];
+	if (j < 4)
+		pMobileParam->subnets[3] = pMobileParam->subnets[2];
+
+	pMobileParam->idHostALF = SOCKADDR_HOST_ID(&CLowerInterface::Singleton()->addresses[0]);
+	pMobileParam->hs.Set<MOBILE_PARAM>(len);
+
+	len += sizeof(FSP_ConnectParam);
+	buf2.snack.hdr.hs.version = THIS_FSP_VERSION;
+	buf2.snack.hdr.hs.opCode = opCode;
+	buf2.snack.hdr.hs.hsp = htobe16(uint16_t(len));
+
+	// Both KEEP_ALIVE and ACK_FLUSH are payloadless out-of-band control block which always apply current session key
+	// See also ControlBlock::SetSequenceFlags
+	buf2.snack.hdr.sequenceNo = htobe32(pControlBlock->sendWindowNextSN - 1);
+	buf2.snack.hdr.expectedSN = htobe32(seqExpected);
+	buf2.snack.hdr.ClearFlags();
+	buf2.snack.hdr.SetRecvWS(pControlBlock->RecvWindowSize());
+	SetIntegrityCheckCode(&buf2.snack.hdr, NULL, 0, buf2.snack.GetSaltValue());
+#ifdef TRACE_PACKET
+	printf_s("To send KEEP_ALIVE seq #%u, acknowledge #%u, source ALFID = %u\n", be32toh(buf2.snack.hdr.sequenceNo), seqExpected, fidPair.source);
+	printf_s("KEEP_ALIVE total header length: %d, should be payloadless\n", len);
+	DumpNetworkUInt16((uint16_t *)& buf2, len / 2);
+#endif
+
+	SendPacket(1, ScatteredSendBuffers(&buf2.snack.hdr, len));
+}
+#endif
+
+
+// On getting remote address event, process the MOBILE_PARAM header
 bool LOCALAPI CSocketItemEx::HandleMobileParam(PFSP_HeaderSignature optHdr)
 {
 	if (optHdr == NULL || optHdr->opCode != MOBILE_PARAM)
 		return false;
-	//TODO: synchronization of ULA-triggered session key installation
-	// the synchronization option header...
+#ifndef OVER_UDP_IPv4
+	FSP_ConnectParam *pMobileParam = (FSP_ConnectParam *)((uint8_t *)optHdr + sizeof(FSP_HeaderSignature) - sizeof(FSP_ConnectParam));
+	// loop roll-out
+	SOCKADDR_SUBNET(&sockAddrTo[0]) = pMobileParam->subnets[0];
+	SOCKADDR_SUBNET(&sockAddrTo[1]) = pMobileParam->subnets[1];
+	SOCKADDR_SUBNET(&sockAddrTo[2]) = pMobileParam->subnets[2];
+	SOCKADDR_SUBNET(&sockAddrTo[3]) = pMobileParam->subnets[3];
+	// UNRESOLVED!? Check hostId to further validate the header? may hostId mobile?
+#endif
 	return true;
 }
 

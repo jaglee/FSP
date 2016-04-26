@@ -95,11 +95,10 @@ void FSPAPI WaitConnection(const char *thisWelcome, unsigned short mLen, Callbac
 	params.sendSize = MAX_FSP_SHM_SIZE;
 	params.recvSize = 0;	// minimal receiving for download server
 
-	TranslateFSPoverIPv4(& atAddress, 0, 80);	//INADDR_ANY
-	// UNRESOLVE! Does PostAdjourn() losted? // TODO: CreateFWRules
-	//atAddress.u.subnet = 0xAAAA00E0;	// 0xE0 00 AA AA	// shall be learned 
-	//atAddress.idHost = 0;
-	//atAddress.idALT = 0x01000000;		// 0x01 [well, it should be the well-known service number...] 
+	//TranslateFSPoverIPv4(& atAddress, 0, 80);	//INADDR_ANY
+	atAddress.u.subnet = 0xAAAA00E0;	// 0xE0 00 AA AA	// shall be learned 
+	atAddress.idHost = 0;
+	atAddress.idALF = 0x01000000;		// 0x01 [well, it should be the well-known service number...] 
 
 	hFspListen = ListenAt(& atAddress, & params);
 
@@ -181,7 +180,8 @@ int	FSPAPI onAccepting(FSPHANDLE h, PFSP_SINKINF p, PFSP_IN6_ADDR remoteAddr)
 {
 	printf_s("\nTo accept handle of FSP session: 0x%08X\n", h);
 	printf_s("Interface: %d, session Id: %u\n", p->ipi6_ifindex, p->idALF);
-	printf_s("Remote address: 0x%llX::%X::%X\n", remoteAddr->u.subnet, remoteAddr->idHost, remoteAddr->idALF);
+	// no be32toh() for local; note that for IPv6 network, little-endian CPU, the peer's remoteAddr->idALF wouldn't match it
+	printf_s("Remote address: 0x%llX::%X::%X\n", be64toh(remoteAddr->u.subnet), be32toh(remoteAddr->idHost), be32toh(remoteAddr->idALF));
 	return 0;	// no opposition
 }
 

@@ -3,8 +3,6 @@
  * AND the security related issues.
  * Platform-dependent / IPC-machanism-dependent
  * Garbage Collection is treated as a security-related issue.
- * handling the UDP/IPv4 (IPv6 in the long run) addresses of the near-end
- * including processing event of IP address change that are key to mobility support
  *
     Copyright (c) 2012, Jason Gao
     All rights reserved.
@@ -32,8 +30,6 @@
     POSSIBILITY OF SUCH DAMAGE.
  */
 
-// The FSP Finite State Machine is splitted across command.cpp, remote.cpp and timers.cpp
-
 #include "fsp_srv.h"
 
 // access control is centralized managed in the 'main' source file
@@ -43,8 +39,10 @@
 // get the security attribute of the service, assigned to the mailslot - shall be everyone's free access
 static void GetServiceSA(PSECURITY_ATTRIBUTES);
 
+// forward declaration of the top-level routine to process the ULA's commands
 static void LOCALAPI ProcessCommand(HANDLE);
 
+// The FSP Finite State Machine is splitted across command.cpp, remote.cpp and timers.cpp
 extern "C"
 int main(int argc, char * argv[])
 {
@@ -178,6 +176,7 @@ Cleanup:
 }
 
 
+
 // Get upper layer application's commands and process them
 // Given
 //	_In_ md the handle of the mailslot receiving ULA commands
@@ -266,7 +265,14 @@ static void LOCALAPI ProcessCommand(HANDLE md)
 		n++;
 	}
 #ifndef NDEBUG
-	// TODO: UNRESOLVED!Crash Recovery? if ReadFile fails, it is a crash
-	printf("Fatal!Read mailslot error, command channel broken\n");
+	// TODO: UNRESOLVED! Crash Recovery? if ReadFile fails, it is a crash
+	printf("Fatal! Read mailslot error, command channel broken\n");
 #endif
 }
+
+
+//
+// TODO: garbage collector, those whose parent process is inactive should be collected!
+// Non-empty notice queue
+// IsProcessAlive
+//

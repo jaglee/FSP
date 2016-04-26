@@ -590,7 +590,7 @@ struct ControlBlock
 	// Used to be the matched list of local and remote addresses.
 	// for security reason the remote addresses were moved to LLS
 	char			nearEndName[INET6_ADDRSTRLEN + 7];	// 72 bytes, in UTF-8
-	FSP_PKTINFO_EX	nearEnd[MAX_PHY_INTERFACES];
+	FSP_PKTINFO_EX	nearEndInfo;
 	struct
 	{
 		char		name[INET6_ADDRSTRLEN + 7];	// 72 bytes

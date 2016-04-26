@@ -180,7 +180,7 @@ CSocketItemDl * LOCALAPI CSocketItemDl::PrepareToAccept(BackLogItem & backLog, C
 		return NULL;
 
 	pSocket->pControlBlock->idParent = this->fidPair.source;
-	// IP address, including Session ID stored in nearEnd[0] would be set by CreateControlBlock
+	// IP address, including Session ID stored in nearEndInfo would be set by CreateControlBlock
 	// Cached fiber ID in the DLL SocketItem stub is set by CreateControlBlock as well
 
 	memcpy(pSocket->pControlBlock->peerAddr.ipFSP.allowedPrefixes
@@ -257,7 +257,7 @@ void CSocketItemDl::ToConcludeConnect()
 	BYTE *payload = GetRecvPtr(skb);
 
 	// See also FSP_LLS$$CSocketItemEx::Connect()
-	fidPair.source = pControlBlock->nearEnd[0].idALF;
+	fidPair.source = pControlBlock->nearEndInfo.idALF;
 	//^As by default Connect2 set the cached fiber ID in the DLL SocketItem to 0
 
 	// Deliver the optional payload and skip the ACK_CONNECT_REQ packet

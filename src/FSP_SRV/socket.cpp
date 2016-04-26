@@ -39,7 +39,7 @@ CSocketSrvTLB::CSocketSrvTLB()
 {
 	memset(listenerSlots, 0, sizeof(listenerSlots));
 	memset(itemStorage, 0, sizeof(itemStorage));
-	memset(poolFiberID, 0, sizeof(poolFiberID));
+	memset(tlbSockets, 0, sizeof(tlbSockets));
 	//^ assert(NULL == 0)
 	headFreeSID = & itemStorage[0];
 	tailFreeSID = & itemStorage[MAX_CONNECTION_NUM - 1];
@@ -48,8 +48,8 @@ CSocketSrvTLB::CSocketSrvTLB()
 	register int i = 0;
 	while(i < MAX_CONNECTION_NUM)
 	{
-		poolFiberID[i] = p;
-		poolFiberID[i++]->next = ++p;
+		tlbSockets[i] = p;
+		tlbSockets[i++]->next = ++p;
 		// other link pointers are already set to NULL
 	}
 	tailFreeSID->next = NULL;	// reset last 'next' pointer
@@ -58,7 +58,7 @@ CSocketSrvTLB::CSocketSrvTLB()
 }
 
 
-
+// allocate from the free list
 CSocketItemEx * CSocketSrvTLB::AllocItem()
 {
 	AcquireMutex();
@@ -100,7 +100,8 @@ CSocketItemEx * CSocketSrvTLB::AllocItem(ALFID_T idListener)
 			p = & listenerSlots[i];
 			p->SetPassive();
 			p->fidPair.source = idListener;
-			p->SetNotReadyUse();
+			p->isReady = 0;
+			p->SetInUse();
 			// do not break, for purpose of duplicate allocation detection
 		}
 		else if(listenerSlots[i].inUse && listenerSlots[i].fidPair.source == idListener)
@@ -120,7 +121,8 @@ CSocketItemEx * CSocketSrvTLB::AllocItem(ALFID_T idListener)
 
 	if(p != NULL)
 	{
-		CSocketItemEx *p0 = poolFiberID[idListener & (MAX_CONNECTION_NUM - 1)];
+		int k = be32toh(idListener) & (MAX_CONNECTION_NUM - 1);
+		CSocketItemEx *p0 = tlbSockets[k];
 		register CSocketItemEx *p1;
 		// TODO: UNRESOLVED! Is it unnecessary to detect the stale entry?
 		for(p1 = p0; p1 != NULL; p1 = p1->prevSame)
@@ -136,7 +138,7 @@ CSocketItemEx * CSocketSrvTLB::AllocItem(ALFID_T idListener)
 		if(p1 == NULL && p != NULL)
 		{
 			p->prevSame = p0;
-			poolFiberID[idListener & (MAX_CONNECTION_NUM - 1)] = p;
+			tlbSockets[k] = p;
 		}
 	}
 
@@ -145,6 +147,11 @@ CSocketItemEx * CSocketSrvTLB::AllocItem(ALFID_T idListener)
 }
 
 
+
+// Given
+//	CSocketItemEx	The pointer to the socket item to free
+// Do
+//	Put the given socket item onto the free list
 void CSocketSrvTLB::FreeItem(CSocketItemEx *p)
 {
 	AcquireMutex();
@@ -154,8 +161,9 @@ void CSocketSrvTLB::FreeItem(CSocketItemEx *p)
 	// if it is allocated by AllocItem(ALFID_T idListener):
 	if(p->IsPassive())
 	{
-		register CSocketItemEx *p1 = poolFiberID[p->fidPair.source & (MAX_CONNECTION_NUM - 1)];
-		p->inUse = 0;
+		int k = be32toh(p->fidPair.source) & (MAX_CONNECTION_NUM - 1);
+		register CSocketItemEx *p1 = tlbSockets[k];
+		_InterlockedExchange8(& p->inUse, 0);
 		// detach it from the hash collision list
 		if(p1 != p)
 		{
@@ -173,7 +181,7 @@ void CSocketSrvTLB::FreeItem(CSocketItemEx *p)
 		}
 		else if(p1->prevSame != NULL)
 		{
-			poolFiberID[p->fidPair.source & (MAX_CONNECTION_NUM - 1)] = p1->prevSame;
+			tlbSockets[k] = p1->prevSame;
 		}
 		// else keep at least one entry in the context-addressing TLB
 		SetMutexFree();
@@ -189,18 +197,25 @@ void CSocketSrvTLB::FreeItem(CSocketItemEx *p)
 	{
 		tailFreeSID->next = p;
 		tailFreeSID = p;
-		p = NULL;	// in case it is not
+		p->next = NULL;	// in case it is not
 	}
-	// postpone processing inUse until next allocation
+	//
+	_InterlockedExchange8(& p->inUse, 0);
 
 	SetMutexFree();
 }
 
 
 
+// Given
+//	ALFID_T		The application layer fiber ID
+// Return
+//	The pointer to the socket item entry matching the ID
+// Remark
+//	The hash algorithm MUST be kept synchronized with PoolingALFIDs
 CSocketItemEx * CSocketSrvTLB::operator[](ALFID_T id)
 {
-	register CSocketItemEx *p = poolFiberID[id & (MAX_CONNECTION_NUM-1)];
+	register CSocketItemEx *p = tlbSockets[be32toh(id) & (MAX_CONNECTION_NUM-1)];
 	do
 	{
 		if(p->fidPair.source == id)
@@ -212,6 +227,10 @@ CSocketItemEx * CSocketSrvTLB::operator[](ALFID_T id)
 
 
 
+// Given
+//	CommandNewSessionSrv	The 'new session' command
+// Return
+//	The new socket item, with control block memory mapped
 CSocketItemEx * CSocketSrvTLB::AllocItem(const CommandNewSessionSrv & cmd)
 {
 	AcquireMutex();
@@ -252,7 +271,7 @@ void CSocketItemEx::InitAssociation()
 
 	// See also CLowerInterface::EnumEffectiveAddresses
 	register PSOCKADDR_INET const pFarEnd = sockAddrTo;
-	if (!pControlBlock->nearEnd->IsIPv6())
+	if (!pControlBlock->nearEndInfo.IsIPv6())
 	{
 		for(register int i = 0; i < MAX_PHY_INTERFACES; i++)
 		{
@@ -282,15 +301,10 @@ void CSocketItemEx::InitAssociation()
 		// namelen = sizeof(SOCKADDR_IN6);
 	}
 
-	// the fiberID part of the first (most preferred local interface) FSP address has been set
-	for (register int i = 1; i < MAX_PHY_INTERFACES; i++)
-	{
-		pControlBlock->nearEnd[i].idALF = fidPair.source;
-	}
 #ifndef NDEBUG
 	printf_s("InitAssociation, fiber ID pair: (%u, %u)\n"
-		, fidPair.source
-		, fidPair.peer);
+		, be32toh(fidPair.source)
+		, be32toh(fidPair.peer));
 #endif
 
 	lowState = pControlBlock->state;
@@ -300,7 +314,10 @@ void CSocketItemEx::InitAssociation()
 
 
 
-//
+// Given
+//	ALFID_T		The remote peer's Application Layer Fiber ID
+// Do
+//	Set the stored multi-path destination fiber ID to the given one
 void LOCALAPI CSocketItemEx::SetRemoteFiberID(ALFID_T id)
 {
 	fidPair.peer = id;
@@ -598,7 +615,7 @@ void CSocketItemEx::Extinguish()
 		lowState = NON_EXISTENT;	// SetState(NON_EXISTENT);
 		RemoveTimer();
 		CSocketItem::Destroy();
-		inUse = 0;	// FreeItem does not reset it
+		isReady = 0;	// FreeItem does not reset it
 		(CLowerInterface::Singleton())->FreeItem(this);
 	}
 	catch(...)

@@ -96,6 +96,7 @@ l_return:
 }
 
 
+
 // Register an incarnated FSP socket
 // Given
 //	CommandNewSession	the synchronization command context
@@ -187,15 +188,12 @@ void CSocketItemEx::Connect()
 	// See also {FSP_DLL}CSocketItemDl::CreateControlBlock()
 	if (((PFSP_IN4_ADDR_PREFIX)pControlBlock->peerAddr.ipFSP.allowedPrefixes)->prefix == PREFIX_FSP_IP6to4)
 	{
-		int	ifDefault = pControlBlock->nearEnd[0].ipi6_ifindex;
-		for (register int i = 0; i < MAX_PHY_INTERFACES; i++)
-		{
-			pControlBlock->nearEnd[i].InitUDPoverIPv4(ifDefault);
-		}
+		int	ifDefault = pControlBlock->nearEndInfo.ipi6_ifindex;
+		pControlBlock->nearEndInfo.InitUDPoverIPv4(ifDefault);
 	}
 	// See also FSP_DLL$$CSocketItemDl::ToConcludeConnect
-	pControlBlock->nearEnd->idALF = fidPair.source;
-	//^For compatibility with passive peer behavior, InitAssociation() does not prepare nearEnd[0]
+	pControlBlock->nearEndInfo.idALF = fidPair.source;
+	//^For compatibility with passive peer behavior, InitAssociation() does not prepare nearEndInfo
 
 	// bind to the interface as soon as the control block mapped into server's memory space
 	InitAssociation();
