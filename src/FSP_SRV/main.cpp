@@ -192,14 +192,16 @@ static void LOCALAPI ProcessCommand(HANDLE md)
 	// TODO: UNRESOLVED!there should be performance profiling variables to record how many commands have been processed?
     static int n = 0;
 	CSocketItemEx *pSocket;
-	// TRACE_HERE("called");
+#if defined(TRACE) && (TRACE & TRACE_ULACALL)
+	TRACE_HERE("called");
+#endif
 	while(ReadFile(md, buffer, MAX_CTRLBUF_LEN, & nBytesRead, NULL))
 	{
 		if(nBytesRead < sizeof(struct CommandToLLS))
 			continue;
-//#ifdef TRACE
-//		printf("%d bytes read, command operation code = %d\n",  nBytesRead, ((struct CommandToLLS *) buffer)->opCode);
-//#endif
+#if defined(TRACE) && (TRACE & TRACE_ULACALL)
+		printf("%d bytes read, command operation code = %d\n",  nBytesRead, ((struct CommandToLLS *) buffer)->opCode);
+#endif
 		//
 		switch(pCmd->opCode)
 		{
@@ -219,7 +221,7 @@ static void LOCALAPI ProcessCommand(HANDLE md)
 			pSocket = (CSocketItemEx *)(*CLowerInterface::Singleton())[pCmd->fiberID];
 			if(pSocket == NULL || !pSocket->IsInUse())
 			{
-#ifdef TRACE
+#if defined(TRACE) && (TRACE & TRACE_ULACALL)
 				printf_s("Erratic!%s (code = %d) called for invalid local fiber#%u\n"
 					, opCodeStrings[pCmd->opCode]
 					, pCmd->opCode
@@ -227,6 +229,9 @@ static void LOCALAPI ProcessCommand(HANDLE md)
 #endif
 				break;
 			}
+			// UNRESOLVED!? Set a command-waiting timeout?
+			while (!pSocket->TestAndWaitReady())
+				Sleep(1000);
 			//
 			switch(pCmd->opCode)
 			{
@@ -257,6 +262,8 @@ static void LOCALAPI ProcessCommand(HANDLE md)
 	#endif
 				break;
 			}
+			//
+			pSocket->SetReady();
 		}
 		// hard-coded: (ushort)(-1) mean exit
 		if(buffer[0] == 0xFF || buffer[1] == 0xFF)

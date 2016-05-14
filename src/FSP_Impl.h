@@ -217,7 +217,7 @@ struct $FSP_HeaderSignature: FSP_HeaderSignature
 		opCode = opCode1;
 		hsp = htobe16(sizeof(THdr));
 	}
-	template<BYTE opCode1> void Set(int len1)
+	void Set(BYTE opCode1, int len1)
 	{
 		version = THIS_FSP_VERSION;
 		opCode = opCode1;
@@ -256,14 +256,13 @@ struct FSP_NormalPacketHeader
  */
 	$FSP_HeaderSignature hs;
 
-	// Set the outlet sequence number
-	void operator>>=(uint32_t seq1) { sequenceNo = htobe32(seq1); }
-	// Set the inlet sequence number
-	void operator<<=(uint32_t seq1) { expectedSN = htobe32(seq1); }
+	// Given sequenceNo, expectedNo, receive window size and total length of all the headers
+	void LOCALAPI Set(uint32_t, uint32_t, int32_t, uint8_t, uint16_t);
 
 	// A bruteforce but safe method of set or retrieve recvWS, with byte order translation
 	int32_t GetRecvWS() const { return ((int32_t)flags_ws[0] << 16) + (flags_ws[1] << 8) + flags_ws[2]; }
 	void SetRecvWS(int32_t v) { flags_ws[0] = (UINT8)(v >> 16); flags_ws[1] = (UINT8)(v >> 8); flags_ws[2] = (UINT8)v; }
+
 	void ClearFlags() { flags_ws[3] = 0; }
 	template<FSP_FlagPosition pos> void SetFlag() { flags_ws[3] |= (1 << pos); }
 	template<FSP_FlagPosition pos> void ClearFlag() { flags_ws[3] &= ~(1 << pos); }
@@ -322,7 +321,7 @@ struct FSP_ConnectParam
 	//
 	// host id of the application layer fiber, alias of listenerID
 	__declspec(property(get=getHostID, put=setHostID))
-	uint32_t	idHostALF;
+	uint32_t	idHost;
 	uint32_t	getHostID() const { return listenerID; }
 	void		setHostID(uint32_t value) { listenerID = value; }
 	//
@@ -360,19 +359,6 @@ struct FSP_SelectiveNACK
 	};
 	uint32_t		serialNo;
 	$FSP_HeaderSignature hs;
-};
-
-
-
-struct FSP_PreparedKEEP_ALIVE
-{
-	FSP_NormalPacketHeader hdr;
-	FSP_SelectiveNACK::GapDescriptor gaps[(MAX_BLOCK_SIZE - sizeof(FSP_SelectiveNACK)) / sizeof(FSP_SelectiveNACK::GapDescriptor)];
-	uint32_t		ackTime;	// sentinel, actually
-	$FSP_HeaderSignature hs;	// sentinel, actually
-	uint32_t		n;	// n >= 0, number of (gapWidth, dataLength) tuples
-	//
-	uint32_t		GetSaltValue() const { return gaps[n].gapWidth; }	// it overlays on serialNo
 };
 
 

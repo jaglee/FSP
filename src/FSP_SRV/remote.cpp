@@ -43,7 +43,7 @@ struct _CookieMaterial
 
 
 
-#if defined(TRACE) || defined(TRACE_HEARTBEAT)
+#if defined(TRACE) && (TRACE & TRACE_HEARTBEAT) && (TRACE & TRACE_PACKET)
 #define TRACE_SOCKET()	\
 	(printf_s("%s local fiber#%u in state %s\n", __FUNCTION__	\
 		, fidPair.source		\
@@ -320,7 +320,7 @@ void LOCALAPI CLowerInterface::OnGetConnectRequest()
 	backlogItem.timeDelta = be32toh(q->timeDelta);
 	backlogItem.nboTimeStamp = q->timeStamp;
 	//
-	backlogItem.remoteHostID = nearInfo.IsIPv6() ? SOCKADDR_HOST_ID(mesgInfo.name) : 0;
+	backlogItem.remoteHostID = nearInfo.IsIPv6() ? SOCKADDR_HOSTID(mesgInfo.name) : 0;
 	//^See also GetRemoteFiberID()
 	backlogItem.idParent = 0;
 	rand_w32(& backlogItem.initialSN, 1);
@@ -424,13 +424,13 @@ bool LOCALAPI CSocketItemEx::ValidateSNACK(ControlBlock::seq_t & ackSeqNo, FSP_S
 	}
 
 
-#ifdef TRACE_HEARTBEAT
+#if defined(TRACE) && (TRACE & (TRACE_PACKET | TRACE_SLIDEWIN))
 	if(seqLastAck == 0)
 		DebugBreak();
 #endif
 	if(int(headPacket->pktSeqNo - seqLastAck) < 0)
 	{
-#if defined(TRACE_PACKET) || defined(TRACE_HEARTBEAT)
+#ifdef TRACE
 		printf_s("%s has encountered stale packet attack? sequence number:\t %u\n", opCodeStrings[p1->hs.opCode], headPacket->pktSeqNo);
 #endif
 		return false;
@@ -442,14 +442,14 @@ bool LOCALAPI CSocketItemEx::ValidateSNACK(ControlBlock::seq_t & ackSeqNo, FSP_S
 	uint32_t sn = be32toh(salt);
 	if(int(headPacket->pktSeqNo - seqLastAck) == 0 && int(sn - lastNAckSN) <= 0)
 	{
-#ifdef TRACE_PACKET
+#ifdef TRACE
 		printf_s("%s has encountered replay attack? sequence number: %u\t%u\n", opCodeStrings[p1->hs.opCode], headPacket->pktSeqNo, sn);
 #endif
 		return false;
 	}
 	lastNAckSN = sn;
 
-#ifdef TRACE_PACKET
+#if defined(TRACE) && (TRACE & (TRACE_PACKET | TRACE_SLIDEWIN))
 	printf_s("%s data length: %d, header length: %d, peer ALFID = %u\n"
 		, opCodeStrings[p1->hs.opCode]
 		, headPacket->lenData
@@ -490,7 +490,7 @@ bool LOCALAPI CSocketItemEx::ValidateSNACK(ControlBlock::seq_t & ackSeqNo, FSP_S
 		return true;
 
 	n /= sizeof(FSP_SelectiveNACK::GapDescriptor);
-#ifdef TRACE
+#if defined(TRACE) && (TRACE & (TRACE_PACKET | TRACE_SLIDEWIN))
 	printf_s("%s has %d gap(s), sequence number: %u\t%u\n", opCodeStrings[p1->hs.opCode], n, headPacket->pktSeqNo, sn);
 #endif
 	return true;
@@ -563,7 +563,7 @@ void LOCALAPI CSocketItemEx::OnConnectRequestAck(FSP_AckConnectRequest & respons
 	// ephemeral session key material was ready OnInitConnectAck
 	InstallEphemeralKey();
 
-#ifdef TRACE
+#if defined(TRACE) && (TRACE & TRACE_HEARTBEAT)
 	TRACE_HERE("the initiator recalculate RTT");
 	DumpTimerInfo(tLastRecv);
 #endif
@@ -649,7 +649,7 @@ void CSocketItemEx::OnGetPersist()
 		pControlBlock->SlideSendWindowByOne();	// See also RespondToSNACK, OnGetCommit
 	}
 
-#ifdef TRACE
+#if defined(TRACE) && (TRACE & (TRACE_HEARTBEAT | TRACE_PACKET | TRACE_SLIDEWIN))
 	TRACE_HERE("the responder calculate RTT");
 #endif
 	CalibrateKeepAlive();
@@ -725,7 +725,7 @@ void CSocketItemEx::OnGetPersist()
 	if (countPlaced == -EEXIST)
 		return;
 
-#ifdef TRACE
+#if defined(TRACE) && (TRACE & TRACE_PACKET)
 	if (countPlaced > 0)
 		printf_s("There is optional payload in the PERSIST packet, payload length = %d\n", countPlaced);
 #endif
@@ -741,7 +741,7 @@ void CSocketItemEx::OnGetPersist()
 //	{COMMITTED, CLOSABLE, PRE_CLOSED}-->/KEEP_ALIVE/<-->{keep state}{Update Peer's Authorized Addresses}
 void CSocketItemEx::OnGetKeepAlive()
 {
-#if defined(TRACE_HEARTBEAT) || defined(TRACE_PACKET)
+#if defined(TRACE) && (TRACE & (TRACE_HEARTBEAT | TRACE_PACKET | TRACE_SLIDEWIN))
 	TRACE_SOCKET();
 #endif
 	bool acknowledgible = InStates(4, ESTABLISHED, COMMITTING, PEER_COMMIT, COMMITTING2);
@@ -758,13 +758,12 @@ void CSocketItemEx::OnGetKeepAlive()
 	ControlBlock::seq_t ackSeqNo;
 	if(!ValidateSNACK(ackSeqNo, gaps, n))
 		return;
-#ifdef TRACE_HEARTBEAT
+#if defined(TRACE) && (TRACE & (TRACE_HEARTBEAT | TRACE_PACKET | TRACE_SLIDEWIN))
 	printf_s("Fiber#%u: SNACK packet with %d gap(s) advertised received\n", fidPair.source, n);
 #endif
 	if(acknowledgible && RespondToSNACK(ackSeqNo, gaps, n) > 0)
 		Notify(FSP_NotifyBufferReady);
 	//
-	// connection parameter may determine whether the payload is encrypted, however, let ULA handle it...
 	PFSP_HeaderSignature phs = headPacket->GetHeaderFSP()->PHeaderNextTo<FSP_SelectiveNACK>(& gaps[n]);
 	if(phs != NULL)
 		HandleMobileParam(phs);
@@ -788,7 +787,7 @@ void CSocketItemEx::OnGetKeepAlive()
 // However ULA protocol designer must keep in mind that these prebuffered may be discarded
 void CSocketItemEx::OnGetPureData()
 {
-#ifdef TRACE_PACKET
+#if defined(TRACE) && (TRACE & TRACE_PACKET)
 	TRACE_SOCKET();
 #endif
 	if (!InStates(4, ESTABLISHED, COMMITTING, COMMITTED, CLONING))
@@ -934,7 +933,7 @@ void CSocketItemEx::OnGetCommit()
 	if (isInitiativeState)
 		tSessionBegin = tRecentSend;	// but only slide the send window when it is a singleton commit as well
 
-#ifdef TRACE
+#if defined(TRACE) && (TRACE & (TRACE_HEARTBEAT | TRACE_PACKET | TRACE_SLIDEWIN))
 	TRACE_HERE("the responder calculate RTT");
 #endif
 	CalibrateKeepAlive();
@@ -1020,7 +1019,7 @@ void CSocketItemEx::OnAckFlush()
 #ifndef NDEBUG
 	if(n != 0)
 	{
-		TRACE_HERE("ACK_FLUSH shall carryaccumulatively positively acknowledge only");
+		TRACE_HERE("ACK_FLUSH should carry accumulatively positively acknowledge only");
 		return;
 	}
 #endif
@@ -1044,6 +1043,11 @@ void CSocketItemEx::OnAckFlush()
 	// For ACK_FLUSH just accumulatively positively acknowledge
 	RespondToSNACK(ackSeqNo, NULL, 0);
 	Notify(FSP_NotifyFlushed);
+
+	// ACK_FLUSH is recognized as a special 'KEEP_ALIVE' and could piggyback MobileParam header
+	PFSP_HeaderSignature phs = headPacket->GetHeaderFSP()->PHeaderNextTo<FSP_SelectiveNACK>(& gaps[n]);
+	if(phs != NULL)
+		HandleMobileParam(phs);
 }
 
 
@@ -1154,7 +1158,7 @@ void CSocketItemEx::OnGetMultiply()
 //	-EFAULT	on memory fault
 int LOCALAPI CSocketItemEx::PlacePayload(ControlBlock::PFSP_SocketBuf skb)
 {
-#ifdef TRACE_PACKET
+#if defined(TRACE) && (TRACE & TRACE_PACKET)
 	printf_s("Place %d payload bytes to 0x%08X (duplicated: %d)\n"
 		, headPacket->lenData
 		, (LONG)(UINT_PTR)skb

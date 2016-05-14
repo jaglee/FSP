@@ -89,10 +89,10 @@ void CSocketItemEx::TimeOut()
 	}
 
 	timestamp_t t1 = NowUTC();
-//#ifdef TRACE
-//	TRACE_HERE(" it's time-outed");
-//	DumpTimerInfo(t1);
-//#endif
+#if defined(TRACE) && (TRACE & TRACE_HEARTBEAT)
+	TRACE_HERE(" it's time-outed");
+	DumpTimerInfo(t1);
+#endif
 	switch(lowState)
 	{
 	case NON_EXISTENT:
@@ -196,7 +196,7 @@ void CSocketItemEx::TimeOut()
 */
 void CSocketItemEx::KeepAlive()
 {
-#if defined(TRACE_HEARTBEAT) || defined(TRACE_PACKET)
+#if defined(TRACE) && (TRACE & (TRACE_HEARTBEAT | TRACE_PACKET | TRACE_SLIDEWIN))
 	printf_s("Keep-alive local fiber#%u\n", fidPair.source);
 	DumpTimerInfo(NowUTC());
 #endif
@@ -210,7 +210,7 @@ void CSocketItemEx::KeepAlive()
 		uint8_t	headOpCode = skb->opCode;
 		if (headOpCode == PERSIST || headOpCode == COMMIT)
 		{
-#if defined(TRACE_HEARTBEAT) || defined(TRACE_PACKET)
+#if defined(TRACE) && (TRACE & (TRACE_HEARTBEAT | TRACE_PACKET | TRACE_SLIDEWIN))
 			printf_s("Keep-alive local fiber#%u, head packet in the queue is happened to be %s\n"
 				, fidPair.source
 				, opCodeStrings[headOpCode]);
@@ -232,42 +232,37 @@ void CSocketItemEx::KeepAlive()
 bool CSocketItemEx::SendSNACK(FSPOperationCode opCode)
 {
 	ControlBlock::seq_t seqExpected;
-	FSP_PreparedKEEP_ALIVE buf;
+	struct
+	{
+		FSP_NormalPacketHeader hdr;
+		FSP_PreparedKEEP_ALIVE snack;
+	} buf;
 
-	int32_t len = GenerateSNACK(buf, seqExpected);
-#if defined(TRACE_PACKET) || defined(TRACE_HEARTBEAT)
+	int32_t len = GenerateSNACK(buf.snack, seqExpected, sizeof(FSP_NormalPacketHeader));
+#if defined(TRACE) && (TRACE & (TRACE_HEARTBEAT | TRACE_PACKET | TRACE_SLIDEWIN))
 	printf_s("Keep-alive local fiber#%u\n"
 		"\tAcknowledged seq#%u, keep-alive header size = %d\n"
 		, fidPair.source
 		, seqExpected
 		, len);
 #endif
-	if(len < sizeof(FSP_SelectiveNACK))
+	if(len < sizeof(FSP_SelectiveNACK) + sizeof(FSP_NormalPacketHeader))
 	{
 		printf_s("Fatal error %d encountered when generate SNACK\n", len);
 		return false;
 	}
-	len += sizeof(FSP_NormalPacketHeader);
-
-	buf.hdr.hs.version = THIS_FSP_VERSION;
-	buf.hdr.hs.opCode = opCode;
-	buf.hdr.hs.hsp = htobe16(uint16_t(len));
 
 	// Both KEEP_ALIVE and ACK_FLUSH are payloadless out-of-band control block which always apply current session key
+	buf.hdr.Set(pControlBlock->sendWindowNextSN - 1, seqExpected, pControlBlock->RecvWindowSize(), opCode, len);
+	SetIntegrityCheckCode(& buf.hdr, NULL, 0, buf.snack.GetSaltValue());
 	// See also ControlBlock::SetSequenceFlags
-	buf.hdr.sequenceNo = htobe32(pControlBlock->sendWindowNextSN - 1);
-	buf.hdr.expectedSN = htobe32(seqExpected);
-	buf.hdr.ClearFlags();
-	buf.hdr.SetRecvWS(pControlBlock->RecvWindowSize());
-
-	SetIntegrityCheckCode(& buf.hdr, NULL, 0, buf.GetSaltValue());
-#ifdef TRACE_PACKET
+#if defined(TRACE) && (TRACE & (TRACE_HEARTBEAT | TRACE_PACKET | TRACE_SLIDEWIN))
 	printf_s("To send KEEP_ALIVE seq #%u, acknowledge #%u, source ALFID = %u\n", be32toh(buf.hdr.sequenceNo), seqExpected, fidPair.source);
 	printf_s("KEEP_ALIVE total header length: %d, should be payloadless\n", len);
 	DumpNetworkUInt16((uint16_t *) & buf, len / 2);
 #endif
 
-	return SendPacket(1, ScatteredSendBuffers(& buf.hdr, len)) > 0;
+	return SendPacket(1, ScatteredSendBuffers(& buf, len)) > 0;
 }
 
 
@@ -295,8 +290,8 @@ int LOCALAPI CSocketItemEx::RespondToSNACK(ControlBlock::seq_t expectedSN, FSP_S
 	const int32_t capacity = pControlBlock->sendBufferBlockN;
 	if (sizeof(ControlBlock) + (sizeof(ControlBlock::FSP_SocketBuf) + MAX_BLOCK_SIZE) * capacity > dwMemorySize)
 	{
+#if defined(TRACE)
 		TRACE_HERE("memory overflow");
-#if TRACE_PACKET
 		printf_s("Given memory size: %d, wanted limit: %zd\n"
 			, dwMemorySize
 			, sizeof(ControlBlock) + (sizeof(ControlBlock::FSP_SocketBuf) + MAX_BLOCK_SIZE) * capacity);
@@ -314,7 +309,7 @@ int LOCALAPI CSocketItemEx::RespondToSNACK(ControlBlock::seq_t expectedSN, FSP_S
 		return 0;	// there is nothing to be acknowledged
 
 	const int nAck = pControlBlock->DealWithSNACK(expectedSN, gaps, n);
-#if defined(TRACE_HEARTBEAT) || defined(TRACE_PACKET)
+#if defined(TRACE) && (TRACE & (TRACE_HEARTBEAT | TRACE_PACKET | TRACE_SLIDEWIN))
 	printf_s("Accumulatively acknowledged SN = %u, %d packet(s) acknowledged.\n", expectedSN, nAck);
 #endif
 	if (nAck < 0)
@@ -382,26 +377,24 @@ int LOCALAPI CSocketItemEx::RespondToSNACK(ControlBlock::seq_t expectedSN, FSP_S
 		{
 			if(! p->GetFlag<IS_COMPLETED>())	// due to parallism the last 'gap' may include imcomplete buffered data
 			{
-#if defined(TRACE_PACKET) || defined(TRACE_HEARTBEAT)
+#ifdef TRACE
 				printf_s("Imcomplete packet: SN = %u, index position = %d\n", seq0, index1);
 #endif
 				goto l_retransmitted;
 			}
 			if(uint32_t(seq0 - headSN) > largestOffset)
 			{
-#if defined(TRACE_HEARTBEAT) || defined(TRACE_PACKET)
+#ifdef TRACE
 				printf_s("NACK largest offset = %u\n", largestOffset);
 #endif
 				goto l_retransmitted;
 			}
 			// Attention please! If you try to trace the packet it would not be retransmitted, for sake of testability
-#if defined(TRACE_PACKET) || defined(TRACE_HEARTBEAT)
+#if defined(TRACE) && (TRACE & (TRACE_HEARTBEAT | TRACE_PACKET | TRACE_SLIDEWIN))
 			printf_s("Meant to retransmit: SN = %u, index position = %u\n", seq0, uint32_t(p - pControlBlock->HeadSend()));
 #endif
-#ifndef TRACE_PACKET
 			if(! p->GetFlag<IS_ACKNOWLEDGED>() && ! EmitWithICC(p, seq0))
 				goto l_retransmitted;
-#endif
 			//
 			++seq0;
 			if(++index1 - capacity >= 0)
@@ -429,7 +422,7 @@ l_retransmitted:
 		// We assume that after sliding send window the number of unacknowledged was reduced
 		pControlBlock->SlideSendWindow();
 		RecalibrateKeepAlive(rtt64_us);
-#ifdef TRACE
+#if defined(TRACE) && (TRACE & (TRACE_HEARTBEAT | TRACE_PACKET | TRACE_SLIDEWIN))
 		printf_s("We guess new tEarliestSend based on relatively tRecentSend = %lld\n"
 			"\ttEarliestSend = %lld, sendWidth = %d, packets on flight = %d\n"
 			, (rtt64_us + tEarliestSend - tRecentSend)	// Equal saved 'NowUTC()' - tRecentSend
@@ -442,7 +435,7 @@ l_retransmitted:
 		// assert(int64_t(tRecentSend - tEarliestSend) >= 0 && sentWidth > pControlBlock->CountSentInFlight());
 #endif
 		tEarliestSend += tdiff64_us * (sentWidth - pControlBlock->CountSentInFlight()) / sentWidth;
-#ifdef TRACE
+#if defined(TRACE) && (TRACE & TRACE_HEARTBEAT)
 		printf_s("\ttRecentSend - tEarliestSend = %lluus, about %llums\n"
 			, (tRecentSend - tEarliestSend)
 			, (tRecentSend - tEarliestSend) >> 10
@@ -458,7 +451,7 @@ l_retransmitted:
 // this member function is called by KeepAlive() only. however, for testability we separate this block of code
 void CSocketItemEx::RecalibrateKeepAlive(uint64_t rtt64_us)
 {
-#ifdef TRACE
+#if defined(TRACE) && (TRACE & (TRACE_HEARTBEAT | TRACE_PACKET | TRACE_SLIDEWIN))
 	TRACE_HERE("to recalibrate keep-alive period");
 	printf_s("\tRTT_old is about %ums, tKeepAlive = %ums. Most recent RTT is about %llums\n"
 		, tRoundTrip_us >> 10
@@ -475,7 +468,7 @@ void CSocketItemEx::RecalibrateKeepAlive(uint64_t rtt64_us)
 	// make sure tKeepAlive is not insanely small after calibration
 	tKeepAlive_ms = max(tKeepAlive_ms, uint32_t(min((rtt64_us + KEEP_ALIVE_TIMEOUT_MIN_us) >> 10, UINT32_MAX)));
 
-#ifdef TRACE
+#if defined(TRACE) && (TRACE & (TRACE_HEARTBEAT | TRACE_PACKET | TRACE_SLIDEWIN))
 	printf_s("\tCalibrated round trip time = %uus, keep-alive timeout = %ums\n\n", tRoundTrip_us,  tKeepAlive_ms);
 #endif
 }

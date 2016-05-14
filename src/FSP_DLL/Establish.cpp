@@ -222,7 +222,7 @@ bool LOCALAPI CSocketItemDl::ToWelcomeConnect(BackLogItem & backLog)
 	memcpy(& pControlBlock->connectParams, & backLog, FSP_MAX_KEY_SIZE);
 
 	params->listenerID = pControlBlock->idParent;
-	params->hs.Set<MOBILE_PARAM>(sizeof(FSP_NormalPacketHeader));
+	params->hs.Set(MOBILE_PARAM, sizeof(FSP_NormalPacketHeader));
 	//
 	skb->opCode = ACK_CONNECT_REQ;
 	skb->len = sizeof(*params);	// the fixed header is generated on the fly

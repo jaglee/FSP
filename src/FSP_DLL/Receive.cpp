@@ -212,31 +212,38 @@ int CSocketItemDl::FetchReceived()
 		p = pControlBlock->GetFirstReceived();
 	}
 	//
-	while(p->GetFlag<IS_FULFILLED>() && !p->GetFlag<IS_DELIVERED>())
+	for(; p->GetFlag<IS_FULFILLED>() && !p->GetFlag<IS_DELIVERED>(); p = pControlBlock->GetFirstReceived())
 	{
 		if(p->len > MAX_BLOCK_SIZE || p->len < 0)
 			return -EFAULT;
 		//
-		if(DeliverData(GetRecvPtr(p), p->len) < 0)
-			break;
+		if(p->len > 0)
+		{
+			if(DeliverData(GetRecvPtr(p), p->len) < 0)
+				break;
+			//
+			m += p->len;
+		}
 		//
 		p->SetFlag<IS_FULFILLED>(false);	// release the buffer
 		p->SetFlag<IS_DELIVERED>();			// so that it would not be re-delivered
 		// but keep the TO_BE_CONTINUED flag
-		m += p->len;
 		//
 		// Slide the left border of the receive window before possibly set the flag 'end of received message'
 		pControlBlock->SlideRecvWindowByOne();
-		if(!p->GetFlag<TO_BE_CONTINUED>() && (p->opCode != PERSIST || p->len != 0))
+		// See also CheckToNewTransaction
+		if(p->opCode == PERSIST && p->len == 0)
+			continue;	// A payloadless PERSIST is just a special acknowledgement
+		//
+		if(!p->GetFlag<TO_BE_CONTINUED>() && p->len != 0 || p->opCode == COMMIT)
 		{
 			SetEndOfRecvMsg();
 			break;
 		}
-		// What? An imcomplete 'to be continued' intermediate packet received?
+		// 'be free to accept': both COMMIT && TO_BE_CONTINUED and PERSIST && len == 0 && TO_BE_CONTINUED
+		// are illegal as well, but we refuse only TO_BE_CONTINUED && len != 0 && len != MAX_BLOCK_SIZE
 		if(p->len != MAX_BLOCK_SIZE)
 			return -EDOM;
-		//
-		p = pControlBlock->GetFirstReceived();
 	}
 	//
 	return m;
@@ -273,18 +280,18 @@ void CSocketItemDl::ProcessReceiveBuffer()
 	// RecvInline takes precedence
 	if(fp1 != NULL)
 	{
-#ifdef TRACE_PACKET
+#ifdef TRACE
 		printf_s("RecvInline...\n");
 #endif
 		bool b;
 		void *p = pControlBlock->InquireRecvBuf(n, b);
-#ifdef TRACE_PACKET
+#ifdef TRACE
 		printf_s("Data to deliver: 0x%08X, length = %u, eom = %d\n", (LONG)p, n, (int)!b);
 #endif
 		// If end-of-message encountered reset fpPeeked so that RecvInline() may work
 		if(!b)
 		{
-#ifdef TRACE_PACKET
+#ifdef TRACE
 			printf_s("Message terminated\n");
 #endif
 			SetEndOfRecvMsg();

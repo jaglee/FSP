@@ -44,7 +44,12 @@
 #pragma intrinsic(_InterlockedExchange, _InterlockedExchange16, _InterlockedExchange8)
 #pragma intrinsic(_InterlockedIncrement, _InterlockedOr, _InterlockedOr8)
 
-
+// For testability
+#define TRACE_ADDRESS	1
+#define TRACE_HEARTBEAT	2
+#define TRACE_PACKET	4
+#define TRACE_SLIDEWIN	8
+#define TRACE_ULACALL	16
 // Return the number of microseconds elapsed since Jan 1, 1970 (unix epoch time)
 timestamp_t NowUTC();	// it seems that a global property 'Now' is not as clear as this function format
 
@@ -73,9 +78,16 @@ struct CtrlMsgHdr
 
 
 
-// Forward declaration; definition/implementation is placed in the OS-dependent source code file
-struct IPv6_HEADER;
-
+// local header, does not send out
+struct FSP_PreparedKEEP_ALIVE
+{
+	FSP_SelectiveNACK::GapDescriptor gaps[(MAX_BLOCK_SIZE - sizeof(FSP_SelectiveNACK)) / sizeof(FSP_SelectiveNACK::GapDescriptor)];
+	uint32_t		ackTime;	// sentinel, actually
+	$FSP_HeaderSignature hs;	// sentinel, actually
+	uint32_t		n;	// n >= 0, number of (gapWidth, dataLength) tuples
+						//
+	uint32_t		GetSaltValue() const { return gaps[n].gapWidth; }	// it overlays on serialNo
+};
 
 
 #if _WIN32_WINNT < 0x0602
@@ -104,7 +116,7 @@ inline uint64_t ntohll(uint64_t h)
  */
 #define SOCKADDR_SUBNET(s)  (((PFSP_IN6_ADDR) & ((PSOCKADDR_IN6)(s))->sin6_addr)->u.subnet)
 #define SOCKADDR_ALFID(s)  (((PFSP_IN6_ADDR) & ((PSOCKADDR_IN6)(s))->sin6_addr)->idALF)
-#define SOCKADDR_HOST_ID(s)  (((PFSP_IN6_ADDR) & ((PSOCKADDR_IN6)(s))->sin6_addr)->idHost)
+#define SOCKADDR_HOSTID(s)  (((PFSP_IN6_ADDR) & ((PSOCKADDR_IN6)(s))->sin6_addr)->idHost)
 
 
 // per-host connection mumber and listener limit defined in LLS:
@@ -387,7 +399,7 @@ public:
 	void SignalAccepting() { pControlBlock->notices.SetHead(FSP_NotifyAccepting); SignalEvent(); }
 	//
 	int LOCALAPI RespondToSNACK(ControlBlock::seq_t, FSP_SelectiveNACK::GapDescriptor *, int);
-	int32_t LOCALAPI GenerateSNACK(FSP_PreparedKEEP_ALIVE &, ControlBlock::seq_t &);
+	int32_t LOCALAPI GenerateSNACK(FSP_PreparedKEEP_ALIVE &, ControlBlock::seq_t &, int);
 	//
 	void InitiateConnect();
 	void CloseSocket();
@@ -445,7 +457,7 @@ public:
 	bool RemoveTimer();
 	bool LOCALAPI ReplaceTimer(uint32_t);
 
-#if defined(TRACE) || defined(TRACE_HEARBEAT)
+#if defined(TRACE) && (TRACE & TRACE_HEARBEAT)
 	int DumpTimerInfo(timestamp_t t1) const
 	{
 		return printf_s("\tRound Trip Time = %uus, Keep-alive period = %ums\n"
@@ -455,7 +467,7 @@ public:
 			, t1 - tEarliestSend);
 	}
 #else
-	int DumpTimerInfo(timestamp_t) const { return 0; }
+	int DumpTimerInfo(timestamp_t) { return 0; }
 #endif
 
 	// Command of ULA
@@ -552,18 +564,17 @@ private:
 	HANDLE	hMobililty;	// handling mobility, the handle of the address-changed event
 
 	SOCKET	sdSend;		// the socket descriptor, would at last be unbound for sending only
-	SOCKET	sdRecv;		// the socket that received message most recently
-
 	fd_set	sdSet;		// set of socket descriptor for listening, one element for each physical interface
 	DWORD	interfaces[FD_SETSIZE];
 	SOCKADDR_IN6 addresses[FD_SETSIZE];	// by default IPv6 addresses, but an entry might be a UDP over IPv4 address
 
 #ifndef OVER_UDP_IPv4
+	ULONG	iRecvAddr;		// index into addresses
 	LONG	disableFlags;	// harf of the default FD_SETSIZE
-	inline	void Disable_sdRecv();
+	inline	void DisableSocket(SOCKET);
 #else
 	// For FSP over UDP/IPv4 bind the UDP-socket
-	void Disable_sdRecv() {}
+	void DisableSocket(SOCKET) {}
 	int BindSendRecv(const SOCKADDR_IN *, int);
 #endif
 
@@ -596,8 +607,7 @@ protected:
 
 	// defined in mobile.cpp
 	int LOCALAPI EnumEffectiveAddresses(uint64_t *);
-	int	AcceptAndProcess();
-
+	int	AcceptAndProcess(SOCKET);
 
 	// defined in os-dependent source file
 	inline int SetInterfaceOptions(SOCKET);
@@ -624,11 +634,12 @@ public:
 	// For FSP over IPv6 raw-socket, preconfigure an IPv6 interface with ALFID pool
 	inline void SetLocalApplicationLayerFiberIDs(int);
 	//
-	inline void RemoveALFIDAddressPool(int);
+	inline void RemoveALFIDAddressPool(ULONG);		// ULONG: NET_IFINDEX
 	// When an interface is removed/disabled, e.g. due to administrative shutdown at least one IPv6 address is unregistered
-	inline void OnRemoveIPv6Address(int, const IN6_ADDR &);
+	inline void OnRemoveIPv6Address(ULONG, const IN6_ADDR &);	// ULONG: NET_IFINDEX
 	// When an interface is enabled, at least one new IPv6 address is added. More detail needed here than OnRemove
-	inline void OnAddIPv6Address(int, const SOCKADDR_IN6 &);
+	inline void OnAddingIPv6Address(ULONG, const SOCKADDR_IN6 &);	// ULONG: NET_IFINDEX
+	inline void OnIPv6AddressMayAdded(ULONG, const SOCKADDR_IN6 &);	// ULONG: NET_IFINDEX
 	//
 	bool LOCALAPI SelectPath(PFSP_SINKINF, ALFID_T, int, const SOCKADDR_INET *);
 #else

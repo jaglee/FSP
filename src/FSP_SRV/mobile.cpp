@@ -139,7 +139,7 @@ uint64_t LOCALAPI CalculateCookie(BYTE *header, int sizeHdr, timestamp_t t0)
 	ALIGN(MAC_ALIGNMENT) BYTE m[sizeof(FSP_InitiateRequest)];
 	timestamp_t t1 = NowUTC();
 
-#ifdef TRACE
+#if defined(TRACE) && (TRACE & TRACE_PACKET)
 	printf("\n**** Cookie Context timestamp ****\n");
 	printf("Previous = 0x%016I64X\n", prevCookieContext.timeStamp);
 	printf("Current  = 0x%016I64X\n", cookieContext.timeStamp);
@@ -184,7 +184,7 @@ uint64_t LOCALAPI CalculateCookie(BYTE *header, int sizeHdr, timestamp_t t0)
 // The ephemeral key is weakly securely established. It is a 64-bit value meant to make obfuscation in calcuate the CRC64 tag
 void CSocketItemEx::InstallEphemeralKey()
 {
-#ifdef TRACE
+#if defined(TRACE) && (TRACE & TRACE_PACKET)
 	printf_s("Session key materials:\n");
 	DumpNetworkUInt16((uint16_t *)  & pControlBlock->connectParams, FSP_MAX_KEY_SIZE / 2);
 #endif
@@ -199,7 +199,7 @@ void CSocketItemEx::InstallEphemeralKey()
 	recvFIDPair.source = fidPair.peer;
 	contextOfICC.curr.precomputedICC[1]
 		=  CalculateCRC64(* (uint64_t *) & recvFIDPair, (uint8_t *) & pControlBlock->connectParams, FSP_MAX_KEY_SIZE);
-#ifdef TRACE
+#if defined(TRACE) && (TRACE & TRACE_PACKET)
 	printf_s("Precomputed ICC 0:");
 	DumpNetworkUInt16((uint16_t *)  & contextOfICC.curr.precomputedICC[0], 4);
 	printf_s("Precomputed ICC 1:");
@@ -230,34 +230,45 @@ void CSocketItemEx::InstallSessionKey()
 
 
 
-// Given
-//	The peer's address obtained from the received and ICC-validated message has been saved in the sentinel place in sockAddrTo
-// DO
+// Do
 //	Automatically register source IP address as the favorite returning IP address
 // Remark
-//	Currently not bothered to support mobility under IPv4 yet
+//	Suppose the most-recently received message has been validated and the peer's address obtained from the underlying IPv6 packet
+//	has been saved in the sentinel place sockAddrTo[MAX_PHY_INTERFACES]
 //	Target address selection/protocol related to network path selection is undetermined yet
 // See also SendPacket
 inline void CSocketItemEx::ChangeRemoteValidatedIP()
 {
+//	Currently not bothered to support mobility under IPv4 yet
 #ifndef OVER_UDP_IPv4
-	bool found = false;
-	for (register int i = MAX_PHY_INTERFACES; i >= 0; i--)
+	register int i = MAX_PHY_INTERFACES - 1;
+	for (; i >= 0; i--)
 	{
-		if (memcmp(sockAddrTo[i].Ipv6.sin6_addr.u.Byte, sockAddrTo[MAX_PHY_INTERFACES].Ipv6.sin6_addr.u.Byte, 12) == 0)
+		if (SOCKADDR_SUBNET(sockAddrTo + i) == SOCKADDR_SUBNET(sockAddrTo + MAX_PHY_INTERFACES)
+		 && SOCKADDR_HOSTID(sockAddrTo + i) == SOCKADDR_HOSTID(sockAddrTo + MAX_PHY_INTERFACES))
 		{
-			sockAddrTo[i] = sockAddrTo[0];
-			found = true;
+			sockAddrTo[i] = sockAddrTo[0];	// save the original favorite target IP address
 			break;
 		}
-	}
+	};
 	//^Let's the compiler do loop-unrolling, if it worthes
-	if(!found)
+	if(i < 0)
 	{
-		memcpy_s(&sockAddrTo[1], sizeof(sockAddrTo[1]) * (MAX_PHY_INTERFACES - 1)
-			, &sockAddrTo[0], sizeof(sockAddrTo[0]) * (MAX_PHY_INTERFACES - 1));
+		memcpy(sockAddrTo + 1, sockAddrTo, sizeof(sockAddrTo[0]) * (MAX_PHY_INTERFACES - 1));
+#if defined(TRACE) && (TRACE & TRACE_ADDRESS)
+		printf_s("%s: set the new favorite target IP to the source address of the most recently received packet.\n", __FUNCTION__);
+#endif
 	}
-	//
+	else if(i == 0)
+	{
+		return;
+	}
+#if defined(TRACE) && (TRACE & TRACE_ADDRESS) && (TRACE & TRACE_HEARTBEAT)
+	else // (i > 0)
+	{
+		printf_s("%s: change the favorite target IP to the source IP address of the new received packet.\n", __FUNCTION__);
+	}
+#endif
 	sockAddrTo[0] = sockAddrTo[MAX_PHY_INTERFACES];
 #endif
 }
@@ -283,7 +294,7 @@ void * LOCALAPI CSocketItemEx::SetIntegrityCheckCode(FSP_NormalPacketHeader *p1,
 	ALIGN(MAC_ALIGNMENT) uint64_t tag[FSP_TAG_SIZE / sizeof(uint64_t)];
 	void * buf;
 	uint32_t seqNo = be32toh(p1->sequenceNo);
-#ifdef TRACE_PACKET
+#if defined(TRACE) && (TRACE & TRACE_PACKET)
 	printf_s("\nBefore GCM_AES_AuthenticatedEncrypt: ptLen = %d\n", ptLen);
 	DumpNetworkUInt16((uint16_t *)p1, sizeof(FSP_NormalPacketHeader) / 2);
 #endif
@@ -291,7 +302,7 @@ void * LOCALAPI CSocketItemEx::SetIntegrityCheckCode(FSP_NormalPacketHeader *p1,
 	// CRC64
 	if(contextOfICC.keyLife == 0)
 	{
-#ifdef TRACE_PACKET
+#if defined(TRACE) && (TRACE & TRACE_PACKET)
 		printf_s("\nPrecomputed ICC: ");
 		DumpNetworkUInt16((uint16_t *) & contextOfICC.curr.precomputedICC[0], sizeof(uint64_t) / 2);
 #endif
@@ -301,7 +312,7 @@ void * LOCALAPI CSocketItemEx::SetIntegrityCheckCode(FSP_NormalPacketHeader *p1,
 	}
 	else if(int32_t(seqNo - contextOfICC.firstSendSNewKey) < 0 && contextOfICC.savedCRC)
 	{
-#ifdef TRACE_PACKET
+#if defined(TRACE) && (TRACE & TRACE_PACKET)
 		printf_s("\nPrecomputed ICC: ");
 		DumpNetworkUInt16((uint16_t *) & contextOfICC.prev.precomputedICC[0], sizeof(uint64_t) / 2);
 #endif
@@ -336,7 +347,7 @@ void * LOCALAPI CSocketItemEx::SetIntegrityCheckCode(FSP_NormalPacketHeader *p1,
 	}
 
 	p1->integrity.code = tag[0];
-#ifdef TRACE_PACKET
+#if defined(TRACE) && (TRACE & TRACE_PACKET)
 	printf_s("After GCM_AES_AuthenticatedEncrypt:\n");	DumpNetworkUInt16((uint16_t *)p1, sizeof(FSP_NormalPacketHeader) / 2);
 #endif
 	return buf;
@@ -358,7 +369,7 @@ bool CSocketItemEx::ValidateICC(FSP_NormalPacketHeader *p1, int32_t ctLen, uint3
 	ALIGN(MAC_ALIGNMENT) uint64_t tag[FSP_TAG_SIZE / sizeof(uint64_t)];
 
 	tag[0] = p1->integrity.code;
-#ifdef TRACE_PACKET
+#if defined(TRACE) && (TRACE & TRACE_PACKET)
 	printf_s("Before GCM_AES_AuthenticateAndDecrypt:\n");
 	DumpNetworkUInt16((uint16_t *)p1, sizeof(FSP_NormalPacketHeader) / 2);
 #endif
@@ -367,7 +378,7 @@ bool CSocketItemEx::ValidateICC(FSP_NormalPacketHeader *p1, int32_t ctLen, uint3
 	// CRC64
 	if(contextOfICC.keyLife == 0)
 	{
-#ifdef TRACE_PACKET
+#if defined(TRACE) && (TRACE & TRACE_PACKET)
 		printf_s("\nPrecomputed ICC: ");
 		DumpNetworkUInt16((uint16_t *) & contextOfICC.curr.precomputedICC[1], sizeof(uint64_t) / 2);
 #endif
@@ -377,7 +388,7 @@ bool CSocketItemEx::ValidateICC(FSP_NormalPacketHeader *p1, int32_t ctLen, uint3
 	}
 	else if(int32_t(seqNo - contextOfICC.firstRecvSNewKey) < 0 && contextOfICC.savedCRC)
 	{
-#ifdef TRACE_PACKET
+#if defined(TRACE) && (TRACE & TRACE_PACKET)
 		printf_s("\nPrecomputed ICC: ");
 		DumpNetworkUInt16((uint16_t *) & contextOfICC.prev.precomputedICC[1], sizeof(uint64_t) / 2);
 #endif
@@ -481,7 +492,7 @@ bool CSocketItemEx::EmitStart()
 		result = 0;	// unrecognized packet type is simply ignored?!
 	}
 
-#ifdef TRACE_SOCKET
+#if defined(TRACE) && (TRACE & TRACE_PACKET)
 	printf_s("Session#%u emit %s, result = %d, time : 0x%016llX\n"
 		, fidPair.source, opCodeStrings[skb->opCode], result, tRecentSend);
 #endif
@@ -537,7 +548,7 @@ bool LOCALAPI CSocketItemEx::EmitWithICC(ControlBlock::PFSP_SocketBuf skb, Contr
 	// ICC, if required, is always set just before being sent
 	if (skb->GetFlag<TO_BE_CONTINUED>() && skb->len != MAX_BLOCK_SIZE)
 	{
-#ifdef TRACE
+#if defined(TRACE) && (TRACE & TRACE_PACKET)
 		printf_s("\nImcomplete packet to send, opCode: %s(%d, len = %d)\n"
 			, opCodeStrings[skb->opCode]
 			, skb->opCode
@@ -547,9 +558,7 @@ bool LOCALAPI CSocketItemEx::EmitWithICC(ControlBlock::PFSP_SocketBuf skb, Contr
 	}
 	// Which is the norm. Dynanically generate the fixed header.
 	pControlBlock->SetSequenceFlags(pHdr, skb, seq);
-	pHdr->hs.opCode = skb->opCode;
-	pHdr->hs.version = THIS_FSP_VERSION;
-	pHdr->hs.hsp = htobe16(sizeof(FSP_NormalPacketHeader));
+	pHdr->hs.Set(skb->opCode, sizeof(FSP_NormalPacketHeader));
 
 	void * paidLoad = SetIntegrityCheckCode(pHdr, (BYTE *)payload, skb->len);
 	if(paidLoad == NULL)
@@ -573,31 +582,30 @@ void CSocketItemEx::OnLocalAddressChanged()
 		return;
 
 	FSPOperationCode opCode = (pControlBlock->HasBeenCommitted() > 0) ? ACK_FLUSH : KEEP_ALIVE;
-
+#if defined(TRACE) && (TRACE & TRACE_ADDRESS)
+	printf_s("Line %d @ %s\n\tTo make acknowledgement: %s [%d]\n", __LINE__, __FUNCTION__, opCodeStrings[opCode], opCode);
+#endif
 	ControlBlock::seq_t seqExpected;
 	struct
 	{
+		FSP_NormalPacketHeader	hdr;
+		FSP_ConnectParam		mp;
 		FSP_PreparedKEEP_ALIVE	snack;
-		FSP_ConnectParam		_placeholder;
-	} buf2;
-	FSP_ConnectParam *pMobileParam;
+	} buf;
 
-	int32_t len = GenerateSNACK(buf2.snack, seqExpected);
-#if defined(TRACE_PACKET) || defined(TRACE_HEARTBEAT)
+	int32_t len = GenerateSNACK(buf.snack, seqExpected,  sizeof(FSP_NormalPacketHeader) + sizeof(FSP_ConnectParam));
+#if defined(TRACE) && (TRACE & (TRACE_ADDRESS | TRACE_HEARTBEAT))
 	printf_s("Keep-alive local fiber#%u\n"
 		"\tAcknowledged seq#%u, keep-alive header size = %d\n"
 		, fidPair.source
 		, seqExpected
 		, len);
 #endif
-	if (len < sizeof(FSP_SelectiveNACK))
+	if (len < sizeof(FSP_SelectiveNACK) + sizeof(FSP_NormalPacketHeader) + sizeof(FSP_ConnectParam))
 	{
-		printf_s("Fatal error %d encountered when generate SNACK\n", len);
+		printf_s("Fatal error %d encountered when generate SNACK, bundled with MOBILE_PARAM\n", len);
 		return;
 	}
-	len += sizeof(FSP_NormalPacketHeader);
-
-	pMobileParam = (FSP_ConnectParam *)((uint8_t *)& buf2 + len);
 
 	u_int k = CLowerInterface::Singleton()->sdSet.fd_count;
 	u_int j = 0;
@@ -606,49 +614,54 @@ void CSocketItemEx::OnLocalAddressChanged()
 	{
 		if (!BitTest(&w, i))
 		{
-			pMobileParam->subnets[j++] = SOCKADDR_SUBNET(&CLowerInterface::Singleton()->addresses[i]);
-			if (j >= sizeof(pMobileParam->subnets) / sizeof(uint64_t))
+			buf.mp.subnets[j++] = SOCKADDR_SUBNET(&CLowerInterface::Singleton()->addresses[i]);
+			if (j >= sizeof(buf.mp.subnets) / sizeof(uint64_t))
 				break;
 		}
 	}
 	// temporarily there is no path to the local end:
 	if (j <= 0)
 		return;
-	// loop-rollout
-	if (j < 2)
-		pMobileParam->subnets[1] = pMobileParam->subnets[0];
-	if (j < 3)
-		pMobileParam->subnets[2] = pMobileParam->subnets[1];
-	if (j < 4)
-		pMobileParam->subnets[3] = pMobileParam->subnets[2];
-
-	pMobileParam->idHostALF = SOCKADDR_HOST_ID(&CLowerInterface::Singleton()->addresses[0]);
-	pMobileParam->hs.Set<MOBILE_PARAM>(len);
-
-	len += sizeof(FSP_ConnectParam);
-	buf2.snack.hdr.hs.version = THIS_FSP_VERSION;
-	buf2.snack.hdr.hs.opCode = opCode;
-	buf2.snack.hdr.hs.hsp = htobe16(uint16_t(len));
+	//
+	while(j < sizeof(buf.mp.subnets) / sizeof(uint64_t))
+	{
+		buf.mp.subnets[j] = buf.mp.subnets[j - 1];
+		j++;
+	}
+	//^Let's the compiler do loop-unrolling
+	buf.mp.idHost = SOCKADDR_HOSTID(&CLowerInterface::Singleton()->addresses[0]);
+	buf.mp.hs.Set(MOBILE_PARAM, sizeof(FSP_NormalPacketHeader));
 
 	// Both KEEP_ALIVE and ACK_FLUSH are payloadless out-of-band control block which always apply current session key
-	// See also ControlBlock::SetSequenceFlags
-	buf2.snack.hdr.sequenceNo = htobe32(pControlBlock->sendWindowNextSN - 1);
-	buf2.snack.hdr.expectedSN = htobe32(seqExpected);
-	buf2.snack.hdr.ClearFlags();
-	buf2.snack.hdr.SetRecvWS(pControlBlock->RecvWindowSize());
-	SetIntegrityCheckCode(&buf2.snack.hdr, NULL, 0, buf2.snack.GetSaltValue());
-#ifdef TRACE_PACKET
-	printf_s("To send KEEP_ALIVE seq #%u, acknowledge #%u, source ALFID = %u\n", be32toh(buf2.snack.hdr.sequenceNo), seqExpected, fidPair.source);
-	printf_s("KEEP_ALIVE total header length: %d, should be payloadless\n", len);
-	DumpNetworkUInt16((uint16_t *)& buf2, len / 2);
+	buf.hdr.Set(pControlBlock->sendWindowNextSN - 1, seqExpected, pControlBlock->RecvWindowSize(), opCode, len);
+	SetIntegrityCheckCode(& buf.hdr, NULL, 0, buf.snack.GetSaltValue());
+	// See also CSocketItemEx::SendSNACK
+#if defined(TRACE) && (TRACE & TRACE_ADDRESS)
+	printf_s("To send KEEP_ALIVE seq #%u, acknowledge #%u, source ALFID = %u\n", be32toh(buf.hdr.sequenceNo), seqExpected, fidPair.source);
+	printf_s("KEEP_ALIVE total header length: %d, including mobile parameter\n", len);
+	DumpNetworkUInt16((uint16_t *)& buf, len / 2);
 #endif
 
-	SendPacket(1, ScatteredSendBuffers(&buf2.snack.hdr, len));
+	// If destination interface happen to be on the same host, update the registered address simultaneously
+	// UNRESOLVED!? The default interface should be the one that is set to promiscuous
+	if (SOCKADDR_SUBNET(sockAddrTo) == 0 && SOCKADDR_HOSTID(sockAddrTo) == 0)
+	{
+		PSOCKADDR_IN6 p = CLowerInterface::Singleton()->addresses + CLowerInterface::Singleton()->iRecvAddr;
+		SOCKADDR_SUBNET(sockAddrTo) = SOCKADDR_SUBNET(p);
+		SOCKADDR_HOSTID(sockAddrTo) = SOCKADDR_HOSTID(p);
+	}
+
+	SendPacket(1, ScatteredSendBuffers(&buf, len));
 }
 #endif
 
 
-// On getting remote address event, process the MOBILE_PARAM header
+// Given
+//	PFSP_HeaderSignature	the MOBILE_PARAM header
+// Do
+//	Process the getting remote address event
+// Remark
+//	Although the subnet that the host belong to could be mobile, the ID of the host should be persistent
 bool LOCALAPI CSocketItemEx::HandleMobileParam(PFSP_HeaderSignature optHdr)
 {
 	if (optHdr == NULL || optHdr->opCode != MOBILE_PARAM)
@@ -660,7 +673,10 @@ bool LOCALAPI CSocketItemEx::HandleMobileParam(PFSP_HeaderSignature optHdr)
 	SOCKADDR_SUBNET(&sockAddrTo[1]) = pMobileParam->subnets[1];
 	SOCKADDR_SUBNET(&sockAddrTo[2]) = pMobileParam->subnets[2];
 	SOCKADDR_SUBNET(&sockAddrTo[3]) = pMobileParam->subnets[3];
-	// UNRESOLVED!? Check hostId to further validate the header? may hostId mobile?
+#if defined(TRACE) && (TRACE & TRACE_ADDRESS)
+	printf_s("New target address set for host %u (== %u)\n", SOCKADDR_HOSTID(sockAddrTo), pMobileParam->idHost);
+#endif
+	//
 #endif
 	return true;
 }
@@ -673,7 +689,7 @@ bool LOCALAPI CSocketItemEx::HandleMobileParam(PFSP_HeaderSignature optHdr)
 // TODO: rate-control/quota control
 void CSocketItemEx::EmitQ()
 {
-#ifdef TRACE
+#if defined(TRACE) && (TRACE & TRACE_PACKET)
 	TRACE_HERE("Sending data...");
 #endif
 	ControlBlock::seq_t lastSN = _InterlockedOr((LONG *) & pControlBlock->sendBufferNextSN, 0);
@@ -688,7 +704,7 @@ void CSocketItemEx::EmitQ()
 		// The flag IS_COMPLETED is for double-stage commit of send buffer, for sake of sending online compressed stream
 		if (!skb->GetFlag<IS_COMPLETED>())
 		{
-#ifdef TRACE
+#if defined(TRACE) && (TRACE & TRACE_PACKET)
 			printf_s("Not ready to send packet SN#%u; next to buffer SN#%u\n", nextSN, lastSN);
 #endif 
 			break;
@@ -713,4 +729,23 @@ void CSocketItemEx::EmitQ()
 		if (pControlBlock->SlideNextToSend() == firstSN + 1)
 			SetEarliestSendTime();
 	}
+}
+
+
+// An auxillary function handling the fixed header
+// Given
+//	uint32_t	The sequenceNo field in host byte order
+//	uint32_t	The expectedNo field in host byte order
+//	uint32_t	The advertised receive window size, in host byte order
+//	uint8_t		The opCode
+//	uint16_t	The total length of all the headers
+// Do
+//	Filled in the fixed header
+void LOCALAPI FSP_NormalPacketHeader::Set(uint32_t seqThis, uint32_t seqExpected, int32_t advRecvWinSize, uint8_t code, uint16_t hsp)
+{
+	expectedSN = htobe32(seqExpected);
+	sequenceNo = htobe32(seqThis);
+	ClearFlags();
+	SetRecvWS(advRecvWinSize);
+	hs.Set(code, hsp);
 }

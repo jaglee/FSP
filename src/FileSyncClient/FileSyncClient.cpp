@@ -8,6 +8,7 @@
 // #define REMOTE_APPLAYER_NAME "lt-at4:80"
 // #define REMOTE_APPLAYER_NAME "lt-ux31e:80"
 #define REMOTE_APPLAYER_NAME "E000:AAAA::1"
+//#define REMOTE_APPLAYER_NAME "E000:BBBB::1"
 
 static int	FSPAPI onConnected(FSPHANDLE, PFSP_Context);
 static void FSPAPI onPublicKeySent(FSPHANDLE, FSP_ServiceCode, int);

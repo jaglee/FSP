@@ -258,20 +258,20 @@ int LOCALAPI CSocketItemEx::ResolveToFSPoverIPv4(const char *nodeName, const cha
 	// assume the project is compiled in ANSI/MBCS language mode
 	if(getaddrinfo(nodeName, serviceName, & hints, & pAddrInfo) != 0)
 	{
-//#ifdef TRACE
+#if defined(TRACE) && (TRACE & TRACE_ADDRESS)
 		DWORD err = WSAGetLastError();
 		char buffer[1024];
 		FormatMessage(FORMAT_MESSAGE_FROM_SYSTEM, NULL, err, 0, (LPTSTR) & buffer, 1024, NULL);
 		printf_s("Cannot Resolve the IPv4 address of the node %s, error code = %d\n %s\n", nodeName, err, (LPTSTR) buffer);
-//#endif
+#endif
 		return -1;
 	}
 
 	if(pAddrInfo == NULL)
 	{
-//#ifdef TRACE
-//		printf("Cannot resolve the IP address of the node %s\n", nodeName);
-//#endif
+#if defined(TRACE) && (TRACE & TRACE_ADDRESS)
+		printf("Cannot resolve the IP address of the node %s\n", nodeName);
+#endif
 		return 0;
 	}
 
@@ -310,7 +310,7 @@ int LOCALAPI CSocketItemEx::ResolveToIPv6(const char *nodeName)
 	// assume the project is compiled in ANSI/MBCS language mode
 	if(getaddrinfo(nodeName, NULL, & hints, & pAddrInfo) != 0)
 	{
-#ifdef TRACE
+#if defined(TRACE) && (TRACE & TRACE_ADDRESS)
 		DWORD err = WSAGetLastError();
 		char buffer[1024];
 		FormatMessage(FORMAT_MESSAGE_FROM_SYSTEM, NULL, err, 0, (LPTSTR) & buffer, 1024, NULL);
@@ -321,17 +321,17 @@ int LOCALAPI CSocketItemEx::ResolveToIPv6(const char *nodeName)
 
 	if(pAddrInfo == NULL)
 	{
-//#ifdef TRACE
-//		printf("Cannot resolve the IPv6 address of the node %s\n", nodeName);
-//#endif
+#if defined(TRACE) && (TRACE & TRACE_ADDRESS)
+		printf("Cannot resolve the IPv6 address of the node %s\n", nodeName);
+#endif
 		return 0;
 	}
 
 	// See also CLowerInterface::EnumEffectiveAddresses
 	register uint64_t * prefixes = pControlBlock->peerAddr.ipFSP.allowedPrefixes;
 	int n = 0;
-	pControlBlock->peerAddr.ipFSP.hostID = SOCKADDR_HOST_ID(pAddrInfo->ai_addr);
 	pControlBlock->peerAddr.ipFSP.fiberID = SOCKADDR_ALFID(pAddrInfo->ai_addr);
+	pControlBlock->peerAddr.ipFSP.hostID = SOCKADDR_HOSTID(pAddrInfo->ai_addr);
 	do
 	{
 		prefixes[n] = *(uint64_t *)(((PSOCKADDR_IN6)pAddrInfo->ai_addr)->sin6_addr.u.Byte);

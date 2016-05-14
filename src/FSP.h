@@ -143,11 +143,11 @@ typedef enum _FSP_Operation_Code: char
 	RELEASE,
 	MULTIPLY,	// To clone connection, may piggyback payload
 	KEEP_ALIVE,
+	RESERVED_CODE13,
 	RESERVED_CODE14,
 	RESERVED_CODE15,
-	RESERVED_CODE16,
 	//
-	MOBILE_PARAM,
+	MOBILE_PARAM = 16,
 	SELECTIVE_NACK,
 	LARGEST_OP_CODE = SELECTIVE_NACK
 } FSPOperationCode;

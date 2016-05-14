@@ -322,7 +322,7 @@ int LOCALAPI CSocketItemDl::CheckCommitOrRevert(FlagEndOfMessage flag)
 //	No matter what happpend if shouldAppendCommit a new COMMIT packet shall be appended and sent!
 void CSocketItemDl::ProcessPendingSend()
 {
-#ifdef TRACE_PACKET
+#ifdef TRACE
 	printf_s("Process pending send in state %s\n", stateNames[pControlBlock->state]);
 #endif
 	if(! WaitUseMutex())

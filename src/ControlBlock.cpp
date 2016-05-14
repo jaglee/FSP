@@ -55,9 +55,9 @@ const char * CStringizeOpCode::names[LARGEST_OP_CODE + 1] =
 	"RELEASE",
 	"MULTIPLY",		// To clone connection, may piggyback payload
 	"KEEP_ALIVE",
+	"RESERVED_CODE13",
 	"RESERVED_CODE14",
 	"RESERVED_CODE15",
-	"RESERVED_CODE16",
 	//
 	"MOBILE_PARAM",
 	"SELECTIVE_NACK"
@@ -790,7 +790,7 @@ void ControlBlock::SlideSendWindowByOne()	// shall be atomic!
 	// UNRESOLVED! But it shall never happen!?
 	if(int(sendWindowNextSN - sendWindowFirstSN) < 0)
 	{
-#ifdef TRACE
+#if defined(TRACE)
 		printf_s("sendWindowNextSN(%u) out of sync on SlideSendWindow, set to %u\n", sendWindowNextSN, sendWindowFirstSN);
 #endif
 		sendWindowNextSN = sendWindowFirstSN;
@@ -799,7 +799,7 @@ void ControlBlock::SlideSendWindowByOne()	// shall be atomic!
 	// UNRESOLVED! But it shall never happen!?
 	if(int(sendBufferNextSN - sendWindowFirstSN) < 0)
 	{
-#ifdef TRACE
+#if defined(TRACE)
 		printf_s("sendBufferNextSN(%u) out of sync on SlideSendWindow, set to %u\n", sendBufferNextSN, sendWindowFirstSN);
 #endif
 		sendBufferNextSN = sendWindowFirstSN;

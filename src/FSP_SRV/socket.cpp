@@ -406,12 +406,13 @@ l_bailout:
 // Given
 //	FSP_SelectiveNACK::GapDescriptor *	the placeholder for the returned gap descriptors, shall be at of at least MAX_BLOCK_SIZE bytes
 //	seq_t &								the placeholder for the returned maximum expected sequence number
+//	int									the number of bytes that prefix the SNACK header
 // Return
-//	Number of bytes taken by the gap descriptors, including the suffix fields of the SNACK header, excluding the FSP fixed header
+//	Number of bytes taken by the gap descriptors, including the suffix fields of the SNACK header and the prefix of the given length
 //	negative indicates that some error occurred
 // Remark
 //	For milky payload this function should never be called
-int32_t LOCALAPI CSocketItemEx::GenerateSNACK(FSP_PreparedKEEP_ALIVE &buf, ControlBlock::seq_t & seq0)
+int32_t LOCALAPI CSocketItemEx::GenerateSNACK(FSP_PreparedKEEP_ALIVE &buf, ControlBlock::seq_t & seq0, int nPrefix)
 {
 	FSP_SelectiveNACK::GapDescriptor *pGaps = buf.gaps;
 	register int n = sizeof(buf.gaps) / sizeof(pGaps[0]);
@@ -431,7 +432,6 @@ int32_t LOCALAPI CSocketItemEx::GenerateSNACK(FSP_PreparedKEEP_ALIVE &buf, Contr
 	// built-in rule: an optional header MUST be 64-bit aligned
 	buf.n = n;
 	FSP_SelectiveNACK *pSNACK = (FSP_SelectiveNACK *)(pGaps + n);
-	pSNACK->hs.Set<FSP_NormalPacketHeader, SELECTIVE_NACK>();
 	while(--n >= 0)
 	{
 		pGaps[n].dataLength = htobe32(pGaps[n].dataLength);
@@ -440,7 +440,8 @@ int32_t LOCALAPI CSocketItemEx::GenerateSNACK(FSP_PreparedKEEP_ALIVE &buf, Contr
 
 	pSNACK->serialNo = htobe32(nextNAckSN);
 	nextNAckSN++;
-	return int32_t((uint8_t *)pSNACK + sizeof(FSP_SelectiveNACK) - (uint8_t *)pGaps);
+	pSNACK->hs.Set(SELECTIVE_NACK, nPrefix);
+	return int32_t((uint8_t *)pSNACK + sizeof(FSP_SelectiveNACK) - (uint8_t *)pGaps) + nPrefix;
 }
 
 
@@ -524,7 +525,7 @@ void LOCALAPI CSocketItemEx::AffirmConnect(const SConnectParam & initState, ALFI
 	// assert(sizeof(initState.allowedPrefixes) >= sizeof(varParams.subnets));
 	memcpy(pkt->params.subnets , initState.allowedPrefixes, sizeof(pkt->params.subnets));
 	pkt->params.listenerID = idListener;
-	pkt->params.hs.Set<MOBILE_PARAM>(sizeof(FSP_ConnectRequest) - sizeof(FSP_ConnectParam));
+	pkt->params.hs.Set(MOBILE_PARAM, sizeof(FSP_ConnectRequest) - sizeof(FSP_ConnectParam));
 	pkt->hs.Set<FSP_ConnectRequest, CONNECT_REQUEST>();
 
 	// while version remains as the same as the very beginning INIT_CONNECT

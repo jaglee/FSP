@@ -146,7 +146,7 @@ int CSocketItemDl::SelfNotify(FSP_ServiceCode c)
 		}
 		Sleep(1);
 	}
-#ifdef TRACE_PACKET
+#ifdef TRACE
 	printf_s("Self notice %s[%d] in local fiber#%u, state %s\t\n", noticeNames[c], c, fidPair.source, stateNames[pControlBlock->state]);
 	if(r > 0)
 		printf_s("--- merged ---\n");
@@ -318,7 +318,7 @@ void CSocketItemDl::WaitEventToDispatch()
 	FSP_ServiceCode notice;
 	while((notice = pControlBlock->notices.Pop()) != NullCommand)
 	{
-#ifdef TRACE_PACKET
+#ifdef TRACE
 		printf_s("\nIn local fiber#%u, state %s\tnotice: %s\n", fidPair.source, stateNames[pControlBlock->state], noticeNames[notice]);
 #endif
 		shouldChainTimeout = 1;

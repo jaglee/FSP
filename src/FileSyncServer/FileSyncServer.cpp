@@ -96,7 +96,8 @@ void FSPAPI WaitConnection(const char *thisWelcome, unsigned short mLen, Callbac
 	params.recvSize = 0;	// minimal receiving for download server
 
 	//TranslateFSPoverIPv4(& atAddress, 0, 80);	//INADDR_ANY
-	atAddress.u.subnet = 0xAAAA00E0;	// 0xE0 00 AA AA	// shall be learned 
+	atAddress.u.subnet = 0xAAAA00E0;	// 0xE0 00 AA AA	// shall be learned
+	//atAddress.u.subnet = 0xBBBB00E0;	// 0xE0 00 BB BB	// shall be learned
 	atAddress.idHost = 0;
 	atAddress.idALF = 0x01000000;		// 0x01 [well, it should be the well-known service number...] 
 

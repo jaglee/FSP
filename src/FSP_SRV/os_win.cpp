@@ -288,19 +288,75 @@ int LOCALAPI CLowerInterface::EnumEffectiveAddresses(uint64_t *prefixes)
 
 
 #ifndef OVER_UDP_IPv4	// by default exploit IPv6
+// put it into promiscuous mode, here user-mode
+static SOCKET	sdPromiscuous;
+static LONG		enableFlags;	// Somewhat a mirror of CLowerInterface disableFlags
+
+// An IPv6 socket that was created with the address family set to AF_INET6, the socket type set to SOCK_RAW,
+// and the protocol set to IPPROTO_IPV6 (but IPPROTO_FSP works!).
+// Any direct change from applying this option on one interface and then to another interface
+// with a single call using this IOCTL is not supported.
+// An application must first use this IOCTL to turn off the behavior on the first interface,
+// and then use this IOCTL to enable the behavior on a new interface.
+int	DisablePromiscuous()
+{
+	DWORD optRcvAll = RCVALL_OFF;
+	DWORD opt_size;
+	int r = 0;
+	if(WSAIoctl(sdPromiscuous, SIO_RCVALL, &optRcvAll, sizeof(optRcvAll), NULL, 0, &opt_size, NULL, NULL) != 0)
+	{
+		REPORT_WSAERROR_TRACE("Cannot disable the promiscuous mode");
+		r = -1;
+	}
+	//
+	sdPromiscuous = NULL;
+	return r;
+}
+
+
+// There's the document glich when this code snippet was written: the output buffer MUST be specified
+// Given
+//	SOCKET		the socket that bind the interface to be set into promiscuous mode
+// Do
+//	Set the given socket as the default promiscuous interface
+// Return
+//	positive if a warning saying that there is already a default promiscuous interface
+//	0 if no error
+//	negative if error
+int	EnablePromiscuous(SOCKET sd)
+{
+	if (sdPromiscuous != NULL)
+		return 1;
+
+	// This error can also be returned if the network interface associated with the socket cannot be found.
+	// This could occur if the network interface associated with the socket is deleted or removed (a remove PCMCIA or USB network device, for example). 
+	DWORD optRcvAll = RCVALL_IPLEVEL;	//  RCVALL_SOCKETLEVELONLY not implemented; // RCVALL_ON let NIC enabled
+	DWORD opt_size;
+	if (WSAIoctl(sd, SIO_RCVALL, &optRcvAll, sizeof(optRcvAll), NULL, 0, &opt_size, NULL, NULL) != 0)
+	{
+		REPORT_WSAERROR_TRACE("Cannot set the default interface in promiscuous mode");
+		return -1;
+	}
+	sdPromiscuous = sd;
+	//
+	return 0;
+}
+
+
+
 // Given
 //	SOCKET			the handle of the socket to bind the designated listening address
 // Return
-//	0 if no error
+//	0 if no error and the new socket is bound to the promiscuous interface
 //	negative if it failed
+//	positive if it succeeded
 // Do
 //	Set valuable options
 // Remark
 //	inline: only in the CLowerInterface constructor may it be called
-//	It is useless to put it into promiscuous mode WSAIoctl(sd, SIO_RCVALL, ...) in user mode.
+//	MUST bind the socket at first or else EnablePromiscuous would return WSAEINVAL
 inline int CLowerInterface::SetInterfaceOptions(SOCKET sd)
 {
-	DWORD optRcvAll = RCVALL_IPLEVEL;	//  RCVALL_SOCKETLEVELONLY not implemented; RCVALL_ON let NIC enabled
 	DWORD wantPktInfo = TRUE;
 
 	if (setsockopt(sd, IPPROTO_IPV6, IPV6_PKTINFO, (char *)& wantPktInfo, sizeof(wantPktInfo)) != 0)
@@ -310,18 +366,7 @@ inline int CLowerInterface::SetInterfaceOptions(SOCKET sd)
 	}
 	// Here we didn't set IPV6_V6ONLY, for we suppose that dual-stack support is not harmful, though neither benefical
 
-	// An IPv6 socket that was created with the address family set to AF_INET6, the socket type set to SOCK_RAW, and the protocol set to IPPROTO_IPV6.
-	// put it into promiscuous mode, here user-mode
-	// The socket handle passed to the WSAIoctl function must be of AF_INET address family, SOCK_RAW socket type, and IPPROTO_IP protocol
-	// There's the document glich when this code snippet was written: the output buffer MUST be specified
-	DWORD opt_size;
-	if (WSAIoctl(sd, SIO_RCVALL, &optRcvAll, sizeof(optRcvAll), NULL, 0, & opt_size, NULL, NULL) != 0)
-	{
-		REPORT_WSAERROR_TRACE("Cannot set it in promiscuous mode");
-		return -1;
-	}
-
-	return 0;
+	return EnablePromiscuous(sd);
 }
 
 
@@ -396,7 +441,10 @@ inline void CLowerInterface::LearnAddresses()
 			REPORT_WSAERROR_TRACE("Bind failure");
 			throw E_ABORT;
 		}
-		SetInterfaceOptions(sdSend);
+		//
+		if(SetInterfaceOptions(sdSend) == 0)
+			iRecvAddr = i;
+		// UNRESOLVED!? But if SetInterfaceOptions failed thoroughly?
 		FD_SET(sdSend, &sdSet);
 		// k++;	// When FD_SET, the alias target is already increased
 
@@ -409,6 +457,7 @@ inline void CLowerInterface::LearnAddresses()
 		printf_s("IPv6 not enabled?");
 		throw E_NOINTERFACE;
 	}
+
 	// note that k is alias of fd_count of the socket set for this instance
 	FreeMibTable(table);
 }
@@ -424,7 +473,6 @@ inline void CLowerInterface::SetLocalApplicationLayerFiberIDs(int iEntry)
 {
 	MIB_UNICASTIPADDRESS_ROW	row;
 	int r;
-	CHAR strIPv6Addr[INET6_ADDRSTRLEN];
 	DWORD ifNo = interfaces[iEntry];	// the interface number/index
 	SOCKADDR_IN6 addr = addresses[iEntry];
 
@@ -442,7 +490,8 @@ inline void CLowerInterface::SetLocalApplicationLayerFiberIDs(int iEntry)
 			ReportErrorAsMessage(r);
 			continue;
 		}
-#ifdef TRACE
+#if defined(TRACE) && (TRACE & TRACE_ADDRESS)
+		CHAR strIPv6Addr[INET6_ADDRSTRLEN];
 		inet_ntop(AF_INET6, &row.Address.Ipv6.sin6_addr, strIPv6Addr, sizeof(strIPv6Addr));
 		printf_s("It returned %d to set IPv6 address to %s@%d\n", r, strIPv6Addr, interfaces[iEntry]);
 #endif
@@ -455,7 +504,7 @@ inline void CLowerInterface::SetLocalApplicationLayerFiberIDs(int iEntry)
 //	int		The index of the interface to remove preallocated ALFID address. The index was originally reported by the network layer
 // Do
 //	Remove EVERY IPv6 address with some preallocated ALFID configured for the designated interface
-inline void CLowerInterface::RemoveALFIDAddressPool(int ifIndex)
+inline void CLowerInterface::RemoveALFIDAddressPool(NET_IFINDEX ifIndex)
 {
 	PMIB_UNICASTIPADDRESS_TABLE table;
 	PIN6_ADDR p;
@@ -507,7 +556,7 @@ inline int CLowerInterface::SetInterfaceOptions(SOCKET sd)
 //	negative, as the error number
 int CLowerInterface::BindSendRecv(const SOCKADDR_IN *pAddrListen, int k)
 {
-#ifdef TRACE
+#if defined(TRACE) && (TRACE & TRACE_ADDRESS)
 	printf_s("Bind to listen at UDP socket address: %d.%d.%d.%d:%d\n"
 		, pAddrListen->sin_addr.S_un.S_un_b.s_b1
 		, pAddrListen->sin_addr.S_un.S_un_b.s_b2
@@ -518,7 +567,7 @@ int CLowerInterface::BindSendRecv(const SOCKADDR_IN *pAddrListen, int k)
 	memcpy(&addresses[k], pAddrListen, sizeof(SOCKADDR_IN));
 	interfaces[k] = 0;
 
-	if (bind(sdSend, (const struct sockaddr *)pAddrListen, sizeof(SOCKADDR_IN)) != 0)
+	if (::bind(sdSend, (const struct sockaddr *)pAddrListen, sizeof(SOCKADDR_IN)) != 0)
 	{
 		REPORT_WSAERROR_TRACE("Cannot bind to the selected address");
 		return -1;
@@ -601,10 +650,10 @@ inline void CLowerInterface::LearnAddresses()
 	sdSend = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 	if (sdSend == INVALID_SOCKET)
 		throw E_HANDLE;
-	// SetInterfaceOptions(sdSend);
 	// Set the INADDR_ANY for transmission; reuse storage of loopback address
 	p->sin_addr.S_un.S_addr = INADDR_ANY;
 	::bind(sdSend, (const struct sockaddr *)p, sizeof(SOCKADDR_IN));
+	// SetInterfaceOptions(sdSend);	// unnecessary
 }
 #endif
 
@@ -656,11 +705,18 @@ inline void CLowerInterface::ProcessRemotePacket()
 		TRACE_HERE("Empty socket set, nowhere listen");
 		throw E_INVALIDARG;
 	}
+	//
+	struct timeval timeout;
+	timeout.tv_sec = 2;	// CONNECT_INITIATION_TIMEOUT_ms / 1000 / 3;
+	timeout.tv_usec = 500000;	// an arbitary, hard-coded time-out value for easy of mobile handling
 	do
 	{
 		// make it as compatible as possible...
 		FD_ZERO(& readFDs);
 		r = 0;
+#if defined(TRACE) && (TRACE & TRACE_ADDRESS)
+		printf_s("Number of register socket = %d\n", sdSet.fd_count);
+#endif
 		for(i = 0; i < (int)sdSet.fd_count; i++)		
 #ifndef OVER_UDP_IPv4
 		if(! BitTest(& disableFlags, i))
@@ -681,7 +737,15 @@ inline void CLowerInterface::ProcessRemotePacket()
 		// 'select' success while following WSARecvMsg will fail
 		// Cannot receive packet information, error code = 10038
 		// Error: An operation was attempted on something that is not a socket.
-		if(select(sdSet.fd_count, & readFDs, NULL, NULL, NULL) <= 0)
+		r = select(readFDs.fd_count, & readFDs, NULL, NULL, & timeout);
+		if(r == 0)
+		{
+#if defined(TRACE) && (TRACE & TRACE_ADDRESS)
+			printf_s("Select timed-out\n");
+#endif
+			continue;
+		}
+		if(r == SOCKET_ERROR)
 		{
 			int	err = WSAGetLastError();
 			if(err == WSAENETDOWN)
@@ -698,20 +762,19 @@ inline void CLowerInterface::ProcessRemotePacket()
 			REPORT_WSAERROR_TRACE("select failure");
 			break;	// TODO: crash recovery from select
 		}
+		//
 		for(i = 0; i < (int) readFDs.fd_count; i++)
 		{
 			AcquireMutex();
 			// Unfortunately, it was proven that no matter whether there is MSG_PEEK
 			// MSG_PARTIAL is not supported by the underlying raw socket service
 			mesgInfo.dwFlags = 0;
-			sdRecv = readFDs.fd_array[i];
-			r = AcceptAndProcess();
-			//
+			r = AcceptAndProcess(readFDs.fd_array[i]);
 			SetMutexFree();
 			if(r == E_ABORT)
 				return;
 			if (r == E_FAIL)
-				Disable_sdRecv();
+				DisableSocket(readFDs.fd_array[i]);
 		}
 	} while(1, 1);
 }
@@ -719,7 +782,7 @@ inline void CLowerInterface::ProcessRemotePacket()
 
 // The handler's mainbody to accept and process one particular remote packet
 // See also SendPacket
-int CLowerInterface::AcceptAndProcess()
+int CLowerInterface::AcceptAndProcess(SOCKET sdRecv)
 {
 	if((pktBuf = GetBuffer()) == NULL)
 		return ENOMEM;	
@@ -741,13 +804,14 @@ int CLowerInterface::AcceptAndProcess()
 	if (WSARecvMsg(sdRecv, &mesgInfo, &countRecv, NULL, NULL) < 0)
 	{
 		int err = WSAGetLastError();
-		SetMutexFree();
+		FreeBuffer(pktBuf);
 		if (err != WSAENOTSOCK)
 		{
 			ReportErrorAsMessage(err);
 			return E_ABORT;		// Unrecoverable error
 		}
 		// TO DO: other errors which could not undertake crash recovery
+		//
 		return E_FAIL;
 	}
 
@@ -762,7 +826,7 @@ int CLowerInterface::AcceptAndProcess()
 #endif
 
 	FSPOperationCode opCode = (FSPOperationCode) pktBuf->hdr.hs.opCode;
-#ifdef TRACE_PACKET
+#if defined(TRACE) && (TRACE & TRACE_PACKET)
 	printf_s("Packet of opCode %d[%s] received\n", (int)opCode, opCodeStrings[opCode]);
 	printf_s("Remote address:\n");
 	DumpNetworkUInt16((uint16_t *) & addrFrom, sizeof(addrFrom) / 2);
@@ -827,7 +891,7 @@ int CLowerInterface::AcceptAndProcess()
 		//
 		pktBuf->lenData = countRecv - be16toh(pktBuf->GetHeaderFSP()->hs.hsp);
 		pktBuf->pktSeqNo = be32toh(pktBuf->GetHeaderFSP()->sequenceNo);
-#ifdef TRACE_PACKET
+#if defined(TRACE) && (TRACE & TRACE_PACKET)
 		printf_s("packet #%u, payload length %d, to put onto the queue\n", pktBuf->pktSeqNo, pktBuf->lenData);
 #endif
 		if(pktBuf->lenData < 0 || pktBuf->lenData > MAX_BLOCK_SIZE)
@@ -890,7 +954,7 @@ int LOCALAPI CLowerInterface::SendBack(char * buf, int len)
 		ReportWSAError("CLowerInterface::SendBack");
 		return 0;
 	}
-#ifdef TRACE_PACKET
+#if defined(TRACE) && (TRACE & TRACE_PACKET)
 	printf("%s, line %d, %d bytes sent back.\n", __FILE__, __LINE__, n);
 	printf_s("  Send from msghdr:\n\t");
 	DumpNetworkUInt16((uint16_t *)& nearInfo, sizeof(nearInfo) / 2);
@@ -911,8 +975,9 @@ int LOCALAPI CLowerInterface::SendBack(char * buf, int len)
 //	and of course, throttled LISTENING state
 void LOCALAPI CLowerInterface::SendPrematureReset(uint32_t reasons, CSocketItemEx *pSocket)
 {
+#if defined(TRACE) && (TRACE & TRACE_PACKET)
 	TRACE_HERE("called");
-
+#endif
 	struct FSP_RejectConnect reject;
 	reject.reasons = reasons;
 	reject.hs.Set<FSP_RejectConnect, RESET>();
@@ -1220,8 +1285,11 @@ DWORD WINAPI HandleFullICC(LPVOID p)
 					QueueUserWorkItem(HandleFullICC, p0, WT_EXECUTELONGFUNCTION);
 				// This is a long function because of the waiting
 				p0->UnlockPacketBuffer();
-					return 0;
+				return 0;
 			}
+			// Because some service call may recycle the FSP socket in a concurrent way
+			if (p0->lowState == NON_EXISTENT || p0->pControlBlock == NULL)
+				goto l_continue;
 			// synchronize the state in the 'cache' and the real state
 			p0->lowState = p0->pControlBlock->state;
 			switch(hdr->hs.opCode)
@@ -1247,7 +1315,7 @@ DWORD WINAPI HandleFullICC(LPVOID p)
 			case KEEP_ALIVE:
 				p0->OnGetKeepAlive();
 			}
-			//
+l_continue:
 			p0->SetReady();
 			p0->PopUnlockPacketBuffer();
 		}
@@ -1324,7 +1392,7 @@ int CSocketItemEx::SendPacket(register ULONG n1, ScatteredSendBuffers s)
 			return 0;	// no selectable path
 		}
 		wsaMsg.dwBufferCount = n1;
-#ifdef TRACE_PACKET
+#if defined(TRACE) && (TRACE & TRACE_PACKET)
 		s.scattered[0].buf = NULL;
 		s.scattered[0].len = 0;
 #endif
@@ -1350,7 +1418,7 @@ int CSocketItemEx::SendPacket(register ULONG n1, ScatteredSendBuffers s)
 	}
 
 	tRecentSend = NowUTC();
-#ifdef TRACE_PACKET
+#if defined(TRACE) && (TRACE & TRACE_PACKET)
 	printf_s("\nPeer socket address:\n");
 	DumpNetworkUInt16((uint16_t *)sockAddrTo, sizeof(SOCKADDR_IN6) / 2);
 	printf_s("Data to sent:\n----\n");
@@ -1365,7 +1433,7 @@ int CSocketItemEx::SendPacket(register ULONG n1, ScatteredSendBuffers s)
 		ReportWSAError("CSocketItemEx::SendPacket");
 		return 0;
 	}
-#ifdef TRACE_PACKET
+#if defined(TRACE) && (TRACE & TRACE_PACKET)
 	printf_s("\n%s, line %d, %d bytes sent.\n", __FILE__, __LINE__, n);
 #endif
 	return n;
@@ -1705,7 +1773,7 @@ l_bailout:
 
 #ifndef OVER_UDP_IPv4
 // Mark sdRecv as disabled
-inline void	CLowerInterface::Disable_sdRecv()
+inline void	CLowerInterface::DisableSocket(SOCKET sdRecv)
 {
 	for (register u_int i = 0; i < sdSet.fd_count; i++)
 	{
@@ -1738,8 +1806,8 @@ inline bool CLowerInterface::IsPrefixDuplicated(int ifIndex, PIN6_ADDR p)
 
 //
 // Given
-//	IPv6_HEADER *		[out] the header to be filled
-//	short				the message length
+//	PFSP_SINKINF 		[out] pointer to the local 'sink' info to be filled
+//	ALFID_T				the intent ALFID
 //	int					the send-out interface
 //	const SOCKADDR_INET * the destination address
 // Do
@@ -1775,7 +1843,6 @@ inline bool CLowerInterface::IsPrefixDuplicated(int ifIndex, PIN6_ADDR p)
 	extern CONST IN6_ADDR in6addr_6to4prefix;
 	extern CONST IN6_ADDR in6addr_teredoprefix;
  */
-
 bool LOCALAPI CLowerInterface::SelectPath(PFSP_SINKINF pNear, ALFID_T nearId, int ifIndex, const SOCKADDR_INET *sockAddrTo)
 {
 	register u_int i;
@@ -1893,35 +1960,73 @@ l_matched:
 		UDP Hypertext Transfer Protocol over TLS / SSL(HTTPS) Official
 		UDP QUIC(from Chromium) for HTTPS Unofficial
  **/
-inline void CLowerInterface::OnAddIPv6Address(int ifIndex, const SOCKADDR_IN6 & sin6Addr)
+// Note that at run time adding an IPv6 address is done when MibParameterChange event is received
+// This simple algorithm support adding new IPv6 address once only!
+inline void CLowerInterface::OnAddingIPv6Address(NET_IFINDEX ifIndex, const SOCKADDR_IN6 & sin6Addr)
 {
 	// See also LearnAddresses, MakeALFIDsPool, operator::[], AllocItem, FreeItem
 	if (be32toh(*(ALFID_T *)& sin6Addr.sin6_addr.u.Byte[12]) > LAST_WELL_KNOWN_ALFID)
 		return;
 
-	register u_int i = 0;
-	while (i < sdSet.fd_count)
+	register u_int i;
+	for(i = 0; i < sdSet.fd_count; i++)
 	{
-		if (interfaces[i] == ifIndex && memcmp(addresses[i].sin6_addr.u.Byte, sin6Addr.sin6_addr.u.Byte, 12) == 0)
+		if (SOCKADDR_SUBNET(addresses + i) == SOCKADDR_SUBNET(& sin6Addr)
+		 && SOCKADDR_HOSTID(addresses + i) == SOCKADDR_HOSTID(& sin6Addr)
+		 && interfaces[i] == ifIndex
+		 && !BitTest(&disableFlags, i))
 		{
-			if (InterlockedBitTestAndReset(& disableFlags, i))
-				goto l_rebind;
+#if defined(TRACE) && (TRACE & TRACE_ADDRESS)
+			printf_s("Found redundant address configured, index = %d\n", i);
+#endif
 			return;
 		}
-		//
-		i++;
+	}
+	// try to replace the first disabled
+	for (i = 0; i < sdSet.fd_count; i++)
+	{
+		if (interfaces[i] == ifIndex && BitTest(&disableFlags, i))
+		{
+#if defined(TRACE) && (TRACE & TRACE_ADDRESS)
+			printf_s("Found a disabled interface due to address reconfiguration, index = %d\n", i);
+#endif
+			break;
+		}
 	}
 	//
 	if (i >= SD_SETSIZE)
 		return;
-	//
-	//disable select of the new, not yet fully configured socke
-	InterlockedBitTestAndSet(& disableFlags, i);
-	sdSet.fd_count++;
-	addresses[i] = sin6Addr;
+
 	interfaces[i] = ifIndex;
+	InterlockedBitTestAndSet(& ::enableFlags, i);
+}
+
+
+
+// This simple algorithm support one new IPv6 address for each interface only!
+inline void CLowerInterface::OnIPv6AddressMayAdded(NET_IFINDEX ifIndex, const SOCKADDR_IN6 & sin6Addr)
+{
+	// See also LearnAddresses, MakeALFIDsPool, operator::[], AllocItem, FreeItem
+	if (be32toh(*(ALFID_T *)& sin6Addr.sin6_addr.u.Byte[12]) > LAST_WELL_KNOWN_ALFID)
+		return;
+
+	register u_int i;
 	//
-l_rebind:
+	for (i = 0; i <= sdSet.fd_count; i++)
+	{
+		if (interfaces[i] == ifIndex && InterlockedBitTestAndReset(&enableFlags, i))
+		{
+#if defined(TRACE) && (TRACE & TRACE_ADDRESS)
+			printf_s("Try to enable/re-enable an interface, index = %d\n", i);
+#endif
+			break;
+		}
+	}
+	if (i > sdSet.fd_count)
+		return;
+	if (i == sdSet.fd_count)
+		sdSet.fd_count++;
+	//
 	SOCKET sdRecv = socket(AF_INET6, SOCK_RAW, IPPROTO_FSP);
 	if (sdRecv == INVALID_SOCKET)
 	{
@@ -1929,13 +2034,22 @@ l_rebind:
 			sdSet.fd_count = i;
 		return; // throw E_HANDLE;	//??
 	}
-	SetLocalApplicationLayerFiberIDs(i);
-	SetInterfaceOptions(sdRecv);
-	if (::bind(sdRecv, (const sockaddr *)& sin6Addr, sizeof(SOCKADDR_IN6)) < 0)
+	//
+	addresses[i] = sin6Addr;
+	if (::bind(sdRecv, (const sockaddr *)& addresses[i], sizeof(SOCKADDR_IN6)) < 0)
 	{
 		TRACE_HERE("cannot bind to new interface address");
 		return;
 	}
+#if defined(TRACE) && (TRACE & TRACE_ADDRESS)
+	CHAR strIPv6Addr[INET6_ADDRSTRLEN];
+	inet_ntop(AF_INET6, (PVOID)& sin6Addr.sin6_addr, strIPv6Addr, sizeof(strIPv6Addr));
+	printf_s("Set IPv6 interface#%d IPv6 address to %s\n", i, strIPv6Addr);
+#endif
+	if (SetInterfaceOptions(sdRecv) == 0)
+		iRecvAddr = i;
+	//
+	SetLocalApplicationLayerFiberIDs(i);
 	// reenable the new socket. if unnecessary, little harm is done
 	sdSet.fd_array[i] = sdRecv;
 	InterlockedBitTestAndReset(& disableFlags, i);
@@ -1950,20 +2064,44 @@ l_rebind:
 
 
 // Linear search and remove the entry. The set is too small to exploit more complicate search algorithm
-// hard coded: 96 bits == 12 bytes
 // We assume if ever one address is removed, all the remain address of the same 96-bit prefix, if any, would be eventually removed as well
-inline void CLowerInterface::OnRemoveIPv6Address(int ifIndex, const IN6_ADDR & in6Addr)
+inline void CLowerInterface::OnRemoveIPv6Address(NET_IFINDEX ifIndex, const IN6_ADDR & in6Addr)
 {
 	for (register u_int i = 0; i < sdSet.fd_count; i++)
 	{
-		if (be32toh(*(ALFID_T *)& in6Addr.u.Byte[12]) <= LAST_WELL_KNOWN_ALFID
+		if (be32toh(((PFSP_IN6_ADDR)& in6Addr)->idALF) <= LAST_WELL_KNOWN_ALFID
 		&& interfaces[i] == ifIndex
-		&& memcmp(in6Addr.u.Byte, addresses[i].sin6_addr.u.Byte, 12) == 0)
+		&& ((PFSP_IN6_ADDR)& in6Addr)->idHost == SOCKADDR_HOSTID(addresses + i)
+		&& ((PFSP_IN6_ADDR)& in6Addr)->u.subnet == SOCKADDR_SUBNET(addresses + i))
 		{
 			if (!InterlockedBitTestAndSet(&disableFlags, i))
 			{
-				RemoveALFIDAddressPool(ifIndex);
+				RemoveALFIDAddressPool(ifIndex);	// so, all IP address bound to the same interface is removed
+				//
+				if (sdSet.fd_array[i] == sdPromiscuous)
+				{
+#if defined(TRACE) && (TRACE & TRACE_ADDRESS)
+					printf_s("To disable promiscous mode on IPv6 interface #%d\n", i);
+#endif
+					DisablePromiscuous();
+				}
+				//
 				closesocket(sdSet.fd_array[i]);
+			}
+			// See also CSocketItemEx::OnLocalAdressChanged. It is a special case for effective loop-back
+			// UNRESOLVED!
+			// When porting to Linux should implement a high-effiency local socket, transparently for ULA
+			for (register int j = 0; j < MAX_CONNECTION_NUM; j++)
+			{
+#if defined(TRACE) && (TRACE & TRACE_ADDRESS)
+				printf_s("To disable a effective loopback socket for connection#%d @%d\n", j, i);
+#endif
+				if (SOCKADDR_HOSTID(itemStorage[j].sockAddrTo) == ((PFSP_IN6_ADDR)& in6Addr)->idHost
+				 && SOCKADDR_SUBNET(itemStorage[j].sockAddrTo) == ((PFSP_IN6_ADDR)& in6Addr)->u.subnet)
+				{
+					SOCKADDR_HOSTID(itemStorage[j].sockAddrTo) = 0;
+					SOCKADDR_SUBNET(itemStorage[j].sockAddrTo) = 0;
+				}
 			}
 			return;
 		}
@@ -1984,9 +2122,10 @@ inline void CLowerInterface::OnRemoveIPv6Address(int ifIndex, const IN6_ADDR & i
  **/
 // The information returned in the MIB_UNICASTIPADDRESS_ROW structure is only enough information that an application can
 // call the GetUnicastIpAddressEntry function to query complete information on the IP address that changed. 
+// At run time MibAddInstance is called BEFORE the new IPv6 address is thoroughly configured
 VOID NETIOAPI_API_ OnUnicastIpChanged(PVOID, PMIB_UNICASTIPADDRESS_ROW row, MIB_NOTIFICATION_TYPE notificationType)
 {
-#if 0	// defined(TRACE_PACKET)
+#if defined(TRACE) && (TRACE & TRACE_ADDRESS)
 	printf_s("MIB_NOTIFICATION_TYPE: %d\n", notificationType);
 	switch (notificationType)
 	{
@@ -2014,7 +2153,9 @@ VOID NETIOAPI_API_ OnUnicastIpChanged(PVOID, PMIB_UNICASTIPADDRESS_ROW row, MIB_
 	}
 
 	if (notificationType == MibAddInstance)
-		CLowerInterface::Singleton()->OnAddIPv6Address(row->InterfaceIndex, row->Address.Ipv6);
+		CLowerInterface::Singleton()->OnAddingIPv6Address(row->InterfaceIndex, row->Address.Ipv6);
+	else if (notificationType == MibParameterNotification)
+		CLowerInterface::Singleton()->OnIPv6AddressMayAdded(row->InterfaceIndex, row->Address.Ipv6);
 	else if (notificationType == MibDeleteInstance)
 		CLowerInterface::Singleton()->OnRemoveIPv6Address(row->InterfaceIndex, row->Address.Ipv6.sin6_addr);
 	// else just ignore
