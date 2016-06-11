@@ -247,7 +247,7 @@ inline void CSocketItemEx::ChangeRemoteValidatedIP()
 		if (SOCKADDR_SUBNET(sockAddrTo + i) == SOCKADDR_SUBNET(sockAddrTo + MAX_PHY_INTERFACES)
 		 && SOCKADDR_HOSTID(sockAddrTo + i) == SOCKADDR_HOSTID(sockAddrTo + MAX_PHY_INTERFACES))
 		{
-			sockAddrTo[i] = sockAddrTo[0];	// save the original favorite target IP address
+			SOCKADDR_SUBNET(sockAddrTo + i) = SOCKADDR_SUBNET(sockAddrTo);	// save the original favorite target IP address
 			break;
 		}
 	};
@@ -269,7 +269,7 @@ inline void CSocketItemEx::ChangeRemoteValidatedIP()
 		printf_s("%s: change the favorite target IP to the source IP address of the new received packet.\n", __FUNCTION__);
 	}
 #endif
-	sockAddrTo[0] = sockAddrTo[MAX_PHY_INTERFACES];
+	SOCKADDR_SUBNET(sockAddrTo) = SOCKADDR_SUBNET(sockAddrTo + MAX_PHY_INTERFACES);
 #endif
 }
 
@@ -382,7 +382,7 @@ bool CSocketItemEx::ValidateICC(FSP_NormalPacketHeader *p1, int32_t ctLen, uint3
 		printf_s("\nPrecomputed ICC: ");
 		DumpNetworkUInt16((uint16_t *) & contextOfICC.curr.precomputedICC[1], sizeof(uint64_t) / 2);
 #endif
-		// well, well, send is not the same as receive...
+		// CRC64 is the initial integrity check algorithm
 		p1->integrity.code = contextOfICC.curr.precomputedICC[1];
 		r = (tag[0] == CalculateCRC64(0, (uint8_t *)p1, sizeof(FSP_NormalPacketHeader)));
 	}
@@ -408,7 +408,6 @@ bool CSocketItemEx::ValidateICC(FSP_NormalPacketHeader *p1, int32_t ctLen, uint3
 		GCM_AES_XorSalt(pCtx, salt);
 		p1->integrity.id.source = fidPair.peer;
 		p1->integrity.id.peer = fidPair.source;
-		// CRC64 is the initial integrity check algorithm
 		r = (GCM_AES_AuthenticateAndDecrypt(pCtx, *(uint64_t *)p1
 			, (const uint8_t *)p1 + byteA, ctLen
 			, (const uint64_t *)p1 + 1, byteA - sizeof(uint64_t)
@@ -419,6 +418,57 @@ bool CSocketItemEx::ValidateICC(FSP_NormalPacketHeader *p1, int32_t ctLen, uint3
 	}
 	p1->integrity.code = tag[0];
 	if(! r)
+		return false;
+
+	ChangeRemoteValidatedIP();
+	return true;
+}
+
+
+
+// Given
+//	FSP_NormalPacketHeader *	The pointer to the fixed header
+//	int32_t						The size of the ciphertext
+//	ALFID_T						The source application fiber ID
+//	uint32_t					The xor'ed salt
+// Return
+//	true if all of the headers passed authentication and the optional payload successfully decrypted
+// Remark
+//	Assume the headers are 64-bit aligned
+//	It is for MULTIPLY, COMMIT and PERSIST command packet where the source ALFID is freshly incarnated
+//	ONLY strongly secured session might be cloned
+bool CSocketItemEx::ValidateICC(FSP_NormalPacketHeader *p1, int32_t ctLen, ALFID_T idSource, uint32_t salt)
+{
+	ALIGN(MAC_ALIGNMENT) uint64_t tag[FSP_TAG_SIZE / sizeof(uint64_t)];
+
+	tag[0] = p1->integrity.code;
+#if defined(TRACE) && (TRACE & TRACE_PACKET)
+	printf_s("Before GCM_AES_AuthenticateAndDecrypt:\n");
+	DumpNetworkUInt16((uint16_t *)p1, sizeof(FSP_NormalPacketHeader) / 2);
+#endif
+	uint32_t seqNo = be32toh(p1->sequenceNo);
+	bool r;
+	GCM_AES_CTX *pCtx = int32_t(seqNo - contextOfICC.firstRecvSNewKey) < 0
+		? &contextOfICC.prev.gcm_aes
+		: &contextOfICC.curr.gcm_aes;
+	uint32_t byteA = be16toh(p1->hs.hsp);
+	if (byteA < sizeof(FSP_NormalPacketHeader) || byteA > MAX_LLS_BLOCK_SIZE || (byteA & (sizeof(uint64_t) - 1)) != 0)
+		return false;
+
+	GCM_AES_XorSalt(pCtx, salt);
+	p1->integrity.id.source = idSource;	// instead of 'fidPair.peer';
+	p1->integrity.id.peer = fidPair.source;
+	// CRC64 is the initial integrity check algorithm
+	r = (GCM_AES_AuthenticateAndDecrypt(pCtx, *(uint64_t *)p1
+		, (const uint8_t *)p1 + byteA, ctLen
+		, (const uint64_t *)p1 + 1, byteA - sizeof(uint64_t)
+		, (const uint8_t *)tag, FSP_TAG_SIZE
+		, (uint64_t *)p1 + byteA / sizeof(uint64_t))
+		== 0);
+	GCM_AES_XorSalt(pCtx, salt);
+
+	p1->integrity.code = tag[0];
+	if (!r)
 		return false;
 
 	ChangeRemoteValidatedIP();
@@ -493,7 +543,7 @@ bool CSocketItemEx::EmitStart()
 	}
 
 #if defined(TRACE) && (TRACE & TRACE_PACKET)
-	printf_s("Session#%u emit %s, result = %d, time : 0x%016llX\n"
+	printf_s("Session#0x%X emit %s, result = %d, time : 0x%016llX\n"
 		, fidPair.source, opCodeStrings[skb->opCode], result, tRecentSend);
 #endif
 	if(result > 0)
@@ -578,35 +628,10 @@ bool LOCALAPI CSocketItemEx::EmitWithICC(ControlBlock::PFSP_SocketBuf skb, Contr
 #ifndef OVER_UDP_IPv4
 void CSocketItemEx::OnLocalAddressChanged()
 {
-	if(! IsInUse() || IsPassive())
+	if(!IsInUse() || IsPassive() || !TestAndWaitReady())
 		return;
-
-	FSPOperationCode opCode = (pControlBlock->HasBeenCommitted() > 0) ? ACK_FLUSH : KEEP_ALIVE;
-#if defined(TRACE) && (TRACE & TRACE_ADDRESS)
-	printf_s("Line %d @ %s\n\tTo make acknowledgement: %s [%d]\n", __LINE__, __FUNCTION__, opCodeStrings[opCode], opCode);
-#endif
-	ControlBlock::seq_t seqExpected;
-	struct
-	{
-		FSP_NormalPacketHeader	hdr;
-		FSP_ConnectParam		mp;
-		FSP_PreparedKEEP_ALIVE	snack;
-	} buf;
-
-	int32_t len = GenerateSNACK(buf.snack, seqExpected,  sizeof(FSP_NormalPacketHeader) + sizeof(FSP_ConnectParam));
-#if defined(TRACE) && (TRACE & (TRACE_ADDRESS | TRACE_HEARTBEAT))
-	printf_s("Keep-alive local fiber#%u\n"
-		"\tAcknowledged seq#%u, keep-alive header size = %d\n"
-		, fidPair.source
-		, seqExpected
-		, len);
-#endif
-	if (len < sizeof(FSP_SelectiveNACK) + sizeof(FSP_NormalPacketHeader) + sizeof(FSP_ConnectParam))
-	{
-		printf_s("Fatal error %d encountered when generate SNACK, bundled with MOBILE_PARAM\n", len);
-		return;
-	}
-
+	
+	FSP_ConnectParam &mp = keepAliveCache.buf3.mp;
 	u_int k = CLowerInterface::Singleton()->sdSet.fd_count;
 	u_int j = 0;
 	LONG w = CLowerInterface::Singleton()->disableFlags;
@@ -614,33 +639,27 @@ void CSocketItemEx::OnLocalAddressChanged()
 	{
 		if (!BitTest(&w, i))
 		{
-			buf.mp.subnets[j++] = SOCKADDR_SUBNET(&CLowerInterface::Singleton()->addresses[i]);
-			if (j >= sizeof(buf.mp.subnets) / sizeof(uint64_t))
+			mp.subnets[j++] = SOCKADDR_SUBNET(&CLowerInterface::Singleton()->addresses[i]);
+			if (j >= sizeof(mp.subnets) / sizeof(uint64_t))
 				break;
 		}
 	}
 	// temporarily there is no path to the local end:
 	if (j <= 0)
-		return;
+		goto l_return;
 	//
-	while(j < sizeof(buf.mp.subnets) / sizeof(uint64_t))
+	while(j < sizeof(mp.subnets) / sizeof(uint64_t))
 	{
-		buf.mp.subnets[j] = buf.mp.subnets[j - 1];
+		mp.subnets[j] = mp.subnets[j - 1];
 		j++;
 	}
 	//^Let's the compiler do loop-unrolling
-	buf.mp.idHost = SOCKADDR_HOSTID(&CLowerInterface::Singleton()->addresses[0]);
-	buf.mp.hs.Set(MOBILE_PARAM, sizeof(FSP_NormalPacketHeader));
-
-	// Both KEEP_ALIVE and ACK_FLUSH are payloadless out-of-band control block which always apply current session key
-	buf.hdr.Set(pControlBlock->sendWindowNextSN - 1, seqExpected, pControlBlock->RecvWindowSize(), opCode, len);
-	SetIntegrityCheckCode(& buf.hdr, NULL, 0, buf.snack.GetSaltValue());
-	// See also CSocketItemEx::SendSNACK
-#if defined(TRACE) && (TRACE & TRACE_ADDRESS)
-	printf_s("To send KEEP_ALIVE seq #%u, acknowledge #%u, source ALFID = %u\n", be32toh(buf.hdr.sequenceNo), seqExpected, fidPair.source);
-	printf_s("KEEP_ALIVE total header length: %d, including mobile parameter\n", len);
-	DumpNetworkUInt16((uint16_t *)& buf, len / 2);
-#endif
+	mp.idHost = SOCKADDR_HOSTID(&CLowerInterface::Singleton()->addresses[0]);
+	mp.hs.Set(MOBILE_PARAM, sizeof(FSP_NormalPacketHeader));
+	
+	keepAliveCache.needAck = true;
+	if(!RefreshKeepAliveCache((pControlBlock->HasBeenCommitted() > 0) ? ACK_FLUSH : KEEP_ALIVE))
+		goto l_return;
 
 	// If destination interface happen to be on the same host, update the registered address simultaneously
 	// UNRESOLVED!? The default interface should be the one that is set to promiscuous
@@ -651,7 +670,14 @@ void CSocketItemEx::OnLocalAddressChanged()
 		SOCKADDR_HOSTID(sockAddrTo) = SOCKADDR_HOSTID(p);
 	}
 
-	SendPacket(1, ScatteredSendBuffers(&buf, len));
+	SendPacket(1, ScatteredSendBuffers(&keepAliveCache.hdr, keepAliveCache.len));
+	//
+	if(lowState == PEER_COMMIT || lowState == CLOSABLE)
+		RestartKeepAlive();
+
+l_return:
+	// leave the critical section only when len has been exploited
+	SetReady();
 }
 #endif
 
@@ -678,6 +704,10 @@ bool LOCALAPI CSocketItemEx::HandleMobileParam(PFSP_HeaderSignature optHdr)
 #endif
 	//
 #endif
+	// For mobility support (acknowledgement to the MOBILE_PARAM header)
+	if (lowState == PEER_COMMIT || lowState == CLOSABLE)
+		SendSNACK(ACK_FLUSH);	// Retransmitted. See also ValidateSNACK
+	//
 	return true;
 }
 
@@ -734,18 +764,18 @@ void CSocketItemEx::EmitQ()
 
 // An auxillary function handling the fixed header
 // Given
+//	FSPOperationCode
+//	uint16_t	The total length of all the headers
 //	uint32_t	The sequenceNo field in host byte order
 //	uint32_t	The expectedNo field in host byte order
 //	uint32_t	The advertised receive window size, in host byte order
-//	uint8_t		The opCode
-//	uint16_t	The total length of all the headers
 // Do
 //	Filled in the fixed header
-void LOCALAPI FSP_NormalPacketHeader::Set(uint32_t seqThis, uint32_t seqExpected, int32_t advRecvWinSize, uint8_t code, uint16_t hsp)
+void LOCALAPI FSP_NormalPacketHeader::Set(FSPOperationCode code, uint16_t hsp, uint32_t seqThis, uint32_t seqExpected, int32_t advRecvWinSize)
 {
+	hs.Set(code, hsp);
 	expectedSN = htobe32(seqExpected);
 	sequenceNo = htobe32(seqThis);
 	ClearFlags();
 	SetRecvWS(advRecvWinSize);
-	hs.Set(code, hsp);
 }

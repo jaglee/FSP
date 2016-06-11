@@ -706,17 +706,11 @@ inline void CLowerInterface::ProcessRemotePacket()
 		throw E_INVALIDARG;
 	}
 	//
-	struct timeval timeout;
-	timeout.tv_sec = 2;	// CONNECT_INITIATION_TIMEOUT_ms / 1000 / 3;
-	timeout.tv_usec = 500000;	// an arbitary, hard-coded time-out value for easy of mobile handling
 	do
 	{
 		// make it as compatible as possible...
 		FD_ZERO(& readFDs);
 		r = 0;
-#if defined(TRACE) && (TRACE & TRACE_ADDRESS)
-		printf_s("Number of register socket = %d\n", sdSet.fd_count);
-#endif
 		for(i = 0; i < (int)sdSet.fd_count; i++)		
 #ifndef OVER_UDP_IPv4
 		if(! BitTest(& disableFlags, i))
@@ -725,6 +719,9 @@ inline void CLowerInterface::ProcessRemotePacket()
 			FD_SET(sdSet.fd_array[i], & readFDs);
 			r++;
 		}
+#if !defined(OVER_UDP_IPv4) && defined(TRACE) && (TRACE & TRACE_ADDRESS)
+		printf_s("Number of registered socket = %d, usable = %d\n", sdSet.fd_count, r);
+#endif
 		// during hand-off there might be no IPv6 interface available
 		// for simplicity hard code the polling interval.
 		// a more sophisticated implementation should be event-driven - wait the IP change event instead
@@ -737,14 +734,8 @@ inline void CLowerInterface::ProcessRemotePacket()
 		// 'select' success while following WSARecvMsg will fail
 		// Cannot receive packet information, error code = 10038
 		// Error: An operation was attempted on something that is not a socket.
-		r = select(readFDs.fd_count, & readFDs, NULL, NULL, & timeout);
-		if(r == 0)
-		{
-#if defined(TRACE) && (TRACE & TRACE_ADDRESS)
-			printf_s("Select timed-out\n");
-#endif
-			continue;
-		}
+		// a more sophisticated implementation should be asynchronous on reading/receiving
+		r = select(readFDs.fd_count, & readFDs, NULL, NULL, NULL);
 		if(r == SOCKET_ERROR)
 		{
 			int	err = WSAGetLastError();
@@ -771,10 +762,17 @@ inline void CLowerInterface::ProcessRemotePacket()
 			mesgInfo.dwFlags = 0;
 			r = AcceptAndProcess(readFDs.fd_array[i]);
 			SetMutexFree();
-			if(r == E_ABORT)
-				return;
 			if (r == E_FAIL)
 				DisableSocket(readFDs.fd_array[i]);
+			else if(r != 0)
+#ifndef TRACE
+				throw -r;	// UNRESOLVED! Unrecoverable?
+#else
+			{
+				printf_s("AcceptAndProcess error return %d\n", r);
+				continue;	// so it could be debug-recovered
+			}
+#endif
 		}
 	} while(1, 1);
 }
@@ -877,11 +875,18 @@ int CLowerInterface::AcceptAndProcess(SOCKET sdRecv)
 		if(pSocket == NULL)
 		{
 #ifdef TRACE
-			printf_s("Cannot map socket for local fiber#%u\n", GetLocalFiberID());
+			printf_s("Cannot map socket for local fiber#0x%X, opCode: %s[%d]\n", GetLocalFiberID(), opCodeStrings[opCode], opCode);
 #endif
 			break;
 		}
-		if(pSocket->fidPair.peer != pktBuf->idPair.source)		// note that pktBuf is the received
+		// MULTIPLY is semi-out-of-band COMMAND starting from a fresh new ALFID. Note that pktBuf is the received
+		// In the CLONING state COMMIT or PERSIST is the legitimate acknowledgement to MULTIPLY,
+		// while the acknowledgement itself shall typically originate from some new ALFID.
+		// && !(opCode == MULTIPLY || (opCode == PERSIST || opCode == COMMIT) && pSocket->lowState == CLONING)
+		if(pSocket->fidPair.peer != pktBuf->idPair.source	// it should be rare
+			&& opCode != MULTIPLY
+			&& (pSocket->lowState != CLONING || opCode != PERSIST && opCode != COMMIT)
+		)
 		{
 #ifdef TRACE
 			printf_s("Source fiber ID #%u the packet does not matched context\n", GetRemoteFiberID());
@@ -1843,18 +1848,9 @@ inline bool CLowerInterface::IsPrefixDuplicated(int ifIndex, PIN6_ADDR p)
 	extern CONST IN6_ADDR in6addr_6to4prefix;
 	extern CONST IN6_ADDR in6addr_teredoprefix;
  */
-bool LOCALAPI CLowerInterface::SelectPath(PFSP_SINKINF pNear, ALFID_T nearId, int ifIndex, const SOCKADDR_INET *sockAddrTo)
+bool LOCALAPI CLowerInterface::SelectPath(PFSP_SINKINF pNear, ALFID_T nearId, NET_IFINDEX ifIndex, const SOCKADDR_INET *sockAddrTo)
 {
 	register u_int i;
-	if(ifIndex > 0)
-	{
-		for (i = 0; i < sdSet.fd_count; i++)
-		{
-			if (!BitTest(&disableFlags, i) && interfaces[i] == ifIndex)
-				goto l_matched;
-		}
-	}
-
 	// Link-local first
 	if (*(int64_t *)& sockAddrTo->Ipv6.sin6_addr.u == *(int64_t *)& in6addr_linklocalprefix.u)	// hard coded 8 byte address prefix lenth
 	{
@@ -1898,6 +1894,7 @@ bool LOCALAPI CLowerInterface::SelectPath(PFSP_SINKINF pNear, ALFID_T nearId, in
 		if (!BitTest(& disableFlags, i))
 		{
 			if(addresses[i].sin6_scope_id == sockAddrTo->Ipv6.sin6_scope_id
+				&& (ifIndex == 0 || interfaces[i] == ifIndex)
 				&& *(int64_t *)& addresses[i].sin6_addr.u != *(int64_t *)& in6addr_linklocalprefix.u
 				&& addresses[i].sin6_addr.u.Word[0] != in6addr_6to4prefix.u.Word[0]
 				&& *(int32_t *)& addresses[i].sin6_addr.u.Word[0] != *(int32_t *)& in6addr_teredoprefix.u
@@ -2024,16 +2021,10 @@ inline void CLowerInterface::OnIPv6AddressMayAdded(NET_IFINDEX ifIndex, const SO
 	}
 	if (i > sdSet.fd_count)
 		return;
-	if (i == sdSet.fd_count)
-		sdSet.fd_count++;
 	//
 	SOCKET sdRecv = socket(AF_INET6, SOCK_RAW, IPPROTO_FSP);
 	if (sdRecv == INVALID_SOCKET)
-	{
-		if (i + 1 == sdSet.fd_count)
-			sdSet.fd_count = i;
 		return; // throw E_HANDLE;	//??
-	}
 	//
 	addresses[i] = sin6Addr;
 	if (::bind(sdRecv, (const sockaddr *)& addresses[i], sizeof(SOCKADDR_IN6)) < 0)
@@ -2051,6 +2042,7 @@ inline void CLowerInterface::OnIPv6AddressMayAdded(NET_IFINDEX ifIndex, const SO
 	//
 	SetLocalApplicationLayerFiberIDs(i);
 	// reenable the new socket. if unnecessary, little harm is done
+	InterlockedCompareExchange(&sdSet.fd_count, i + 1, i);
 	sdSet.fd_array[i] = sdRecv;
 	InterlockedBitTestAndReset(& disableFlags, i);
 

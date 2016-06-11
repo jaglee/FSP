@@ -30,56 +30,124 @@
  */
 #include "FSP_DLL.h"
 
-
-/*
-SIO_ENABLE_CIRCULAR_QUEUEING
-Indicates to the underlying message-oriented service provider that
-a newly arrived message should never be dropped because of a buffer queue overflow.
-Instead, the oldest message in the queue should be eliminated in order to accommodate the newly arrived message.
-No input and output buffers are required.
-Note that this IOCTL is only valid for sockets associated with unreliable, message-oriented protocols.
-The WSAENOPROTOOPT error code is indicated for service providers that do not support this IOCTL.
-*/
 /**
-6.3  ConnectMU
-(1)	上层应用调用DLL中ConnectMU函数，指定希望复制的FSP连接句柄远、连接成功（或明确失败）时的回调函数、Milk-transport旗标，以及可选的背载发送数据块；
-(2)	DLL按协议要求，生成向远端发送连接复制报文，并将该报文置为发送队列头（其中如有背载数据，则参照WriteTo处理）；
-(3)	DLL向LLS传递参数，参数传递方式同Connect2；
-(4)	LLS分配新的本端Session ID，并按协议规定动作发送位于发送队列头的报文；
-(5)	LLS在检查接收到的连接应答报文ICC无误后，将所接收报文置入接收队列，然后触发同步事件；
-(6)	DLL的事件等待工作线程获取返回结果，调用上层应用提供的回调函数，如果上层应用确认接受连接（并根据需要继续做收发数据或其他处理），则DLL使连接进入ACTIVE状态（其中如果有背载数据，则参照RecvInline处理）；如果上层应用因故拒绝连接，则DLL通过Reject命令告知LLS回应RESET并释放资源。
-(7)	可能发生的异常：
-i.	上层应用传递的发送缓冲区和/或接收缓冲区大小超过实现限制；
-ii.	被复制连接不可用；
-iii.	无空闲的本地Session ID；
-iv.	无法创建异步通讯所用的线程池；
-v.	远端拒绝连接复制（远端因无空闲的Session ID等原因，回复带有拒绝码的Reset报文）；
-vi.	超时；
-vii.	其他运行时错误。
-**/
+  Multiply
+  - Generate MULTIPLY packet, encapsulate optional payload
+  - Call LLS
+  LLS/SynConnection
+  - Allocate session ID
+  - Transmit the start packet
+  The peer' LLS:
+  - OnGetMultiply
+	- Check redundant
+	- Check ICC
+	- Put to backlog
+  The peer's DLL:
+  - WaitEventToDispatch, ToWelcomeMultiply
+	- Send PERSIST/COMMIT
+  The nearend's LLS:
+  - OnGetCommit/OnGetPersist
+	- Update peer's ID
+  The nearend's DLL
+	- Continue to send
+ */
+
 //[API: Multiply]
 //	NON_EXISTENT-->CLONING-->[Send MULTIPLY]{enable retry}
 // UNRESOLVED! ALLOCATED NEW SESSION ID in LLS?
 // Given
 //	FSPHANDLE		the handle of the parent FSP socket to be multiplied
 //	PFSP_Context	the pointer to the parameter structure of the socket to create by multiplication
+//	FlagEndOfMessage
+//	NotifyOrReturn	the callback function pointer
 // Return
 //	the handle of the new created socket
 //	or NULL if there is some immediate error, more information may be got from the flags set in the context parameter
 // Remark
+//	The payload piggybacked should be specified by the 'welcome' message, where might be of zero length
 //	Even the function return no immediate error, the callback function may be called with a NULL FSPHANDLE
 //	which indicate some error has happened. In that case ULA might make further investigation by calling GetLastFSPError()
+//	See also SendStream, FinalizeSend
 DllExport
-FSPHANDLE FSPAPI ConnectMU(FSPHANDLE hFSP, PFSP_Context psp1)
+FSPHANDLE FSPAPI MultiplyAndWrite(FSPHANDLE hFSP, PFSP_Context psp1, FlagEndOfMessage flag, NotifyOrReturn fp1)
 {
 	TRACE_HERE("called");
-	if(hFSP == NULL)
+
+	CommandNewSession objCommand;
+	CSocketItemDl *p = CSocketItemDl::ToPrepareMultiply((CSocketItemDl *)hFSP, psp1, objCommand);
+	if(p == NULL)
+		return p;
+
+	if(psp1->welcome != NULL)
+	{
+		p->pendingSendBuf = (BYTE *)psp1->welcome;
+		p->bytesBuffered = 0;
+		p->TestSetSendReturn(fp1);
+		p->CheckCommitOrRevert(flag);
+		// pendingSendSize set in BufferData
+		p->BufferData(psp1->len);
+		p->SetNewTransaction();
+	}
+
+	return p->CallCreate(objCommand, SynConnection);
+}
+
+
+
+
+// given
+//	the handle of the FSP socket whose connection is to be duplicated,
+//	the pointer to the socket parameter
+//	[inout] pointer to the placeholder of an integer specifying the the minimum requested size of the buffer
+//	the pointer to the callback function
+// return
+//	the handle of the new created socket
+//	or NULL if there is some immediate error, more information may be got from the flags set in the context parameter
+// remark
+//	The MULTIPLY request is sent to the remote peer only when following SendInPlace was called
+//	The handle returned might be useless, if CallbackConnected report error laterly
+//	the capacity of immediately available buffer (might be 0) is outputted in the reference
+//	As it is in CLONING state if onBufferReady is specified, it would be called but data would just be prebuffered
+//	See also InquireSendBuf, SendInplace, FinalizeSend
+DllExport
+FSPHANDLE FSPAPI MultiplyAndGetSendBuffer(FSPHANDLE hFSP, PFSP_Context psp1, int *pSize, CallbackBufferReady onBufferReady)
+{
+	TRACE_HERE("called");
+
+	CommandNewSession objCommand;
+	CSocketItemDl *p = CSocketItemDl::ToPrepareMultiply((CSocketItemDl *)hFSP, psp1, objCommand);
+	if(p == NULL)
+		return p;
+
+	if(pSize != NULL && *pSize > 0)
+	{
+		p->pendingSendSize = *pSize;
+		//
+		void *buf = p->pControlBlock->InquireSendBuf(*pSize);
+		if(buf == NULL)
+		{
+			socketsTLB.FreeItem(p);
+			return NULL;
+		}
+		//
+		if(onBufferReady != NULL)
+			onBufferReady(p, buf, *pSize);
+	}
+
+	return p->CallCreate(objCommand, SynConnection);
+}
+
+
+
+
+CSocketItemDl * LOCALAPI CSocketItemDl::ToPrepareMultiply(CSocketItemDl *p, PFSP_Context psp1, CommandNewSession &)
+{
+	TRACE_HERE("called");
+	if(p == NULL)
 	{
 		psp1->u.flags = EBADF;
 		return NULL;
 	}
-
-	TRACE_HERE("called");
 
 	// TODO: SHOULD inherit the latest effective near address
 	IN6_ADDR addrAny = IN6ADDR_ANY_INIT;
@@ -91,13 +159,34 @@ FSPHANDLE FSPAPI ConnectMU(FSPHANDLE hFSP, PFSP_Context psp1)
 		psp1->u.flags = EBADF;	// E_HANDLE;
 		return NULL;
 	}
-	// TODO: SHOULD constuct the MULTIPLY command packet
 
 	// TODO: SHOULD install a new, derived session key!
-	// socketItem->pControlBlock->connectParams = ...;
-	// Unlike CONNECT_REQUEST, MULTIPLY do start a new transmit transaction
-	socketItem->SetNewTransaction();
-	return socketItem->CallCreate(objCommand, SynConnection);
+	try
+	{
+		memcpy(& socketItem->pControlBlock->connectParams, & p->pControlBlock->connectParams, FSP_MAX_KEY_SIZE);
+	}
+	catch(int)	// could we really catch run-time memory access exception?
+	{
+		socketsTLB.FreeItem(socketItem);
+		return NULL;
+	}
+
+	socketItem->ToPrepareMultiply();
+
+	return socketItem;
+}
+
+
+
+void CSocketItemDl::ToPrepareMultiply()
+{
+	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend();
+	skb->opCode = MULTIPLY;
+	skb->len = 0;
+	skb->InitFlags();	// locked, incomplete
+
+	SetState(CLONING);
+	SetNewTransaction();
 }
 
 
@@ -110,7 +199,7 @@ FSPHANDLE FSPAPI ConnectMU(FSPHANDLE hFSP, PFSP_Context psp1)
 bool LOCALAPI CSocketItemDl::ToWelcomeMultiply(BackLogItem & backLog)
 {
 	// Multiply: but the upper layer application may still throttle it...fpRequested CANNOT read or write anything!
-	PFSP_IN6_ADDR remoteAddr = (PFSP_IN6_ADDR) & pControlBlock->peerAddr.ipFSP.allowedPrefixes[MAX_PHY_INTERFACES-1];
+	PFSP_IN6_ADDR remoteAddr = (PFSP_IN6_ADDR) & pControlBlock->peerAddr.ipFSP.allowedPrefixes[MAX_PHY_INTERFACES - 1];
 	SetNewTransaction();
 	if( fpRequested == NULL	// This is NOT the same policy as ToWelcomeConnect
 	 || fpRequested(this, & backLog.acceptAddr, remoteAddr) < 0 )

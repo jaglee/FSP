@@ -158,7 +158,7 @@ void LOCALAPI CSocketItemEx::Listen(CommandNewSessionSrv &cmd)
 void CSocketItemEx::Connect()
 {
 #ifdef TRACE
-	printf_s("Try to make connection to %s (@local fiber#%u)\n", PeerName(), fidPair.source);
+	printf_s("Try to make connection to %s (@local fiber#0x%X)\n", PeerName(), fidPair.source);
 #endif
 	char nodeName[INET6_ADDRSTRLEN];
 	char *peerName = PeerName();

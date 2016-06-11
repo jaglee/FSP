@@ -211,13 +211,13 @@ extern CStringizeNotice noticeNames;
 
 struct $FSP_HeaderSignature: FSP_HeaderSignature
 {
-	template<typename THdr, BYTE opCode1> void Set()
+	template<typename THdr, FSPOperationCode opCode1> void Set()
 	{
 		version = THIS_FSP_VERSION;
 		opCode = opCode1;
 		hsp = htobe16(sizeof(THdr));
 	}
-	void Set(BYTE opCode1, int len1)
+	void Set(FSPOperationCode opCode1, int len1)
 	{
 		version = THIS_FSP_VERSION;
 		opCode = opCode1;
@@ -256,8 +256,8 @@ struct FSP_NormalPacketHeader
  */
 	$FSP_HeaderSignature hs;
 
-	// Given sequenceNo, expectedNo, receive window size and total length of all the headers
-	void LOCALAPI Set(uint32_t, uint32_t, int32_t, uint8_t, uint16_t);
+	// Given the opCode, total length of all the headers, sequenceNo, expectedNo and receive window size
+	void LOCALAPI Set(FSPOperationCode, uint16_t, uint32_t, uint32_t, int32_t);
 
 	// A bruteforce but safe method of set or retrieve recvWS, with byte order translation
 	int32_t GetRecvWS() const { return ((int32_t)flags_ws[0] << 16) + (flags_ws[1] << 8) + flags_ws[2]; }
@@ -455,7 +455,7 @@ struct SConnectParam	// MUST be aligned on 64-bit words!
 
 	// For sake of SCB reuse we arranged to save remained key life in the timeDelta field
 	__declspec(property(get = getKeyLife, put = setKeyLife))
-		int32_t	keyLife;
+	int32_t	keyLife;
 	int32_t getKeyLife() const { return timeDelta; }
 	void setKeyLife(int32_t value) { timeDelta = value; } 
 
@@ -640,7 +640,7 @@ struct ControlBlock
 		int32_t		len;
 		uint16_t	flags;
 		uint8_t		version;	// should be the same as in the FSP fixed header
-		uint8_t		opCode;		// should be the same as in the FSP fixed header
+		FSPOperationCode opCode;// should be the same as in the FSP fixed header
 		//
 #if ARCH_BIG_ENDIAN
 		template<SocketBufFlagBitPosition i>

@@ -18,6 +18,8 @@ static int	FSPAPI onReceiveNextBlock(FSPHANDLE, void *, int32_t, bool);
 //
 static void FSPAPI onAcknowledgeSent(FSPHANDLE, FSP_ServiceCode, int);
 
+//
+extern int	FSPAPI onMultiplying(FSPHANDLE, PFSP_SINKINF, PFSP_IN6_ADDR);
 
 static unsigned char bufPrivateKey[CRYPTO_NACL_KEYBYTES];
 static unsigned char bufPublicKey[CRYPTO_NACL_KEYBYTES];
@@ -130,7 +132,7 @@ int main(int argc, char *argv[])
 
 	FSP_SocketParameter parms;
 	memset(& parms, 0, sizeof(parms));
-	// parms.beforeAccept = NULL;
+	//parms.beforeAccept = onMultiplying;
 	parms.afterAccept = onConnected;
 	parms.onError = onNotice;
 	parms.onFinish = onServerClose;

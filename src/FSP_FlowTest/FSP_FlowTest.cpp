@@ -96,20 +96,20 @@ void UnitTestICC()
 	FSP_NormalPacketHeader &request = storage.hdr;
 	request.hs.Set<FSP_NormalPacketHeader, PURE_DATA>();
 
-	request >>= FIRST_SN;
+	request.sequenceNo = FIRST_SN;
 	socket.SetIntegrityCheckCode(& request);
 	//
 	bool checked = socketR2.ValidateICC(& request);
 	assert(checked);
 
-	request >>= FIRST_SN - 1;
+	request.sequenceNo = FIRST_SN - 1;
 	socket.SetIntegrityCheckCode(& request);
 	//
 	checked = socketR2.ValidateICC(& request);
 	assert(checked);
 
 	// should apply AES-GCM
-	request >>= FIRST_SN + 1;
+	request.sequenceNo = FIRST_SN + 1;
 	socket.SetIntegrityCheckCode(& request);
 	//
 	checked = socketR2.ValidateICC(& request);
@@ -154,17 +154,24 @@ void UnitTestICC()
 
 	// See also: timer.cpp::KeepAlive
 	ControlBlock::seq_t seq0;
-	FSP_PreparedKEEP_ALIVE buf;
-	int sizeSNACK = socketR2.GenerateSNACK(buf, seq0);
-	uint32_t salt = buf.ackTime;
+	struct
+	{
+		FSP_NormalPacketHeader hdr;
+		FSP_PreparedKEEP_ALIVE buf;
+	} mp;
+	int sizeSNACK = socketR2.GenerateSNACK(mp.buf, seq0, sizeof(FSP_NormalPacketHeader));
+	uint32_t salt = mp.buf.sentinel.serialNo;
 	printf_s("Size of the SNACK header = %d, expected SN = %u, salt=0x%X\n", sizeSNACK, seq0, salt);
 
-	buf.hdr.hs.Set<KEEP_ALIVE>(sizeof(FSP_NormalPacketHeader) + sizeSNACK);
-	pSCB->SetSequenceFlags(& buf.hdr, seq0);
+	mp.hdr.hs.Set(KEEP_ALIVE, sizeof(FSP_NormalPacketHeader) + sizeSNACK);
+	pSCB->SetSequenceFlags(& mp.hdr, seq0);
 	//
-	socketR2.SetIntegrityCheckCode(& buf.hdr, NULL, 0, salt);
+	socketR2.SetIntegrityCheckCode(& mp.hdr, NULL, 0, salt);
 
-	checked = socket.ValidateICC(& buf.hdr, 0, salt);
+	checked = socket.ValidateICC(& mp.hdr, 0, salt);
+	assert(checked);
+
+	checked = socket.ValidateICC(& mp.hdr, 0, socket.fidPair.peer, salt);
 	assert(checked);
 }
 
@@ -217,11 +224,11 @@ void UnitTestTweetNacl()
  */
 int _tmain(int argc, _TCHAR* argv[])
 {
-	FlowTestAcknowledge();
+	//FlowTestAcknowledge();
 	FlowTestRetransmission();
 
 	//UnitTestCRC();
-	//UnitTestICC();
+	UnitTestICC();
 
 	//TrySRP6();
 	//UnitTestTweetNacl();

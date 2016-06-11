@@ -45,7 +45,7 @@ struct _CookieMaterial
 
 #if defined(TRACE) && (TRACE & TRACE_HEARTBEAT) && (TRACE & TRACE_PACKET)
 #define TRACE_SOCKET()	\
-	(printf_s("%s local fiber#%u in state %s\n", __FUNCTION__	\
+	(printf_s("%s local fiber#0x%X in state %s\n", __FUNCTION__	\
 		, fidPair.source		\
 		, stateNames[lowState])	\
 	&& pControlBlock->DumpSendRecvWindowInfo())
@@ -331,8 +331,6 @@ void LOCALAPI CLowerInterface::OnGetConnectRequest()
 
 	// lastly, put it into the backlog
 	pSocket->pControlBlock->backLog.Put(& backlogItem);
-	// TODO: handling resurrection failure -- just reuse?
-	// if (pSocket->InState(CLOSED));
 	pSocket->SignalAccepting();
 
 l_return:
@@ -440,14 +438,15 @@ bool LOCALAPI CSocketItemEx::ValidateSNACK(ControlBlock::seq_t & ackSeqNo, FSP_S
 	FSP_SelectiveNACK *pSNACK = (FSP_SelectiveNACK *)((uint8_t *)p1 + offset - sizeof(FSP_SelectiveNACK));
 	uint32_t salt = pSNACK->serialNo;
 	uint32_t sn = be32toh(salt);
-	if(int(headPacket->pktSeqNo - seqLastAck) == 0 && int(sn - lastNAckSN) <= 0)
+
+	if(int(headPacket->pktSeqNo - seqLastAck) == 0 && int(sn - lastOOBSN) <= 0)
 	{
 #ifdef TRACE
 		printf_s("%s has encountered replay attack? sequence number: %u\t%u\n", opCodeStrings[p1->hs.opCode], headPacket->pktSeqNo, sn);
 #endif
 		return false;
 	}
-	lastNAckSN = sn;
+	lastOOBSN = sn;
 
 #if defined(TRACE) && (TRACE & (TRACE_PACKET | TRACE_SLIDEWIN))
 	printf_s("%s data length: %d, header length: %d, peer ALFID = %u\n"
@@ -458,12 +457,20 @@ bool LOCALAPI CSocketItemEx::ValidateSNACK(ControlBlock::seq_t & ackSeqNo, FSP_S
 	DumpNetworkUInt16((uint16_t *)p1, offset / 2);
 #endif
 
-	if(! ValidateICC(p1, 0, salt))
+	if(! ValidateICC(p1, offset - sizeof(FSP_NormalPacketHeader), salt))
 	{
 #ifdef TRACE
 		printf_s("Invalid intergrity check code of %s!? Acknowledged sequence number: %u\n", opCodeStrings[p1->hs.opCode], ackSeqNo);
 #endif
 		return false;
+	}
+
+	// whenever the peer's validated, forwarding KEEP_ALIVE was received the MOBILE_PARAM is marked as acknowledged
+	if (keepAliveCache.needAck && int(keepAliveCache.snExpected - sn) <= 0)
+	{
+		if(lowState == PEER_COMMIT || lowState == CLOSABLE)
+			StopKeepAlive();
+		keepAliveCache.needAck = false;
 	}
 
 	ackSeqNo = be32toh(p1->expectedSN);
@@ -605,20 +612,39 @@ void CSocketItemEx::OnGetPersist()
 		return;
 	}
 
-	if (pControlBlock->IsRetriableStale(headPacket->pktSeqNo))
+	FSP_NormalPacketHeader *p1 = headPacket->GetHeaderFSP();
+	if (lowState != CLONING)	// the normality
 	{
+		if (pControlBlock->IsRetriableStale(headPacket->pktSeqNo))
+		{
 #ifdef TRACE
-		printf_s("Invalid sequence number: %u\n", headPacket->pktSeqNo);
-		pControlBlock->DumpSendRecvWindowInfo();
+			printf_s("Invalid sequence number: %u\n", headPacket->pktSeqNo);
+			pControlBlock->DumpSendRecvWindowInfo();
 #endif
-		return;
+			return;
+		}
+		//
+		if (!ValidateICC())
+		{
+			TRACE_HERE("Invalid intergrity check code!?");
+			return;
+		}
 	}
-
-	if (!ValidateICC())
+	else // if (lowState == CLONING)
 	{
-		TRACE_HERE("Invalid intergrity check code!?");
-		return;
+		if (!ValidateICC(p1, headPacket->lenData, headPacket->idPair.source, 0))
+		{
+			TRACE_HERE("Invalid intergrity check code of PERSIST to MULTIPLY!?");
+			return;
+		}
+		//
+		pControlBlock->SetRecvWindowHead(headPacket->pktSeqNo);
+		seqLastAck = headPacket->pktSeqNo;
+		fidPair.peer = headPacket->idPair.source;
+		CLowerInterface::Singleton()->PutToRTLB(this);
 	}
+	// If ever a PERSIST was accepted the keep-alive cache should be refreshed
+	_InterlockedExchange(&keepAliveCache.len, 0);
 
 	if (InState(ESTABLISHED))
 	{
@@ -626,7 +652,6 @@ void CSocketItemEx::OnGetPersist()
 		return;
 	}
 
-	FSP_NormalPacketHeader *p1 = headPacket->GetHeaderFSP();
 	ControlBlock::seq_t ackSeqNo = be32toh(p1->expectedSN);
 	if (!ResizeSendWindow(ackSeqNo, p1->GetRecvWS()))
 	{
@@ -759,7 +784,7 @@ void CSocketItemEx::OnGetKeepAlive()
 	if(!ValidateSNACK(ackSeqNo, gaps, n))
 		return;
 #if defined(TRACE) && (TRACE & (TRACE_HEARTBEAT | TRACE_PACKET | TRACE_SLIDEWIN))
-	printf_s("Fiber#%u: SNACK packet with %d gap(s) advertised received\n", fidPair.source, n);
+	printf_s("Fiber#0x%X: SNACK packet with %d gap(s) advertised received\n", fidPair.source, n);
 #endif
 	if(acknowledgible && RespondToSNACK(ackSeqNo, gaps, n) > 0)
 		Notify(FSP_NotifyBufferReady);
@@ -898,25 +923,42 @@ void CSocketItemEx::OnGetCommit()
 
 	// As calculate ICC may consume CPU resource intensively we are relunctant to send RESET
 
+	FSP_NormalPacketHeader *p1 = headPacket->GetHeaderFSP();
 	// check the ICC at first, silently discard the packet if ICC check failed
 	// preliminary check of sequence numbers [they are IV on calculating ICC]
 	// UNRESOLVED!? Taking the risk of DoS attack by replayed COMMIT...
 	// TODO: throttle the rate of processing COMMIT by 'early dropping'
-	if (pControlBlock->IsRetriableStale(headPacket->pktSeqNo))
+	if (lowState != CLONING)	// the normality
 	{
+		if (pControlBlock->IsRetriableStale(headPacket->pktSeqNo))
+		{
 #ifdef TRACE
-		printf_s("IsRetriableStale check sequence number:\t %u\n", headPacket->pktSeqNo);
+			printf_s("IsRetriableStale check sequence number:\t %u\n", headPacket->pktSeqNo);
 #endif
-		return;
+			return;
+		}
+		if (!ValidateICC())
+		{
+			TRACE_HERE("Invalid intergrity check code!?");
+			return;
+		}
 	}
-
-	if (!ValidateICC())
+	else // if (lowState == CLONING)
 	{
-		TRACE_HERE("Invalid intergrity check code!?");
-		return;
+		if (!ValidateICC(p1, headPacket->lenData, headPacket->idPair.source, 0))
+		{
+			TRACE_HERE("Invalid intergrity check code of COMMIT to MULTIPLY!?");
+			return;
+		}
+		//
+		pControlBlock->SetRecvWindowHead(headPacket->pktSeqNo);
+		seqLastAck = headPacket->pktSeqNo;
+		fidPair.peer = headPacket->idPair.source;
+		CLowerInterface::Singleton()->PutToRTLB(this);
 	}
+	// If ever a COMMIT was accepted the keep-alive cache should be refreshed
+	InterlockedExchange(&keepAliveCache.len, 0);
 
-	FSP_NormalPacketHeader *p1 = headPacket->GetHeaderFSP();
 	ControlBlock::seq_t ackSeqNo = be32toh(p1->expectedSN);
 	if (!ResizeSendWindow(ackSeqNo, p1->GetRecvWS()))
 	{
@@ -1109,6 +1151,7 @@ void CSocketItemEx::OnGetRelease()
 //	{COMMITTING, CLOSABLE}<-->/MULTIPLY/[Send RESET]
 // Remark
 //	It is assumed that ULA/DLL implements connection multiplication throttle control
+//	See also OnGetConnectRequest()
 void CSocketItemEx::OnGetMultiply()
 {
 	TRACE_SOCKET();
@@ -1119,33 +1162,59 @@ void CSocketItemEx::OnGetMultiply()
 	if (pControlBlock->IsRetriableStale(headPacket->pktSeqNo))
 		return;
 
-	if (!ValidateICC())
+	FSP_NormalPacketHeader *p1 = (FSP_NormalPacketHeader *)headPacket->GetHeaderFSP();
+	ALFID_T idSource = headPacket->idPair.source;
+	if (!ValidateICC(p1, headPacket->lenData, idSource, p1->expectedSN))
 	{
 		TRACE_HERE("Invalid intergrity check code!?");
 		return;
 	}
 
-//连接复制（！）的应答方每收到一个MULTIPLY报文，即应检查其连接复用报头中所传递的复用发起方新连接Session ID，
-//如果和与相同主机所建立的任何连接的远端Session ID相同，则认为是重复的MULTIPLY报文，
-//这时应在新连接的上下文中，根据新连接的当前状态，重传PERSIST或COMMIT报文；否则即认为是新一次的连接复用请求。
-//实现上可使用针对远端Session ID与local root Session ID联立的hash table来排查重复的MULTIPLY请求，
-//也可以使用树结构来串接“相同主机”的连接上下文方式。
-//原始侦听者不是树根，而是森林种子。每次Accept时新建的连接的本地Session ID，才是上述local root Session ID。
-	// ControlBlock::seq_t ackSeqNo = be32toh(pkt.expectedSN);
-	// if(! pSocket->IsValidExpectedSN(ackSeqNo)) return;
-	// pSocket->pControlBlock->sendWindowSize
-	//	= min(pSocket->pControlBlock->sendBufferBlockN, be16toh(pkt.recvWS));
-	// See also OnConnectRequest()
-	// TODO: UNRESOLVED! if it return -EEXIST, should ULA be re-alerted?
-	// MULTIPLY is ALWAYS an out-of-band control packet !?
+	CSocketItemEx *pSocket = CLowerInterface::Singleton()->FindSocket(pControlBlock->connectParams.remoteHostID, idSource, fidPair.source);
+	// UNRESOLVED!? Check whether it is a collision!?
+	if(pSocket != NULL && pSocket->IsInUse())
+	{
+		if (pSocket->lowState == COMMITTING || pSocket->lowState == ESTABLISHED)
+			pSocket->EmitStart();
+		//
+		return;
+	}
 
-	// it is possible that new local fiber ID collided with some other session, but it does not matter (?)
+	BackLogItem backlogItem;	// Inherit the session key of its parent
+	(SConnectParam &)backlogItem = pControlBlock->connectParams;
+	backlogItem.idRemote = idSource;
+	rand_w32(& backlogItem.initialSN, 1);
+	if(pSocket->pControlBlock->backLog.Has(& backlogItem))
+	{
+		TRACE_HERE("Duplicate MULTIPLY backlogged already");
+		return;
+	}
 
-	// TODO: parse the multiplication optional header
-	HandleMobileParam(headPacket->GetHeaderFSP()->PFirstExtHeader());
-	// no more extension header expected for MULTIPLY
+	// secondly, fill in the backlog item if it is new
+	CtrlMsgHdr * const pHdr = (CtrlMsgHdr *)(CLowerInterface::Singleton()->mesgInfo.Control.buf);
+	if (pHdr->IsIPv6())
+	{
+		memcpy(&backlogItem.acceptAddr, &pHdr->u, sizeof(FSP_SINKINF));
+	}
+	else
+	{	// FSP over UDP/IPv4
+		register PFSP_IN6_ADDR fspAddr = (PFSP_IN6_ADDR) & backlogItem.acceptAddr;
+		fspAddr->u.st.prefix = PREFIX_FSP_IP6to4;
+		fspAddr->u.st.ipv4 = pHdr->u.ipi_addr;
+		fspAddr->u.st.port = DEFAULT_FSP_UDPPORT;
+		fspAddr->idHost = 0;	// no for IPv4 no virtual host might be specified
+		fspAddr->idALF = idSource;
+		backlogItem.acceptAddr.ipi6_ifindex = pHdr->u.ipi_ifindex;
+	}	
 
-	OnMultiply();	// tLastRecv = NowUTC()?
+	// TODO: the initiator make the cloning
+	backlogItem.idParent = fidPair.source;
+	backlogItem.expectedSN = headPacket->pktSeqNo;
+
+	// lastly, put it into the backlog
+	pSocket->pControlBlock->backLog.Put(& backlogItem);
+	pSocket->SignalAccepting();
+
 	SignalEvent();
 }
 
@@ -1187,6 +1256,9 @@ int LOCALAPI CSocketItemEx::PlacePayload(ControlBlock::PFSP_SocketBuf skb)
 	skb->opCode = pHdr->hs.opCode;
 	skb->len = headPacket->lenData;
 	skb->SetFlag<IS_FULFILLED>();
+
+	// If ever a new payload was accepted the keep-alive cache should be refreshed
+	InterlockedExchange(&keepAliveCache.len, 0);
 
 	return headPacket->lenData;
 }

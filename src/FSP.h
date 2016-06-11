@@ -164,7 +164,7 @@ typedef enum: char
 	SynConnection,		// make SCB entry of the DLL and the LLS synchronized
 	FSP_Reject,			// a forward command, explicitly reject some request
 	FSP_Recycle,		// a forward command, connection might be aborted
-	FSP_Start,			// send a start packet, MULTIPLY or PERSIST
+	FSP_Start,			// send a packet starting a new send-transaction
 	FSP_Send,			// send a packet/a group of packets
 	FSP_Urge,			// send a packet urgently, mean to urge COMMIT
 	FSP_Shutdown,		// close the connection
@@ -250,9 +250,9 @@ struct PairALFID
 
 typedef	struct FSP_HeaderSignature
 {
-	uint8_t version;
-	uint8_t opCode;
-	uint16_t hsp;
+	uint8_t				version;
+	FSPOperationCode	opCode;
+	uint16_t			hsp;
 } *PFSP_HeaderSignature;
 
 

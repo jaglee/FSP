@@ -92,7 +92,8 @@ class CSocketItemDl: public CSocketItem
 
 	friend FSPHANDLE FSPAPI ListenAt(const PFSP_IN6_ADDR, PFSP_Context);
 	friend FSPHANDLE FSPAPI Connect2(const char *, PFSP_Context);
-	friend FSPHANDLE FSPAPI ConnectMU(FSPHANDLE, PFSP_Context);
+	friend FSPHANDLE FSPAPI MultiplyAndWrite(FSPHANDLE, PFSP_Context, FlagEndOfMessage, NotifyOrReturn);
+	friend FSPHANDLE FSPAPI MultiplyAndGetSendBuffer(FSPHANDLE, PFSP_Context, int *, CallbackBufferReady);
 
 	SRWLOCK			rtSRWLock;
 	HANDLE			timer;
@@ -162,7 +163,12 @@ protected:
 
 	CSocketItemDl * LOCALAPI PrepareToAccept(BackLogItem &, CommandNewSession &);
 	bool LOCALAPI ToWelcomeConnect(BackLogItem &);
+
+	// In Multiplex.cpp
+	static CSocketItemDl * LOCALAPI CSocketItemDl::ToPrepareMultiply(CSocketItemDl *, PFSP_Context, CommandNewSession &);
+	void ToPrepareMultiply();
 	bool LOCALAPI ToWelcomeMultiply(BackLogItem &);
+
 	//
 	void ProcessPendingSend();
 	void ProcessReceiveBuffer();

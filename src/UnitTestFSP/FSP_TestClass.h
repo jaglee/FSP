@@ -14,9 +14,7 @@ class CSocketItemExDbg: public CSocketItemEx
 public:
 	CSocketItemExDbg()
 	{
-		// isMilky = 0;	// RespondToSNACK cares it
-		hMemoryMap = NULL;
-		hEvent = NULL;
+		memset(this, 0, sizeof(CSocketItemEx));
 		pControlBlock = (ControlBlock *)malloc
 			(sizeof(ControlBlock) + (sizeof(ControlBlock::FSP_SocketBuf) + MAX_BLOCK_SIZE) * 8);
 		pControlBlock->Init(MAX_BLOCK_SIZE * 2, MAX_BLOCK_SIZE * 2);
@@ -51,6 +49,8 @@ public:
 	}
 	void SetPairOfFiberID(ALFID_T src, ALFID_T dst) { fidPair.source = src; fidPair.peer = dst; }
 
+	friend void UnitTestSocketRTLB();
+	friend void UnitTestICC();
 	friend void UnitTestSocketInState();
 	friend void UnitTestReceiveQueue();
 	friend void FlowTestRetransmission();
@@ -63,5 +63,6 @@ class CLowerInterfaceDbg: public CLowerInterface
 {
 public:
 	PktBufferBlock *CurrentHead() { return freeBufferHead; }
-	friend	void UnitTestReceiveQueue();
+	friend void UnitTestReceiveQueue();
+	friend void UnitTestSelectPath();
 };

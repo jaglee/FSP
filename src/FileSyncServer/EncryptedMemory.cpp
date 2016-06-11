@@ -107,6 +107,9 @@ static void FSPAPI onFileNameSent(FSPHANDLE h, FSP_ServiceCode c, int r)
 		Dispose(h);
 		return;
 	}
+
+	//// Besides, open another reverse-connection to send the signature
+	//StartToSendSignature(h);
 }
 
 

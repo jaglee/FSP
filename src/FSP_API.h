@@ -220,14 +220,31 @@ FSPHANDLE FSPAPI Connect2(const char *, PFSP_Context);
 // given
 //	the handle of the FSP socket whose connection is to be duplicated,
 //	the pointer to the socket parameter
+//	FlagEndOfMessage
+//	NotifyOrReturn	the callback function pointer
 // return
 //	the handle of the new created socket
 //	or NULL if there is some immediate error, more information may be got from the flags set in the context parameter
 // remark
 //	The handle returned might be useless, if CallbackConnected report error laterly
 DllSpec
-FSPHANDLE FSPAPI ConnectMU(FSPHANDLE, PFSP_Context);
+FSPHANDLE FSPAPI MultiplyAndWrite(FSPHANDLE, PFSP_Context, FlagEndOfMessage, NotifyOrReturn);
 
+
+
+// given
+//	the handle of the FSP socket whose connection is to be duplicated,
+//	the pointer to the socket parameter
+//	[inout] pointer to the placeholder of an integer specifying the the minimum requested size of the buffer
+//	the pointer to the callback function
+// return
+//	the handle of the new created socket
+//	or NULL if there is some immediate error, more information may be got from the flags set in the context parameter
+// remark
+//	The handle returned might be useless, if CallbackConnected report error laterly
+//	the capacity of immediately available buffer (might be 0) is outputted in the reference
+DllSpec
+FSPHANDLE FSPAPI MultiplyAndGetSendBuffer(FSPHANDLE, PFSP_Context, int *, CallbackBufferReady);
 
 
 // given

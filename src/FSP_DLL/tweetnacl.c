@@ -1,7 +1,8 @@
+#pragma warning(disable:4018 4146 4244)	// For MSVC only
 #include "tweetnacl.h"
+
 #define FOR(i,n) for (i = 0;i < n;++i)
 #define sv static void
-
 typedef unsigned char u8;
 typedef unsigned long u32;
 typedef unsigned long long u64;

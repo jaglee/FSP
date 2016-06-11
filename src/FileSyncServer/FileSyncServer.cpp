@@ -29,6 +29,7 @@ static void FSPAPI onFileNameSent(FSPHANDLE, FSP_ServiceCode, int);
 static int	FSPAPI toSendNextBlock(FSPHANDLE, void *, int32_t);
 
 extern int	FSPAPI onAccepting(FSPHANDLE, PFSP_SINKINF, PFSP_IN6_ADDR);
+extern void StartToSendSignature(FSPHANDLE h);
 extern void SendMemoryPattern();
 extern void SendMemoryPatternEncyrpted();
 extern void FSPAPI onResponseReceived(FSPHANDLE, FSP_ServiceCode, int);

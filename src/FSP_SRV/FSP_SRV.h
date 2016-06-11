@@ -82,10 +82,8 @@ struct CtrlMsgHdr
 struct FSP_PreparedKEEP_ALIVE
 {
 	FSP_SelectiveNACK::GapDescriptor gaps[(MAX_BLOCK_SIZE - sizeof(FSP_SelectiveNACK)) / sizeof(FSP_SelectiveNACK::GapDescriptor)];
-	uint32_t		ackTime;	// sentinel, actually
-	$FSP_HeaderSignature hs;	// sentinel, actually
+	FSP_SelectiveNACK sentinel;
 	uint32_t		n;	// n >= 0, number of (gapWidth, dataLength) tuples
-						//
 	uint32_t		GetSaltValue() const { return gaps[n].gapWidth; }	// it overlays on serialNo
 };
 
@@ -243,7 +241,9 @@ struct ICC_Context
 
 
 
-// Review it carefully!Only Interlock* operation may be applied on any volatile member variable
+// KEEP_ALIVE cache:
+//	In committed / closable state, the peer needs not transmit ack_flush / keep_alive
+//	In peer_commit / closable state, mobile_param should be retransmitted
 class CSocketItemEx: public CSocketItem
 {
 	friend class CLowerInterface;
@@ -255,6 +255,25 @@ class CSocketItemEx: public CSocketItem
 	SRWLOCK	rtSRWLock;
 	DWORD	idSrcProcess;
 	HANDLE	hSrcMemory;
+	//
+	struct
+	{
+		ControlBlock::seq_t	snExpected;
+		LONG	len;
+		bool	needAck;
+		ALIGN(8)
+		FSP_NormalPacketHeader hdr;
+		union
+		{
+			FSP_PreparedKEEP_ALIVE snack;
+			//
+			struct
+			{
+				FSP_ConnectParam		mp;
+				FSP_PreparedKEEP_ALIVE	snack;
+			} buf3;
+		};
+	}	keepAliveCache;
 	//
 	uint8_t	cipherText[MAX_BLOCK_SIZE];
 	//
@@ -275,8 +294,14 @@ protected:
 	volatile char	toUpdateTimer;
 	FSP_Session_State lowState;
 
-	CSocketItemEx * volatile next;
-	CSocketItemEx * volatile prevSame;
+	// chainlist on the collision entry of the remote ALFID TLB
+	uint32_t		idRemoteHost;
+	ALFID_T			idParent;
+	CSocketItemEx * prevRemote;
+
+	// chainlist on the collision entry of the near ALFID TLB
+	CSocketItemEx * next;
+	CSocketItemEx * prevSame;
 
 	uint32_t	tRoundTrip_us;	// round trip time evaluated in microseconds
 	uint32_t	tKeepAlive_ms;	// keep-alive time-out limit in milliseconds
@@ -286,8 +311,8 @@ protected:
 	timestamp_t	tLastRecv;
 	timestamp_t tEarliestSend;
 
-	uint32_t	nextNAckSN;	// host byte order for near end. if it overflow the session MUST be terminated
-	uint32_t	lastNAckSN;	// host byte order, the serial number of peer's last SNACK
+	uint32_t	nextOOBSN;	// host byte order for near end. if it overflow the session MUST be terminated
+	uint32_t	lastOOBSN;	// host byte order, the serial number of peer's last out-of-band packet
 	ALIGN(8)
 	ControlBlock::seq_t	seqLastAck;
 
@@ -299,7 +324,12 @@ protected:
 
 	ICC_Context		contextOfICC;
 
+#if defined(TRACE) && (TRACE & TRACE_HEARTBEAT)
+	// For debug purpose, fixed the heartbeat interval to 10 seconds
+	void RestartKeepAlive() { ReplaceTimer(10000); }
+#else
 	void RestartKeepAlive() { ReplaceTimer(tKeepAlive_ms); }
+#endif
 	void StopKeepAlive() { ReplaceTimer(SCAVENGE_THRESHOLD_ms); }
 	void CalibrateKeepAlive();
 	void RecalibrateKeepAlive(uint64_t);
@@ -402,10 +432,10 @@ public:
 	int32_t LOCALAPI GenerateSNACK(FSP_PreparedKEEP_ALIVE &, ControlBlock::seq_t &, int);
 	//
 	void InitiateConnect();
+	void InitiateMultiply();
 	void CloseSocket();
 	void Disconnect();
 	void DisposeOnReset();
-	void OnMultiply();
 	void Recycle();
 
 	void HandleMemoryCorruption() {	Extinguish(); }
@@ -425,6 +455,7 @@ public:
 		return pControlBlock->ResizeSendWindow(seq1, adRecvWS);
 	}
 
+	bool RefreshKeepAliveCache(FSPOperationCode);
 	//
 	template<FSPOperationCode c> int SendPacket()
 	{
@@ -440,6 +471,7 @@ public:
 	void * LOCALAPI SetIntegrityCheckCode(FSP_NormalPacketHeader *, void * = NULL, int32_t = 0, uint32_t = 0);
 	// Solid input,  the payload, if any, is copied later
 	bool LOCALAPI ValidateICC(FSP_NormalPacketHeader *, int32_t = 0, uint32_t = 0);
+	bool LOCALAPI ValidateICC(FSP_NormalPacketHeader *, int32_t, ALFID_T, uint32_t);
 	bool ValidateICC() { return ValidateICC(headPacket->GetHeaderFSP(), headPacket->lenData); }
 	bool LOCALAPI ValidateSNACK(ControlBlock::seq_t &, FSP_SelectiveNACK::GapDescriptor * &, int &);
 	// On near end's IPv6 address changed automatically send KEEP_ALIVE with MOBILE_HEADER
@@ -493,7 +525,7 @@ public:
 
 #include <poppack.h>
 
-
+// The translate look-aside buffer of the server's socket pool
 class CSocketSrvTLB
 {
 protected:
@@ -503,8 +535,12 @@ protected:
 	CSocketItemEx listenerSlots[MAX_LISTENER_NUM];
 	ALIGN(MAC_ALIGNMENT)
 	CSocketItemEx itemStorage[MAX_CONNECTION_NUM];
+
 	// The translation look-aside buffer of the socket items
 	CSocketItemEx *tlbSockets[MAX_CONNECTION_NUM];
+	CSocketItemEx *tlbSocketsByRemote[MAX_CONNECTION_NUM];
+
+	// The free list
 	CSocketItemEx *headFreeSID, *tailFreeSID;
 
 public:
@@ -519,6 +555,9 @@ public:
 	void FreeItem(CSocketItemEx *r);
 
 	CSocketItemEx * operator[](ALFID_T);
+
+	bool PutToRTLB(CSocketItemEx *);
+	CSocketItemEx * FindSocket(uint32_t, ALFID_T, ALFID_T);
 };
 
 
@@ -567,6 +606,9 @@ private:
 	fd_set	sdSet;		// set of socket descriptor for listening, one element for each physical interface
 	DWORD	interfaces[FD_SETSIZE];
 	SOCKADDR_IN6 addresses[FD_SETSIZE];	// by default IPv6 addresses, but an entry might be a UDP over IPv4 address
+#if defined(_DEBUG) && defined(_WINDLL)
+	friend void UnitTestSelectPath();
+#endif
 
 #ifndef OVER_UDP_IPv4
 	ULONG	iRecvAddr;		// index into addresses
@@ -641,10 +683,10 @@ public:
 	inline void OnAddingIPv6Address(ULONG, const SOCKADDR_IN6 &);	// ULONG: NET_IFINDEX
 	inline void OnIPv6AddressMayAdded(ULONG, const SOCKADDR_IN6 &);	// ULONG: NET_IFINDEX
 	//
-	bool LOCALAPI SelectPath(PFSP_SINKINF, ALFID_T, int, const SOCKADDR_INET *);
+	bool LOCALAPI SelectPath(PFSP_SINKINF, ALFID_T, uint32_t, const SOCKADDR_INET *);	// uint32_t: NET_IFINDEX, ipi6_ifindex
 #else
 	// No, in IPv4 network FSP does not support multi-path
-	bool SelectPath(PFSP_SINKINF, ALFID_T, int, const SOCKADDR_INET *) { return false; }
+	bool SelectPath(PFSP_SINKINF, ALFID_T, uint32_t, const SOCKADDR_INET *) { return false; }
 #endif
 
 	static CLowerInterface * Singleton() { return pSingleInstance; }

@@ -48,7 +48,7 @@ const char * CStringizeOpCode::names[LARGEST_OP_CODE + 1] =
 	"CONNECT_REQUEST",
 	"ACK_CONNECT_REQ",
 	"RESET",
-	"PERSIST",		// Alias: KEEP_ALIVE, DATA_WITH_ACK,
+	"PERSIST",		// Alias: DATA_WITH_ACK
 	"PURE_DATA",	// Without any optional header
 	"COMMIT",
 	"ACK_FLUSH",
@@ -104,6 +104,7 @@ const char * CStringizeState::names[LARGEST_FSP_STATE + 1] =
 	"CLONING",
 };
 
+
 const char * CStringizeNotice::names[LARGEST_FSP_NOTICE + 1] =
 {
 	"NullCommand",
@@ -113,7 +114,7 @@ const char * CStringizeNotice::names[LARGEST_FSP_NOTICE + 1] =
 	"FSP_NotifyAccepting",	//  = SynConnection,	// a reverse command to make context ready
 	"FSP_Reject",		// a forward command, explicitly reject some request
 	"FSP_Recycle",		// a forward command, connection might be aborted
-	"FSP_Start",		// send a start packet such as MULTIPLY, PERSIST and transactional COMMIT
+	"FSP_Start",		// send a packet starting a new send-transaction
 	"FSP_Send",			// send a packet/a group of packets
 	"FSP_Urge",			// send a packet urgently, mean to urge COMMIT
 	"FSP_Shutdown",		// close the connection
@@ -155,6 +156,7 @@ const char * CStringizeOpCode::operator[](int i)
 	}
 	return CStringizeOpCode::names[i];
 }
+
 
 // assume it is atomic (the assumption might be broken!)
 const char * CStringizeState::operator[](int i)

@@ -40,6 +40,7 @@ CSocketSrvTLB::CSocketSrvTLB()
 	memset(listenerSlots, 0, sizeof(listenerSlots));
 	memset(itemStorage, 0, sizeof(itemStorage));
 	memset(tlbSockets, 0, sizeof(tlbSockets));
+	memset(tlbSocketsByRemote, 0, sizeof(tlbSocketsByRemote));
 	//^ assert(NULL == 0)
 	headFreeSID = & itemStorage[0];
 	tailFreeSID = & itemStorage[MAX_CONNECTION_NUM - 1];
@@ -210,7 +211,7 @@ void CSocketSrvTLB::FreeItem(CSocketItemEx *p)
 // Given
 //	ALFID_T		The application layer fiber ID
 // Return
-//	The pointer to the socket item entry matching the ID
+//	The pointer to the socket item entry that matches the ID
 // Remark
 //	The hash algorithm MUST be kept synchronized with PoolingALFIDs
 CSocketItemEx * CSocketSrvTLB::operator[](ALFID_T id)
@@ -257,6 +258,61 @@ l_return:
 	return p;
 }
 
+
+
+// Given
+//	CSocketItemEx * The pointer to the socket that to be put into the Remote Translate Look-aside Buffer
+// Return
+//	true if success
+//	false if failed
+// Remark
+//	Assume the remote application layer fiber ID HAS been stored in the fidPair
+//	The algorithm MUST be keep aligned with FindSocket
+// TODO
+bool CSocketSrvTLB::PutToRTLB(CSocketItemEx *pItem)
+{
+	uint32_t remoteHostId = pItem->idRemoteHost;
+	ALFID_T idRemote = pItem->fidPair.peer;
+	ALFID_T idParent = pItem->idParent;
+	int k = be32toh(idRemote) & (MAX_CONNECTION_NUM-1);
+	CSocketItemEx *p0 = tlbSocketsByRemote[k];
+	pItem->prevRemote = p0;	// might be NULL
+	//
+	for(register CSocketItemEx *p = p0; p != NULL; p = p->prevRemote)
+	{
+		if(p->fidPair.peer == idRemote && p->idRemoteHost == remoteHostId && p->idParent == idParent)
+		{
+			TRACE_HERE("Found collision when put to remote ALFID's translate look-aside buffer");
+			return false;
+		}
+	}
+	// If no collision found, good!
+	tlbSocketsByRemote[k] = pItem;
+	return true;
+}
+
+
+
+// Given
+//	uint32_t	The remote host ID
+//	ALFID_T		The remote application layer fiber ID
+//	ALFID_T		The parent application layer fiber ID
+// Return
+//	The pointer to the socket item entry that matches the given parameters
+// TODO
+//	Remark: make 
+CSocketItemEx * CSocketSrvTLB::FindSocket(uint32_t remoteHostId, ALFID_T idRemote, ALFID_T idParent)
+{
+	register CSocketItemEx *p = tlbSocketsByRemote[be32toh(idRemote) & (MAX_CONNECTION_NUM-1)];
+	do
+	{
+		if(p->fidPair.peer == idRemote && p->idRemoteHost == remoteHostId && p->idParent == idParent)
+			return p;
+		p = p->prevRemote;
+	} while(p != NULL);
+	//
+	return p;	// assert(p == NULL);
+}
 
 
 // Initialize the association of the remote end [represent by sockAddrTo] and the near end
@@ -404,15 +460,15 @@ l_bailout:
 
 
 // Given
-//	FSP_SelectiveNACK::GapDescriptor *	the placeholder for the returned gap descriptors, shall be at of at least MAX_BLOCK_SIZE bytes
-//	seq_t &								the placeholder for the returned maximum expected sequence number
-//	int									the number of bytes that prefix the SNACK header
+//	FSP_PreparedKEEP_ALIVE& 	the placeholder for the returned gap descriptors, shall be at of at least MAX_BLOCK_SIZE bytes
+//	seq_t &						the placeholder for the returned maximum expected sequence number
+//	int							the number of bytes that prefix the SNACK header
 // Return
 //	Number of bytes taken by the gap descriptors, including the suffix fields of the SNACK header and the prefix of the given length
 //	negative indicates that some error occurred
 // Remark
 //	For milky payload this function should never be called
-int32_t LOCALAPI CSocketItemEx::GenerateSNACK(FSP_PreparedKEEP_ALIVE &buf, ControlBlock::seq_t & seq0, int nPrefix)
+int32_t LOCALAPI CSocketItemEx::GenerateSNACK(FSP_PreparedKEEP_ALIVE &buf, ControlBlock::seq_t &seq0, int nPrefix)
 {
 	FSP_SelectiveNACK::GapDescriptor *pGaps = buf.gaps;
 	register int n = sizeof(buf.gaps) / sizeof(pGaps[0]);
@@ -430,20 +486,20 @@ int32_t LOCALAPI CSocketItemEx::GenerateSNACK(FSP_PreparedKEEP_ALIVE &buf, Contr
 #endif
 	// Suffix the effective gap descriptors block with the FSP_SelectiveNACK struct
 	// built-in rule: an optional header MUST be 64-bit aligned
+	// I don't know why, but set buf.n sometime cause memory around some stack variable corruptted!?
+	register FSP_SelectiveNACK *pSNACK = (FSP_SelectiveNACK *)(pGaps + n);
 	buf.n = n;
-	FSP_SelectiveNACK *pSNACK = (FSP_SelectiveNACK *)(pGaps + n);
 	while(--n >= 0)
 	{
 		pGaps[n].dataLength = htobe32(pGaps[n].dataLength);
 		pGaps[n].gapWidth = htobe32(pGaps[n].gapWidth);
 	}
 
-	pSNACK->serialNo = htobe32(nextNAckSN);
-	nextNAckSN++;
+	++nextOOBSN;	// Because lastOOBSN start from zero as well. See ValidateSNACK
+	pSNACK->serialNo = htobe32(nextOOBSN);
 	pSNACK->hs.Set(SELECTIVE_NACK, nPrefix);
 	return int32_t((uint8_t *)pSNACK + sizeof(FSP_SelectiveNACK) - (uint8_t *)pGaps) + nPrefix;
 }
-
 
 
 
@@ -543,6 +599,41 @@ void LOCALAPI CSocketItemEx::AffirmConnect(const SConnectParam & initState, ALFI
 
 
 
+// MULTIPLY, SequenceNo, Salt, ICC, FREWS[, payload]
+// See InitiateConnect and @DLL ULA FSPAPI ConnectMU
+// Remark
+//	On get peer's COMMIT or PERSIST the socket would be put into the remote id's translate look-aside buffer
+//TODO: unit test
+//	MULTIPLY, COMMIT and PERSIST could carry payload!
+//	// TODO: create new session key as soon as COMMIT/PERSIST was sent/received
+void CSocketItemEx::InitiateMultiply()
+{
+	TRACE_HERE("called");
+
+	// Note tht we cannot put initial SN into ephemeral session key as the peers do not have the same initial SN
+	ControlBlock::seq_t seq0;
+	rand_w32(&seq0, 1);
+	pControlBlock->SetSendWindowHead(pControlBlock->connectParams.initialSN = seq0);
+
+	// MULTIPLY can only be the very first packet
+	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend();
+	FSP_NormalPacketHeader q;
+	q.Set(MULTIPLY, sizeof(FSP_NormalPacketHeader), seq0, nextOOBSN++, pControlBlock->recvBufferBlockN);
+
+	void * paidLoad = SetIntegrityCheckCode(& q, GetSendPtr(skb), skb->len, q.expectedSN);
+	if (paidLoad == NULL)
+	{
+		TRACE_HERE("Cannot set ICC for the new MULTIPLY command");
+		return;	// but it's an exception!
+	}
+	//
+	SendPacket(2, ScatteredSendBuffers(& q, sizeof(FSP_NormalPacketHeader), paidLoad, skb->len));
+	SetEarliestSendTime();
+	// And the timer was handled by the caller of this function
+}
+
+
+
 // Remark
 //	For sake of congestion control only one packet is sent presently
 // See also
@@ -563,33 +654,29 @@ void CSocketItemEx::SynConnect()
 	lowState = pControlBlock->state;
 	if (lowState == CHALLENGING)
 	{
-		InstallEphemeralKey();
 		tKeepAlive_ms = TRASIENT_STATE_TIMEOUT_ms;
-	}
-	else
-	{
-		tKeepAlive_ms = CONNECT_INITIATION_TIMEOUT_ms;
+		InstallEphemeralKey();
+		EmitStartAndSlide();
+		seqLastAck = pControlBlock->recvWindowFirstSN;
 	}
 	//^ ephemeral session key material was ready when CSocketItemDl::PrepareToAccept
-	EmitStartAndSlide();
+	else if (lowState == CLONING)
+	{
+		tKeepAlive_ms = CONNECT_INITIATION_TIMEOUT_ms;
+		InitiateMultiply();
+		// TODO?! InstallKey...
+		// seqLastAck is set when the COMMIT or PERSIST 
+	}
+#ifdef TRACE
+	{
+		printf_s("Unsupport state when SynConnection %s (%d)\n", stateNames[lowState], lowState);
+		return;
+	}
+#endif
 
-	seqLastAck = pControlBlock->recvWindowFirstSN;
 	AddTimer();
-
 	SetCallable();	// The success or failure signal is delayed until PERSIST, COMMIT or RESET received
 }
-
-
-
-//ACTIVE<-->[{duplication detected}: retransmit {in the new context}]
-//      |<-->[{no listener}: Send {out-of-band} RESET]
-//      |-->[API{Callback}{new context}]-->ACTIVE{new context}
-//         |-->[{Return}:Accept]-->[Send PERSIST]
-//         |-->[{Return}:Reject]-->[Send RESET]-->NON_EXISTENT
-void CSocketItemEx::OnMultiply()
-{
-}
-
 
 
 

@@ -490,6 +490,72 @@ void UnitTestSocketSrvTLB()
 
 
 
+void UnitTestSocketRTLB()
+{
+	try
+	{
+		new CLowerInterfaceDbg();
+	}
+	catch(HRESULT x)
+	{
+		sprintf_s(linebuf, sizeof(linebuf), "Exception number 0x%X, cannot access lower interface, aborted.\n", x); 
+		Logger::WriteMessage(linebuf);
+
+		DbgRaiseAssertionFailure();
+	}
+	
+	CLowerInterfaceDbg *pRTLB = (CLowerInterfaceDbg *)(CLowerInterface::Singleton());
+
+	CSocketItemExDbg *p1 = (CSocketItemExDbg *)pRTLB->AllocItem(2);
+	Assert::IsNotNull(p1, L"There should be free item slot for listener");
+
+	CSocketItemExDbg *p = (CSocketItemExDbg *)(*pRTLB)[2];
+	Assert::IsTrue(p == p1, L"The remapped listening socket should be the same as the allocated");
+
+	p = (CSocketItemExDbg *)pRTLB->AllocItem();
+	Assert::IsNotNull(p, L"There should be free item slot");
+
+	IN6_ADDR addrList[MAX_PHY_INTERFACES];
+	// no hint
+	memset(addrList, 0, sizeof(addrList));
+	ALFID_T id = pRTLB->RandALFID();
+	Assert::IsFalse(id == 0, L"There should be free id space");
+
+	id = pRTLB->RandALFID(addrList);
+	Assert::IsFalse(id == 0, L"There should be free id space");
+
+	sprintf_s(linebuf, "Allocated ID = %d\n", id);
+	Logger::WriteMessage(linebuf);
+
+	CSocketItemExDbg *p2 = (CSocketItemExDbg *)(*pRTLB)[id];
+	Assert::IsFalse(p2 == p1, L"RandID shouldn't alloc the same item as AllocItem for listener");
+	Assert::IsFalse(p2 == p, L"RandID shouldn't alloc the same item as AllocItem");
+
+	p->fidPair.peer = id;
+	p->idRemoteHost = 0x1234;
+	p->idParent = 0xABCD;
+
+	p2->fidPair.peer = id + 2;
+	p2->idRemoteHost = 0x1236;
+	p2->idParent = 0xABCF;
+
+	pRTLB->PutToRTLB(p);
+	pRTLB->PutToRTLB(p2);
+
+	CSocketItemExDbg *q = (CSocketItemExDbg *)pRTLB->FindSocket(p->idRemoteHost, p->fidPair.peer, p->idParent);
+	Assert::IsTrue(q == p);
+
+	q = (CSocketItemExDbg *)pRTLB->FindSocket(p2->idRemoteHost, p2->fidPair.peer, p2->idParent);
+	Assert::IsTrue(q == p2);
+
+	pRTLB->FreeItem(p1);
+	pRTLB->FreeItem(p);
+	pRTLB->FreeItem(p2);
+}
+
+
+
+
 void UnitTestReceiveQueue()
 {
 	CLowerInterfaceDbg *pLowerSrv = (CLowerInterfaceDbg *)CLowerInterface::Singleton();
@@ -608,6 +674,81 @@ void UnitTestOCB_MAC()
 }
 
 
+// But this is NOT a comprehensive coverage test of SelectPath
+void UnitTestSelectPath()
+{
+	CLowerInterfaceDbg *pSrv;
+	try
+	{
+		pSrv = new CLowerInterfaceDbg();
+	}
+	catch(HRESULT x)
+	{
+		sprintf_s(linebuf, sizeof(linebuf), "Exception number 0x%X, cannot access lower interface, aborted.\n", x); 
+		Logger::WriteMessage(linebuf);
+
+		DbgRaiseAssertionFailure();
+	}
+
+	FSP_SINKINF nearInfo;
+	SOCKADDR_INET addr;
+
+	pSrv->sdSet.fd_count = 4;
+	pSrv->addresses[0].sin6_addr = in6addr_linklocalprefix;
+	pSrv->addresses[1].sin6_addr = in6addr_6to4prefix;
+	pSrv->addresses[2].sin6_addr = in6addr_teredoprefix;
+	//
+	pSrv->addresses[3].sin6_addr.u.Word[0] = 0x00FC;
+	pSrv->addresses[3].sin6_addr.u.Word[1] = 0x0000;
+	pSrv->addresses[3].sin6_addr.u.Word[2] = 0x0000;
+	pSrv->addresses[3].sin6_addr.u.Word[3] = 0x0000;
+	pSrv->addresses[3].sin6_addr.u.Word[4] = 0x0000;
+	pSrv->addresses[3].sin6_addr.u.Word[5] = 0x0000;
+	pSrv->addresses[3].sin6_addr.u.Word[6] = 0x0000;
+	pSrv->addresses[3].sin6_addr.u.Word[7] = 0x0100;
+
+	pSrv->addresses[4].sin6_addr.u.Word[0] = 0x00E0;
+	pSrv->addresses[4].sin6_addr.u.Word[1] = 0x0000;
+	pSrv->addresses[4].sin6_addr.u.Word[2] = 0x0000;
+	pSrv->addresses[4].sin6_addr.u.Word[3] = 0x0000;
+	pSrv->addresses[4].sin6_addr.u.Word[4] = 0x0000;
+	pSrv->addresses[4].sin6_addr.u.Word[5] = 0x0000;
+	pSrv->addresses[4].sin6_addr.u.Word[6] = 0x0000;
+	pSrv->addresses[4].sin6_addr.u.Word[7] = 0x0100;
+
+	pSrv->interfaces[0] = 1;
+	pSrv->interfaces[1] = 2;
+	pSrv->interfaces[2] = 3;
+	pSrv->interfaces[3] = 4;
+	pSrv->interfaces[4] = 5;
+
+	addr.Ipv6.sin6_addr = in6addr_linklocalprefix;
+	pSrv->SelectPath(& nearInfo, 2, 1, & addr);
+
+	// then in6addr_6to4prefix
+	addr.Ipv6.sin6_addr = in6addr_6to4prefix;
+	pSrv->SelectPath(& nearInfo, 2, 2, & addr);
+
+	// then match terodo tunnelling
+	addr.Ipv6.sin6_addr = in6addr_teredoprefix;
+	pSrv->SelectPath(& nearInfo, 2, 3, & addr);
+
+	// then a Unique Local Address (but site-local is obsolete)
+	addr.Ipv6.sin6_addr.u.Word[0] = 0x00FC;
+	addr.Ipv6.sin6_addr.u.Word[1] = 0x0000;
+	addr.Ipv6.sin6_addr.u.Word[2] = 0x0000;
+	addr.Ipv6.sin6_addr.u.Word[3] = 0x0000;
+	pSrv->SelectPath(& nearInfo, 2, 4, & addr);
+
+	// at last the global unique address
+	addr.Ipv6.sin6_addr.u.Word[0] = 0x00E0;
+	addr.Ipv6.sin6_addr.u.Word[1] = 0x0000;
+	addr.Ipv6.sin6_addr.u.Word[2] = 0x0000;
+	addr.Ipv6.sin6_addr.u.Word[3] = 0x0000;
+	pSrv->SelectPath(& nearInfo, 2, 4, & addr);
+}
+
+
 
 namespace UnitTestFSP
 {		
@@ -674,6 +815,12 @@ namespace UnitTestFSP
 		}
 
 
+		TEST_METHOD(TestSocketRTLB)
+		{
+			UnitTestSocketRTLB();
+		}
+
+
 		TEST_METHOD(TestConnectQueue)
 		{
 			UnitTestConnectQueue();
@@ -714,5 +861,11 @@ namespace UnitTestFSP
 		{
 			UnitTestSocketInState();
 		}
+
+		TEST_METHOD(TestSelectPath)
+		{
+			UnitTestSelectPath();
+		}
+
 	};
 }

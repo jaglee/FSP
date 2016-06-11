@@ -206,7 +206,7 @@ static void LOCALAPI ProcessCommand(HANDLE md)
 		switch(pCmd->opCode)
 		{
 		case FSP_Listen:		// register a passive socket
-			printf_s("Requested to listen on local fiber#%d, assigned event trigger is %s\n"
+			printf_s("Requested to listen on local fiber#0x%X, assigned event trigger is %s\n"
 				, pCmd->fiberID
 				, ((CommandNewSession *)pCmd)->szEventName);
 			Listen(CommandNewSessionSrv(pCmd));
@@ -222,7 +222,7 @@ static void LOCALAPI ProcessCommand(HANDLE md)
 			if(pSocket == NULL || !pSocket->IsInUse())
 			{
 #if defined(TRACE) && (TRACE & TRACE_ULACALL)
-				printf_s("Erratic!%s (code = %d) called for invalid local fiber#%u\n"
+				printf_s("Erratic!%s (code = %d) called for invalid local fiber#0x%X\n"
 					, opCodeStrings[pCmd->opCode]
 					, pCmd->opCode
 					, pCmd->fiberID);
