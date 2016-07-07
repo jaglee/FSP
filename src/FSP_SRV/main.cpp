@@ -214,8 +214,11 @@ static void LOCALAPI ProcessCommand(HANDLE md)
 		case InitConnection:	// register an initiative socket			
 			Connect(CommandNewSessionSrv(pCmd));
 			break;
-		case SynConnection:
-			SyncSession(CommandNewSessionSrv(pCmd));
+		case FSP_Accept:
+			Accept(CommandNewSessionSrv(pCmd));
+			break;
+		case FSP_Multiply:
+			Multiply(CommandCloneSessionSrv(pCmd));
 			break;
 		default:
 			pSocket = (CSocketItemEx *)(*CLowerInterface::Singleton())[pCmd->fiberID];
@@ -236,7 +239,7 @@ static void LOCALAPI ProcessCommand(HANDLE md)
 			switch(pCmd->opCode)
 			{
 			case FSP_Reject:
-				pSocket->Disconnect();
+				pSocket->RejectOrReset();
 				break;
 			case FSP_Recycle:
 				pSocket->Recycle();

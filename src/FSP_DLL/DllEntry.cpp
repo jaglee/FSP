@@ -336,45 +336,58 @@ void CSocketItemDl::WaitEventToDispatch()
 				ToConcludeConnect();
 				return;
 			}
-			// InStates(ESTABLISHED, PEER_COMMIT) or (COMMITTED, CLOSABLE). Used to be InStates(CLONING, CHALLENGING)
-			if(fpAccepted != NULL)
-				fpAccepted(this, &context);
+			else if(InState(ESTABLISHED) || InState(COMMITTED))	// <= CLONING
+			{
+				ToConcludeMultiply();
+				return;
+			}
+			// else in COMMITTED or CLOSABLE state // <= CHALLENGING
+			if(context.onAccepted != NULL)
+				context.onAccepted(this, &context);
 			ProcessReceiveBuffer();
 			break;
 		case FSP_NotifyDataReady:
 			ProcessReceiveBuffer();
 			break;
-		case FSP_NotifyFlushing:
+		case FSP_NotifyBufferReady:
+			ProcessPendingSend();
+			break;
+		case FSP_NotifyToCommit:
 			ProcessReceiveBuffer();	// See FSP_NotifyDataReady, FSP_NotifyFlushed and CSocketItemDl::Shutdown()
 			if(InState(CLOSABLE) && GetResetFlushing() == FLUSHING_SHUTDOWN)
 				Call<FSP_Shutdown>();
 			break;
-		case FSP_NotifyBufferReady:
-			ProcessPendingSend();
-			break;
-		case FSP_NotifyReset:
-			NotifyError(notice, -EINTR);
-			if(_InterlockedCompareExchange8(& inUse, 0, 1) != 0)
-				socketsTLB.FreeItem(this);	// No, no 'this->Destroy();' as the handle and the memory space might be reused!
-			return;
 		case FSP_NotifyFlushed:
 			ProcessPendingSend();
 			if(InState(CLOSABLE) && GetResetFlushing() == FLUSHING_SHUTDOWN)
 				Call<FSP_Shutdown>();
 			break;
 		case FSP_NotifyToFinish:
-			if(context.onFinish != NULL)
-				context.onFinish(this, FSP_NotifyToFinish, 0);
+			lowerLayerRecycled = 1;
+			if(initiatingShutdown)
+				Recycle();
+			else if(context.onRelease != NULL)
+				context.onRelease(this, FSP_NotifyToFinish, 0);
 			return;
 		case FSP_NotifyRecycled:
+			lowerLayerRecycled = 1;
 			CancelTimer();	// If any; typically for Shutdown 
 			RespondToRecycle();
+			return;
+		case FSP_NotifyReset:
+			lowerLayerRecycled = 1;
+			NotifyError(notice, -EINTR);
+			if (_InterlockedCompareExchange8(&inUse, 0, 1) != 0)
+			{
+				socketsTLB.FreeItem(this);
+				this->Destroy();
+			}
 			return;
 		case FSP_IPC_CannotReturn:
 			if (pControlBlock->state == LISTENING)
 				NotifyError(FSP_Listen, -EFAULT);
 			else if (pControlBlock->state == CONNECT_BOOTSTRAP || pControlBlock->state == CONNECT_AFFIRMING)
-				this->fpAccepted(NULL, &context);		// general error
+				context.onAccepted(NULL, &context);		// general error
 #ifdef TRACE
 			else	// else just ignore the dist
 				printf_s("Get FSP_IPC_CannotReturn in the state %s\n", stateNames[pControlBlock->state]);
@@ -386,6 +399,7 @@ void CSocketItemDl::WaitEventToDispatch()
 			return;
 		case FSP_NotifyOverflow:	// LLS should have recyle the session context mapping already
 		case FSP_NotifyTimeout:
+			lowerLayerRecycled = 1;	// UNRESOLVED?! But overflow is not clarified yet
 		case FSP_NotifyNameResolutionFailed: // There could be some remedy, let ULA decide it
 			NotifyError(notice, -EINTR);
 			this->Recycle();		// Tell LLS to recycle the session context mapping
@@ -402,7 +416,7 @@ void CSocketItemDl::WaitEventToDispatch()
 //	CommandNewSession & the command context of the socket,  to pass to LLS
 // Return
 //	NULL if it failed, or else the new allocated socket whose session control block has been initialized
-CSocketItemDl * CSocketItemDl::CreateControlBlock(const PFSP_IN6_ADDR nearAddr, PFSP_Context psp1, CommandNewSession & cmd)
+CSocketItemDl * LOCALAPI CSocketItemDl::CreateControlBlock(const PFSP_IN6_ADDR nearAddr, PFSP_Context psp1, CommandNewSession & cmd)
 {
 	CSocketItemDl *socketItem = socketsTLB.AllocItem();
 	if(socketItem == NULL)
@@ -518,7 +532,6 @@ CSocketItemDl * CSocketDLLTLB::AllocItem()
 			goto l_bailout;
 	}
 
-	// UNRESOLVED!? Maximum Capcity of Disconnected Session Recyling Cache /Resumable Disconnected Session Cache
 	if(countAllItems < MAX_CONNECTION_NUM * 3)
 	{
 		item = new CSocketItemDl();

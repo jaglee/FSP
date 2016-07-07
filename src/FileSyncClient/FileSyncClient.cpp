@@ -3,31 +3,13 @@
 
 #include "stdafx.h"
 
-//#define REMOTE_APPLAYER_NAME "localhost:80"
-// #define REMOTE_APPLAYER_NAME "lt-x61t:80"
-// #define REMOTE_APPLAYER_NAME "lt-at4:80"
-// #define REMOTE_APPLAYER_NAME "lt-ux31e:80"
-#define REMOTE_APPLAYER_NAME "E000:AAAA::1"
-//#define REMOTE_APPLAYER_NAME "E000:BBBB::1"
-
-static int	FSPAPI onConnected(FSPHANDLE, PFSP_Context);
-static void FSPAPI onPublicKeySent(FSPHANDLE, FSP_ServiceCode, int);
-static void FSPAPI onReceiveFileNameReturn(FSPHANDLE, FSP_ServiceCode, int);
-static int	FSPAPI onReceiveNextBlock(FSPHANDLE, void *, int32_t, bool);
-
-//
-static void FSPAPI onAcknowledgeSent(FSPHANDLE, FSP_ServiceCode, int);
-
-//
-extern int	FSPAPI onMultiplying(FSPHANDLE, PFSP_SINKINF, PFSP_IN6_ADDR);
-
 static unsigned char bufPrivateKey[CRYPTO_NACL_KEYBYTES];
 static unsigned char bufPublicKey[CRYPTO_NACL_KEYBYTES];
 
 static HANDLE hFile;
 static char fileName[MAX_PATH];
-volatile static bool finished = false;
-
+static bool finished;
+// static bool toFinish;
 
 
 static void FSPAPI onNotice(FSPHANDLE h, FSP_ServiceCode code, int value)
@@ -56,7 +38,7 @@ static void FSPAPI onError2(FSPHANDLE h, FSP_ServiceCode code, int value)
 //
 static void FSPAPI onFinished(FSPHANDLE h, FSP_ServiceCode code, int value)
 {
-	printf_s("Fiber ID = %u, session was to shut down.\n", (uint32_t)(intptr_t)h);
+	printf_s("Fiber ID = 0x%X, session was to shut down.\n", (uint32_t)(intptr_t)h);
 	if(code != FSP_NotifyRecycled)
 	{
 		printf_s("Should got ON_RECYCLED, but service code = %d, return %d\n", code, value);
@@ -70,18 +52,18 @@ static void FSPAPI onFinished(FSPHANDLE h, FSP_ServiceCode code, int value)
 
 
 
-//
+// Just report the progress. Should not terminate the parent process, however
+// Should gracefully 'close' the socket
 static void FSPAPI onServerClose(FSPHANDLE h, FSP_ServiceCode code, int value)
 {
-	printf_s("Fiber ID = %u, the server shutdown the session.\n", (uint32_t)(intptr_t)h);
+	printf_s("Fiber ID = 0x%X, the server shutdown the session.\n", (uint32_t)(intptr_t)h);
 	if(code != FSP_NotifyToFinish)
 	{
 		printf_s("Should got TO_FINISH, but service code = %d, return %d\n", code, value);
 		return;
 	}
 
-	Dispose(h);	// should be graceful 'close' socket
-	finished = true;
+	// toFinish = true;
 	return;
 }
 
@@ -113,10 +95,6 @@ static int ReportLastError()
 
 
 
-int CompareMemoryPattern(char	*fileName);
-
-
-
 // the server would send the filename in the first message. the client should change the name
 // in case it is in the same directory of the same machine 
 int main(int argc, char *argv[])
@@ -132,10 +110,10 @@ int main(int argc, char *argv[])
 
 	FSP_SocketParameter parms;
 	memset(& parms, 0, sizeof(parms));
-	//parms.beforeAccept = onMultiplying;
-	parms.afterAccept = onConnected;
+	parms.onAccepting = onMultiplying;
+	parms.onAccepted = onConnected;
 	parms.onError = onNotice;
-	parms.onFinish = onServerClose;
+	parms.onRelease = onServerClose;
 	parms.recvSize = MAX_FSP_SHM_SIZE;	// 4MB
 	parms.sendSize = 0;	// the underlying service would give the minimum, however
 	if(Connect2(REMOTE_APPLAYER_NAME, & parms) == NULL)
@@ -159,9 +137,9 @@ l_bailout:
 
 
 
-int FSPAPI onConnected(FSPHANDLE h, PFSP_Context ctx)
+static int	FSPAPI  onConnected(FSPHANDLE h, PFSP_Context ctx)
 {
-	printf_s("\nHandle of FSP session: Fiber ID = %u", (uint32_t)(intptr_t)h);
+	printf_s("\nHandle of FSP session: Fiber ID = 0x%X", (uint32_t)(intptr_t)h);
 	if(h == NULL)
 	{
 		printf_s("\nConnection failure.\n");

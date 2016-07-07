@@ -58,6 +58,11 @@ int CSocketItemDl::Recycle()
 	// The shared control block MUST be preserved, or else LLS might encountered error
 	// So every time a control block is re-used, it MUST be re-initialized
 	socketsTLB.FreeItem(this);
+	if (lowerLayerRecycled)
+	{
+		RespondToRecycle();
+		return 0;
+	}
 	return Call<FSP_Recycle>() ? 0 : -EIO;
 }
 
@@ -109,12 +114,13 @@ int LOCALAPI CSocketItemDl::Shutdown(NotifyOrReturn fp1)
 	}
 
 	isFlushing = FLUSHING_SHUTDOWN;
+	initiatingShutdown = 1;
 	SetCallbackOnRecyle(fp1);
 
 	if (InState(CLOSED))
 	{
 		SetMutexFree();
-		SelfNotify(FSP_NotifyRecycled);
+		Recycle();
 		return 0;
 	}
 
@@ -166,8 +172,9 @@ l_finish:
 // Important! ULA should not access the socket itself anyway
 void CSocketItemDl::RespondToRecycle()
 {
-	Recycle();
-	//
-	if(fpRecycled != NULL)
-		fpRecycled(this,  FSP_NotifyRecycled, 0);
+	NotifyOrReturn fp1 = (NotifyOrReturn)InterlockedExchangePointer(& fpRecycled, NULL);
+	socketsTLB.FreeItem(this);
+	this->Destroy();
+	if (fp1 != NULL)
+		fp1(this, FSP_NotifyRecycled, 0);
 }

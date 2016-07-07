@@ -366,6 +366,9 @@ inline int CLowerInterface::SetInterfaceOptions(SOCKET sd)
 	}
 	// Here we didn't set IPV6_V6ONLY, for we suppose that dual-stack support is not harmful, though neither benefical
 
+	// We do want to test larger gap, and be in favor of FIFD
+	WSAIoctl(sd, SIO_ENABLE_CIRCULAR_QUEUEING, NULL, 0, NULL, 0, NULL, NULL, NULL);
+
 	return EnablePromiscuous(sd);
 }
 
@@ -871,6 +874,10 @@ int CLowerInterface::AcceptAndProcess(SOCKET sdRecv)
 	case RELEASE:
 	case MULTIPLY:
 	case KEEP_ALIVE:
+#ifdef _DEBUG
+		if(opCode == MULTIPLY)
+			DebugBreak();
+#endif
 		pSocket = MapSocket();
 		if(pSocket == NULL)
 		{
@@ -1097,6 +1104,7 @@ TimerWheel::TimerWheel()
 }
 
 
+
 TimerWheel::~TimerWheel()
 {
 	if(timerQueue != NULL)
@@ -1112,7 +1120,7 @@ bool CSocketItemEx::AddTimer()
 {
 	return (
 		::CreateTimerQueueTimer(& timer, TimerWheel::Singleton()
-			, TimeOut	// WAITORTIMERCALLBACK
+			, KeepAlive	// WAITORTIMERCALLBACK
 			, this		// LPParameter
 			, tKeepAlive_ms
 			, tKeepAlive_ms
@@ -1120,22 +1128,6 @@ bool CSocketItemEx::AddTimer()
 			) != FALSE
 		);
 }
-
-
-
-bool CSocketItemEx::RemoveTimer()
-{
-	if(::DeleteTimerQueueTimer(TimerWheel::Singleton(), timer, NULL))
-	{
-		timer = NULL;
-		return true;
-	}
-	else
-	{
-		return false;
-	}
-}
-
 
 
 // Given
@@ -1147,7 +1139,7 @@ bool LOCALAPI CSocketItemEx::ReplaceTimer(uint32_t period)
 	tKeepAlive_ms = period;
 	return ( timer == NULL 
 		&&	::CreateTimerQueueTimer(& timer, TimerWheel::Singleton()
-			, TimeOut	// WAITORTIMERCALLBACK
+			, KeepAlive	// WAITORTIMERCALLBACK
 			, this		// LPParameter
 			, period
 			, period
@@ -1157,6 +1149,49 @@ bool LOCALAPI CSocketItemEx::ReplaceTimer(uint32_t period)
 		);
 }
 
+
+
+// A lazy acknowledgement is hard coded to one RTT, with an implementation depended floor value
+bool CSocketItemEx::AddLazyAckTimer()
+{
+	return (lazyAckTimer == NULL
+		&& ::CreateTimerQueueTimer(&lazyAckTimer, TimerWheel::Singleton()
+			, LazilySendSNACK
+			, this
+			, max(LAZY_ACK_DELAY_MIN_ms, (tRoundTrip_us >> 10))
+			, 0
+			, WT_EXECUTEINTIMERTHREAD));
+}
+
+
+
+// A retransmission timer should be hard coded to 4 RTT, with an implementation depended floor value
+bool CSocketItemEx::AddResendTimer(uint32_t rtt_ms)
+{
+	return (resendTimer == NULL
+		&& ::CreateTimerQueueTimer(&resendTimer, TimerWheel::Singleton()
+			, DoResend
+			, this
+			, max(LAZY_ACK_DELAY_MIN_ms, rtt_ms)
+			, 0
+			, WT_EXECUTEINTIMERTHREAD));
+}
+
+
+
+// Assume a mutex has been obtained
+void CSocketItemEx::RemoveTimers()
+{
+	HANDLE h;
+	if((h = (HANDLE)InterlockedExchangePointer(& timer, NULL)) != NULL)
+		::DeleteTimerQueueTimer(TimerWheel::Singleton(), h, NULL);
+	
+	if((h = (HANDLE)InterlockedExchangePointer(& lazyAckTimer, NULL)) != NULL)
+		::DeleteTimerQueueTimer(TimerWheel::Singleton(), h, NULL);
+
+	if((h = (HANDLE)InterlockedExchangePointer(& resendTimer, NULL)) != NULL)
+		::DeleteTimerQueueTimer(TimerWheel::Singleton(), h, NULL);
+}
 
 
 // The OS-depending implementation of scheduling transmission queue
@@ -1273,6 +1308,7 @@ DWORD WINAPI HandleSendQ(LPVOID p)
 		return 0;
 	}
 }
+
 
 
 // Directedly registered by AcceptAndProcess
@@ -1397,13 +1433,31 @@ int CSocketItemEx::SendPacket(register ULONG n1, ScatteredSendBuffers s)
 			return 0;	// no selectable path
 		}
 		wsaMsg.dwBufferCount = n1;
-#if defined(TRACE) && (TRACE & TRACE_PACKET)
+#ifndef NDEBUG
 		s.scattered[0].buf = NULL;
 		s.scattered[0].len = 0;
 #endif
 		wsaMsg.lpBuffers = & s.scattered[1];
 		wsaMsg.name = (LPSOCKADDR)sockAddrTo;
 		wsaMsg.namelen = sizeof(sockAddrTo->Ipv6);
+#ifdef _DEBUG
+		if(nearInfo.u.idALF != fidPair.source)
+		{
+			TRACE_HERE("nearInfo.u.idALF != fidPair.source");
+			DebugBreak();
+		}
+#endif
+#if defined(TRACE) && (TRACE & TRACE_ADDRESS)
+		printf_s("Near end's address info:\n");
+		// Level: [0 for IPv4, 41 for IPv6]]
+		printf("Len = %d, level = %d, type = %d, local interface address:\n"
+			, (int)nearInfo.pktHdr.cmsg_len
+			, nearInfo.pktHdr.cmsg_level
+			, nearInfo.pktHdr.cmsg_type);
+		DumpHexical((BYTE *)& nearInfo.u, sizeof(nearInfo.u));
+		printf_s("Target address:\n\t");
+		DumpNetworkUInt16((uint16_t *)wsaMsg.name, wsaMsg.namelen / 2);
+#endif
 		r = WSASendMsg(CLowerInterface::Singleton()->sdSend, & wsaMsg, 0, &n, NULL, NULL);
 	}
 	else
@@ -1449,6 +1503,8 @@ int CSocketItemEx::SendPacket(register ULONG n1, ScatteredSendBuffers s)
 /**
  *	Manipulation of connection request queue
  */
+
+
 
 // Given
 //	CommandNewSessionSrv		The request for new connection
@@ -1775,7 +1831,6 @@ l_bailout:
 
 
 
-
 #ifndef OVER_UDP_IPv4
 // Mark sdRecv as disabled
 inline void	CLowerInterface::DisableSocket(SOCKET sdRecv)
@@ -1851,6 +1906,10 @@ inline bool CLowerInterface::IsPrefixDuplicated(int ifIndex, PIN6_ADDR p)
 bool LOCALAPI CLowerInterface::SelectPath(PFSP_SINKINF pNear, ALFID_T nearId, NET_IFINDEX ifIndex, const SOCKADDR_INET *sockAddrTo)
 {
 	register u_int i;
+#if defined(TRACE) && (TRACE & TRACE_ADDRESS)
+	printf_s("%s fiberId#0x%X, ifIndex = %d\n", __FUNCTION__, nearId, ifIndex);
+#endif
+
 	// Link-local first
 	if (*(int64_t *)& sockAddrTo->Ipv6.sin6_addr.u == *(int64_t *)& in6addr_linklocalprefix.u)	// hard coded 8 byte address prefix lenth
 	{
@@ -1914,9 +1973,12 @@ bool LOCALAPI CLowerInterface::SelectPath(PFSP_SINKINF pNear, ALFID_T nearId, NE
 	i = lastResort;
 	//
 l_matched:
-	memcpy(& pNear->ipi_addr, addresses[i].sin6_addr.u.Byte, 12);	// hard-coded network prefix length, including the host id
+	// memcpy(& pNear->ipi_addr, addresses[i].sin6_addr.u.Byte, 12);	// hard-coded network prefix length, including the host id
+	*(uint64_t *)&pNear->ipi_addr = SOCKADDR_SUBNET(addresses + i);
+	pNear->idHost = SOCKADDR_HOSTID(addresses + i);
 	pNear->idALF = nearId;
-	pNear->ipi6_ifindex = ifIndex;
+	pNear->ipi6_ifindex = 0;	// pNear->ipi6_ifindex = ifIndex;
+	//^always send out from the default interface so that underlying routing service can do optimization
 	//
 	return true;
 }

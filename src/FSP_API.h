@@ -67,6 +67,7 @@ typedef enum
 	FSP_SET_COMPRESSION,		// 0: disable, 1: lz4, others: reserved
 	FSP_SET_CALLBACK_ON_ERROR,	// NotifyOrReturn
 	FSP_SET_CALLBACK_ON_FINISH,	// NotifyOrReturn
+	FSP_SET_CALLBACK_ON_REQUEST,// CallbackRequested
 	FSP_SET_CALLBACK_ON_CONNECT	// CallbackConnected
 } FSP_ControlCode;
 
@@ -146,10 +147,10 @@ typedef void (FSPAPI *NotifyOrReturn)(FSPHANDLE, FSP_ServiceCode, int);
 
 struct FSP_SocketParameter
 {
-	CallbackRequested	beforeAccept;	// may be NULL
-	CallbackConnected	afterAccept;	// cannot be NULL
+	CallbackRequested	onAccepting;	// may be NULL, cannot be NULL for cloning offspring
+	CallbackConnected	onAccepted;		// cannot be NULL
 	NotifyOrReturn		onError;		// should be non-NULL
-	NotifyOrReturn		onFinish;		// on getting remote peer's RELEASE packet, may be NULL
+	NotifyOrReturn		onRelease;		// on getting remote peer's RELEASE packet, may be NULL
 	//
 	const void *	welcome;		// default welcome message, may be NULL
 	unsigned short	len;			// length of the default welcome message

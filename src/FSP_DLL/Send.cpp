@@ -221,16 +221,15 @@ int LOCALAPI CSocketItemDl::SendStream(void * buffer, int len, FlagEndOfMessage 
 
 
 
-//[API: Send]
-//	CLONING<-->[Send PERSIST]{enable retry}
-//	ACTIVE<-->[Send{more data}]
-//	ACTIVE-->[Send flush]-->COMMITTING
-//	PEER_COMMIT<-->[Send{more data}]
-//	PEER_COMMIT-->[Send{flush}]-->COMMITTING2{enable retry}
-//	COMMITTED-->ACTIVE-->[Send PERSIST]
-//	COMMITTED-->[Send{flush}]-->COMMITTING
-//	CLOSABLE-->PEER_COMMIT-->[Send PERSIST]{enable retry}
-//	CLOSABLE-->[Send{flush}]-->COMMITTING2{enable retry}
+/**
+	A PERSIST or MULTIPLY packet always starts a transmit transaction.
+	A MULTIPLY packet with 'To Be Continued' flag cleared terminates the transmit transaction as well.
+	Here the transaction consists of one message of one single packet.
+	A COMMIT packet terminates a transmit transaction. It is sent on request of ULA.
+	A COMMIT packet may both start and terminate a transmit transaction,
+	if the transaction consists of one message of one single packet.
+	An ACK_CONNECT_REQ packet itself make a singular transmit transaction if it piggybacks any payload.
+ */
 // Return
 //	1 if revert to ACTIVE or PEER_COMMIT state
 //	0 if no state change

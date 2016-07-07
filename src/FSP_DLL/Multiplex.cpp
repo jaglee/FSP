@@ -34,7 +34,7 @@
   Multiply
   - Generate MULTIPLY packet, encapsulate optional payload
   - Call LLS
-  LLS/SynConnection
+  LLS/FSP_Multiply
   - Allocate session ID
   - Transmit the start packet
   The peer' LLS:
@@ -73,7 +73,7 @@ FSPHANDLE FSPAPI MultiplyAndWrite(FSPHANDLE hFSP, PFSP_Context psp1, FlagEndOfMe
 {
 	TRACE_HERE("called");
 
-	CommandNewSession objCommand;
+	CommandCloneSession objCommand;
 	CSocketItemDl *p = CSocketItemDl::ToPrepareMultiply((CSocketItemDl *)hFSP, psp1, objCommand);
 	if(p == NULL)
 		return p;
@@ -86,10 +86,9 @@ FSPHANDLE FSPAPI MultiplyAndWrite(FSPHANDLE hFSP, PFSP_Context psp1, FlagEndOfMe
 		p->CheckCommitOrRevert(flag);
 		// pendingSendSize set in BufferData
 		p->BufferData(psp1->len);
-		p->SetNewTransaction();
 	}
 
-	return p->CallCreate(objCommand, SynConnection);
+	return p->CallCreate(objCommand, FSP_Multiply);
 }
 
 
@@ -114,7 +113,7 @@ FSPHANDLE FSPAPI MultiplyAndGetSendBuffer(FSPHANDLE hFSP, PFSP_Context psp1, int
 {
 	TRACE_HERE("called");
 
-	CommandNewSession objCommand;
+	CommandCloneSession objCommand;
 	CSocketItemDl *p = CSocketItemDl::ToPrepareMultiply((CSocketItemDl *)hFSP, psp1, objCommand);
 	if(p == NULL)
 		return p;
@@ -134,13 +133,18 @@ FSPHANDLE FSPAPI MultiplyAndGetSendBuffer(FSPHANDLE hFSP, PFSP_Context psp1, int
 			onBufferReady(p, buf, *pSize);
 	}
 
-	return p->CallCreate(objCommand, SynConnection);
+	return p->CallCreate(objCommand, FSP_Multiply);
 }
 
 
 
-
-CSocketItemDl * LOCALAPI CSocketItemDl::ToPrepareMultiply(CSocketItemDl *p, PFSP_Context psp1, CommandNewSession &)
+// Given
+//	CSocketItemDl *		The parent socket item
+//	PFSP_Context		The context of the new child connection
+//	CommandCloneSession [out] The connection multiplication command structure
+// Return
+//	The new socket item
+CSocketItemDl * LOCALAPI CSocketItemDl::ToPrepareMultiply(CSocketItemDl *p, PFSP_Context psp1, CommandCloneSession & objCommand)
 {
 	TRACE_HERE("called");
 	if(p == NULL)
@@ -149,10 +153,8 @@ CSocketItemDl * LOCALAPI CSocketItemDl::ToPrepareMultiply(CSocketItemDl *p, PFSP
 		return NULL;
 	}
 
-	// TODO: SHOULD inherit the latest effective near address
 	IN6_ADDR addrAny = IN6ADDR_ANY_INIT;
 	psp1->u.st.passive = 0;	// override what is provided by ULA
-	CommandNewSession objCommand;
 	CSocketItemDl * socketItem = CSocketItemDl::CreateControlBlock((PFSP_IN6_ADDR) & addrAny, psp1, objCommand);
 	if(socketItem == NULL)
 	{
@@ -160,10 +162,13 @@ CSocketItemDl * LOCALAPI CSocketItemDl::ToPrepareMultiply(CSocketItemDl *p, PFSP
 		return NULL;
 	}
 
-	// TODO: SHOULD install a new, derived session key!
 	try
 	{
 		memcpy(& socketItem->pControlBlock->connectParams, & p->pControlBlock->connectParams, FSP_MAX_KEY_SIZE);
+		objCommand.idParent = socketItem->pControlBlock->idParent = p->fidPair.source;
+		socketItem->pControlBlock->peerAddr = p->pControlBlock->peerAddr;
+		// But nearEndName cannot be inheritted
+		socketItem->pControlBlock->nearEndInfo = p->pControlBlock->nearEndInfo;
 	}
 	catch(int)	// could we really catch run-time memory access exception?
 	{
@@ -178,6 +183,7 @@ CSocketItemDl * LOCALAPI CSocketItemDl::ToPrepareMultiply(CSocketItemDl *p, PFSP
 
 
 
+// An indirect shared subroutine of MultiplyAndXXX
 void CSocketItemDl::ToPrepareMultiply()
 {
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend();
@@ -196,13 +202,15 @@ void CSocketItemDl::ToPrepareMultiply()
 //	|-->[{Return Accept}]-->{new context}ACTIVE/COMMITTING
 //		-->[Send PERSIST]{start keep-alive}
 //	|-->[{Return}:Reject]-->[Send RESET] {abort creating new context}
-bool LOCALAPI CSocketItemDl::ToWelcomeMultiply(BackLogItem & backLog)
+// UNRESOLVED!
+//	Multiply: but the upper layer application may still throttle it?
+//	..context.onAccepting CANNOT read or write anything!?
+bool CSocketItemDl::ToWelcomeMultiply(BackLogItem & backLog)
 {
-	// Multiply: but the upper layer application may still throttle it...fpRequested CANNOT read or write anything!
 	PFSP_IN6_ADDR remoteAddr = (PFSP_IN6_ADDR) & pControlBlock->peerAddr.ipFSP.allowedPrefixes[MAX_PHY_INTERFACES - 1];
 	SetNewTransaction();
-	if( fpRequested == NULL	// This is NOT the same policy as ToWelcomeConnect
-	 || fpRequested(this, & backLog.acceptAddr, remoteAddr) < 0 )
+	if( context.onAccepting == NULL	// This is NOT the same policy as ToWelcomeConnect
+	 || context.onAccepting(this, & backLog.acceptAddr, remoteAddr) < 0 )
 	{
 		// UNRESOLVED! report that the upper layer application reject it?
 		return false;
@@ -211,4 +219,18 @@ bool LOCALAPI CSocketItemDl::ToWelcomeMultiply(BackLogItem & backLog)
 	SetState(isFlushing > 0 ? COMMITTING : ESTABLISHED); // See also ToConcludeConnect()
 	CheckToNewTransaction();
 	return true;
+}
+
+
+
+// See also
+//	ToConcludeConnect, @LLS::InitiateMultiply
+void CSocketItemDl::ToConcludeMultiply()
+{
+	// See also FSP_LLS$$CSocketItemEx::Connect()
+	fidPair.source = pControlBlock->nearEndInfo.idALF;
+
+	ProcessReceiveBuffer();
+	ProcessPendingSend();
+	// Unlike ToConcludeConnect, do not callback context.onAccepted
 }

@@ -11,8 +11,8 @@ CSocketItemDbg *GetPreparedSocket()
 	static CommandNewSession objCommand;
 	static FSP_SocketParameter parms;
 	memset(& parms, sizeof(parms), 0);
-	parms.beforeAccept = NULL;
-	parms.afterAccept = NULL;
+	parms.onAccepting = NULL;
+	parms.onAccepted = NULL;
 	parms.onError = NULL;
 	parms.recvSize = MAX_FSP_SHM_SIZE;	// 4MB
 	parms.sendSize = 0;	// the underlying service would give the minimum, however

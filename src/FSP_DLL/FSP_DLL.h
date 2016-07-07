@@ -105,17 +105,12 @@ class CSocketItemDl: public CSocketItem
 	char			newTransaction;	// it may simultaneously start a transmit transaction and flush/commit it
 	char			isFlushing;
 	char			inUse;
-	char			shouldAppendCommit:1;
-	char			shouldChainTimeout:1;
+	char			initiatingShutdown : 1;
+	char			lowerLayerRecycled : 1;
+	char			shouldAppendCommit : 1;
+	char			shouldChainTimeout : 1;
 protected:
 	ALIGN(8)		HANDLE theWaitObject;
-
-	// when request of the initiator just received by the responder and it is to accept
-	__declspec(property(get = GetOnRequested))	CallbackRequested fpRequested;
-	CallbackRequested GetOnRequested() const { return context.beforeAccept; }
-
-	__declspec(property(get = GetOnAccepted))	CallbackConnected fpAccepted;
-	CallbackConnected GetOnAccepted() const { return context.afterAccept; }
 
 	NotifyOrReturn	fpRecycled;	// Callback for SHUT_DOWN
 
@@ -161,19 +156,20 @@ protected:
 	// in Establish.cpp
 	void ProcessBacklog();
 
-	CSocketItemDl * LOCALAPI PrepareToAccept(BackLogItem &, CommandNewSession &);
-	bool LOCALAPI ToWelcomeConnect(BackLogItem &);
+	CSocketItemDl * PrepareToAccept(BackLogItem &, CommandNewSession &);
+	bool ToWelcomeConnect(BackLogItem &);
+	void ToConcludeConnect();
 
 	// In Multiplex.cpp
-	static CSocketItemDl * LOCALAPI CSocketItemDl::ToPrepareMultiply(CSocketItemDl *, PFSP_Context, CommandNewSession &);
+	static CSocketItemDl * LOCALAPI CSocketItemDl::ToPrepareMultiply(CSocketItemDl *, PFSP_Context, CommandCloneSession &);
 	void ToPrepareMultiply();
-	bool LOCALAPI ToWelcomeMultiply(BackLogItem &);
+	void ToConcludeMultiply();
+	bool ToWelcomeMultiply(BackLogItem &);
 
 	//
 	void ProcessPendingSend();
 	void ProcessReceiveBuffer();
 	//
-	void ToConcludeConnect();
 	void RespondToRecycle();
 
 	int LOCALAPI BufferData(int);
@@ -292,8 +288,8 @@ public:
 
 	int LOCALAPI Shutdown(NotifyOrReturn);
 
-	void SetCallbackOnAccept(CallbackConnected fp1) { context.afterAccept = fp1; }
-	void SetCallbackOnFinish(NotifyOrReturn fp1) { context.onFinish = fp1; }
+	void SetCallbackOnAccept(CallbackConnected fp1) { context.onAccepted = fp1; }
+	void SetCallbackOnFinish(NotifyOrReturn fp1) { context.onRelease = fp1; }
 	void SetCallbackOnRecyle(NotifyOrReturn fp1) { fpRecycled = fp1; }
 
 	char GetResetFlushing() { return _InterlockedExchange8(& isFlushing, 0);}

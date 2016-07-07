@@ -265,15 +265,15 @@ void CSocketItemDl::ProcessReceiveBuffer()
 		TRACE_HERE("deadlock encountered!?");
 		return;
 	}
-	// See also @LLS::OnGetPersist() and @LLS:OnGetCommit()
-	if (!InState(ESTABLISHED) && !InState(COMMITTING)  && !InState(COMMITTED)  && !InState(PEER_COMMIT) && !InState(COMMITTING2) && !InState(CLOSABLE))
+	// The received message might be buffered and fetched any time in any legal state
+#ifndef NDEBUG
+	if (InIllegalState())
 	{
-#ifdef TRACE
 		printf_s("Is it illegal to ProcessReceiveBuffer in state %s?!\n", stateNames[pControlBlock->state]);
-#endif
 		SetMutexFree();
 		return;
 	}
+#endif
 	//
 	CallbackPeeked fp1 = fpPeeked;
 	int n;

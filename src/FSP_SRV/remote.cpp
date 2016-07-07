@@ -78,7 +78,7 @@ bool CSocketItemEx::InStates(int n, ...)
 
 
 
-bool LOCALAPI CSocketItemEx::Notify(FSP_ServiceCode n)
+bool CSocketItemEx::Notify(FSP_ServiceCode n)
 {
 	int r = pControlBlock->notices.Put(n);
 	if(r < 0)
@@ -330,7 +330,13 @@ void LOCALAPI CLowerInterface::OnGetConnectRequest()
 	memcpy(backlogItem.allowedPrefixes, q->params.subnets, sizeof(uint64_t) * MAX_PHY_INTERFACES);
 
 	// lastly, put it into the backlog
-	pSocket->pControlBlock->backLog.Put(& backlogItem);
+	if (pSocket->pControlBlock->backLog.Put(&backlogItem) < 0)
+	{
+#if defined(TRACE) && (TRACE & TRACE_PACKET)
+		printf_s("Cannot put the multiplying connection request into the SCB backlog.\n");
+#endif
+		goto l_return;
+	}
 	pSocket->SignalAccepting();
 
 l_return:
@@ -413,33 +419,26 @@ bool LOCALAPI CSocketItemEx::ValidateSNACK(ControlBlock::seq_t & ackSeqNo, FSP_S
 		return false;
 	}
 	//
-	if (int(headPacket->pktSeqNo - pControlBlock->recvWindowFirstSN) >= pControlBlock->recvBufferBlockN)
+	if (pControlBlock->IsRetriableStale(headPacket->pktSeqNo))
 	{
 #ifdef TRACE
-		printf_s("%s has invalid sequence number:\t %u\n", opCodeStrings[p1->hs.opCode], headPacket->pktSeqNo);
-#endif
-		return false;
-	}
-
-
-#if defined(TRACE) && (TRACE & (TRACE_PACKET | TRACE_SLIDEWIN))
-	if(seqLastAck == 0)
+		printf_s("%s has encountered attack? sequence number: %u\n\tshould in: [%u %u]\n"
+			, opCodeStrings[p1->hs.opCode]
+			, headPacket->pktSeqNo
+			, pControlBlock->recvWindowFirstSN
+			, pControlBlock->recvWindowFirstSN +  pControlBlock->recvBufferBlockN
+			);
 		DebugBreak();
 #endif
-	if(int(headPacket->pktSeqNo - seqLastAck) < 0)
-	{
-#ifdef TRACE
-		printf_s("%s has encountered stale packet attack? sequence number:\t %u\n", opCodeStrings[p1->hs.opCode], headPacket->pktSeqNo);
-#endif
 		return false;
 	}
 
-	int32_t offset = be16toh(p1->hs.hsp);	// For the KEEP_ALIVE/ACK_FLUSH/SNACK packet it is the packet length as well
+	int32_t offset = be16toh(p1->hs.hsp);	// For the KEEP_ALIVE/ACK_FLUSH it is the packet length as well
 	FSP_SelectiveNACK *pSNACK = (FSP_SelectiveNACK *)((uint8_t *)p1 + offset - sizeof(FSP_SelectiveNACK));
 	uint32_t salt = pSNACK->serialNo;
 	uint32_t sn = be32toh(salt);
 
-	if(int(headPacket->pktSeqNo - seqLastAck) == 0 && int(sn - lastOOBSN) <= 0)
+	if(int(sn - lastOOBSN) <= 0)
 	{
 #ifdef TRACE
 		printf_s("%s has encountered replay attack? sequence number: %u\t%u\n", opCodeStrings[p1->hs.opCode], headPacket->pktSeqNo, sn);
@@ -449,7 +448,7 @@ bool LOCALAPI CSocketItemEx::ValidateSNACK(ControlBlock::seq_t & ackSeqNo, FSP_S
 	lastOOBSN = sn;
 
 #if defined(TRACE) && (TRACE & (TRACE_PACKET | TRACE_SLIDEWIN))
-	printf_s("%s data length: %d, header length: %d, peer ALFID = %u\n"
+	printf_s("%s data length: %d, header length: %d, peer ALFID = 0x%X\n"
 		, opCodeStrings[p1->hs.opCode]
 		, headPacket->lenData
 		, offset
@@ -457,20 +456,13 @@ bool LOCALAPI CSocketItemEx::ValidateSNACK(ControlBlock::seq_t & ackSeqNo, FSP_S
 	DumpNetworkUInt16((uint16_t *)p1, offset / 2);
 #endif
 
-	if(! ValidateICC(p1, offset - sizeof(FSP_NormalPacketHeader), salt))
+	//if(! ValidateICC(p1, offset - sizeof(FSP_NormalPacketHeader), salt))	// No! Extension header is not encrypted!
+	if(! ValidateICC(p1, 0, salt))	// No! Extension header is not encrypted!
 	{
 #ifdef TRACE
 		printf_s("Invalid intergrity check code of %s!? Acknowledged sequence number: %u\n", opCodeStrings[p1->hs.opCode], ackSeqNo);
 #endif
 		return false;
-	}
-
-	// whenever the peer's validated, forwarding KEEP_ALIVE was received the MOBILE_PARAM is marked as acknowledged
-	if (keepAliveCache.needAck && int(keepAliveCache.snExpected - sn) <= 0)
-	{
-		if(lowState == PEER_COMMIT || lowState == CLOSABLE)
-			StopKeepAlive();
-		keepAliveCache.needAck = false;
 	}
 
 	ackSeqNo = be32toh(p1->expectedSN);
@@ -490,8 +482,6 @@ bool LOCALAPI CSocketItemEx::ValidateSNACK(ControlBlock::seq_t & ackSeqNo, FSP_S
 		return false;
 	}
 
-	seqLastAck = headPacket->pktSeqNo;
-
 	gaps = (FSP_SelectiveNACK::GapDescriptor *)((BYTE *)pSNACK - n);
 	if(n == 0)
 		return true;
@@ -510,7 +500,7 @@ bool LOCALAPI CSocketItemEx::ValidateSNACK(ControlBlock::seq_t & ackSeqNo, FSP_S
 //		|-->{Return Accept}-->PEER_COMMIT-->[Send PERSIST]{start keep-alive}
 //		|-->{Return Reject}-->NON_EXISTENT-->[Send RESET]
 // See also {FSP_DLL}CSocketItemDl::ToConcludeConnect()
-void LOCALAPI CSocketItemEx::OnConnectRequestAck(FSP_AckConnectRequest & response, int lenData)
+void CSocketItemEx::OnConnectRequestAck(FSP_AckConnectRequest & response, int lenData)
 {
 	TRACE_SOCKET();
 	if(! InState(CONNECT_AFFIRMING))
@@ -572,15 +562,11 @@ void LOCALAPI CSocketItemEx::OnConnectRequestAck(FSP_AckConnectRequest & respons
 
 #if defined(TRACE) && (TRACE & TRACE_HEARTBEAT)
 	TRACE_HERE("the initiator recalculate RTT");
-	DumpTimerInfo(tLastRecv);
+	//DumpTimerInfo(tLastRecv);
 #endif
 	// OS time-slice, if any, might somewhat affect calculating of RTT. But it can be igored for large BDP pipe
 	tRoundTrip_us = (uint32_t)min(UINT32_MAX, (tRoundTrip_us + (tSessionBegin - tRecentSend) + 1) >> 1);
-	tKeepAlive_ms = tRoundTrip_us >> 8; // Would be put into effect on sending PERSIST or COMMIT
-	// New keep_alive tempo is enabled on state transition. See FSP_Start
-
-	seqLastAck = pktSeqNo - 1;
-	//^Because the sequence number of ACK_CONNECT_REQUEST might be reused to acknowledge PERSIST or COMMIT 
+	tKeepAlive_ms = KEEP_ALIVE_TIMEOUT_ms;	// instead of CONNECT_INITIATION_TIMEOUT_ms
 
 	SignalAccepted();	// The initiator may cancel data transmission, however
 	TRACE_HERE("finally the connection request is accepted by the remote end");
@@ -618,7 +604,7 @@ void CSocketItemEx::OnGetPersist()
 		if (pControlBlock->IsRetriableStale(headPacket->pktSeqNo))
 		{
 #ifdef TRACE
-			printf_s("Invalid sequence number: %u\n", headPacket->pktSeqNo);
+			printf_s("@%s: Invalid sequence number:\t %u\n", __FUNCTION__, headPacket->pktSeqNo);
 			pControlBlock->DumpSendRecvWindowInfo();
 #endif
 			return;
@@ -630,25 +616,16 @@ void CSocketItemEx::OnGetPersist()
 			return;
 		}
 	}
-	else // if (lowState == CLONING)
+	else if(! FinalizeMultiply())	// if (lowState == CLONING)
 	{
-		if (!ValidateICC(p1, headPacket->lenData, headPacket->idPair.source, 0))
-		{
-			TRACE_HERE("Invalid intergrity check code of PERSIST to MULTIPLY!?");
-			return;
-		}
-		//
-		pControlBlock->SetRecvWindowHead(headPacket->pktSeqNo);
-		seqLastAck = headPacket->pktSeqNo;
-		fidPair.peer = headPacket->idPair.source;
-		CLowerInterface::Singleton()->PutToRTLB(this);
+		TRACE_HERE("Invalid intergrity check code of COMMIT to MULTIPLY!?");
+		return;
 	}
-	// If ever a PERSIST was accepted the keep-alive cache should be refreshed
-	_InterlockedExchange(&keepAliveCache.len, 0);
 
+	// A duplicated, normally resent, PERSIST should be acknowledged instantly
 	if (InState(ESTABLISHED))
 	{
-		SendSNACK(KEEP_ALIVE);
+		SendKeepAlive();
 		return;
 	}
 
@@ -677,7 +654,7 @@ void CSocketItemEx::OnGetPersist()
 #if defined(TRACE) && (TRACE & (TRACE_HEARTBEAT | TRACE_PACKET | TRACE_SLIDEWIN))
 	TRACE_HERE("the responder calculate RTT");
 #endif
-	CalibrateKeepAlive();
+	CalibrateRTT();
 
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->AllocRecvBuf(headPacket->pktSeqNo);
 	if(skb == NULL)
@@ -716,7 +693,7 @@ void CSocketItemEx::OnGetPersist()
 			StopKeepAlive();
 			SetState(PEER_COMMIT);
 		}
-		SendSNACK(ACK_FLUSH);
+		SendAckFlush();
 	}
 	else
 	{
@@ -744,7 +721,7 @@ void CSocketItemEx::OnGetPersist()
 			SetState(ESTABLISHED);
 		}
 		// It might be redundant, but make the protocol robust
-		SendSNACK(KEEP_ALIVE);
+		AddLazyAckTimer();
 	}
 
 	if (countPlaced == -EEXIST)
@@ -760,7 +737,7 @@ void CSocketItemEx::OnGetPersist()
 
 
 
-// KEEP_ALIVE is out-of-band and carrying some special optional headers for mobility support
+// KEEP_ALIVE is out-of-band and may carry a special optional header for multi-homed mobility support
 //	{ACTIVE, COMMITTING, PEER_COMMIT, COMMITTING2}-->/KEEP_ALIVE/
 //		<-->{keep state}[Retransmit selectively]
 //	{COMMITTED, CLOSABLE, PRE_CLOSED}-->/KEEP_ALIVE/<-->{keep state}{Update Peer's Authorized Addresses}
@@ -788,10 +765,10 @@ void CSocketItemEx::OnGetKeepAlive()
 #endif
 	if(acknowledgible && RespondToSNACK(ackSeqNo, gaps, n) > 0)
 		Notify(FSP_NotifyBufferReady);
-	//
+	
 	PFSP_HeaderSignature phs = headPacket->GetHeaderFSP()->PHeaderNextTo<FSP_SelectiveNACK>(& gaps[n]);
 	if(phs != NULL)
-		HandleMobileParam(phs);
+		HandlePeerSubnets(phs);
 }
 
 
@@ -827,7 +804,7 @@ void CSocketItemEx::OnGetPureData()
 	if (skb == NULL)
 	{
 #ifdef TRACE
-		printf_s("Invalid sequence number:\t %u\n", headPacket->pktSeqNo);
+		printf_s("@%s: Invalid sequence number:\t %u\n", __FUNCTION__, headPacket->pktSeqNo);
 #endif
 		return;
 	}
@@ -853,13 +830,26 @@ void CSocketItemEx::OnGetPureData()
 	// However, we may safely assume that out-of-order packets are of low ratior and it does not make too much overload
 	// It is definitely less efficient than polling for 'very' high throughput network application
 	int r = PlacePayload(skb);
-	if(r <= 0)
+#if defined(_DEBUG) && defined(TRACE)
+	if(r == 0)
 	{
-#ifdef TRACE
-		printf_s("Either a PURE_DATA does not carry payload or the payload it is not stored safely: %d\n", r);
-#endif
+		printf_s("Either a PURE_DATA does not carry payload or the payload it is not stored safely\n");
 		return;
 	}
+	if(r == -EEXIST)
+	{
+		printf_s("A retransmitted PURE_DATA is simply ignored.\n");
+		return;
+	}
+	if(r < 0)
+	{
+		printf_s("Fatal error when place payload, error number = %d\n", r);
+		return;
+	}
+#else
+	if(r <= 0)
+		return;
+#endif
 
 	tLastRecv = NowUTC();
 
@@ -879,12 +869,11 @@ void CSocketItemEx::OnGetPureData()
 			StopKeepAlive();
 			SetState(PEER_COMMIT);
 		}
-		SendSNACK(ACK_FLUSH);
+		SendAckFlush();
 	}
 	else
 	{
-		// UNRESOLVED! Lazy acknowledgement might enhance efficiency
-		SendSNACK(KEEP_ALIVE);
+		AddLazyAckTimer();
 	}
 	// See also OnGetPersist()
 
@@ -933,7 +922,8 @@ void CSocketItemEx::OnGetCommit()
 		if (pControlBlock->IsRetriableStale(headPacket->pktSeqNo))
 		{
 #ifdef TRACE
-			printf_s("IsRetriableStale check sequence number:\t %u\n", headPacket->pktSeqNo);
+			printf_s("@%s: Invalid sequence number:\t %u\n", __FUNCTION__, headPacket->pktSeqNo);
+			//printf_s("IsRetriableStale check sequence number:\t %u\n", headPacket->pktSeqNo);
 #endif
 			return;
 		}
@@ -943,21 +933,11 @@ void CSocketItemEx::OnGetCommit()
 			return;
 		}
 	}
-	else // if (lowState == CLONING)
+	else if(! FinalizeMultiply())	// if (lowState == CLONING)
 	{
-		if (!ValidateICC(p1, headPacket->lenData, headPacket->idPair.source, 0))
-		{
-			TRACE_HERE("Invalid intergrity check code of COMMIT to MULTIPLY!?");
-			return;
-		}
-		//
-		pControlBlock->SetRecvWindowHead(headPacket->pktSeqNo);
-		seqLastAck = headPacket->pktSeqNo;
-		fidPair.peer = headPacket->idPair.source;
-		CLowerInterface::Singleton()->PutToRTLB(this);
+		TRACE_HERE("Invalid intergrity check code of COMMIT to MULTIPLY!?");
+		return;
 	}
-	// If ever a COMMIT was accepted the keep-alive cache should be refreshed
-	InterlockedExchange(&keepAliveCache.len, 0);
 
 	ControlBlock::seq_t ackSeqNo = be32toh(p1->expectedSN);
 	if (!ResizeSendWindow(ackSeqNo, p1->GetRecvWS()))
@@ -978,7 +958,7 @@ void CSocketItemEx::OnGetCommit()
 #if defined(TRACE) && (TRACE & (TRACE_HEARTBEAT | TRACE_PACKET | TRACE_SLIDEWIN))
 	TRACE_HERE("the responder calculate RTT");
 #endif
-	CalibrateKeepAlive();
+	CalibrateRTT();
 
 	// Unlike PURE_DATA, a retransmitted COMMIT cannot be silent discarded
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->AllocRecvBuf(headPacket->pktSeqNo);
@@ -988,7 +968,7 @@ void CSocketItemEx::OnGetCommit()
 #ifdef TRACE
 		printf_s("Duplicate COMMIT received in %s state\n", stateNames[lowState]);
 #endif
-		SendSNACK();
+		SendAckFlush();
 		return;
 	}
 	// but it is well known if PlayPayload return < 0 it is either -EFAULT or -EEXIST
@@ -1028,7 +1008,7 @@ void CSocketItemEx::OnGetCommit()
 			pControlBlock->SlideSendWindowByOne();
 		}
 		// MUST slide the send window BEFORE SendSNACK or else the sequence number of ACK_FLUSH or KEEP_ALIVE is wrong
-		SendSNACK();
+		SendAckFlush();
 		//
 		if(isInitiativeState)
 		{
@@ -1037,7 +1017,7 @@ void CSocketItemEx::OnGetCommit()
 		}
 	}
 
-	Notify(FSP_NotifyFlushing);
+	Notify(FSP_NotifyToCommit);
 }
 
 
@@ -1085,11 +1065,6 @@ void CSocketItemEx::OnAckFlush()
 	// For ACK_FLUSH just accumulatively positively acknowledge
 	RespondToSNACK(ackSeqNo, NULL, 0);
 	Notify(FSP_NotifyFlushed);
-
-	// ACK_FLUSH is recognized as a special 'KEEP_ALIVE' and could piggyback MobileParam header
-	PFSP_HeaderSignature phs = headPacket->GetHeaderFSP()->PHeaderNextTo<FSP_SelectiveNACK>(& gaps[n]);
-	if(phs != NULL)
-		HandleMobileParam(phs);
 }
 
 
@@ -1118,28 +1093,19 @@ void CSocketItemEx::OnGetRelease()
 		return;
 	}
 
-	// UNRESOLVED! When RespondToSNACK? But RELEASE is an In-band packet, to mark the termination!
 	FSP_NormalPacketHeader *p1 = headPacket->GetHeaderFSP();
 	ControlBlock::seq_t ackSeqNo = be32toh(p1->expectedSN);
 	RespondToSNACK(ackSeqNo, NULL, 0);
 
-	bool initiativeShutdown = InState(PRE_CLOSED);
 	if(InState(COMMITTING2))
 		StopKeepAlive();
-	// InState(PRE_CLOSED): CloseSocket would StopKeepAlive
-	SetState(CLOSED);
+
+	// There used to be 'connection resurrection'; might send redundant RELEASE, but it makes robustness
+	_InterlockedExchange8((char *)& pControlBlock->state, CLOSED);
 	SendPacket<RELEASE>();
-	// NotifyRecyled is meant to be call-back of gracefully shutdown,
-	// while NotifyToFinish is requested by the remote end
-	if (initiativeShutdown)
-	{
-		Notify(FSP_NotifyRecycled);
-		CloseSocket();
-	}
-	else
-	{
-		Notify(FSP_NotifyToFinish);
-	}
+	Notify(FSP_NotifyToFinish);
+
+	Destroy();	// LLS 
 }
 
 
@@ -1162,17 +1128,27 @@ void CSocketItemEx::OnGetMultiply()
 	if (pControlBlock->IsRetriableStale(headPacket->pktSeqNo))
 		return;
 
-	FSP_NormalPacketHeader *p1 = (FSP_NormalPacketHeader *)headPacket->GetHeaderFSP();
+	FSP_NormalPacketHeader *pFH = (FSP_NormalPacketHeader *)headPacket->GetHeaderFSP();	// the fixed header
 	ALFID_T idSource = headPacket->idPair.source;
-	if (!ValidateICC(p1, headPacket->lenData, idSource, p1->expectedSN))
+	// The out-of-band serial number is stored in p1->expectedSN
+	if (!ValidateICC(pFH, headPacket->lenData, idSource, pFH->expectedSN))
 	{
 		TRACE_HERE("Invalid intergrity check code!?");
 		return;
 	}
 
+	// The request is already put into the multiplication backlog
+	if (CMultiplyBacklog::Find(fidPair.source, idSource) != NULL)
+	{
+#if defined(TRACE) && (TRACE & TRACE_PACKET)
+		printf_s("Duplicate connection multiplication request.\n");
+#endif
+		return;
+	}
+
+	// Check whether it is a collision!?
 	CSocketItemEx *pSocket = CLowerInterface::Singleton()->FindSocket(pControlBlock->connectParams.remoteHostID, idSource, fidPair.source);
-	// UNRESOLVED!? Check whether it is a collision!?
-	if(pSocket != NULL && pSocket->IsInUse())
+	if (pSocket != NULL && pSocket->IsInUse())
 	{
 		if (pSocket->lowState == COMMITTING || pSocket->lowState == ESTABLISHED)
 			pSocket->EmitStart();
@@ -1180,42 +1156,65 @@ void CSocketItemEx::OnGetMultiply()
 		return;
 	}
 
+	// See also CLowerInterface::OnGetInitConnect
+	CSocketItemEx * newSlot = CLowerInterface::Singleton()->AllocItem();
+	if(newSlot == NULL)
+	{
+		TRACE_HERE("Cannot allocate new socket slot for multiplication");
+		return;		// for security reason silently the exception
+	}
+
 	BackLogItem backlogItem;	// Inherit the session key of its parent
 	(SConnectParam &)backlogItem = pControlBlock->connectParams;
 	backlogItem.idRemote = idSource;
-	rand_w32(& backlogItem.initialSN, 1);
-	if(pSocket->pControlBlock->backLog.Has(& backlogItem))
+	rand_w32(&backlogItem.initialSN, 1);
+	if (pSocket->pControlBlock->backLog.Has(&backlogItem))
 	{
 		TRACE_HERE("Duplicate MULTIPLY backlogged already");
+l_bailout:
+		CLowerInterface::Singleton()->FreeItem(newSlot);
 		return;
 	}
 
-	// secondly, fill in the backlog item if it is new
-	CtrlMsgHdr * const pHdr = (CtrlMsgHdr *)(CLowerInterface::Singleton()->mesgInfo.Control.buf);
-	if (pHdr->IsIPv6())
+	CMultiplyBacklogItem *pMItem = CMultiplyBacklog::Alloc(fidPair.source, idSource, headPacket->pktSeqNo, pFH->expectedSN);
+	if (pMItem == NULL)
 	{
-		memcpy(&backlogItem.acceptAddr, &pHdr->u, sizeof(FSP_SINKINF));
-	}
-	else
-	{	// FSP over UDP/IPv4
-		register PFSP_IN6_ADDR fspAddr = (PFSP_IN6_ADDR) & backlogItem.acceptAddr;
-		fspAddr->u.st.prefix = PREFIX_FSP_IP6to4;
-		fspAddr->u.st.ipv4 = pHdr->u.ipi_addr;
-		fspAddr->u.st.port = DEFAULT_FSP_UDPPORT;
-		fspAddr->idHost = 0;	// no for IPv4 no virtual host might be specified
-		fspAddr->idALF = idSource;
-		backlogItem.acceptAddr.ipi6_ifindex = pHdr->u.ipi_ifindex;
-	}	
+#if defined(TRACE) && (TRACE & TRACE_PACKET)
+		printf_s("Cannot put the connection multiplication request into the system backlog.\n");
+#endif
 
-	// TODO: the initiator make the cloning
-	backlogItem.idParent = fidPair.source;
+		goto l_bailout;
+	}
+
 	backlogItem.expectedSN = headPacket->pktSeqNo;
+	backlogItem.idParent = fidPair.source;
+	backlogItem.acceptAddr = pControlBlock->nearEndInfo;
+	backlogItem.acceptAddr.idALF = newSlot->fidPair.source;
 
 	// lastly, put it into the backlog
-	pSocket->pControlBlock->backLog.Put(& backlogItem);
-	pSocket->SignalAccepting();
+	if (pSocket->pControlBlock->backLog.Put(&backlogItem) < 0)
+	{
+#if defined(TRACE) && (TRACE & TRACE_PACKET)
+		printf_s("Cannot put the multiplying connection request into the SCB backlog.\n");
+#endif
+		CMultiplyBacklog::Free(pMItem);
+		goto l_bailout;
+	}
 
-	SignalEvent();
+	// place payload into the backlog, see also placepayload
+	pMItem->lenData = headPacket->lenData;
+	if (headPacket->lenData > 0)
+	{
+		memcpy(pMItem->plainText, (BYTE *)pFH + be16toh(pFH->hs.hsp), headPacket->lenData);
+		pMItem->isEOM = (pFH->GetFlag<ToBeContinued>() != 0);
+	}
+
+	newSlot->contextOfICC = contextOfICC;
+	newSlot->tKeepAlive_ms = TRASIENT_STATE_TIMEOUT_ms;
+	newSlot->lowState = NON_EXISTENT;	// so that when timeout it is scavenged
+	newSlot->AddTimer();
+
+	SignalAccepting();
 }
 
 
@@ -1256,9 +1255,6 @@ int LOCALAPI CSocketItemEx::PlacePayload(ControlBlock::PFSP_SocketBuf skb)
 	skb->opCode = pHdr->hs.opCode;
 	skb->len = headPacket->lenData;
 	skb->SetFlag<IS_FULFILLED>();
-
-	// If ever a new payload was accepted the keep-alive cache should be refreshed
-	InterlockedExchange(&keepAliveCache.len, 0);
 
 	return headPacket->lenData;
 }

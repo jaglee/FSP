@@ -121,16 +121,14 @@ void TraceLastError(char * fileName, int lineNo, char *funcName, char *s1);
 /**
  * Implementation defined timeout
  */
-#define MAXIMUM_SESSION_LIFE_ms		43200000	// 12 hours
 
-#ifdef TRACE
-# define KEEP_ALIVE_TIMEOUT_MIN_us	1000000	// 1 second
+#ifdef _DEBUG
 # define SCAVENGE_THRESHOLD_ms		180000	// 3 minutes
+# define LAZY_ACK_DELAY_MIN_ms		100		// 100 millisecond, minimum delay for lazy acknowledgement
 #else
-# define KEEP_ALIVE_TIMEOUT_MIN_us	500		// 0.5 millisecond
 # define SCAVENGE_THRESHOLD_ms		1800000	// 30 minutes
+# define LAZY_ACK_DELAY_MIN_ms		1		// 1 millisecond, minimum delay for lazy acknowledgement
 #endif
-
 
 
 #if defined(_MSC_VER) || defined(_MSC_EXTENSIONS)
@@ -313,7 +311,7 @@ struct FSP_Challenge
 
 // FSP_ConnectParam specifies the parent connection in a MULTIPLY or CONNECT_REQUEST packet
 // while alias as the mobile parameters
-// MOBILE_PARAM used to be CONNECT_PARAM and it is perfect OK to treat the latter as the canonical alias of the former
+// PEER_SUBNETS used to be CONNECT_PARAM and it is perfect OK to treat the latter as the canonical alias of the former
 struct FSP_ConnectParam
 {
 	uint64_t	subnets[MAX_PHY_INTERFACES];
@@ -417,6 +415,11 @@ struct CommandNewSession: CommandToLLS
 	CommandNewSession() { memset(this, 0, sizeof(CommandNewSession)); }
 };
 
+
+struct CommandCloneSession: CommandNewSession
+{
+	ALFID_T			idParent;
+};
 
 
 struct FSP_PKTINFO_EX : FSP_SINKINF
@@ -637,6 +640,7 @@ struct ControlBlock
 	// Total size of FSP_SocketBuf (descriptor): 8 bytes (a 64-bit word)
 	typedef struct FSP_SocketBuf
 	{
+		timestamp_t	timeSent;
 		int32_t		len;
 		uint16_t	flags;
 		uint8_t		version;	// should be the same as in the FSP fixed header
@@ -766,15 +770,13 @@ struct ControlBlock
 		return (d < -1) || (d >= recvBufferBlockN);
 	}
 
-	void LOCALAPI SetSequenceFlags(FSP_NormalPacketHeader *, PFSP_SocketBuf, seq_t);
-	void LOCALAPI SetSequenceFlags(FSP_NormalPacketHeader *, seq_t);
 	void LOCALAPI SetSequenceFlags(FSP_NormalPacketHeader *);
 
 	void * LOCALAPI InquireSendBuf(int &);
 
 	PFSP_SocketBuf GetFirstReceived() const { return HeadRecv() + recvWindowHeadPos; }
 	int LOCALAPI GetSelectiveNACK(seq_t &, FSP_SelectiveNACK::GapDescriptor *, int) const;
-	int LOCALAPI DealWithSNACK(seq_t, FSP_SelectiveNACK::GapDescriptor *, int & n);
+	int LOCALAPI DealWithSNACK(seq_t, FSP_SelectiveNACK::GapDescriptor *, int, timestamp_t &);
 
 	// Return the last received packet, which might be already delivered
 	PFSP_SocketBuf LOCALAPI AllocRecvBuf(seq_t);

@@ -208,7 +208,6 @@ void CSocketItemEx::InstallEphemeralKey()
 }
 
 
-
 // See @DLL::InstallKey
 void CSocketItemEx::InstallSessionKey()
 {
@@ -229,6 +228,42 @@ void CSocketItemEx::InstallSessionKey()
 }
 
 
+// Set the session key for the packet next sent and the next received. KDF counter mode
+// As the NIST SP800-108 recommended, K(i) = PRF(K, [i] || Label || 0x00 || Context || L)
+// Label  ¨C A string that identifies the purpose for the derived keying material, here we set to "FSP connection multiplication"
+// Context - idRemoteHost, idParent
+// Length -  An integer specifying the length (in bits) of the derived keying material K-output
+void CSocketItemEx::DeriveNextKey()
+{
+	// hard coded, as specified by the protocol
+	ALIGN(8)
+	uint8_t paddedData[48];
+	// The first 128 bits
+	paddedData[0] = 0;
+	paddedData[1] = 0;
+	paddedData[2] = 1;
+	memcpy(paddedData + 3, "Multiplication of FSP connection", 32); // works in multi-byte/ASCII encoding source only
+	paddedData[35] = 0;
+	*(uint32_t *)(paddedData + 36) = pControlBlock->peerAddr.ipFSP.hostID;	// byte-order neutral, actually
+	*(uint32_t *)(paddedData + 40) = pControlBlock->idParent;		// byte-order neutral, actually
+	*(uint32_t *)(paddedData + 44) = htobe32(pControlBlock->connectParams.keyLength * 8);
+
+	GCM_SecureHash(& contextOfICC.curr.gcm_aes
+		, pControlBlock->sendWindowNextSN
+		, paddedData, sizeof(paddedData)
+		, (uint8_t *) & pControlBlock->connectParams, 8);
+	if(pControlBlock->connectParams.keyLength <= 16)
+		return;
+	//
+	paddedData[2] = 2;
+	GCM_SecureHash(& contextOfICC.curr.gcm_aes
+		, pControlBlock->sendWindowNextSN
+		, paddedData, sizeof(paddedData)
+		, (uint8_t *) & pControlBlock->connectParams, 8);
+
+}
+
+
 
 // Do
 //	Automatically register source IP address as the favorite returning IP address
@@ -240,7 +275,7 @@ void CSocketItemEx::InstallSessionKey()
 inline void CSocketItemEx::ChangeRemoteValidatedIP()
 {
 //	Currently not bothered to support mobility under IPv4 yet
-#ifndef OVER_UDP_IPv4
+#ifndef OVER_UDP_IPv4 //_DEBUG //
 	register int i = MAX_PHY_INTERFACES - 1;
 	for (; i >= 0; i--)
 	{
@@ -513,11 +548,12 @@ bool CSocketItemEx::EmitStart()
 
 	register FSP_NormalPacketHeader * const pHdr = & pControlBlock->tmpHeader;
 	int result;
+	skb->timeSent = NowUTC();	// This make the initial RTT including the near end's send delay, including timer slice jitter
 	switch (skb->opCode)
 	{
 	case ACK_CONNECT_REQ:
 		pControlBlock->SetSequenceFlags(pHdr);
-		pHdr->integrity.code = htobe64(tRecentSend);
+		pHdr->integrity.code = htobe64(skb->timeSent);
 
 		CLowerInterface::Singleton()->EnumEffectiveAddresses(pControlBlock->connectParams.allowedPrefixes);
 		memcpy((BYTE *)payload, pControlBlock->connectParams.allowedPrefixes, sizeof(uint64_t) * MAX_PHY_INTERFACES);
@@ -541,15 +577,13 @@ bool CSocketItemEx::EmitStart()
 		TRACE_HERE("Unexpected socket buffer block");
 		result = 0;	// unrecognized packet type is simply ignored?!
 	}
-
 #if defined(TRACE) && (TRACE & TRACE_PACKET)
 	printf_s("Session#0x%X emit %s, result = %d, time : 0x%016llX\n"
-		, fidPair.source, opCodeStrings[skb->opCode], result, tRecentSend);
+		, fidPair.source, opCodeStrings[skb->opCode], result, skb->timeSent);
 #endif
-	if(result > 0)
-		SetEarliestSendTime();
 	return (result >= 0);
 }
+
 
 
 // Do
@@ -606,8 +640,17 @@ bool LOCALAPI CSocketItemEx::EmitWithICC(ControlBlock::PFSP_SocketBuf skb, Contr
 #endif
 		return false;
 	}
-	// Which is the norm. Dynanically generate the fixed header.
-	pControlBlock->SetSequenceFlags(pHdr, skb, seq);
+
+	pHdr->expectedSN = htobe32(pControlBlock->recvWindowNextSN);
+	pHdr->sequenceNo = htobe32(seq);
+	pHdr->ClearFlags();	// pHdr->u.flags = 0;
+	if (skb->GetFlag<TO_BE_CONTINUED>())
+		pHdr->SetFlag<ToBeContinued>();
+	else
+		pHdr->ClearFlag<ToBeContinued>();
+	// UNRESOLVED! compressed? ECN?
+	// here we needn't check memory corruption as mishavior only harms himself
+	pHdr->SetRecvWS(pControlBlock->RecvWindowSize());
 	pHdr->hs.Set(skb->opCode, sizeof(FSP_NormalPacketHeader));
 
 	void * paidLoad = SetIntegrityCheckCode(pHdr, (BYTE *)payload, skb->len);
@@ -623,43 +666,15 @@ bool LOCALAPI CSocketItemEx::EmitWithICC(ControlBlock::PFSP_SocketBuf skb, Contr
 
 
 
-// On near end's IPv6 address changed automatically send KEEP_ALIVE with MOBILE_HEADER
-// See also CSocketItemEx::SendSNACK(), OnGetPureData, OnGetPersist
 #ifndef OVER_UDP_IPv4
+// On near end's IPv6 address changed automatically send KEEP_ALIVE
+// No matter whether the KEEP_ALIVE flag was set when the connection was setup
 void CSocketItemEx::OnLocalAddressChanged()
 {
 	if(!IsInUse() || IsPassive() || !TestAndWaitReady())
 		return;
 	
-	FSP_ConnectParam &mp = keepAliveCache.buf3.mp;
-	u_int k = CLowerInterface::Singleton()->sdSet.fd_count;
-	u_int j = 0;
-	LONG w = CLowerInterface::Singleton()->disableFlags;
-	for (register u_int i = 0; i < k; i++)
-	{
-		if (!BitTest(&w, i))
-		{
-			mp.subnets[j++] = SOCKADDR_SUBNET(&CLowerInterface::Singleton()->addresses[i]);
-			if (j >= sizeof(mp.subnets) / sizeof(uint64_t))
-				break;
-		}
-	}
-	// temporarily there is no path to the local end:
-	if (j <= 0)
-		goto l_return;
-	//
-	while(j < sizeof(mp.subnets) / sizeof(uint64_t))
-	{
-		mp.subnets[j] = mp.subnets[j - 1];
-		j++;
-	}
-	//^Let's the compiler do loop-unrolling
-	mp.idHost = SOCKADDR_HOSTID(&CLowerInterface::Singleton()->addresses[0]);
-	mp.hs.Set(MOBILE_PARAM, sizeof(FSP_NormalPacketHeader));
-	
-	keepAliveCache.needAck = true;
-	if(!RefreshKeepAliveCache((pControlBlock->HasBeenCommitted() > 0) ? ACK_FLUSH : KEEP_ALIVE))
-		goto l_return;
+	SendKeepAlive();
 
 	// If destination interface happen to be on the same host, update the registered address simultaneously
 	// UNRESOLVED!? The default interface should be the one that is set to promiscuous
@@ -670,16 +685,10 @@ void CSocketItemEx::OnLocalAddressChanged()
 		SOCKADDR_HOSTID(sockAddrTo) = SOCKADDR_HOSTID(p);
 	}
 
-	SendPacket(1, ScatteredSendBuffers(&keepAliveCache.hdr, keepAliveCache.len));
-	//
-	if(lowState == PEER_COMMIT || lowState == CLOSABLE)
-		RestartKeepAlive();
-
-l_return:
-	// leave the critical section only when len has been exploited
 	SetReady();
 }
 #endif
+
 
 
 // Given
@@ -688,10 +697,11 @@ l_return:
 //	Process the getting remote address event
 // Remark
 //	Although the subnet that the host belong to could be mobile, the ID of the host should be persistent
-bool LOCALAPI CSocketItemEx::HandleMobileParam(PFSP_HeaderSignature optHdr)
+bool CSocketItemEx::HandlePeerSubnets(PFSP_HeaderSignature optHdr)
 {
-	if (optHdr == NULL || optHdr->opCode != MOBILE_PARAM)
+	if (optHdr == NULL || optHdr->opCode != PEER_SUBNETS)
 		return false;
+	//
 #ifndef OVER_UDP_IPv4
 	FSP_ConnectParam *pMobileParam = (FSP_ConnectParam *)((uint8_t *)optHdr + sizeof(FSP_HeaderSignature) - sizeof(FSP_ConnectParam));
 	// loop roll-out
@@ -700,13 +710,10 @@ bool LOCALAPI CSocketItemEx::HandleMobileParam(PFSP_HeaderSignature optHdr)
 	SOCKADDR_SUBNET(&sockAddrTo[2]) = pMobileParam->subnets[2];
 	SOCKADDR_SUBNET(&sockAddrTo[3]) = pMobileParam->subnets[3];
 #if defined(TRACE) && (TRACE & TRACE_ADDRESS)
-	printf_s("New target address set for host %u (== %u)\n", SOCKADDR_HOSTID(sockAddrTo), pMobileParam->idHost);
+	printf_s("New target address set for host 0x%X (== 0x%X)\n", SOCKADDR_HOSTID(sockAddrTo), pMobileParam->idHost);
 #endif
 	//
 #endif
-	// For mobility support (acknowledgement to the MOBILE_PARAM header)
-	if (lowState == PEER_COMMIT || lowState == CLOSABLE)
-		SendSNACK(ACK_FLUSH);	// Retransmitted. See also ValidateSNACK
 	//
 	return true;
 }
@@ -728,6 +735,7 @@ void CSocketItemEx::EmitQ()
 	int32_t winSize = _InterlockedOr((LONG *) & pControlBlock->sendWindowSize, 0);
 	//
 	register ControlBlock::PFSP_SocketBuf skb;
+	bool someSent = false;
 	while (int(nextSN - lastSN) < 0 && int(nextSN - firstSN) <= winSize)
 	{
 		skb = pControlBlock->HeadSend() + pControlBlock->sendWindowNextPos;
@@ -754,28 +762,10 @@ void CSocketItemEx::EmitQ()
 			skb->Unlock();
 			break;
 		}
+		someSent = true;
 		skb->SetFlag<IS_SENT>();
-		//
-		if (pControlBlock->SlideNextToSend() == firstSN + 1)
-			SetEarliestSendTime();
+		skb->timeSent = NowUTC();	// not necessarily tRecentSend
 	}
-}
-
-
-// An auxillary function handling the fixed header
-// Given
-//	FSPOperationCode
-//	uint16_t	The total length of all the headers
-//	uint32_t	The sequenceNo field in host byte order
-//	uint32_t	The expectedNo field in host byte order
-//	uint32_t	The advertised receive window size, in host byte order
-// Do
-//	Filled in the fixed header
-void LOCALAPI FSP_NormalPacketHeader::Set(FSPOperationCode code, uint16_t hsp, uint32_t seqThis, uint32_t seqExpected, int32_t advRecvWinSize)
-{
-	hs.Set(code, hsp);
-	expectedSN = htobe32(seqExpected);
-	sequenceNo = htobe32(seqThis);
-	ClearFlags();
-	SetRecvWS(advRecvWinSize);
+	if(someSent)
+		AddResendTimer(tRoundTrip_us >> 8);	// only the first one would be success
 }

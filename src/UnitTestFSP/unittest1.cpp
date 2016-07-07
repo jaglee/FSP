@@ -234,6 +234,8 @@ void UnitTestNoticeQ()
 
 
 
+extern "C" double CubicRoot(double);
+//^defined in CubicRoot.c
 void UnitTestCubicRoot()
 {
 	Assert::IsTrue(fabs(CubicRoot(0)) < DBL_EPSILON);
@@ -554,6 +556,49 @@ void UnitTestSocketRTLB()
 }
 
 
+void UnitTestMultiplyBacklog()
+{
+	CMultiplyBacklog::Prepare();
+	
+	CMultiplyBacklogItem *p = CMultiplyBacklog::Alloc(1, 2, 3, 4);
+	Assert::IsNotNull(p);
+
+	CMultiplyBacklogItem *p1 = CMultiplyBacklog::Find(1, 2);
+	Assert::IsTrue(p == p1);
+
+	CMultiplyBacklog::Free(p);
+
+	p1 = CMultiplyBacklog::Alloc(1, 2, 3, 4);
+	Assert::IsNotNull(p1);
+	Assert::IsFalse(p == p1);
+
+	// Collision detection:
+	p = CMultiplyBacklog::Alloc(1, 2, 3, 4);
+	Assert::IsNull(p);
+
+	CMultiplyBacklogItem *pRet[MULTIPLY_BACKLOG_SIZE];
+	// We have allocated one
+	for(register int i = 0; i < MULTIPLY_BACKLOG_SIZE - 1; i ++)
+	{
+		pRet[i] = CMultiplyBacklog::Alloc(i + 2, 2, 3, 4);
+		Assert::IsNotNull(pRet[i]);
+	}
+
+	p = CMultiplyBacklog::Alloc(MULTIPLY_BACKLOG_SIZE + 2, 2, 3, 4);
+	Assert::IsNull(p);
+
+	CMultiplyBacklog::Free(p1);
+	p = CMultiplyBacklog::Alloc(MULTIPLY_BACKLOG_SIZE + 2, 2, 3, 4);
+	Assert::IsNotNull(p);
+
+	p1 = CMultiplyBacklog::Alloc(MULTIPLY_BACKLOG_SIZE + 3, 2, 3, 4);
+	Assert::IsNull(p1);
+
+	Sleep(CONNECT_INITIATION_TIMEOUT_ms);	// Let the first entry timed-out
+	p = CMultiplyBacklog::Alloc(MULTIPLY_BACKLOG_SIZE + 3, 2, 3, 4);
+	Assert::IsNotNull(p);
+}
+
 
 
 void UnitTestReceiveQueue()
@@ -693,11 +738,11 @@ void UnitTestSelectPath()
 	FSP_SINKINF nearInfo;
 	SOCKADDR_INET addr;
 
-	pSrv->sdSet.fd_count = 4;
+	pSrv->sdSet.fd_count = 5;
 	pSrv->addresses[0].sin6_addr = in6addr_linklocalprefix;
 	pSrv->addresses[1].sin6_addr = in6addr_6to4prefix;
 	pSrv->addresses[2].sin6_addr = in6addr_teredoprefix;
-	//
+	// ULA
 	pSrv->addresses[3].sin6_addr.u.Word[0] = 0x00FC;
 	pSrv->addresses[3].sin6_addr.u.Word[1] = 0x0000;
 	pSrv->addresses[3].sin6_addr.u.Word[2] = 0x0000;
@@ -707,14 +752,8 @@ void UnitTestSelectPath()
 	pSrv->addresses[3].sin6_addr.u.Word[6] = 0x0000;
 	pSrv->addresses[3].sin6_addr.u.Word[7] = 0x0100;
 
+	pSrv->addresses[4].sin6_addr = pSrv->addresses[3].sin6_addr;
 	pSrv->addresses[4].sin6_addr.u.Word[0] = 0x00E0;
-	pSrv->addresses[4].sin6_addr.u.Word[1] = 0x0000;
-	pSrv->addresses[4].sin6_addr.u.Word[2] = 0x0000;
-	pSrv->addresses[4].sin6_addr.u.Word[3] = 0x0000;
-	pSrv->addresses[4].sin6_addr.u.Word[4] = 0x0000;
-	pSrv->addresses[4].sin6_addr.u.Word[5] = 0x0000;
-	pSrv->addresses[4].sin6_addr.u.Word[6] = 0x0000;
-	pSrv->addresses[4].sin6_addr.u.Word[7] = 0x0100;
 
 	pSrv->interfaces[0] = 1;
 	pSrv->interfaces[1] = 2;
@@ -724,14 +763,23 @@ void UnitTestSelectPath()
 
 	addr.Ipv6.sin6_addr = in6addr_linklocalprefix;
 	pSrv->SelectPath(& nearInfo, 2, 1, & addr);
+	Assert::IsTrue(nearInfo.idALF == 2
+		//&& nearInfo.ipi6_ifindex == 1
+		&& nearInfo.ipi_addr == *(uint32_t *) & in6addr_linklocalprefix.u);
 
 	// then in6addr_6to4prefix
 	addr.Ipv6.sin6_addr = in6addr_6to4prefix;
 	pSrv->SelectPath(& nearInfo, 2, 2, & addr);
+	Assert::IsTrue(nearInfo.idALF == 2
+		//&& nearInfo.ipi6_ifindex == 2
+		&& nearInfo.ipi_addr == *(uint32_t *) & in6addr_6to4prefix.u);
 
 	// then match terodo tunnelling
 	addr.Ipv6.sin6_addr = in6addr_teredoprefix;
 	pSrv->SelectPath(& nearInfo, 2, 3, & addr);
+	Assert::IsTrue(nearInfo.idALF == 2
+		//&& nearInfo.ipi6_ifindex == 3
+		&& nearInfo.ipi_addr == *(uint32_t *) & in6addr_teredoprefix.u);
 
 	// then a Unique Local Address (but site-local is obsolete)
 	addr.Ipv6.sin6_addr.u.Word[0] = 0x00FC;
@@ -739,14 +787,21 @@ void UnitTestSelectPath()
 	addr.Ipv6.sin6_addr.u.Word[2] = 0x0000;
 	addr.Ipv6.sin6_addr.u.Word[3] = 0x0000;
 	pSrv->SelectPath(& nearInfo, 2, 4, & addr);
+	Assert::IsTrue(nearInfo.idALF == 2
+		//&& nearInfo.ipi6_ifindex == 4
+		&& nearInfo.ipi_addr == 0xFC);
 
-	// at last the global unique address
+	// lastly the global unique address
 	addr.Ipv6.sin6_addr.u.Word[0] = 0x00E0;
 	addr.Ipv6.sin6_addr.u.Word[1] = 0x0000;
 	addr.Ipv6.sin6_addr.u.Word[2] = 0x0000;
 	addr.Ipv6.sin6_addr.u.Word[3] = 0x0000;
-	pSrv->SelectPath(& nearInfo, 2, 4, & addr);
+	pSrv->SelectPath(& nearInfo, 2, 5, & addr);
+	Assert::IsTrue(nearInfo.idALF == 2
+		//&& nearInfo.ipi6_ifindex == 5
+		&& nearInfo.ipi_addr == 0xE0);
 }
+
 
 
 
@@ -820,6 +875,11 @@ namespace UnitTestFSP
 			UnitTestSocketRTLB();
 		}
 
+
+		TEST_METHOD(TestMultiplyBacklog)
+		{
+			UnitTestMultiplyBacklog();
+		}
 
 		TEST_METHOD(TestConnectQueue)
 		{

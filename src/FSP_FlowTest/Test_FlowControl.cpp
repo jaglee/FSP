@@ -272,7 +272,7 @@ void FlowTestRetransmission()
 	p->hdr.expectedSN = htobe32(seq4);
 	p->hdr.ClearFlags();
 	p->hdr.SetRecvWS(pSCB->RecvWindowSize());
-
+	
 	dbgSocket.SetIntegrityCheckCode(& p->hdr, NULL, 0, p->ext.GetSaltValue());
 
 	// Firstly emulate receive the packet before emulate OnGetKeepAlive
@@ -280,9 +280,7 @@ void FlowTestRetransmission()
 	dbgSocket.headPacket->pktSeqNo = FIRST_SN + 3;
 	dbgSocket.headPacket->lenData = 0;
 	dbgSocket.tRoundTrip_us = 1;
-	dbgSocket.tEarliestSend = NowUTC();
-	dbgSocket.tRecentSend = dbgSocket.tEarliestSend + 1;
-	dbgSocket.seqLastAck = FIRST_SN - 1;
+	dbgSocket.tRecentSend = NowUTC() + 1;
 	// See also CSocketItemEx::OnGetKeepAlive
 	FSP_SelectiveNACK::GapDescriptor *snack;
 	int n;

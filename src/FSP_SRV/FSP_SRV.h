@@ -44,7 +44,9 @@
 #pragma intrinsic(_InterlockedExchange, _InterlockedExchange16, _InterlockedExchange8)
 #pragma intrinsic(_InterlockedIncrement, _InterlockedOr, _InterlockedOr8)
 
-// For testability
+#define MULTIPLY_BACKLOG_SIZE	8
+
+ // For testability
 #define TRACE_ADDRESS	1
 #define TRACE_HEARTBEAT	2
 #define TRACE_PACKET	4
@@ -125,8 +127,9 @@ inline uint64_t ntohll(uint64_t h)
 
 
 
-class CommandNewSessionSrv: CommandToLLS
+class CommandNewSessionSrv: protected CommandToLLS
 {
+protected:
 	friend class ConnectRequestQueue;
 	friend class CSocketItemEx;
 	friend class CSocketSrvTLB;
@@ -134,7 +137,7 @@ class CommandNewSessionSrv: CommandToLLS
 	// defined in command.cpp
 	friend void LOCALAPI Listen(CommandNewSessionSrv &);
 	friend void LOCALAPI Connect(CommandNewSessionSrv &);
-	friend void LOCALAPI SyncSession(CommandNewSessionSrv &);
+	friend void LOCALAPI Accept(CommandNewSessionSrv &);
 
 	HANDLE	hMemoryMap;		// pass to LLS by ULA, should be duplicated by the server
 	DWORD	dwMemorySize;	// size of the shared memory, in the mapped view
@@ -147,6 +150,16 @@ public:
 	CommandNewSessionSrv() {}
 
 	void DoConnect();
+};
+
+
+
+class CommandCloneSessionSrv: CommandNewSessionSrv
+{
+	friend void Multiply(CommandCloneSessionSrv &);
+	ALFID_T idParent;
+public:
+	CommandCloneSessionSrv(const CommandToLLS *p): CommandNewSessionSrv(p) { idParent = ((CommandCloneSession *)p)->idParent; }
 };
 
 
@@ -241,9 +254,6 @@ struct ICC_Context
 
 
 
-// KEEP_ALIVE cache:
-//	In committed / closable state, the peer needs not transmit ack_flush / keep_alive
-//	In peer_commit / closable state, mobile_param should be retransmitted
 class CSocketItemEx: public CSocketItem
 {
 	friend class CLowerInterface;
@@ -251,30 +261,13 @@ class CSocketItemEx: public CSocketItem
 
 	// any packet with full-weight integrity-check-code except aforementioned
 	friend DWORD WINAPI HandleFullICC(LPVOID);
+	friend void Multiply(CommandCloneSessionSrv &);
 
 	SRWLOCK	rtSRWLock;
 	DWORD	idSrcProcess;
 	HANDLE	hSrcMemory;
 	//
-	struct
-	{
-		ControlBlock::seq_t	snExpected;
-		LONG	len;
-		bool	needAck;
-		ALIGN(8)
-		FSP_NormalPacketHeader hdr;
-		union
-		{
-			FSP_PreparedKEEP_ALIVE snack;
-			//
-			struct
-			{
-				FSP_ConnectParam		mp;
-				FSP_PreparedKEEP_ALIVE	snack;
-			} buf3;
-		};
-	}	keepAliveCache;
-	//
+	ICC_Context	contextOfICC;
 	uint8_t	cipherText[MAX_BLOCK_SIZE];
 	//
 protected:
@@ -289,14 +282,11 @@ protected:
 	// the extra one is for saving temporary souce address
 	SOCKADDR_INET	sockAddrTo[MAX_PHY_INTERFACES + 1];
 
-	volatile char	inUse;	// assert ALIGN(2)
-	volatile char	isReady;
-	volatile char	toUpdateTimer;
+	char	inUse;	// assert ALIGN(2)
+	char	isReady;
 	FSP_Session_State lowState;
 
 	// chainlist on the collision entry of the remote ALFID TLB
-	uint32_t		idRemoteHost;
-	ALFID_T			idParent;
 	CSocketItemEx * prevRemote;
 
 	// chainlist on the collision entry of the near ALFID TLB
@@ -305,34 +295,47 @@ protected:
 
 	uint32_t	tRoundTrip_us;	// round trip time evaluated in microseconds
 	uint32_t	tKeepAlive_ms;	// keep-alive time-out limit in milliseconds
-	HANDLE		timer;
+	HANDLE		timer;			// the repeating timer
+	HANDLE		resendTimer;	// retransmission timer
+	HANDLE		lazyAckTimer;	// an one-shot timer, typically for sending snack lazily
 	timestamp_t	tSessionBegin;
-	timestamp_t tRecentSend;
 	timestamp_t	tLastRecv;
-	timestamp_t tEarliestSend;
+	timestamp_t tRecentSend;
 
 	uint32_t	nextOOBSN;	// host byte order for near end. if it overflow the session MUST be terminated
 	uint32_t	lastOOBSN;	// host byte order, the serial number of peer's last out-of-band packet
-	ALIGN(8)
-	ControlBlock::seq_t	seqLastAck;
 
-	//
 	struct
 	{
 		timestamp_t tMigrate;
 	}	clockCheckPoint;
 
-	ICC_Context		contextOfICC;
+	//
+	bool AddLazyAckTimer();
+	bool AddResendTimer(uint32_t);
+	bool AddTimer();
+	void RemoveTimers();
+	bool LOCALAPI ReplaceTimer(uint32_t);
 
-#if defined(TRACE) && (TRACE & TRACE_HEARTBEAT)
-	// For debug purpose, fixed the heartbeat interval to 10 seconds
-	void RestartKeepAlive() { ReplaceTimer(10000); }
-#else
-	void RestartKeepAlive() { ReplaceTimer(tKeepAlive_ms); }
-#endif
+	void RestartKeepAlive() { ReplaceTimer(KEEP_ALIVE_TIMEOUT_ms); }
 	void StopKeepAlive() { ReplaceTimer(SCAVENGE_THRESHOLD_ms); }
-	void CalibrateKeepAlive();
-	void RecalibrateKeepAlive(uint64_t);
+	void CalibrateRTT()
+	{ 
+		tLastRecv = NowUTC();
+		// The timer was already started for transient state management when Accept(), Multiply() or sending MULTIPLY
+		tRoundTrip_us = (uint32_t)min(UINT32_MAX, tLastRecv - tRecentSend);
+	}
+	// Note that the raw round trip time includes the lazy-acknowledgement delay
+	// We hard-coded the lazy-acknowledgement delay as one RTT
+	void RecalibrateRTT(uint64_t rtt64_us)
+	{
+		if(rtt64_us > LAZY_ACK_DELAY_MIN_ms * 2000)
+			tRoundTrip_us = uint32_t((min(rtt64_us >> 1, UINT32_MAX) + tRoundTrip_us + 1) >> 1);
+		else if(rtt64_us > LAZY_ACK_DELAY_MIN_ms * 1000)
+			tRoundTrip_us = uint32_t((rtt64_us + tRoundTrip_us + 1) >> 1);
+		else
+			tRoundTrip_us = uint32_t((LAZY_ACK_DELAY_MIN_ms * 1000 + tRoundTrip_us + 1) >> 1);
+	}
 
 	bool IsPassive() const { return lowState == LISTENING; }
 	void SetPassive() { lowState = LISTENING; }
@@ -345,7 +348,7 @@ protected:
 	bool InState(FSP_Session_State s) { return lowState == s; }
 	bool InStates(int n, ...);
 
-	bool LOCALAPI HandleMobileParam(PFSP_HeaderSignature);
+	bool HandlePeerSubnets(PFSP_HeaderSignature);
 
 	PktBufferBlock *PushPacketBuffer(PktBufferBlock *);
 	FSP_NormalPacketHeader *PeekLockPacketBuffer();
@@ -366,13 +369,19 @@ protected:
 			pControlBlock->RoundSendWindowNextPos();
 		}
 	}
-	bool LOCALAPI SendSNACK(FSPOperationCode = ACK_FLUSH);
+	bool SendAckFlush();
+	bool SendKeepAlive();
 	bool LOCALAPI EmitWithICC(ControlBlock::PFSP_SocketBuf, ControlBlock::seq_t);
 
-	void Extinguish();
-	void TimeOut();
+	void Destroy();	// override that of the base class
+	void DoResend();
+	void KeepAlive();
+	void LazilySendSNACK();
 
-	static VOID NTAPI TimeOut(PVOID c, BOOLEAN) { ((CSocketItemEx *)c)->TimeOut(); }
+	static VOID NTAPI DoResend(PVOID c, BOOLEAN) { ((CSocketItemEx *)c)->DoResend(); }
+	static VOID NTAPI KeepAlive(PVOID c, BOOLEAN) { ((CSocketItemEx *)c)->KeepAlive(); }
+	static VOID NTAPI LazilySendSNACK(PVOID c, BOOLEAN) { ((CSocketItemEx *)c)->LazilySendSNACK(); }
+
 	//
 public:
 	//
@@ -385,10 +394,11 @@ public:
 	bool TestAndLockReady() { return IsInUse() && _InterlockedCompareExchange8(& isReady, 0, 1) != 0; }
 	bool TestAndWaitReady();
 
-	void SetEarliestSendTime() { tEarliestSend = tRecentSend; }
+	// void SetEarliestSendTime() { tEarliestSend = tRecentSend; }
 
 	void InstallEphemeralKey();
 	void InstallSessionKey();
+	void DeriveNextKey();
 
 	bool CheckMemoryBorder(ControlBlock::PFSP_SocketBuf p)
 	{
@@ -411,19 +421,19 @@ public:
 		return (offset < sizeof(ControlBlock) || offset >= dwMemorySize) ? NULL : p;
 	}
 
-	void LOCALAPI SetNearEndInfo(const CtrlMsgHdr & nearInfo)
+	void SetNearEndInfo(const CtrlMsgHdr & nearInfo)
 	{
 		pControlBlock->nearEndInfo.cmsg_level = nearInfo.pktHdr.cmsg_level;
 		*(FSP_SINKINF *)& pControlBlock->nearEndInfo = nearInfo.u;
 	}
-	void LOCALAPI SetRemoteFiberID(ALFID_T id);
+	void SetRemoteFiberID(ALFID_T id);
 
 	char *PeerName() const { return (char *)pControlBlock->peerAddr.name; }
 
-	int LOCALAPI ResolveToIPv6(const char *);
-	int LOCALAPI ResolveToFSPoverIPv4(const char *, const char *);
+	int ResolveToIPv6(const char *);
+	int ResolveToFSPoverIPv4(const char *, const char *);
 
-	bool LOCALAPI Notify(FSP_ServiceCode);
+	bool Notify(FSP_ServiceCode);
 	void SignalEvent() { ::SetEvent(hEvent); }
 	void SignalAccepted() { pControlBlock->notices.SetHead(FSP_NotifyAccepted); SignalEvent(); }
 	void SignalAccepting() { pControlBlock->notices.SetHead(FSP_NotifyAccepting); SignalEvent(); }
@@ -432,14 +442,15 @@ public:
 	int32_t LOCALAPI GenerateSNACK(FSP_PreparedKEEP_ALIVE &, ControlBlock::seq_t &, int);
 	//
 	void InitiateConnect();
-	void InitiateMultiply();
-	void CloseSocket();
-	void Disconnect();
+	void RejectOrReset();
 	void DisposeOnReset();
 	void Recycle();
+	void InitiateMultiply(const CSocketItemEx *);
+	void ResponseToMultiply();
+	bool FinalizeMultiply();
 
-	void HandleMemoryCorruption() {	Extinguish(); }
-	void LOCALAPI AffirmConnect(const SConnectParam &, ALFID_T);
+	void HandleMemoryCorruption() {	Destroy(); }
+	void AffirmConnect(const SConnectParam &, ALFID_T);
 
 	bool IsValidSequence(ControlBlock::seq_t seq1) { return pControlBlock->IsValidSequence(seq1); }
 
@@ -455,11 +466,9 @@ public:
 		return pControlBlock->ResizeSendWindow(seq1, adRecvWS);
 	}
 
-	bool RefreshKeepAliveCache(FSPOperationCode);
-	//
 	template<FSPOperationCode c> int SendPacket()
 	{
-		// See also KeepAlive, AffirmConnect and OnAckFlush
+		// See also SendKeepAlive, AffirmConnect and SendAckFlush
 		FSP_NormalPacketHeader hdr;
 		pControlBlock->SetSequenceFlags(& hdr);
 		hdr.hs.Set<FSP_NormalPacketHeader, c>();
@@ -474,56 +483,78 @@ public:
 	bool LOCALAPI ValidateICC(FSP_NormalPacketHeader *, int32_t, ALFID_T, uint32_t);
 	bool ValidateICC() { return ValidateICC(headPacket->GetHeaderFSP(), headPacket->lenData); }
 	bool LOCALAPI ValidateSNACK(ControlBlock::seq_t &, FSP_SelectiveNACK::GapDescriptor * &, int &);
-	// On near end's IPv6 address changed automatically send KEEP_ALIVE with MOBILE_HEADER
+	// On near end's IPv6 address changed automatically send an out-of-sync KEEP_ALIVE
 	void OnLocalAddressChanged();
 	// On got valid ICC automatically register source IP address as the favorite returning IP address
 	inline void ChangeRemoteValidatedIP();
 
 	void EmitQ();
-	void KeepAlive();
 	void ScheduleEmitQ();
 	void ScheduleConnect(CommandNewSessionSrv *);
-
-	//
-	bool AddTimer();
-	bool RemoveTimer();
-	bool LOCALAPI ReplaceTimer(uint32_t);
-
-#if defined(TRACE) && (TRACE & TRACE_HEARBEAT)
-	int DumpTimerInfo(timestamp_t t1) const
-	{
-		return printf_s("\tRound Trip Time = %uus, Keep-alive period = %ums\n"
-			"\tTime elapsed since earlist sent = %lluus\n"
-			, tRoundTrip_us
-			, tKeepAlive_ms
-			, t1 - tEarliestSend);
-	}
-#else
-	int DumpTimerInfo(timestamp_t) { return 0; }
-#endif
 
 	// Command of ULA
 	// Connect and Send are special in the sense that it may take such a long time to complete that
 	// if it gains exclusive access of the socket too many packets might be lost
 	// when there are too many packets in the send queue
 	void Connect();
+	void Accept();
 	void Start();
 	void UrgeCommit();
-	void SynConnect();
-	void LOCALAPI Listen(CommandNewSessionSrv &);
+	void Listen(CommandNewSessionSrv &);
 
 	// Event triggered by the remote peer
-	void LOCALAPI OnConnectRequestAck(FSP_AckConnectRequest &, int lenData);
+	void OnConnectRequestAck(FSP_AckConnectRequest &, int lenData);
 	void OnGetPersist();	// PERSIST packet might be apparently out-of-band/out-of-order
 	void OnGetPureData();	// PURE_DATA
 	void OnGetCommit();		// COMMIT packet might be apparently out-of-band/out-of-order as well
 	void OnAckFlush();		// ACK_FLUSH is always out-of-band
 	void OnGetRelease();	// RELEASE may not carry payload
 	void OnGetMultiply();	// MULTIPLY is treated out-of-band
-	void OnGetKeepAlive();	// KEEP_ALIVE is usually out-of-band
+	void OnGetKeepAlive();	// KEEP_ALIVE is always out-of-band
 };
 
 #include <poppack.h>
+
+
+
+// The backlog of connection multiplication, for buffering the payload piggybacked by the MULTIPLY packet
+struct CMultiplyBacklogItem
+{
+	CMultiplyBacklogItem *prev, *next;
+	timestamp_t	time0;
+	ALFID_T		idParent;
+	ALFID_T		idRemote;
+	FSPOperationCode opCode;
+	char		isEOM;
+	char		isEOT;
+	uint16_t	lenData;
+	uint64_t	iv;		// sequence number of the MULTIPLY packet, concated with the expectedSN field of the packet
+	uint8_t		plainText[MAX_BLOCK_SIZE];
+};
+
+
+// As a concept prototype we apply double-linked list to manage the backlog
+class CMultiplyBacklog
+{
+	static CMultiplyBacklogItem storage[MULTIPLY_BACKLOG_SIZE];
+	static CMultiplyBacklogItem *head, *tail;
+	static CMultiplyBacklogItem *allocHead, *allocTail;
+	static volatile	char mutex;
+	//
+public:
+	static void WaitSetMutex() { while (_InterlockedCompareExchange8(&mutex, 1, 0)) Sleep(0); }
+	static void SetMutexFree() { _InterlockedExchange8(&mutex, 0); }
+	// Given parent ALFID, the peer's ALFID, the packet sequence number and the out-of-band serial number
+	// allocate a slot of multiplication backlog
+	static CMultiplyBacklogItem * Alloc(ALFID_T, ALFID_T, uint32_t, uint32_t);
+	// Given parent ALFID, the peer's ALFID, find the matching multiplication backlog item
+	static CMultiplyBacklogItem * Find(ALFID_T, ALFID_T);
+	// Free the given multiplication backlog slot
+	static void Free(CMultiplyBacklogItem *);
+	static void Prepare();
+};
+
+
 
 // The translate look-aside buffer of the server's socket pool
 class CSocketSrvTLB
@@ -683,10 +714,10 @@ public:
 	inline void OnAddingIPv6Address(ULONG, const SOCKADDR_IN6 &);	// ULONG: NET_IFINDEX
 	inline void OnIPv6AddressMayAdded(ULONG, const SOCKADDR_IN6 &);	// ULONG: NET_IFINDEX
 	//
-	bool LOCALAPI SelectPath(PFSP_SINKINF, ALFID_T, uint32_t, const SOCKADDR_INET *);	// uint32_t: NET_IFINDEX, ipi6_ifindex
+	bool LOCALAPI SelectPath(PFSP_SINKINF, ALFID_T, ULONG, const SOCKADDR_INET *);
 #else
 	// No, in IPv4 network FSP does not support multi-path
-	bool SelectPath(PFSP_SINKINF, ALFID_T, uint32_t, const SOCKADDR_INET *) { return false; }
+	bool SelectPath(PFSP_SINKINF, ALFID_T, ULONG, const SOCKADDR_INET *) { return false; }
 #endif
 
 	static CLowerInterface * Singleton() { return pSingleInstance; }
@@ -710,16 +741,12 @@ DWORD WINAPI HandleSendQ(LPVOID);
 DWORD WINAPI HandleFullICC(LPVOID);
 
 // defined in socket.cpp
-void LOCALAPI DumpCMsgHdr(CtrlMsgHdr &);
 void LOCALAPI DumpHexical(BYTE *, int);
 void LOCALAPI DumpNetworkUInt16(uint16_t *, int);
 
 
 // defined in mobile.cpp
 uint64_t LOCALAPI CalculateCookie(BYTE *, int, timestamp_t);
-
-// defined in CubicRoot.c
-extern "C" double CubicRoot(double);
 
 // defined in CRC64.c
 extern "C" uint64_t CalculateCRC64(register uint64_t, register uint8_t *, size_t);

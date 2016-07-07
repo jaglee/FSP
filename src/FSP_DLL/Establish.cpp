@@ -109,7 +109,7 @@ FSPHANDLE FSPAPI Connect2(const char *peerName, PFSP_Context psp1)
 		return NULL;
 	}
 
-	socketItem->AddOneShotTimer(CONNECT_INITIATION_TIMEOUT_ms * 2);
+	socketItem->AddOneShotTimer(CONNECT_INITIATION_TIMEOUT_ms);
 	socketItem->isFlushing = 0;
 	socketItem->SetPeerName(peerName, strlen(peerName));
 	return socketItem->CallCreate(objCommand, InitConnection);
@@ -147,7 +147,7 @@ void CSocketItemDl::ProcessBacklog()
 			continue;
 		}
 		//
-		if(! socketItem->CallCreate(objCommand, SynConnection))
+		if(! socketItem->CallCreate(objCommand, FSP_Accept))
 		{
 			TRACE_HERE("Process listening backlog: cannot synchronize - local IPC error");
 			socketsTLB.FreeItem(socketItem);
@@ -163,18 +163,27 @@ void CSocketItemDl::ProcessBacklog()
 //	CommandNewSession & the command context of the backlog
 // Return
 //	The pointer to the socket created for the new connection requested
-CSocketItemDl * LOCALAPI CSocketItemDl::PrepareToAccept(BackLogItem & backLog, CommandNewSession & cmd)
+CSocketItemDl * CSocketItemDl::PrepareToAccept(BackLogItem & backLog, CommandNewSession & cmd)
 {
 	PFSP_IN6_ADDR pListenIP = (PFSP_IN6_ADDR) & backLog.acceptAddr;
 	FSP_SocketParameter newContext = this->context;
 	newContext.ifDefault = backLog.acceptAddr.ipi6_ifindex;
 	newContext.u.st.passive = 0;
-	// UNRESOLVED! check function pointers!?
+
+	// Inherit the two NotifyOrReturn functions, onError and onRelease,
+	// the CallbackConnected function onAccepted
+	// but not CallbackRequested/onAccepting
 	if(! this->context.u.st.passive)	// this->InState(LISTENING)
 	{
 		newContext.welcome = NULL;
 		newContext.len = 0;
 	}
+	else
+	{
+		newContext.onAccepting = NULL;
+	}
+	// If the incarnated connection could be cloned, onAccepting shall be set by FSPControl
+
 	CSocketItemDl *pSocket = CreateControlBlock(pListenIP, &newContext, cmd);
 	if(pSocket == NULL)
 		return NULL;
@@ -203,14 +212,14 @@ CSocketItemDl * LOCALAPI CSocketItemDl::PrepareToAccept(BackLogItem & backLog, C
 //	BackLogItem &	the reference to the acception backlog item
 // Do
 //	(ACK_CONNECT_REQ, Initial SN, Expected SN, Timestamp, Receive Window[, responder's half-connection parameter[, payload])
-bool LOCALAPI CSocketItemDl::ToWelcomeConnect(BackLogItem & backLog)
+bool CSocketItemDl::ToWelcomeConnect(BackLogItem & backLog)
 {
-	// Ask the upper layer whether to accept the connection...fpRequested CANNOT read or write anything!
 	PFSP_IN6_ADDR p = (PFSP_IN6_ADDR) & pControlBlock->peerAddr.ipFSP.allowedPrefixes[MAX_PHY_INTERFACES - 1];
 	//
 	SetNewTransaction();	// ACK_CONNECT_REQ is a singleton transmit transaction
 	SetState(CHALLENGING);
-	if(fpRequested != NULL && fpRequested(this, & backLog.acceptAddr, p) < 0)
+	// Ask ULA whether to accept the connection. Note that context.onAccepting may not read or write
+	if(context.onAccepting != NULL && context.onAccepting(this, & backLog.acceptAddr, p) < 0)
 	{
 		// UNRESOLVED! report that the upper layer application reject it?
 		return false;
@@ -222,7 +231,7 @@ bool LOCALAPI CSocketItemDl::ToWelcomeConnect(BackLogItem & backLog)
 	memcpy(& pControlBlock->connectParams, & backLog, FSP_MAX_KEY_SIZE);
 
 	params->listenerID = pControlBlock->idParent;
-	params->hs.Set(MOBILE_PARAM, sizeof(FSP_NormalPacketHeader));
+	params->hs.Set(PEER_SUBNETS, sizeof(FSP_NormalPacketHeader));
 	//
 	skb->opCode = ACK_CONNECT_REQ;
 	skb->len = sizeof(*params);	// the fixed header is generated on the fly
@@ -277,7 +286,7 @@ void CSocketItemDl::ToConcludeConnect()
 	SetMutexFree();
 
 	SetNewTransaction();	// meant to send a PERSIST or a COMMIT
-	if(fpAccepted != NULL && fpAccepted(this, &context) < 0)
+	if(context.onAccepted != NULL && context.onAccepted(this, &context) < 0)
 	{
 		Recycle();
 		return;

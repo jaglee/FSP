@@ -107,7 +107,7 @@ l_return:
 //	and go on to emit the command and optional data packets in the send queue
 // Remark
 //	An FSP socket is incarnated when a connection is cloned, or a listening socket is forked on CONNECT_REQUEST or MULTIPLY received
-void LOCALAPI SyncSession(CommandNewSessionSrv &cmd)
+void LOCALAPI Accept(CommandNewSessionSrv &cmd)
 {
 	if(cmd.hEvent == NULL)
 	{
@@ -123,8 +123,71 @@ void LOCALAPI SyncSession(CommandNewSessionSrv &cmd)
 		return;
 	}
 
-	socketItem->SynConnect();
+	socketItem->Accept();
 	// Only on exception would it signal event to DLL
+}
+
+
+// Given
+//	CommandCloneSessionSrv&		The connection multiplication command
+// Do
+//	Clone the root connection
+void Multiply(CommandCloneSessionSrv &cmd)
+{
+	if (cmd.hEvent == NULL)
+	{
+		REPORT_ERROR_ON_TRACE();
+		return;
+	}
+
+	CSocketItemEx *srcItem = (* CLowerInterface::Singleton())[cmd.idParent];
+	if(srcItem == NULL)
+	{
+		TRACE_HERE("Cloned connection not found");
+		return;
+	}
+
+	if(! srcItem->TestAndWaitReady())
+	{
+		TRACE_HERE("Cloned connect busy");
+		return;
+	}
+
+	if(srcItem->contextOfICC.keyLife == 0)
+	{
+		TRACE_HERE("Only strong-protected session may be cloned");
+		goto l_return;
+	}
+
+	// To make life easier we do not allow clone FSP session across process border
+	if(cmd.idProcess != srcItem->idSrcProcess)
+	{
+		TRACE_HERE("Cannot clone other user's session");
+		goto l_return;
+	}
+
+	CSocketItemEx *newItem = (CLowerInterface::Singleton())->AllocItem();
+	if (newItem == NULL || !newItem->MapControlBlock(cmd))
+	{
+		srcItem->SetReady();
+		if(newItem == NULL)
+		{
+			TRACE_HERE("Internal panic! Cannot allocate new socket slot");
+		}
+		else
+		{
+			TRACE_HERE("Internal panic! Cannot map control block of the client into server's memory space");
+			(CLowerInterface::Singleton())->FreeItem(newItem);
+		}
+		::SetEvent(cmd.hEvent);
+		return;
+	}
+
+
+	newItem->InitiateMultiply(srcItem);
+l_return:
+	// Only on exception would it signal event to DLL
+	srcItem->SetReady();
 }
 
 
@@ -133,7 +196,7 @@ void LOCALAPI SyncSession(CommandNewSessionSrv &cmd)
 //	CommandNewSession
 // Do
 //	Routine works of registering a passive FSP socket
-void LOCALAPI CSocketItemEx::Listen(CommandNewSessionSrv &cmd)
+void CSocketItemEx::Listen(CommandNewSessionSrv &cmd)
 {
 	if(! MapControlBlock(cmd))
 	{
@@ -219,9 +282,10 @@ void CSocketItemEx::Start()
 #endif
 	// synchronize the state in the 'cache' and the real state
 	lowState = pControlBlock->state;
-	EmitStartAndSlide();
 	//
+	EmitStartAndSlide();
 	RestartKeepAlive();
+	AddResendTimer(tRoundTrip_us >> 8);
 	//^Sometimes it is redundant but does little harm anyway
 }
 
@@ -250,7 +314,7 @@ void CSocketItemEx::UrgeCommit()
 //	Resolve the UDP socket addresses of the given remote peer and store them in the peerAddr field of SCB
 // Return
 //	Number of addresses resolved, negative if error
-int LOCALAPI CSocketItemEx::ResolveToFSPoverIPv4(const char *nodeName, const char *serviceName)
+int CSocketItemEx::ResolveToFSPoverIPv4(const char *nodeName, const char *serviceName)
 {
 	static const struct addrinfo hints = { 0, AF_INET, };
 	PADDRINFOA pAddrInfo;
@@ -300,7 +364,7 @@ int LOCALAPI CSocketItemEx::ResolveToFSPoverIPv4(const char *nodeName, const cha
 //	Resolve the IPv6 addresses of the given remote peer and store them in the peerAddr field of SCB
 // Return
 //	Number of addresses resolved, negative if error
-int LOCALAPI CSocketItemEx::ResolveToIPv6(const char *nodeName)
+int CSocketItemEx::ResolveToIPv6(const char *nodeName)
 {
 	static const struct addrinfo hints = { 0, AF_INET6, };
 	PADDRINFOA pAddrInfo;

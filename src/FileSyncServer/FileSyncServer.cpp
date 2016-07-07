@@ -1,38 +1,17 @@
-#include <stdlib.h>
-#include <stdio.h>
-#include <string.h>
-#include <io.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <share.h>
-
-#include "../FSP_API.h"
-
-#define MAX_FILENAME_WITH_PATH_LEN	260
+#include "stdafx.h"
 
 const char		*defaultWelcome = "File synchronizer based on Flexible Session Protocol, version 0.1";
 
 volatile bool	finished = false;
 FSPHANDLE		hFspListen;
+char			linebuf[80];
 
 static char		fileName[MAX_FILENAME_WITH_PATH_LEN];
 static int		fd;
-static char		linebuf[80];
 
 // assume that address space layout randomization keep the secret hard to find
 static unsigned char bufPrivateKey[CRYPTO_NACL_KEYBYTES];
 static unsigned char bufPeerPublicKey[CRYPTO_NACL_KEYBYTES];
-
-static int	FSPAPI onAccepted(FSPHANDLE, PFSP_Context);
-static void FSPAPI onPublicKeyReceived(FSPHANDLE, FSP_ServiceCode, int);
-static void FSPAPI onFileNameSent(FSPHANDLE, FSP_ServiceCode, int);
-static int	FSPAPI toSendNextBlock(FSPHANDLE, void *, int32_t);
-
-extern int	FSPAPI onAccepting(FSPHANDLE, PFSP_SINKINF, PFSP_IN6_ADDR);
-extern void StartToSendSignature(FSPHANDLE h);
-extern void SendMemoryPattern();
-extern void SendMemoryPatternEncyrpted();
-extern void FSPAPI onResponseReceived(FSPHANDLE, FSP_ServiceCode, int);
 
 
 void FSPAPI onNotice(FSPHANDLE h, FSP_ServiceCode code, int value)
@@ -65,7 +44,8 @@ void FSPAPI onFinished(FSPHANDLE h, FSP_ServiceCode code, int value)
 
 
 
-//
+// Just notify
+// should be graceful 'close' socket
 void FSPAPI onClientClose(FSPHANDLE h, FSP_ServiceCode code, int value)
 {
 	printf_s("Fiber ID = %u, the client shutdown the session.\n", (uint32_t)(intptr_t)h);
@@ -75,8 +55,8 @@ void FSPAPI onClientClose(FSPHANDLE h, FSP_ServiceCode code, int value)
 		return;
 	}
 
-	Dispose(h);	// should be graceful 'close' socket
-	finished = true;
+	//Dispose(h);
+	//finished = true;
 	return;
 }
 
@@ -87,10 +67,10 @@ void FSPAPI WaitConnection(const char *thisWelcome, unsigned short mLen, Callbac
 	FSP_SocketParameter params;
 	FSP_IN6_ADDR atAddress;
 	memset(& params, 0, sizeof(params));
-	params.beforeAccept = onAccepting;
-	params.afterAccept = onAccepted;
+	params.onAccepting = onAccepting;
+	params.onAccepted = onAccepted;
 	params.onError = onNotice;
-	params.onFinish = onClientClose;
+	params.onRelease = onClientClose;
 	params.welcome = thisWelcome;
 	params.len = mLen;
 	params.sendSize = MAX_FSP_SHM_SIZE;
@@ -191,7 +171,7 @@ int	FSPAPI onAccepting(FSPHANDLE h, PFSP_SINKINF p, PFSP_IN6_ADDR remoteAddr)
 
 static int FSPAPI onAccepted(FSPHANDLE h, PFSP_Context ctx)
 {
-	printf_s("\nHandle of FSP session: Fiber ID = %u\n", (uint32_t)(intptr_t)h);
+	printf_s("\nFileSyncServer onAccepted: handle of FSP session/Fiber ID = 0x%X\n", (uint32_t)(intptr_t)h);
 	// TODO: check connection context
 
 	ReadFrom(h, bufPeerPublicKey, sizeof(bufPeerPublicKey), onPublicKeyReceived);

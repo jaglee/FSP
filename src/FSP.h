@@ -147,7 +147,7 @@ typedef enum _FSP_Operation_Code: char
 	RESERVED_CODE14,
 	RESERVED_CODE15,
 	//
-	MOBILE_PARAM = 16,
+	PEER_SUBNETS = 16,
 	SELECTIVE_NACK,
 	LARGEST_OP_CODE = SELECTIVE_NACK
 } FSPOperationCode;
@@ -161,7 +161,7 @@ typedef enum: char
 	// 1~15: DLL to LLS
 	FSP_Listen = 1,		// register a passive socket
 	InitConnection,		// register an initiative socket
-	SynConnection,		// make SCB entry of the DLL and the LLS synchronized
+	FSP_Accept,			// accept the connection, make SCB of LLS synchronized with DLL 
 	FSP_Reject,			// a forward command, explicitly reject some request
 	FSP_Recycle,		// a forward command, connection might be aborted
 	FSP_Start,			// send a packet starting a new send-transaction
@@ -169,16 +169,17 @@ typedef enum: char
 	FSP_Urge,			// send a packet urgently, mean to urge COMMIT
 	FSP_Shutdown,		// close the connection
 	FSP_InstallKey,		// install the authenticated encryption key
+	FSP_Multiply,		// clone the connection, make SCB of LLS synchronized with DLL
 	// 16~23: LLS to DLL in the backlog
-	FSP_NotifyAccepting = SynConnection,	// a reverse command to make context ready
+	FSP_NotifyAccepting = FSP_Accept,		// a reverse command to make context ready
 	FSP_NotifyRecycled = FSP_Recycle,		// a reverse command to inform DLL to release resource passively
 	FSP_NotifyAccepted = 16,
 	FSP_NotifyDataReady,
 	FSP_NotifyBufferReady,
-	FSP_NotifyReset,
+	FSP_NotifyToCommit,
 	FSP_NotifyFlushed,
 	FSP_NotifyToFinish,
-	FSP_NotifyFlushing, // 22: used to be FSP_Dispose
+	FSP_NotifyReset,	// 22: used to be FSP_Dispose
 	// 23: Reserved
 	// 24~31: near end error status
 	FSP_IPC_CannotReturn = 24,
@@ -199,7 +200,20 @@ typedef uint64_t timestamp_t;
 /**
  * Protocol defined timeouts
  */
-#define CONNECT_INITIATION_TIMEOUT_ms	30000	// half a minute
+// In debug mode we allow pre-definition via compiler's command-line option
+#ifdef _DEBUG
+# ifndef CONNECT_INITIATION_TIMEOUT_ms
+# define CONNECT_INITIATION_TIMEOUT_ms	300000	// 5 minutes
+# endif
+# ifndef KEEP_ALIVE_TIMEOUT_ms
+# define KEEP_ALIVE_TIMEOUT_ms			30000	// half a minute
+# endif
+#else
+# define CONNECT_INITIATION_TIMEOUT_ms	30000	// half a minute
+# define KEEP_ALIVE_TIMEOUT_ms			500		// half a second
+#endif
+
+#define MAXIMUM_SESSION_LIFE_ms			43200000// 12 hours
 #define TRASIENT_STATE_TIMEOUT_ms		300000	// 5 minutes
 
 #include <pshpack1.h>

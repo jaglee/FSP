@@ -71,10 +71,10 @@ CSocketItemEx * CSocketSrvTLB::AllocItem()
 		if(headFreeSID == NULL)
 			tailFreeSID = NULL;
 		_InterlockedExchange8(& p->isReady, 0);
-		// See also Extinguish()
+		// See also Destroy()
 		if(_InterlockedExchange8(& p->inUse, 1))
 		{
-			p->RemoveTimer();
+			p->RemoveTimers();
 			p->Destroy();
 		}
 		//
@@ -271,16 +271,18 @@ l_return:
 // TODO
 bool CSocketSrvTLB::PutToRTLB(CSocketItemEx *pItem)
 {
-	uint32_t remoteHostId = pItem->idRemoteHost;
+	uint32_t remoteHostId = pItem->pControlBlock->peerAddr.ipFSP.hostID;
 	ALFID_T idRemote = pItem->fidPair.peer;
-	ALFID_T idParent = pItem->idParent;
+	ALFID_T idParent = pItem->pControlBlock->idParent;
 	int k = be32toh(idRemote) & (MAX_CONNECTION_NUM-1);
 	CSocketItemEx *p0 = tlbSocketsByRemote[k];
 	pItem->prevRemote = p0;	// might be NULL
 	//
 	for(register CSocketItemEx *p = p0; p != NULL; p = p->prevRemote)
 	{
-		if(p->fidPair.peer == idRemote && p->idRemoteHost == remoteHostId && p->idParent == idParent)
+		if(p->fidPair.peer == idRemote
+		&& p->pControlBlock->idParent == idParent
+		&& p->pControlBlock->peerAddr.ipFSP.hostID == remoteHostId)
 		{
 			TRACE_HERE("Found collision when put to remote ALFID's translate look-aside buffer");
 			return false;
@@ -306,8 +308,12 @@ CSocketItemEx * CSocketSrvTLB::FindSocket(uint32_t remoteHostId, ALFID_T idRemot
 	register CSocketItemEx *p = tlbSocketsByRemote[be32toh(idRemote) & (MAX_CONNECTION_NUM-1)];
 	do
 	{
-		if(p->fidPair.peer == idRemote && p->idRemoteHost == remoteHostId && p->idParent == idParent)
+		if(p->fidPair.peer == idRemote
+			&& p->pControlBlock->idParent == idParent
+			&& p->pControlBlock->peerAddr.ipFSP.hostID == remoteHostId)
+		{
 			return p;
+		}
 		p = p->prevRemote;
 	} while(p != NULL);
 	//
@@ -374,7 +380,7 @@ void CSocketItemEx::InitAssociation()
 //	ALFID_T		The remote peer's Application Layer Fiber ID
 // Do
 //	Set the stored multi-path destination fiber ID to the given one
-void LOCALAPI CSocketItemEx::SetRemoteFiberID(ALFID_T id)
+void CSocketItemEx::SetRemoteFiberID(ALFID_T id)
 {
 	fidPair.peer = id;
 	for (register int i = 0; i < MAX_PHY_INTERFACES; i++)
@@ -540,16 +546,15 @@ void CSocketItemEx::InitiateConnect()
 
 	q->timeStamp = initState.nboTimeStamp;
 	skb->SetFlag<IS_COMPLETED>();	// for resend
+	skb->timeSent = NowUTC();		// SetEarliestSendTime();
 	// it neednot be unlocked
 	SendPacket(1, ScatteredSendBuffers(q, sizeof(FSP_InitiateRequest)));
-	// initState.timeStamp is not necessarily tRecentSend
-	SetEarliestSendTime();
 
 	if(timer != NULL)
 	{
 		TRACE_HERE ("\nInternal panic! Unclean connection reuse?\n"
 					"Timer to acknowledge connect request is not cleared beforehand.");
-		return;
+		RemoveTimers();
 	}
 	tKeepAlive_ms = CONNECT_INITIATION_TIMEOUT_ms;
 	AddTimer();
@@ -559,7 +564,7 @@ void CSocketItemEx::InitiateConnect()
 
 // CONNECT_REQUEST, timestamp, Cookie, Salt, ephemeral-key, half-connection parameters [, resource requirement]
 // It is assumed that exclusive access to the socket has been gained
-void LOCALAPI CSocketItemEx::AffirmConnect(const SConnectParam & initState, ALFID_T idListener)
+void CSocketItemEx::AffirmConnect(const SConnectParam & initState, ALFID_T idListener)
 {
 	TRACE_HERE("called");
 
@@ -570,6 +575,7 @@ void LOCALAPI CSocketItemEx::AffirmConnect(const SConnectParam & initState, ALFI
 		TRACE_HERE("memory corruption");
 		return;
 	}
+	tRoundTrip_us = uint32_t(min(UINT32_MAX, NowUTC() - skb->timeSent));
 
 	// Because CONNECT_REQUEST overlay INIT_CONNECT these three fields are reused
 	//pkt->timeStamp = initState.nboTimeStamp;
@@ -581,7 +587,7 @@ void LOCALAPI CSocketItemEx::AffirmConnect(const SConnectParam & initState, ALFI
 	// assert(sizeof(initState.allowedPrefixes) >= sizeof(varParams.subnets));
 	memcpy(pkt->params.subnets , initState.allowedPrefixes, sizeof(pkt->params.subnets));
 	pkt->params.listenerID = idListener;
-	pkt->params.hs.Set(MOBILE_PARAM, sizeof(FSP_ConnectRequest) - sizeof(FSP_ConnectParam));
+	pkt->params.hs.Set(PEER_SUBNETS, sizeof(FSP_ConnectRequest) - sizeof(FSP_ConnectParam));
 	pkt->hs.Set<FSP_ConnectRequest, CONNECT_REQUEST>();
 
 	// while version remains as the same as the very beginning INIT_CONNECT
@@ -593,32 +599,39 @@ void LOCALAPI CSocketItemEx::AffirmConnect(const SConnectParam & initState, ALFI
 	// Safely suppose that internal processing takes orders of magnitude less time than network propagation
 	SetState(CONNECT_AFFIRMING);
 	SendPacket(1, ScatteredSendBuffers(pkt, skb->len));	// it would set tRecentSend
-	tRoundTrip_us = uint32_t(min(UINT32_MAX, tRecentSend - tEarliestSend));
-	// after ACK_CONNECT_REQ would 'tKeepAlive_ms = tRoundTrip_us >> 8';
 }
 
 
 
 // MULTIPLY, SequenceNo, Salt, ICC, FREWS[, payload]
 // See InitiateConnect and @DLL ULA FSPAPI ConnectMU
+// Given
+//	ControlBlock *	Pointer to the source session control block/the first connection
 // Remark
 //	On get peer's COMMIT or PERSIST the socket would be put into the remote id's translate look-aside buffer
-//TODO: unit test
-//	MULTIPLY, COMMIT and PERSIST could carry payload!
-//	// TODO: create new session key as soon as COMMIT/PERSIST was sent/received
-void CSocketItemEx::InitiateMultiply()
+// See also
+//	OnConnectRequestAck; CSocketItemDl::ToWelcomeConnect; CSocketItemDl::ToWelcomeMultiply
+void CSocketItemEx::InitiateMultiply(const CSocketItemEx *srcItem)
 {
 	TRACE_HERE("called");
 
+	// Inherit the interfaces, excluding the last one which is ephemeral 
+	memcpy(this->sockAddrTo, srcItem->sockAddrTo, sizeof(SOCKADDR_INET) * MAX_PHY_INTERFACES);
+	this->pControlBlock->nearEndInfo.idALF = fidPair.source;	// and pass back to DLL/ULA
+	InitAssociation();
+
 	// Note tht we cannot put initial SN into ephemeral session key as the peers do not have the same initial SN
-	ControlBlock::seq_t seq0;
-	rand_w32(&seq0, 1);
-	pControlBlock->SetSendWindowHead(pControlBlock->connectParams.initialSN = seq0);
+	// Share the same session key at first:
+	ControlBlock::seq_t seq0 = srcItem->pControlBlock->sendWindowNextSN;
+	this->contextOfICC = srcItem->contextOfICC;
+	contextOfICC.firstSendSNewKey = pControlBlock->connectParams.initialSN = seq0;
+	// this->contextOfICC.savedCRC = true; // why?!
 
 	// MULTIPLY can only be the very first packet
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend();
 	FSP_NormalPacketHeader q;
-	q.Set(MULTIPLY, sizeof(FSP_NormalPacketHeader), seq0, nextOOBSN++, pControlBlock->recvBufferBlockN);
+	++nextOOBSN;
+	q.Set(MULTIPLY, sizeof(FSP_NormalPacketHeader), seq0, nextOOBSN, pControlBlock->recvBufferBlockN);
 
 	void * paidLoad = SetIntegrityCheckCode(& q, GetSendPtr(skb), skb->len, q.expectedSN);
 	if (paidLoad == NULL)
@@ -628,8 +641,64 @@ void CSocketItemEx::InitiateMultiply()
 	}
 	//
 	SendPacket(2, ScatteredSendBuffers(& q, sizeof(FSP_NormalPacketHeader), paidLoad, skb->len));
-	SetEarliestSendTime();
+	skb->timeSent = NowUTC();
 	// And the timer was handled by the caller of this function
+	// Would install a new, derived session key when acknowledgement to the MULTIPLY packet is received
+}
+
+
+
+// Congest the peer's MULTIPLY payload and make response 
+void CSocketItemEx::ResponseToMultiply()
+{
+	ALFID_T & idParent = pControlBlock->idParent;
+	CMultiplyBacklogItem *pMItem = CMultiplyBacklog::Find(idParent, fidPair.peer);
+	if(pMItem == NULL)
+	{
+#if defined(TRACE) && (TRACE & TRACE_PACKET)
+		printf_s("Cannot find the connection multiplication request in the system backlog.\n"
+			"\tidParent = 0x%X, idPeer = 0x%X\n", idParent, fidPair.peer);
+#endif
+		return;	// And let the timed-out mechanism do the clean-up work
+	}
+
+	ControlBlock::PFSP_SocketBuf skb = pControlBlock->GetFirstReceived();
+	// if (!CheckMemoryBorder(skb)) throw -EFAULT;
+	// See also PlacePayload
+	BYTE *ubuf = GetRecvPtr(skb);
+	if(ubuf == NULL)
+	{
+		HandleMemoryCorruption();
+		return;
+	}
+	memcpy(ubuf, pMItem->plainText, pMItem->lenData);
+	skb->SetFlag<TO_BE_CONTINUED>(pMItem->isEOM);	// But how about EOT? A MULTIPLY packet CANNOT terminate a transmit transaction itself!?
+
+	// See also @DLL::PrepareToAccept
+	contextOfICC.firstRecvSNewKey = pControlBlock->recvWindowFirstSN;
+	contextOfICC.firstSendSNewKey = pControlBlock->sendWindowFirstSN;
+
+	EmitStart();
+	SetCallable();
+}
+
+
+
+// On getting the peer's response to MULTIPLY, finalize the clone action by deriving new session key
+bool CSocketItemEx::FinalizeMultiply()
+{
+	contextOfICC.firstRecvSNewKey = headPacket->pktSeqNo;
+	fidPair.peer = headPacket->idPair.source;
+	if (!ValidateICC())
+	{
+		TRACE_HERE("Invalid intergrity check code of PERSIST to MULTIPLY!?");
+		return false;
+	}
+	//
+	pControlBlock->SetRecvWindowHead(headPacket->pktSeqNo);
+	DeriveNextKey();
+	InstallSessionKey();
+	return CLowerInterface::Singleton()->PutToRTLB(this);
 }
 
 
@@ -638,7 +707,7 @@ void CSocketItemEx::InitiateMultiply()
 //	For sake of congestion control only one packet is sent presently
 // See also
 //	OnConnectRequestAck; CSocketItemDl::ToWelcomeConnect; CSocketItemDl::ToWelcomeMultiply
-void CSocketItemEx::SynConnect()
+void CSocketItemEx::Accept()
 {
 	TRACE_HERE("called");
 	if(timer != NULL)
@@ -647,32 +716,20 @@ void CSocketItemEx::SynConnect()
 					"Timer to acknowledge connect request is not cleared beforehand.");
 		return;
 	}
+
 	// bind to the interface as soon as the control block mapped into server's memory space
 	InitAssociation();
-
-	// See also CSocketItemEx::Start()
-	lowState = pControlBlock->state;
-	if (lowState == CHALLENGING)
+	if(lowState != CHALLENGING)
 	{
-		tKeepAlive_ms = TRASIENT_STATE_TIMEOUT_ms;
-		InstallEphemeralKey();
-		EmitStartAndSlide();
-		seqLastAck = pControlBlock->recvWindowFirstSN;
-	}
-	//^ ephemeral session key material was ready when CSocketItemDl::PrepareToAccept
-	else if (lowState == CLONING)
-	{
-		tKeepAlive_ms = CONNECT_INITIATION_TIMEOUT_ms;
-		InitiateMultiply();
-		// TODO?! InstallKey...
-		// seqLastAck is set when the COMMIT or PERSIST 
-	}
-#ifdef TRACE
-	{
-		printf_s("Unsupport state when SynConnection %s (%d)\n", stateNames[lowState], lowState);
+		ResponseToMultiply();
 		return;
 	}
-#endif
+
+	// See also CSocketItemEx::Start()
+	tKeepAlive_ms = TRASIENT_STATE_TIMEOUT_ms;
+	InstallEphemeralKey();
+	EmitStartAndSlide();
+	//^ ephemeral session key material was ready when CSocketItemDl::PrepareToAccept
 
 	AddTimer();
 	SetCallable();	// The success or failure signal is delayed until PERSIST, COMMIT or RESET received
@@ -681,7 +738,7 @@ void CSocketItemEx::SynConnect()
 
 
 // Dispose on the demand of the remote peer. Let the garbage collector recycle the resource occupied
-// See also Extinguish() and *::TimeOut() {case NON_EXISTENT}
+// See also Destroy() and *::KeepAlive case NON_EXISTENT
 void CSocketItemEx::DisposeOnReset()
 {
 	pControlBlock->notices.SetHead(FSP_NotifyReset);
@@ -695,13 +752,13 @@ void CSocketItemEx::DisposeOnReset()
 
 // Do
 //	Set the state to 'NON_EXISTENT', and make the resources be safely recyclable
-// See also ~::TimeOut case NON_EXISTENT
-void CSocketItemEx::Extinguish()
+// See also ~::KeepAlive case NON_EXISTENT
+void CSocketItemEx::Destroy()
 {
 	try
 	{
 		lowState = NON_EXISTENT;	// SetState(NON_EXISTENT);
-		RemoveTimer();
+		RemoveTimers();
 		CSocketItem::Destroy();
 		isReady = 0;	// FreeItem does not reset it
 		(CLowerInterface::Singleton())->FreeItem(this);
@@ -727,51 +784,42 @@ void CSocketItemEx::Recycle()
 #ifdef TRACE
 		printf_s("Recycle called in %s(%d) state\n", stateNames[lowState], lowState);
 #endif
-		Disconnect();
+		RejectOrReset();
 		return;
 	}
-	//
-	CloseSocket();
-}
-
-
-
-// See also AllocItem, FreeItem
-void CSocketItemEx::CloseSocket()
-{
-	// Copy keyLife for DLL access for sake of SCB reuse, but only when worthful
-	if(contextOfICC.keyLife < 4)	// hard-coded here for no reason
-	{
-		Extinguish();
-		return;
-	}
-
-	pControlBlock->connectParams.keyLife = contextOfICC.keyLife;
-	StopKeepAlive();
-	(CLowerInterface::Singleton())->FreeItem(this);
+	// See also DisposeOnReset, Destroy and @DLL::RespondToRecycle
+	pControlBlock->notices.SetHead(FSP_NotifyRecycled);
+	pControlBlock->state = NON_EXISTENT;
+	Destroy();
+	SignalEvent();
 }
 
 
 
 // Do
 //	Send RESET to the remote peer in the certain states (not guaranteed to be received)
-// See also ~::TimeOut case NON_EXISTENT
-void CSocketItemEx::Disconnect()
+// See also ~::KeepAlive case NON_EXISTENT
+void CSocketItemEx::RejectOrReset()
 {
 	if(lowState == CHALLENGING || lowState == CONNECT_AFFIRMING)
 		CLowerInterface::Singleton()->SendPrematureReset(EINTR, this);
 	else if(InStates(6, ESTABLISHED, COMMITTING, PEER_COMMIT, COMMITTING2, COMMITTED, CLOSABLE))
 		SendPacket<RESET>();
 	//
+	pControlBlock->notices.SetHead(FSP_NotifyRecycled);
+	pControlBlock->state = NON_EXISTENT;
+	// See also DisposeOnReset, Recycle
 	if(TestAndLockReady())
 	{
-		Extinguish();
+		Destroy();
 	}
 	else
 	{
 		SetState(NON_EXISTENT);
 		ReplaceTimer(TRASIENT_STATE_TIMEOUT_ms);
 	}
+	// It could be lazily Destroyed
+	SignalEvent();
 }
 
 
@@ -799,12 +847,201 @@ void LOCALAPI DumpNetworkUInt16(uint16_t * buf, int len)
 
 
 
-void LOCALAPI DumpCMsgHdr(CtrlMsgHdr & hdrInfo)
+// An auxillary function handling the fixed header
+// Given
+//	FSPOperationCode
+//	uint16_t	The total length of all the headers
+//	uint32_t	The sequenceNo field in host byte order
+//	uint32_t	The expectedNo field in host byte order
+//	uint32_t	The advertised receive window size, in host byte order
+// Do
+//	Filled in the fixed header
+void LOCALAPI FSP_NormalPacketHeader::Set(FSPOperationCode code, uint16_t hsp, uint32_t seqThis, uint32_t seqExpected, int32_t advRecvWinSize)
 {
-	// Level: [0 for IPv4, 41 for IPv6]]
-	printf("Len = %d, level = %d, type = %d, local interface address:\n"
-		, (int)hdrInfo.pktHdr.cmsg_len
-		, hdrInfo.pktHdr.cmsg_level
-		, hdrInfo.pktHdr.cmsg_type);
-	DumpHexical((BYTE *) & hdrInfo.u, sizeof(hdrInfo.u));
+	hs.Set(code, hsp);
+	expectedSN = htobe32(seqExpected);
+	sequenceNo = htobe32(seqThis);
+	ClearFlags();
+	SetRecvWS(advRecvWinSize);
+}
+
+
+
+/**
+ *	Manipulation of connection multiplication backlog
+ */
+
+CMultiplyBacklogItem	CMultiplyBacklog::storage[MULTIPLY_BACKLOG_SIZE];
+CMultiplyBacklogItem*	CMultiplyBacklog::head;
+CMultiplyBacklogItem*	CMultiplyBacklog::tail;
+CMultiplyBacklogItem*	CMultiplyBacklog::allocHead;
+CMultiplyBacklogItem*	CMultiplyBacklog::allocTail;
+volatile	char		CMultiplyBacklog::mutex;
+//
+
+// Initialize the memory structure
+void CMultiplyBacklog::Prepare()
+{
+	memset(storage, 0, sizeof(storage));
+	head = &storage[0];
+	tail = &storage[MULTIPLY_BACKLOG_SIZE - 1];
+	//
+	for(register int i = 1; i < MULTIPLY_BACKLOG_SIZE; i++)
+	{
+		storage[MULTIPLY_BACKLOG_SIZE - i].prev = & storage[MULTIPLY_BACKLOG_SIZE - i - 1];
+		storage[i-1].next = & storage[i];
+	}
+	head->prev = NULL;
+	tail->next = NULL;
+	//
+	allocHead = NULL;
+	allocTail = NULL;
+	//
+	mutex = 0;
+}
+
+
+
+// Given
+//	ALFID_T		The near end's parent ALFID
+//	ALFID_T		The remote end's ALFID
+//	uint32_t	The remote end packet's sequence number
+//	uint32_t	The out-of-band sequence number of the MULTIPLY packet
+// Return
+//	the allocated multiply backlog item
+//	NULL if error, either no memory or collision found.
+//	For security reason we neednot and should not make the return value clarifying further
+CMultiplyBacklogItem * CMultiplyBacklog::Alloc(ALFID_T idParent1, ALFID_T idRemote1, uint32_t seq, uint32_t oobSN)
+{
+	register CMultiplyBacklogItem *p;
+	WaitSetMutex();
+
+	// detect collision first
+	for(p = allocHead; p != NULL; p = p->next)
+	{
+		if(p->idParent == idParent1 && p->idRemote == idRemote1)
+		{
+			p = NULL;
+			goto l_return;
+		}
+	}
+
+	timestamp_t time1 = NowUTC();
+	p = head;
+	if(p != NULL)
+	{
+		head = p->next;
+		if(head == NULL)
+			tail = NULL;	// == head
+		//
+		p->prev = allocTail;
+		if(allocTail == NULL)
+		{
+			allocTail = allocHead = p;
+		}
+		else
+		{
+			allocTail->next = p;
+			allocTail = p;
+		}
+	}
+	else
+	{
+		p = allocHead;
+		if(p == NULL)
+			goto l_return;
+		// automatically but lazily collect the timed-out
+		if(int64_t(time1 - p->time0 - CONNECT_INITIATION_TIMEOUT_ms * 1000) < 0)
+		{
+			p = NULL;
+			goto l_return;
+		}
+		//
+		if(allocTail != p)
+		{
+			p->prev = allocTail;
+			allocTail->next = p;
+			allocTail = p;
+			allocHead = p->next;
+		}
+		// else allocHead == allocTail, and p->prev == NULL && p->next == NULL
+	}
+
+	p->next = NULL;
+	p->time0 = time1;
+	p->idParent = idParent1;
+	p->idRemote = idRemote1;
+	*(uint32_t *) & p->iv = seq;
+	*((uint32_t *) & p->iv + 1) = oobSN;
+
+l_return:
+	SetMutexFree();
+	return p;
+}
+
+
+
+// Given
+//	CMultiplyBacklogItem *		the item to be free
+// Do
+//	Return the backlog item to the storage space
+void CMultiplyBacklog::Free(CMultiplyBacklogItem *p)
+{
+	WaitSetMutex();
+	assert(p != NULL);
+	
+	// Get p off the allocated list
+	if(p->prev == NULL)
+	{
+		allocHead = p->next;
+		if(allocHead == NULL)
+			allocTail = NULL;
+	}
+	else
+	{
+		p->prev = p->prev->prev;
+		if(p->prev == NULL)
+			allocHead = p;
+		else
+			p->prev->next = p->next;
+	}
+
+	// Then put it onto the free list
+	if(tail == NULL)
+	{
+		p->prev = p->next = NULL;
+		head = tail = p;
+	}
+	else
+	{
+		tail->next = p;
+		p->prev = tail;
+		p->next = NULL;
+		tail = p;
+	}
+
+	SetMutexFree();
+}
+
+
+
+// Given
+//	ALFID_T		The near end's parent ALFID
+//	ALFID_T		The remote end's ALFID
+// Return
+//	the item with the matched pair of ALFIDs
+//	NULL if not found
+CMultiplyBacklogItem * CMultiplyBacklog::Find(ALFID_T idParent1, ALFID_T idRemote1)
+{
+	register CMultiplyBacklogItem *p;
+	WaitSetMutex();
+
+	for(p = allocHead; p != NULL; p = p->next)
+	{
+		if(p->idParent == idParent1 && p->idRemote == idRemote1)
+			break;
+	}
+
+	SetMutexFree();
+	return p;
 }

@@ -164,7 +164,8 @@ void UnitTestICC()
 	printf_s("Size of the SNACK header = %d, expected SN = %u, salt=0x%X\n", sizeSNACK, seq0, salt);
 
 	mp.hdr.hs.Set(KEEP_ALIVE, sizeof(FSP_NormalPacketHeader) + sizeSNACK);
-	pSCB->SetSequenceFlags(& mp.hdr, seq0);
+	pSCB->SetSequenceFlags(& mp.hdr);
+	mp.hdr.expectedSN = htobe32(seq0);
 	//
 	socketR2.SetIntegrityCheckCode(& mp.hdr, NULL, 0, salt);
 

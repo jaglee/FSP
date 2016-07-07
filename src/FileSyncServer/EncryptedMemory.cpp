@@ -1,36 +1,25 @@
-#include <stdlib.h>
-#include <stdio.h>
-#include <string.h>
-#include <errno.h>
-#include "../FSP_API.h"
-
-extern	const char		*defaultWelcome;
-
-extern volatile bool	finished;
-extern FSPHANDLE		hFspListen;
-
-extern void FSPAPI WaitConnection(const char *, unsigned short, CallbackConnected);
-extern int	FSPAPI onAccepting(FSPHANDLE, PFSP_SINKINF, PFSP_IN6_ADDR);
-extern void FSPAPI onReturn(FSPHANDLE h, FSP_ServiceCode code, int value);
-extern void FSPAPI onFinished(FSPHANDLE h, FSP_ServiceCode code, int value);
+#include "stdafx.h"
 
 
 // assume that address space layout randomization keep the secret hard to find
 static unsigned char bufPrivateKey[CRYPTO_NACL_KEYBYTES];
 static unsigned char bufPeerPublicKey[CRYPTO_NACL_KEYBYTES];
 
-static int	FSPAPI onAccepted(FSPHANDLE, PFSP_Context);
-static void FSPAPI onPublicKeyReceived(FSPHANDLE, FSP_ServiceCode, int);
-static void FSPAPI onFileNameSent(FSPHANDLE, FSP_ServiceCode, int);
-static int	FSPAPI toSendNextBlock(FSPHANDLE, void *, int32_t);
-
 static char		*fileName = "$memory.^";
-static	uint8_t	bytesToSend[0x20000];	// 128KB
+static uint8_t	*bytesToSend;
+static size_t	sizeOfBuffer = TEST_MEM_SIZE;
 
 
 void SendMemoryPatternEncyrpted()
 {
-	for(register int i = 0; i < sizeof(bytesToSend) / sizeof(uint32_t); i++)
+	bytesToSend = (uint8_t *)malloc(sizeOfBuffer);
+	if(bytesToSend == NULL)
+	{
+		printf_s("Cannot allocate memory block size of %zu bytes\n", sizeOfBuffer);
+		return;
+	}
+
+	for(register int i = 0; (size_t)i < sizeOfBuffer / sizeof(uint32_t); i++)
 	{
 		* (uint32_t *) & bytesToSend[i * sizeof(uint32_t)] = htobe32(i);
 	}
@@ -45,20 +34,9 @@ void SendMemoryPatternEncyrpted()
 }
 
 
-// This function is for tracing purpose
-static int	FSPAPI onAccepting(FSPHANDLE h, PFSP_SINKINF p, PFSP_IN6_ADDR remoteAddr)
-{
-	printf_s("\nTo accept handle of FSP session: 0x%08X\n", h);
-	printf_s("Interface: %d, session Id: %u\n", p->ipi6_ifindex, p->idALF);
-	printf_s("Remote address: 0x%llX::%X::%X\n", remoteAddr->u.subnet, remoteAddr->idHost, remoteAddr->idALF);
-	return 0;	// no opposition
-}
-
-
-
 static int FSPAPI onAccepted(FSPHANDLE h, PFSP_Context ctx)
 {
-	printf_s("\nHandle of FSP session: Fiber ID = %u\n", (uint32_t)(intptr_t)h);
+	printf_s("\nEncyrptedMemory onAccepted: handle of FSP session/Fiber ID = 0x%X\n", (uint32_t)(intptr_t)h);
 	// TODO: check connection context
 
 	ReadFrom(h, bufPeerPublicKey, sizeof(bufPeerPublicKey), onPublicKeyReceived);
@@ -108,8 +86,11 @@ static void FSPAPI onFileNameSent(FSPHANDLE h, FSP_ServiceCode c, int r)
 		return;
 	}
 
-	//// Besides, open another reverse-connection to send the signature
-	//StartToSendSignature(h);
+	// Besides, open another reverse-connection to send the signature
+	StartToSendSignature(h);
+
+	printf_s("And we expected success acknowledgement\n");
+	ReadFrom(h, linebuf, sizeof(linebuf), onResponseReceived);
 }
 
 
@@ -123,22 +104,18 @@ static int FSPAPI toSendNextBlock(FSPHANDLE h, void * batchBuffer, int32_t capac
 		return -1;
 	}
 
-	int bytesRead = __min(sizeof(bytesToSend) - offset, (size_t)capacity);
+	int bytesRead = __min(sizeOfBuffer - offset, (size_t)capacity);
 	memcpy(batchBuffer, bytesToSend + offset, bytesRead);
 	printf_s("To send %d bytes to the remote end, %d bytes have been sent\n", bytesRead, offset);
 
 	offset += bytesRead;
-	bool r = (offset >= sizeof(bytesToSend));
 
+	// Would wait until acknowledgement is received. Shutdown is called in onResponseReceived
+	bool r = (offset >= (int)sizeOfBuffer);
 	SendInline(h, batchBuffer, bytesRead, r ? END_OF_MESSAGE : NOT_END_ANYWAY);
 	if(r)
 	{
-		printf("All content has been sent. To shutdown.\n");
-		if(Shutdown(h, onFinished) != 0)
-		{
-			Dispose(h);
-			finished = true;
-		}
+		printf("All content has been sent. To wait acknowledgement and shutdown.\n");
 		return -1;
 	}
 

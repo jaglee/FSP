@@ -1,12 +1,4 @@
-#include <stdlib.h>
-#include <stdio.h>
-#include <string.h>
-#include <io.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <share.h>
-#include "../FSP_API.h"
-
+#include "stdafx.h"
 
 // "$memory.^";
 int CompareMemoryPattern(char *fileName)

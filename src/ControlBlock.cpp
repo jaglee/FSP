@@ -59,7 +59,7 @@ const char * CStringizeOpCode::names[LARGEST_OP_CODE + 1] =
 	"RESERVED_CODE14",
 	"RESERVED_CODE15",
 	//
-	"MOBILE_PARAM",
+	"PEER_SUBNETS",
 	"SELECTIVE_NACK"
 } ;
 
@@ -111,7 +111,7 @@ const char * CStringizeNotice::names[LARGEST_FSP_NOTICE + 1] =
 	// 1~15: DLL to LLS
 	"FSP_Listen",		// register a passive socket
 	"InitConnection",	// register an initiative socket
-	"FSP_NotifyAccepting",	//  = SynConnection,	// a reverse command to make context ready
+	"FSP_NotifyAccepting",	// FSP_Accept
 	"FSP_Reject",		// a forward command, explicitly reject some request
 	"FSP_Recycle",		// a forward command, connection might be aborted
 	"FSP_Start",		// send a packet starting a new send-transaction
@@ -126,15 +126,15 @@ const char * CStringizeNotice::names[LARGEST_FSP_NOTICE + 1] =
 	"Reserved14",
 	"Reserved15",
 	// 16~23: LLS to DLL in the backlog
-	//FSP_NotifyAccepting = SynConnection,	// a reverse command to make context ready
+	//FSP_NotifyAccepting = FSP_Accept,	// a reverse command to make context ready
 	//FSP_NotifyRecycled = FSP_Recycle,		// a reverse command to inform DLL to release resource passively
 	"FSP_NotifyAccepted",
 	"FSP_NotifyDataReady",
 	"FSP_NotifyBufferReady",
-	"FSP_NotifyReset",
+	"FSP_NotifyToCommit",
 	"FSP_NotifyFlushed",
 	"FSP_NotifyToFinish",
-	"FSP_NotifyFlushing",	// used to be FSP_Dispose or Reserved22
+	"FSP_NotifyReset",		// used to be FSP_Dispose or Reserved22
 	"Reserved23",
 	// 24~31: near end error status
 	"FSP_IPC_CannotReturn",	// LLS cannot return to DLL for some reason
@@ -169,6 +169,7 @@ const char * CStringizeState::operator[](int i)
 	}
 	return CStringizeState::names[i];
 }
+
 
 // assume it is atomic (the assumption might be broken!)
 const char * CStringizeNotice::operator[](int i)
@@ -476,45 +477,6 @@ void * LOCALAPI ControlBlock::InquireSendBuf(int & m)
 
 // Given
 //	FSP_NormalPacketHeader	the place-holder of sequence number and flags
-//	PFSP_SocketBuf			the pointer to the send buffer block descriptor
-//	seq_t					the sequence number of the packet meant to be set
-// Do
-//	Set the sequence number, expected acknowledgment sequencenumber,
-//	flags and the advertised receive window size field of the FSP header 
-void LOCALAPI ControlBlock::SetSequenceFlags(FSP_NormalPacketHeader *pHdr, PFSP_SocketBuf skb, seq_t seq)
-{
-	pHdr->expectedSN = htobe32(recvWindowNextSN);
-	pHdr->sequenceNo = htobe32(seq);
-	pHdr->ClearFlags();	// pHdr->u.flags = 0;
-	if (skb->GetFlag<TO_BE_CONTINUED>())
-		pHdr->SetFlag<ToBeContinued>();
-	else
-		pHdr->ClearFlag<ToBeContinued>();
-	// UNRESOLVED! compressed? ECN?
-	// here we needn't check memory corruption as mishavior only harms himself
-	pHdr->SetRecvWS(RecvWindowSize());
-}
-
-
-
-// Given
-//	FSP_NormalPacketHeader	the place-holder of sequence number and flags
-//	seq_t					the sequence number to be accumulatively acknowledged 
-// Do
-//	Set the sequence number, expected acknowledgment sequencenumber,
-//	flags and the advertised receive window size field of the FSP header 
-void LOCALAPI ControlBlock::SetSequenceFlags(FSP_NormalPacketHeader *pHdr, seq_t seqExpected)
-{
-	pHdr->sequenceNo = htobe32(sendWindowNextSN);
-	pHdr->expectedSN = htobe32(seqExpected);
-	pHdr->ClearFlags();
-	pHdr->SetRecvWS(RecvWindowSize());
-}
-
-
-
-// Given
-//	FSP_NormalPacketHeader	the place-holder of sequence number and flags
 // Do
 //	Set the default sequence number, expected acknowledgment sequencenumber,
 //	flags and the advertised receive window size field of the FSP header 
@@ -698,8 +660,6 @@ int LOCALAPI ControlBlock::GetSelectiveNACK(seq_t & snExpect, FSP_SelectiveNACK:
 	PFSP_SocketBuf p = HeadRecv() + iHead;
 	// it is possible that the head packet is the gap because of delivery
 
-	// To make life easier we have not taken into account of possibility of larger continuous data with much smaller gap
-	// If a 'very large' gap or continuous received area appeared (exceed USHRT_MAX) it would be adjusted
 	seq_t		seq0 = recvWindowNextSN - nRcv;	// Because of parallism it is not necessarily recvWindowFirstSN now
 	uint32_t	dataLength;
 	uint32_t	gapWidth;
@@ -812,9 +772,10 @@ void ControlBlock::SlideSendWindowByOne()	// shall be atomic!
 
 
 // Given
-//	ControlBlock::seq_t		the maximum sequence number expected by the remote end, without gaps
+//	ControlBlock::seq_t		the sequence number that was accumulatively acknowledged
 //	const GapDescriptor *	array of the gap descriptors
 //	int						number of gap descriptors
+//	timestamp_t & [In, Out]	In: the timestamp of Now. Out: 
 // Do
 //	Make acknowledgement, maybe accumulatively if number of gap descriptors is 0
 // Return
@@ -823,7 +784,7 @@ void ControlBlock::SlideSendWindowByOne()	// shall be atomic!
 //	As the receiver has nothing to know about the tail packets the sender MUST append a gap.
 //	It's destructive! Endian conversion is also destructive.
 //	UNRESOLVED!? For big endian architecture it is unnecessary to transform the descriptor: let's the compiler/optimizer handle it
-int LOCALAPI ControlBlock::DealWithSNACK(seq_t expectedSN, FSP_SelectiveNACK::GapDescriptor *gaps, int & n)
+int LOCALAPI ControlBlock::DealWithSNACK(seq_t expectedSN, FSP_SelectiveNACK::GapDescriptor *gaps, int n, timestamp_t & rttNow)
 {
 	// Check validity of the control block descriptors to prevent memory corruption propagation
 	const int32_t & capacity = sendBufferBlockN;
@@ -835,6 +796,7 @@ int LOCALAPI ControlBlock::DealWithSNACK(seq_t expectedSN, FSP_SelectiveNACK::Ga
 	int	countAck = 0;
 
 	register int nAck = int(expectedSN - seq0);
+	uint64_t rtt64_us = 0;
 	for(int	k = 0; ; k++)
 	{
 		seq0 += nAck;
@@ -844,7 +806,10 @@ int LOCALAPI ControlBlock::DealWithSNACK(seq_t expectedSN, FSP_SelectiveNACK::Ga
 			if(! p->GetFlag<IS_ACKNOWLEDGED>())
 			{
 				p->SetFlag<IS_ACKNOWLEDGED>();
-				countAck++;
+				// round-trip time: 
+				if(countAck++ == 0)
+					rtt64_us = rttNow - p->timeSent;
+				rtt64_us = (rtt64_us + (rttNow - p->timeSent)) >> 1;
 			}
 			//
 			if(++iHead - capacity >= 0)
@@ -871,13 +836,8 @@ int LOCALAPI ControlBlock::DealWithSNACK(seq_t expectedSN, FSP_SelectiveNACK::Ga
 		nAck = gaps[k].dataLength = be32toh(gaps[k].dataLength);
 	}
 
-	// Here the SNACK suffix may be destroyed: the gapWidth overlay with 'serialNo' of the SNACK suffix
-	// However the header signature is kept.
-	if(int(sendWindowNextSN - seq0) > 0 && gaps != NULL)
-	{
-		gaps[n].gapWidth = int(sendWindowNextSN - seq0);
-		n++;
-	}
+	if(countAck > 0)
+		rttNow = rtt64_us;
 
 	return countAck;
 }
