@@ -52,6 +52,7 @@
 #define TRACE_PACKET	4
 #define TRACE_SLIDEWIN	8
 #define TRACE_ULACALL	16
+#define TRACE_OUTBAND	32	// Other than KEEP_ALIVE
 // Return the number of microseconds elapsed since Jan 1, 1970 (unix epoch time)
 timestamp_t NowUTC();	// it seems that a global property 'Now' is not as clear as this function format
 
@@ -264,13 +265,13 @@ class CSocketItemEx: public CSocketItem
 	friend void Multiply(CommandCloneSessionSrv &);
 
 	SRWLOCK	rtSRWLock;
-	DWORD	idSrcProcess;
 	HANDLE	hSrcMemory;
+	DWORD	idSrcProcess;
 	//
+protected:
 	ICC_Context	contextOfICC;
 	uint8_t	cipherText[MAX_BLOCK_SIZE];
 	//
-protected:
 	PktBufferBlock * volatile headPacket;
 	PktBufferBlock * volatile tailPacket;
 
@@ -284,7 +285,10 @@ protected:
 
 	char	inUse;	// assert ALIGN(2)
 	char	isReady;
+	char	shouldAppendCommit;
 	FSP_Session_State lowState;
+
+	ALFID_T		idParent;
 
 	// chainlist on the collision entry of the remote ALFID TLB
 	CSocketItemEx * prevRemote;
@@ -301,15 +305,13 @@ protected:
 	timestamp_t	tSessionBegin;
 	timestamp_t	tLastRecv;
 	timestamp_t tRecentSend;
+	timestamp_t tMigrate;
 
 	uint32_t	nextOOBSN;	// host byte order for near end. if it overflow the session MUST be terminated
 	uint32_t	lastOOBSN;	// host byte order, the serial number of peer's last out-of-band packet
 
-	struct
-	{
-		timestamp_t tMigrate;
-	}	clockCheckPoint;
-
+	int8_t		lazyAckTimeoutRetryCount;
+	int8_t		resendTimeoutRetryCount;
 	//
 	bool AddLazyAckTimer();
 	bool AddResendTimer(uint32_t);
@@ -343,7 +345,7 @@ protected:
 	{
 		_InterlockedExchange8((char *) & pControlBlock->state, s);
 		lowState = s;
-		clockCheckPoint.tMigrate = NowUTC();
+		tMigrate = NowUTC();
 	}
 	bool InState(FSP_Session_State s) { return lowState == s; }
 	bool InStates(int n, ...);
@@ -371,7 +373,7 @@ protected:
 	}
 	bool SendAckFlush();
 	bool SendKeepAlive();
-	bool LOCALAPI EmitWithICC(ControlBlock::PFSP_SocketBuf, ControlBlock::seq_t);
+	int	 EmitWithICC(ControlBlock::PFSP_SocketBuf, ControlBlock::seq_t);
 
 	void Destroy();	// override that of the base class
 	void DoResend();
@@ -435,8 +437,7 @@ public:
 
 	bool Notify(FSP_ServiceCode);
 	void SignalEvent() { ::SetEvent(hEvent); }
-	void SignalAccepted() { pControlBlock->notices.SetHead(FSP_NotifyAccepted); SignalEvent(); }
-	void SignalAccepting() { pControlBlock->notices.SetHead(FSP_NotifyAccepting); SignalEvent(); }
+	void SignalFirstEvent(FSP_ServiceCode code) { pControlBlock->notices.SetHead(code); ::SetEvent(hEvent); }
 	//
 	int LOCALAPI RespondToSNACK(ControlBlock::seq_t, FSP_SelectiveNACK::GapDescriptor *, int);
 	int32_t LOCALAPI GenerateSNACK(FSP_PreparedKEEP_ALIVE &, ControlBlock::seq_t &, int);
@@ -445,8 +446,7 @@ public:
 	void RejectOrReset();
 	void DisposeOnReset();
 	void Recycle();
-	void InitiateMultiply(const CSocketItemEx *);
-	void ResponseToMultiply();
+	void InitiateMultiply(CSocketItemEx *);
 	bool FinalizeMultiply();
 
 	void HandleMemoryCorruption() {	Destroy(); }
@@ -516,42 +516,22 @@ public:
 #include <poppack.h>
 
 
-
 // The backlog of connection multiplication, for buffering the payload piggybacked by the MULTIPLY packet
-struct CMultiplyBacklogItem
+// By reuse
+//	cipherText field of CSocketItemEx
+//	tSessionBegin => first two bytes: lenData, last byte: EOM
+//	contextOfICC.firstRecvSNewKey => initialSN
+//	SOCKADDR_ALFID and SOCKADDR_HOSTID of sockAddrTo: idRemote and remoteHostID
+class CMultiplyBacklogItem: public CSocketItemEx
 {
-	CMultiplyBacklogItem *prev, *next;
-	timestamp_t	time0;
-	ALFID_T		idParent;
-	ALFID_T		idRemote;
-	FSPOperationCode opCode;
-	char		isEOM;
-	char		isEOT;
-	uint16_t	lenData;
-	uint64_t	iv;		// sequence number of the MULTIPLY packet, concated with the expectedSN field of the packet
-	uint8_t		plainText[MAX_BLOCK_SIZE];
-};
-
-
-// As a concept prototype we apply double-linked list to manage the backlog
-class CMultiplyBacklog
-{
-	static CMultiplyBacklogItem storage[MULTIPLY_BACKLOG_SIZE];
-	static CMultiplyBacklogItem *head, *tail;
-	static CMultiplyBacklogItem *allocHead, *allocTail;
-	static volatile	char mutex;
-	//
+	friend	class CSocketSrvTLB;
 public:
-	static void WaitSetMutex() { while (_InterlockedCompareExchange8(&mutex, 1, 0)) Sleep(0); }
-	static void SetMutexFree() { _InterlockedExchange8(&mutex, 0); }
-	// Given parent ALFID, the peer's ALFID, the packet sequence number and the out-of-band serial number
-	// allocate a slot of multiplication backlog
-	static CMultiplyBacklogItem * Alloc(ALFID_T, ALFID_T, uint32_t, uint32_t);
-	// Given parent ALFID, the peer's ALFID, find the matching multiplication backlog item
-	static CMultiplyBacklogItem * Find(ALFID_T, ALFID_T);
-	// Free the given multiplication backlog slot
-	static void Free(CMultiplyBacklogItem *);
-	static void Prepare();
+	void	CopyInPlainText(const uint8_t *buf, int n) { *((uint16_t *)& tSessionBegin) = (uint16_t)n; if(n > 0) memcpy(cipherText, buf, n); }
+	int		CopyOutPlainText(uint8_t *buf) { int n = *((uint16_t *)& tSessionBegin); if(n > 0) memcpy(buf, cipherText, n); return n; }
+	bool	IsEndOfMessage() const { return *((uint8_t *)& tSessionBegin + 3) != 0; }
+	void	SetEndOfMessage(bool value) { *((uint8_t *)& tSessionBegin + 3) = (uint8_t)value; }
+	//
+	void	ResponseToMultiply();
 };
 
 
@@ -587,8 +567,9 @@ public:
 
 	CSocketItemEx * operator[](ALFID_T);
 
-	bool PutToRTLB(CSocketItemEx *);
-	CSocketItemEx * FindSocket(uint32_t, ALFID_T, ALFID_T);
+	bool PutToRemoteTLB(CMultiplyBacklogItem *);
+	// Given the remote host Id, the remote ALFID and the near end's parent id return the matching
+	CMultiplyBacklogItem * FindByRemoteId(uint32_t, ALFID_T, ALFID_T);
 };
 
 
@@ -596,8 +577,8 @@ public:
 // Dual stack support: FSP over UDP/IPv4 and FSP over IPv6 require buffer block of different size
 struct CPacketBuffers
 {
-	PktBufferBlock *freeBufferHead;
 	ALIGN(8) PktBufferBlock bufferMemory[MAX_BUFFER_BLOCKS];
+	PktBufferBlock *freeBufferHead;
 
 	PktBufferBlock	*GetBuffer()
 	{

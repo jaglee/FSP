@@ -27,10 +27,10 @@ void FlowTestAcknowledge()
 	assert(pSCB->sendWindowFirstSN == FIRST_SN + 1);
 	assert(pSCB->sendWindowNextSN == FIRST_SN + 1);
 
-	pSCB->SetSendWindowWithHeadReserved(FIRST_SN);
-	ControlBlock::PFSP_SocketBuf skb = pSCB->HeadSend();
+	pSCB->SetSendWindow(FIRST_SN);
+	ControlBlock::PFSP_SocketBuf skb = pSCB->GetSendBuf();
 	//Assert::IsNotNull(skb);
-	assert(pSCB->sendWindowSize == 1);	// set by GetVeryFirstSendBuf
+	assert(pSCB->sendWindowSize == 1);
 	assert(pSCB->sendBufferNextSN == FIRST_SN + 1);
 	skb->SetFlag<IS_COMPLETED>();
 	skb->Lock();
@@ -177,8 +177,8 @@ void PrepareFlowTestResend(CSocketItemExDbg & dbgSocket, PControlBlock & pSCB)
 	pSCB->Init((memsize - sizeof(ControlBlock)) / 2, (memsize - sizeof(ControlBlock)) / 2);
 	pSCB->recvWindowFirstSN = pSCB->recvWindowNextSN = FIRST_SN;
 
-	pSCB->SetSendWindowWithHeadReserved(FIRST_SN);
-	ControlBlock::PFSP_SocketBuf skb = pSCB->HeadSend();
+	pSCB->SetSendWindow(FIRST_SN);
+	ControlBlock::PFSP_SocketBuf skb = pSCB->GetSendBuf();
 	skb->SetFlag<IS_COMPLETED>();
 	assert(pSCB->sendBufferNextSN == FIRST_SN + 1);
 

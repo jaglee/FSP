@@ -29,15 +29,12 @@ void UnitTestSendRecvWnd()
 
 	// set the begin of the send sequence number for the test to work properly
 	// set the negotiated receive window parameter
-	pSCB->SetRecvWindowHead(FIRST_SN);
-	pSCB->SetSendWindowWithHeadReserved(FIRST_SN);
+	pSCB->SetRecvWindow(FIRST_SN);
+	pSCB->SetSendWindow(FIRST_SN);
 
-	ControlBlock::PFSP_SocketBuf skb = pSCB->HeadSend();
+	ControlBlock::PFSP_SocketBuf skb = pSCB->GetSendBuf();
 	Assert::IsNotNull(skb);
 	Assert::IsTrue(pSCB->sendBufferNextSN == FIRST_SN + 1);
-	// TODO: SCB pointer to user space pointer
-	// TODO: recalibrate pointer...
-	// FSP_AffirmToConnect & request = *(FSP_AffirmToConnect *)(*pControlBlock)[skb];
 
 	int m = MAX_BLOCK_SIZE;
 	void *inplaceBuf = pSCB->InquireSendBuf(m);
@@ -168,7 +165,7 @@ void UnitTestGenerateSNACK()
 {
 	CSocketItemExDbg socket(MAX_BLOCK_NUM, MAX_BLOCK_NUM);
 	ControlBlock *pSCB = socket.GetControlBlock();
-	pSCB->SetRecvWindowHead(FIRST_SN);
+	pSCB->SetRecvWindow(FIRST_SN);
 
 	FSP_SelectiveNACK::GapDescriptor gaps[MAX_GAPS_NUM];
 	ControlBlock::seq_t seq0;
@@ -263,7 +260,7 @@ void UnitTestHasBeenCommitted()
 {
 	CSocketItemExDbg socket(MAX_BLOCK_NUM, MAX_BLOCK_NUM);
 	ControlBlock *pSCB = socket.GetControlBlock();
-	pSCB->SetRecvWindowHead(FIRST_SN);
+	pSCB->SetRecvWindow(FIRST_SN);
 	//
 	// TODO: put test data...
 	ControlBlock::PFSP_SocketBuf skb = pSCB->AllocRecvBuf(FIRST_SN);

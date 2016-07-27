@@ -113,7 +113,7 @@ void CSocketItemEx::KeepAlive()
 	case CONNECT_BOOTSTRAP:
 	case CONNECT_AFFIRMING:
 	case CHALLENGING:
-		if (t1 - clockCheckPoint.tMigrate > (TRASIENT_STATE_TIMEOUT_ms << 10))
+		if (t1 - tMigrate > (TRASIENT_STATE_TIMEOUT_ms << 10))
 		{
 #ifdef TRACE
 			printf_s("\nTransient state time out in state %s\n", stateNames[lowState]);
@@ -143,7 +143,7 @@ void CSocketItemEx::KeepAlive()
 			SendKeepAlive();
 		break;
 	case PRE_CLOSED:
-		if((t1 - clockCheckPoint.tMigrate) > (TRASIENT_STATE_TIMEOUT_ms << 10)
+		if((t1 - tMigrate) > (TRASIENT_STATE_TIMEOUT_ms << 10)
 		 || t1 - tSessionBegin >  (MAXIMUM_SESSION_LIFE_ms << 10) )
 		{
 #ifdef TRACE
@@ -166,7 +166,7 @@ void CSocketItemEx::KeepAlive()
 		}
 		break;
 	case CLONING:
-		if (t1 - clockCheckPoint.tMigrate > (TRASIENT_STATE_TIMEOUT_ms << 10)
+		if (t1 - tMigrate > (TRASIENT_STATE_TIMEOUT_ms << 10)
 		 || t1 - tSessionBegin >  (MAXIMUM_SESSION_LIFE_ms << 10) )
 		{
 #ifdef TRACE
@@ -183,26 +183,27 @@ void CSocketItemEx::KeepAlive()
 
 
 
-/**
--	Retransmission of PERSIST
-	An FSP node MUST retransmit the unacknowledged PERSIST packet at the head of the send queue
-	at the tempo of transmitting heartbeat signals.
--	Retransmission of COMMIT
-	An FSP node MUST retransmit the unacknowledged COMMIT packet at the head of the send queue
-	at the tempo of transmitting heartbeat signals. 
-*/
+// The resend timer is a one-shot timer, and it is NOT immediately canceled as soon as the packet is acknowledged
+// but is re-scheduled instead on timed-out *resendTimer = NULL / AddResendTimer
 void CSocketItemEx::DoResend()
 {
 	const int32_t capacity = pControlBlock->sendBufferBlockN;
+	resendTimer = NULL;
 	if(! TestAndLockReady())
 	{
 #ifdef TRACE
 		printf_s("\n#0x%X's DoResend not executed due to lack of locks in state %s. InUse: %d\n"
 			, fidPair.source, stateNames[lowState], IsInUse());
 #endif
+		if(resendTimeoutRetryCount < TIMEOUT_RETRY_MAX_COUNT)
+		{
+			resendTimeoutRetryCount++;
+			AddResendTimer(LAZY_ACK_DELAY_MIN_ms);
+		}
 		return;
 	}
-	// TODO: light-weight mutex
+	resendTimeoutRetryCount = 0;
+
 	ControlBlock::seq_t seq1 = pControlBlock->sendWindowFirstSN;
 	int32_t index1 = pControlBlock->sendWindowHeadPos;
 	ControlBlock::PFSP_SocketBuf p = pControlBlock->HeadSend() + index1;
@@ -223,7 +224,7 @@ void CSocketItemEx::DoResend()
 			pControlBlock->SlideSendWindowByOne();
 		else if( (tNow - p->timeSent) < (tRoundTrip_us << 2))	// retransmission time-out is hard coded to 4RTT
 			break;
-		else if(!EmitWithICC(p, seq1))
+		else if(EmitWithICC(p, seq1) <= 0)
 			break;
 		//
 		++seq1;
@@ -239,10 +240,9 @@ void CSocketItemEx::DoResend()
 	}
 
 	if(k < n)
-	{
-		resendTimer = NULL;
 		AddResendTimer(uint32_t((tRoundTrip_us  - ((tNow - p->timeSent) >> 2)) >> 8));
-	}
+	else
+		EmitQ();	// retry to send those pending on the queue
 
 	SetReady();
 }
@@ -252,14 +252,21 @@ void CSocketItemEx::DoResend()
 // Send the selective negative acknowledgement on laziness timed-out
 void CSocketItemEx::LazilySendSNACK()
 {
+	lazyAckTimer = NULL;
 	if(! TestAndLockReady())
 	{
 #ifdef TRACE
 		printf_s("\n#0x%X's LazilySendSNACK not executed due to lack of locks in state %s. InUse: %d\n"
 			, fidPair.source, stateNames[lowState], IsInUse());
 #endif
+		if(lazyAckTimeoutRetryCount < TIMEOUT_RETRY_MAX_COUNT)
+		{
+			lazyAckTimeoutRetryCount++;
+			AddLazyAckTimer();
+		}
 		return;
 	}
+	lazyAckTimeoutRetryCount = 0;
 
 	// A COMMIT packet may trigger an instant ACK_FLUSH and make the lazy KEEP_ALIVE obsolete
 	if(!InState(ESTABLISHED) && !InState(COMMITTING) && !InState(COMMITTED))
@@ -310,7 +317,6 @@ void CSocketItemEx::LazilySendSNACK()
 	SendPacket(1, ScatteredSendBuffers(&buf2, len));
 
 l_done:
-	lazyAckTimer = NULL;
 	SetReady();
 }
 
@@ -486,7 +492,24 @@ int LOCALAPI CSocketItemEx::RespondToSNACK(ControlBlock::seq_t expectedSN, FSP_S
 	// ONLY when the first packet in the send window is acknowledged may round-trip time re-calibrated
 	// We assume that after sliding send window the number of unacknowledged was reduced
 	if(pControlBlock->GetSendQueueHead()->GetFlag<IS_ACKNOWLEDGED>())
+	{
 		pControlBlock->SlideSendWindow();
-
+		// See also UrgeCommit, DoResend
+		if(_InterlockedCompareExchange8(& shouldAppendCommit, 0, 1) != 0)
+		{
+			int r = pControlBlock->ReplaceSendQueueTailToCommit();
+			if(r == 0)
+			{
+				if (pControlBlock->CountSendBuffered() == 1)
+				{
+					EmitStart();
+					pControlBlock->SlideNextToSend();
+				}
+				// See also EmitQ
+				if(resendTimer == NULL)
+					AddResendTimer(tRoundTrip_us >> 8);
+			}
+		}
+	}
 	return nAck;
 }

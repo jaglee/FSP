@@ -170,14 +170,14 @@ int FSPAPI FSPControl(FSPHANDLE hFSPSocket, FSP_ControlCode controlCode, ULONG_P
 		case FSP_GET_SIGNATURE:
 			*(uint64_t *)value = pSocket->GetULASignature();
 			break;
-		case FSP_SET_COMPRESSION:
-			pSocket->SetCompression((int)value);
+		case FSP_SET_SEND_COMPRESSING:
+			pSocket->SetSendCompressing(value != 0);
 			break;
 		case FSP_SET_CALLBACK_ON_ERROR:
 			pSocket->SetCallbackOnError((NotifyOrReturn)value);
 			break;
-		case FSP_SET_CALLBACK_ON_FINISH:
-			pSocket->SetCallbackOnFinish((NotifyOrReturn)value);
+		case FSP_SET_CALLBACK_ON_REQUEST:
+			pSocket->SetCallbackOnRequest((CallbackRequested)value);
 			break;
 		case FSP_SET_CALLBACK_ON_CONNECT:
 			pSocket->SetCallbackOnAccept((CallbackConnected)value);
@@ -336,15 +336,15 @@ void CSocketItemDl::WaitEventToDispatch()
 				ToConcludeConnect();
 				return;
 			}
-			else if(InState(ESTABLISHED) || InState(COMMITTED))	// <= CLONING
-			{
-				ToConcludeMultiply();
-				return;
-			}
-			// else in COMMITTED or CLOSABLE state // <= CHALLENGING
 			if(context.onAccepted != NULL)
 				context.onAccepted(this, &context);
 			ProcessReceiveBuffer();
+			break;
+		case FSP_NotifyMultiplied:	// See also @LLS::Connect()
+			CancelTimer();			// If any
+			fidPair.source = pControlBlock->nearEndInfo.idALF;
+			ProcessReceiveBuffer();
+			ProcessPendingSend();	// To inherently chain WriteTo/SendInline with Multiply
 			break;
 		case FSP_NotifyDataReady:
 			ProcessReceiveBuffer();
@@ -354,20 +354,18 @@ void CSocketItemDl::WaitEventToDispatch()
 			break;
 		case FSP_NotifyToCommit:
 			ProcessReceiveBuffer();	// See FSP_NotifyDataReady, FSP_NotifyFlushed and CSocketItemDl::Shutdown()
-			if(InState(CLOSABLE) && GetResetFlushing() == FLUSHING_SHUTDOWN)
+			if(InState(CLOSABLE) && GetResetFlushing())
 				Call<FSP_Shutdown>();
 			break;
 		case FSP_NotifyFlushed:
 			ProcessPendingSend();
-			if(InState(CLOSABLE) && GetResetFlushing() == FLUSHING_SHUTDOWN)
+			if(InState(CLOSABLE) && GetResetFlushing())
 				Call<FSP_Shutdown>();
 			break;
 		case FSP_NotifyToFinish:
 			lowerLayerRecycled = 1;
 			if(initiatingShutdown)
-				Recycle();
-			else if(context.onRelease != NULL)
-				context.onRelease(this, FSP_NotifyToFinish, 0);
+				RespondToRecycle();
 			return;
 		case FSP_NotifyRecycled:
 			lowerLayerRecycled = 1;

@@ -3,6 +3,13 @@
 
 #include "stdafx.h"
 
+//#define REMOTE_APPLAYER_NAME "localhost:80"
+// #define REMOTE_APPLAYER_NAME "lt-x61t:80"
+// #define REMOTE_APPLAYER_NAME "lt-at4:80"
+// #define REMOTE_APPLAYER_NAME "lt-ux31e:80"
+#define REMOTE_APPLAYER_NAME "E000:AAAA::1"
+//#define REMOTE_APPLAYER_NAME "E000:BBBB::1"
+
 static unsigned char bufPrivateKey[CRYPTO_NACL_KEYBYTES];
 static unsigned char bufPublicKey[CRYPTO_NACL_KEYBYTES];
 
@@ -52,23 +59,6 @@ static void FSPAPI onFinished(FSPHANDLE h, FSP_ServiceCode code, int value)
 
 
 
-// Just report the progress. Should not terminate the parent process, however
-// Should gracefully 'close' the socket
-static void FSPAPI onServerClose(FSPHANDLE h, FSP_ServiceCode code, int value)
-{
-	printf_s("Fiber ID = 0x%X, the server shutdown the session.\n", (uint32_t)(intptr_t)h);
-	if(code != FSP_NotifyToFinish)
-	{
-		printf_s("Should got TO_FINISH, but service code = %d, return %d\n", code, value);
-		return;
-	}
-
-	// toFinish = true;
-	return;
-}
-
-
-
 static int ReportLastError()
 {
 	int	err = GetLastError();
@@ -113,7 +103,6 @@ int main(int argc, char *argv[])
 	parms.onAccepting = onMultiplying;
 	parms.onAccepted = onConnected;
 	parms.onError = onNotice;
-	parms.onRelease = onServerClose;
 	parms.recvSize = MAX_FSP_SHM_SIZE;	// 4MB
 	parms.sendSize = 0;	// the underlying service would give the minimum, however
 	if(Connect2(REMOTE_APPLAYER_NAME, & parms) == NULL)
@@ -230,8 +219,10 @@ static void FSPAPI onReceiveFileNameReturn(FSPHANDLE h, FSP_ServiceCode resultCo
 		// | FILE_FLAG_NO_BUFFERING [require data block alignment which condition is too strict]
 		if(hFile == INVALID_HANDLE_VALUE && GetLastError() == ERROR_FILE_EXISTS)
 		{
+			char linebuf[80];
 			printf_s("Overwrite existent file? Y/n: ");
-			int c = toupper(getchar());
+			gets_s(linebuf, sizeof(linebuf));
+			int c = toupper(linebuf[0]);
 			if(c != 'Y')
 			{
 				finished = true;

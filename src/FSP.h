@@ -166,13 +166,14 @@ typedef enum: char
 	FSP_Recycle,		// a forward command, connection might be aborted
 	FSP_Start,			// send a packet starting a new send-transaction
 	FSP_Send,			// send a packet/a group of packets
-	FSP_Urge,			// send a packet urgently, mean to urge COMMIT
+	FSP_Commit,			// send a standalone COMMIT packet, or mark the last unsent packet COMMITTING
 	FSP_Shutdown,		// close the connection
 	FSP_InstallKey,		// install the authenticated encryption key
 	FSP_Multiply,		// clone the connection, make SCB of LLS synchronized with DLL
 	// 16~23: LLS to DLL in the backlog
 	FSP_NotifyAccepting = FSP_Accept,		// a reverse command to make context ready
 	FSP_NotifyRecycled = FSP_Recycle,		// a reverse command to inform DLL to release resource passively
+	FSP_NotifyMultiplied = FSP_Multiply,	// a reverse command to inform DLL to accept a multiply request
 	FSP_NotifyAccepted = 16,
 	FSP_NotifyDataReady,
 	FSP_NotifyBufferReady,
@@ -202,19 +203,15 @@ typedef uint64_t timestamp_t;
  */
 // In debug mode we allow pre-definition via compiler's command-line option
 #ifdef _DEBUG
-# ifndef CONNECT_INITIATION_TIMEOUT_ms
-# define CONNECT_INITIATION_TIMEOUT_ms	300000	// 5 minutes
-# endif
-# ifndef KEEP_ALIVE_TIMEOUT_ms
-# define KEEP_ALIVE_TIMEOUT_ms			30000	// half a minute
-# endif
+# define INIT_RETRANSMIT_TIMEOUT_ms		60000	// 1 minute
+# define TRASIENT_STATE_TIMEOUT_ms		300000	// 5 minutes
 #else
-# define CONNECT_INITIATION_TIMEOUT_ms	30000	// half a minute
-# define KEEP_ALIVE_TIMEOUT_ms			500		// half a second
+# define INIT_RETRANSMIT_TIMEOUT_ms		15000	// 15 seconds
+# define TRASIENT_STATE_TIMEOUT_ms		60000	// 1 minute
 #endif
 
+#define KEEP_ALIVE_TIMEOUT_ms			600000	// 10 minutes
 #define MAXIMUM_SESSION_LIFE_ms			43200000// 12 hours
-#define TRASIENT_STATE_TIMEOUT_ms		300000	// 5 minutes
 
 #include <pshpack1.h>
 

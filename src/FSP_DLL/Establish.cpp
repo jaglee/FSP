@@ -65,6 +65,7 @@ FSPHANDLE FSPAPI ListenAt(const PFSP_IN6_ADDR listenOn, PFSP_Context psp1)
 		return NULL;
 
 	socketItem->AddOneShotTimer(TRASIENT_STATE_TIMEOUT_ms);
+	socketItem->sendCompressing = psp1->u.st.compressing;
 	socketItem->SetState(LISTENING);
 	// MUST set the state before calling LLS so that event-driven state transition may work properly
 	return socketItem->CallCreate(objCommand, FSP_Listen);
@@ -109,8 +110,9 @@ FSPHANDLE FSPAPI Connect2(const char *peerName, PFSP_Context psp1)
 		return NULL;
 	}
 
-	socketItem->AddOneShotTimer(CONNECT_INITIATION_TIMEOUT_ms);
+	socketItem->AddOneShotTimer(TRASIENT_STATE_TIMEOUT_ms);
 	socketItem->isFlushing = 0;
+	socketItem->sendCompressing = psp1->u.st.compressing;
 	socketItem->SetPeerName(peerName, strlen(peerName));
 	return socketItem->CallCreate(objCommand, InitConnection);
 }
@@ -168,19 +170,19 @@ CSocketItemDl * CSocketItemDl::PrepareToAccept(BackLogItem & backLog, CommandNew
 	PFSP_IN6_ADDR pListenIP = (PFSP_IN6_ADDR) & backLog.acceptAddr;
 	FSP_SocketParameter newContext = this->context;
 	newContext.ifDefault = backLog.acceptAddr.ipi6_ifindex;
-	newContext.u.st.passive = 0;
 
-	// Inherit the two NotifyOrReturn functions, onError and onRelease,
+	// Inherit the NotifyOrReturn functions onError,
 	// the CallbackConnected function onAccepted
 	// but not CallbackRequested/onAccepting
-	if(! this->context.u.st.passive)	// this->InState(LISTENING)
+	if(! this->context.u.st.passive)
 	{
 		newContext.welcome = NULL;
 		newContext.len = 0;
 	}
-	else
+	else // this->InState(LISTENING)
 	{
 		newContext.onAccepting = NULL;
+		newContext.u.st.passive = 0;
 	}
 	// If the incarnated connection could be cloned, onAccepting shall be set by FSPControl
 
@@ -201,8 +203,8 @@ CSocketItemDl * CSocketItemDl::PrepareToAccept(BackLogItem & backLog, CommandNew
 	pSocket->pControlBlock->connectParams = backLog;
 	// UNRESOLVED!? Correct pSocket->pControlBlock->connectParams.allowedPrefixes in LLS
 
-	pSocket->pControlBlock->SetRecvWindowHead(backLog.expectedSN);
-	pSocket->pControlBlock->SetSendWindowWithHeadReserved(backLog.initialSN);
+	pSocket->pControlBlock->SetRecvWindow(backLog.expectedSN);
+	pSocket->pControlBlock->SetSendWindow(backLog.initialSN);
 	
 	return pSocket;
 }
@@ -225,6 +227,9 @@ bool CSocketItemDl::ToWelcomeConnect(BackLogItem & backLog)
 		return false;
 	}
 
+	pControlBlock->sendBufferNextSN = pControlBlock->sendWindowNextSN + 1;
+	pControlBlock->sendBufferNextPos = 1;	// reserve the head packet
+	//
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend();
 	FSP_ConnectParam *params = (FSP_ConnectParam *)GetSendPtr(skb);
 	//
@@ -233,8 +238,10 @@ bool CSocketItemDl::ToWelcomeConnect(BackLogItem & backLog)
 	params->listenerID = pControlBlock->idParent;
 	params->hs.Set(PEER_SUBNETS, sizeof(FSP_NormalPacketHeader));
 	//
+	skb->version = THIS_FSP_VERSION;
 	skb->opCode = ACK_CONNECT_REQ;
 	skb->len = sizeof(*params);	// the fixed header is generated on the fly
+	skb->InitFlags();
 	//
 	if(pendingSendBuf != NULL && pendingSendSize + skb->len <= MAX_BLOCK_SIZE)
 	{
@@ -276,26 +283,50 @@ void CSocketItemDl::ToConcludeConnect()
 	// TODO: provide extensibility of customized compression/decompression method?
 	context.welcome = payload;
 	context.len = skb->len;
-	context.u.st.compressing = skb->GetFlag<IS_COMPRESSED>();
+
+	this->recvCompressed = skb->GetFlag<IS_COMPRESSED>();
 
 	pControlBlock->SlideRecvWindowByOne();
-	// Overlay CONNECT_REQUEST
-	pControlBlock->sendWindowNextSN = pControlBlock->sendWindowFirstSN;
 
 	TRACE_HERE("connection request has been accepted");
 	SetMutexFree();
 
-	SetNewTransaction();	// meant to send a PERSIST or a COMMIT
+	SetNewTransaction();
 	if(context.onAccepted != NULL && context.onAccepted(this, &context) < 0)
 	{
 		Recycle();
 		return;
 	}
+	SetHeadPacketIfEmpty(PERSIST);
+	SetState(isFlushing ? COMMITTING2 : PEER_COMMIT);
+	// See also ToWelcomeMultiply, differs in state migration
 
-	// isFlushing > 0: isFlushing == ONLY_FLUSHING || isFlushing == FLUSHING_SHUTDOWN
-	SetState(isFlushing > 0 ? COMMITTING2 : PEER_COMMIT);
-	CheckToNewTransaction();
 	Call<FSP_Start>();
+}
+
+
+// Given
+//	FSPOperationCode the header packet's operation code
+//	FSPOperationCode the header packet's operation code if it is in flushing mode
+// Do
+//	Set the head packet
+// Return
+//	The pointer to the header packet's descriptor if the queue used to be non-empty
+//	NULL if the send queue used to be empty
+ControlBlock::PFSP_SocketBuf CSocketItemDl::SetHeadPacketIfEmpty(FSPOperationCode c, FSPOperationCode cFlush)
+{
+	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend();
+	ControlBlock::seq_t k = pControlBlock->sendWindowFirstSN;
+	if(_InterlockedCompareExchange((LONG *)& pControlBlock->sendBufferNextSN, k + 1, k) != k)
+		return skb;
+
+	pControlBlock->sendBufferNextPos = 1;
+	skb->version = THIS_FSP_VERSION;
+	skb->opCode = (isFlushing ? cFlush : c);
+	skb->len = 0;
+	skb->flags = 0;
+	skb->SetFlag<IS_COMPLETED>();
+	return NULL;
 }
 
 
@@ -379,26 +410,3 @@ int LOCALAPI CSocketItemDl::InstallKey(BYTE *key, int keySize, int32_t keyLife, 
 	SetMutexFree();
 	return r;
 }
-
-
-
-// Do
-//	insert a new PERSIST/COMMIT packet at the head of the send queue
-// Remark
-//	Start a new transmit transaction, might be singleton packet message 
-bool CSocketItemDl::CheckToNewTransaction()
-{
-	if(_InterlockedCompareExchange8(& newTransaction, 0, 1) == 0)
-		return false;
-	//
-	ControlBlock::PFSP_SocketBuf skb = pControlBlock->GetSendBuf();
-	skb->opCode = InState(COMMITTING) || InState(COMMITTING2) ? COMMIT : PERSIST;
-	skb->len = 0;
-	skb->SetFlag<IS_COMPLETED>();
-
-	return true;
-}
-
-
-// The sibling functions of Connect2() for 'fast reconnect', 'session resume'
-// and 'connection multiplication' (ConnectMU), is in Multiply.cpp

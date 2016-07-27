@@ -104,25 +104,31 @@ int FSPAPI Shutdown(FSPHANDLE hFSPSocket, NotifyOrReturn fp1)
 // ALWAYS assume that only after it has finished receiving is shutdown called
 int LOCALAPI CSocketItemDl::Shutdown(NotifyOrReturn fp1)
 {
+	if(lowerLayerRecycled)	// no mutex required?!
+	{
+		RespondToRecycle();
+		return 0;
+	}
+
+#if defined(TRACE) && !defined(NDEBUG)
+	if(InterlockedExchangePointer((PVOID *)& fpRecycled, fp1) != NULL)
+		printf_s("Shutdown: the socket is already in graceful shutdown process.\n");
+#else
+	InterlockedExchangePointer((PVOID *)& fpRecycled, fp1);
+#endif
+
 	if(! WaitUseMutex())
 		return -EINTR;
 
-	if(InState(NON_EXISTENT))
+	// assert: if the socket is in CLOSED state its LLS image must have been recycled 
+	if(InState(NON_EXISTENT) || InState(CLOSED))
 	{
 		SetMutexFree();
 		return EBADF;	// A warning saying that the socket has already been closed thoroughly
 	}
 
-	isFlushing = FLUSHING_SHUTDOWN;
 	initiatingShutdown = 1;
-	SetCallbackOnRecyle(fp1);
-
-	if (InState(CLOSED))
-	{
-		SetMutexFree();
-		Recycle();
-		return 0;
-	}
+	isFlushing = 1;
 
 	if (InState(PRE_CLOSED))
 	{
@@ -143,22 +149,20 @@ int LOCALAPI CSocketItemDl::Shutdown(NotifyOrReturn fp1)
 	if(InState(COMMITTED))
 		goto l_finish;
 
-	if(! TestSetState(ESTABLISHED, COMMITTING) && ! InState(COMMITTING)
-	&& ! TestSetState(PEER_COMMIT, COMMITTING2) && ! InState(COMMITTING2))
+	if(InState(COMMITTING) || InState(COMMITTING2))
+	{
+		r = EBUSY;	// a warning saying that it is COMMITTING
+		goto l_finish;
+	}
+
+	if(! TestSetState(ESTABLISHED, COMMITTING) && ! TestSetState(PEER_COMMIT, COMMITTING2))
 	{
 		SetMutexFree();
 		Recycle();
 		return EDOM;	// A warning say that the connection is aborted actually, for it is not in the proper state
 	}
 
-	// If the last packet happened to have been sent by @LLS::EmitQ append a COMMIT and FSP_Urge would activate @LLS::EmitQ again 
-	r = pControlBlock->ReplaceSendQueueTailToCommit();
-	if(r == 0)
-		r = (Call<FSP_Urge>() ? 0 : -EIO);
-	else if(r < 0)
-		shouldAppendCommit = 1, r = 0;
-	else
-		r = EBUSY;	// a warning saying that it is COMMITTING
+	r = (Call<FSP_Commit>() ? 0 : -EIO);
 
 l_finish:
 	AddOneShotTimer(TRASIENT_STATE_TIMEOUT_ms);
@@ -170,9 +174,10 @@ l_finish:
 
 // Callback for SHUTDOWN, triggered by the near end, to recycle the socket
 // Important! ULA should not access the socket itself anyway
+// UNRESOLVED!? Should it be thread-safe?!
 void CSocketItemDl::RespondToRecycle()
 {
-	NotifyOrReturn fp1 = (NotifyOrReturn)InterlockedExchangePointer(& fpRecycled, NULL);
+	NotifyOrReturn fp1 = (NotifyOrReturn)InterlockedExchangePointer((PVOID *)& fpRecycled, NULL);
 	socketsTLB.FreeItem(this);
 	this->Destroy();
 	if (fp1 != NULL)

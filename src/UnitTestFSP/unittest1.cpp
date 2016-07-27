@@ -534,69 +534,25 @@ void UnitTestSocketRTLB()
 	Assert::IsFalse(p2 == p, L"RandID shouldn't alloc the same item as AllocItem");
 
 	p->fidPair.peer = id;
-	p->idRemoteHost = 0x1234;
 	p->idParent = 0xABCD;
+	SOCKADDR_HOSTID(p->sockAddrTo) = 0x1234;
 
 	p2->fidPair.peer = id + 2;
-	p2->idRemoteHost = 0x1236;
 	p2->idParent = 0xABCF;
+	SOCKADDR_HOSTID(p2->sockAddrTo) = 0x1236;
 
-	pRTLB->PutToRTLB(p);
-	pRTLB->PutToRTLB(p2);
+	pRTLB->PutToRemoteTLB((CMultiplyBacklogItem *)p);
+	pRTLB->PutToRemoteTLB((CMultiplyBacklogItem *)p2);
 
-	CSocketItemExDbg *q = (CSocketItemExDbg *)pRTLB->FindSocket(p->idRemoteHost, p->fidPair.peer, p->idParent);
+	CSocketItemExDbg *q = (CSocketItemExDbg *)pRTLB->FindByRemoteId(SOCKADDR_HOSTID(p->sockAddrTo), p->fidPair.peer, p->idParent);
 	Assert::IsTrue(q == p);
 
-	q = (CSocketItemExDbg *)pRTLB->FindSocket(p2->idRemoteHost, p2->fidPair.peer, p2->idParent);
+	q = (CSocketItemExDbg *)pRTLB->FindByRemoteId(SOCKADDR_HOSTID(p2->sockAddrTo), p2->fidPair.peer, p2->idParent);
 	Assert::IsTrue(q == p2);
 
 	pRTLB->FreeItem(p1);
 	pRTLB->FreeItem(p);
 	pRTLB->FreeItem(p2);
-}
-
-
-void UnitTestMultiplyBacklog()
-{
-	CMultiplyBacklog::Prepare();
-	
-	CMultiplyBacklogItem *p = CMultiplyBacklog::Alloc(1, 2, 3, 4);
-	Assert::IsNotNull(p);
-
-	CMultiplyBacklogItem *p1 = CMultiplyBacklog::Find(1, 2);
-	Assert::IsTrue(p == p1);
-
-	CMultiplyBacklog::Free(p);
-
-	p1 = CMultiplyBacklog::Alloc(1, 2, 3, 4);
-	Assert::IsNotNull(p1);
-	Assert::IsFalse(p == p1);
-
-	// Collision detection:
-	p = CMultiplyBacklog::Alloc(1, 2, 3, 4);
-	Assert::IsNull(p);
-
-	CMultiplyBacklogItem *pRet[MULTIPLY_BACKLOG_SIZE];
-	// We have allocated one
-	for(register int i = 0; i < MULTIPLY_BACKLOG_SIZE - 1; i ++)
-	{
-		pRet[i] = CMultiplyBacklog::Alloc(i + 2, 2, 3, 4);
-		Assert::IsNotNull(pRet[i]);
-	}
-
-	p = CMultiplyBacklog::Alloc(MULTIPLY_BACKLOG_SIZE + 2, 2, 3, 4);
-	Assert::IsNull(p);
-
-	CMultiplyBacklog::Free(p1);
-	p = CMultiplyBacklog::Alloc(MULTIPLY_BACKLOG_SIZE + 2, 2, 3, 4);
-	Assert::IsNotNull(p);
-
-	p1 = CMultiplyBacklog::Alloc(MULTIPLY_BACKLOG_SIZE + 3, 2, 3, 4);
-	Assert::IsNull(p1);
-
-	Sleep(CONNECT_INITIATION_TIMEOUT_ms);	// Let the first entry timed-out
-	p = CMultiplyBacklog::Alloc(MULTIPLY_BACKLOG_SIZE + 3, 2, 3, 4);
-	Assert::IsNotNull(p);
 }
 
 
@@ -875,11 +831,6 @@ namespace UnitTestFSP
 			UnitTestSocketRTLB();
 		}
 
-
-		TEST_METHOD(TestMultiplyBacklog)
-		{
-			UnitTestMultiplyBacklog();
-		}
 
 		TEST_METHOD(TestConnectQueue)
 		{

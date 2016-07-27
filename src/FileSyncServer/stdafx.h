@@ -16,10 +16,10 @@
 
 #define MAX_FILENAME_WITH_PATH_LEN	260
 
-//#define TEST_MEM_SIZE	0x200		// 512B, only one block
-#define TEST_MEM_SIZE	0x20000		// 128KB
-//#define TEST_MEM_SIZE	0x200000	// 2MB
-//#define TEST_MEM_SIZE	0x2000000	// 32MB
+#ifndef TEST_MEM_SIZE
+# define TEST_MEM_SIZE	0x20000		// 128KB
+#endif
+//^Other typical choices: //	0x200 // 512B, only one block	// 0x200000 // 2MB		// 0x2000000 // 32MB
 
 extern const char		*defaultWelcome;
 

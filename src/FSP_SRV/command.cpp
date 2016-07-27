@@ -244,7 +244,7 @@ void CSocketItemEx::Connect()
 			return;
 		}
 	}
-	pControlBlock->connectParams.idRemote = pControlBlock->peerAddr.ipFSP.fiberID;
+	pControlBlock->connectParams.idRemote = pControlBlock->peerAddr.ipFSP.fiberID;	// Exploited in OnInitConnectAck 
 
 	// By default Connect() prefer initiatiating connection from an IPv6 interface
 	// but if the peer is of FSP over UDP/IPv4 address it must be changed
@@ -284,9 +284,8 @@ void CSocketItemEx::Start()
 	lowState = pControlBlock->state;
 	//
 	EmitStartAndSlide();
-	RestartKeepAlive();
 	AddResendTimer(tRoundTrip_us >> 8);
-	//^Sometimes it is redundant but does little harm anyway
+	// While the KEEP_ALIVE_TIMEOUT was set already in OnConnectRequestAck
 }
 
 
@@ -294,7 +293,12 @@ void CSocketItemEx::Start()
 // Mean to urge sending of the COMMIT packet
 void CSocketItemEx::UrgeCommit()
 {
-	TRACE_HERE("called");
+#if defined(TRACE) && (TRACE & TRACE_ULACALL)
+	printf_s("%s called, LLS state: %s(%d), ULA state: %s(%d)\n"
+		, __FUNCDNAME__
+		, stateNames[lowState], lowState
+		, stateNames[pControlBlock->state], pControlBlock->state);
+#endif
 	// synchronize the state in the 'cache' and the real state
 	if (_InterlockedExchange8((char *) & lowState, pControlBlock->state) != pControlBlock->state)
 	{
@@ -302,7 +306,22 @@ void CSocketItemEx::UrgeCommit()
 			RestartKeepAlive();
 	}
 	//
-	EmitQ();
+	int r = pControlBlock->ReplaceSendQueueTailToCommit();
+	if(r == 0)
+	{
+		if (pControlBlock->CountSendBuffered() == 1)
+		{
+			EmitStart();
+			pControlBlock->SlideNextToSend();
+		}
+		// See also EmitQ
+		if(resendTimer == NULL)
+			AddResendTimer(tRoundTrip_us >> 8);
+	}
+	else if(r < 0)
+	{
+		shouldAppendCommit = 1;
+	}
 }
 
 

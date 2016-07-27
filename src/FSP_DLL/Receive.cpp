@@ -111,7 +111,7 @@ int CSocketItemDl::RecvInline(PVOID fp1)
 		return -EBUSY;
 	}
 	//
-	SetEndOfRecvMsg(false);
+	endOfPeerMessage = 0;
 	if(!IsRecvBufferEmpty())
 	{
 		SetMutexFree();
@@ -157,7 +157,7 @@ int LOCALAPI CSocketItemDl::ReadFrom(void * buffer, int capacity, PVOID fp1)
 
 	bytesReceived = 0;
 	waitingRecvSize = capacity;
-	SetEndOfRecvMsg(false);	// See also FetchReceived()
+	endOfPeerMessage = 0;	// See also FetchReceived()
 
 	if(fpPeeked != NULL)
 	{
@@ -237,7 +237,7 @@ int CSocketItemDl::FetchReceived()
 		//
 		if(!p->GetFlag<TO_BE_CONTINUED>() && p->len != 0 || p->opCode == COMMIT)
 		{
-			SetEndOfRecvMsg();
+			endOfPeerMessage = 1;
 			break;
 		}
 		// 'be free to accept': both COMMIT && TO_BE_CONTINUED and PERSIST && len == 0 && TO_BE_CONTINUED
@@ -294,7 +294,7 @@ void CSocketItemDl::ProcessReceiveBuffer()
 #ifdef TRACE
 			printf_s("Message terminated\n");
 #endif
-			SetEndOfRecvMsg();
+			endOfPeerMessage = 1;
 			fpPeeked = NULL;
 		}
 		if(n == 0)	// (n == 0 && !b) when the last message is a payloadless COMMIT
@@ -332,7 +332,7 @@ void CSocketItemDl::ProcessReceiveBuffer()
 		return;
 	}
 	//
-	if(IsEndOfRecvMsg() || waitingRecvSize <= 0)
+	if(endOfPeerMessage || waitingRecvSize <= 0)
 		FinalizeRead();
 	else
 		SetMutexFree();

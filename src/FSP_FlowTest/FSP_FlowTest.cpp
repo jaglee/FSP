@@ -79,12 +79,12 @@ void UnitTestICC()
 	// so it must be copied beforehand
 	DumpNetworkUInt16((uint16_t *)  & pCBR->connectParams, FSP_MAX_KEY_SIZE / 2);
 
-	pSCB->SetSendWindowWithHeadReserved(FIRST_SN);
+	pSCB->SetSendWindow(FIRST_SN);
 	socket.SetPairOfFiberID(nearFID, htobe32(LAST_WELL_KNOWN_ALFID));
 	socket.InstallEphemeralKey();	// initializtion
 	socket.InstallSessionKey(samplekey);
 
-	pCBR->SetRecvWindowHead(FIRST_SN);
+	pCBR->SetRecvWindow(FIRST_SN);
 	socketR2.SetPairOfFiberID(htobe32(LAST_WELL_KNOWN_ALFID), nearFID);
 	socketR2.InstallEphemeralKey();	// initializtion
 	pCBR->recvWindowNextSN++;		// == FIRST_SN + 1

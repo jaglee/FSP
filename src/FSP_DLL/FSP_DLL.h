@@ -107,8 +107,12 @@ class CSocketItemDl: public CSocketItem
 	char			inUse;
 	char			initiatingShutdown : 1;
 	char			lowerLayerRecycled : 1;
-	char			shouldAppendCommit : 1;
 	char			shouldChainTimeout : 1;
+	char			endOfPeerMessage : 1;
+	char			endOfMessage : 1;
+	char			$reserved : 1;
+	char			recvCompressed: 1;
+	char			sendCompressing: 1;
 protected:
 	ALIGN(8)		HANDLE theWaitObject;
 
@@ -159,11 +163,16 @@ protected:
 	CSocketItemDl * PrepareToAccept(BackLogItem &, CommandNewSession &);
 	bool ToWelcomeConnect(BackLogItem &);
 	void ToConcludeConnect();
+	ControlBlock::PFSP_SocketBuf SetHeadPacketIfEmpty(FSPOperationCode c, FSPOperationCode cFlush = COMMIT);
 
 	// In Multiplex.cpp
 	static CSocketItemDl * LOCALAPI CSocketItemDl::ToPrepareMultiply(CSocketItemDl *, PFSP_Context, CommandCloneSession &);
-	void ToPrepareMultiply();
-	void ToConcludeMultiply();
+	void ToPrepareMultiply()
+	{
+		SetState(CLONING);
+		SetNewTransaction();
+	}
+	void CompleteMultiply();
 	bool ToWelcomeMultiply(BackLogItem &);
 
 	//
@@ -178,14 +187,6 @@ protected:
 	void FinalizeRead();
 
 public:
-	enum FlushingFlag
-	{
-		// NOT_FLUSHING == 0, and '0' is self-explanatory
-		END_MESSAGE_ONLY = -1,
-		FLUSHING_COMMIT = 1,
-		FLUSHING_SHUTDOWN = 2
-	};
-
 	CSocketItemDl() { InitializeSRWLock(& rtSRWLock); }	// and lazily initialized
 	~CSocketItemDl()
 	{
@@ -219,11 +220,8 @@ public:
 	}
 	bool InIllegalState() const { return pControlBlock->state <= 0 || pControlBlock->state > LARGEST_FSP_STATE; }
 
-	// return value ? _interlockedbittestandset((LONG *) & context.u.flags, 3) : _interlockedbittestandreset((LONG *) & context.u.flags, 3)
-	int SetCompression(int value) { int r = context.u.st.compressing; context.u.st.compressing = value; return r; }
-
 	uint64_t GetULASignature() const { return context.signatureULA; }
-
+	void SetSendCompressing(bool value) { sendCompressing = value ? 1 : 0; }
 	bool WaitUseMutex();
 	void SetMutexFree() { ReleaseSRWLockExclusive(& rtSRWLock); }
 	bool IsInUse() { return (_InterlockedXor8(& inUse, 0) != 0); }
@@ -265,7 +263,7 @@ public:
 	{
 		return InterlockedCompareExchangePointer((PVOID *) & fpSent, fp1, NULL) == NULL; 
 	}
-	int LOCALAPI CheckCommitOrRevert(FlagEndOfMessage);
+	int LOCALAPI CheckTransmitaction(FlagEndOfMessage);
 	//
 	int LOCALAPI FinalizeSend(int r)
 	{
@@ -282,19 +280,15 @@ public:
 	int	LOCALAPI RecvInline(PVOID);
 	int LOCALAPI ReadFrom(void *, int, PVOID);
 
-	bool IsEndOfRecvMsg() const { return context.u.st.eom; }
-	void SetEndOfRecvMsg(bool value = true) { context.u.st.eom = value ? 1 : 0; }
 	bool IsRecvBufferEmpty()  { return pControlBlock->CountReceived() <= 0; }
 
 	int LOCALAPI Shutdown(NotifyOrReturn);
 
+	void SetCallbackOnRequest(CallbackRequested fp1) { context.onAccepting = fp1; }
 	void SetCallbackOnAccept(CallbackConnected fp1) { context.onAccepted = fp1; }
-	void SetCallbackOnFinish(NotifyOrReturn fp1) { context.onRelease = fp1; }
-	void SetCallbackOnRecyle(NotifyOrReturn fp1) { fpRecycled = fp1; }
 
 	char GetResetFlushing() { return _InterlockedExchange8(& isFlushing, 0);}
 
-	bool CheckToNewTransaction();
 	void SetNewTransaction() { newTransaction = 1; }
 
 	int SelfNotify(FSP_ServiceCode c);

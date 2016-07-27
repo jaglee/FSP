@@ -337,7 +337,7 @@ void LOCALAPI CLowerInterface::OnGetConnectRequest()
 #endif
 		goto l_return;
 	}
-	pSocket->SignalAccepting();
+	pSocket->SignalFirstEvent(FSP_NotifyAccepting);
 
 l_return:
 	pSocket->SetReady();
@@ -531,7 +531,7 @@ void CSocketItemEx::OnConnectRequestAck(FSP_AckConnectRequest & response, int le
 	memcpy(par->allowedPrefixes, response.params.subnets, sizeof(response.params.subnets));
 
 	ControlBlock::seq_t pktSeqNo = be32toh(response.sequenceNo);
-	pControlBlock->SetRecvWindowHead(pktSeqNo);
+	pControlBlock->SetRecvWindow(pktSeqNo);
 	pControlBlock->SetSendWindowSize(response.GetRecvWS());
 
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->AllocRecvBuf(pktSeqNo);
@@ -566,9 +566,9 @@ void CSocketItemEx::OnConnectRequestAck(FSP_AckConnectRequest & response, int le
 #endif
 	// OS time-slice, if any, might somewhat affect calculating of RTT. But it can be igored for large BDP pipe
 	tRoundTrip_us = (uint32_t)min(UINT32_MAX, (tRoundTrip_us + (tSessionBegin - tRecentSend) + 1) >> 1);
-	tKeepAlive_ms = KEEP_ALIVE_TIMEOUT_ms;	// instead of CONNECT_INITIATION_TIMEOUT_ms
+	RestartKeepAlive();	// The timer was already started in InitiateConnect
 
-	SignalAccepted();	// The initiator may cancel data transmission, however
+	SignalFirstEvent(FSP_NotifyAccepted);	// The initiator may cancel data transmission, however
 	TRACE_HERE("finally the connection request is accepted by the remote end");
 }
 
@@ -639,18 +639,6 @@ void CSocketItemEx::OnGetPersist()
 		return;
 	}
 
-	bool isInitiativeState = InState(CHALLENGING) || InState(CLONING);
-	// PERSIST is always the accumulative acknowledgement to ACK_CONNECT_REQ or MULTIPLY
-	// ULA slide the receive window, no matter whether the packet has payload
-	if(isInitiativeState)
-	{
-		tSessionBegin = tRecentSend;
-#ifdef TRACE
-		printf_s("\nPERSIST received. Acknowledged SN\t = %u\n", ackSeqNo);
-#endif
-		pControlBlock->SlideSendWindowByOne();	// See also RespondToSNACK, OnGetCommit
-	}
-
 #if defined(TRACE) && (TRACE & (TRACE_HEARTBEAT | TRACE_PACKET | TRACE_SLIDEWIN))
 	TRACE_HERE("the responder calculate RTT");
 #endif
@@ -673,7 +661,19 @@ void CSocketItemEx::OnGetPersist()
 		return;
 	}
 
-	if(pControlBlock->HasBeenCommitted() > 0)
+	bool isInitiativeState = InState(CHALLENGING) || InState(CLONING);
+	bool isMultiplying = InState(CLONING);
+	// PERSIST is always the accumulative acknowledgement to ACK_CONNECT_REQ or MULTIPLY
+	// ULA slide the receive window, no matter whether the packet has payload
+	if (isInitiativeState)
+	{
+#ifdef TRACE
+		printf_s("\nPERSIST received. Acknowledged SN\t = %u\n", ackSeqNo);
+#endif
+		pControlBlock->SlideSendWindowByOne();	// See also RespondToSNACK, OnGetCommit
+	}
+
+	if(pControlBlock->HasBeenCommitted())
 	{
 		if (lowState == CHALLENGING)
 		{
@@ -690,6 +690,11 @@ void CSocketItemEx::OnGetPersist()
 		}
 		else // if (InStates(CLONING))
 		{
+#ifdef TRACE
+			printf_s("\nTo transmit to PEER_COMMIT from %s, %s\n\n"
+				, stateNames[lowState]
+				, stateNames[pControlBlock->state]);
+#endif
 			StopKeepAlive();
 			SetState(PEER_COMMIT);
 		}
@@ -731,8 +736,10 @@ void CSocketItemEx::OnGetPersist()
 	if (countPlaced > 0)
 		printf_s("There is optional payload in the PERSIST packet, payload length = %d\n", countPlaced);
 #endif
-	if (isInitiativeState)
-		SignalAccepted();
+	if (isMultiplying)
+		SignalFirstEvent(FSP_NotifyMultiplied);
+	else if (isInitiativeState)
+		SignalFirstEvent(FSP_NotifyAccepted);
 }
 
 
@@ -853,7 +860,7 @@ void CSocketItemEx::OnGetPureData()
 
 	tLastRecv = NowUTC();
 
-	if(pControlBlock->HasBeenCommitted() > 0)
+	if(pControlBlock->HasBeenCommitted())
 	{
 		if (lowState == COMMITTING)
 		{
@@ -866,6 +873,11 @@ void CSocketItemEx::OnGetPureData()
 		}
 		else // if (InStates(ESTABLISHED, CLONING))
 		{
+#ifdef TRACE
+			printf_s("\nTo transmit to PEER_COMMIT from %s, %s\n\n"
+				, stateNames[lowState]
+				, stateNames[pControlBlock->state]);
+#endif
 			StopKeepAlive();
 			SetState(PEER_COMMIT);
 		}
@@ -949,12 +961,6 @@ void CSocketItemEx::OnGetCommit()
 		return;
 	}
 
-	// figure out whether it was in any initiative state before migration
-	// See also OnGetPersist()
-	bool isInitiativeState = InState(CHALLENGING) || InState(CLONING);
-	if (isInitiativeState)
-		tSessionBegin = tRecentSend;	// but only slide the send window when it is a singleton commit as well
-
 #if defined(TRACE) && (TRACE & (TRACE_HEARTBEAT | TRACE_PACKET | TRACE_SLIDEWIN))
 	TRACE_HERE("the responder calculate RTT");
 #endif
@@ -979,7 +985,11 @@ void CSocketItemEx::OnGetCommit()
 		return;
 	}
 
-	if(pControlBlock->HasBeenCommitted() > 0)
+	// figure out whether it was in any initiative state before migration
+	// See also OnGetPersist()
+	bool isInitiativeState = InState(CHALLENGING) || InState(CLONING);
+	bool isMultiplying = InState(CLONING);
+	if(pControlBlock->HasBeenCommitted())
 	{
 		if (lowState == CHALLENGING)
 		{
@@ -996,6 +1006,11 @@ void CSocketItemEx::OnGetCommit()
 		}
 		else // if (InStates(ESTABLISHED, CLONING))
 		{
+#ifdef TRACE
+			printf_s("\nTo transmit to PEER_COMMIT from %s, %s\n\n"
+				, stateNames[lowState]
+				, stateNames[pControlBlock->state]);
+#endif
 			StopKeepAlive();
 			SetState(PEER_COMMIT);
 		}
@@ -1010,9 +1025,14 @@ void CSocketItemEx::OnGetCommit()
 		// MUST slide the send window BEFORE SendSNACK or else the sequence number of ACK_FLUSH or KEEP_ALIVE is wrong
 		SendAckFlush();
 		//
-		if(isInitiativeState)
+		if (isMultiplying)
 		{
-			SignalAccepted();
+			SignalFirstEvent(FSP_NotifyMultiplied);
+			return;
+		}
+		else if (isInitiativeState)
+		{
+			SignalFirstEvent(FSP_NotifyAccepted);
 			return;
 		}
 	}
@@ -1045,8 +1065,6 @@ void CSocketItemEx::OnAckFlush()
 		return;
 	}
 #endif
-
-	tLastRecv = NowUTC();
 
 	if (InState(COMMITTING2))
 	{
@@ -1129,6 +1147,7 @@ void CSocketItemEx::OnGetMultiply()
 		return;
 
 	FSP_NormalPacketHeader *pFH = (FSP_NormalPacketHeader *)headPacket->GetHeaderFSP();	// the fixed header
+	uint32_t remoteHostID = pControlBlock->connectParams.remoteHostID;
 	ALFID_T idSource = headPacket->idPair.source;
 	// The out-of-band serial number is stored in p1->expectedSN
 	if (!ValidateICC(pFH, headPacket->lenData, idSource, pFH->expectedSN))
@@ -1137,85 +1156,78 @@ void CSocketItemEx::OnGetMultiply()
 		return;
 	}
 
-	// The request is already put into the multiplication backlog
-	if (CMultiplyBacklog::Find(fidPair.source, idSource) != NULL)
-	{
-#if defined(TRACE) && (TRACE & TRACE_PACKET)
-		printf_s("Duplicate connection multiplication request.\n");
-#endif
-		return;
-	}
-
+	// Check whether the request is already put into the multiplication backlog
 	// Check whether it is a collision!?
-	CSocketItemEx *pSocket = CLowerInterface::Singleton()->FindSocket(pControlBlock->connectParams.remoteHostID, idSource, fidPair.source);
-	if (pSocket != NULL && pSocket->IsInUse())
-	{
-		if (pSocket->lowState == COMMITTING || pSocket->lowState == ESTABLISHED)
-			pSocket->EmitStart();
-		//
+	CMultiplyBacklogItem *newItem  = CLowerInterface::Singleton()->FindByRemoteId(remoteHostID, idSource, fidPair.source);
+	// Unlike ACK_CONNECT_REQUEST, response to MULTIPLY is retranmitted on timed-out, not on demand
+	if (newItem != NULL)
 		return;
-	}
 
 	// See also CLowerInterface::OnGetInitConnect
-	CSocketItemEx * newSlot = CLowerInterface::Singleton()->AllocItem();
-	if(newSlot == NULL)
+	newItem = (CMultiplyBacklogItem *)CLowerInterface::Singleton()->AllocItem();
+	if(newItem == NULL)
 	{
 		TRACE_HERE("Cannot allocate new socket slot for multiplication");
 		return;		// for security reason silently the exception
 	}
 
-	BackLogItem backlogItem;	// Inherit the session key of its parent
-	(SConnectParam &)backlogItem = pControlBlock->connectParams;
+	BackLogItem backlogItem(pControlBlock->connectParams);
+	// Inherit the parent's session key:
 	backlogItem.idRemote = idSource;
 	rand_w32(&backlogItem.initialSN, 1);
-	if (pSocket->pControlBlock->backLog.Has(&backlogItem))
+	if (pControlBlock->backLog.Has(&backlogItem))
 	{
 		TRACE_HERE("Duplicate MULTIPLY backlogged already");
 l_bailout:
-		CLowerInterface::Singleton()->FreeItem(newSlot);
+		CLowerInterface::Singleton()->FreeItem(newItem);
 		return;
-	}
-
-	CMultiplyBacklogItem *pMItem = CMultiplyBacklog::Alloc(fidPair.source, idSource, headPacket->pktSeqNo, pFH->expectedSN);
-	if (pMItem == NULL)
-	{
-#if defined(TRACE) && (TRACE & TRACE_PACKET)
-		printf_s("Cannot put the connection multiplication request into the system backlog.\n");
-#endif
-
-		goto l_bailout;
 	}
 
 	backlogItem.expectedSN = headPacket->pktSeqNo;
 	backlogItem.idParent = fidPair.source;
 	backlogItem.acceptAddr = pControlBlock->nearEndInfo;
-	backlogItem.acceptAddr.idALF = newSlot->fidPair.source;
+	backlogItem.acceptAddr.idALF = newItem->fidPair.source;
 
 	// lastly, put it into the backlog
-	if (pSocket->pControlBlock->backLog.Put(&backlogItem) < 0)
+	if (pControlBlock->backLog.Put(&backlogItem) < 0)
 	{
-#if defined(TRACE) && (TRACE & TRACE_PACKET)
+#if defined(TRACE) && (TRACE & TRACE_OUTBAND)
 		printf_s("Cannot put the multiplying connection request into the SCB backlog.\n");
 #endif
-		CMultiplyBacklog::Free(pMItem);
 		goto l_bailout;
 	}
 
+#if defined(TRACE) && (TRACE & TRACE_OUTBAND)
+	printf_s("Multiply request put into the backlog\n"
+		"\tParent's fid = 0x%X, allocated fid = 0x%X, peer's fid = 0x%X\n", fidPair.source, newItem->fidPair.source, idSource);
+#endif
+
+	SOCKADDR_HOSTID(newItem->sockAddrTo) = remoteHostID;
+	newItem->fidPair.peer = idSource;
+	newItem->idParent = fidPair.source;
+	newItem->nextOOBSN = this->nextOOBSN;
+	newItem->lastOOBSN = pFH->expectedSN;
 	// place payload into the backlog, see also placepayload
-	pMItem->lenData = headPacket->lenData;
-	if (headPacket->lenData > 0)
-	{
-		memcpy(pMItem->plainText, (BYTE *)pFH + be16toh(pFH->hs.hsp), headPacket->lenData);
-		pMItem->isEOM = (pFH->GetFlag<ToBeContinued>() != 0);
-	}
+	newItem->SetEndOfMessage(pFH->GetFlag<ToBeContinued>() != 0);
+	newItem->CopyInPlainText((BYTE *)pFH + be16toh(pFH->hs.hsp), headPacket->lenData);
+	
+	// The first packet received is in the parent's session key while the very first responding packet shall be sent in the derived key!
+	newItem->contextOfICC.firstRecvSNewKey = headPacket->pktSeqNo + 1;
+	newItem->contextOfICC.firstSendSNewKey = backlogItem.initialSN;
+	newItem->contextOfICC.prev = contextOfICC.curr;
+	newItem->contextOfICC.keyLife = pControlBlock->connectParams.keyLife;
+	newItem->contextOfICC.savedCRC = false;
+	// Derivation of the new session key is delayed until ULA accepted the multiplication, however.
 
-	newSlot->contextOfICC = contextOfICC;
-	newSlot->tKeepAlive_ms = TRASIENT_STATE_TIMEOUT_ms;
-	newSlot->lowState = NON_EXISTENT;	// so that when timeout it is scavenged
-	newSlot->AddTimer();
+	newItem->tLastRecv = tLastRecv;	// inherit the time when the MULTIPLY packet was received
+	newItem->tRoundTrip_us = tRoundTrip_us;	// inherit the value of the parent as the initial
+	newItem->tKeepAlive_ms = TRASIENT_STATE_TIMEOUT_ms;
+	newItem->lowState = NON_EXISTENT;	// so that when timeout it is scavenged
+	newItem->AddTimer();
 
-	SignalAccepting();
+	Notify(FSP_NotifyAccepting);	// Not necessarily the first one in the queue
 }
+
 
 
 // Given

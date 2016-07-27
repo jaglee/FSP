@@ -172,7 +172,7 @@ int LOCALAPI CSocketItemDl::SendInplace(void * buffer, int len, FlagEndOfMessage
 	if(! WaitUseMutex())
 		return -EINTR;
 	//
-	int r = CheckCommitOrRevert(eomFlag);
+	int r = CheckTransmitaction(eomFlag);
 	if (r < 0)
 	{
 		SetMutexFree();
@@ -202,7 +202,7 @@ int LOCALAPI CSocketItemDl::SendStream(void * buffer, int len, FlagEndOfMessage 
 	if(! WaitUseMutex())
 		return -EINTR;
 
-	int r = CheckCommitOrRevert(flag);
+	int r = CheckTransmitaction(flag);
 	if (r < 0)
 	{
 		SetMutexFree();
@@ -240,32 +240,31 @@ int LOCALAPI CSocketItemDl::SendStream(void * buffer, int len, FlagEndOfMessage 
 //	It MIGHT change state in the ESTABLISHED state
 //	It may change indication 'isFlushing' as well
 //	See also FinalizeSend()
-int LOCALAPI CSocketItemDl::CheckCommitOrRevert(FlagEndOfMessage flag)
+int LOCALAPI CSocketItemDl::CheckTransmitaction(FlagEndOfMessage flag)
 {
 	if(pControlBlock->hasPendingKey != 0)
 		flag = END_OF_TRANSACTION;
 	//
-	if (isFlushing == 0 && flag == END_OF_MESSAGE)
-		isFlushing = END_MESSAGE_ONLY;
-	else if (flag == END_OF_TRANSACTION && isFlushing != FLUSHING_SHUTDOWN)
-		isFlushing = FLUSHING_COMMIT;
+	if(flag == END_OF_TRANSACTION)
+		endOfMessage = 1, isFlushing = 1;
+	else if(flag == END_OF_MESSAGE)
+		endOfMessage = 1;
+	else
+		endOfMessage = 0;
 
 	if(InState(CLONING) || InState(CONNECT_AFFIRMING) || InState(CHALLENGING))
 		return 0;	// Just prebuffer, data could be sent without state migration
 
-	if (shouldAppendCommit != 0)
-		return -EBUSY;
-
 	if(InState(ESTABLISHED))
 	{
-		if(isFlushing > 0)
+		if(isFlushing)
 			SetState(COMMITTING);
 		return 0;
 	}
 
 	if(InState(PEER_COMMIT))
 	{
-		if(isFlushing > 0)
+		if(isFlushing)
 			SetState(COMMITTING2);
 		return 0;
 	}
@@ -278,7 +277,7 @@ int LOCALAPI CSocketItemDl::CheckCommitOrRevert(FlagEndOfMessage flag)
 #ifdef TRACE
 		printf_s("Data requested to be sent in %s state. Migrated\n", stateNames[GetState()]);
 #endif
-		if(isFlushing > 0)
+		if(isFlushing)
 		{
 			SetState(COMMITTING);
 		}
@@ -293,9 +292,9 @@ int LOCALAPI CSocketItemDl::CheckCommitOrRevert(FlagEndOfMessage flag)
 	if (InState(CLOSABLE))
 	{
 #ifdef TRACE
-		printf_s("Data requested to be sent in %s state. Migrated\n", stateNames[GetState()]);
+		printf_s("\nData requested to be sent in %s state. Migrated\n", stateNames[GetState()]);
 #endif
-		if(isFlushing > 0)
+		if(isFlushing)
 		{
 			SetState(COMMITTING2);
 		}
@@ -317,8 +316,6 @@ int LOCALAPI CSocketItemDl::CheckCommitOrRevert(FlagEndOfMessage flag)
 //	may call back fpSent and clear the function pointer
 //	Here we have assumed that the underlying binary system does not change
 //	execution order of accessing volatile variables
-// UNRESOLVED!
-//	No matter what happpend if shouldAppendCommit a new COMMIT packet shall be appended and sent!
 void CSocketItemDl::ProcessPendingSend()
 {
 #ifdef TRACE
@@ -366,17 +363,6 @@ void CSocketItemDl::ProcessPendingSend()
 	// pending WriteTo(), or pending Commit()
 	pendingSendBuf = NULL;	// So that WriteTo() chaining is possible, see also BufferData()
 	//
-	if (shouldAppendCommit != 0)
-	{
-		int r = pControlBlock->ReplaceSendQueueTailToCommit();
-		if (r >= 0)
-		{
-			shouldAppendCommit = 0;
-			if (r == 1)	// should be the norm
-				Call<FSP_Send>();
-		}
-	}
-	//
 	SetMutexFree();
 	if (fp2 != NULL)
 		((NotifyOrReturn)fp2)(this, FSP_Send, bytesBuffered);
@@ -400,9 +386,6 @@ int LOCALAPI CSocketItemDl::BufferData(int len)
 	// pack the byte stream, TODO: compression
 	if(p != NULL && !p->GetFlag<IS_COMPLETED>())
 	{
-#ifdef TRACE
-		printf_s("BufferData: assert(p->GetFlag<TO_BE_CONTINUED>() && p->len < MAX_BLOCK_SIZE || p->opCode == PERSIST && p->len == 0)");
-#endif
 #ifndef NDEBUG
 		if (p->len < 0 || p->len >= MAX_BLOCK_SIZE)
 		{
@@ -455,7 +438,6 @@ int LOCALAPI CSocketItemDl::BufferData(int len)
 	}
 
 l_finish:
-	// assert:
 	// It somewhat overlaps with checking isFlushing, i.e. there is some redundancy, but it keeps code simple
 	if(_InterlockedCompareExchange8(& newTransaction, 0, 1) != 0)
 	{
@@ -479,15 +461,15 @@ l_finish:
 	//
 	if (pendingSendSize == 0)
 	{
-		if (isFlushing == FlushingFlag::END_MESSAGE_ONLY)
-		{
-			p->SetFlag<TO_BE_CONTINUED>(false);
-			p->SetFlag<IS_COMPLETED>();
-		}
-		else if (isFlushing > 0)
+		if (isFlushing)
 		{
 			p->SetFlag<TO_BE_CONTINUED>(false);
 			p->opCode = COMMIT;
+			p->SetFlag<IS_COMPLETED>();
+		}
+		else if (endOfMessage)
+		{
+			p->SetFlag<TO_BE_CONTINUED>(false);
 			p->SetFlag<IS_COMPLETED>();
 		}
 		// otherwise WriteTo following may put further data into the last packet buffer
@@ -532,8 +514,7 @@ int LOCALAPI CSocketItemDl::PrepareToSend(void * buf, int len, FlagEndOfMessage 
 	if(m < len)
 		return -ENOMEM;
 
-	ControlBlock::PFSP_SocketBuf skb0 = pControlBlock->HeadSend() + pControlBlock->sendWindowNextPos;
-	p = skb0;
+	p = pControlBlock->HeadSend() + pControlBlock->sendBufferNextPos;;
 	// p now is the descriptor of the first available buffer block
 	m = (len - 1) / MAX_BLOCK_SIZE;
 	for(int j = 0; j < m; j++)
@@ -563,12 +544,13 @@ int LOCALAPI CSocketItemDl::PrepareToSend(void * buf, int len, FlagEndOfMessage 
 	// Slightly differ from BufferData on when to set COMMIT or PERSIST
 	if(_InterlockedCompareExchange8(& newTransaction, 0, 1) != 0)
 	{
+		p = pControlBlock->HeadSend() + pControlBlock->sendWindowNextPos;
 #ifdef TRACE
-		if(skb0->GetFlag<IS_SENT>())
+		if(p->GetFlag<IS_SENT>())
 			printf_s("Erraneous implementation!? Maynot start a new transaction");
 #endif
-		if(skb0->opCode != COMMIT)
-			skb0->opCode = PERSIST;
+		if(p->opCode != COMMIT)
+			p->opCode = PERSIST;
 	}
 
 	return (m + 1);

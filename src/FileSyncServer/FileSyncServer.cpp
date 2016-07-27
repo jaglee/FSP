@@ -1,4 +1,5 @@
 #include "stdafx.h"
+#pragma warning(disable:4996)	// disable complaint of _sleep
 
 const char		*defaultWelcome = "File synchronizer based on Flexible Session Protocol, version 0.1";
 
@@ -44,24 +45,6 @@ void FSPAPI onFinished(FSPHANDLE h, FSP_ServiceCode code, int value)
 
 
 
-// Just notify
-// should be graceful 'close' socket
-void FSPAPI onClientClose(FSPHANDLE h, FSP_ServiceCode code, int value)
-{
-	printf_s("Fiber ID = %u, the client shutdown the session.\n", (uint32_t)(intptr_t)h);
-	if(code != FSP_NotifyToFinish)
-	{
-		printf_s("Should got TO_FINISH, but service code = %d, return %d\n", code, value);
-		return;
-	}
-
-	//Dispose(h);
-	//finished = true;
-	return;
-}
-
-
-
 void FSPAPI WaitConnection(const char *thisWelcome, unsigned short mLen, CallbackConnected onAccepted)
 {
 	FSP_SocketParameter params;
@@ -70,7 +53,6 @@ void FSPAPI WaitConnection(const char *thisWelcome, unsigned short mLen, Callbac
 	params.onAccepting = onAccepting;
 	params.onAccepted = onAccepted;
 	params.onError = onNotice;
-	params.onRelease = onClientClose;
 	params.welcome = thisWelcome;
 	params.len = mLen;
 	params.sendSize = MAX_FSP_SHM_SIZE;

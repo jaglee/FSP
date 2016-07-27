@@ -12,15 +12,6 @@
 #include <share.h>
 #include "../FSP_API.h"
 
-
-
-//#define REMOTE_APPLAYER_NAME "localhost:80"
-// #define REMOTE_APPLAYER_NAME "lt-x61t:80"
-// #define REMOTE_APPLAYER_NAME "lt-at4:80"
-// #define REMOTE_APPLAYER_NAME "lt-ux31e:80"
-#define REMOTE_APPLAYER_NAME "E000:AAAA::1"
-//#define REMOTE_APPLAYER_NAME "E000:BBBB::1"
-
 // Branch controllers
 extern int CompareMemoryPattern(char	*fileName);
 

@@ -12,11 +12,14 @@ Macro definitions for testability
 NDEBUG -- Release, driver only
 DEBUG - DEBUG mode
 TRACE - DEBUG mode, meant to trace execution path
-TRACE_PACKET - DEBUG mode, meant to trace send-receive
+// different trace flag: TRACE_ADDRESS, TRACE_PACKET, etc
 
+Not a protocol glitch fixed: disallow ACK_CONNECT_REQUEST start a full-message send transaction
 
+Because the packet is NOT ICC protected
 
 Open Source Hardware / Open Hardware
+Next generation switch
 
 
 //in linux, use high-resolution timers, jiffies 

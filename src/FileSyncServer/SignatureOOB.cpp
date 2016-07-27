@@ -15,20 +15,6 @@ static int FSPAPI onMultiplied(FSPHANDLE h, PFSP_Context ctx)
 	return 0;
 }
 
-// The cloned connection is automatically closed, independent to the main connection
-static void FSPAPI onPeerClose(FSPHANDLE h, FSP_ServiceCode code, int value)
-{
-	printf_s("Fiber ID = 0x%X, the pear release the connection.\n", (uint32_t)(intptr_t)h);
-	if(code != FSP_NotifyToFinish)
-	{
-		printf_s("Should got TO_FINISH, but service code = %d, return %d\n", code, value);
-		return;
-	}
-
-	Dispose(h);
-	return;
-}
-
 
 
 static void FSPAPI onShutdown(FSPHANDLE h, FSP_ServiceCode code, int value)
@@ -63,7 +49,6 @@ void StartToSendSignature(FSPHANDLE h)
 	// parms.onAccepting = NULL;
 	parms.onAccepted = onMultiplied;
 	parms.onError = onNotice;
-	parms.onRelease = onPeerClose;
 	parms.recvSize = 0;	// the underlying service would give the minimum, however
 	parms.sendSize = MAX_FSP_SHM_SIZE;	// 4MB
 	parms.welcome = signature;

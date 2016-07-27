@@ -233,8 +233,12 @@ void CSocketItemEx::InstallSessionKey()
 // Label  ¨C A string that identifies the purpose for the derived keying material, here we set to "FSP connection multiplication"
 // Context - idRemoteHost, idParent
 // Length -  An integer specifying the length (in bits) of the derived keying material K-output
+// Assume other fields of contextOfICC have been filled properly, such as
+//	contextOfICC.savedCRC = false;
+//	contextOfICC.prev = contextOfICC.curr;
 void CSocketItemEx::DeriveNextKey()
 {
+	TRACE_HERE("called");
 	// hard coded, as specified by the protocol
 	ALIGN(8)
 	uint8_t paddedData[48];
@@ -248,7 +252,7 @@ void CSocketItemEx::DeriveNextKey()
 	*(uint32_t *)(paddedData + 40) = pControlBlock->idParent;		// byte-order neutral, actually
 	*(uint32_t *)(paddedData + 44) = htobe32(pControlBlock->connectParams.keyLength * 8);
 
-	GCM_SecureHash(& contextOfICC.curr.gcm_aes
+	GCM_SecureHash(& contextOfICC.prev.gcm_aes
 		, pControlBlock->sendWindowNextSN
 		, paddedData, sizeof(paddedData)
 		, (uint8_t *) & pControlBlock->connectParams, 8);
@@ -256,11 +260,12 @@ void CSocketItemEx::DeriveNextKey()
 		return;
 	//
 	paddedData[2] = 2;
-	GCM_SecureHash(& contextOfICC.curr.gcm_aes
+	GCM_SecureHash(& contextOfICC.prev.gcm_aes
 		, pControlBlock->sendWindowNextSN
 		, paddedData, sizeof(paddedData)
 		, (uint8_t *) & pControlBlock->connectParams, 8);
 
+	GCM_AES_SetKey(& contextOfICC.curr.gcm_aes, (uint8_t *) & pControlBlock->connectParams, pControlBlock->connectParams.keyLength);
 }
 
 
@@ -566,6 +571,7 @@ bool CSocketItemEx::EmitStart()
 	case COMMIT:	// COMMIT is always in the queue
 	case MULTIPLY:
 		result = EmitWithICC(skb, pControlBlock->sendWindowFirstSN);
+		skb->SetFlag<IS_SENT>();
 		break;
 	// Only possible for retransmission
 	case INIT_CONNECT:
@@ -590,19 +596,19 @@ bool CSocketItemEx::EmitStart()
 //	Transmit a packet to the remote end, enforcing secure mobility support
 // Remark
 //  The IP address of the near end may change dynamically
-bool LOCALAPI CSocketItemEx::EmitWithICC(ControlBlock::PFSP_SocketBuf skb, ControlBlock::seq_t seq)
+int CSocketItemEx::EmitWithICC(ControlBlock::PFSP_SocketBuf skb, ControlBlock::seq_t seq)
 {
 #ifdef _DEBUG
 	if(skb->opCode == INIT_CONNECT || skb->opCode == ACK_INIT_CONNECT || skb->opCode == CONNECT_REQUEST || skb->opCode == ACK_CONNECT_REQ)
 	{
 		printf_s("Assertion failed! %s (opcode: %d) has no ICC field\n", opCodeStrings[skb->opCode], skb->opCode);
-		return false;
+		return 0;
 	}
 #endif
 	if(contextOfICC.keyLife == 1)
 	{
 		TRACE_HERE("Session key run out of life");
-		return false;
+		return 0;
 	}
 
 	// UNRESOLVED! retransmission consume key life? of course?
@@ -624,11 +630,10 @@ bool LOCALAPI CSocketItemEx::EmitWithICC(ControlBlock::PFSP_SocketBuf skb, Contr
 	{
 		TRACE_HERE("TODO: debug log memory corruption error");
 		HandleMemoryCorruption();
-		return false;
+		return 0;
 	}
 
 	register FSP_NormalPacketHeader *pHdr = & pControlBlock->tmpHeader;
-	int result;
 	// ICC, if required, is always set just before being sent
 	if (skb->GetFlag<TO_BE_CONTINUED>() && skb->len != MAX_BLOCK_SIZE)
 	{
@@ -638,7 +643,7 @@ bool LOCALAPI CSocketItemEx::EmitWithICC(ControlBlock::PFSP_SocketBuf skb, Contr
 			, skb->opCode
 			, skb->len);
 #endif
-		return false;
+		return 0;
 	}
 
 	pHdr->expectedSN = htobe32(pControlBlock->recvWindowNextSN);
@@ -655,13 +660,12 @@ bool LOCALAPI CSocketItemEx::EmitWithICC(ControlBlock::PFSP_SocketBuf skb, Contr
 
 	void * paidLoad = SetIntegrityCheckCode(pHdr, (BYTE *)payload, skb->len);
 	if(paidLoad == NULL)
-		return false;
+		return 0;
+	//
 	if (skb->len > 0)
-		result = SendPacket(2, ScatteredSendBuffers(pHdr, sizeof(FSP_NormalPacketHeader), paidLoad, skb->len));
+		return SendPacket(2, ScatteredSendBuffers(pHdr, sizeof(FSP_NormalPacketHeader), paidLoad, skb->len));
 	else
-		result = SendPacket(1, ScatteredSendBuffers(pHdr, sizeof(FSP_NormalPacketHeader)));
-
-	return (result > 0);
+		return SendPacket(1, ScatteredSendBuffers(pHdr, sizeof(FSP_NormalPacketHeader)));
 }
 
 
@@ -734,12 +738,12 @@ void CSocketItemEx::EmitQ()
 	ControlBlock::seq_t & nextSN = pControlBlock->sendWindowNextSN;
 	int32_t winSize = _InterlockedOr((LONG *) & pControlBlock->sendWindowSize, 0);
 	//
+	bool shouldRetry = pControlBlock->CountSendBuffered() > 0;
 	register ControlBlock::PFSP_SocketBuf skb;
-	bool someSent = false;
+	// The flag IS_COMPLETED is for double-stage commit of send buffer, for sake of sending online compressed stream
 	while (int(nextSN - lastSN) < 0 && int(nextSN - firstSN) <= winSize)
 	{
 		skb = pControlBlock->HeadSend() + pControlBlock->sendWindowNextPos;
-		// The flag IS_COMPLETED is for double-stage commit of send buffer, for sake of sending online compressed stream
 		if (!skb->GetFlag<IS_COMPLETED>())
 		{
 #if defined(TRACE) && (TRACE & TRACE_PACKET)
@@ -753,19 +757,18 @@ void CSocketItemEx::EmitQ()
 #ifndef NDEBUG
 			printf_s("Should be rare: cannot get the exclusive lock on the packet to send SN#%u\n", nextSN);
 #endif
-			pControlBlock->SlideNextToSend();
-			continue;
+			break;
 		}
 
-		if (!EmitWithICC(skb, nextSN))
+		if (EmitWithICC(skb, nextSN) <= 0)
 		{
 			skb->Unlock();
 			break;
 		}
-		someSent = true;
 		skb->SetFlag<IS_SENT>();
 		skb->timeSent = NowUTC();	// not necessarily tRecentSend
+		pControlBlock->SlideNextToSend();
 	}
-	if(someSent)
-		AddResendTimer(tRoundTrip_us >> 8);	// only the first one would be success
+	if(shouldRetry)
+		AddResendTimer(tRoundTrip_us >> 8);
 }

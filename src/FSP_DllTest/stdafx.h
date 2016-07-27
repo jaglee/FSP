@@ -19,9 +19,8 @@ class CSocketItemDbg: CSocketItemDl
 {
 public:
 	ControlBlock * GetControlBlock() const { return pControlBlock; }
-	friend void UnitTestCheckedRevertToResume();
+	friend void UnitTestCheckedRevertCommit();
 
+	friend void UnitTestPrepareToSend();
 	friend void UnitTestBufferData();
-	//friend void UnitTestPrepareToSend();
-	friend void UnitTestDSRC();
 };

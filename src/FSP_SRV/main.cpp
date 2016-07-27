@@ -189,18 +189,16 @@ static void LOCALAPI ProcessCommand(HANDLE md)
 	BYTE buffer[MAX_CTRLBUF_LEN];
 	DWORD nBytesRead;
 	CommandToLLS *pCmd = (CommandToLLS *) buffer;
+	bool r;
+	CSocketItemEx *pSocket;
 	// TODO: UNRESOLVED!there should be performance profiling variables to record how many commands have been processed?
     static int n = 0;
-	CSocketItemEx *pSocket;
-#if defined(TRACE) && (TRACE & TRACE_ULACALL)
-	TRACE_HERE("called");
-#endif
 	while(ReadFile(md, buffer, MAX_CTRLBUF_LEN, & nBytesRead, NULL))
 	{
 		if(nBytesRead < sizeof(struct CommandToLLS))
 			continue;
 #if defined(TRACE) && (TRACE & TRACE_ULACALL)
-		printf("%d bytes read, command operation code = %d\n",  nBytesRead, ((struct CommandToLLS *) buffer)->opCode);
+		printf("\n\n#%d command, %d bytes read, %s(operation code = %d)\n",  n, nBytesRead, noticeNames[pCmd->opCode], pCmd->opCode);
 #endif
 		//
 		switch(pCmd->opCode)
@@ -211,7 +209,7 @@ static void LOCALAPI ProcessCommand(HANDLE md)
 				, ((CommandNewSession *)pCmd)->szEventName);
 			Listen(CommandNewSessionSrv(pCmd));
 			break;
-		case InitConnection:	// register an initiative socket			
+		case InitConnection:	// register an initiative socket
 			Connect(CommandNewSessionSrv(pCmd));
 			break;
 		case FSP_Accept:
@@ -232,10 +230,17 @@ static void LOCALAPI ProcessCommand(HANDLE md)
 #endif
 				break;
 			}
-			// UNRESOLVED!? Set a command-waiting timeout?
-			while (!pSocket->TestAndWaitReady())
-				Sleep(1000);
-			//
+			//  UNRESOLVED! In production multi-issue/multi-executation of ULA command shall be implemented.
+			r = pSocket->TestAndLockReady();
+#ifdef TRACE
+			if(!r)
+			{
+				printf_s("Forcefully enter critical section: %s (code = %d), local fiber#0x%X\n"
+					, opCodeStrings[pCmd->opCode]
+					, pCmd->opCode
+					, pCmd->fiberID);
+			}
+#endif
 			switch(pCmd->opCode)
 			{
 			case FSP_Reject:
@@ -250,7 +255,7 @@ static void LOCALAPI ProcessCommand(HANDLE md)
 			case FSP_Send:			// send a packet/group of packets
 				pSocket->ScheduleEmitQ();
 				break;
-			case FSP_Urge:
+			case FSP_Commit:
 				pSocket->UrgeCommit();
 				break;
 			case FSP_Shutdown:
@@ -266,12 +271,16 @@ static void LOCALAPI ProcessCommand(HANDLE md)
 				break;
 			}
 			//
-			pSocket->SetReady();
+			if(r)
+				pSocket->SetReady();
 		}
 		// hard-coded: (ushort)(-1) mean exit
 		if(buffer[0] == 0xFF || buffer[1] == 0xFF)
 			break;
 		//
+#if defined(TRACE) && (TRACE & TRACE_ULACALL)
+		printf_s("#%d command processed, operation code = %d\n\n",  n, pCmd->opCode);
+#endif
 		n++;
 	}
 #ifndef NDEBUG

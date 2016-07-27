@@ -64,9 +64,8 @@ typedef struct FSP_SocketParameter *PFSP_Context;
 typedef enum
 {
 	FSP_GET_SIGNATURE,			// pointer to the placeholder of the 64-bit signature
-	FSP_SET_COMPRESSION,		// 0: disable, 1: lz4, others: reserved
+	FSP_SET_SEND_COMPRESSING,	// 0: disable, 1: enabled
 	FSP_SET_CALLBACK_ON_ERROR,	// NotifyOrReturn
-	FSP_SET_CALLBACK_ON_FINISH,	// NotifyOrReturn
 	FSP_SET_CALLBACK_ON_REQUEST,// CallbackRequested
 	FSP_SET_CALLBACK_ON_CONNECT	// CallbackConnected
 } FSP_ControlCode;
@@ -150,7 +149,6 @@ struct FSP_SocketParameter
 	CallbackRequested	onAccepting;	// may be NULL, cannot be NULL for cloning offspring
 	CallbackConnected	onAccepted;		// cannot be NULL
 	NotifyOrReturn		onError;		// should be non-NULL
-	NotifyOrReturn		onRelease;		// on getting remote peer's RELEASE packet, may be NULL
 	//
 	const void *	welcome;		// default welcome message, may be NULL
 	unsigned short	len;			// length of the default welcome message
@@ -159,10 +157,8 @@ struct FSP_SocketParameter
 		struct
 		{
 			unsigned short	milky:		1;
-			unsigned short	RESERVED_AE:1;	// reserved for further authenticated encryption
 			unsigned short	compressing:1;
-			unsigned short	RESERVED:	11;
-			unsigned short	eom:		1;	// end of message, a run-time flag
+			unsigned short	RESERVED:	13;
 			unsigned short	passive:	1;	// internal use only, shall be ignored by ULA
 		} st;
 		unsigned short flags; //[_In_] the requested features [_Out] the error reason

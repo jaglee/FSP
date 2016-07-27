@@ -78,19 +78,19 @@ FSPHANDLE FSPAPI MultiplyAndWrite(FSPHANDLE hFSP, PFSP_Context psp1, FlagEndOfMe
 	if(p == NULL)
 		return p;
 
+	p->TestSetSendReturn(fp1);
 	if(psp1->welcome != NULL)
 	{
 		p->pendingSendBuf = (BYTE *)psp1->welcome;
 		p->bytesBuffered = 0;
-		p->TestSetSendReturn(fp1);
-		p->CheckCommitOrRevert(flag);
+		p->CheckTransmitaction(flag);
 		// pendingSendSize set in BufferData
 		p->BufferData(psp1->len);
 	}
 
+	p->CompleteMultiply();
 	return p->CallCreate(objCommand, FSP_Multiply);
 }
-
 
 
 
@@ -133,6 +133,7 @@ FSPHANDLE FSPAPI MultiplyAndGetSendBuffer(FSPHANDLE hFSP, PFSP_Context psp1, int
 			onBufferReady(p, buf, *pSize);
 	}
 
+	p->CompleteMultiply();
 	return p->CallCreate(objCommand, FSP_Multiply);
 }
 
@@ -169,6 +170,8 @@ CSocketItemDl * LOCALAPI CSocketItemDl::ToPrepareMultiply(CSocketItemDl *p, PFSP
 		socketItem->pControlBlock->peerAddr = p->pControlBlock->peerAddr;
 		// But nearEndName cannot be inheritted
 		socketItem->pControlBlock->nearEndInfo = p->pControlBlock->nearEndInfo;
+		socketItem->pControlBlock->SetSendWindow(0);
+		//^The actual send and receive window would be initialized in LLS
 	}
 	catch(int)	// could we really catch run-time memory access exception?
 	{
@@ -183,16 +186,16 @@ CSocketItemDl * LOCALAPI CSocketItemDl::ToPrepareMultiply(CSocketItemDl *p, PFSP
 
 
 
-// An indirect shared subroutine of MultiplyAndXXX
-void CSocketItemDl::ToPrepareMultiply()
+// Do
+//	Fill in the MULTPLY packet
+void CSocketItemDl::CompleteMultiply()
 {
-	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend();
-	skb->opCode = MULTIPLY;
-	skb->len = 0;
-	skb->InitFlags();	// locked, incomplete
-
-	SetState(CLONING);
-	SetNewTransaction();
+	ControlBlock::PFSP_SocketBuf skb = SetHeadPacketIfEmpty(MULTIPLY, MULTIPLY);
+	if(skb != NULL)
+	{
+		skb->opCode = MULTIPLY;
+		skb->SetFlag<IS_COMPLETED>(); 
+	}
 }
 
 
@@ -207,30 +210,19 @@ void CSocketItemDl::ToPrepareMultiply()
 //	..context.onAccepting CANNOT read or write anything!?
 bool CSocketItemDl::ToWelcomeMultiply(BackLogItem & backLog)
 {
-	PFSP_IN6_ADDR remoteAddr = (PFSP_IN6_ADDR) & pControlBlock->peerAddr.ipFSP.allowedPrefixes[MAX_PHY_INTERFACES - 1];
+	TRACE_HERE("called");
+
+	PFSP_IN6_ADDR remoteAddr = (PFSP_IN6_ADDR) & pControlBlock->peerAddr.ipFSP.allowedPrefixes[MAX_PHY_INTERFACES - 1];	
 	SetNewTransaction();
 	if( context.onAccepting == NULL	// This is NOT the same policy as ToWelcomeConnect
 	 || context.onAccepting(this, & backLog.acceptAddr, remoteAddr) < 0 )
 	{
-		// UNRESOLVED! report that the upper layer application reject it?
+		TRACE_HERE("The upper layer application has rejected connection multiplication"); // UNRESOLVED! report that 
+		Recycle();
 		return false;
 	}
+	SetHeadPacketIfEmpty(PERSIST);
+	SetState(isFlushing ? COMMITTING : ESTABLISHED); // See also ToConcludeConnect()
 
-	SetState(isFlushing > 0 ? COMMITTING : ESTABLISHED); // See also ToConcludeConnect()
-	CheckToNewTransaction();
 	return true;
-}
-
-
-
-// See also
-//	ToConcludeConnect, @LLS::InitiateMultiply
-void CSocketItemDl::ToConcludeMultiply()
-{
-	// See also FSP_LLS$$CSocketItemEx::Connect()
-	fidPair.source = pControlBlock->nearEndInfo.idALF;
-
-	ProcessReceiveBuffer();
-	ProcessPendingSend();
-	// Unlike ToConcludeConnect, do not callback context.onAccepted
 }

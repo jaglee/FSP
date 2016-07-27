@@ -874,7 +874,7 @@ int CLowerInterface::AcceptAndProcess(SOCKET sdRecv)
 	case RELEASE:
 	case MULTIPLY:
 	case KEEP_ALIVE:
-#ifdef _DEBUG
+#if defined(_DEBUG) && (TRACE & TRACE_OUTBAND)
 		if(opCode == MULTIPLY)
 			DebugBreak();
 #endif
@@ -1391,10 +1391,10 @@ DWORD WINAPI HandleConnect(LPVOID p)
  */
 bool CSocketItemEx::TestAndWaitReady()
 {
-	time_t t0 = time(NULL);
+	time_t t0 = time(NULL);	// seconds elapsed since midnight(00:00:00), 1970/01/01
 	while(! TestAndLockReady())
 	{
-		if(time(NULL) - t0 > TRASIENT_STATE_TIMEOUT_ms)
+		if(time(NULL) - t0 > TRASIENT_STATE_TIMEOUT_ms/1000)
 		{
 			TRACE_HERE("TestAndWaitReady timeout");
 			return false;

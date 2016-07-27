@@ -130,6 +130,7 @@ void TraceLastError(char * fileName, int lineNo, char *funcName, char *s1);
 # define LAZY_ACK_DELAY_MIN_ms		1		// 1 millisecond, minimum delay for lazy acknowledgement
 #endif
 
+#define	TIMEOUT_RETRY_MAX_COUNT		5
 
 #if defined(_MSC_VER) || defined(_MSC_EXTENSIONS)
   #define DELTA_EPOCH_IN_MICROSECS  11644473600000000Ui64
@@ -480,6 +481,7 @@ struct BackLogItem: SConnectParam
 	uint32_t	expectedSN;	// the expected sequence number of the packet to receive by order
 	//
 	BackLogItem() { } // default constructor
+	BackLogItem(const SConnectParam & v): SConnectParam(v) { }
 	BackLogItem(ALFID_T id1, uint32_t salt1) { idRemote = id1; salt = salt1; } 
 };
 
@@ -529,7 +531,6 @@ public:
 	int Pop();
 	int LOCALAPI Put(const BackLogItem *p);
 };
-
 
 
 
@@ -629,7 +630,9 @@ struct ControlBlock
 	int32_t		recvWindowNextPos;	// the index number of the block with recvWindowNextSN
 	//
 	seq_t		welcomedNextSNtoSend;
+	seq_t		recvWindowExpectedSN;
 	//
+	int32_t		recvWindowSize;		// UNRESOLVED! Reserved yet. To be meaningful it could be less than recvBufferBlockN
 	int32_t		recvBufferBlockN;	// capacity of the receive buffer
 
 	int32_t		sendBufDescriptors;	// relative to start of the control block, may be updated via memory map
@@ -746,7 +749,8 @@ struct ControlBlock
 		return CountSendBuffered() <= 0 ? NULL : p;
 	}
 	// Return 0 if there is no COMMIT packet at the tail and there is no error on appending one
-	//	1 if there is already a COMMIT packet at the tail of the send queue
+	//	1 if there is already an unsent COMMIT packet at the tail of the send queue
+	//	2 if there is already a COMMIT packet at the tail but it has been sent
 	//	-1 if failed
 	int ReplaceSendQueueTailToCommit();
 
@@ -787,34 +791,28 @@ struct ControlBlock
 			recvWindowHeadPos -= recvBufferBlockN;
 		InterlockedIncrement((LONG *) & recvWindowFirstSN);
 	}
+	// Given
+	//	int & : [_Out_] place holder of the number of bytes [to be] peeked.
+	//	bool &: [_Out_] place holder of the flag telling whether there are further data to receive
+	// Return
+	//	Start address of the received message
 	void * LOCALAPI InquireRecvBuf(int &, bool &);
 
-	void SetRecvWindowHead(seq_t pktSeqNo)
+	void SetRecvWindow(seq_t pktSeqNo)
 	{
-		recvWindowNextSN = recvWindowFirstSN = pktSeqNo; 
+		recvWindowExpectedSN = recvWindowNextSN = recvWindowFirstSN = pktSeqNo;
 		recvWindowHeadPos = recvWindowNextPos = 0;
 	}
-	void SetSendWindowHead(seq_t initialSN)
+	void SetSendWindow(seq_t initialSN)
 	{
 		welcomedNextSNtoSend = sendBufferNextSN = sendWindowNextSN = sendWindowFirstSN = initialSN;
 		sendBufferNextPos = sendWindowNextPos = sendWindowHeadPos = 0;
 		sendWindowSize = 1;
 	}
-	void SetSendWindowWithHeadReserved(seq_t initialSN)
-	{
-		PFSP_SocketBuf skb = HeadSend();
-		skb->InitFlags(); // and locked
-		skb->version = THIS_FSP_VERSION;
-		welcomedNextSNtoSend = sendWindowNextSN = sendWindowFirstSN = initialSN;
-		sendBufferNextSN = initialSN + 1;	// prevent the head packet from being overlaid
-		sendWindowNextPos = sendWindowHeadPos = 0;
-		sendBufferNextPos = 1;
-		sendWindowSize = 1;
-	}
 	void SetSendWindowSize(int32_t sz1) { sendWindowSize = min(sendBufferBlockN, sz1); }
 
-	// there is a COMMIT packet in the receive queue and there is no gap before the COMMIT packet
-	int HasBeenCommitted() const;
+	// Whether the last packet is a COMMIT in the receive queue and there is no gap before the COMMIT packet
+	bool HasBeenCommitted() const;
 
 	// Slide the send window to skip all of the acknowledged
 	void SlideSendWindow();
