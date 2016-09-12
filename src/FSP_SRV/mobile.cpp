@@ -184,7 +184,11 @@ uint64_t LOCALAPI CalculateCookie(BYTE *header, int sizeHdr, timestamp_t t0)
 // The ephemeral key is weakly securely established. It is a 64-bit value meant to make obfuscation in calcuate the CRC64 tag
 void CSocketItemEx::InstallEphemeralKey()
 {
-#if defined(TRACE) && (TRACE & TRACE_PACKET)
+#if defined(TRACE) && (TRACE & (TRACE_SLIDEWIN | TRACE_ULACALL))
+	printf_s("\n" __FUNCDNAME__ "\n\tsendBufferSN =  %u, recvWindowNextSN = %u\n"
+		, pControlBlock->sendBufferNextSN
+		, pControlBlock->recvWindowNextSN);
+	//
 	printf_s("Session key materials:\n");
 	DumpNetworkUInt16((uint16_t *)  & pControlBlock->connectParams, FSP_MAX_KEY_SIZE / 2);
 #endif
@@ -199,7 +203,7 @@ void CSocketItemEx::InstallEphemeralKey()
 	recvFIDPair.source = fidPair.peer;
 	contextOfICC.curr.precomputedICC[1]
 		=  CalculateCRC64(* (uint64_t *) & recvFIDPair, (uint8_t *) & pControlBlock->connectParams, FSP_MAX_KEY_SIZE);
-#if defined(TRACE) && (TRACE & TRACE_PACKET)
+#if defined(TRACE) && (TRACE & (TRACE_SLIDEWIN | TRACE_ULACALL))
 	printf_s("Precomputed ICC 0:");
 	DumpNetworkUInt16((uint16_t *)  & contextOfICC.curr.precomputedICC[0], 4);
 	printf_s("Precomputed ICC 1:");
@@ -211,6 +215,14 @@ void CSocketItemEx::InstallEphemeralKey()
 // See @DLL::InstallKey
 void CSocketItemEx::InstallSessionKey()
 {
+#if defined(TRACE) && (TRACE & (TRACE_SLIDEWIN | TRACE_ULACALL))
+	printf_s("\n" __FUNCDNAME__ "\n\tsendWindowNextSN = %u, sendBufferNextSN = %u\n\trecvWindowNextSN = %u\n"
+		, pControlBlock->sendWindowNextSN
+		, pControlBlock->sendBufferNextSN
+		, pControlBlock->recvWindowNextSN);
+	printf("Key length: %d bytes\t", pControlBlock->connectParams.keyLength / 8);
+	DumpHexical((uint8_t *)& pControlBlock->connectParams, pControlBlock->connectParams.keyLength / 8);
+#endif
 #ifndef NDEBUG
 	contextOfICC._mac_ctx_protect_prolog[0]
 		= contextOfICC._mac_ctx_protect_prolog[1]
@@ -220,12 +232,13 @@ void CSocketItemEx::InstallSessionKey()
 #endif
 	contextOfICC.savedCRC = (contextOfICC.keyLife == 0);
 	contextOfICC.prev = contextOfICC.curr;
-	contextOfICC.keyLife = pControlBlock->connectParams.initialSN;
+	contextOfICC.keyLife = pControlBlock->connectParams.keyLife$initialSN;
 	GCM_AES_SetKey(& contextOfICC.curr.gcm_aes, (uint8_t *) & pControlBlock->connectParams, pControlBlock->connectParams.keyLength);
 
-	contextOfICC.firstSendSNewKey = pControlBlock->sendBufferNextSN;
-	contextOfICC.firstRecvSNewKey = pControlBlock->recvWindowNextSN;
+	contextOfICC.snFirstRecvWithCurrKey	= pControlBlock->recvWindowNextSN;
+	contextOfICC.snFirstSendWithCurrKey = pControlBlock->sendBufferNextSN;
 }
+
 
 
 // Set the session key for the packet next sent and the next received. KDF counter mode
@@ -238,7 +251,12 @@ void CSocketItemEx::InstallSessionKey()
 //	contextOfICC.prev = contextOfICC.curr;
 void CSocketItemEx::DeriveNextKey()
 {
-	TRACE_HERE("called");
+#if defined(TRACE) && (TRACE & (TRACE_SLIDEWIN | TRACE_ULACALL))
+	printf_s("\n" __FUNCDNAME__ "\n\tsendWindowNextSN = %u, sendBufferNextSN = %u\n\trecvWindowNextSN = %u\n"
+		, pControlBlock->sendWindowNextSN
+		, pControlBlock->sendBufferNextSN
+		, pControlBlock->recvWindowNextSN);
+#endif
 	// hard coded, as specified by the protocol
 	ALIGN(8)
 	uint8_t paddedData[48];
@@ -350,7 +368,7 @@ void * LOCALAPI CSocketItemEx::SetIntegrityCheckCode(FSP_NormalPacketHeader *p1,
 		tag[0] = CalculateCRC64(0, (uint8_t *)p1, sizeof(FSP_NormalPacketHeader));
 		buf = content;
 	}
-	else if(int32_t(seqNo - contextOfICC.firstSendSNewKey) < 0 && contextOfICC.savedCRC)
+	else if(int32_t(seqNo - contextOfICC.snFirstSendWithCurrKey) < 0 && contextOfICC.savedCRC)
 	{
 #if defined(TRACE) && (TRACE & TRACE_PACKET)
 		printf_s("\nPrecomputed ICC: ");
@@ -362,7 +380,7 @@ void * LOCALAPI CSocketItemEx::SetIntegrityCheckCode(FSP_NormalPacketHeader *p1,
 	}
 	else
 	{
-		GCM_AES_CTX *pCtx = int32_t(seqNo - contextOfICC.firstSendSNewKey) < 0
+		GCM_AES_CTX *pCtx = int32_t(seqNo - contextOfICC.snFirstSendWithCurrKey) < 0
 			? & contextOfICC.prev.gcm_aes
 			: & contextOfICC.curr.gcm_aes;
 		uint32_t byteA = be16toh(p1->hs.hsp);
@@ -426,7 +444,7 @@ bool CSocketItemEx::ValidateICC(FSP_NormalPacketHeader *p1, int32_t ctLen, uint3
 		p1->integrity.code = contextOfICC.curr.precomputedICC[1];
 		r = (tag[0] == CalculateCRC64(0, (uint8_t *)p1, sizeof(FSP_NormalPacketHeader)));
 	}
-	else if(int32_t(seqNo - contextOfICC.firstRecvSNewKey) < 0 && contextOfICC.savedCRC)
+	else if(int32_t(seqNo - contextOfICC.snFirstRecvWithCurrKey) < 0 && contextOfICC.savedCRC)
 	{
 #if defined(TRACE) && (TRACE & TRACE_PACKET)
 		printf_s("\nPrecomputed ICC: ");
@@ -438,7 +456,7 @@ bool CSocketItemEx::ValidateICC(FSP_NormalPacketHeader *p1, int32_t ctLen, uint3
 	}
 	else
 	{
-		GCM_AES_CTX *pCtx = int32_t(seqNo - contextOfICC.firstRecvSNewKey) < 0
+		GCM_AES_CTX *pCtx = int32_t(seqNo - contextOfICC.snFirstRecvWithCurrKey) < 0
 			? & contextOfICC.prev.gcm_aes
 			: & contextOfICC.curr.gcm_aes;
 		uint32_t byteA = be16toh(p1->hs.hsp);
@@ -475,8 +493,7 @@ bool CSocketItemEx::ValidateICC(FSP_NormalPacketHeader *p1, int32_t ctLen, uint3
 //	true if all of the headers passed authentication and the optional payload successfully decrypted
 // Remark
 //	Assume the headers are 64-bit aligned
-//	It is for MULTIPLY, COMMIT and PERSIST command packet where the source ALFID is freshly incarnated
-//	ONLY strongly secured session might be cloned
+//	It is for MULTIPLY command packet where the source ALFID is freshly incarnated
 bool CSocketItemEx::ValidateICC(FSP_NormalPacketHeader *p1, int32_t ctLen, ALFID_T idSource, uint32_t salt)
 {
 	ALIGN(MAC_ALIGNMENT) uint64_t tag[FSP_TAG_SIZE / sizeof(uint64_t)];
@@ -488,7 +505,7 @@ bool CSocketItemEx::ValidateICC(FSP_NormalPacketHeader *p1, int32_t ctLen, ALFID
 #endif
 	uint32_t seqNo = be32toh(p1->sequenceNo);
 	bool r;
-	GCM_AES_CTX *pCtx = int32_t(seqNo - contextOfICC.firstRecvSNewKey) < 0
+	GCM_AES_CTX *pCtx = int32_t(seqNo - contextOfICC.snFirstRecvWithCurrKey) < 0
 		? &contextOfICC.prev.gcm_aes
 		: &contextOfICC.curr.gcm_aes;
 	uint32_t byteA = be16toh(p1->hs.hsp);
@@ -527,7 +544,6 @@ bool CSocketItemEx::ValidateICC(FSP_NormalPacketHeader *p1, int32_t ctLen, ALFID
 	ACK_CONNECT_REQ		separate payload/ temporary: responder may retransmit it passively/transient for initiator
 	RESET				temporary		/ temporary: one-shot only
 	PERSIST				separate payload/ separate payload: fixed header regenerated on retransmission
-	COMMIT				separate payload/ separate payload buffer: space reserved for fixed and optional headers
 	PURE_DATA			separate payload/ separate payload: fixed header regenerated on retransmission
 	KEEP_ALIVE			temporary		/ temporary: KEEP_ALIVE is always generate on fly
 	ACK_FLUSH			temporary		/ temporary: ACK_FLUSH is always generate on fly
@@ -568,7 +584,6 @@ bool CSocketItemEx::EmitStart()
 		result = SendPacket(2, ScatteredSendBuffers(pHdr, sizeof(FSP_NormalPacketHeader), payload, skb->len));
 		break;
 	case PERSIST:	// PERSIST is an in-band control packet with optional payload that confirms a connection
-	case COMMIT:	// COMMIT is always in the queue
 	case MULTIPLY:
 		result = EmitWithICC(skb, pControlBlock->sendWindowFirstSN);
 		skb->SetFlag<IS_SENT>();
@@ -615,16 +630,6 @@ int CSocketItemEx::EmitWithICC(ControlBlock::PFSP_SocketBuf skb, ControlBlock::s
 	if(contextOfICC.keyLife > 0)
 		contextOfICC.keyLife--;
 
-	// The COMMIT packet, if any, is the last one that applied CRC64 or the old transmission key
-	// assume the receive direction is not ready yet
-	// See also OnAckFlush and @DLL::InstallKey 
-	if(skb->opCode == COMMIT && (pControlBlock->hasPendingKey & HAS_PENDING_KEY_FOR_SEND) != 0)
-	{
-		InstallSessionKey();
-		pControlBlock->hasPendingKey &= ~HAS_PENDING_KEY_FOR_SEND;
-		contextOfICC.firstRecvSNewKey = pControlBlock->recvWindowNextSN + INT32_MAX;
-	}
-
 	void  *payload = (FSP_NormalPacketHeader *)this->GetSendPtr(skb);
 	if(payload == NULL)
 	{
@@ -635,24 +640,11 @@ int CSocketItemEx::EmitWithICC(ControlBlock::PFSP_SocketBuf skb, ControlBlock::s
 
 	register FSP_NormalPacketHeader *pHdr = & pControlBlock->tmpHeader;
 	// ICC, if required, is always set just before being sent
-	if (skb->GetFlag<TO_BE_CONTINUED>() && skb->len != MAX_BLOCK_SIZE)
-	{
-#if defined(TRACE) && (TRACE & TRACE_PACKET)
-		printf_s("\nImcomplete packet to send, opCode: %s(%d, len = %d)\n"
-			, opCodeStrings[skb->opCode]
-			, skb->opCode
-			, skb->len);
-#endif
-		return 0;
-	}
-
 	pHdr->expectedSN = htobe32(pControlBlock->recvWindowNextSN);
 	pHdr->sequenceNo = htobe32(seq);
 	pHdr->ClearFlags();	// pHdr->u.flags = 0;
-	if (skb->GetFlag<TO_BE_CONTINUED>())
-		pHdr->SetFlag<ToBeContinued>();
-	else
-		pHdr->ClearFlag<ToBeContinued>();
+	if (skb->GetFlag<END_OF_TRANSACTION>())
+		pHdr->SetFlag<EndOfTransaction>();
 	// UNRESOLVED! compressed? ECN?
 	// here we needn't check memory corruption as mishavior only harms himself
 	pHdr->SetRecvWS(pControlBlock->RecvWindowSize());

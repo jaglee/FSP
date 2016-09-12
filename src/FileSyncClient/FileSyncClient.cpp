@@ -160,9 +160,13 @@ static int	FSPAPI  onConnected(FSPHANDLE h, PFSP_Context ctx)
 
 	CryptoNaClGetSharedSecret(bufSharedKey, bufPeersKey, bufPrivateKey);
 
-	InstallAuthenticKey(h, bufSharedKey, CRYPTO_NACL_KEYBYTES, INT32_MAX, NOT_END_ANYWAY);
 	FSPControl(h, FSP_SET_CALLBACK_ON_ERROR, (ulong_ptr)onError2);
-	WriteTo(h, bufPublicKey, CRYPTO_NACL_KEYBYTES, END_OF_MESSAGE, onPublicKeySent);
+
+	printf_s("\nTo send the key material for shared key agreement...\n");
+	WriteTo(h, bufPublicKey, CRYPTO_NACL_KEYBYTES, EOF, onPublicKeySent);
+
+	printf_s("\tTo install the shared key instantly...\n");
+	InstallAuthenticKey(h, bufSharedKey, CRYPTO_NACL_KEYBYTES, INT32_MAX, FSP_INSTALL_KEY_INSTANTLY);
 
 	return 0;
 }
@@ -290,7 +294,7 @@ static int FSPAPI onReceiveNextBlock(FSPHANDLE h, void *buf, int32_t len, bool t
 	{
 		printf_s("All data have been received, to acknowledge...\n");
 		// Respond with a code saying no error
-		return WriteTo(h, "0000", 4, END_OF_MESSAGE, onAcknowledgeSent);
+		return WriteTo(h, "0000", 4, EOF, onAcknowledgeSent);
 	}
 
 	return 1;

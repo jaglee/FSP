@@ -869,7 +869,6 @@ int CLowerInterface::AcceptAndProcess(SOCKET sdRecv)
 	// TODO: get hint of explicit congest notification
 	case PERSIST:
 	case PURE_DATA:
-	case COMMIT:
 	case ACK_FLUSH:
 	case RELEASE:
 	case MULTIPLY:
@@ -887,12 +886,10 @@ int CLowerInterface::AcceptAndProcess(SOCKET sdRecv)
 			break;
 		}
 		// MULTIPLY is semi-out-of-band COMMAND starting from a fresh new ALFID. Note that pktBuf is the received
-		// In the CLONING state COMMIT or PERSIST is the legitimate acknowledgement to MULTIPLY,
+		// In the CLONING state only PERSIST is the legitimate acknowledgement to MULTIPLY,
 		// while the acknowledgement itself shall typically originate from some new ALFID.
-		// && !(opCode == MULTIPLY || (opCode == PERSIST || opCode == COMMIT) && pSocket->lowState == CLONING)
 		if(pSocket->fidPair.peer != pktBuf->idPair.source	// it should be rare
-			&& opCode != MULTIPLY
-			&& (pSocket->lowState != CLONING || opCode != PERSIST && opCode != COMMIT)
+		&& opCode != MULTIPLY && (pSocket->lowState != CLONING || opCode != PERSIST)
 		)
 		{
 #ifdef TRACE
@@ -904,7 +901,8 @@ int CLowerInterface::AcceptAndProcess(SOCKET sdRecv)
 		pktBuf->lenData = countRecv - be16toh(pktBuf->GetHeaderFSP()->hs.hsp);
 		pktBuf->pktSeqNo = be32toh(pktBuf->GetHeaderFSP()->sequenceNo);
 #if defined(TRACE) && (TRACE & TRACE_PACKET)
-		printf_s("packet #%u, payload length %d, to put onto the queue\n", pktBuf->pktSeqNo, pktBuf->lenData);
+		printf_s("%s[%d] packet #%u\n\tpayload length %d, to put onto the queue\n"
+			, opCodeStrings[opCode], opCode, pktBuf->pktSeqNo, pktBuf->lenData);
 #endif
 		if(pktBuf->lenData < 0 || pktBuf->lenData > MAX_BLOCK_SIZE)
 		{
@@ -1168,6 +1166,7 @@ bool CSocketItemEx::AddLazyAckTimer()
 // A retransmission timer should be hard coded to 4 RTT, with an implementation depended floor value
 bool CSocketItemEx::AddResendTimer(uint32_t rtt_ms)
 {
+#if !defined(TRACE) || !(TRACE & TRACE_PACKET)
 	return (resendTimer == NULL
 		&& ::CreateTimerQueueTimer(&resendTimer, TimerWheel::Singleton()
 			, DoResend
@@ -1175,6 +1174,9 @@ bool CSocketItemEx::AddResendTimer(uint32_t rtt_ms)
 			, max(LAZY_ACK_DELAY_MIN_ms, rtt_ms)
 			, 0
 			, WT_EXECUTEINTIMERTHREAD));
+#else
+	return true;
+#endif
 }
 
 
@@ -1194,12 +1196,17 @@ void CSocketItemEx::RemoveTimers()
 }
 
 
+// Assume that all packets of the transmit transaction have been buffered in the send queue if to 
+// See also @DLL::InstallKey and @DLL::CheckTransmitaction
 // The OS-depending implementation of scheduling transmission queue
 void CSocketItemEx::ScheduleEmitQ()
 {
 #ifdef TRACE
 	TRACE_HERE("It is scheduled to send data in the queue");
 #endif
+	if(_InterlockedCompareExchange8(& pControlBlock->hasPendingKey, 0, 1) != 0)
+		InstallSessionKey();
+
 	QueueUserWorkItem(HandleSendQ, this, WT_EXECUTELONGFUNCTION);
 }
 
@@ -1295,7 +1302,9 @@ DWORD WINAPI HandleSendQ(LPVOID p)
 		{
 			if(p0->IsInUse())
 				QueueUserWorkItem(HandleSendQ, p0, WT_EXECUTELONGFUNCTION);
-			// This is a long function because of the waiting
+#if defined(TRACE) && (TRACE & TRACE_ULACALL)
+			printf_s("\nLock unavailable!?\n\tSend may be queued again. This is a long function because of the waiting.\n");
+#endif
 			return 0;
 		}
 		p0->EmitQ();
@@ -1311,6 +1320,7 @@ DWORD WINAPI HandleSendQ(LPVOID p)
 
 
 
+// TODO!! illiminate memory leak / PopUnlockPacketBuffer, if any, when do cleanup!!!!
 // Directedly registered by AcceptAndProcess
 DWORD WINAPI HandleFullICC(LPVOID p)
 {
@@ -1340,9 +1350,6 @@ DWORD WINAPI HandleFullICC(LPVOID p)
 				break;
 			case PURE_DATA:
 				p0->OnGetPureData();
-				break;
-			case COMMIT:
-				p0->OnGetCommit();
 				break;
 			case ACK_FLUSH:
 				p0->OnAckFlush();

@@ -26,12 +26,11 @@ CSocketItemDbg *GetPreparedSocket()
 
 
 
-// TODO: Further test case, for FlagEndOfMessage
 void UnitTestCheckedRevertCommit()
 {
 	CSocketItemDbg *pSocketItem = GetPreparedSocket();
 	ControlBlock *pSCB = pSocketItem->GetControlBlock();
-	FlagEndOfMessage flag = NOT_END_ANYWAY;
+	int8_t flag = 0;
 
 	pSCB->state = NON_EXISTENT;
 	int r = pSocketItem->CheckTransmitaction(flag);
@@ -87,61 +86,12 @@ void UnitTestCheckedRevertCommit()
 	// LISTENING state is just ignored
 	//
 	pSCB->state = NON_EXISTENT;
-	flag = END_OF_MESSAGE;
-	r = pSocketItem->CheckTransmitaction(flag);
-	assert(r < 0);
-
-	pSCB->state = CONNECT_BOOTSTRAP;
-	r = pSocketItem->CheckTransmitaction(flag);
-	assert(r < 0);
-
-	pSCB->state = PRE_CLOSED;
-	r = pSocketItem->CheckTransmitaction(flag);
-	assert(r < 0);
-
-	pSCB->state = CLOSED;
-	r = pSocketItem->CheckTransmitaction(flag);
-	assert(r < 0);
-	//
-
-	pSCB->state = COMMITTING;
-	r = pSocketItem->CheckTransmitaction(flag);
-	assert(r == -EBUSY);
-
-	pSCB->state = COMMITTING2;
-	r = pSocketItem->CheckTransmitaction(flag);
-	assert(r == -EBUSY);
-
-	pSCB->state = COMMITTED;
-	r = pSocketItem->CheckTransmitaction(flag);
-	assert(r == 1 && pSCB->state == ESTABLISHED);
-
-	pSCB->state = CLOSABLE;
-	r = pSocketItem->CheckTransmitaction(flag);
-	assert(r == 1 && pSCB->state == PEER_COMMIT);
-
-	//
-	pSCB->state = CONNECT_AFFIRMING;
-	r = pSocketItem->CheckTransmitaction(flag);
-	assert(r == 0);
-
-	pSCB->state = ESTABLISHED;
-	r = pSocketItem->CheckTransmitaction(flag);
-	assert(r == 0);
-
-	pSCB->state = PEER_COMMIT;
-	r = pSocketItem->CheckTransmitaction(flag);
-	assert(r == 0);
-
-	pSCB->state = CLONING;
-	r = pSocketItem->CheckTransmitaction(flag);
-	assert(r == 0);
 
 	//
 	//
 	//
 	pSCB->state = NON_EXISTENT;
-	flag = END_OF_TRANSACTION;
+	flag = EOF;
 	r = pSocketItem->CheckTransmitaction(flag);
 	assert(r < 0);
 
@@ -214,7 +164,7 @@ void UnitTestBufferData()
 	// Emulate SendStream()
 	//
 	pSocketItem->SetState(ESTABLISHED);
-	pSocketItem->CheckTransmitaction(NOT_END_ANYWAY);
+	pSocketItem->CheckTransmitaction(0);
 	pSocketItem->pendingSendBuf = preparedTestData;
 	pSocketItem->BufferData(MIN_RESERVED_BUF - 2);
 	printf_s("Buffer next SN = %u\n", pSCB->sendBufferNextSN);
@@ -303,7 +253,7 @@ void UnitTestPrepareToSend()
 	// One packet
 	pSocketItem->SetState(ESTABLISHED);
 	pSocketItem->SetNewTransaction();
-	pSocketItem->PrepareToSend(buf, MAX_BLOCK_SIZE - 2, END_OF_TRANSACTION);
+	pSocketItem->PrepareToSend(buf, MAX_BLOCK_SIZE - 2, EOF);
 	assert(pSCB->sendBufferNextSN == FIRST_SN + 1);
 	printf_s("Buffer next SN = %u; start packet operation is %s, state is %s\n"
 		, pSCB->sendBufferNextSN
@@ -314,7 +264,7 @@ void UnitTestPrepareToSend()
 	pSocketItem->SetState(ESTABLISHED);
 	pSocketItem->SetNewTransaction();
 	pSCB->SetSendWindow(FIRST_SN);
-	pSocketItem->PrepareToSend(buf, MIN_RESERVED_BUF - 2, END_OF_TRANSACTION);
+	pSocketItem->PrepareToSend(buf, MIN_RESERVED_BUF - 2, EOF);
 	printf_s("Buffer next SN = %u; start packet operation is %s, state is %s\n\n"
 		, pSCB->sendBufferNextSN
 		, opCodeStrings[skb->opCode]

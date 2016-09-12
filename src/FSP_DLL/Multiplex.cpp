@@ -30,35 +30,15 @@
  */
 #include "FSP_DLL.h"
 
-/**
-  Multiply
-  - Generate MULTIPLY packet, encapsulate optional payload
-  - Call LLS
-  LLS/FSP_Multiply
-  - Allocate session ID
-  - Transmit the start packet
-  The peer' LLS:
-  - OnGetMultiply
-	- Check redundant
-	- Check ICC
-	- Put to backlog
-  The peer's DLL:
-  - WaitEventToDispatch, ToWelcomeMultiply
-	- Send PERSIST/COMMIT
-  The nearend's LLS:
-  - OnGetCommit/OnGetPersist
-	- Update peer's ID
-  The nearend's DLL
-	- Continue to send
- */
-
 //[API: Multiply]
 //	NON_EXISTENT-->CLONING-->[Send MULTIPLY]{enable retry}
 // UNRESOLVED! ALLOCATED NEW SESSION ID in LLS?
 // Given
 //	FSPHANDLE		the handle of the parent FSP socket to be multiplied
 //	PFSP_Context	the pointer to the parameter structure of the socket to create by multiplication
-//	FlagEndOfMessage
+//	int8_t	
+//		0:		do not terminate the transmit transaction
+//		EOF:	terminate the transaction
 //	NotifyOrReturn	the callback function pointer
 // Return
 //	the handle of the new created socket
@@ -69,7 +49,7 @@
 //	which indicate some error has happened. In that case ULA might make further investigation by calling GetLastFSPError()
 //	See also SendStream, FinalizeSend
 DllExport
-FSPHANDLE FSPAPI MultiplyAndWrite(FSPHANDLE hFSP, PFSP_Context psp1, FlagEndOfMessage flag, NotifyOrReturn fp1)
+FSPHANDLE FSPAPI MultiplyAndWrite(FSPHANDLE hFSP, PFSP_Context psp1, int8_t flag, NotifyOrReturn fp1)
 {
 	TRACE_HERE("called");
 
@@ -83,7 +63,7 @@ FSPHANDLE FSPAPI MultiplyAndWrite(FSPHANDLE hFSP, PFSP_Context psp1, FlagEndOfMe
 	{
 		p->pendingSendBuf = (BYTE *)psp1->welcome;
 		p->bytesBuffered = 0;
-		p->CheckTransmitaction(flag);
+		p->CheckTransmitaction(flag != 0);
 		// pendingSendSize set in BufferData
 		p->BufferData(psp1->len);
 	}
@@ -190,7 +170,7 @@ CSocketItemDl * LOCALAPI CSocketItemDl::ToPrepareMultiply(CSocketItemDl *p, PFSP
 //	Fill in the MULTPLY packet
 void CSocketItemDl::CompleteMultiply()
 {
-	ControlBlock::PFSP_SocketBuf skb = SetHeadPacketIfEmpty(MULTIPLY, MULTIPLY);
+	ControlBlock::PFSP_SocketBuf skb = SetHeadPacketIfEmpty(MULTIPLY);
 	if(skb != NULL)
 	{
 		skb->opCode = MULTIPLY;
@@ -208,7 +188,7 @@ void CSocketItemDl::CompleteMultiply()
 // UNRESOLVED!
 //	Multiply: but the upper layer application may still throttle it?
 //	..context.onAccepting CANNOT read or write anything!?
-bool CSocketItemDl::ToWelcomeMultiply(BackLogItem & backLog)
+bool LOCALAPI CSocketItemDl::ToWelcomeMultiply(BackLogItem & backLog)
 {
 	TRACE_HERE("called");
 

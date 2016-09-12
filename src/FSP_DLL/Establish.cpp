@@ -111,7 +111,6 @@ FSPHANDLE FSPAPI Connect2(const char *peerName, PFSP_Context psp1)
 	}
 
 	socketItem->AddOneShotTimer(TRASIENT_STATE_TIMEOUT_ms);
-	socketItem->isFlushing = 0;
 	socketItem->sendCompressing = psp1->u.st.compressing;
 	socketItem->SetPeerName(peerName, strlen(peerName));
 	return socketItem->CallCreate(objCommand, InitConnection);
@@ -214,7 +213,7 @@ CSocketItemDl * CSocketItemDl::PrepareToAccept(BackLogItem & backLog, CommandNew
 //	BackLogItem &	the reference to the acception backlog item
 // Do
 //	(ACK_CONNECT_REQ, Initial SN, Expected SN, Timestamp, Receive Window[, responder's half-connection parameter[, payload])
-bool CSocketItemDl::ToWelcomeConnect(BackLogItem & backLog)
+bool LOCALAPI CSocketItemDl::ToWelcomeConnect(BackLogItem & backLog)
 {
 	PFSP_IN6_ADDR p = (PFSP_IN6_ADDR) & pControlBlock->peerAddr.ipFSP.allowedPrefixes[MAX_PHY_INTERFACES - 1];
 	//
@@ -227,7 +226,7 @@ bool CSocketItemDl::ToWelcomeConnect(BackLogItem & backLog)
 		return false;
 	}
 
-	pControlBlock->sendBufferNextSN = pControlBlock->sendWindowNextSN + 1;
+	pControlBlock->sendBufferNextSN = pControlBlock->sendWindowFirstSN + 1;
 	pControlBlock->sendBufferNextPos = 1;	// reserve the head packet
 	//
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend();
@@ -286,7 +285,9 @@ void CSocketItemDl::ToConcludeConnect()
 
 	this->recvCompressed = skb->GetFlag<IS_COMPRESSED>();
 
-	pControlBlock->SlideRecvWindowByOne();
+	pControlBlock->SlideRecvWindowByOne();	// ACK_CONNECT_REQUEST, which may carry welcome
+	// But // CONNECT_REQUEST does NOT consume a sequence number
+	// See @LLS::OnGetConnectRequest
 
 	TRACE_HERE("connection request has been accepted");
 	SetMutexFree();
@@ -307,13 +308,14 @@ void CSocketItemDl::ToConcludeConnect()
 
 // Given
 //	FSPOperationCode the header packet's operation code
-//	FSPOperationCode the header packet's operation code if it is in flushing mode
 // Do
 //	Set the head packet
 // Return
 //	The pointer to the header packet's descriptor if the queue used to be non-empty
 //	NULL if the send queue used to be empty
-ControlBlock::PFSP_SocketBuf CSocketItemDl::SetHeadPacketIfEmpty(FSPOperationCode c, FSPOperationCode cFlush)
+//	//skb->SetFlag<END_OF_TRANSACTION>();
+//	But the payloadless PERSIST/MULTIPLY does NOT terminate the transmit transaction!
+ControlBlock::PFSP_SocketBuf LOCALAPI CSocketItemDl::SetHeadPacketIfEmpty(FSPOperationCode c)
 {
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend();
 	ControlBlock::seq_t k = pControlBlock->sendWindowFirstSN;
@@ -322,7 +324,7 @@ ControlBlock::PFSP_SocketBuf CSocketItemDl::SetHeadPacketIfEmpty(FSPOperationCod
 
 	pControlBlock->sendBufferNextPos = 1;
 	skb->version = THIS_FSP_VERSION;
-	skb->opCode = (isFlushing ? cFlush : c);
+	skb->opCode = c;
 	skb->len = 0;
 	skb->flags = 0;
 	skb->SetFlag<IS_COMPLETED>();
@@ -352,14 +354,14 @@ uint32_t * FSPAPI TranslateFSPoverIPv4(PFSP_IN6_ADDR p, uint32_t dwIPv4, uint32_
 
 
 DllSpec
-int FSPAPI InstallAuthenticKey(FSPHANDLE h, BYTE * key, int keySize, int32_t keyLife, FlagEndOfMessage eotFlag)
+int FSPAPI InstallAuthenticKey(FSPHANDLE h, BYTE * key, int keySize, int32_t keyLife, FSP_InstallKeyTime lazily)
 {
 	if(keySize < FSP_MIN_KEY_SIZE || keySize > FSP_MAX_KEY_SIZE || keySize % sizeof(uint64_t) != 0 || keyLife <= 0)
 		return -EDOM;
 	try
 	{
 		CSocketItemDl *pSocket = (CSocketItemDl *)h;
-		return pSocket->InstallKey(key, keySize, keyLife, eotFlag);
+		return pSocket->InstallKey(key, keySize, keyLife, lazily);
 	}
 	catch(...)
 	{
@@ -373,40 +375,35 @@ int FSPAPI InstallAuthenticKey(FSPHANDLE h, BYTE * key, int keySize, int32_t key
 //	BYTE *		byte stream of the key
 //	int			length of the key, should be multiplication of 8
 //	int32_t		life of the key, maximum number of packets that may utilize the key
+//	FSP_InstallKeyTime
 // Return
 //	-EINTR	if cannot obtain the right lock
 //	-EIO	if cannot trigger LLS to do the installation work through I/O
+//	-EAGAIN if previous key had not been installed yet, so that InstallKey again was not allowed
 //	0		if no failure
-// The protocol is:
-//	The final responder install the new session key immediately
-//	The final initiator install the new session key for send direction as soon as the COMMIT packet is transmitted
-//	The final initiator install the new session key for receive direction as soon as the ACK_FLUSH packet is received
-//	The final initiator is not necessarily the initial initiator.
-int LOCALAPI CSocketItemDl::InstallKey(BYTE *key, int keySize, int32_t keyLife, FlagEndOfMessage eotFlag)
+//	EAGAIN	a warning saying that previous installation is overriden before finished
+int LOCALAPI CSocketItemDl::InstallKey(BYTE *key, int keySize, int32_t keyLife, FSP_InstallKeyTime lazily)
 {
 	if(! WaitUseMutex())
 		return -EINTR;
 
-	if(_InterlockedCompareExchange8(& pControlBlock->hasPendingKey, HAS_PENDING_KEY_FOR_SEND + HAS_PENDING_KEY_FOR_RECV, 0) != 0)
-	{
-		SetMutexFree();
-		return -EAGAIN;
-	}
-	//
 	memcpy(& pControlBlock->connectParams, key, keySize);
 	pControlBlock->connectParams.keyLength = keySize;
-	pControlBlock->connectParams.initialSN = keyLife;
+	pControlBlock->connectParams.keyLife$initialSN = keyLife;
 
-	// It is the final initiator in key establishment
-	if(eotFlag == NOT_END_ANYWAY)
+	register int r = 0;
+	if(!lazily)
 	{
-		SetMutexFree();
-		return 0;
+		// It is the final responder in key establishment
+		if(_InterlockedExchange8(& pControlBlock->hasPendingKey, 0) != 0)
+			r = EAGAIN;
+		if(!Call<FSP_InstallKey>())
+			r = -EIO;
 	}
-
-	// It is the final responder in key establishment
-	int r = Call<FSP_InstallKey>() ? 0 : -EIO;
-	pControlBlock->hasPendingKey = 0;
+	else if(_InterlockedCompareExchange8(& pControlBlock->hasPendingKey, (char)lazily, 0) != 0)
+	{
+		r = -EAGAIN;
+	}
 	SetMutexFree();
 	return r;
 }

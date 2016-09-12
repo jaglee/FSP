@@ -22,7 +22,7 @@ static int FSPAPI onAccepted(FSPHANDLE h, PFSP_Context ctx)
 	// TODO: check connection context
 
 	printf_s("\tTo send filename to the remote end...\n");
-	WriteTo(h, fileName, (int)strlen(fileName) + 1, END_OF_MESSAGE, onFileNameSent);
+	WriteTo(h, fileName, (int)strlen(fileName) + 1, EOF, onFileNameSent);
 
 	return 0;
 }
@@ -64,7 +64,7 @@ static int FSPAPI toSendNextBlock(FSPHANDLE h, void * batchBuffer, int32_t capac
 	if(capacity <= 0)
 	{
 		finished = true;
-		return -1;
+		return -ENOMEM;
 	}
 
 	int bytesRead = __min(sizeof(bytesToSend) - offset, (size_t)capacity);
@@ -72,19 +72,6 @@ static int FSPAPI toSendNextBlock(FSPHANDLE h, void * batchBuffer, int32_t capac
 	printf_s("To send %d bytes to the remote end, %d bytes have been sent\n", bytesRead, offset);
 
 	offset += bytesRead;
-	bool r = (offset >= sizeof(bytesToSend));
 
-	SendInline(h, batchBuffer, bytesRead, r ? END_OF_MESSAGE : NOT_END_ANYWAY);
-	if(r)
-	{
-		printf("All content has been sent. To shutdown.\n");
-		if(Shutdown(h, onFinished) != 0)
-		{
-			Dispose(h);
-			finished = true;
-		}
-		return -1;
-	}
-
-	return 0;
+	return SendInline(h, batchBuffer, bytesRead, (int8_t)(offset >= sizeof(bytesToSend)));
 }

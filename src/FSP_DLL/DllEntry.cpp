@@ -114,6 +114,9 @@ bool CSocketItemDl::WaitUseMutex()
 	if(_InterlockedXor8(& inUse, 0) == 0)
 		return false;
 #ifndef NDEBUG
+#ifdef TRACE
+	printf_s("\nFSPSocket#0x%X  WaitUseMutex\n", (CSocketItem *)this);
+#endif
 	uint64_t t0 = GetTickCount64();
 	while(!TryAcquireSRWLockExclusive(& rtSRWLock))
 	{
@@ -122,13 +125,23 @@ bool CSocketItemDl::WaitUseMutex()
 			TRACE_HERE("Please trace the call stack, there may be deadlock!");
 			return false;
 		}
-		Sleep(1);
+		Sleep(50);	// if there is some thread that has exclusive access on the lock, wait patiently
 	}
 #else
 	AcquireSRWLockExclusive(& rtSRWLock);
 #endif
 	return (_InterlockedXor8(& inUse, 0) != 0); 
 }
+
+
+
+#if !defined(NDEBUG) && defined(TRACE)
+void CSocketItemDl::SetMutexFree()
+{
+	ReleaseSRWLockExclusive(& rtSRWLock);
+	printf_s("\nFSPSocket#0x%X  SetMutexFree\n", (CSocketItem *)this);
+}
+#endif
 
 
 
@@ -308,10 +321,27 @@ CSocketItemDl * LOCALAPI CSocketItemDl::CallCreate(CommandNewSession & objComman
 // The asynchronous, multi-thread friendly soft interrupt handler
 void CSocketItemDl::WaitEventToDispatch()
 {
-	if(! IsInUse() && pControlBlock->state != CLOSED || InIllegalState())
+	if(pControlBlock == NULL)
 	{
+#ifndef NDEBUG
+		printf_s("\nDescriptor=0x%X: event to be processed, but the Control Block is missing!\n", (int32_t)(CSocketItem *)this);
+#endif
+		socketsTLB.FreeItem(this);
+		CancelTimer();	// if any
 		NotifyError(FSP_NotifyReset, -EBADF);
-		this->Recycle();		// Tell LLS to recycle the session context mapping
+		return;
+	}
+
+	if(InIllegalState())
+	{
+#ifndef NDEBUG
+		printf_s(
+			"\nDescriptor=0x%X, event to be processed, but the socket is in state %s[%d]?\n"
+			, (int32_t)(CSocketItem *)this
+			, stateNames[pControlBlock->state], pControlBlock->state);
+#endif
+		NotifyError(FSP_NotifyReset, -EBADF);
+		this->Recycle();
 		return;
 	}
 
@@ -321,6 +351,23 @@ void CSocketItemDl::WaitEventToDispatch()
 #ifdef TRACE
 		printf_s("\nIn local fiber#0x%X, state %s\tnotice: %s\n", fidPair.source, stateNames[pControlBlock->state], noticeNames[notice]);
 #endif
+		// If recyled or in the state not earlier than ToFinish, LLS should have recyle the session context mapping already
+		if(notice == FSP_NotifyRecycled || notice >= FSP_NotifyToFinish)
+			lowerLayerRecycled = 1;
+		// Initially lowerLayerRecycled is 0 and it is never reset
+		if(! IsInUse() && lowerLayerRecycled != 0)
+		{
+#ifndef NDEBUG
+			printf_s(
+				"\nEvent to be processed, but the socket has been recycled!?\n"
+				"\tdescriptor=0x%X, state: %s[%d]\n"
+				, (int32_t)(CSocketItem *)this
+				, stateNames[pControlBlock->state], pControlBlock->state);
+#endif
+			NotifyError(FSP_NotifyReset, -EBADF);
+			return;
+		}
+
 		shouldChainTimeout = 1;
 		switch(notice)
 		{
@@ -354,32 +401,24 @@ void CSocketItemDl::WaitEventToDispatch()
 			break;
 		case FSP_NotifyToCommit:
 			ProcessReceiveBuffer();	// See FSP_NotifyDataReady, FSP_NotifyFlushed and CSocketItemDl::Shutdown()
-			if(InState(CLOSABLE) && GetResetFlushing())
+			if(InState(CLOSABLE) && initiatingShutdown)
 				Call<FSP_Shutdown>();
 			break;
 		case FSP_NotifyFlushed:
 			ProcessPendingSend();
-			if(InState(CLOSABLE) && GetResetFlushing())
+			if(InState(CLOSABLE) && initiatingShutdown)
 				Call<FSP_Shutdown>();
 			break;
 		case FSP_NotifyToFinish:
-			lowerLayerRecycled = 1;
 			if(initiatingShutdown)
 				RespondToRecycle();
 			return;
+		case FSP_NotifyReset:
+			NotifyError(notice, -EINTR);
+			//^otherwise it were as if recycled:
 		case FSP_NotifyRecycled:
-			lowerLayerRecycled = 1;
 			CancelTimer();	// If any; typically for Shutdown 
 			RespondToRecycle();
-			return;
-		case FSP_NotifyReset:
-			lowerLayerRecycled = 1;
-			NotifyError(notice, -EINTR);
-			if (_InterlockedCompareExchange8(&inUse, 0, 1) != 0)
-			{
-				socketsTLB.FreeItem(this);
-				this->Destroy();
-			}
 			return;
 		case FSP_IPC_CannotReturn:
 			if (pControlBlock->state == LISTENING)
@@ -391,17 +430,13 @@ void CSocketItemDl::WaitEventToDispatch()
 				printf_s("Get FSP_IPC_CannotReturn in the state %s\n", stateNames[pControlBlock->state]);
 #endif
 			return;
-		case FSP_MemoryCorruption:	//
-			NotifyError(notice, -EINTR);
-			this->Recycle();		// Tell LLS to recycle the session context mapping
-			return;
-		case FSP_NotifyOverflow:	// LLS should have recyle the session context mapping already
+		case FSP_MemoryCorruption:
+		case FSP_NotifyOverflow:
 		case FSP_NotifyTimeout:
-			lowerLayerRecycled = 1;	// UNRESOLVED?! But overflow is not clarified yet
-		case FSP_NotifyNameResolutionFailed: // There could be some remedy, let ULA decide it
+		case FSP_NotifyNameResolutionFailed:
 			NotifyError(notice, -EINTR);
-			this->Recycle();		// Tell LLS to recycle the session context mapping
-			return;
+			RespondToRecycle();
+			// UNRESOLVED!? There could be some remedy if name resolution failed?
 		}
 	}
 }

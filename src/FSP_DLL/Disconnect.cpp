@@ -98,10 +98,13 @@ int FSPAPI Shutdown(FSPHANDLE hFSPSocket, NotifyOrReturn fp1)
 }
 
 
-
-// PEER_COMMIT-->[API:Send{ flush }]-->COMMITTING2{ chain async - shutdown }
-// CLOSABLE-->[Send RELEASE]-->PRE_CLOSED
-// ALWAYS assume that only after it has finished receiving is shutdown called
+// [API:Shutdown]
+//	ESTABLISHED-->COMMITTING {chain async-shutdown}
+//	COMMITTING <--> {chain async-shutdown}
+//	PEER_COMMIT-->COMMITTING2{chain async-shutdown}
+//	COMMITTING2<--> {chain async-shutdown}
+//	CLOSABLE-->PRE_CLOSED-->[Send RELEASE]
+//	ALWAYS assume that only after it has finished receiving is shutdown called
 int LOCALAPI CSocketItemDl::Shutdown(NotifyOrReturn fp1)
 {
 	if(lowerLayerRecycled)	// no mutex required?!
@@ -137,6 +140,7 @@ int LOCALAPI CSocketItemDl::Shutdown(NotifyOrReturn fp1)
 	}
 
 	// Send RELEASE and wait echoed RELEASE. LLS to signal FSP_NotifyRecycled, NotifyReset or NotifyTimeout
+	AddOneShotTimer(TRASIENT_STATE_TIMEOUT_ms);
 	if (InState(CLOSABLE))
 	{
 		SetState(PRE_CLOSED);
@@ -145,14 +149,16 @@ int LOCALAPI CSocketItemDl::Shutdown(NotifyOrReturn fp1)
 	}
 
 	// The last resort: flush sending stream if it has not yet been committed
-	int r = 0;
 	if(InState(COMMITTED))
-		goto l_finish;
+	{
+		SetMutexFree();
+		return 0;
+	}
 
 	if(InState(COMMITTING) || InState(COMMITTING2))
 	{
-		r = EBUSY;	// a warning saying that it is COMMITTING
-		goto l_finish;
+		SetMutexFree();
+		return EBUSY;	// a warning saying that it is COMMITTING
 	}
 
 	if(! TestSetState(ESTABLISHED, COMMITTING) && ! TestSetState(PEER_COMMIT, COMMITTING2))
@@ -162,12 +168,8 @@ int LOCALAPI CSocketItemDl::Shutdown(NotifyOrReturn fp1)
 		return EDOM;	// A warning say that the connection is aborted actually, for it is not in the proper state
 	}
 
-	r = (Call<FSP_Commit>() ? 0 : -EIO);
-
-l_finish:
-	AddOneShotTimer(TRASIENT_STATE_TIMEOUT_ms);
 	SetMutexFree();
-	return r;
+	return (Call<FSP_Commit>() ? 0 : -EIO);
 }
 
 

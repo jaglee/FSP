@@ -248,9 +248,9 @@ struct ICC_Context
 	// Previous key is applied for CRC only
 	bool		savedCRC;
 	// only when there is no packet left applied with previous key may current key changed  
-	// the sequence number of the packet to send and expected which utilized last key
-	ControlBlock::seq_t	firstSendSNewKey;
-	ControlBlock::seq_t	firstRecvSNewKey;
+	// the sequence number of the first packet to be sent or received with current key, respectively
+	ControlBlock::seq_t	snFirstSendWithCurrKey;
+	ControlBlock::seq_t	snFirstRecvWithCurrKey;
 };
 
 
@@ -357,7 +357,8 @@ protected:
 	void PopUnlockPacketBuffer();
 	void UnlockPacketBuffer() { ReleaseSRWLockShared(& rtSRWLock); }
 
-	int  LOCALAPI PlacePayload(ControlBlock::PFSP_SocketBuf);
+	// return -EEXIST if overriden, -EFAULT if memory error, or payload effectively placed
+	int	PlacePayload();
 
 	int	 SendPacket(register ULONG, ScatteredSendBuffers);
 	bool EmitStart();
@@ -452,7 +453,17 @@ public:
 	void HandleMemoryCorruption() {	Destroy(); }
 	void AffirmConnect(const SConnectParam &, ALFID_T);
 
-	bool IsValidSequence(ControlBlock::seq_t seq1) { return pControlBlock->IsValidSequence(seq1); }
+	// Compare the given sequence with the left and right edge of the receive window
+	// Return 0 if it falls in the window (not out of window),
+	// or the offset if it is out of window, negative if on the left, positive if on the right
+	// somewhat 'be free to accept' as we didnot enforce 'announced receive window size'
+	int32_t IsOutOfWindow(ControlBlock::seq_t seq1) const
+	{
+		register int32_t d = int32_t(seq1 - pControlBlock->recvWindowFirstSN);
+		return ((0 <= d) && (d < pControlBlock->recvBufferBlockN)) ? 0 : d;
+	}
+	// With replay-attack suppression. It could be true while still be out of window
+	bool ICCSeqValid();
 
 	// Given
 	//	ControlBlock::seq_t	The sequence number of the packet that mostly expected by the remote end
@@ -504,12 +515,12 @@ public:
 
 	// Event triggered by the remote peer
 	void OnConnectRequestAck(FSP_AckConnectRequest &, int lenData);
-	void OnGetPersist();	// PERSIST packet might be apparently out-of-band/out-of-order
+	void OnGetPersist();	// PERSIST packet might be apparently out-of-band as it might be payloadless
 	void OnGetPureData();	// PURE_DATA
-	void OnGetCommit();		// COMMIT packet might be apparently out-of-band/out-of-order as well
+	void OnGetEOT();		// Used to be a standalone COMMIT packet, now the EoT flag
 	void OnAckFlush();		// ACK_FLUSH is always out-of-band
 	void OnGetRelease();	// RELEASE may not carry payload
-	void OnGetMultiply();	// MULTIPLY is treated out-of-band
+	void OnGetMultiply();	// MULTIPLY is in-band at the initiative side, out-of-band at the passive side
 	void OnGetKeepAlive();	// KEEP_ALIVE is always out-of-band
 };
 
@@ -520,7 +531,7 @@ public:
 // By reuse
 //	cipherText field of CSocketItemEx
 //	tSessionBegin => first two bytes: lenData, last byte: EOM
-//	contextOfICC.firstRecvSNewKey => initialSN
+//	contextOfICC.snFirstRecvWithCurrKey => initialSN
 //	SOCKADDR_ALFID and SOCKADDR_HOSTID of sockAddrTo: idRemote and remoteHostID
 class CMultiplyBacklogItem: public CSocketItemEx
 {

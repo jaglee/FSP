@@ -43,7 +43,7 @@ int FSPAPI GetSendBuffer(FSPHANDLE hFSPSocket, int m, CallbackBufferReady fp1)
 	try
 	{
 		// Invalid FSP handle: for sake of prebuffering only in a limited number of states sending is prehibited
-		if (p->InState(NON_EXISTENT) || p->InState(LISTENING) || p->InState(PRE_CLOSED) || p->InState(CLOSED))
+		if (p->InIllegalState() || p->InState(LISTENING) || p->InState(PRE_CLOSED) || p->InState(CLOSED))
 			return -EBADF;
 		if (!p->TestSetSendReturn(fp1))
 			return -EBUSY;
@@ -61,7 +61,9 @@ int FSPAPI GetSendBuffer(FSPHANDLE hFSPSocket, int m, CallbackBufferReady fp1)
 //	FSPHANDLE	the socket handle
 //	void *		the buffer pointer
 //	int			the number of octets to send
-//	FlagEndOfMessage
+//	int8_t	
+//		0:		do not terminate the transmit transaction
+//		EOF:	terminate the transaction
 // Return
 //	number of octets really scheduled to send
 // Remark
@@ -70,7 +72,7 @@ int FSPAPI GetSendBuffer(FSPHANDLE hFSPSocket, int m, CallbackBufferReady fp1)
 //	if the buffer is to be continued, its size MUST be multiplier of MAX_BLOCK_SIZE
 //	SendInline could be chained in tandem with GetSendBuffer
 DllExport
-int FSPAPI SendInline(FSPHANDLE hFSPSocket, void * buffer, int len, FlagEndOfMessage eomFlag)
+int FSPAPI SendInline(FSPHANDLE hFSPSocket, void * buffer, int len, int8_t eomFlag)
 {
 	register CSocketItemDl * p = (CSocketItemDl *)hFSPSocket;
 	try
@@ -89,7 +91,9 @@ int FSPAPI SendInline(FSPHANDLE hFSPSocket, void * buffer, int len, FlagEndOfMes
 //	FSPHANDLE	the socket handle
 //	void *		the buffer pointer
 //	int			the number of octets to send
-//	FlagEndOfMessage
+//	int8_t	
+//		0:		do not terminate the transmit transaction
+//		EOF:	terminate the transaction
 //	NotifyOrReturn	the callback function pointer
 // Return
 //	0 if no immediate error, negative if it failed, or positive it was warned (I/O pending)
@@ -102,7 +106,7 @@ int FSPAPI SendInline(FSPHANDLE hFSPSocket, void * buffer, int len, FlagEndOfMes
 //		1: it is the trail of the containing message
 //		2: it is the last message of the session of the particular transmit direction
 DllExport
-int FSPAPI WriteTo(FSPHANDLE hFSPSocket, void * buffer, int len, FlagEndOfMessage flag, NotifyOrReturn fp1)
+int FSPAPI WriteTo(FSPHANDLE hFSPSocket, void * buffer, int len, int8_t flag, NotifyOrReturn fp1)
 {
 	register CSocketItemDl * p = (CSocketItemDl *)hFSPSocket;
 	try
@@ -113,7 +117,7 @@ int FSPAPI WriteTo(FSPHANDLE hFSPSocket, void * buffer, int len, FlagEndOfMessag
 		if(!p->TestSetSendReturn(fp1))
 			return -EBUSY;
 		//
-		int r = p->SendStream(buffer, len, flag);
+		int r = p->SendStream(buffer, len, flag != 0);
 		return (r < len ? E2BIG : 0);	// Error too BIG is a warning here, however
 	}
 	catch(...)
@@ -158,13 +162,15 @@ int LOCALAPI CSocketItemDl::AcquireSendBuf(int n)
 // Given
 //	void *		the buffer pointer
 //	int			the number of octets to send
-//	FlagEndOfMessage
+//	int8_t	
+//		0:		do not terminate the transmit transaction
+//		EOF:	terminate the transaction
 // Return
 //	number of octets really scheduled to send
 // Remark
 //	SendInplace works in tandem with AcquireSendBuf
 //	This is a prototype and thus simultaneous send and receive is not considered
-int LOCALAPI CSocketItemDl::SendInplace(void * buffer, int len, FlagEndOfMessage eomFlag)
+int LOCALAPI CSocketItemDl::SendInplace(void * buffer, int len, int8_t eomFlag)
 {
 #ifdef TRACE
 	printf_s("SendInplace in state %s[%d]\n", stateNames[GetState()], GetState());
@@ -172,7 +178,7 @@ int LOCALAPI CSocketItemDl::SendInplace(void * buffer, int len, FlagEndOfMessage
 	if(! WaitUseMutex())
 		return -EINTR;
 	//
-	int r = CheckTransmitaction(eomFlag);
+	int r = CheckTransmitaction(eomFlag != 0);
 	if (r < 0)
 	{
 		SetMutexFree();
@@ -180,7 +186,7 @@ int LOCALAPI CSocketItemDl::SendInplace(void * buffer, int len, FlagEndOfMessage
 	}
 	//
 	bytesBuffered = 0;
-	return FinalizeSend(PrepareToSend(buffer, len, eomFlag));
+	return FinalizeSend(PrepareToSend(buffer, len, eomFlag != 0));
 }
 
 
@@ -188,13 +194,13 @@ int LOCALAPI CSocketItemDl::SendInplace(void * buffer, int len, FlagEndOfMessage
 // Given
 //	void * 	the pointer to the source data buffer
 //	int		the size of the source data in bytes
-//	FlagEndOfMessage
+//	bool	whether terminate the transaction
 // Return
 //	Number of bytes put on the send queue
 //	negative on error
 // Remark
 //	This is a prototype and thus simultaneous send and receive is not considered
-int LOCALAPI CSocketItemDl::SendStream(void * buffer, int len, FlagEndOfMessage flag)
+int LOCALAPI CSocketItemDl::SendStream(void * buffer, int len, bool flag)
 {
 #ifdef TRACE
 	printf_s("SendStream in state %s[%d]\n", stateNames[GetState()], GetState());
@@ -222,13 +228,9 @@ int LOCALAPI CSocketItemDl::SendStream(void * buffer, int len, FlagEndOfMessage 
 
 
 /**
+	An ACK_CONNECT_REQ packet itself make a singular transmit transaction.
 	A PERSIST or MULTIPLY packet always starts a transmit transaction.
-	A MULTIPLY packet with 'To Be Continued' flag cleared terminates the transmit transaction as well.
-	Here the transaction consists of one message of one single packet.
-	A COMMIT packet terminates a transmit transaction. It is sent on request of ULA.
-	A COMMIT packet may both start and terminate a transmit transaction,
-	if the transaction consists of one message of one single packet.
-	An ACK_CONNECT_REQ packet itself make a singular transmit transaction if it piggybacks any payload.
+	A PERSIST or MULTIPLY packet with 'To Be Continued' flag cleared terminates the transmit transaction as well.
  */
 // Return
 //	1 if revert to ACTIVE or PEER_COMMIT state
@@ -240,17 +242,11 @@ int LOCALAPI CSocketItemDl::SendStream(void * buffer, int len, FlagEndOfMessage 
 //	It MIGHT change state in the ESTABLISHED state
 //	It may change indication 'isFlushing' as well
 //	See also FinalizeSend()
-int LOCALAPI CSocketItemDl::CheckTransmitaction(FlagEndOfMessage flag)
+int LOCALAPI CSocketItemDl::CheckTransmitaction(bool eotFlag)
 {
-	if(pControlBlock->hasPendingKey != 0)
-		flag = END_OF_TRANSACTION;
-	//
-	if(flag == END_OF_TRANSACTION)
-		endOfMessage = 1, isFlushing = 1;
-	else if(flag == END_OF_MESSAGE)
-		endOfMessage = 1;
-	else
-		endOfMessage = 0;
+	if(eotFlag || pControlBlock->hasPendingKey != 0)
+		isFlushing = 1;
+	// else keep the isFlushing flag
 
 	if(InState(CLONING) || InState(CONNECT_AFFIRMING) || InState(CHALLENGING))
 		return 0;	// Just prebuffer, data could be sent without state migration
@@ -425,7 +421,6 @@ int LOCALAPI CSocketItemDl::BufferData(int len)
 		// TODO: Encrypt
 		bytesBuffered += p->len;
 
-		p->SetFlag<TO_BE_CONTINUED>();
 		if(p->len >= MAX_BLOCK_SIZE)
 			p->SetFlag<IS_COMPLETED>();
 		//
@@ -459,22 +454,12 @@ l_finish:
 		return (len - m);
 	}
 	//
-	if (pendingSendSize == 0)
+	if (pendingSendSize == 0 && isFlushing)
 	{
-		if (isFlushing)
-		{
-			p->SetFlag<TO_BE_CONTINUED>(false);
-			p->opCode = COMMIT;
-			p->SetFlag<IS_COMPLETED>();
-		}
-		else if (endOfMessage)
-		{
-			p->SetFlag<TO_BE_CONTINUED>(false);
-			p->SetFlag<IS_COMPLETED>();
-		}
-		// otherwise WriteTo following may put further data into the last packet buffer
+		p->SetFlag<END_OF_TRANSACTION>();
+		p->SetFlag<IS_COMPLETED>();
 	}
-	//
+	// otherwise WriteTo following may put further data into the last packet buffer
 	return (len - m);
 }
 
@@ -483,7 +468,7 @@ l_finish:
 // Given
 //	void *	the pointer to the in-place buffer to be marked in the send queue
 //	int		the size of the buffer in bytes
-//	FlagEndOfMessage
+//	bool	whether terminate the transaction
 // Return
 //	number of blocks split
 //	-EFAULT if the first parameter is illegal
@@ -491,9 +476,9 @@ l_finish:
 //	-EDOM if the second or third parameter is illegal
 // Remark
 //	Would automatically mark the previous last packet as completed
-int LOCALAPI CSocketItemDl::PrepareToSend(void * buf, int len, FlagEndOfMessage eomFlag)
+int LOCALAPI CSocketItemDl::PrepareToSend(void * buf, int len, bool eotFlag)
 {
-	if(len <= 0 || len % MAX_BLOCK_SIZE != 0 && eomFlag == NOT_END_ANYWAY)
+	if(len <= 0 || len % MAX_BLOCK_SIZE != 0 && ! eotFlag)
 		return -EDOM;
 
 	// Automatically mark the last unsent packet as completed. See also BufferData()
@@ -503,7 +488,7 @@ int LOCALAPI CSocketItemDl::PrepareToSend(void * buf, int len, FlagEndOfMessage 
 #ifdef TRACE
 		printf_s("SendInline automatically closes previous packet sent by WriteTo() or implicit welcome\n");
 #endif
-		p->SetFlag<IS_COMPLETED>();	// TO_BE_CONTINUED, if any, is kept, however
+		p->SetFlag<IS_COMPLETED>();
 		//^it might be redundant, but do little harm
 		p->Unlock();
 	}
@@ -514,44 +499,38 @@ int LOCALAPI CSocketItemDl::PrepareToSend(void * buf, int len, FlagEndOfMessage 
 	if(m < len)
 		return -ENOMEM;
 
-	p = pControlBlock->HeadSend() + pControlBlock->sendBufferNextPos;;
+	p = pControlBlock->HeadSend() + pControlBlock->sendBufferNextPos;
 	// p now is the descriptor of the first available buffer block
 	m = (len - 1) / MAX_BLOCK_SIZE;
+	register ControlBlock::PFSP_SocketBuf p0 = p;
 	for(int j = 0; j < m; j++)
 	{
 		p->InitFlags();	// and locked
 		p->version = THIS_FSP_VERSION;
 		p->opCode = PURE_DATA;
 		p->len = MAX_BLOCK_SIZE;
-		p->SetFlag<TO_BE_CONTINUED>();
 		p->SetFlag<IS_COMPLETED>();
-		p->Unlock();	// so it could be send
+		if(p != p0)			// keep p0 locked until the tail pointer is adjusted
+			p->Unlock();	// to keep the co-routine EmitQ of LLS from flounder
 		p++;
 	}
 	//
 	p->InitFlags();	// and locked
 	p->version = THIS_FSP_VERSION;
 	p->len = len - MAX_BLOCK_SIZE * m;
-	p->opCode = (eomFlag == END_OF_TRANSACTION ? COMMIT : PURE_DATA);
-	p->SetFlag<TO_BE_CONTINUED>(eomFlag == NOT_END_ANYWAY);
+	p->opCode = PURE_DATA;
+	p->SetFlag<END_OF_TRANSACTION>(eotFlag);
 	p->SetFlag<IS_COMPLETED>();
-	p->Unlock();
 	//
 	pControlBlock->sendBufferNextPos += m + 1;
 	pControlBlock->RoundSendBufferNextPos();
 	pControlBlock->sendBufferNextSN += m + 1;
-
-	// Slightly differ from BufferData on when to set COMMIT or PERSIST
+	// Slightly differ from BufferData; Unlock the start packet only when 
 	if(_InterlockedCompareExchange8(& newTransaction, 0, 1) != 0)
-	{
-		p = pControlBlock->HeadSend() + pControlBlock->sendWindowNextPos;
-#ifdef TRACE
-		if(p->GetFlag<IS_SENT>())
-			printf_s("Erraneous implementation!? Maynot start a new transaction");
-#endif
-		if(p->opCode != COMMIT)
-			p->opCode = PERSIST;
-	}
+		p0->opCode = PERSIST;
+	//
+	p->Unlock();	// delay unlock p in case p == p0
+	p0->Unlock();	// might be redundant, but it doesn't matter
 
 	return (m + 1);
 }

@@ -92,7 +92,7 @@ class CSocketItemDl: public CSocketItem
 
 	friend FSPHANDLE FSPAPI ListenAt(const PFSP_IN6_ADDR, PFSP_Context);
 	friend FSPHANDLE FSPAPI Connect2(const char *, PFSP_Context);
-	friend FSPHANDLE FSPAPI MultiplyAndWrite(FSPHANDLE, PFSP_Context, FlagEndOfMessage, NotifyOrReturn);
+	friend FSPHANDLE FSPAPI MultiplyAndWrite(FSPHANDLE, PFSP_Context, int8_t, NotifyOrReturn);
 	friend FSPHANDLE FSPAPI MultiplyAndGetSendBuffer(FSPHANDLE, PFSP_Context, int *, CallbackBufferReady);
 
 	SRWLOCK			rtSRWLock;
@@ -109,8 +109,7 @@ class CSocketItemDl: public CSocketItem
 	char			lowerLayerRecycled : 1;
 	char			shouldChainTimeout : 1;
 	char			endOfPeerMessage : 1;
-	char			endOfMessage : 1;
-	char			$reserved : 1;
+	char			$reserved : 2;
 	char			recvCompressed: 1;
 	char			sendCompressing: 1;
 protected:
@@ -119,7 +118,7 @@ protected:
 	NotifyOrReturn	fpRecycled;	// Callback for SHUT_DOWN
 
 	// to support full-duplex send and receive does not share the same call back function
-	NotifyOrReturn	fpRecept;
+	NotifyOrReturn	fpReceived;
 	// to support surveillance RecvInline() over ReadFrom() make CallbackPeeked an independent function
 	CallbackPeeked	fpPeeked;
 	CallbackBufferReady fpSent;
@@ -161,9 +160,9 @@ protected:
 	void ProcessBacklog();
 
 	CSocketItemDl * PrepareToAccept(BackLogItem &, CommandNewSession &);
-	bool ToWelcomeConnect(BackLogItem &);
+	bool LOCALAPI ToWelcomeConnect(BackLogItem &);
 	void ToConcludeConnect();
-	ControlBlock::PFSP_SocketBuf SetHeadPacketIfEmpty(FSPOperationCode c, FSPOperationCode cFlush = COMMIT);
+	ControlBlock::PFSP_SocketBuf LOCALAPI SetHeadPacketIfEmpty(FSPOperationCode c);
 
 	// In Multiplex.cpp
 	static CSocketItemDl * LOCALAPI CSocketItemDl::ToPrepareMultiply(CSocketItemDl *, PFSP_Context, CommandCloneSession &);
@@ -173,7 +172,7 @@ protected:
 		SetNewTransaction();
 	}
 	void CompleteMultiply();
-	bool ToWelcomeMultiply(BackLogItem &);
+	bool LOCALAPI ToWelcomeMultiply(BackLogItem &);
 
 	//
 	void ProcessPendingSend();
@@ -190,12 +189,13 @@ public:
 	CSocketItemDl() { InitializeSRWLock(& rtSRWLock); }	// and lazily initialized
 	~CSocketItemDl()
 	{
-		if(theWaitObject != NULL)
-		// waits for all callback functions to complete before returning
-		{
-			UnregisterWaitEx(theWaitObject, INVALID_HANDLE_VALUE);
-			theWaitObject = NULL;
-		}
+		register HANDLE h;
+		CancelTimer();
+		if((h = InterlockedExchangePointer((PVOID *) & theWaitObject, NULL)) != NULL)
+			UnregisterWaitEx(theWaitObject, NULL);
+		//^NULL: return immediately; INVALID_HANDLE_VALUE: waits for all callback functions to complete before returning
+		//
+		CSocketItem::Destroy();
 	}
 	int LOCALAPI Initialize(PFSP_Context, char *);
 	int Recycle();
@@ -223,7 +223,11 @@ public:
 	uint64_t GetULASignature() const { return context.signatureULA; }
 	void SetSendCompressing(bool value) { sendCompressing = value ? 1 : 0; }
 	bool WaitUseMutex();
+#if defined(NDEBUG) || !defined(TRACE)
 	void SetMutexFree() { ReleaseSRWLockExclusive(& rtSRWLock); }
+#else
+	void SetMutexFree();
+#endif
 	bool IsInUse() { return (_InterlockedXor8(& inUse, 0) != 0); }
 
 	void SetPeerName(const char *cName, size_t len)
@@ -250,20 +254,20 @@ public:
 	}
 	CSocketItemDl * LOCALAPI CallCreate(CommandNewSession &, FSP_ServiceCode);
 
-	int LOCALAPI InstallKey(BYTE *, int, int32_t, FlagEndOfMessage);
+	int LOCALAPI InstallKey(BYTE *, int, int32_t, FSP_InstallKeyTime);
 
 	int LOCALAPI AcquireSendBuf(int);
-	int LOCALAPI SendInplace(void *, int, FlagEndOfMessage);
+	int LOCALAPI SendInplace(void *, int, int8_t);
 
 	ControlBlock::PFSP_SocketBuf GetSendBuf() { return pControlBlock->GetSendBuf(); }
 
-	int LOCALAPI PrepareToSend(void *, int, FlagEndOfMessage);
-	int LOCALAPI SendStream(void *, int, FlagEndOfMessage);
+	int LOCALAPI PrepareToSend(void *, int, bool);
+	int LOCALAPI SendStream(void *, int, bool);
 	bool TestSetSendReturn(PVOID fp1)
 	{
 		return InterlockedCompareExchangePointer((PVOID *) & fpSent, fp1, NULL) == NULL; 
 	}
-	int LOCALAPI CheckTransmitaction(FlagEndOfMessage);
+	int LOCALAPI CheckTransmitaction(bool);
 	//
 	int LOCALAPI FinalizeSend(int r)
 	{
@@ -287,10 +291,8 @@ public:
 	void SetCallbackOnRequest(CallbackRequested fp1) { context.onAccepting = fp1; }
 	void SetCallbackOnAccept(CallbackConnected fp1) { context.onAccepted = fp1; }
 
-	char GetResetFlushing() { return _InterlockedExchange8(& isFlushing, 0);}
-
-	void SetNewTransaction() { newTransaction = 1; }
-
+	void SetNewTransaction() { isFlushing = 0; newTransaction = 1; }
+	
 	int SelfNotify(FSP_ServiceCode c);
 	void SetCallbackOnError(NotifyOrReturn fp1) { context.onError = fp1; }
 	void NotifyError(FSP_ServiceCode c, int e = 0) { if (context.onError != NULL) context.onError(this, c, e); }

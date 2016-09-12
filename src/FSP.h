@@ -105,15 +105,15 @@ typedef enum _FSP_Session_State: char
 	// responder: after getting the first PERSIST
 	// no default timeout. however, implementation could arbitrarily limit a session life
 	ESTABLISHED,
-	// after sending COMMIT/FLUSH, before getting all packet-in-flight acknowledged.
+	// after sending EoT flag, before getting all packet-in-flight acknowledged.
 	COMMITTING,	// A.K.A. FLUSHING; used to be PAUSING
-	// after getting the peer's COMMIT packet
+	// after getting the peer's EoT flag
 	PEER_COMMIT,
-	// after getting the peer's COMMIT and the near end has sent COMMIT
+	// after getting the peer's EoT flag and the near end has sent EoT
 	COMMITTING2,
-	// after getting ACK_FLUSH, i.e. all packet-in-flight acknowledged, including the COMMIT/FLUSH packet.
+	// after getting ACK_FLUSH, i.e. both EoT flag and all packet-in-flight have been acknowledged
 	COMMITTED,	// unilaterally adjourned
-	// after getting the peer's COMMIT/FLUSH in the COMMITTED state, or ACK_FLUSH in the COMMITTING2 state
+	// after getting the peer's EoT flag in the COMMITTED state, or ACK_FLUSH in the COMMITTING2 state
 	CLOSABLE,
 	// asymmetrically shutdown
 	PRE_CLOSED,
@@ -136,9 +136,9 @@ typedef enum _FSP_Operation_Code: char
 	CONNECT_REQUEST,
 	ACK_CONNECT_REQ,	// may piggyback payload
 	RESET,
-	PERSIST,	// While COMMIT/COMMIT make it transactional
+	PERSIST,	// Start a new transmit transaction, while EoT flag make it transactional
 	PURE_DATA,	// Without any optional header
-	COMMIT,		// A.K.A. FLUSH, used to be ADJOURN
+	_COMMIT,	// Not literally sent anyway, just as a mark in the receive buffer
 	ACK_FLUSH,
 	RELEASE,
 	MULTIPLY,	// To clone connection, may piggyback payload
@@ -166,7 +166,8 @@ typedef enum: char
 	FSP_Recycle,		// a forward command, connection might be aborted
 	FSP_Start,			// send a packet starting a new send-transaction
 	FSP_Send,			// send a packet/a group of packets
-	FSP_Commit,			// send a standalone COMMIT packet, or mark the last unsent packet COMMITTING
+	FSP_Commit,			// force to send a EoT flag,
+	//^ The EoT flag is either embedded in the last in-band packet, or piggybacked on the most recent KEEP_ALIVE/ACK_FLUSH
 	FSP_Shutdown,		// close the connection
 	FSP_InstallKey,		// install the authenticated encryption key
 	FSP_Multiply,		// clone the connection, make SCB of LLS synchronized with DLL

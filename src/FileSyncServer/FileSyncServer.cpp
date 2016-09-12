@@ -173,11 +173,12 @@ static void FSPAPI onPublicKeyReceived(FSPHANDLE h, FSP_ServiceCode c, int r)
 
 	unsigned char bufSharedKey[CRYPTO_NACL_KEYBYTES];
 	CryptoNaClGetSharedSecret(bufSharedKey, bufPeerPublicKey, bufPrivateKey);
+
 	printf_s("\tTo install the negotiated shared key...\n");
-	InstallAuthenticKey(h, bufSharedKey, CRYPTO_NACL_KEYBYTES, INT32_MAX, END_OF_TRANSACTION); 
+	InstallAuthenticKey(h, bufSharedKey, CRYPTO_NACL_KEYBYTES, INT32_MAX, FSP_INSTALL_KEY_INSTANTLY);
 
 	printf_s("\tTo send filename to the remote end...\n");
-	WriteTo(h, fileName, (int)strlen(fileName) + 1, END_OF_MESSAGE, onFileNameSent);
+	WriteTo(h, fileName, (int)strlen(fileName) + 1, EOF, onFileNameSent);
 }
 
 
@@ -247,9 +248,10 @@ static int FSPAPI toSendNextBlock(FSPHANDLE h, void * batchBuffer, int32_t capac
 
 	printf_s("To send %d bytes to the remote end\n", bytesRead);
 
-	SendInline(h, batchBuffer, bytesRead, r ? END_OF_MESSAGE : NOT_END_ANYWAY);
-	return (r ? -1 : 0);	// if EOF, tell DLL to terminate send
+	int err = SendInline(h, batchBuffer, bytesRead, (int8_t)r);
+	return (r ? -1 : err);	// if EOF, tell DLL to terminate send
 }
+
 
 
 // non-static!

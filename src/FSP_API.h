@@ -72,6 +72,15 @@ typedef enum
 
 
 
+typedef enum
+{
+	FSP_INSTALL_KEY_INSTANTLY = 0,
+	FSP_INSTALL_KEY_SEND_PENDING = 1,
+	FSP_INSTALL_KEY_RECV_PENDING = 2
+} FSP_InstallKeyTime;
+
+
+
 #ifdef __cplusplus
 	extern "C" {
 #endif
@@ -173,19 +182,6 @@ struct FSP_SocketParameter
 
 
 
-//	Choice of the flag:
-//		0: not finshed more data to follow
-//		1: it is the trail of the containing message
-//		2: it is the last message of the transaction on the particular transmit direction
-enum FlagEndOfMessage
-{
-	NOT_END_ANYWAY = 0,
-	END_OF_MESSAGE = 1,
-	END_OF_TRANSACTION = 2
-};
-
-
-
 #ifdef __cplusplus
 	extern "C" {
 #endif
@@ -217,7 +213,9 @@ FSPHANDLE FSPAPI Connect2(const char *, PFSP_Context);
 // given
 //	the handle of the FSP socket whose connection is to be duplicated,
 //	the pointer to the socket parameter
-//	FlagEndOfMessage
+//	int8_t	
+//		0:		do not terminate the transmit transaction
+//		EOF:	terminate the transaction
 //	NotifyOrReturn	the callback function pointer
 // return
 //	the handle of the new created socket
@@ -225,7 +223,7 @@ FSPHANDLE FSPAPI Connect2(const char *, PFSP_Context);
 // remark
 //	The handle returned might be useless, if CallbackConnected report error laterly
 DllSpec
-FSPHANDLE FSPAPI MultiplyAndWrite(FSPHANDLE, PFSP_Context, FlagEndOfMessage, NotifyOrReturn);
+FSPHANDLE FSPAPI MultiplyAndWrite(FSPHANDLE, PFSP_Context, int8_t, NotifyOrReturn);
 
 
 
@@ -249,14 +247,19 @@ FSPHANDLE FSPAPI MultiplyAndGetSendBuffer(FSPHANDLE, PFSP_Context, int *, Callba
 //	the buffer of the key
 //	the length of the key in bytes
 //	the life of the key in terms of number of packets allowed to send or resend
-//	FlagEndOfMessage, NOT_END_ANYWAY if it is the final initiator, END_OF_TRANSACTION the final responder
+//	whether the key is to be installled lazily
+//		0 if instantly
+//		1 if send of key material pending
+//		2 if receive of key material pending
 // return
 //	0 if no error
-//	-EDOM if parameter domain error
+//	-EAGAIN if previous key had not been installed yet, so that InstallKey again was not allowed
+//	-EDOM	if parameter domain error
 //	-EFAULT if unexpected exception
-//	-EIO if I/O interface error between the message layer and the packet layer
+//	-EINTR	if cannot obtain the right lock
+//	-EIO	if cannot trigger LLS to do the installation work through I/O
 DllSpec
-int FSPAPI InstallAuthenticKey(FSPHANDLE, uint8_t *, int, int32_t, FlagEndOfMessage);
+int FSPAPI InstallAuthenticKey(FSPHANDLE, uint8_t *, int, int32_t, FSP_InstallKeyTime);
 
 
 
@@ -274,7 +277,9 @@ int FSPAPI GetSendBuffer(FSPHANDLE, int, CallbackBufferReady);
 //	FSPHANDLE	the socket handle
 //	void *		the buffer pointer
 //	int			the number of octets to send
-//	FlagEndOfMessage
+//	int8_t	
+//		0:		do not terminate the transmit transaction
+//		EOF:	terminate the transaction
 // Return
 //	number of octets really scheduled to send
 // Remark
@@ -283,14 +288,16 @@ int FSPAPI GetSendBuffer(FSPHANDLE, int, CallbackBufferReady);
 //	if the buffer is to be continued, its size MUST be multiplier of MAX_BLOCK_SIZE
 //	SendInline could be chained in tandem with GetSendBuffer
 DllSpec
-int FSPAPI SendInline(FSPHANDLE, void *, int, enum FlagEndOfMessage);
+int FSPAPI SendInline(FSPHANDLE, void *, int, int8_t);
 
 
 // Given
 //	FSPHANDLE	the socket handle
 //	void *		the buffer pointer
 //	int			the number of octets to send
-//	FlagEndOfMessage
+//	int8_t	
+//		0:		do not terminate the transmit transaction
+//		EOF:	terminate the transaction
 //	NotifyOrReturn	the callback function pointer
 // Return
 //	0 if no immediate error, negative if it failed, or positive it was warned (I/O pending)
@@ -299,7 +306,7 @@ int FSPAPI SendInline(FSPHANDLE, void *, int, enum FlagEndOfMessage);
 //	which may be less or greater than requested because of compression and/or encryption
 //	Only all data have been buffered may be NotifyOrReturn called.
 DllSpec
-int FSPAPI WriteTo(FSPHANDLE, void *, int, enum FlagEndOfMessage, NotifyOrReturn);
+int FSPAPI WriteTo(FSPHANDLE, void *, int, int8_t, NotifyOrReturn);
 
 
 // given

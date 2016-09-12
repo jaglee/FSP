@@ -104,11 +104,9 @@ int CSocketItemDl::RecvInline(PVOID fp1)
 		return -EDEADLK;
 	}
 
-	if(InterlockedCompareExchangePointer((PVOID *) & fpPeeked, fp1, NULL) != NULL)
+	if(InterlockedExchangePointer((PVOID *) & fpPeeked, fp1) != NULL)
 	{
-		TRACE_HERE("calling convention error: cannot receive inline before previous RecvInline called back");
-		SetMutexFree();
-		return -EBUSY;
+		TRACE_HERE("warning: Receive-inline called before previous RecvInline called back");
 	}
 	//
 	endOfPeerMessage = 0;
@@ -139,7 +137,7 @@ int LOCALAPI CSocketItemDl::ReadFrom(void * buffer, int capacity, PVOID fp1)
 	if(! WaitUseMutex())
 		return -EINTR;
 	//
-	if(InterlockedCompareExchangePointer((PVOID *) & fpRecept, fp1, NULL) != NULL)
+	if(InterlockedCompareExchangePointer((PVOID *) & fpReceived, fp1, NULL) != NULL)
 	{
 		TRACE_HERE("calling convention error: cannot read the stream before previous ReadFrom called back");
 		SetMutexFree();
@@ -205,14 +203,13 @@ int CSocketItemDl::FetchReceived()
 {
 	int m = 0;	// note that left border of the receive window slided in the loop body
 	// firstly, skip those already delivered
-	ControlBlock::PFSP_SocketBuf p = pControlBlock->GetFirstReceived();
-	while(p->GetFlag<IS_DELIVERED>())
+	ControlBlock::PFSP_SocketBuf p;
+	while(!IsRecvBufferEmpty() && (p = pControlBlock->GetFirstReceived())->opCode == 0)
 	{
 		pControlBlock->SlideRecvWindowByOne();
-		p = pControlBlock->GetFirstReceived();
 	}
 	//
-	for(; p->GetFlag<IS_FULFILLED>() && !p->GetFlag<IS_DELIVERED>(); p = pControlBlock->GetFirstReceived())
+	for(; p->opCode != 0 && p->GetFlag<IS_FULFILLED>(); p = pControlBlock->GetFirstReceived())
 	{
 		if(p->len > MAX_BLOCK_SIZE || p->len < 0)
 			return -EFAULT;
@@ -226,22 +223,19 @@ int CSocketItemDl::FetchReceived()
 		}
 		//
 		p->SetFlag<IS_FULFILLED>(false);	// release the buffer
-		p->SetFlag<IS_DELIVERED>();			// so that it would not be re-delivered
-		// but keep the TO_BE_CONTINUED flag
-		//
 		// Slide the left border of the receive window before possibly set the flag 'end of received message'
 		pControlBlock->SlideRecvWindowByOne();
-		// See also CheckToNewTransaction
-		if(p->opCode == PERSIST && p->len == 0)
+		//
+		if(_InterlockedExchange8((char *)& p->opCode, 0) == PERSIST && p->len == 0)
 			continue;	// A payloadless PERSIST is just a special acknowledgement
 		//
-		if(!p->GetFlag<TO_BE_CONTINUED>() && p->len != 0 || p->opCode == COMMIT)
+		if(p->GetFlag<END_OF_TRANSACTION>())
 		{
 			endOfPeerMessage = 1;
 			break;
 		}
-		// 'be free to accept': both COMMIT && TO_BE_CONTINUED and PERSIST && len == 0 && TO_BE_CONTINUED
-		// are illegal as well, but we refuse only TO_BE_CONTINUED && len != 0 && len != MAX_BLOCK_SIZE
+		// 'be free to accept': both _COMMIT && !END_OF_TRANSACTION and PERSIST && len == 0 && !END_OF_TRANSACTION
+		// are illegal as well, but we refuse only !END_OF_TRANSACTION && len != 0 && len != MAX_BLOCK_SIZE
 		if(p->len != MAX_BLOCK_SIZE)
 			return -EDOM;
 	}
@@ -252,7 +246,7 @@ int CSocketItemDl::FetchReceived()
 
 
 // Remark
-//	fpRecept would not be reset if internal memeory allocation error detected
+//	fpReceived would not be reset if internal memeory allocation error detected
 //	If RecvInline() failed (say, due to compression and/or encryption), data may be picked up by ReadFrom()
 //	ULA should make sure that the socket is freed in the callback function (if recycling is notified)
 void CSocketItemDl::ProcessReceiveBuffer()
@@ -297,7 +291,7 @@ void CSocketItemDl::ProcessReceiveBuffer()
 			endOfPeerMessage = 1;
 			fpPeeked = NULL;
 		}
-		if(n == 0)	// (n == 0 && !b) when the last message is a payloadless COMMIT
+		if(n == 0)	// (n == 0 && !b) when the last message is a payloadless PERSIST with the EoT flag set
 		{
 			TRACE_HERE("Nothing to deliver");
 			SetMutexFree();
@@ -314,7 +308,7 @@ void CSocketItemDl::ProcessReceiveBuffer()
 	}
 
 	// it is possible that data is buffered and waiting to be delivered to ULA
-	if(waitingRecvBuf == NULL || waitingRecvSize <= 0 || fpRecept == NULL)
+	if(waitingRecvBuf == NULL || waitingRecvSize <= 0 || fpReceived == NULL)
 	{
 		SetMutexFree();
 		return;
@@ -342,10 +336,10 @@ void CSocketItemDl::ProcessReceiveBuffer()
 
 void CSocketItemDl::FinalizeRead()
 {
-	NotifyOrReturn fp1 = (NotifyOrReturn)InterlockedExchangePointer((PVOID volatile *) & fpRecept, NULL);
+	NotifyOrReturn fp1 = (NotifyOrReturn)InterlockedExchangePointer((PVOID *) & fpReceived, NULL);
 	waitingRecvBuf = NULL;
 	SetMutexFree();
-	// due to multi-task nature although fpRecept has been checked in the caller it could be already reset
+	// due to multi-task nature it could be already reset in the caller although fpReceived has been checked here
 	if(fp1 != NULL)
 		fp1(this, FSP_NotifyDataReady, bytesReceived);
 }

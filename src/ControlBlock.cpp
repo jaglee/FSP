@@ -50,7 +50,7 @@ const char * CStringizeOpCode::names[LARGEST_OP_CODE + 1] =
 	"RESET",
 	"PERSIST",		// Alias: DATA_WITH_ACK
 	"PURE_DATA",	// Without any optional header
-	"COMMIT",
+	"_COMMIT",
 	"ACK_FLUSH",
 	"RELEASE",
 	"MULTIPLY",		// To clone connection, may piggyback payload
@@ -116,7 +116,7 @@ const char * CStringizeNotice::names[LARGEST_FSP_NOTICE + 1] =
 	"FSP_Recycle",		// a forward command, connection might be aborted
 	"FSP_Start",		// send a packet starting a new send-transaction
 	"FSP_Send",			// send a packet/a group of packets
-	"FSP_Commit",		// commit a transmit transaction by send or append a COMMIT
+	"FSP_Commit",		// commit a transmit transaction by send an EOT flag
 	"FSP_Shutdown",		// close the connection
 	"FSP_InstallKey",	// install the authenticated encryption key
 	// 11-15, 5 reserved
@@ -605,18 +605,17 @@ void * LOCALAPI ControlBlock::InquireRecvBuf(int & nIO, bool & toBeContinued)
 			return NULL;
 		}
 		//
-		if (p->GetFlag<IS_DELIVERED>())
+		if (_InterlockedExchange8((char *) & p->opCode, 0) == 0)
 		{
 			TRACE_HERE("To double deliver a packet?");
 			recvWindowFirstSN -= i;
 			return NULL;
 		}
-		p->SetFlag<IS_DELIVERED>();
 		//
 		recvWindowFirstSN++;
 		nIO += p->len;
 		//
-		if(! p->GetFlag<TO_BE_CONTINUED>())
+		if(p->GetFlag<END_OF_TRANSACTION>())
 		{
 			toBeContinued = false;
 			i++;
@@ -861,8 +860,8 @@ int LOCALAPI ControlBlock::DealWithSNACK(seq_t expectedSN, FSP_SelectiveNACK::Ga
 
 
 // Return
-//	true if the last packet in the queue is a COMMIT and there is no gap before the COMMIT packet AND no packet after the COMMIT packet
-//	false if there is no COMMIT packet in the queue, or there is some gap before the COMMIT packet
+//	true if the last packet in the queue is a _COMMIT and there is neither gap before _COMMIT nor after _COMMIT
+//	false if there is no _COMMIT packet in the queue, or there is some gap before or after the _COMMIT packet
 bool ControlBlock::HasBeenCommitted() const
 {
 	register int d = int(recvWindowExpectedSN - recvWindowNextSN);
@@ -875,49 +874,30 @@ bool ControlBlock::HasBeenCommitted() const
 	else if (d < 0)
 		d += recvBufferBlockN;
 
-	return ((HeadRecv() + d)->opCode == COMMIT);
+	return ((HeadRecv() + d)->opCode == _COMMIT);
 }
 
 
 
 // Return
-//	0 if there is no COMMIT packet at the tail and there is no error on appending one
-//	1 if there is already an unsent COMMIT packet at the tail of the send queue
-//	2 if there is already a COMMIT packet at the tail but it has been sent
-//	-1 if failed
-// Remark
-//	There could be continuous COMMIT packets which belong to different transmit transaction
-int ControlBlock::ReplaceSendQueueTailToCommit()
+//	0 if used to be no packet at all
+//	1 if there existed a sent packet at the tail which has ready marked EOT 
+//	2 if there existed an unsent packet at the tail and it is marked EOT
+//  -1 if there existed a sent packet at the tail which could not be marked EOT
+int ControlBlock::MarkSendQueueEOT()
 {
-	register PFSP_SocketBuf p;
 	if(CountSendBuffered() <= 0)
-		goto l_appendNew;
+		return 0;
 
 	register int i = sendBufferNextPos - 1;
+	register PFSP_SocketBuf p;
 	p = HeadSend() + (i < 0 ? sendBufferBlockN - 1 : i);
 
-	if(p->opCode == COMMIT)
-	{
-		if(p->Lock())
-		{
-			p->Unlock();
-			return 1;
-		}
-		return p->GetFlag<IS_SENT>() ? 2 : 1;
-	}
+	if(p->GetFlag<IS_SENT>())
+		return p->GetFlag<END_OF_TRANSACTION>() ? 1 : -1;
 
-	if((p->opCode == PURE_DATA || p->opCode == PERSIST) && p->Lock())
-		goto l_setOpCode;
-
-l_appendNew:
-	p = GetSendBuf();
-	if(p == NULL)
-		return -1;
-l_setOpCode:
-	p->opCode = COMMIT;
-	p->SetFlag<IS_COMPLETED>();
-	p->Unlock();
-	return 0;
+	p->SetFlag<END_OF_TRANSACTION>();
+	return 2;
 }
 
 

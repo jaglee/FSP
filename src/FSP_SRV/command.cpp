@@ -274,9 +274,10 @@ void CSocketItemEx::Connect()
 void CSocketItemEx::Start()
 {
 #ifdef TRACE
-	printf_s("To send first packet in %s[%d], firstSN = %u, nextSN = %u\n"
-		, stateNames[lowState]
-		, lowState
+	printf_s("To send first packet %s\n\tin %s[%d] => %s[%d] state\n\tfirstSN = %u, nextSN = %u\n"
+		, opCodeStrings[(pControlBlock->HeadSend() + pControlBlock->sendWindowHeadPos)->opCode]
+		, stateNames[lowState], lowState
+		, stateNames[pControlBlock->state], pControlBlock->state
 		, pControlBlock->sendWindowFirstSN
 		, pControlBlock->sendWindowNextSN);
 #endif
@@ -290,7 +291,7 @@ void CSocketItemEx::Start()
 
 
 
-// Mean to urge sending of the COMMIT packet
+// Mean to urge sending of the End of Transaction flag
 void CSocketItemEx::UrgeCommit()
 {
 #if defined(TRACE) && (TRACE & TRACE_ULACALL)
@@ -306,21 +307,13 @@ void CSocketItemEx::UrgeCommit()
 			RestartKeepAlive();
 	}
 	//
-	int r = pControlBlock->ReplaceSendQueueTailToCommit();
-	if(r == 0)
+	int r = pControlBlock->MarkSendQueueEOT();
+	if(r <= 0)
 	{
-		if (pControlBlock->CountSendBuffered() == 1)
-		{
-			EmitStart();
-			pControlBlock->SlideNextToSend();
-		}
+		shouldAppendCommit = 1;
 		// See also EmitQ
 		if(resendTimer == NULL)
 			AddResendTimer(tRoundTrip_us >> 8);
-	}
-	else if(r < 0)
-	{
-		shouldAppendCommit = 1;
 	}
 }
 

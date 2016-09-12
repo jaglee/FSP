@@ -57,6 +57,7 @@ void UnitTestSendRecvWnd()
 	Assert::IsTrue(pSCB->recvWindowFirstSN == FIRST_SN);
 	Assert::IsTrue(pSCB->recvWindowNextSN == FIRST_SN + 1);
 	// TODO: SCB buffer pointer to user space pointer
+	skb4->opCode = PURE_DATA;
 	skb4->len = MAX_BLOCK_SIZE - 13;
 	skb4->SetFlag<TO_BE_CONTINUED>(false);
 	skb4->SetFlag<IS_FULFILLED>();
@@ -82,6 +83,7 @@ void UnitTestSendRecvWnd()
 	recvBuf2 = pSCB->GetRecvPtr(skb5);
 	Assert::IsTrue(recvBuf2 - recvBuf == MAX_BLOCK_SIZE * 2);
 
+	skb5->opCode = PURE_DATA;
 	skb5->len = MAX_BLOCK_SIZE - 13;
 	skb5->SetFlag<TO_BE_CONTINUED>(false);
 	skb5->SetFlag<IS_FULFILLED>();
@@ -91,6 +93,7 @@ void UnitTestSendRecvWnd()
 	Assert::IsNotNull(skb5);
 	//Assert::IsTrue(pSCB->recvWindowNextSN == FIRST_SN + 2);
 
+	skb5->opCode = PURE_DATA;
 	skb5->len = MAX_BLOCK_SIZE;
 	skb5->SetFlag<TO_BE_CONTINUED>();
 	skb5->SetFlag<IS_FULFILLED>();
@@ -103,6 +106,7 @@ void UnitTestSendRecvWnd()
 	recvBuf2 = pSCB->GetRecvPtr(skb5);
 	Assert::IsTrue(recvBuf2 == recvBuf);	// because the size of the receive queue == MAX_BLOCK_SIZE * 4
 
+	skb5->opCode = PURE_DATA;
 	skb5->len = MAX_BLOCK_SIZE - 13;
 	skb5->SetFlag<TO_BE_CONTINUED>(false);
 	skb5->SetFlag<IS_FULFILLED>();
@@ -121,16 +125,15 @@ void UnitTestSendRecvWnd()
 	// See CSocketItemDl::FetchReceived()
 	// firstly, skip those already delivered
 	ControlBlock::PFSP_SocketBuf p = pSCB->GetFirstReceived();
-	while(p->GetFlag<IS_DELIVERED>())
+	while(p->opCode == 0)
 	{
 		pSCB->SlideRecvWindowByOne();
 		p = pSCB->GetFirstReceived();
 	}
 	//
-	while(p->GetFlag<IS_FULFILLED>() && !p->GetFlag<IS_DELIVERED>())
+	while(p->GetFlag<IS_FULFILLED>() && _InterlockedExchange8((char *)& p->opCode, 0) != 0)
 	{
 		pSCB->SlideRecvWindowByOne();
-		p->SetFlag<IS_DELIVERED>();	// so that it would not be re-delivered
 		p->SetFlag<IS_FULFILLED>(false);	// so that it would not be re-delivered
 		if(!p->GetFlag<TO_BE_CONTINUED>())
 			break;
@@ -139,8 +142,11 @@ void UnitTestSendRecvWnd()
 	Assert::IsTrue(pSCB->recvWindowFirstSN == FIRST_SN + 3);
 
 	skb4 = pSCB->AllocRecvBuf(FIRST_SN + 6);
+	Assert::IsNotNull(skb4);
+	skb4->opCode = PURE_DATA;
 	skb4->SetFlag<IS_FULFILLED>();
 	skb4->len = MAX_BLOCK_SIZE - 13;
+
 	skb5 = pSCB->AllocRecvBuf(FIRST_SN + 7);
 
 	m4 = pSCB->GetSelectiveNACK(seq4, snack, 4);
@@ -177,21 +183,24 @@ void UnitTestGenerateSNACK()
 	// secondly, one gap only
 	ControlBlock::PFSP_SocketBuf skb1 = socket.AllocRecvBuf(FIRST_SN);
 	Assert::IsNotNull(skb1);
-	Assert::IsTrue(pSCB->recvWindowNextSN == FIRST_SN + 1);
+	skb1->opCode = PURE_DATA;
 	skb1->SetFlag<IS_FULFILLED>();
+	Assert::IsTrue(pSCB->recvWindowNextSN == FIRST_SN + 1);
 
 	skb1 = socket.AllocRecvBuf(FIRST_SN + 2);
 	Assert::IsNotNull(skb1);
-	Assert::IsTrue(pSCB->recvWindowNextSN == FIRST_SN + 3);
+	skb1->opCode = PURE_DATA;
 	skb1->SetFlag<IS_FULFILLED>();
+	Assert::IsTrue(pSCB->recvWindowNextSN == FIRST_SN + 3);
 
 	r = pSCB->GetSelectiveNACK(seq0, gaps, MAX_GAPS_NUM);
 	Assert::IsTrue(r == 1 && seq0 == FIRST_SN + 1);
 
 	// when a very large gap among small continuous data segments found
 	skb1 = socket.AllocRecvBuf(FIRST_SN + 0x10003);
-	skb1->SetFlag<IS_FULFILLED>();
 	Assert::IsNotNull(skb1);
+	skb1->opCode = PURE_DATA;
+	skb1->SetFlag<IS_FULFILLED>();
 	Assert::IsTrue(pSCB->recvWindowNextSN == FIRST_SN + 0x10004);
 
 	r = pSCB->GetSelectiveNACK(seq0, gaps, MAX_GAPS_NUM);
@@ -199,8 +208,9 @@ void UnitTestGenerateSNACK()
 
 	// when capacity of gap descriptors overflow
 	skb1 = socket.AllocRecvBuf(FIRST_SN + 0x8003);
-	skb1->SetFlag<IS_FULFILLED>();
 	Assert::IsNotNull(skb1);
+	skb1->opCode = PURE_DATA;
+	skb1->SetFlag<IS_FULFILLED>();
 	Assert::IsTrue(pSCB->recvWindowNextSN == FIRST_SN + 0x10004);
 
 	r = pSCB->GetSelectiveNACK(seq0, gaps, MAX_GAPS_NUM);
@@ -211,6 +221,7 @@ void UnitTestGenerateSNACK()
 	{
 		skb1 = socket.AllocRecvBuf(FIRST_SN + i);
 		Assert::IsNotNull(skb1);
+		skb1->opCode = PURE_DATA;
 		skb1->SetFlag<IS_FULFILLED>();
 	}
 
@@ -223,6 +234,8 @@ void UnitTestGenerateSNACK()
 	Assert::IsTrue(pSCB->recvWindowHeadPos == 1 && pSCB->recvWindowFirstSN == (FIRST_SN + 1));
 
 	skb1 = socket.AllocRecvBuf(FIRST_SN + 1);
+	Assert::IsNotNull(skb1);
+	skb1->opCode = PURE_DATA;
 	skb1->SetFlag<IS_FULFILLED>();
 
 	ControlBlock::PFSP_SocketBuf p = pSCB->HeadRecv();
@@ -236,6 +249,8 @@ void UnitTestGenerateSNACK()
 	Assert::IsTrue(b && r == MAX_BLOCK_SIZE * 2);
 
 	skb1 = socket.AllocRecvBuf(FIRST_SN + 3);
+	Assert::IsNotNull(skb1);
+	skb1->opCode = PURE_DATA;
 	skb1->SetFlag<IS_FULFILLED>();
 	skb1->SetFlag<TO_BE_CONTINUED>();
 
@@ -245,6 +260,8 @@ void UnitTestGenerateSNACK()
 
 	//
 	skb1 = socket.AllocRecvBuf(FIRST_SN + 0x20001);
+	Assert::IsNotNull(skb1);
+	skb1->opCode = PURE_DATA;
 	skb1->SetFlag<IS_FULFILLED>();
 	Assert::IsTrue(pSCB->recvWindowNextSN == FIRST_SN + 0x20002);
 

@@ -228,7 +228,7 @@ struct $FSP_HeaderSignature: FSP_HeaderSignature
 // position start from 0, the rightmost one
 enum FSP_FlagPosition: UINT8
 {
-	ToBeContinued = 0,
+	EndOfTransaction = 0,
 	Compressed = 1,
 	RESERVED_AT_2,
 	RESERVED_AT_3,
@@ -457,13 +457,12 @@ struct SConnectParam	// MUST be aligned on 64-bit words!
 	//^ Timestamp in network byte order, together with the first four fields, totally 256 bits could be overlaid
 	//
 
-	// For sake of SCB reuse we arranged to save remained key life in the timeDelta field
-	__declspec(property(get = getKeyLife, put = setKeyLife))
-	int32_t	keyLife;
-	int32_t getKeyLife() const { return timeDelta; }
-	void setKeyLife(int32_t value) { timeDelta = value; } 
+	union
+	{
+		uint32_t	initialSN;
+		int32_t		keyLife$initialSN;
+	};
 
-	uint32_t	initialSN;	// the initial sequence number of the packet to send
 	int32_t		keyLength;	// by default 16 bytes
 	ALFID_T		idRemote;	// ID of the listener or the new forked, depending on context
 	uint32_t	remoteHostID;
@@ -542,20 +541,11 @@ enum SocketBufFlagBitPosition
 	EXCLUSIVE_LOCK = 0,
 	IS_ACKNOWLEDGED = 1,
 	IS_COMPLETED = 2,
-	IS_DELIVERED = 3,
+	IS_SENT = 3,
 	IS_FULFILLED = IS_COMPLETED,// mutual-mirroring flags for send and receive
-	IS_SENT = IS_DELIVERED,		// IS_SENT is for send while IS_DELIVERED is for receive 
 	// 4, 5: reserved
 	IS_COMPRESSED = 6,
-	TO_BE_CONTINUED = 7
-};
-
-
-
-enum PendingKeyMask
-{
-	HAS_PENDING_KEY_FOR_SEND = 1,
-	HAS_PENDING_KEY_FOR_RECV = 2
+	END_OF_TRANSACTION = 7
 };
 
 
@@ -748,11 +738,12 @@ struct ControlBlock
 		// An invalid packet buffer might be locked
 		return CountSendBuffered() <= 0 ? NULL : p;
 	}
-	// Return 0 if there is no COMMIT packet at the tail and there is no error on appending one
-	//	1 if there is already an unsent COMMIT packet at the tail of the send queue
-	//	2 if there is already a COMMIT packet at the tail but it has been sent
-	//	-1 if failed
-	int ReplaceSendQueueTailToCommit();
+	// Return
+	//	0 if used to be no packet at all
+	//	1 if there existed a sent packet at the tail which has ready marked EOT 
+	//	2 if there existed an unsent packet at the tail and it is marked EOT
+	//  -1 if there existed a sent packet at the tail which could not be marked EOT
+	int MarkSendQueueEOT();
 
 	// Allocate a new send buffer
 	PFSP_SocketBuf	GetSendBuf();
@@ -761,18 +752,6 @@ struct ControlBlock
 	void RoundSendWindowNextPos() { int32_t m = sendWindowNextPos - sendBufferBlockN; if(m >= 0) sendWindowNextPos = m; }
 
 	int32_t CountReceived() const { return int32_t(recvWindowNextSN - recvWindowFirstSN); }
-	bool IsValidSequence(seq_t seq1) const
-	{
-		register int32_t d = int32_t(seq1 - recvWindowFirstSN);
-		// somewhat 'be free to accept' as we didnot enforce 'announced receive window size'
-		return (0 <= d) && (d < recvBufferBlockN);
-	}
-	bool IsRetriableStale(seq_t seq1) const
-	{
-		register int32_t d = int32_t(seq1 - recvWindowFirstSN);
-		// somewhat 'be free to accept' as we didnot enforce 'announced receive window size'
-		return (d < -1) || (d >= recvBufferBlockN);
-	}
 
 	void LOCALAPI SetSequenceFlags(FSP_NormalPacketHeader *);
 
@@ -811,7 +790,7 @@ struct ControlBlock
 	}
 	void SetSendWindowSize(int32_t sz1) { sendWindowSize = min(sendBufferBlockN, sz1); }
 
-	// Whether the last packet is a COMMIT in the receive queue and there is no gap before the COMMIT packet
+	// Whether both the End of Transaction flag is received and there is no receiving gap left
 	bool HasBeenCommitted() const;
 
 	// Slide the send window to skip all of the acknowledged
@@ -857,20 +836,19 @@ protected:
 
 	void SetCallable() { pControlBlock->notices.SetHead(NullCommand); }	// clear the 'NOT-returned' notice
 
-	~CSocketItem() { Destroy(); }
+	//virtual ~CSocketItem() { }	// Make this a semi-abstract class
 	void Destroy()
 	{
-		if(hMemoryMap != NULL)
+		register HANDLE h;
+		//
+		if((h = InterlockedExchangePointer((PVOID *) & hEvent, NULL)) != NULL)
+			::CloseHandle(h);
+		//
+		if((h = InterlockedExchangePointer((PVOID *) & hMemoryMap, NULL)) != NULL)
 		{
 			::UnmapViewOfFile(pControlBlock);
-			::CloseHandle(hMemoryMap);
-			hMemoryMap = NULL;
+			::CloseHandle(h);
 			pControlBlock = NULL;
-		}
-		if(hEvent != NULL)
-		{
-			::CloseHandle(hEvent);
-			hEvent = NULL;
 		}
 	}
 };

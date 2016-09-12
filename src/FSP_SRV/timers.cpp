@@ -38,7 +38,7 @@
 #include <time.h>
 
 /**
-  Continual KEEP_ALIVE packets are sent as heartbeat signals. PERSIST or COMMIT may be retransmitted in the heartbeat interval
+  Continual KEEP_ALIVE packets are sent as heartbeat signals. PERSIST may be retransmitted in the heartbeat interval
   ACK_CONNECT_REQ, PURE_DATA or ACK_FLUSH is retransmitted on demand.
   ACK_INIT_CONNECT is never retransmitted.
 
@@ -60,7 +60,7 @@
   The actual heartbeat interval should be no less than one OS time slice interval 
 
   timeouts:
-	- transaction commit [LLS: send COMMIT to ACK_FLUSH]
+	- transaction commit [LLS: send EoT flag to ACK_FLUSH]
 	  {COMMITTING, COMMITTING2}-->NON_EXISTENT
 	- transient state
 	  CLONING-->NON_EXISTENT
@@ -152,8 +152,7 @@ void CSocketItemEx::KeepAlive()
 			// UNRESOLVED!? But PRE_CLOSED connection might be resurrected
 			TIMED_OUT();
 		}
-		//
-		SendPacket<RELEASE>();
+		// UNRESOLVED!? There used to be re-send RELEASE command here
 		break;
 	case CLOSABLE:	// CLOSABLE does not automatically timeout to CLOSED
 	case CLOSED:
@@ -176,6 +175,12 @@ void CSocketItemEx::KeepAlive()
 		}
 		EmitStart();
 		break;
+	default:
+#ifndef NDEBUG
+		printf_s("\n*** ULA could not change state arbitrarily (%d) and beat the implementation! ***\n", lowState);
+		// The shared memory portion of ControlBlock might be inaccessable.
+#endif
+		Destroy();
 	}
 
 	SetReady();
@@ -203,6 +208,10 @@ void CSocketItemEx::DoResend()
 		return;
 	}
 	resendTimeoutRetryCount = 0;
+
+	if(shouldAppendCommit)
+		SendKeepAlive();
+	//^TODO: optimization! Eliminate the long-interval KEEP_ALIVE, until 
 
 	ControlBlock::seq_t seq1 = pControlBlock->sendWindowFirstSN;
 	int32_t index1 = pControlBlock->sendWindowHeadPos;
@@ -239,7 +248,7 @@ void CSocketItemEx::DoResend()
 		}
 	}
 
-	if(k < n)
+	if(k < n || shouldAppendCommit)
 		AddResendTimer(uint32_t((tRoundTrip_us  - ((tNow - p->timeSent) >> 2)) >> 8));
 	else
 		EmitQ();	// retry to send those pending on the queue
@@ -275,48 +284,12 @@ void CSocketItemEx::LazilySendSNACK()
 		printf_s("\n#0x%X's LazilySendSNACK not executed due to it has migrated to state %s.\n"
 			, fidPair.source, stateNames[lowState]);
 #endif
-		goto l_done;
+	}
+	else
+	{
+		SendKeepAlive();
 	}
 
-	ALIGN(16)
-	struct
-	{
-		FSP_NormalPacketHeader	hdr;
-		FSP_PreparedKEEP_ALIVE	snack;
-	} buf2;	// a buffer with two headers
-
-	ControlBlock::seq_t	snKeepAliveExp;
-	LONG len = GenerateSNACK(buf2.snack, snKeepAliveExp, sizeof(FSP_NormalPacketHeader));
-	assert(len < 0 || len >= sizeof(FSP_NormalPacketHeader) + sizeof(FSP_SelectiveNACK));
-	if (len < 0)
-	{
-		printf_s("Fatal error %d encountered when generate SNACK\n", len);
-		goto l_done;
-	}
-#if defined(TRACE) && (TRACE & (TRACE_HEARTBEAT | TRACE_PACKET | TRACE_SLIDEWIN))
-	printf_s("LazilySendSNACK local fiber#0x%X\n"
-		"\tAcknowledged seq#%u, keep-alive header size = %d\n"
-		, fidPair.source
-		, snKeepAliveExp
-		, len);
-#endif
-
-	buf2.hdr.Set(KEEP_ALIVE, (uint16_t)len
-		, pControlBlock->sendWindowNextSN - 1
-		, snKeepAliveExp
-		, pControlBlock->RecvWindowSize());
-	SetIntegrityCheckCode(&buf2.hdr, NULL, 0, buf2.snack.GetSaltValue());
-#if defined(TRACE) && (TRACE & (TRACE_HEARTBEAT | TRACE_PACKET | TRACE_SLIDEWIN))
-	printf_s("To send KEEP_ALIVE seq #%u, acknowledge #%u, source ALFID = 0x%X\n"
-		, be32toh(buf2.hdr.sequenceNo)
-		, snKeepAliveExp
-		, fidPair.source);
-	printf_s("KEEP_ALIVE total header length: %d, should be payloadless\n", len);
-	DumpNetworkUInt16((uint16_t *)& buf2, len / 2);
-#endif
-	SendPacket(1, ScatteredSendBuffers(&buf2, len));
-
-l_done:
 	SetReady();
 }
 
@@ -327,6 +300,7 @@ l_done:
 // Return
 //	true if KEEP_ALIVE was sent successfully
 //	false if send was failed
+// TODO: suppress rate of sending KEEP_ALIVE
 bool CSocketItemEx::SendKeepAlive()
 {
 	ALIGN(16)
@@ -382,6 +356,10 @@ bool CSocketItemEx::SendKeepAlive()
 		, pControlBlock->sendWindowNextSN - 1
 		, snKeepAliveExp
 		, pControlBlock->RecvWindowSize());
+	//
+	if(shouldAppendCommit)
+		buf3.hdr.SetFlag<EndOfTransaction>();
+	//
 	SetIntegrityCheckCode(&buf3.hdr, NULL, 0, buf3.snack.GetSaltValue());
 #if defined(TRACE) && (TRACE & (TRACE_HEARTBEAT | TRACE_PACKET | TRACE_SLIDEWIN))
 	printf_s("To send KEEP_ALIVE seq #%u, acknowledge #%u, source ALFID = 0x%X\n"
@@ -492,24 +470,7 @@ int LOCALAPI CSocketItemEx::RespondToSNACK(ControlBlock::seq_t expectedSN, FSP_S
 	// ONLY when the first packet in the send window is acknowledged may round-trip time re-calibrated
 	// We assume that after sliding send window the number of unacknowledged was reduced
 	if(pControlBlock->GetSendQueueHead()->GetFlag<IS_ACKNOWLEDGED>())
-	{
 		pControlBlock->SlideSendWindow();
-		// See also UrgeCommit, DoResend
-		if(_InterlockedCompareExchange8(& shouldAppendCommit, 0, 1) != 0)
-		{
-			int r = pControlBlock->ReplaceSendQueueTailToCommit();
-			if(r == 0)
-			{
-				if (pControlBlock->CountSendBuffered() == 1)
-				{
-					EmitStart();
-					pControlBlock->SlideNextToSend();
-				}
-				// See also EmitQ
-				if(resendTimer == NULL)
-					AddResendTimer(tRoundTrip_us >> 8);
-			}
-		}
-	}
+
 	return nAck;
 }

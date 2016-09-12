@@ -602,7 +602,7 @@ void CSocketItemEx::AffirmConnect(const SConnectParam & initState, ALFID_T idLis
 // Given
 //	CSocketItemEx *		Pointer to the source socket slot. The nextOOBSN field would be updated
 // Remark
-//	On get peer's COMMIT or PERSIST the socket would be put into the remote id's translate look-aside buffer
+//	On get peer's PERSIST the socket would be put into the remote id's translate look-aside buffer
 // See also
 //	OnConnectRequestAck; CSocketItemDl::ToWelcomeConnect; CSocketItemDl::ToWelcomeMultiply
 void CSocketItemEx::InitiateMultiply(CSocketItemEx *srcItem)
@@ -620,10 +620,10 @@ void CSocketItemEx::InitiateMultiply(CSocketItemEx *srcItem)
 	ControlBlock::seq_t seq0 = srcItem->pControlBlock->sendWindowNextSN;
 	contextOfICC.prev = srcItem->contextOfICC.curr;
 	contextOfICC.savedCRC = false;
-	contextOfICC.firstSendSNewKey = seq0 + 1;
-	contextOfICC.keyLife = pControlBlock->connectParams.keyLife;
+	contextOfICC.snFirstSendWithCurrKey = seq0 + 1;
+	contextOfICC.keyLife = pControlBlock->connectParams.keyLife$initialSN;
 	DeriveNextKey();
-	// But the firstRecvSNewKey is set until the first response packet is accepted.
+	// But the snFirstRecvWithCurrKey is unset until the first response packet is accepted.
 	pControlBlock->connectParams.initialSN = seq0;
 
 #if defined(TRACE) && (TRACE & TRACE_OUTBAND)
@@ -655,7 +655,7 @@ void CSocketItemEx::InitiateMultiply(CSocketItemEx *srcItem)
 	tSessionBegin = skb->timeSent = NowUTC();	// UNRESOLVED!? But if SendPacket failed?
 	SendPacket(2, ScatteredSendBuffers(&q, sizeof(FSP_NormalPacketHeader), paidLoad, skb->len));
 
-	// tRoundTrip_us would be calculated when PERSIST or COMMIT is got, when tLastRecv is set as well
+	// tRoundTrip_us would be calculated when PERSIST is got, when tLastRecv is set as well
 	ReplaceTimer(INIT_RETRANSMIT_TIMEOUT_ms);
 }
 
@@ -665,7 +665,7 @@ void CSocketItemEx::InitiateMultiply(CSocketItemEx *srcItem)
 // so that the derived new session key is put into effect
 bool CSocketItemEx::FinalizeMultiply()
 {
-	contextOfICC.firstRecvSNewKey = headPacket->pktSeqNo;
+	contextOfICC.snFirstRecvWithCurrKey = headPacket->pktSeqNo;
 	fidPair.peer = headPacket->idPair.source;
 	if (!ValidateICC())
 	{
@@ -708,14 +708,14 @@ void CMultiplyBacklogItem::ResponseToMultiply()
 	}
 	bool eot = this->IsEndOfMessage();
 	skb->len = CopyOutPlainText(ubuf);
-	skb->SetFlag<TO_BE_CONTINUED>(!eot);
+	skb->SetFlag<END_OF_TRANSACTION>(eot);
 	if (eot)	// See also @DLL::ToWelcomeMultiply
 		SetState(pControlBlock->state == COMMITTING ? COMMITTING2 : PEER_COMMIT);
 	else
 		lowState = pControlBlock->state;
 	// Should lowState == NON_EXISTENT before. See also OnGetMultiply
 
-	// assume contextOfICC, including firstRecvSNewKey and firstSendSNewKey has been set properly
+	// assume contextOfICC, including snFirstRecvWithCurrKey and snFirstSendWithCurrKey has been set properly
 	DeriveNextKey();
 	EmitStart();
 }
@@ -746,16 +746,28 @@ void CSocketItemEx::Accept()
 		((CMultiplyBacklogItem *)this)->ResponseToMultiply();
 	}
 	tSessionBegin = tRecentSend;	// See also CSocketItemEx::OnConnectRequestAck
-	SetCallable();	// The success or failure signal is delayed until PERSIST, COMMIT or RESET received
+	SetCallable();	// The success or failure signal is delayed until PERSIST or RESET received
 }
 
+
+
+// With replay-attack suppression. It could be true while still be out of window
+// TODO! anti-replay attack by manage a replay-attack cache!?
+bool CSocketItemEx::ICCSeqValid()
+{
+	int32_t d = IsOutOfWindow(headPacket->pktSeqNo);
+	if (d > 0 || d <= -MAX_BUFFER_BLOCKS)
+		return false;
+	//
+	return ValidateICC();
+}
 
 
 // Dispose on the demand of the remote peer. Let the garbage collector recycle the resource occupied
 // See also Destroy() and *::KeepAlive case NON_EXISTENT
 void CSocketItemEx::DisposeOnReset()
 {
-	SetState(NON_EXISTENT);
+	lowState = NON_EXISTENT;	// But the ULA's state is kept
 	// It is somewhat an NMI to ULA
 	SignalFirstEvent(FSP_NotifyReset);
 	ReplaceTimer(TRASIENT_STATE_TIMEOUT_ms);
@@ -770,7 +782,7 @@ void CSocketItemEx::Destroy()
 {
 	try
 	{
-		lowState = NON_EXISTENT;	// SetState(NON_EXISTENT);
+		lowState = NON_EXISTENT;	// Donot [SetState(NON_EXISTENT);] as the ULA might do further cleanup
 		RemoveTimers();
 		CSocketItem::Destroy();
 		isReady = 0;	// FreeItem does not reset it
@@ -800,8 +812,8 @@ void CSocketItemEx::Recycle()
 		RejectOrReset();
 		return;
 	}
+	// Donot [pControlBlock->state = NON_EXISTENT;] as the ULA might do further cleanup
 	// See also RejectOrReset, Destroy and @DLL::RespondToRecycle
-	pControlBlock->state = NON_EXISTENT;
 	SignalFirstEvent(FSP_NotifyRecycled);
 	Destroy();
 }
@@ -817,8 +829,7 @@ void CSocketItemEx::RejectOrReset()
 		CLowerInterface::Singleton()->SendPrematureReset(EINTR, this);
 	else if(InStates(6, ESTABLISHED, COMMITTING, PEER_COMMIT, COMMITTING2, COMMITTED, CLOSABLE))
 		SendPacket<RESET>();
-	//
-	pControlBlock->state = NON_EXISTENT;
+	// Do not [pControlBlock->state = NON_EXISTENT;] as the ULA might do further cleanup
 	SignalFirstEvent(FSP_NotifyRecycled);
 	// See also DisposeOnReset, Recycle
 	if(TestAndLockReady())
@@ -828,7 +839,7 @@ void CSocketItemEx::RejectOrReset()
 	else
 	{
 		// It could be lazily Destroyed
-		SetState(NON_EXISTENT);
+		lowState = NON_EXISTENT;
 		ReplaceTimer(TRASIENT_STATE_TIMEOUT_ms);
 	}
 }
