@@ -72,15 +72,6 @@ typedef enum
 
 
 
-typedef enum
-{
-	FSP_INSTALL_KEY_INSTANTLY = 0,
-	FSP_INSTALL_KEY_SEND_PENDING = 1,
-	FSP_INSTALL_KEY_RECV_PENDING = 2
-} FSP_InstallKeyTime;
-
-
-
 #ifdef __cplusplus
 	extern "C" {
 #endif
@@ -118,13 +109,13 @@ typedef int (FSPAPI *CallbackConnected)(FSPHANDLE, PFSP_Context);
 //	FSPHANDLE		the handle of the FSP socket (the context)
 //	void *			the pointer to the (partial) message buffer
 //	int32_t			the length of the available (partial) message in bytes
-//	bool			whether the message is unfinal/partial (to be continued)
+//	BOOL			whether the peer has committed the tansmit transaction
 // Return
 //	true(positive non-zero) if processing is successful and the buffer should be release
 //	false(zero) if processing has not finished and the receive buffer should be held
 // Remark
 //	the caller shall make the callback function thread-safe
-typedef int (FSPAPI *CallbackPeeked)(FSPHANDLE, void *, int32_t, bool);
+typedef int (FSPAPI *CallbackPeeked)(FSPHANDLE, void *, int32_t, BOOL);
 
 
 // The pointer of the function callbacked when some inline send buffer is available
@@ -247,19 +238,14 @@ FSPHANDLE FSPAPI MultiplyAndGetSendBuffer(FSPHANDLE, PFSP_Context, int *, Callba
 //	the buffer of the key
 //	the length of the key in bytes
 //	the life of the key in terms of number of packets allowed to send or resend
-//	whether the key is to be installled lazily
-//		0 if instantly
-//		1 if send of key material pending
-//		2 if receive of key material pending
 // return
 //	0 if no error
-//	-EAGAIN if previous key had not been installed yet, so that InstallKey again was not allowed
 //	-EDOM	if parameter domain error
 //	-EFAULT if unexpected exception
 //	-EINTR	if cannot obtain the right lock
 //	-EIO	if cannot trigger LLS to do the installation work through I/O
 DllSpec
-int FSPAPI InstallAuthenticKey(FSPHANDLE, uint8_t *, int, int32_t, FSP_InstallKeyTime);
+int FSPAPI InstallAuthenticKey(FSPHANDLE, uint8_t *, int, int32_t);
 
 
 
@@ -325,12 +311,12 @@ int FSPAPI RecvInline(FSPHANDLE, CallbackPeeked);
 //	FSPHANDLE		the FSP socket handle
 //	void *			the start pointer of the receive buffer
 //	int				the capacity in byte of the receive buffer
-//	NotifyOrReturn	the function called back when either end of message reached,
+//	NotifyOrReturn	the function called back when either EoT reached,
 //					connection terminated or receive buffer fulfilled
 // Return
 //	0 if no immediate error, negative if error
 // Remark
-//	NotifyOrReturn is called when receive buffer is full OR end of message encountered
+//	NotifyOrReturn is called when receive buffer is full OR end of transaction encountered
 //	NotifyOrReturn might report error later even if ReadFrom itself return no error
 //	Return value passed in NotifyOrReturn is number of octets really received
 //	ULA should check whether the message is completed by calling DLL FSPControl. See also WriteTo()

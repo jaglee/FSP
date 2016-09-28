@@ -14,10 +14,11 @@ static void FSPAPI onShutdown(FSPHANDLE h, FSP_ServiceCode code, int value)
 }
 
 
-static int FSPAPI  onSignatureReceived(FSPHANDLE h, void * buf, int32_t length, bool eom)
+static int FSPAPI  onSignatureReceived(FSPHANDLE h, void * buf, int32_t length, BOOL eot)
 {
 	printf_s("Fiber ID = 0x%X, %d bytes recevied, message:\n", (uint32_t)(intptr_t)h, length);
 	printf_s("%s\n", (CHAR *)buf);
+	// assert(eot);
 	Shutdown(h, onShutdown);
 	return TRUE;
 }

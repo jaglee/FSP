@@ -111,7 +111,7 @@ BOOL WINAPI DllMain(HINSTANCE hInstance, DWORD dwReason, LPVOID lpvReserved)
 //	Exploit _InterlockedXor8 to keep memory access order as the coded order
 bool CSocketItemDl::WaitUseMutex()
 {
-	if(_InterlockedXor8(& inUse, 0) == 0)
+	if(!IsInUse())
 		return false;
 #ifndef NDEBUG
 #ifdef TRACE
@@ -122,7 +122,7 @@ bool CSocketItemDl::WaitUseMutex()
 	{
 		if(GetTickCount64() - t0 > MAX_LOCK_WAIT_ms)
 		{
-			TRACE_HERE("Please trace the call stack, there may be deadlock!");
+			DebugBreak();	// To trace the call stack, there may be deadlock
 			return false;
 		}
 		Sleep(50);	// if there is some thread that has exclusive access on the lock, wait patiently
@@ -130,7 +130,7 @@ bool CSocketItemDl::WaitUseMutex()
 #else
 	AcquireSRWLockExclusive(& rtSRWLock);
 #endif
-	return (_InterlockedXor8(& inUse, 0) != 0); 
+	return IsInUse();
 }
 
 
@@ -154,10 +154,10 @@ int CSocketItemDl::SelfNotify(FSP_ServiceCode c)
 	{
 		if(GetTickCount64() - t0 > MAX_LOCK_WAIT_ms)
 		{
-			TRACE_HERE("Please trace the call stack, there may be deadlock on waiting for free notice slot");
+			DebugBreak();	// To trace the call stack, there may be deadlock on waiting for free notice slot
 			return -EINTR;
 		}
-		Sleep(1);
+		Sleep(50);
 	}
 #ifdef TRACE
 	printf_s("Self notice %s[%d] in local fiber#0x%X, state %s\t\n", noticeNames[c], c, fidPair.source, stateNames[pControlBlock->state]);
@@ -318,18 +318,24 @@ CSocketItemDl * LOCALAPI CSocketItemDl::CallCreate(CommandNewSession & objComman
 
 
 
-// The asynchronous, multi-thread friendly soft interrupt handler
-void CSocketItemDl::WaitEventToDispatch()
+bool CSocketItemDl::LockAndValidate()
 {
+	if(! WaitUseMutex())
+	{
+		if(IsInUse())
+			DebugBreak();	// TRACE_HERE("deadlock encountered!?");
+		return false;
+	}
+
 	if(pControlBlock == NULL)
 	{
 #ifndef NDEBUG
 		printf_s("\nDescriptor=0x%X: event to be processed, but the Control Block is missing!\n", (int32_t)(CSocketItem *)this);
 #endif
 		socketsTLB.FreeItem(this);
-		CancelTimer();	// if any
+		Reinitialize();
 		NotifyError(FSP_NotifyReset, -EBADF);
-		return;
+		return false;
 	}
 
 	if(InIllegalState())
@@ -340,14 +346,29 @@ void CSocketItemDl::WaitEventToDispatch()
 			, (int32_t)(CSocketItem *)this
 			, stateNames[pControlBlock->state], pControlBlock->state);
 #endif
-		NotifyError(FSP_NotifyReset, -EBADF);
+		InterlockedExchangePointer((PVOID *)& fpRecycled, NULL);
 		this->Recycle();
-		return;
+		NotifyError(FSP_NotifyReset, -EBADF);
+		return false;
 	}
 
+	return true;
+}
+
+
+// The asynchronous, multi-thread friendly soft interrupt handler
+void CSocketItemDl::WaitEventToDispatch()
+{
 	FSP_ServiceCode notice;
-	while((notice = pControlBlock->notices.Pop()) != NullCommand)
+	while(LockAndValidate())
 	{
+		notice = pControlBlock->notices.Pop();
+		if(notice == NullCommand)
+		{
+			SetMutexFree();
+			break;
+		}
+
 #ifdef TRACE
 		printf_s("\nIn local fiber#0x%X, state %s\tnotice: %s\n", fidPair.source, stateNames[pControlBlock->state], noticeNames[notice]);
 #endif
@@ -364,6 +385,8 @@ void CSocketItemDl::WaitEventToDispatch()
 				, (int32_t)(CSocketItem *)this
 				, stateNames[pControlBlock->state], pControlBlock->state);
 #endif
+			socketsTLB.FreeItem(this);
+			Reinitialize();
 			NotifyError(FSP_NotifyReset, -EBADF);
 			return;
 		}
@@ -374,60 +397,87 @@ void CSocketItemDl::WaitEventToDispatch()
 		case FSP_NotifyAccepting:	// overloaded callback for either CONNECT_REQUEST or MULTIPLY
 			if(pControlBlock->HasBacklog())
 				ProcessBacklog();
+			SetMutexFree();
 			break;
 		case FSP_NotifyAccepted:
 			CancelTimer();			// If any
 			// Asychronous return of Connect2, where the initiator may cancel data transmission
 			if(InState(CONNECT_AFFIRMING))
 			{
-				ToConcludeConnect();
+				ToConcludeConnect();// SetMutexFree();
 				return;
 			}
 			if(context.onAccepted != NULL)
+			{
+				SetMutexFree();
 				context.onAccepted(this, &context);
-			ProcessReceiveBuffer();
+				if(! LockAndValidate())
+					return;
+			}
+			ProcessReceiveBuffer();	// SetMutexFree();
 			break;
 		case FSP_NotifyMultiplied:	// See also @LLS::Connect()
 			CancelTimer();			// If any
 			fidPair.source = pControlBlock->nearEndInfo.idALF;
 			ProcessReceiveBuffer();
+			if(! LockAndValidate())
+				return;
 			ProcessPendingSend();	// To inherently chain WriteTo/SendInline with Multiply
 			break;
 		case FSP_NotifyDataReady:
-			ProcessReceiveBuffer();
+			ProcessReceiveBuffer();	// SetMutexFree();
 			break;
 		case FSP_NotifyBufferReady:
-			ProcessPendingSend();
+			ProcessPendingSend();	// SetMutexFree();
 			break;
 		case FSP_NotifyToCommit:
 			ProcessReceiveBuffer();	// See FSP_NotifyDataReady, FSP_NotifyFlushed and CSocketItemDl::Shutdown()
+			if(! LockAndValidate())
+				return;
 			if(InState(CLOSABLE) && initiatingShutdown)
 				Call<FSP_Shutdown>();
+			SetMutexFree();
 			break;
 		case FSP_NotifyFlushed:
-			ProcessPendingSend();
+			ProcessPendingSend();	// SetMutexFree();
+			if(! LockAndValidate())
+				return;
 			if(InState(CLOSABLE) && initiatingShutdown)
 				Call<FSP_Shutdown>();
+			SetMutexFree();
 			break;
 		case FSP_NotifyToFinish:
 			if(initiatingShutdown)
 				RespondToRecycle();
+			else
+				SetMutexFree();
 			return;
-		case FSP_NotifyReset:
-			NotifyError(notice, -EINTR);
-			//^otherwise it were as if recycled:
 		case FSP_NotifyRecycled:
 			CancelTimer();	// If any; typically for Shutdown 
 			RespondToRecycle();
 			return;
+		case FSP_NotifyReset:
+			socketsTLB.FreeItem(this);
+			Reinitialize();
+			NotifyError(notice, -EINTR);
+			return;
 		case FSP_IPC_CannotReturn:
 			if (pControlBlock->state == LISTENING)
+			{
+				SetMutexFree();
 				NotifyError(FSP_Listen, -EFAULT);
+			}
 			else if (pControlBlock->state == CONNECT_BOOTSTRAP || pControlBlock->state == CONNECT_AFFIRMING)
+			{
+				SetMutexFree();
 				context.onAccepted(NULL, &context);		// general error
+			}
 #ifdef TRACE
 			else	// else just ignore the dist
+			{
+				SetMutexFree();
 				printf_s("Get FSP_IPC_CannotReturn in the state %s\n", stateNames[pControlBlock->state]);
+			}
 #endif
 			return;
 		case FSP_MemoryCorruption:
@@ -435,7 +485,9 @@ void CSocketItemDl::WaitEventToDispatch()
 		case FSP_NotifyTimeout:
 		case FSP_NotifyNameResolutionFailed:
 			NotifyError(notice, -EINTR);
-			RespondToRecycle();
+			socketsTLB.FreeItem(this);
+			Reinitialize();	// SetMutexFree();
+			return;
 			// UNRESOLVED!? There could be some remedy if name resolution failed?
 		}
 	}

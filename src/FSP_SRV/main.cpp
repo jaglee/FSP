@@ -189,7 +189,6 @@ static void LOCALAPI ProcessCommand(HANDLE md)
 	BYTE buffer[MAX_CTRLBUF_LEN];
 	DWORD nBytesRead;
 	CommandToLLS *pCmd = (CommandToLLS *) buffer;
-	bool r;
 	CSocketItemEx *pSocket;
 	// TODO: UNRESOLVED!there should be performance profiling variables to record how many commands have been processed?
     static int n = 0;
@@ -220,7 +219,7 @@ static void LOCALAPI ProcessCommand(HANDLE md)
 			break;
 		default:
 			pSocket = (CSocketItemEx *)(*CLowerInterface::Singleton())[pCmd->fiberID];
-			if(pSocket == NULL || !pSocket->IsInUse())
+			if(pSocket == NULL)
 			{
 #if defined(TRACE) && (TRACE & TRACE_ULACALL)
 				printf_s("Erratic!%s (code = %d) called for invalid local fiber#0x%X\n"
@@ -230,49 +229,7 @@ static void LOCALAPI ProcessCommand(HANDLE md)
 #endif
 				break;
 			}
-			//  UNRESOLVED! In production multi-issue/multi-executation of ULA command shall be implemented.
-			r = pSocket->TestAndLockReady();
-#ifdef TRACE
-			if(!r)
-			{
-				printf_s("Forcefully enter critical section: %s (code = %d), local fiber#0x%X\n"
-					, opCodeStrings[pCmd->opCode]
-					, pCmd->opCode
-					, pCmd->fiberID);
-			}
-#endif
-			switch(pCmd->opCode)
-			{
-			case FSP_Reject:
-				pSocket->RejectOrReset();
-				break;
-			case FSP_Recycle:
-				pSocket->Recycle();
-				break;
-			case FSP_Start:
-				pSocket->Start();
-				break;
-			case FSP_Send:			// send a packet/group of packets
-				pSocket->ScheduleEmitQ();
-				break;
-			case FSP_Commit:
-				pSocket->UrgeCommit();
-				break;
-			case FSP_Shutdown:
-				pSocket->SendPacket<RELEASE>();
-				break;
-			case FSP_InstallKey:
-				pSocket->InstallSessionKey();
-				break;
-			default:
-	#ifndef NDEUBG
-				printf("Internal error: undefined upper layer application command code %d\n", pCmd->opCode);
-	#endif
-				break;
-			}
-			//
-			if(r)
-				pSocket->SetReady();
+			pSocket->ProcessCommand(pCmd->opCode);
 		}
 		// hard-coded: (ushort)(-1) mean exit
 		if(buffer[0] == 0xFF || buffer[1] == 0xFF)

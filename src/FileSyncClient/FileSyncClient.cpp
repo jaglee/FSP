@@ -166,7 +166,7 @@ static int	FSPAPI  onConnected(FSPHANDLE h, PFSP_Context ctx)
 	WriteTo(h, bufPublicKey, CRYPTO_NACL_KEYBYTES, EOF, onPublicKeySent);
 
 	printf_s("\tTo install the shared key instantly...\n");
-	InstallAuthenticKey(h, bufSharedKey, CRYPTO_NACL_KEYBYTES, INT32_MAX, FSP_INSTALL_KEY_INSTANTLY);
+	InstallAuthenticKey(h, bufSharedKey, CRYPTO_NACL_KEYBYTES, INT32_MAX);
 
 	return 0;
 }
@@ -264,7 +264,7 @@ static void FSPAPI onReceiveFileNameReturn(FSPHANDLE h, FSP_ServiceCode resultCo
 
 
 
-static int FSPAPI onReceiveNextBlock(FSPHANDLE h, void *buf, int32_t len, bool toBeContinued)
+static int FSPAPI onReceiveNextBlock(FSPHANDLE h, void *buf, int32_t len, BOOL eot)
 {
 	if(buf == NULL)
 	{
@@ -290,7 +290,7 @@ static int FSPAPI onReceiveNextBlock(FSPHANDLE h, void *buf, int32_t len, bool t
 	printf_s("%d bytes written to local storage.\n", bytesWritten);
 	// needn't UnlockPeeked as Shutdown would forcefully close the receive window
 	// and return a non-zero would let the occupied receive buffer free
-	if(! toBeContinued)
+	if(eot)
 	{
 		printf_s("All data have been received, to acknowledge...\n");
 		// Respond with a code saying no error

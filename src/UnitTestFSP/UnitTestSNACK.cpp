@@ -59,12 +59,12 @@ void UnitTestSendRecvWnd()
 	// TODO: SCB buffer pointer to user space pointer
 	skb4->opCode = PURE_DATA;
 	skb4->len = MAX_BLOCK_SIZE - 13;
-	skb4->SetFlag<TO_BE_CONTINUED>(false);
+	skb4->SetFlag<END_OF_TRANSACTION>();
 	skb4->SetFlag<IS_FULFILLED>();
 
 	int m2;	// onReturn it should == skb4->len, i.e. MAX_BLOCK_SIZE - 13
-	bool toBeContinued;
-	uint8_t *recvBuf2 = (uint8_t *)pSCB->InquireRecvBuf(m2, toBeContinued);
+	bool b;
+	uint8_t *recvBuf2 = (uint8_t *)pSCB->InquireRecvBuf(m2, b);
 	Assert::IsTrue(recvBuf2 == recvBuf);
 	Assert::IsTrue(m2 == MAX_BLOCK_SIZE - 13);
 	Assert::IsTrue(pSCB->recvWindowFirstSN == FIRST_SN + 1);
@@ -85,7 +85,7 @@ void UnitTestSendRecvWnd()
 
 	skb5->opCode = PURE_DATA;
 	skb5->len = MAX_BLOCK_SIZE - 13;
-	skb5->SetFlag<TO_BE_CONTINUED>(false);
+	skb5->SetFlag<END_OF_TRANSACTION>();
 	skb5->SetFlag<IS_FULFILLED>();
 	skb5->Lock();
 
@@ -95,7 +95,7 @@ void UnitTestSendRecvWnd()
 
 	skb5->opCode = PURE_DATA;
 	skb5->len = MAX_BLOCK_SIZE;
-	skb5->SetFlag<TO_BE_CONTINUED>();
+	skb5->SetFlag<END_OF_TRANSACTION>(false);
 	skb5->SetFlag<IS_FULFILLED>();
 	skb5->Lock();
 
@@ -108,7 +108,7 @@ void UnitTestSendRecvWnd()
 
 	skb5->opCode = PURE_DATA;
 	skb5->len = MAX_BLOCK_SIZE - 13;
-	skb5->SetFlag<TO_BE_CONTINUED>(false);
+	skb5->SetFlag<END_OF_TRANSACTION>();
 	skb5->SetFlag<IS_FULFILLED>();
 
 	// what is the content of the selective negative acknowledgement?
@@ -135,7 +135,7 @@ void UnitTestSendRecvWnd()
 	{
 		pSCB->SlideRecvWindowByOne();
 		p->SetFlag<IS_FULFILLED>(false);	// so that it would not be re-delivered
-		if(!p->GetFlag<TO_BE_CONTINUED>())
+		if(p->GetFlag<END_OF_TRANSACTION>())
 			break;
 		p = pSCB->GetFirstReceived();
 	}
@@ -185,6 +185,7 @@ void UnitTestGenerateSNACK()
 	Assert::IsNotNull(skb1);
 	skb1->opCode = PURE_DATA;
 	skb1->SetFlag<IS_FULFILLED>();
+	skb1->SetFlag<END_OF_TRANSACTION>();
 	Assert::IsTrue(pSCB->recvWindowNextSN == FIRST_SN + 1);
 
 	skb1 = socket.AllocRecvBuf(FIRST_SN + 2);
@@ -217,7 +218,7 @@ void UnitTestGenerateSNACK()
 	Assert::IsTrue(r == 2 && seq0 == FIRST_SN + 1);
 
 	// when a very large continuous data segment among small gaps
-	for(int i = 4; i < 0x10003; i++)
+	for(int i = 4; i < 0x10003U; i++)
 	{
 		skb1 = socket.AllocRecvBuf(FIRST_SN + i);
 		Assert::IsNotNull(skb1);
@@ -228,9 +229,9 @@ void UnitTestGenerateSNACK()
 	r = pSCB->GetSelectiveNACK(seq0, gaps, MAX_GAPS_NUM);
 	Assert::IsTrue(r == 2 && seq0 == FIRST_SN + 1);
 
-	bool b;
+	bool b;	// Used to be test for 'To be Continued', now for 'End of Transaction'
 	pSCB->InquireRecvBuf(r, b);
-	Assert::IsFalse(b);
+	Assert::IsTrue(b);
 	Assert::IsTrue(pSCB->recvWindowHeadPos == 1 && pSCB->recvWindowFirstSN == (FIRST_SN + 1));
 
 	skb1 = socket.AllocRecvBuf(FIRST_SN + 1);
@@ -239,22 +240,25 @@ void UnitTestGenerateSNACK()
 	skb1->SetFlag<IS_FULFILLED>();
 
 	ControlBlock::PFSP_SocketBuf p = pSCB->HeadRecv();
-	for(int i = 0; i < 0x10001; i++)
-	{
-		p->len = MAX_BLOCK_SIZE;
-		(p++)->SetFlag<TO_BE_CONTINUED>();
-	}
+	(++p)->len = MAX_BLOCK_SIZE;
+	(++p)->len = MAX_BLOCK_SIZE;
 
 	pSCB->InquireRecvBuf(r, b);
-	Assert::IsTrue(b && r == MAX_BLOCK_SIZE * 2);
+	Assert::IsTrue(!b && r == MAX_BLOCK_SIZE * 2);	// positon 0 skipped; position 3 is the gap
 
 	skb1 = socket.AllocRecvBuf(FIRST_SN + 3);
 	Assert::IsNotNull(skb1);
 	skb1->opCode = PURE_DATA;
 	skb1->SetFlag<IS_FULFILLED>();
-	skb1->SetFlag<TO_BE_CONTINUED>();
 
-	pSCB->InquireRecvBuf(r, b);
+	for(int i = 0; i < 0x10000; i++, p++)	// position 3 to position 0x10002
+	{
+		p->len = MAX_BLOCK_SIZE;	// opCode has been set
+	}
+	p->SetFlag<IS_FULFILLED>(false);// p->SetFlag<END_OF_TRANSACTION>();//partial delivery should work
+
+	void * buf = pSCB->InquireRecvBuf(r, b);
+	Assert::IsNotNull(buf);
 	Assert::IsFalse(b);
 	Assert::IsTrue(pSCB->recvWindowHeadPos == 0x10002 && pSCB->recvWindowFirstSN == (FIRST_SN + 0x10002));
 
@@ -264,11 +268,13 @@ void UnitTestGenerateSNACK()
 	skb1->opCode = PURE_DATA;
 	skb1->SetFlag<IS_FULFILLED>();
 	Assert::IsTrue(pSCB->recvWindowNextSN == FIRST_SN + 0x20002);
+	// But the last dataLength == 2 because of buffer round-robin
 
 	r = pSCB->GetSelectiveNACK(seq0, gaps, MAX_GAPS_NUM);
 	// there's a continuous data block which is not delivered yet. however, it is not considered needing a gap descriptor
-	Assert::IsTrue(r == 1 && seq0 == FIRST_SN + 0x10004);	// because +0x10003 has been assumed received
-	// Dump the descriptor in the flow test which attaches a console.
+	Assert::IsTrue(r == 2 && seq0 == FIRST_SN + 0x10002);	// because position 0x10003's NOT IS_FULFILLED was cleared
+	Assert::IsTrue(gaps[0].gapWidth == 1 && gaps[0].dataLength == 1
+				&& gaps[1].gapWidth == 0xFFFC && gaps[1].dataLength == 2);
 }
 
 

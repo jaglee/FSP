@@ -22,7 +22,7 @@ extern int	FSPAPI onMultiplying(FSPHANDLE, PFSP_SINKINF, PFSP_IN6_ADDR);
 static int	FSPAPI onConnected(FSPHANDLE, PFSP_Context);
 static void FSPAPI onPublicKeySent(FSPHANDLE, FSP_ServiceCode, int);
 static void FSPAPI onReceiveFileNameReturn(FSPHANDLE, FSP_ServiceCode, int);
-static int	FSPAPI onReceiveNextBlock(FSPHANDLE, void *, int32_t, bool);
+static int	FSPAPI onReceiveNextBlock(FSPHANDLE, void *, int32_t, BOOL);
 
 //
 static void FSPAPI onAcknowledgeSent(FSPHANDLE, FSP_ServiceCode, int);

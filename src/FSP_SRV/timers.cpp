@@ -75,14 +75,14 @@
 #define TIMED_OUT() \
 		Notify(FSP_NotifyTimeout);	\
 		lowState = NON_EXISTENT;	\
-		SetReady();	\
+		SetMutexFree();	\
 		return
 
 
 // A low frequence KEEP_ALIVE is a MUST
 void CSocketItemEx::KeepAlive()
 {
-	if(! this->TestAndLockReady())
+	if(! WaitUseMutex())
 	{
 		if (!IsInUse())
 		{
@@ -183,7 +183,7 @@ void CSocketItemEx::KeepAlive()
 		Destroy();
 	}
 
-	SetReady();
+	SetMutexFree();
 }
 
 
@@ -194,7 +194,7 @@ void CSocketItemEx::DoResend()
 {
 	const int32_t capacity = pControlBlock->sendBufferBlockN;
 	resendTimer = NULL;
-	if(! TestAndLockReady())
+	if(! WaitUseMutex())
 	{
 #ifdef TRACE
 		printf_s("\n#0x%X's DoResend not executed due to lack of locks in state %s. InUse: %d\n"
@@ -253,7 +253,7 @@ void CSocketItemEx::DoResend()
 	else
 		EmitQ();	// retry to send those pending on the queue
 
-	SetReady();
+	SetMutexFree();
 }
 
 
@@ -262,13 +262,13 @@ void CSocketItemEx::DoResend()
 void CSocketItemEx::LazilySendSNACK()
 {
 	lazyAckTimer = NULL;
-	if(! TestAndLockReady())
+	if(! WaitUseMutex())
 	{
 #ifdef TRACE
 		printf_s("\n#0x%X's LazilySendSNACK not executed due to lack of locks in state %s. InUse: %d\n"
 			, fidPair.source, stateNames[lowState], IsInUse());
 #endif
-		if(lazyAckTimeoutRetryCount < TIMEOUT_RETRY_MAX_COUNT)
+		if(IsInUse() && lazyAckTimeoutRetryCount < TIMEOUT_RETRY_MAX_COUNT)
 		{
 			lazyAckTimeoutRetryCount++;
 			AddLazyAckTimer();
@@ -277,7 +277,6 @@ void CSocketItemEx::LazilySendSNACK()
 	}
 	lazyAckTimeoutRetryCount = 0;
 
-	// A COMMIT packet may trigger an instant ACK_FLUSH and make the lazy KEEP_ALIVE obsolete
 	if(!InState(ESTABLISHED) && !InState(COMMITTING) && !InState(COMMITTED))
 	{
 #ifdef TRACE
@@ -290,7 +289,7 @@ void CSocketItemEx::LazilySendSNACK()
 		SendKeepAlive();
 	}
 
-	SetReady();
+	SetMutexFree();
 }
 
 

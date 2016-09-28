@@ -82,9 +82,6 @@ typedef CSocketItem * PSocketItem;
 // per-session connection limit. thereotically any connectable socket might be listener
 #define MAX_CONNECTION_NUM	16	// 256	// must be some power value of 2
 
-#define MAX_LOCK_WAIT_ms	60000	// one minute. for very large buffer compression or de-compression it may be too small
-
-
 class CSocketItemDl: public CSocketItem
 {
 	friend class	CSocketDLLTLB;
@@ -155,6 +152,7 @@ protected:
 	void TimeOut();
 
 	void WaitEventToDispatch();
+	bool LockAndValidate();
 
 	// in Establish.cpp
 	void ProcessBacklog();
@@ -187,7 +185,8 @@ protected:
 
 public:
 	CSocketItemDl() { InitializeSRWLock(& rtSRWLock); }	// and lazily initialized
-	~CSocketItemDl()
+	~CSocketItemDl() { Reinitialize(); }
+	void Reinitialize()
 	{
 		register HANDLE h;
 		CancelTimer();
@@ -196,6 +195,11 @@ public:
 		//^NULL: return immediately; INVALID_HANDLE_VALUE: waits for all callback functions to complete before returning
 		//
 		CSocketItem::Destroy();
+		fpSent = NULL;
+		fpPeeked = NULL;
+		fpReceived = NULL;
+		fpRecycled = NULL;
+		InitializeSRWLock(& rtSRWLock); 
 	}
 	int LOCALAPI Initialize(PFSP_Context, char *);
 	int Recycle();
@@ -254,7 +258,7 @@ public:
 	}
 	CSocketItemDl * LOCALAPI CallCreate(CommandNewSession &, FSP_ServiceCode);
 
-	int LOCALAPI InstallKey(BYTE *, int, int32_t, FSP_InstallKeyTime);
+	int LOCALAPI InstallKey(BYTE *, int, int32_t);
 
 	int LOCALAPI AcquireSendBuf(int);
 	int LOCALAPI SendInplace(void *, int, int8_t);

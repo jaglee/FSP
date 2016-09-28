@@ -130,7 +130,10 @@ void TraceLastError(char * fileName, int lineNo, char *funcName, char *s1);
 # define LAZY_ACK_DELAY_MIN_ms		1		// 1 millisecond, minimum delay for lazy acknowledgement
 #endif
 
+
+#define MAX_LOCK_WAIT_ms			60000	// one minute
 #define	TIMEOUT_RETRY_MAX_COUNT		5
+
 
 #if defined(_MSC_VER) || defined(_MSC_EXTENSIONS)
   #define DELTA_EPOCH_IN_MICROSECS  11644473600000000Ui64
@@ -560,7 +563,7 @@ struct ControlBlock
 {
 	ALIGN(8)
 	volatile FSP_Session_State state;
-	char			hasPendingKey;
+	//
 	ALFID_T			idParent;
 
 	ALIGN(8)	// 64-bit aligment
@@ -772,7 +775,7 @@ struct ControlBlock
 	}
 	// Given
 	//	int & : [_Out_] place holder of the number of bytes [to be] peeked.
-	//	bool &: [_Out_] place holder of the flag telling whether there are further data to receive
+	//	bool &: [_Out_] place holder of the End of Transaction flag
 	// Return
 	//	Start address of the received message
 	void * LOCALAPI InquireRecvBuf(int &, bool &);

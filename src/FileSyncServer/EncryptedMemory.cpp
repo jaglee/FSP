@@ -57,7 +57,7 @@ static void FSPAPI onPublicKeyReceived(FSPHANDLE h, FSP_ServiceCode c, int r)
 	CryptoNaClGetSharedSecret(bufSharedKey, bufPeerPublicKey, bufPrivateKey);
 
 	printf_s("\nTo install the negotiated shared key instantly...\n");
-	InstallAuthenticKey(h, bufSharedKey, CRYPTO_NACL_KEYBYTES, INT32_MAX, FSP_INSTALL_KEY_INSTANTLY);
+	InstallAuthenticKey(h, bufSharedKey, CRYPTO_NACL_KEYBYTES, INT32_MAX);
 
 	printf_s("\tTo send filename to the remote end...\n");
 	WriteTo(h, fileName, (int)strlen(fileName) + 1, EOF, onFileNameSent);

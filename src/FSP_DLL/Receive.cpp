@@ -63,7 +63,7 @@ int FSPAPI RecvInline(FSPHANDLE hFSPSocket, CallbackPeeked fp1)
 //	FSPHANDLE		the FSP socket handle
 //	void *			the start pointer of the receive buffer
 //	int				the capacity in byte of the receive buffer
-//	NotifyOrReturn	the function called back when either end of message reached,
+//	NotifyOrReturn	the function called back when either EoT reached,
 //					connection terminated or receive buffer fulfilled
 // Return
 //	0 if no immediate error, negative if error, positive if it is the length of the available data
@@ -246,6 +246,8 @@ int CSocketItemDl::FetchReceived()
 
 
 // Remark
+//	It is meant to be called by the soft interrupt handling entry function where the mutex lock has been obtained
+//	and it sets the mutex lock free on leave.
 //	fpReceived would not be reset if internal memeory allocation error detected
 //	If RecvInline() failed (say, due to compression and/or encryption), data may be picked up by ReadFrom()
 //	ULA should make sure that the socket is freed in the callback function (if recycling is notified)
@@ -253,20 +255,6 @@ void CSocketItemDl::ProcessReceiveBuffer()
 {
 #ifdef TRACE
 	printf_s("Process receive buffer in state %s\n", stateNames[pControlBlock->state]);
-#endif
-	if(! WaitUseMutex())
-	{
-		TRACE_HERE("deadlock encountered!?");
-		return;
-	}
-	// The received message might be buffered and fetched any time in any legal state
-#ifndef NDEBUG
-	if (InIllegalState())
-	{
-		printf_s("Is it illegal to ProcessReceiveBuffer in state %s?!\n", stateNames[pControlBlock->state]);
-		SetMutexFree();
-		return;
-	}
 #endif
 	//
 	CallbackPeeked fp1 = fpPeeked;
@@ -280,10 +268,10 @@ void CSocketItemDl::ProcessReceiveBuffer()
 		bool b;
 		void *p = pControlBlock->InquireRecvBuf(n, b);
 #ifdef TRACE
-		printf_s("Data to deliver: 0x%08X, length = %u, eom = %d\n", (LONG)p, n, (int)!b);
+		printf_s("Data to deliver: 0x%08X, length = %u, eot = %d\n", (LONG)p, n, (int)b);
 #endif
-		// If end-of-message encountered reset fpPeeked so that RecvInline() may work
-		if(!b)
+		// If end-of-transaction encountered reset fpPeeked so that RecvInline() may work
+		if(b)
 		{
 #ifdef TRACE
 			printf_s("Message terminated\n");

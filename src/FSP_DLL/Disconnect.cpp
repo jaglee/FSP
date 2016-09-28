@@ -55,15 +55,19 @@ int CSocketItemDl::Recycle()
 	if(! IsInUse())
 		return EAGAIN;	// warning: already disposed
 
-	// The shared control block MUST be preserved, or else LLS might encountered error
-	// So every time a control block is re-used, it MUST be re-initialized
-	socketsTLB.FreeItem(this);
 	if (lowerLayerRecycled)
 	{
 		RespondToRecycle();
 		return 0;
 	}
-	return Call<FSP_Recycle>() ? 0 : -EIO;
+	bool b = Call<FSP_Recycle>();
+	if(b)
+		return 0;	// Free the socket item when FSP_Recycle called back
+	// Shall be rare:
+	socketsTLB.FreeItem(this);
+	Reinitialize();
+	DebugBreak();
+	return -EIO;
 }
 
 
@@ -181,7 +185,7 @@ void CSocketItemDl::RespondToRecycle()
 {
 	NotifyOrReturn fp1 = (NotifyOrReturn)InterlockedExchangePointer((PVOID *)& fpRecycled, NULL);
 	socketsTLB.FreeItem(this);
-	this->Destroy();
+	Reinitialize();
 	if (fp1 != NULL)
 		fp1(this, FSP_NotifyRecycled, 0);
 }

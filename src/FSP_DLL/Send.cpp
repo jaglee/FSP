@@ -244,7 +244,7 @@ int LOCALAPI CSocketItemDl::SendStream(void * buffer, int len, bool flag)
 //	See also FinalizeSend()
 int LOCALAPI CSocketItemDl::CheckTransmitaction(bool eotFlag)
 {
-	if(eotFlag || pControlBlock->hasPendingKey != 0)
+	if(eotFlag)
 		isFlushing = 1;
 	// else keep the isFlushing flag
 
@@ -317,11 +317,6 @@ void CSocketItemDl::ProcessPendingSend()
 #ifdef TRACE
 	printf_s("Process pending send in state %s\n", stateNames[pControlBlock->state]);
 #endif
-	if(! WaitUseMutex())
-	{
-		TRACE_HERE("deadlock encountered!?");
-		return;
-	}
 	// Assume it has taken exclusive access of the socket
 	// WriteTo takes precedence over SendInline. In the contrast to RecvInline takes precedence over ReadFrom
 	if(pendingSendBuf != NULL && pendingSendSize > 0)

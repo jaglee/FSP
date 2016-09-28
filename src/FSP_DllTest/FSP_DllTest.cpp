@@ -30,7 +30,7 @@ void UnitTestCheckedRevertCommit()
 {
 	CSocketItemDbg *pSocketItem = GetPreparedSocket();
 	ControlBlock *pSCB = pSocketItem->GetControlBlock();
-	int8_t flag = 0;
+	bool flag = false;
 
 	pSCB->state = NON_EXISTENT;
 	int r = pSocketItem->CheckTransmitaction(flag);
@@ -91,7 +91,7 @@ void UnitTestCheckedRevertCommit()
 	//
 	//
 	pSCB->state = NON_EXISTENT;
-	flag = EOF;
+	flag = true;
 	r = pSocketItem->CheckTransmitaction(flag);
 	assert(r < 0);
 
@@ -253,7 +253,7 @@ void UnitTestPrepareToSend()
 	// One packet
 	pSocketItem->SetState(ESTABLISHED);
 	pSocketItem->SetNewTransaction();
-	pSocketItem->PrepareToSend(buf, MAX_BLOCK_SIZE - 2, EOF);
+	pSocketItem->PrepareToSend(buf, MAX_BLOCK_SIZE - 2, true);
 	assert(pSCB->sendBufferNextSN == FIRST_SN + 1);
 	printf_s("Buffer next SN = %u; start packet operation is %s, state is %s\n"
 		, pSCB->sendBufferNextSN
@@ -264,7 +264,7 @@ void UnitTestPrepareToSend()
 	pSocketItem->SetState(ESTABLISHED);
 	pSocketItem->SetNewTransaction();
 	pSCB->SetSendWindow(FIRST_SN);
-	pSocketItem->PrepareToSend(buf, MIN_RESERVED_BUF - 2, EOF);
+	pSocketItem->PrepareToSend(buf, MIN_RESERVED_BUF - 2, true);
 	printf_s("Buffer next SN = %u; start packet operation is %s, state is %s\n\n"
 		, pSCB->sendBufferNextSN
 		, opCodeStrings[skb->opCode]

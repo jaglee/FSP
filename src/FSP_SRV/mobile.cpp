@@ -416,13 +416,14 @@ void * LOCALAPI CSocketItemEx::SetIntegrityCheckCode(FSP_NormalPacketHeader *p1,
 // Given
 //	FSP_NormalPacketHeader *	The pointer to the fixed header
 //	int32_t						The size of the ciphertext
+//	ALFID_T						The source ALFID of the received packet
 //	uint32_t					The xor'ed salt
 // Return
 //	true if all of the headers passed authentication and the optional payload successfully decrypted
 // Remark
 //	Assume the headers are 64-bit aligned
 //	UNRESOLVED!? Is it meaningless to recover the ICC field?	// p1->integrity.code = *(uint64_t *)tag;
-bool CSocketItemEx::ValidateICC(FSP_NormalPacketHeader *p1, int32_t ctLen, uint32_t salt)
+bool LOCALAPI CSocketItemEx::ValidateICC(FSP_NormalPacketHeader *p1, int32_t ctLen, ALFID_T idSource, uint32_t salt)
 {
 	ALIGN(MAC_ALIGNMENT) uint64_t tag[FSP_TAG_SIZE / sizeof(uint64_t)];
 
@@ -464,7 +465,7 @@ bool CSocketItemEx::ValidateICC(FSP_NormalPacketHeader *p1, int32_t ctLen, uint3
 			return false;
 
 		GCM_AES_XorSalt(pCtx, salt);
-		p1->integrity.id.source = fidPair.peer;
+		p1->integrity.id.source = idSource;
 		p1->integrity.id.peer = fidPair.source;
 		r = (GCM_AES_AuthenticateAndDecrypt(pCtx, *(uint64_t *)p1
 			, (const uint8_t *)p1 + byteA, ctLen
@@ -476,56 +477,6 @@ bool CSocketItemEx::ValidateICC(FSP_NormalPacketHeader *p1, int32_t ctLen, uint3
 	}
 	p1->integrity.code = tag[0];
 	if(! r)
-		return false;
-
-	ChangeRemoteValidatedIP();
-	return true;
-}
-
-
-
-// Given
-//	FSP_NormalPacketHeader *	The pointer to the fixed header
-//	int32_t						The size of the ciphertext
-//	ALFID_T						The source application fiber ID
-//	uint32_t					The xor'ed salt
-// Return
-//	true if all of the headers passed authentication and the optional payload successfully decrypted
-// Remark
-//	Assume the headers are 64-bit aligned
-//	It is for MULTIPLY command packet where the source ALFID is freshly incarnated
-bool CSocketItemEx::ValidateICC(FSP_NormalPacketHeader *p1, int32_t ctLen, ALFID_T idSource, uint32_t salt)
-{
-	ALIGN(MAC_ALIGNMENT) uint64_t tag[FSP_TAG_SIZE / sizeof(uint64_t)];
-
-	tag[0] = p1->integrity.code;
-#if defined(TRACE) && (TRACE & TRACE_PACKET)
-	printf_s("Before GCM_AES_AuthenticateAndDecrypt:\n");
-	DumpNetworkUInt16((uint16_t *)p1, sizeof(FSP_NormalPacketHeader) / 2);
-#endif
-	uint32_t seqNo = be32toh(p1->sequenceNo);
-	bool r;
-	GCM_AES_CTX *pCtx = int32_t(seqNo - contextOfICC.snFirstRecvWithCurrKey) < 0
-		? &contextOfICC.prev.gcm_aes
-		: &contextOfICC.curr.gcm_aes;
-	uint32_t byteA = be16toh(p1->hs.hsp);
-	if (byteA < sizeof(FSP_NormalPacketHeader) || byteA > MAX_LLS_BLOCK_SIZE || (byteA & (sizeof(uint64_t) - 1)) != 0)
-		return false;
-
-	GCM_AES_XorSalt(pCtx, salt);
-	p1->integrity.id.source = idSource;	// instead of 'fidPair.peer';
-	p1->integrity.id.peer = fidPair.source;
-	// CRC64 is the initial integrity check algorithm
-	r = (GCM_AES_AuthenticateAndDecrypt(pCtx, *(uint64_t *)p1
-		, (const uint8_t *)p1 + byteA, ctLen
-		, (const uint64_t *)p1 + 1, byteA - sizeof(uint64_t)
-		, (const uint8_t *)tag, FSP_TAG_SIZE
-		, (uint64_t *)p1 + byteA / sizeof(uint64_t))
-		== 0);
-	GCM_AES_XorSalt(pCtx, salt);
-
-	p1->integrity.code = tag[0];
-	if (!r)
 		return false;
 
 	ChangeRemoteValidatedIP();
@@ -667,8 +618,10 @@ int CSocketItemEx::EmitWithICC(ControlBlock::PFSP_SocketBuf skb, ControlBlock::s
 // No matter whether the KEEP_ALIVE flag was set when the connection was setup
 void CSocketItemEx::OnLocalAddressChanged()
 {
-	if(!IsInUse() || IsPassive() || !TestAndWaitReady())
+	if (!WaitUseMutex())
 		return;
+	if (!IsInUse() || IsPassive())
+		goto l_return;
 	
 	SendKeepAlive();
 
@@ -680,8 +633,8 @@ void CSocketItemEx::OnLocalAddressChanged()
 		SOCKADDR_SUBNET(sockAddrTo) = SOCKADDR_SUBNET(p);
 		SOCKADDR_HOSTID(sockAddrTo) = SOCKADDR_HOSTID(p);
 	}
-
-	SetReady();
+l_return:
+	SetMutexFree();
 }
 #endif
 

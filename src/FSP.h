@@ -92,6 +92,8 @@ typedef enum _FSP_Session_State: char
 	NON_EXISTENT = 0, 
 	// the passiver listener to folk new connection handle:
 	LISTENING,
+	// context cloned/connection multiplying (ESTABLISHED:CLOSABLE)
+	CLONING,
 	// initiative, after sending initiator's check code, before getting responder's cookie
 	// timeout to retry or NON_EXISTENT:
 	CONNECT_BOOTSTRAP,
@@ -120,10 +122,8 @@ typedef enum _FSP_Session_State: char
 	// after ULA shutdown the connection in CLOSABLE state gracefully
 	// it isn't a pseudo-state alike TCP, but a physical, resumable/reusable state
 	CLOSED,
-	// context cloned/connection multiplying (ESTABLISHED:CLOSABLE)
-	CLONING,
 	//
-	LARGEST_FSP_STATE = CLONING
+	LARGEST_FSP_STATE = CLOSED
 } FSP_Session_State;
 
 

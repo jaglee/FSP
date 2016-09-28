@@ -71,6 +71,8 @@ const char * CStringizeState::names[LARGEST_FSP_STATE + 1] =
 	"NON_EXISTENT",
 	// the passiver listener to folk new connection handle:
 	"LISTENING",
+	// context cloned by MultiplyAndWrite or MultiplyAndGetSendBuffer:
+	"CLONING",
 	// initiative, after sending initiator's check code, before getting responder's cookie
 	// timeout to retry or NON_EXISTENT:
 	"CONNECT_BOOTSTRAP",
@@ -100,8 +102,6 @@ const char * CStringizeState::names[LARGEST_FSP_STATE + 1] =
 	// after ULA shutdown the connection in CLOSABLE state gracefully
 	// it isn't a pseudo-state alike TCP, but a physical, resumable/reusable state
 	"CLOSED",
-	// context cloned by ConnectMU:
-	"CLONING",
 };
 
 
@@ -560,7 +560,7 @@ ControlBlock::PFSP_SocketBuf LOCALAPI ControlBlock::AllocRecvBuf(seq_t seq1)
 
 // Given
 //	int & : [_Out_] place holder of the number of bytes [to be] peeked.
-//	bool &: [_Out_] place holder of the flag telling whether there are further data to receive
+//	bool &: [_Out_] place holder of the End of Transaction flag
 // Return
 //	Start address of the received message
 // Remark
@@ -570,7 +570,7 @@ ControlBlock::PFSP_SocketBuf LOCALAPI ControlBlock::AllocRecvBuf(seq_t seq1)
 //	-EFAULT		the descriptor is corrupted (illegal payload length:
 //				payload length of an intermediate packet of a message should be MAX_BLOCK_SIZE,
 //				payload length of any packet should be no less than 0 and no greater than MAX_BLOCK_SIZE)
-void * LOCALAPI ControlBlock::InquireRecvBuf(int & nIO, bool & toBeContinued)
+void * LOCALAPI ControlBlock::InquireRecvBuf(int & nIO, bool & eotFlag)
 {
 	PFSP_SocketBuf p = GetFirstReceived();
 	void *pMsg = GetRecvPtr(p);
@@ -595,7 +595,7 @@ void * LOCALAPI ControlBlock::InquireRecvBuf(int & nIO, bool & toBeContinued)
 	}
 	//
 	nIO = 0;
-	toBeContinued = true;
+	eotFlag = false;
 	for(i = 0; i < m && p->GetFlag<IS_FULFILLED>(); i++)
 	{
 		if(p->len > MAX_BLOCK_SIZE || p->len < 0)
@@ -608,16 +608,14 @@ void * LOCALAPI ControlBlock::InquireRecvBuf(int & nIO, bool & toBeContinued)
 		if (_InterlockedExchange8((char *) & p->opCode, 0) == 0)
 		{
 			TRACE_HERE("To double deliver a packet?");
-			recvWindowFirstSN -= i;
 			return NULL;
 		}
 		//
-		recvWindowFirstSN++;
 		nIO += p->len;
 		//
 		if(p->GetFlag<END_OF_TRANSACTION>())
 		{
-			toBeContinued = false;
+			eotFlag = true;
 			i++;
 			break;
 		}
@@ -631,6 +629,7 @@ void * LOCALAPI ControlBlock::InquireRecvBuf(int & nIO, bool & toBeContinued)
 		p++;
 	}
 	//
+	recvWindowFirstSN += i;
 	recvWindowHeadPos += i;
 	if(recvWindowHeadPos - recvBufferBlockN >= 0)
 		recvWindowHeadPos -= recvBufferBlockN;

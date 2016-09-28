@@ -147,7 +147,7 @@ void Multiply(CommandCloneSessionSrv &cmd)
 		return;
 	}
 
-	if(! srcItem->TestAndWaitReady())
+	if(! srcItem->WaitUseMutex())
 	{
 		TRACE_HERE("Cloned connect busy");
 		return;
@@ -169,7 +169,7 @@ void Multiply(CommandCloneSessionSrv &cmd)
 	CSocketItemEx *newItem = (CLowerInterface::Singleton())->AllocItem();
 	if (newItem == NULL || !newItem->MapControlBlock(cmd))
 	{
-		srcItem->SetReady();
+		srcItem->SetMutexFree();
 		if(newItem == NULL)
 		{
 			TRACE_HERE("Internal panic! Cannot allocate new socket slot");
@@ -187,9 +187,58 @@ void Multiply(CommandCloneSessionSrv &cmd)
 	newItem->InitiateMultiply(srcItem);
 l_return:
 	// Only on exception would it signal event to DLL
-	srcItem->SetReady();
+	srcItem->SetMutexFree();
 }
 
+
+
+// Given
+//	FSP_ServiceCode		The service command requested by ULA
+// Do
+//	Excute ULA's request
+// UNRESOLVED! In production multi-issue/multi-executation of ULA command shall be implemented.
+void CSocketItemEx::ProcessCommand(FSP_ServiceCode c)
+{
+	WaitUseMutex();
+	if(!IsInUse() || lowState <= 0 || lowState > LARGEST_FSP_STATE)
+	{
+		SetMutexFree();
+		printf_s("Socket(%p) is not in working state, inUse = %d, %s[%d]\n", this, inUse, stateNames[lowState], lowState);
+		return;
+	}
+	//
+	switch(c)
+	{
+	case FSP_Reject:
+		RejectOrReset();
+		break;
+	case FSP_Recycle:
+		Recycle();
+		break;
+	case FSP_Start:
+		Start();
+		break;
+	case FSP_Send:			// send a packet/group of packets
+		ScheduleEmitQ();
+		break;
+	case FSP_Commit:
+		UrgeCommit();
+		break;
+	case FSP_Shutdown:
+		SendPacket<RELEASE>();
+		break;
+	case FSP_InstallKey:
+		InstallSessionKey();
+		break;
+	default:
+#ifndef NDEUBG
+		printf("Internal error: undefined upper layer application command code %d\n", c);
+#endif
+		break;
+	}
+	//
+	SetMutexFree();
+}
 
 
 // Given

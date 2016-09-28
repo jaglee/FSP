@@ -265,9 +265,6 @@ bool LOCALAPI CSocketItemDl::ToWelcomeConnect(BackLogItem & backLog)
 //	|-->{Return Reject}-->NON_EXISTENT-->[Send RESET]
 void CSocketItemDl::ToConcludeConnect()
 {
-	if(! WaitUseMutex())
-		return;
-
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadRecv();
 	BYTE *payload = GetRecvPtr(skb);
 
@@ -354,14 +351,14 @@ uint32_t * FSPAPI TranslateFSPoverIPv4(PFSP_IN6_ADDR p, uint32_t dwIPv4, uint32_
 
 
 DllSpec
-int FSPAPI InstallAuthenticKey(FSPHANDLE h, BYTE * key, int keySize, int32_t keyLife, FSP_InstallKeyTime lazily)
+int FSPAPI InstallAuthenticKey(FSPHANDLE h, BYTE * key, int keySize, int32_t keyLife)
 {
 	if(keySize < FSP_MIN_KEY_SIZE || keySize > FSP_MAX_KEY_SIZE || keySize % sizeof(uint64_t) != 0 || keyLife <= 0)
 		return -EDOM;
 	try
 	{
 		CSocketItemDl *pSocket = (CSocketItemDl *)h;
-		return pSocket->InstallKey(key, keySize, keyLife, lazily);
+		return pSocket->InstallKey(key, keySize, keyLife);
 	}
 	catch(...)
 	{
@@ -375,14 +372,16 @@ int FSPAPI InstallAuthenticKey(FSPHANDLE h, BYTE * key, int keySize, int32_t key
 //	BYTE *		byte stream of the key
 //	int			length of the key, should be multiplication of 8
 //	int32_t		life of the key, maximum number of packets that may utilize the key
-//	FSP_InstallKeyTime
 // Return
 //	-EINTR	if cannot obtain the right lock
 //	-EIO	if cannot trigger LLS to do the installation work through I/O
-//	-EAGAIN if previous key had not been installed yet, so that InstallKey again was not allowed
 //	0		if no failure
-//	EAGAIN	a warning saying that previous installation is overriden before finished
-int LOCALAPI CSocketItemDl::InstallKey(BYTE *key, int keySize, int32_t keyLife, FSP_InstallKeyTime lazily)
+// Remark
+//	We need the mutex lock because it shall be atomic to copy in key material structure as the parameter
+//	Normally only in CLOSABLE or COMMITTING2 state may a session key installed
+//	however it is not checked because the function
+//	might be called in the callback function before the right state migration
+int LOCALAPI CSocketItemDl::InstallKey(BYTE *key, int keySize, int32_t keyLife)
 {
 	if(! WaitUseMutex())
 		return -EINTR;
@@ -391,19 +390,6 @@ int LOCALAPI CSocketItemDl::InstallKey(BYTE *key, int keySize, int32_t keyLife, 
 	pControlBlock->connectParams.keyLength = keySize;
 	pControlBlock->connectParams.keyLife$initialSN = keyLife;
 
-	register int r = 0;
-	if(!lazily)
-	{
-		// It is the final responder in key establishment
-		if(_InterlockedExchange8(& pControlBlock->hasPendingKey, 0) != 0)
-			r = EAGAIN;
-		if(!Call<FSP_InstallKey>())
-			r = -EIO;
-	}
-	else if(_InterlockedCompareExchange8(& pControlBlock->hasPendingKey, (char)lazily, 0) != 0)
-	{
-		r = -EAGAIN;
-	}
 	SetMutexFree();
-	return r;
+	return Call<FSP_InstallKey>() ? 0 : -EIO;
 }

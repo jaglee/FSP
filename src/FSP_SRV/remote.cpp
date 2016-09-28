@@ -189,7 +189,7 @@ void LOCALAPI CLowerInterface::OnInitConnectAck()
 	if(pSocket == NULL)
 		return;
 
-	if(! pSocket->TestAndLockReady())
+	if(! pSocket->WaitUseMutex())
 	{
 		TRACE_HERE("lost ACK_INIT_CONNECT due to lack of locks");
 		return;
@@ -217,7 +217,7 @@ void LOCALAPI CLowerInterface::OnInitConnectAck()
 	pSocket->AffirmConnect(initState, idListener);
 
 l_return:
-	pSocket->SetReady();
+	pSocket->SetMutexFree();
 }
 
 
@@ -265,7 +265,7 @@ void LOCALAPI CLowerInterface::OnGetConnectRequest()
 			return;
 	}
 
-	if (! pSocket->TestAndLockReady())
+	if (! pSocket->WaitUseMutex())
 	{
 		TRACE_HERE("lost of CONNECT_REQUEST due to lack of locks");
 		return;
@@ -336,7 +336,7 @@ void LOCALAPI CLowerInterface::OnGetConnectRequest()
 	pSocket->SignalFirstEvent(FSP_NotifyAccepting);
 
 l_return:
-	pSocket->SetReady();
+	pSocket->SetMutexFree();
 }
 
 
@@ -389,7 +389,7 @@ void LOCALAPI CLowerInterface::OnGetResetSignal()
 	else if(! pSocket->InState(LISTENING) && ! pSocket->InState(CLOSED))
 	{
 		if(pSocket->IsOutOfWindow(be32toh(reject.u.sn.initial)) != 0
-		&& pSocket->ValidateICC((FSP_NormalPacketHeader *) & reject))
+		&& pSocket->ValidateICC((FSP_NormalPacketHeader *) & reject, 0, pSocket->fidPair.peer, 0))
 		{
 			pSocket->DisposeOnReset();
 		}
@@ -454,7 +454,7 @@ bool LOCALAPI CSocketItemEx::ValidateSNACK(ControlBlock::seq_t & ackSeqNo, FSP_S
 	DumpNetworkUInt16((uint16_t *)p1, offset / 2);
 #endif
 
-	if(! ValidateICC(p1, 0, salt))	// No! Extension header is not encrypted!
+	if(! ValidateICC(p1, 0, fidPair.peer, salt))	// No! Extension header is not encrypted!
 	{
 #ifdef TRACE
 		printf_s("Invalid intergrity check code of %s!? Acknowledged sequence number: %u\n", opCodeStrings[p1->hs.opCode], ackSeqNo);
@@ -928,8 +928,6 @@ void CSocketItemEx::OnGetEOT()
 			return;
 	}
 	// if(skb->opCode == 0) every packet has been delivered. EOT make it committed
-	if (_InterlockedCompareExchange8(&pControlBlock->hasPendingKey, 0, 2) != 0)
-		InstallSessionKey();	// 1 meaning FSP_INSTALL_KEY_SEND_PENDIGN, 2 FSP_INSTALL_KEY_RECV_PENDING
 	//
 	switch(lowState)
 	{

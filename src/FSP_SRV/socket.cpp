@@ -70,7 +70,6 @@ CSocketItemEx * CSocketSrvTLB::AllocItem()
 		headFreeSID = p->next;
 		if(headFreeSID == NULL)
 			tailFreeSID = NULL;
-		_InterlockedExchange8(& p->isReady, 0);
 		// See also Destroy()
 		if(_InterlockedExchange8(& p->inUse, 1))
 		{
@@ -81,7 +80,7 @@ CSocketItemEx * CSocketSrvTLB::AllocItem()
 		p->next = NULL;
 	}
 
-	SetMutexFree();
+	ReleaseMutex();
 	return p;
 }
 
@@ -101,7 +100,6 @@ CSocketItemEx * CSocketSrvTLB::AllocItem(ALFID_T idListener)
 			p = & listenerSlots[i];
 			p->SetPassive();
 			p->fidPair.source = idListener;
-			p->isReady = 0;
 			p->SetInUse();
 			// do not break, for purpose of duplicate allocation detection
 		}
@@ -143,7 +141,7 @@ CSocketItemEx * CSocketSrvTLB::AllocItem(ALFID_T idListener)
 		}
 	}
 
-	SetMutexFree();
+	ReleaseMutex();
 	return p;
 }
 
@@ -156,8 +154,6 @@ CSocketItemEx * CSocketSrvTLB::AllocItem(ALFID_T idListener)
 void CSocketSrvTLB::FreeItem(CSocketItemEx *p)
 {
 	AcquireMutex();
-	//
-	// It is deliberate to keep 'isReady'
 	//
 	// if it is allocated by AllocItem(ALFID_T idListener):
 	if(p->IsPassive())
@@ -185,7 +181,7 @@ void CSocketSrvTLB::FreeItem(CSocketItemEx *p)
 			tlbSockets[k] = p1->prevSame;
 		}
 		// else keep at least one entry in the context-addressing TLB
-		SetMutexFree();
+		AcquireMutex();
 		return;
 	}
 
@@ -203,7 +199,7 @@ void CSocketSrvTLB::FreeItem(CSocketItemEx *p)
 	//
 	_InterlockedExchange8(& p->inUse, 0);
 
-	SetMutexFree();
+	ReleaseMutex();
 }
 
 
@@ -252,10 +248,9 @@ CSocketItemEx * CSocketSrvTLB::AllocItem(const CommandNewSessionSrv & cmd)
 			p = NULL;
 			goto l_return;
 		}
-		p->SetReady();
 	}
 l_return:
-	SetMutexFree();
+	ReleaseMutex();
 	return p;
 }
 
@@ -370,8 +365,6 @@ void CSocketItemEx::InitAssociation()
 #endif
 
 	lowState = pControlBlock->state;
-	InitializeSRWLock(& rtSRWLock);
-	SetReady();
 }
 
 
@@ -757,7 +750,10 @@ bool CSocketItemEx::ICCSeqValid()
 {
 	int32_t d = IsOutOfWindow(headPacket->pktSeqNo);
 	if (d > 0 || d <= -MAX_BUFFER_BLOCKS)
+	{
+		DebugBreak();
 		return false;
+	}
 	//
 	return ValidateICC();
 }
@@ -785,7 +781,14 @@ void CSocketItemEx::Destroy()
 		lowState = NON_EXISTENT;	// Donot [SetState(NON_EXISTENT);] as the ULA might do further cleanup
 		RemoveTimers();
 		CSocketItem::Destroy();
-		isReady = 0;	// FreeItem does not reset it
+		// Do not process receive buffer further:
+		for(PktBufferBlock *p; headPacket != NULL; headPacket = p)
+		{
+			p = headPacket->next;
+			CLowerInterface::Singleton()->FreeBuffer(headPacket);
+		}
+		tailPacket = NULL;
+		//
 		(CLowerInterface::Singleton())->FreeItem(this);
 	}
 	catch(...)
@@ -832,7 +835,7 @@ void CSocketItemEx::RejectOrReset()
 	// Do not [pControlBlock->state = NON_EXISTENT;] as the ULA might do further cleanup
 	SignalFirstEvent(FSP_NotifyRecycled);
 	// See also DisposeOnReset, Recycle
-	if(TestAndLockReady())
+	if(WaitUseMutex())
 	{
 		Destroy();
 	}

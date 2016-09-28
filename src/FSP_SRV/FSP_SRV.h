@@ -264,7 +264,6 @@ class CSocketItemEx: public CSocketItem
 	friend DWORD WINAPI HandleFullICC(LPVOID);
 	friend void Multiply(CommandCloneSessionSrv &);
 
-	SRWLOCK	rtSRWLock;
 	HANDLE	hSrcMemory;
 	DWORD	idSrcProcess;
 	//
@@ -283,8 +282,8 @@ protected:
 	// the extra one is for saving temporary souce address
 	SOCKADDR_INET	sockAddrTo[MAX_PHY_INTERFACES + 1];
 
-	char	inUse;	// assert ALIGN(2)
-	char	isReady;
+	char	locked;	// emulate spinlock linux-kernel
+	char	inUse;
 	char	shouldAppendCommit;
 	FSP_Session_State lowState;
 
@@ -355,7 +354,6 @@ protected:
 	PktBufferBlock *PushPacketBuffer(PktBufferBlock *);
 	FSP_NormalPacketHeader *PeekLockPacketBuffer();
 	void PopUnlockPacketBuffer();
-	void UnlockPacketBuffer() { ReleaseSRWLockShared(& rtSRWLock); }
 
 	// return -EEXIST if overriden, -EFAULT if memory error, or payload effectively placed
 	int	PlacePayload();
@@ -391,13 +389,14 @@ public:
 	bool MapControlBlock(const CommandNewSessionSrv &);
 	void InitAssociation();
 
+	bool WaitUseMutex();
+#ifdef NDEBUG
+	void SetMutexFree() { _InterlockedExchange8(& locked, 0); }
+#else
+	void SetMutexFree();
+#endif
 	bool IsInUse() { return (_InterlockedOr8(& inUse, 0) != 0); }
 	void SetInUse() { _InterlockedExchange8(& inUse, 1); }
-	void SetReady() { _InterlockedExchange8(& isReady, 1); }
-	bool TestAndLockReady() { return IsInUse() && _InterlockedCompareExchange8(& isReady, 0, 1) != 0; }
-	bool TestAndWaitReady();
-
-	// void SetEarliestSendTime() { tEarliestSend = tRecentSend; }
 
 	void InstallEphemeralKey();
 	void InstallSessionKey();
@@ -490,9 +489,9 @@ public:
 	// Given the fixed header, the content (plaintext), the length of the context and the xor-value of salt
 	void * LOCALAPI SetIntegrityCheckCode(FSP_NormalPacketHeader *, void * = NULL, int32_t = 0, uint32_t = 0);
 	// Solid input,  the payload, if any, is copied later
-	bool LOCALAPI ValidateICC(FSP_NormalPacketHeader *, int32_t = 0, uint32_t = 0);
 	bool LOCALAPI ValidateICC(FSP_NormalPacketHeader *, int32_t, ALFID_T, uint32_t);
-	bool ValidateICC() { return ValidateICC(headPacket->GetHeaderFSP(), headPacket->lenData); }
+	bool ValidateICC() { return ValidateICC(headPacket->GetHeaderFSP(), headPacket->lenData, fidPair.peer, 0); }
+
 	bool LOCALAPI ValidateSNACK(ControlBlock::seq_t &, FSP_SelectiveNACK::GapDescriptor * &, int &);
 	// On near end's IPv6 address changed automatically send an out-of-sync KEEP_ALIVE
 	void OnLocalAddressChanged();
@@ -507,6 +506,7 @@ public:
 	// Connect and Send are special in the sense that it may take such a long time to complete that
 	// if it gains exclusive access of the socket too many packets might be lost
 	// when there are too many packets in the send queue
+	void ProcessCommand(FSP_ServiceCode);
 	void Connect();
 	void Accept();
 	void Start();
@@ -568,8 +568,12 @@ protected:
 public:
 	CSocketSrvTLB();
 	void InitMutex() { InitializeSRWLock(& rtSRWLock); } 
+#ifdef NDEBUG
 	void AcquireMutex() { AcquireSRWLockExclusive(& rtSRWLock); }
-	void SetMutexFree() { ReleaseSRWLockExclusive(& rtSRWLock); }
+#else
+	void AcquireMutex();
+#endif
+	void ReleaseMutex() { ReleaseSRWLockExclusive(& rtSRWLock); }
 
 	CSocketItemEx * AllocItem(const CommandNewSessionSrv &);
 	CSocketItemEx * AllocItem(ALFID_T);

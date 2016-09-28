@@ -33,19 +33,19 @@ void UnitTestCRC()
 
 	storage2 = storage;
 
-	bool checked = socketR2.ValidateICC(& storage2.hdr);
+	bool checked = socketR2.ValidateICC(& storage2.hdr, 0, nearFID, 0);
 	assert(checked);
 
 	storage2.payload[0] ^= 1;
-	checked = socketR2.ValidateICC(& storage2.hdr);
+	checked = socketR2.ValidateICC(& storage2.hdr, 0, nearFID, 0);
 	assert(checked);	// Because in CRC mode we doesn't care about the payload
 
 	* ((uint8_t *) & storage2.hdr) ^= 1;
-	checked = socketR2.ValidateICC(& storage2.hdr);
+	checked = socketR2.ValidateICC(& storage2.hdr, 0, nearFID, 0);
 	assert(! checked);	// CRC64 could figure out burst of 64 bits error
 
 	* ((uint8_t *) & storage2.hdr) ^= 1;
-	checked = socketR2.ValidateICC(& storage2.hdr);
+	checked = socketR2.ValidateICC(& storage2.hdr, 0, nearFID, 0);
 	assert(checked);
 }
 
@@ -99,27 +99,27 @@ void UnitTestICC()
 	request.sequenceNo = FIRST_SN;
 	socket.SetIntegrityCheckCode(& request);
 	//
-	bool checked = socketR2.ValidateICC(& request);
+	bool checked = socketR2.ValidateICC(& request, 0, nearFID, 0);
 	assert(checked);
 
 	request.sequenceNo = FIRST_SN - 1;
 	socket.SetIntegrityCheckCode(& request);
 	//
-	checked = socketR2.ValidateICC(& request);
+	checked = socketR2.ValidateICC(& request, 0, nearFID, 0);
 	assert(checked);
 
 	// should apply AES-GCM
 	request.sequenceNo = FIRST_SN + 1;
 	socket.SetIntegrityCheckCode(& request);
 	//
-	checked = socketR2.ValidateICC(& request);
+	checked = socketR2.ValidateICC(& request, 0, nearFID, 0);
 	assert(checked);
 
 	// partially scattered I/O
 	// make it a gap of one qword
 	BYTE *payload = (BYTE *) & request + sizeof(FSP_NormalPacketHeader) + 8;
 	socket.SetIntegrityCheckCode(& request, payload, 9);	// arbitrary length in the stack
-	checked = socketR2.ValidateICC(& request, 9);
+	checked = socketR2.ValidateICC(& request, 9, nearFID, 0);
 	assert(!checked);	// because of the gap
 
 	// continuous calculation of ICC should not have negative effect 
@@ -132,19 +132,19 @@ void UnitTestICC()
 	memcpy(storage2.payload, & storage.payload[8], sizeof(FSP_NormalPacketHeader));	// make received 'solidified'
 
 	storage2.payload[0] ^= 1;
-	checked = socketR2.ValidateICC(& storage2.hdr, 21);
+	checked = socketR2.ValidateICC(& storage2.hdr, 21, nearFID, 0);
 	assert(!checked);
 
 	storage2.payload[0] ^= 1;
-	checked = socketR2.ValidateICC(& storage2.hdr, 21);
+	checked = socketR2.ValidateICC(& storage2.hdr, 21, nearFID, 0);
 	assert(checked);
 
 	memcpy(& storage3, & storage, sizeof(FSP_NormalPacketHeader) + 21);
-	checked = socketR2.ValidateICC(& storage3.hdr, 21);
+	checked = socketR2.ValidateICC(& storage3.hdr, 21, nearFID, 0);
 	assert(!checked);	// because of the gap
 
 	memcpy(storage3.payload, & storage.payload[8], 21);
-	checked = socketR2.ValidateICC(& storage3.hdr, 21);
+	checked = socketR2.ValidateICC(& storage3.hdr, 21, nearFID, 0);
 	assert(checked);
 
 	// Merge the KEEP_ALIVE packet testing...
@@ -169,7 +169,7 @@ void UnitTestICC()
 	//
 	socketR2.SetIntegrityCheckCode(& mp.hdr, NULL, 0, salt);
 
-	checked = socket.ValidateICC(& mp.hdr, 0, salt);
+	checked = socket.ValidateICC(& mp.hdr, 0, socketR2.fidPair.source, salt);
 	assert(checked);
 
 	checked = socket.ValidateICC(& mp.hdr, 0, socket.fidPair.peer, salt);

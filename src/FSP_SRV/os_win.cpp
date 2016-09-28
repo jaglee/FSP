@@ -114,6 +114,23 @@ inline int GetPointerOfWSASendMsg(SOCKET sock)
 VOID NETIOAPI_API_ OnUnicastIpChanged(PVOID, PMIB_UNICASTIPADDRESS_ROW, MIB_NOTIFICATION_TYPE);
 
 
+#ifndef NDEBUG
+void CSocketSrvTLB::AcquireMutex()
+{
+	uint64_t t0 = GetTickCount64();
+	while(!TryAcquireSRWLockExclusive(& rtSRWLock))
+	{
+		if(GetTickCount64() - t0 > MAX_LOCK_WAIT_ms)
+		{
+			DebugBreak();	// To trace the call stack
+			throw -EDEADLK;
+		}
+		Sleep(50);	// if there is some thread that has exclusive access on the lock, wait patiently
+	}
+}
+#endif
+
+
 
 // The constructor of the lower service interface instance
 //	- Startup the socket service
@@ -754,19 +771,27 @@ inline void CLowerInterface::ProcessRemotePacket()
 				continue;
 			}
 			REPORT_WSAERROR_TRACE("select failure");
+			DebugBreak();
 			break;	// TODO: crash recovery from select
 		}
 		//
 		for(i = 0; i < (int) readFDs.fd_count; i++)
 		{
-			AcquireMutex();
 			// Unfortunately, it was proven that no matter whether there is MSG_PEEK
 			// MSG_PARTIAL is not supported by the underlying raw socket service
 			mesgInfo.dwFlags = 0;
+#if defined(TRACE) && (TRACE & TRACE_PACKET)
+			printf_s("\nPacket on socket #%X: to process...\n", (unsigned)readFDs.fd_array[i]);
+#endif
 			r = AcceptAndProcess(readFDs.fd_array[i]);
-			SetMutexFree();
+#if defined(TRACE) && (TRACE & TRACE_PACKET)
+			printf_s("\nPacket on socket #%X: processed, result = %d\n", (unsigned)readFDs.fd_array[i], r);
+#endif
 			if (r == E_FAIL)
+			{
+				TRACE_HERE("AcceptAndProcess failed, socket might be closed");
 				DisableSocket(readFDs.fd_array[i]);
+			}
 			else if(r != 0)
 #ifndef TRACE
 				throw -r;	// UNRESOLVED! Unrecoverable?
@@ -785,8 +810,13 @@ inline void CLowerInterface::ProcessRemotePacket()
 // See also SendPacket
 int CLowerInterface::AcceptAndProcess(SOCKET sdRecv)
 {
+	AcquireMutex();
+	//
 	if((pktBuf = GetBuffer()) == NULL)
+	{
+		ReleaseMutex();
 		return ENOMEM;	
+	}
 
 	// Unfortunately, it was proven that no matter whether there is MSG_PEEK
 	// MSG_PARTIAL is not supported by the underlying raw socket service
@@ -804,8 +834,10 @@ int CLowerInterface::AcceptAndProcess(SOCKET sdRecv)
 
 	if (WSARecvMsg(sdRecv, &mesgInfo, &countRecv, NULL, NULL) < 0)
 	{
-		int err = WSAGetLastError();
 		FreeBuffer(pktBuf);
+		ReleaseMutex();
+		//
+		int err = WSAGetLastError();
 		if (err != WSAENOTSOCK)
 		{
 			ReportErrorAsMessage(err);
@@ -815,6 +847,7 @@ int CLowerInterface::AcceptAndProcess(SOCKET sdRecv)
 		//
 		return E_FAIL;
 	}
+	ReleaseMutex();
 
 	// From the receiver's point of view the local fiber id was stored in the peer fiber id field of the received packet
 #ifdef OVER_UDP_IPv4
@@ -853,14 +886,14 @@ int CLowerInterface::AcceptAndProcess(SOCKET sdRecv)
 		if(pSocket == NULL)
 			break;
 		//
-		if(! pSocket->TestAndLockReady())
+		if(! pSocket->WaitUseMutex())
 		{
 			TRACE_HERE("lost ACK_CONNECT_REQ due to lack of locks");
 			pSocket = NULL;	// FreeBuffer(pktBuf);
 			break;
 		}
 		pSocket->OnConnectRequestAck( *FSP_OperationHeader<FSP_AckConnectRequest>(), countRecv  - sizeof(FSP_AckConnectRequest) );
-		pSocket->SetReady();
+		pSocket->SetMutexFree();
 		pSocket = NULL;	// FreeBuffer(pktBuf);
 		break;
 	case RESET:
@@ -882,6 +915,13 @@ int CLowerInterface::AcceptAndProcess(SOCKET sdRecv)
 		{
 #ifdef TRACE
 			printf_s("Cannot map socket for local fiber#0x%X, opCode: %s[%d]\n", GetLocalFiberID(), opCodeStrings[opCode], opCode);
+#endif
+			break;
+		}
+		if(!pSocket->IsInUse() || pSocket->lowState <= 0 || pSocket->lowState >= CLOSED)
+		{
+#ifdef TRACE
+			printf_s("Socket for local fiber#%p in non-workable state: %s[%d]\n", pSocket, stateNames[pSocket->lowState], pSocket->lowState);
 #endif
 			break;
 		}
@@ -920,7 +960,11 @@ int CLowerInterface::AcceptAndProcess(SOCKET sdRecv)
 	}
 
 	if(pSocket == NULL)
+	{
+		AcquireMutex();	// Make it lockless as much as possible
 		FreeBuffer(pktBuf);
+		ReleaseMutex();
+	}	
 	// Or else it is in the working thread that the memory block free
 
 	return 0;
@@ -1196,17 +1240,10 @@ void CSocketItemEx::RemoveTimers()
 }
 
 
-// Assume that all packets of the transmit transaction have been buffered in the send queue if to 
-// See also @DLL::InstallKey and @DLL::CheckTransmitaction
+
 // The OS-depending implementation of scheduling transmission queue
 void CSocketItemEx::ScheduleEmitQ()
 {
-#ifdef TRACE
-	TRACE_HERE("It is scheduled to send data in the queue");
-#endif
-	if(_InterlockedCompareExchange8(& pControlBlock->hasPendingKey, 0, 1) != 0)
-		InstallSessionKey();
-
 	QueueUserWorkItem(HandleSendQ, this, WT_EXECUTELONGFUNCTION);
 }
 
@@ -1224,6 +1261,27 @@ void CSocketItemEx::ScheduleConnect(CommandNewSessionSrv *pCmd)
 /**
  *	The backlog of accepted remote packets
  */
+bool CSocketItemEx::WaitUseMutex()
+{
+	uint64_t t0 = GetTickCount64();
+	while (_InterlockedCompareExchange8(& locked, 1, 0) != 0)
+	{
+		if (GetTickCount64() - t0 > MAX_LOCK_WAIT_ms)
+			return false;
+		Sleep(50);	// if there is some thread that has exclusive access on the lock, wait patiently
+	}
+	return true;
+}
+
+#ifndef NDEBUG
+void CSocketItemEx::SetMutexFree()
+{
+	if(_InterlockedExchange8(& locked, 0) == 0)
+		printf_s("Warning: to release the spinlock of the socket#0x%p, but it was released\n", this);
+}
+#endif
+
+
 // Given
 //	PktSignature *	the pointer to the next packe buffer to be put into the receive-process queue of the socket
 // Return
@@ -1231,7 +1289,11 @@ void CSocketItemEx::ScheduleConnect(CommandNewSessionSrv *pCmd)
 inline
 PktBufferBlock * CSocketItemEx::PushPacketBuffer(PktBufferBlock *pNext)
 {
-	AcquireSRWLockExclusive(& rtSRWLock);
+	if(! WaitUseMutex())
+	{
+		DebugBreak();	// To trace the call stack
+		throw - EDEADLK;
+	}
 
 	PktBufferBlock *p = tailPacket;
 	pNext->next = NULL;
@@ -1245,7 +1307,7 @@ PktBufferBlock * CSocketItemEx::PushPacketBuffer(PktBufferBlock *pNext)
 		tailPacket = pNext;
 	}
 
-	ReleaseSRWLockExclusive(& rtSRWLock);
+	SetMutexFree();
 	return p;
 }
 
@@ -1256,12 +1318,13 @@ PktBufferBlock * CSocketItemEx::PushPacketBuffer(PktBufferBlock *pNext)
 inline
 FSP_NormalPacketHeader * CSocketItemEx::PeekLockPacketBuffer()
 {
-	AcquireSRWLockExclusive(& rtSRWLock);
+	if (!WaitUseMutex())
+		return NULL;
 
 	if(headPacket == NULL)
 	{
-		ReleaseSRWLockExclusive(& rtSRWLock);
 		// assert(tailPacket == NULL);
+		SetMutexFree();
 		return NULL;
 	}
 
@@ -1270,21 +1333,21 @@ FSP_NormalPacketHeader * CSocketItemEx::PeekLockPacketBuffer()
 
 
 
+// The packet buffer list might both empty and exclusively locked if the socket is disposed on receiving RELEASE or RESET
 // assume mutex is busy
 inline
 void CSocketItemEx::PopUnlockPacketBuffer()
 {
-	// UNRESOLVED!? Can the packet buffer be exclusively locked?
-	if(headPacket == NULL)
-		return;		// assert(tailPacket == NULL);
+	if (headPacket == NULL)
+		goto l_return;		// assert(tailPacket == NULL);
 
 	PktBufferBlock *p = headPacket->next;	// MUST put before FreeBuffer or else it may be overwritten
 	CLowerInterface::Singleton()->FreeBuffer(headPacket);
 
 	if((headPacket = p) == NULL)
 		tailPacket = NULL;
-
-	ReleaseSRWLockExclusive(& rtSRWLock);
+l_return:
+	SetMutexFree();
 }
 
 
@@ -1298,18 +1361,9 @@ DWORD WINAPI HandleSendQ(LPVOID p)
 	try
 	{
 		CSocketItemEx *p0 = (CSocketItemEx *)p;
-		if(! p0->TestAndWaitReady())
-		{
-			if(p0->IsInUse())
-				QueueUserWorkItem(HandleSendQ, p0, WT_EXECUTELONGFUNCTION);
-#if defined(TRACE) && (TRACE & TRACE_ULACALL)
-			printf_s("\nLock unavailable!?\n\tSend may be queued again. This is a long function because of the waiting.\n");
-#endif
-			return 0;
-		}
+		p0->WaitUseMutex();
 		p0->EmitQ();
-		p0->SetReady();
-
+		p0->SetMutexFree();
 		return 1;
 	}
 	catch(...)
@@ -1330,14 +1384,6 @@ DWORD WINAPI HandleFullICC(LPVOID p)
 		FSP_NormalPacketHeader *hdr;
 		while(hdr = p0->PeekLockPacketBuffer())
 		{
-			if(! p0->TestAndWaitReady())
-			{
-				if(p0->IsInUse())
-					QueueUserWorkItem(HandleFullICC, p0, WT_EXECUTELONGFUNCTION);
-				// This is a long function because of the waiting
-				p0->UnlockPacketBuffer();
-				return 0;
-			}
 			// Because some service call may recycle the FSP socket in a concurrent way
 			if (p0->lowState == NON_EXISTENT || p0->pControlBlock == NULL)
 				goto l_continue;
@@ -1364,7 +1410,6 @@ DWORD WINAPI HandleFullICC(LPVOID p)
 				p0->OnGetKeepAlive();
 			}
 l_continue:
-			p0->SetReady();
 			p0->PopUnlockPacketBuffer();
 		}
 		return 1;
@@ -1389,27 +1434,6 @@ DWORD WINAPI HandleConnect(LPVOID p)
 	{
 		return 0;
 	}
-}
-
-
-
-/**
- *	Some further OS-dependeng auxilary functions
- */
-bool CSocketItemEx::TestAndWaitReady()
-{
-	time_t t0 = time(NULL);	// seconds elapsed since midnight(00:00:00), 1970/01/01
-	while(! TestAndLockReady())
-	{
-		if(time(NULL) - t0 > TRASIENT_STATE_TIMEOUT_ms/1000)
-		{
-			TRACE_HERE("TestAndWaitReady timeout");
-			return false;
-		}
-		Sleep(1);
-	}
-	//
-	return true;
 }
 
 
