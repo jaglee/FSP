@@ -23,10 +23,10 @@
 
 extern const char		*defaultWelcome;
 
+extern volatile bool	toMultiply;
 extern volatile bool	finished;
 extern FSPHANDLE		hFspListen;
 extern char				linebuf[80];
-
 
 // Branch controllers
 extern void StartToSendSignature(FSPHANDLE h);

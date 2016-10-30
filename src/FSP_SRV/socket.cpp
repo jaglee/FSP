@@ -111,7 +111,9 @@ CSocketItemEx * CSocketSrvTLB::AllocItem(ALFID_T idListener)
 			p = & listenerSlots[i];
 			if(IsProcessAlive(p->idSrcProcess))
 			{
-				TRACE_HERE("collision of listener fiber ID detected!");
+#ifdef TRACE
+				printf_s("\nCollision of listener fiber#%u detected for process#%u\n", idListener, p->idSrcProcess);
+#endif
 				p = NULL;
 			}
 			break;
@@ -160,7 +162,6 @@ void CSocketSrvTLB::FreeItem(CSocketItemEx *p)
 	{
 		int k = be32toh(p->fidPair.source) & (MAX_CONNECTION_NUM - 1);
 		register CSocketItemEx *p1 = tlbSockets[k];
-		_InterlockedExchange8(& p->inUse, 0);
 		// detach it from the hash collision list
 		if(p1 != p)
 		{
@@ -181,8 +182,7 @@ void CSocketSrvTLB::FreeItem(CSocketItemEx *p)
 			tlbSockets[k] = p1->prevSame;
 		}
 		// else keep at least one entry in the context-addressing TLB
-		AcquireMutex();
-		return;
+		goto l_return;
 	}
 
 	// if it is allocated by AllocItem() [by assigning a pseudo-random fiber ID]
@@ -197,9 +197,9 @@ void CSocketSrvTLB::FreeItem(CSocketItemEx *p)
 		p->next = NULL;	// in case it is not
 	}
 	//
-	_InterlockedExchange8(& p->inUse, 0);
-
+l_return:
 	ReleaseMutex();
+	_InterlockedExchange8(& p->inUse, 0);
 }
 
 
@@ -243,7 +243,7 @@ CSocketItemEx * CSocketSrvTLB::AllocItem(const CommandNewSessionSrv & cmd)
 		}
 		if(! p->MapControlBlock(cmd))
 		{
-			TRACE_HERE("Control block shall be created by the ULA via DLL call already");
+			REPORT_ERRMSG_ON_TRACE("Control block shall be created by the ULA via DLL call already");
 			p->inUse = 0;	// No, you cannot 'FreeItem(p);' because mutex is SHARED_BUSY
 			p = NULL;
 			goto l_return;
@@ -280,7 +280,10 @@ bool CSocketSrvTLB::PutToRemoteTLB(CMultiplyBacklogItem *pItem)
 		&& p->idParent == idParent
 		&& SOCKADDR_HOSTID(p->sockAddrTo) == remoteHostId)
 		{
-			TRACE_HERE("Found collision when put to remote ALFID's translate look-aside buffer");
+#ifdef TRACE
+			printf_s("\nFound collision when put to remote ALFID's translate look-aside buffer:\n"
+					 "Parent fiber#%u, remote fiber#%u\n", idParent, idRemote);
+#endif
 			return false;
 		}
 	}
@@ -357,14 +360,8 @@ void CSocketItemEx::InitAssociation()
 		}
 		// namelen = sizeof(SOCKADDR_IN6);
 	}
-
-#ifndef NDEBUG
-	printf_s("InitAssociation, fiber ID pair: (%u, %u)\n"
-		, be32toh(fidPair.source)
-		, be32toh(fidPair.peer));
-#endif
-
-	lowState = pControlBlock->state;
+	//
+	SyncState();
 }
 
 
@@ -505,9 +502,6 @@ int32_t LOCALAPI CSocketItemEx::GenerateSNACK(FSP_PreparedKEEP_ALIVE &buf, Contr
 // INIT_CONNECT, timestamp, Cookie, Salt, ephemeral-key, half-connection parameters [, resource requirement]
 void CSocketItemEx::InitiateConnect()
 {
-	TRACE_HERE("called");
-	SetState(CONNECT_BOOTSTRAP);
-
 	// Note tht we cannot put initial SN into ephemeral session key as the peers do not have the same initial SN
 	SConnectParam & initState = pControlBlock->connectParams;
 	rand_w32((uint32_t *) & initState,
@@ -530,7 +524,7 @@ void CSocketItemEx::InitiateConnect()
 	FSP_ConnectRequest *q = (FSP_ConnectRequest *)GetSendPtr(skb);
 	if(q == NULL)
 	{
-		TRACE_HERE("Memory corruption!");
+		DebugBreak();	//TRACE_HERE("Memory corruption!");
 		return;
 	}
 	q->initCheckCode = initState.initCheckCode;
@@ -545,6 +539,7 @@ void CSocketItemEx::InitiateConnect()
 
 	tKeepAlive_ms = INIT_RETRANSMIT_TIMEOUT_ms;
 	AddTimer();
+	SetState(CONNECT_BOOTSTRAP);
 }
 
 
@@ -553,13 +548,11 @@ void CSocketItemEx::InitiateConnect()
 // It is assumed that exclusive access to the socket has been gained
 void CSocketItemEx::AffirmConnect(const SConnectParam & initState, ALFID_T idListener)
 {
-	TRACE_HERE("called");
-
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend(); // Reuse what's occupied by INIT_CONNECT
 	FSP_ConnectRequest *pkt = (FSP_ConnectRequest *)this->GetSendPtr(skb);
 	if(pkt == NULL)
 	{
-		TRACE_HERE("memory corruption");
+		DebugBreak();	//TRACE_HERE("memory corruption");
 		return;
 	}
 	tRoundTrip_us = uint32_t(min(UINT32_MAX, NowUTC() - skb->timeSent));
@@ -595,41 +588,29 @@ void CSocketItemEx::AffirmConnect(const SConnectParam & initState, ALFID_T idLis
 // Given
 //	CSocketItemEx *		Pointer to the source socket slot. The nextOOBSN field would be updated
 // Remark
-//	On get peer's PERSIST the socket would be put into the remote id's translate look-aside buffer
+//	On get the peer's PERSIST the socket would be put into the remote id's translate look-aside buffer
+//	In some extreme situation the peer's PERSIST to MULTIPLY could be received before tSessionBegin was set
+//	and such an acknowledgement is effectively lost
+//	however, it is not a fault but is a feature in sake of proper state management
 // See also
 //	OnConnectRequestAck; CSocketItemDl::ToWelcomeConnect; CSocketItemDl::ToWelcomeMultiply
 void CSocketItemEx::InitiateMultiply(CSocketItemEx *srcItem)
 {
-	TRACE_HERE("called");
-
 	// Inherit the interfaces, excluding the last one which is ephemeral 
+	memcpy(&pControlBlock->peerAddr, &srcItem->pControlBlock->peerAddr, sizeof(pControlBlock->peerAddr));
 	memcpy(this->sockAddrTo, srcItem->sockAddrTo, sizeof(SOCKADDR_INET) * MAX_PHY_INTERFACES);
 	pControlBlock->nearEndInfo.idALF = fidPair.source;	// and pass back to DLL/ULA
 	pControlBlock->connectParams = srcItem->pControlBlock->connectParams;
 	InitAssociation();
+	assert(fidPair.peer == srcItem->fidPair.peer);	// Set in InitAssociation
 
-	// Note tht we cannot put initial SN into ephemeral session key as the peers do not have the same initial SN
-	// Share the same session key at first:
-	ControlBlock::seq_t seq0 = srcItem->pControlBlock->sendWindowNextSN;
+	contextOfICC.keyLife = (srcItem->contextOfICC.keyLife == 0 ? 0 : INT32_MAX - 1);
+	contextOfICC.savedCRC = (srcItem->contextOfICC.keyLife == 0);
 	contextOfICC.prev = srcItem->contextOfICC.curr;
-	contextOfICC.savedCRC = false;
+	//
+	ControlBlock::seq_t seq0 = pControlBlock->sendWindowNextSN;	// See also @DLL::ToPrepareMultiply
 	contextOfICC.snFirstSendWithCurrKey = seq0 + 1;
-	contextOfICC.keyLife = pControlBlock->connectParams.keyLife$initialSN;
-	DeriveNextKey();
 	// But the snFirstRecvWithCurrKey is unset until the first response packet is accepted.
-	pControlBlock->connectParams.initialSN = seq0;
-
-#if defined(TRACE) && (TRACE & TRACE_OUTBAND)
-	printf_s("To send MULTIPLY in LLS, sendBufferBlockN = %d\n"
-			"\tParent's fid = 0x%X, allocated fid = 0x%X, peer's fid = 0x%X\n"
-		, pControlBlock->sendBufferBlockN
-		, idParent, fidPair.source, fidPair.peer);
-#endif
-
-	pControlBlock->sendWindowFirstSN = seq0;
-	assert(pControlBlock->sendWindowHeadPos == 0);
-	pControlBlock->sendWindowNextSN = seq0 + pControlBlock->sendWindowNextPos;
-	pControlBlock->sendBufferNextSN = seq0 + pControlBlock->sendBufferNextPos;
 
 	// MULTIPLY can only be the very first packet
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend();
@@ -641,13 +622,14 @@ void CSocketItemEx::InitiateMultiply(CSocketItemEx *srcItem)
 	void * paidLoad = SetIntegrityCheckCode(& q, GetSendPtr(skb), skb->len, q.expectedSN);
 	if (paidLoad == NULL)
 	{
-		TRACE_HERE("Cannot set ICC for the new MULTIPLY command");
+		DebugBreak();	//TRACE_HERE("Cannot set ICC for the new MULTIPLY command");
 		return;	// but it's an exception!
 	}
+	SendPacket(2, ScatteredSendBuffers(&q, sizeof(FSP_NormalPacketHeader), paidLoad, skb->len));
 	//
 	tSessionBegin = skb->timeSent = NowUTC();	// UNRESOLVED!? But if SendPacket failed?
-	SendPacket(2, ScatteredSendBuffers(&q, sizeof(FSP_NormalPacketHeader), paidLoad, skb->len));
-
+	pControlBlock->SlideNextToSend();
+	SetState(CLONING);
 	// tRoundTrip_us would be calculated when PERSIST is got, when tLastRecv is set as well
 	ReplaceTimer(INIT_RETRANSMIT_TIMEOUT_ms);
 }
@@ -658,11 +640,29 @@ void CSocketItemEx::InitiateMultiply(CSocketItemEx *srcItem)
 // so that the derived new session key is put into effect
 bool CSocketItemEx::FinalizeMultiply()
 {
+	ALFID_T idPeerParent = _InterlockedExchange((long *)&pControlBlock->peerAddr.ipFSP.fiberID, headPacket->idPair.source);
 	contextOfICC.snFirstRecvWithCurrKey = headPacket->pktSeqNo;
-	fidPair.peer = headPacket->idPair.source;
+	InitAssociation();	// reinitialize with new peer's ALFID
+	assert(fidPair.peer == headPacket->idPair.source);
+#if defined(TRACE) && (TRACE & TRACE_PACKET)
+	printf_s("\nGet the acknowledgement PERSIST to MULTIPLY in LLS, ICC context:\n"
+		"\tsend start SN = %09u, recv start sn = %09u\n"
+		"\tnear end's ALFID  = %u, ALFID of peer's parent = %u\n"
+		, contextOfICC.snFirstSendWithCurrKey, contextOfICC.snFirstRecvWithCurrKey
+		, fidPair.source, idPeerParent);
+#endif
+	if (contextOfICC.keyLife != 0)
+	{
+		DeriveNextKey(contextOfICC.snFirstSendWithCurrKey, contextOfICC.snFirstRecvWithCurrKey, fidPair.source, idPeerParent);
+	}
+	else
+	{
+		assert(contextOfICC.savedCRC);
+		contextOfICC.curr = contextOfICC.prev;
+	}
 	if (!ValidateICC())
 	{
-		TRACE_HERE("Invalid intergrity check code of PERSIST to MULTIPLY!?");
+		DebugBreak();	//TRACE_HERE("Invalid intergrity check code of PERSIST to MULTIPLY!?");
 		return false;
 	}
 
@@ -672,7 +672,7 @@ bool CSocketItemEx::FinalizeMultiply()
 		, pControlBlock->recvBufferBlockN
 		, idParent, fidPair.source, fidPair.peer);
 #endif
-
+	RestartKeepAlive();
 	// And continue to accept the payload in the caller
 	pControlBlock->SetRecvWindow(headPacket->pktSeqNo);
 	return CLowerInterface::Singleton()->PutToRemoteTLB((CMultiplyBacklogItem *)this);
@@ -681,15 +681,9 @@ bool CSocketItemEx::FinalizeMultiply()
 
 
 // Congest the peer's MULTIPLY payload and make response designated by ULA transmitted
-// See also OnGetMultiply(), @DLL::PrepareToAccept
+// See also OnGetMultiply(), @DLL::PrepareToAccept, ToWelcomeMultiply
 void CMultiplyBacklogItem::ResponseToMultiply()
 {
-	ALFID_T & idParent = pControlBlock->idParent;
-
-#if defined(TRACE) && (TRACE & TRACE_OUTBAND)
-	printf_s("To make response to MULTIPLY, parent's fid = 0x%X\n", idParent);
-#endif
-
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->GetFirstReceived();
 	// if (!CheckMemoryBorder(skb)) throw -EFAULT;
 	// See also PlacePayload
@@ -699,18 +693,37 @@ void CMultiplyBacklogItem::ResponseToMultiply()
 		HandleMemoryCorruption();
 		return;
 	}
-	bool eot = this->IsEndOfMessage();
+
+	*(& skb->len + 1) = *(& TempSocketBuf()->len + 1);
 	skb->len = CopyOutPlainText(ubuf);
-	skb->SetFlag<END_OF_TRANSACTION>(eot);
-	if (eot)	// See also @DLL::ToWelcomeMultiply
+	if (skb->GetFlag<END_OF_TRANSACTION>())
 		SetState(pControlBlock->state == COMMITTING ? COMMITTING2 : PEER_COMMIT);
 	else
-		lowState = pControlBlock->state;
-	// Should lowState == NON_EXISTENT before. See also OnGetMultiply
+		SyncState();
+	//^See also OnGetMultiply, ControlBlock::FSP_SocketBuf 
+	pControlBlock->recvWindowNextSN++;
+	pControlBlock->recvWindowNextPos++;
+	// The receive buffer is eventually ready
 
+	ALFID_T & idParent = pControlBlock->idParent;
 	// assume contextOfICC, including snFirstRecvWithCurrKey and snFirstSendWithCurrKey has been set properly
-	DeriveNextKey();
-	EmitStart();
+#if defined(TRACE) && (TRACE & TRACE_PACKET)
+	printf_s("\nTo acknowledge MULTIPLY/send a PERSIST in LLS, ICC context:\n"
+		"\trecv start SN = %09u, send start sn = %09u\n"
+		"\tpeer's ALFID  = %u, near end's parent ALFID  = %u\n"
+		, contextOfICC.snFirstRecvWithCurrKey, contextOfICC.snFirstSendWithCurrKey
+		, fidPair.peer, idParent);
+#endif
+	// note that the responder's key material mirrors the initiator's
+	if (contextOfICC.keyLife != 0)
+	{
+		DeriveNextKey(contextOfICC.snFirstRecvWithCurrKey, contextOfICC.snFirstSendWithCurrKey, fidPair.peer, idParent);
+	}
+	else
+	{
+		assert(contextOfICC.savedCRC);
+		contextOfICC.curr = contextOfICC.prev;
+	}
 }
 
 
@@ -718,28 +731,31 @@ void CMultiplyBacklogItem::ResponseToMultiply()
 // Remark
 //	For sake of congestion control only one packet is sent presently
 // See also
-//	OnConnectRequestAck; CSocketItemDl::ToWelcomeConnect; CSocketItemDl::ToWelcomeMultiply
+//	CSocketItemEx::Start(), OnConnectRequestAck(); CSocketItemDl::ToWelcomeConnect(), ToWelcomeMultiply()
+// Remark
+//	ACK_CONNECT_REQUEST is resent on requested only.
 void CSocketItemEx::Accept()
 {
-	TRACE_HERE("called");
-
 	// bind to the interface as soon as the control block mapped into server's memory space
 	InitAssociation();
 	if(lowState == CHALLENGING)
 	{
-		ReplaceTimer(TRASIENT_STATE_TIMEOUT_ms);	// The socket slot might be a reused one
+		ReplaceTimer(TRANSIENT_STATE_TIMEOUT_ms);	// The socket slot might be a reused one
 		InstallEphemeralKey();
 		//^ ephemeral session key material was ready when CSocketItemDl::PrepareToAccept
-		EmitStartAndSlide();
-		// ACK_CONNECT_REQUEST is resent on requested only. See also CSocketItemEx::Start()
+		SetCallable();	// The success or failure signal is delayed until PERSIST or RESET received
 	}
 	else
 	{
 		// Timer has been set when the socket slot was prepared on getting MULTIPLY
 		((CMultiplyBacklogItem *)this)->ResponseToMultiply();
+		SignalFirstEvent(FSP_NotifyDataReady);
+		// UNRESOLVED!? Implement lazy notification to wait further data?
+		AddResendTimer(tRoundTrip_us >> 8);	// tRoundTrip_us was set OnGetMultiply
 	}
-	tSessionBegin = tRecentSend;	// See also CSocketItemEx::OnConnectRequestAck
-	SetCallable();	// The success or failure signal is delayed until PERSIST or RESET received
+	//
+	EmitStartAndSlide();
+	tSessionBegin = tRecentSend;
 }
 
 
@@ -766,7 +782,7 @@ void CSocketItemEx::DisposeOnReset()
 	lowState = NON_EXISTENT;	// But the ULA's state is kept
 	// It is somewhat an NMI to ULA
 	SignalFirstEvent(FSP_NotifyReset);
-	ReplaceTimer(TRASIENT_STATE_TIMEOUT_ms);
+	ReplaceTimer(TRANSIENT_STATE_TIMEOUT_ms);
 }
 
 
@@ -778,6 +794,9 @@ void CSocketItemEx::Destroy()
 {
 	try
 	{
+#ifdef TRACE
+		printf_s("\nSCB of fiber#%u to be destroyed\n", fidPair.source);
+#endif
 		lowState = NON_EXISTENT;	// Donot [SetState(NON_EXISTENT);] as the ULA might do further cleanup
 		RemoveTimers();
 		CSocketItem::Destroy();
@@ -793,6 +812,7 @@ void CSocketItemEx::Destroy()
 	}
 	catch(...)
 	{
+		DebugBreak();
 		// UNRESOLVED! trap run-time exception and trace the calling stack, write error log
 	}
 }
@@ -812,8 +832,12 @@ void CSocketItemEx::Recycle()
 #ifdef TRACE
 		printf_s("Recycle called in %s(%d) state\n", stateNames[lowState], lowState);
 #endif
-		RejectOrReset();
-		return;
+		// It is legitimate to recycle in CLOSABLE or PRE_CLOSED state to support timeout in the upper layer
+		if (lowState != PRE_CLOSED && lowState != CLOSABLE)
+		{
+			RejectOrReset();
+			return;
+		}
 	}
 	// Donot [pControlBlock->state = NON_EXISTENT;] as the ULA might do further cleanup
 	// See also RejectOrReset, Destroy and @DLL::RespondToRecycle
@@ -843,17 +867,17 @@ void CSocketItemEx::RejectOrReset()
 	{
 		// It could be lazily Destroyed
 		lowState = NON_EXISTENT;
-		ReplaceTimer(TRASIENT_STATE_TIMEOUT_ms);
+		ReplaceTimer(TRANSIENT_STATE_TIMEOUT_ms);
 	}
 }
 
 
 
-void LOCALAPI DumpHexical(BYTE * buf, int len)
+void LOCALAPI DumpHexical(const void *buf, int len)
 {
 	for(register int i = 0; i < len; i++)
 	{
-		printf("%02X ", buf[i]);
+		printf("%02X ", ((const uint8_t *)buf)[i]);
 	}
 	printf("\n");
 }

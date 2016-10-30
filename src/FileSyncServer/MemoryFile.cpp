@@ -18,7 +18,7 @@ void SendMemoryPattern()
 
 static int FSPAPI onAccepted(FSPHANDLE h, PFSP_Context ctx)
 {
-	printf_s("\nMemoryFile onAccepted: handle of FSP session/Fiber ID = 0x%X\n", (uint32_t)(intptr_t)h);
+	printf_s("\nMemoryFile onAccepted: handle of FSP session %p\n", h);
 	// TODO: check connection context
 
 	printf_s("\tTo send filename to the remote end...\n");

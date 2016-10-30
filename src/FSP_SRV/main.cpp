@@ -77,7 +77,7 @@ int main(int argc, char * argv[])
 	}
 	catch(HRESULT x)
 	{
-		printf("In main: exception number 0x%X, internal panic!Cannot start the timer\n", x); 
+		printf("In main: exception number 0x%X, internal panic! Cannot start the timer\n", x); 
 		goto l_bailout;
 	}
 
@@ -88,9 +88,9 @@ int main(int argc, char * argv[])
 	}
 	catch(...)
 	{
+		DebugBreak();
 		delete TimerWheel::Singleton();
 		delete CLowerInterface::Singleton();
-		TRACE_HERE("Exception caught on processing upper layer command.");
 	}
 
 l_bailout:
@@ -197,24 +197,34 @@ static void LOCALAPI ProcessCommand(HANDLE md)
 		if(nBytesRead < sizeof(struct CommandToLLS))
 			continue;
 #if defined(TRACE) && (TRACE & TRACE_ULACALL)
-		printf("\n\n#%d command, %d bytes read, %s(operation code = %d)\n",  n, nBytesRead, noticeNames[pCmd->opCode], pCmd->opCode);
+		printf_s("\n\n#%d command, fiber#%u, %s(code = %d, size = %d)\n"
+			, n, pCmd->fiberID, noticeNames[pCmd->opCode], pCmd->opCode, nBytesRead);
 #endif
 		//
 		switch(pCmd->opCode)
 		{
 		case FSP_Listen:		// register a passive socket
-			printf_s("Requested to listen on local fiber#0x%X, assigned event trigger is %s\n"
-				, pCmd->fiberID
-				, ((CommandNewSession *)pCmd)->szEventName);
+#if defined(TRACE) && (TRACE & TRACE_ULACALL)
+			printf_s("Listen: assigned event trigger is:\n  %s\n", ((CommandNewSession *)pCmd)->szEventName);
+#endif
 			Listen(CommandNewSessionSrv(pCmd));
 			break;
 		case InitConnection:	// register an initiative socket
+#if defined(TRACE) && (TRACE & TRACE_ULACALL)
+			printf_s("Connect: assigned event trigger is:\n  %s\n", ((CommandNewSession *)pCmd)->szEventName);
+#endif
 			Connect(CommandNewSessionSrv(pCmd));
 			break;
 		case FSP_Accept:
+#if defined(TRACE) && (TRACE & TRACE_ULACALL)
+			printf_s("Accept: assigned event trigger is:\n  %s\n", ((CommandNewSession *)pCmd)->szEventName);
+#endif
 			Accept(CommandNewSessionSrv(pCmd));
 			break;
 		case FSP_Multiply:
+#if defined(TRACE) && (TRACE & TRACE_ULACALL)
+			printf_s("Multiply: assigned event trigger is:\n  %s\n", ((CommandNewSession *)pCmd)->szEventName);
+#endif
 			Multiply(CommandCloneSessionSrv(pCmd));
 			break;
 		default:
@@ -222,14 +232,14 @@ static void LOCALAPI ProcessCommand(HANDLE md)
 			if(pSocket == NULL)
 			{
 #if defined(TRACE) && (TRACE & TRACE_ULACALL)
-				printf_s("Erratic!%s (code = %d) called for invalid local fiber#0x%X\n"
+				printf_s("Erratic!%s (code = %d) called for invalid local fiber#%u\n"
 					, opCodeStrings[pCmd->opCode]
 					, pCmd->opCode
 					, pCmd->fiberID);
 #endif
 				break;
 			}
-			pSocket->ProcessCommand(pCmd->opCode);
+			pSocket->ProcessCommand(pCmd);
 		}
 		// hard-coded: (ushort)(-1) mean exit
 		if(buffer[0] == 0xFF || buffer[1] == 0xFF)

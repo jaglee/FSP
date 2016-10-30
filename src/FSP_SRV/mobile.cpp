@@ -117,14 +117,14 @@ ALFID_T LOCALAPI CLowerInterface::RandALFID()
 
 
 // Given
-//	BYTE *		pointer to the byte string of cookie material for the calculation
+//	const void *pointer to the byte string of cookie material for the calculation
 //	int			the length of the cookie material
 //	timestamp_t	the time associated with the cookie, to deduce the life-span of the cookie
 // Do
 //	Calculate the cookie
 // Return
 //	The 64-bit cookie value
-uint64_t LOCALAPI CalculateCookie(BYTE *header, int sizeHdr, timestamp_t t0)
+uint64_t LOCALAPI CalculateCookie(const void *header, int sizeHdr, timestamp_t t0)
 {
 	static struct
 	{
@@ -213,15 +213,17 @@ void CSocketItemEx::InstallEphemeralKey()
 
 
 // See @DLL::InstallKey
-void CSocketItemEx::InstallSessionKey()
+void CSocketItemEx::InstallSessionKey(const CommandInstallKey & cmd)
 {
 #if defined(TRACE) && (TRACE & (TRACE_SLIDEWIN | TRACE_ULACALL))
-	printf_s("\n" __FUNCDNAME__ "\n\tsendWindowNextSN = %u, sendBufferNextSN = %u\n\trecvWindowNextSN = %u\n"
+	printf_s("\n" __FUNCDNAME__ "\tsendWindowNextSN = %u\n"
+		"  sendBufferNextSN = %09u, \trecvWindowNextSN = %09u\n"
+		"command.nextSendSN = %09u, \t RecvRE snapshot = %09u\n"
 		, pControlBlock->sendWindowNextSN
-		, pControlBlock->sendBufferNextSN
-		, pControlBlock->recvWindowNextSN);
-	printf("Key length: %d bytes\t", pControlBlock->connectParams.keyLength / 8);
-	DumpHexical((uint8_t *)& pControlBlock->connectParams, pControlBlock->connectParams.keyLength / 8);
+		, pControlBlock->sendBufferNextSN, pControlBlock->recvWindowNextSN
+		, cmd.nextSendSN, pControlBlock->connectParams.nextKey$initialSN);
+	printf("Key length: %d bytes\t", pControlBlock->connectParams.keyLength);
+	DumpHexical(& pControlBlock->connectParams, pControlBlock->connectParams.keyLength);
 #endif
 #ifndef NDEBUG
 	contextOfICC._mac_ctx_protect_prolog[0]
@@ -232,58 +234,73 @@ void CSocketItemEx::InstallSessionKey()
 #endif
 	contextOfICC.savedCRC = (contextOfICC.keyLife == 0);
 	contextOfICC.prev = contextOfICC.curr;
-	contextOfICC.keyLife = pControlBlock->connectParams.keyLife$initialSN;
 	GCM_AES_SetKey(& contextOfICC.curr.gcm_aes, (uint8_t *) & pControlBlock->connectParams, pControlBlock->connectParams.keyLength);
 
-	contextOfICC.snFirstRecvWithCurrKey	= pControlBlock->recvWindowNextSN;
-	contextOfICC.snFirstSendWithCurrKey = pControlBlock->sendBufferNextSN;
+	contextOfICC.keyLife = cmd.keyLife;
+	contextOfICC.snFirstSendWithCurrKey = cmd.nextSendSN;
+	contextOfICC.snFirstRecvWithCurrKey	= pControlBlock->connectParams.nextKey$initialSN;
 }
 
 
 
+// Given
+//	ControlBlock::seq_t sn1			The sequence number of the initiator's MULTIPLY packet
+//	ControlBlock::seq_t ackSN		The sequence number of the responder's PERSIST packet
+//	ALFID_T idInitiator				The initiator's NEW ALFID
+//	ALFID_T idResponder				The responder's original ALFID (the parent ALFID)
 // Set the session key for the packet next sent and the next received. KDF counter mode
 // As the NIST SP800-108 recommended, K(i) = PRF(K, [i] || Label || 0x00 || Context || L)
 // Label  ¨C A string that identifies the purpose for the derived keying material, here we set to "FSP connection multiplication"
-// Context - idRemoteHost, idParent
+// Context - idParent, idRemoteHost 
 // Length -  An integer specifying the length (in bits) of the derived keying material K-output
-// Assume other fields of contextOfICC have been filled properly, such as
-//	contextOfICC.savedCRC = false;
-//	contextOfICC.prev = contextOfICC.curr;
-void CSocketItemEx::DeriveNextKey()
+// Assume other fields of contextOfICC have been filled properly, especially contextOfICC.prev = contextOfICC.curr
+void LOCALAPI CSocketItemEx::DeriveNextKey(ControlBlock::seq_t sn1, ControlBlock::seq_t ackSN, ALFID_T idInitiator, ALFID_T idResponder)
 {
-#if defined(TRACE) && (TRACE & (TRACE_SLIDEWIN | TRACE_ULACALL))
-	printf_s("\n" __FUNCDNAME__ "\n\tsendWindowNextSN = %u, sendBufferNextSN = %u\n\trecvWindowNextSN = %u\n"
-		, pControlBlock->sendWindowNextSN
-		, pControlBlock->sendBufferNextSN
-		, pControlBlock->recvWindowNextSN);
-#endif
+	register uint8_t *keyBuffer = (uint8_t *)& pControlBlock->connectParams;
+	register int L = pControlBlock->connectParams.keyLength;
+	uint64_t nonce = htobe64(((uint64_t)sn1 << 32) + ackSN);
 	// hard coded, as specified by the protocol
 	ALIGN(8)
-	uint8_t paddedData[48];
+	uint8_t paddedData[40];
+	memcpy(paddedData + 1, "Multiply an FSP connection", 26); // works in multi-byte character set/ASCII encoding source only
+	paddedData[27] = 0;
+	// ALFIDs were transmitted in neutral byte order, actually
+	*(uint32_t *)(paddedData + 28) = idInitiator;
+	*(uint32_t *)(paddedData + 32) = idResponder;
+	*(uint32_t *)(paddedData + 36) = htobe32(L * 8);
+
 	// The first 128 bits
-	paddedData[0] = 0;
-	paddedData[1] = 0;
-	paddedData[2] = 1;
-	memcpy(paddedData + 3, "Multiplication of FSP connection", 32); // works in multi-byte/ASCII encoding source only
-	paddedData[35] = 0;
-	*(uint32_t *)(paddedData + 36) = pControlBlock->peerAddr.ipFSP.hostID;	// byte-order neutral, actually
-	*(uint32_t *)(paddedData + 40) = pControlBlock->idParent;		// byte-order neutral, actually
-	*(uint32_t *)(paddedData + 44) = htobe32(pControlBlock->connectParams.keyLength * 8);
-
+	paddedData[0] = 1;
 	GCM_SecureHash(& contextOfICC.prev.gcm_aes
-		, pControlBlock->sendWindowNextSN
+		, nonce
 		, paddedData, sizeof(paddedData)
-		, (uint8_t *) & pControlBlock->connectParams, 8);
-	if(pControlBlock->connectParams.keyLength <= 16)
-		return;
+		, keyBuffer, 16);
+	if(L <= 16)
+		goto l_return;
+	// the second 128-bits
+	paddedData[0] = 2;
+	GCM_SecureHash(& contextOfICC.prev.gcm_aes
+		, nonce
+		, paddedData, sizeof(paddedData)
+		, keyBuffer + 16, 16);
+	// 384-bits AES does not exist. However, Blowfish, the default cipher algorithm exploited by OpenVPN,
+	// although suspectible to birthday attack in some senario, can utilise key length up to 448 bits
+	// https://sweet32.info/  mitigate the attack by forcing frequent rekeying with reneg-bytes 64000000. (64MB) 
+	if (L <= 32)
+		goto l_return;
+	// the third 128-bits
+	paddedData[0] = 3;
+	GCM_SecureHash(&contextOfICC.prev.gcm_aes
+		, nonce
+		, paddedData, sizeof(paddedData)
+		, keyBuffer + 32, 16);
 	//
-	paddedData[2] = 2;
-	GCM_SecureHash(& contextOfICC.prev.gcm_aes
-		, pControlBlock->sendWindowNextSN
-		, paddedData, sizeof(paddedData)
-		, (uint8_t *) & pControlBlock->connectParams, 8);
-
-	GCM_AES_SetKey(& contextOfICC.curr.gcm_aes, (uint8_t *) & pControlBlock->connectParams, pControlBlock->connectParams.keyLength);
+l_return:
+#ifndef NDEBUG
+	if (L != 16 && L != 32 && L != 48)
+		throw - EDOM;	// unsupported key length, there must be protocol incoherency
+#endif
+	GCM_AES_SetKey(& contextOfICC.curr.gcm_aes, keyBuffer, L);
 }
 
 
@@ -352,28 +369,28 @@ void * LOCALAPI CSocketItemEx::SetIntegrityCheckCode(FSP_NormalPacketHeader *p1,
 	ALIGN(MAC_ALIGNMENT) uint64_t tag[FSP_TAG_SIZE / sizeof(uint64_t)];
 	void * buf;
 	uint32_t seqNo = be32toh(p1->sequenceNo);
-#if defined(TRACE) && (TRACE & TRACE_PACKET)
-	printf_s("\nBefore GCM_AES_AuthenticatedEncrypt: ptLen = %d\n", ptLen);
-	DumpNetworkUInt16((uint16_t *)p1, sizeof(FSP_NormalPacketHeader) / 2);
-#endif
+//#if defined(TRACE) && (TRACE & TRACE_PACKET)
+//	printf_s("\nBefore GCM_AES_AuthenticatedEncrypt: ptLen = %d\n", ptLen);
+//	DumpNetworkUInt16((uint16_t *)p1, sizeof(FSP_NormalPacketHeader) / 2);
+//#endif
 
 	// CRC64
 	if(contextOfICC.keyLife == 0)
 	{
-#if defined(TRACE) && (TRACE & TRACE_PACKET)
-		printf_s("\nPrecomputed ICC: ");
-		DumpNetworkUInt16((uint16_t *) & contextOfICC.curr.precomputedICC[0], sizeof(uint64_t) / 2);
-#endif
+//#if defined(TRACE) && (TRACE & TRACE_PACKET)
+//		printf_s("\nPrecomputed ICC: ");
+//		DumpNetworkUInt16((uint16_t *) & contextOfICC.curr.precomputedICC[0], sizeof(uint64_t) / 2);
+//#endif
 		p1->integrity.code = contextOfICC.curr.precomputedICC[0];
 		tag[0] = CalculateCRC64(0, (uint8_t *)p1, sizeof(FSP_NormalPacketHeader));
 		buf = content;
 	}
 	else if(int32_t(seqNo - contextOfICC.snFirstSendWithCurrKey) < 0 && contextOfICC.savedCRC)
 	{
-#if defined(TRACE) && (TRACE & TRACE_PACKET)
-		printf_s("\nPrecomputed ICC: ");
-		DumpNetworkUInt16((uint16_t *) & contextOfICC.prev.precomputedICC[0], sizeof(uint64_t) / 2);
-#endif
+//#if defined(TRACE) && (TRACE & TRACE_PACKET)
+//		printf_s("\nPrecomputed ICC: ");
+//		DumpNetworkUInt16((uint16_t *) & contextOfICC.prev.precomputedICC[0], sizeof(uint64_t) / 2);
+//#endif
 		p1->integrity.code = contextOfICC.prev.precomputedICC[0];
 		tag[0] = CalculateCRC64(0, (uint8_t *)p1, sizeof(FSP_NormalPacketHeader));
 		buf = content;
@@ -396,7 +413,6 @@ void * LOCALAPI CSocketItemEx::SetIntegrityCheckCode(FSP_NormalPacketHeader *p1,
 			, (uint8_t *)tag, FSP_TAG_SIZE)
 			!= 0)
 		{
-			TRACE_HERE("Encryption error?");
 			GCM_AES_XorSalt(pCtx, salt);
 			return NULL;
 		}
@@ -405,9 +421,9 @@ void * LOCALAPI CSocketItemEx::SetIntegrityCheckCode(FSP_NormalPacketHeader *p1,
 	}
 
 	p1->integrity.code = tag[0];
-#if defined(TRACE) && (TRACE & TRACE_PACKET)
-	printf_s("After GCM_AES_AuthenticatedEncrypt:\n");	DumpNetworkUInt16((uint16_t *)p1, sizeof(FSP_NormalPacketHeader) / 2);
-#endif
+//#if defined(TRACE) && (TRACE & TRACE_PACKET)
+//	printf_s("After GCM_AES_AuthenticatedEncrypt:\n");	DumpNetworkUInt16((uint16_t *)p1, sizeof(FSP_NormalPacketHeader) / 2);
+//#endif
 	return buf;
 }
 
@@ -513,7 +529,7 @@ bool CSocketItemEx::EmitStart()
 	void  *payload = (FSP_NormalPacketHeader *)this->GetSendPtr(skb);
 	if(payload == NULL)
 	{
-		TRACE_HERE("TODO: debug log memory corruption error");
+		DebugBreak();	//TRACE_HERE("TODO: debug log memory corruption error");
 		HandleMemoryCorruption();
 		return false;
 	}
@@ -546,11 +562,11 @@ bool CSocketItemEx::EmitStart()
 		result = SendPacket(1, ScatteredSendBuffers(payload, skb->len));
 		break;
 	default:
-		TRACE_HERE("Unexpected socket buffer block");
+		DebugBreak();
 		result = 0;	// unrecognized packet type is simply ignored?!
 	}
 #if defined(TRACE) && (TRACE & TRACE_PACKET)
-	printf_s("Session#0x%X emit %s, result = %d, time : 0x%016llX\n"
+	printf_s("Session#%u emit %s, result = %d, time : 0x%016llX\n"
 		, fidPair.source, opCodeStrings[skb->opCode], result, skb->timeSent);
 #endif
 	return (result >= 0);
@@ -573,7 +589,9 @@ int CSocketItemEx::EmitWithICC(ControlBlock::PFSP_SocketBuf skb, ControlBlock::s
 #endif
 	if(contextOfICC.keyLife == 1)
 	{
-		TRACE_HERE("Session key run out of life");
+#ifdef TRACE
+		printf_s("\nSession#%u key run out of life\n", fidPair.source);
+#endif
 		return 0;
 	}
 
@@ -584,7 +602,7 @@ int CSocketItemEx::EmitWithICC(ControlBlock::PFSP_SocketBuf skb, ControlBlock::s
 	void  *payload = (FSP_NormalPacketHeader *)this->GetSendPtr(skb);
 	if(payload == NULL)
 	{
-		TRACE_HERE("TODO: debug log memory corruption error");
+		DebugBreak();	//TRACE_HERE("TODO: debug log memory corruption error");
 		HandleMemoryCorruption();
 		return 0;
 	}
@@ -596,7 +614,6 @@ int CSocketItemEx::EmitWithICC(ControlBlock::PFSP_SocketBuf skb, ControlBlock::s
 	pHdr->ClearFlags();	// pHdr->u.flags = 0;
 	if (skb->GetFlag<END_OF_TRANSACTION>())
 		pHdr->SetFlag<EndOfTransaction>();
-	// UNRESOLVED! compressed? ECN?
 	// here we needn't check memory corruption as mishavior only harms himself
 	pHdr->SetRecvWS(pControlBlock->RecvWindowSize());
 	pHdr->hs.Set(skb->opCode, sizeof(FSP_NormalPacketHeader));
@@ -675,9 +692,6 @@ bool CSocketItemEx::HandlePeerSubnets(PFSP_HeaderSignature optHdr)
 // TODO: rate-control/quota control
 void CSocketItemEx::EmitQ()
 {
-#if defined(TRACE) && (TRACE & TRACE_PACKET)
-	TRACE_HERE("Sending data...");
-#endif
 	ControlBlock::seq_t lastSN = _InterlockedOr((LONG *) & pControlBlock->sendBufferNextSN, 0);
 	ControlBlock::seq_t firstSN = pControlBlock->sendWindowFirstSN;
 	ControlBlock::seq_t & nextSN = pControlBlock->sendWindowNextSN;
@@ -685,7 +699,6 @@ void CSocketItemEx::EmitQ()
 	//
 	bool shouldRetry = pControlBlock->CountSendBuffered() > 0;
 	register ControlBlock::PFSP_SocketBuf skb;
-	// The flag IS_COMPLETED is for double-stage commit of send buffer, for sake of sending online compressed stream
 	while (int(nextSN - lastSN) < 0 && int(nextSN - firstSN) <= winSize)
 	{
 		skb = pControlBlock->HeadSend() + pControlBlock->sendWindowNextPos;

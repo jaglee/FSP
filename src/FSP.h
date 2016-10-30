@@ -205,10 +205,10 @@ typedef uint64_t timestamp_t;
 // In debug mode we allow pre-definition via compiler's command-line option
 #ifdef _DEBUG
 # define INIT_RETRANSMIT_TIMEOUT_ms		60000	// 1 minute
-# define TRASIENT_STATE_TIMEOUT_ms		300000	// 5 minutes
+# define TRANSIENT_STATE_TIMEOUT_ms		300000	// 5 minutes
 #else
 # define INIT_RETRANSMIT_TIMEOUT_ms		15000	// 15 seconds
-# define TRASIENT_STATE_TIMEOUT_ms		60000	// 1 minute
+# define TRANSIENT_STATE_TIMEOUT_ms		60000	// 1 minute
 #endif
 
 #define KEEP_ALIVE_TIMEOUT_ms			600000	// 10 minutes

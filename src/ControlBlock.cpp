@@ -111,7 +111,7 @@ const char * CStringizeNotice::names[LARGEST_FSP_NOTICE + 1] =
 	// 1~15: DLL to LLS
 	"FSP_Listen",		// register a passive socket
 	"InitConnection",	// register an initiative socket
-	"FSP_NotifyAccepting",	// FSP_Accept
+	"FSP_Accept",		// accept the connection, make SCB of LLS synchronized with DLL
 	"FSP_Reject",		// a forward command, explicitly reject some request
 	"FSP_Recycle",		// a forward command, connection might be aborted
 	"FSP_Start",		// send a packet starting a new send-transaction
@@ -119,8 +119,8 @@ const char * CStringizeNotice::names[LARGEST_FSP_NOTICE + 1] =
 	"FSP_Commit",		// commit a transmit transaction by send an EOT flag
 	"FSP_Shutdown",		// close the connection
 	"FSP_InstallKey",	// install the authenticated encryption key
-	// 11-15, 5 reserved
-	"Reserved11",
+	"FSP_Multiply",		// clone the connection, make SCB of LLS synchronized with DLL
+	// 12-15, 4 reserved
 	"Reserved12",
 	"Reserved13",
 	"Reserved14",
@@ -128,6 +128,7 @@ const char * CStringizeNotice::names[LARGEST_FSP_NOTICE + 1] =
 	// 16~23: LLS to DLL in the backlog
 	//FSP_NotifyAccepting = FSP_Accept,	// a reverse command to make context ready
 	//FSP_NotifyRecycled = FSP_Recycle,		// a reverse command to inform DLL to release resource passively
+	//FSP_NotifyMultiplied = FSP_Multiply,	// a reverse command to inform DLL to accept a multiply request
 	"FSP_NotifyAccepted",
 	"FSP_NotifyDataReady",
 	"FSP_NotifyBufferReady",
@@ -600,14 +601,14 @@ void * LOCALAPI ControlBlock::InquireRecvBuf(int & nIO, bool & eotFlag)
 	{
 		if(p->len > MAX_BLOCK_SIZE || p->len < 0)
 		{
-			TRACE_HERE("Unrecoverable error! memory corruption might have occurred");
+			DebugBreak();	// TRACE_HERE("Unrecoverable error! memory corruption might have occurred");
 			nIO = -EFAULT;
 			return NULL;
 		}
 		//
 		if (_InterlockedExchange8((char *) & p->opCode, 0) == 0)
 		{
-			TRACE_HERE("To double deliver a packet?");
+			DebugBreak();	// TRACE_HERE("To double deliver a packet?");
 			return NULL;
 		}
 		//
@@ -621,7 +622,7 @@ void * LOCALAPI ControlBlock::InquireRecvBuf(int & nIO, bool & eotFlag)
 		}
 		if(p->len != MAX_BLOCK_SIZE)
 		{
-			TRACE_HERE("Unrecoverable error! Unconform to the protocol");
+			DebugBreak();	//TRACE_HERE("Unrecoverable error! Unconform to the protocol");
 			nIO = -EFAULT;
 			return NULL;
 		}
@@ -924,3 +925,18 @@ bool LOCALAPI ControlBlock::ResizeSendWindow(seq_t seq1, unsigned int adRecvWin)
 	SetSendWindowSize(int32_t(d + adRecvWin));
 	return true;
 }
+
+
+#if defined(TRACE) && !defined(NDEDUG)
+int ControlBlock::DumpSendRecvWindowInfo() const
+{
+	return printf_s("\tSend[head, tail] = [%d, %d], packets on flight = %d\n"
+		"\tSN next to send = %u(@%d), welcomedNextSNtoSend = %u\n"
+		"\tRecv[head, tail] = [%d, %d], receive window size = %d\n"
+		"\tSN first received = %u, max expected = %u\n"
+		, sendWindowHeadPos, sendBufferNextPos, int(sendWindowNextSN - sendWindowFirstSN)
+		, sendWindowNextSN, sendWindowNextPos, welcomedNextSNtoSend
+		, recvWindowHeadPos, recvWindowNextPos, int(recvWindowNextSN - recvWindowFirstSN)
+		, recvWindowFirstSN, recvWindowNextSN);
+}
+#endif

@@ -32,7 +32,6 @@
 
 //[API: Multiply]
 //	NON_EXISTENT-->CLONING-->[Send MULTIPLY]{enable retry}
-// UNRESOLVED! ALLOCATED NEW SESSION ID in LLS?
 // Given
 //	FSPHANDLE		the handle of the parent FSP socket to be multiplied
 //	PFSP_Context	the pointer to the parameter structure of the socket to create by multiplication
@@ -51,9 +50,7 @@
 DllExport
 FSPHANDLE FSPAPI MultiplyAndWrite(FSPHANDLE hFSP, PFSP_Context psp1, int8_t flag, NotifyOrReturn fp1)
 {
-	TRACE_HERE("called");
-
-	CommandCloneSession objCommand;
+	CommandCloneConnect objCommand;
 	CSocketItemDl *p = CSocketItemDl::ToPrepareMultiply((CSocketItemDl *)hFSP, psp1, objCommand);
 	if(p == NULL)
 		return p;
@@ -68,8 +65,7 @@ FSPHANDLE FSPAPI MultiplyAndWrite(FSPHANDLE hFSP, PFSP_Context psp1, int8_t flag
 		p->BufferData(psp1->len);
 	}
 
-	p->CompleteMultiply();
-	return p->CallCreate(objCommand, FSP_Multiply);
+	return p->CompleteMultiply(objCommand);
 }
 
 
@@ -91,9 +87,7 @@ FSPHANDLE FSPAPI MultiplyAndWrite(FSPHANDLE hFSP, PFSP_Context psp1, int8_t flag
 DllExport
 FSPHANDLE FSPAPI MultiplyAndGetSendBuffer(FSPHANDLE hFSP, PFSP_Context psp1, int *pSize, CallbackBufferReady onBufferReady)
 {
-	TRACE_HERE("called");
-
-	CommandCloneSession objCommand;
+	CommandCloneConnect objCommand;
 	CSocketItemDl *p = CSocketItemDl::ToPrepareMultiply((CSocketItemDl *)hFSP, psp1, objCommand);
 	if(p == NULL)
 		return p;
@@ -113,8 +107,7 @@ FSPHANDLE FSPAPI MultiplyAndGetSendBuffer(FSPHANDLE hFSP, PFSP_Context psp1, int
 			onBufferReady(p, buf, *pSize);
 	}
 
-	p->CompleteMultiply();
-	return p->CallCreate(objCommand, FSP_Multiply);
+	return p->CompleteMultiply(objCommand);
 }
 
 
@@ -122,12 +115,13 @@ FSPHANDLE FSPAPI MultiplyAndGetSendBuffer(FSPHANDLE hFSP, PFSP_Context psp1, int
 // Given
 //	CSocketItemDl *		The parent socket item
 //	PFSP_Context		The context of the new child connection
-//	CommandCloneSession [out] The connection multiplication command structure
+//	CommandCloneConnect [out] The connection multiplication command structure
 // Return
 //	The new socket item
-CSocketItemDl * LOCALAPI CSocketItemDl::ToPrepareMultiply(CSocketItemDl *p, PFSP_Context psp1, CommandCloneSession & objCommand)
+// Remark
+//	Requirement of a command structure is rendered by CreateControlBlock
+CSocketItemDl * LOCALAPI CSocketItemDl::ToPrepareMultiply(CSocketItemDl *p, PFSP_Context psp1, CommandCloneConnect & objCommand)
 {
-	TRACE_HERE("called");
 	if(p == NULL)
 	{
 		psp1->u.flags = EBADF;
@@ -146,12 +140,15 @@ CSocketItemDl * LOCALAPI CSocketItemDl::ToPrepareMultiply(CSocketItemDl *p, PFSP
 	try
 	{
 		memcpy(& socketItem->pControlBlock->connectParams, & p->pControlBlock->connectParams, FSP_MAX_KEY_SIZE);
-		objCommand.idParent = socketItem->pControlBlock->idParent = p->fidPair.source;
+		socketItem->pControlBlock->idParent = p->fidPair.source;
+		socketItem->pControlBlock->SetSendWindow(p->pControlBlock->sendWindowNextSN - 1);
+		//^The receive window would be initialized in LLS
+		// The MULTIPLY packet itself is sent in old key, while the packet next to MULTIPLY is send in derived key
+		socketItem->SetState(CLONING);
+		socketItem->SetNewTransaction();
 		socketItem->pControlBlock->peerAddr = p->pControlBlock->peerAddr;
 		// But nearEndName cannot be inheritted
 		socketItem->pControlBlock->nearEndInfo = p->pControlBlock->nearEndInfo;
-		socketItem->pControlBlock->SetSendWindow(0);
-		//^The actual send and receive window would be initialized in LLS
 	}
 	catch(int)	// could we really catch run-time memory access exception?
 	{
@@ -159,16 +156,15 @@ CSocketItemDl * LOCALAPI CSocketItemDl::ToPrepareMultiply(CSocketItemDl *p, PFSP
 		return NULL;
 	}
 
-	socketItem->ToPrepareMultiply();
-
 	return socketItem;
 }
 
 
-
+// Given
+//	CommandCloneConnect &		The command context whose shared memory and event handlers have been prepared
 // Do
-//	Fill in the MULTPLY packet
-void CSocketItemDl::CompleteMultiply()
+//	Fill in the MULTPLY packet, construct and pass command to LLS
+FSPHANDLE CSocketItemDl::CompleteMultiply(CommandCloneConnect & cmd)
 {
 	ControlBlock::PFSP_SocketBuf skb = SetHeadPacketIfEmpty(MULTIPLY);
 	if(skb != NULL)
@@ -176,6 +172,21 @@ void CSocketItemDl::CompleteMultiply()
 		skb->opCode = MULTIPLY;
 		skb->SetFlag<IS_COMPLETED>(); 
 	}
+	// See also InitCommand, CallCreate
+	cmd.fiberID = pControlBlock->idParent;
+	cmd.idProcess = ::idThisProcess;
+	cmd.hMemoryMap = hMemoryMap;
+	cmd.dwMemorySize = dwMemorySize;
+	//
+	cmd.isFlushing = this->isFlushing;
+	cmd.opCode = FSP_Multiply;
+	if(! Call(cmd, sizeof(cmd)))
+	{
+		socketsTLB.FreeItem(this);
+		return NULL;
+	}
+
+	return this;
 }
 
 
@@ -190,14 +201,11 @@ void CSocketItemDl::CompleteMultiply()
 //	..context.onAccepting CANNOT read or write anything!?
 bool LOCALAPI CSocketItemDl::ToWelcomeMultiply(BackLogItem & backLog)
 {
-	TRACE_HERE("called");
-
 	PFSP_IN6_ADDR remoteAddr = (PFSP_IN6_ADDR) & pControlBlock->peerAddr.ipFSP.allowedPrefixes[MAX_PHY_INTERFACES - 1];	
 	SetNewTransaction();
 	if( context.onAccepting == NULL	// This is NOT the same policy as ToWelcomeConnect
 	 || context.onAccepting(this, & backLog.acceptAddr, remoteAddr) < 0 )
 	{
-		TRACE_HERE("The upper layer application has rejected connection multiplication"); // UNRESOLVED! report that 
 		Recycle();
 		return false;
 	}

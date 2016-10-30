@@ -88,14 +88,12 @@ FORCEINLINE char _InterlockedExchange16(volatile short * a, short b)
  * For testability
  */
 #ifdef TRACE
-# define TRACE_HERE(s) printf("\n/**\n * %s, line %d\n * %s\n * %s\n */\n", __FILE__, __LINE__, __FUNCDNAME__, s)
 # define REPORT_ERROR_ON_TRACE() \
 	TraceLastError(__FILE__, __LINE__, __FUNCDNAME__, "ERROR REPORT")
 # define REPORT_ERRMSG_ON_TRACE(s1) \
 	TraceLastError(__FILE__, __LINE__, __FUNCDNAME__, (s1))
 void TraceLastError(char * fileName, int lineNo, char *funcName, char *s1);
 #else
-# define TRACE_HERE
 # define REPORT_ERROR_ON_TRACE()
 # define REPORT_ERRMSG_ON_TRACE(s) (s)
 #endif
@@ -228,13 +226,11 @@ struct $FSP_HeaderSignature: FSP_HeaderSignature
 };
 
 
+
 // position start from 0, the rightmost one
 enum FSP_FlagPosition: UINT8
 {
 	EndOfTransaction = 0,
-	Compressed = 1,
-	RESERVED_AT_2,
-	RESERVED_AT_3,
 	FirstInFirstDrop = 4,
 };
 
@@ -251,11 +247,6 @@ struct FSP_NormalPacketHeader
 	} integrity;
 	//
 	UINT8	flags_ws[4];
-/**
-	For IPv4, maximum buffer size = 512 * 65536 = 32MB
-	For IPv6 normal packet, maximum buffer size = 1024 * 65536 = 64MB
-	However, for IPv6 jumbo packet it can easily reach 512MB or even more
- */
 	$FSP_HeaderSignature hs;
 
 	// Given the opCode, total length of all the headers, sequenceNo, expectedNo and receive window size
@@ -420,10 +411,22 @@ struct CommandNewSession: CommandToLLS
 };
 
 
-struct CommandCloneSession: CommandNewSession
+
+struct CommandInstallKey : CommandToLLS
 {
-	ALFID_T			idParent;
+	uint32_t	nextSendSN;	// ControlBlock::seq_t
+	int32_t		keyLife;
+	CommandInstallKey(uint32_t seq1, int32_t v) { nextSendSN = seq1;  keyLife = v; }
 };
+
+
+
+struct CommandCloneConnect : CommandNewSession
+{
+	ALIGN(4)
+	char		isFlushing;
+};
+
 
 
 struct FSP_PKTINFO_EX : FSP_SINKINF
@@ -459,19 +462,19 @@ struct SConnectParam	// MUST be aligned on 64-bit words!
 	timestamp_t nboTimeStamp;
 	//^ Timestamp in network byte order, together with the first four fields, totally 256 bits could be overlaid
 	//
-
+	int8_t		padding[8];	// allow maximum key length of 384-bit, padding the structure to 64 bytes/512bits
+	int32_t		keyLength;	// by default 16 bytes
 	union
 	{
 		uint32_t	initialSN;
-		int32_t		keyLife$initialSN;
+		int32_t		nextKey$initialSN;
 	};
 
-	int32_t		keyLength;	// by default 16 bytes
 	ALFID_T		idRemote;	// ID of the listener or the new forked, depending on context
 	uint32_t	remoteHostID;
 	//
 	uint64_t	allowedPrefixes[MAX_PHY_INTERFACES];
-};	// totally 56 bytes, 448 bits
+};	// totally 64 bytes, 512 bits
 
 
 
@@ -546,8 +549,7 @@ enum SocketBufFlagBitPosition
 	IS_COMPLETED = 2,
 	IS_SENT = 3,
 	IS_FULFILLED = IS_COMPLETED,// mutual-mirroring flags for send and receive
-	// 4, 5: reserved
-	IS_COMPRESSED = 6,
+	// 4, 5, 6 : reserved
 	END_OF_TRANSACTION = 7
 };
 
@@ -708,18 +710,8 @@ struct ControlBlock
 	//
 	int CountSendBuffered() const { return int(sendBufferNextSN - sendWindowFirstSN); }
 	int CountSentInFlight() const { return int(sendWindowNextSN - sendWindowFirstSN); }
-#if defined(TRACE) || defined(TRACE_HEARTBEAT)
-	int DumpSendRecvWindowInfo() const
-	{
-		return printf_s("\tSend[head, tail] = [%d, %d], packets on flight = %d\n"
-			"\tSN next to send = %u(@%d), welcomedNextSNtoSend = %u\n"
-			"\tRecv[head, tail] = [%d, %d], receive window size = %d\n"
-			"\tSN first received = %u, max expected = %u\n"
-			, sendWindowHeadPos, sendBufferNextPos, int(sendWindowNextSN - sendWindowFirstSN)
-			, sendWindowNextSN, sendWindowNextPos, welcomedNextSNtoSend
-			, recvWindowHeadPos, recvWindowNextPos, int(recvWindowNextSN - recvWindowFirstSN)
-			, recvWindowFirstSN, recvWindowNextSN);
-	}
+#if defined(TRACE) && !defined(NDEBUG)
+	int DumpSendRecvWindowInfo() const;
 #else
 	int DumpSendRecvWindowInfo() const { return 0; }
 #endif
@@ -747,6 +739,8 @@ struct ControlBlock
 	//	2 if there existed an unsent packet at the tail and it is marked EOT
 	//  -1 if there existed a sent packet at the tail which could not be marked EOT
 	int MarkSendQueueEOT();
+	// Take snapshot of the right edge of the receive window, typically on transmit transaction committed
+	void SnapshotReceiveWindowRightEdge() { connectParams.nextKey$initialSN = recvWindowNextSN; }
 
 	// Allocate a new send buffer
 	PFSP_SocketBuf	GetSendBuf();
@@ -836,8 +830,6 @@ protected:
 	HANDLE	hMemoryMap;
 	DWORD	dwMemorySize;	// size of the shared memory, in the mapped view
 	ControlBlock *pControlBlock;
-
-	void SetCallable() { pControlBlock->notices.SetHead(NullCommand); }	// clear the 'NOT-returned' notice
 
 	//virtual ~CSocketItem() { }	// Make this a semi-abstract class
 	void Destroy()

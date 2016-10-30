@@ -6,6 +6,7 @@ const char		*defaultWelcome = "File synchronizer based on Flexible Session Proto
 volatile bool	finished = false;
 FSPHANDLE		hFspListen;
 char			linebuf[80];
+extern	bool	r2Finish;
 
 static char		fileName[MAX_FILENAME_WITH_PATH_LEN];
 static int		fd;
@@ -17,11 +18,10 @@ static unsigned char bufPeerPublicKey[CRYPTO_NACL_KEYBYTES];
 
 void FSPAPI onNotice(FSPHANDLE h, FSP_ServiceCode code, int value)
 {
-	printf_s("Notify: Fiber ID = %u, service code = %d, return %d\n", (uint32_t)(intptr_t)h, code, value);
+	printf_s("Notify: socket %p, service code = %d, return %d\n", h, code, value);
 	if(value < 0)
 	{
-		Dispose(h);
-		finished = true;
+		r2Finish = finished = true;
 		return;
 	}
 }
@@ -31,14 +31,13 @@ void FSPAPI onNotice(FSPHANDLE h, FSP_ServiceCode code, int value)
 //
 void FSPAPI onFinished(FSPHANDLE h, FSP_ServiceCode code, int value)
 {
-	printf_s("Fiber ID = %u, session was to shut down.\n", (uint32_t)(intptr_t)h);
+	printf_s("Socket %p, session was to shut down.\n", h);
 	if(code != FSP_NotifyRecycled)
 	{
 		printf_s("Should got ON_RECYCLED, but service code = %d, return %d\n", code, value);
 		return;
 	}
 
-	Dispose(h);
 	finished = true;
 	return;
 }
@@ -66,10 +65,9 @@ void FSPAPI WaitConnection(const char *thisWelcome, unsigned short mLen, Callbac
 
 	hFspListen = ListenAt(& atAddress, & params);
 
-	while(! finished)
+	while(!r2Finish || !finished)
 		_sleep(1);	// yield CPU out for at least 1ms/one time slice
 
-	//_sleep(300000);	// for debug purpose
 	if(hFspListen != NULL)
 		Dispose(hFspListen);
 }
@@ -139,11 +137,12 @@ l_bailout:
 }
 
 
+
 // This function is for tracing purpose
 int	FSPAPI onAccepting(FSPHANDLE h, PFSP_SINKINF p, PFSP_IN6_ADDR remoteAddr)
 {
-	printf_s("\nTo accept handle of FSP session: 0x%08X\n", h);
-	printf_s("Interface: %d, session Id: %u\n", p->ipi6_ifindex, p->idALF);
+	printf_s("\nTo accept handle of FSP session: %p\n", h);
+	printf_s("Interface#%d, fiber#%u\n", p->ipi6_ifindex, p->idALF);
 	// no be32toh() for local; note that for IPv6 network, little-endian CPU, the peer's remoteAddr->idALF wouldn't match it
 	printf_s("Remote address: 0x%llX::%X::%X\n", be64toh(remoteAddr->u.subnet), be32toh(remoteAddr->idHost), be32toh(remoteAddr->idALF));
 	return 0;	// no opposition
@@ -153,7 +152,7 @@ int	FSPAPI onAccepting(FSPHANDLE h, PFSP_SINKINF p, PFSP_IN6_ADDR remoteAddr)
 
 static int FSPAPI onAccepted(FSPHANDLE h, PFSP_Context ctx)
 {
-	printf_s("\nFileSyncServer onAccepted: handle of FSP session/Fiber ID = 0x%X\n", (uint32_t)(intptr_t)h);
+	printf_s("\nFileSyncServer onAccepted: handle of FSP session is %p\n", h);
 	// TODO: check connection context
 
 	ReadFrom(h, bufPeerPublicKey, sizeof(bufPeerPublicKey), onPublicKeyReceived);

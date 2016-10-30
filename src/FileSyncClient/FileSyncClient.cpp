@@ -16,27 +16,24 @@ static unsigned char bufPublicKey[CRYPTO_NACL_KEYBYTES];
 static HANDLE hFile;
 static char fileName[MAX_PATH];
 static bool finished;
-// static bool toFinish;
+extern int32_t count2Finish;	// the reverse socket, count to finish
 
 
-static void FSPAPI onNotice(FSPHANDLE h, FSP_ServiceCode code, int value)
+static void FSPAPI onError(FSPHANDLE h, FSP_ServiceCode code, int value)
 {
-	printf_s("Notify: Fiber ID = %u, service code = %d, return %d\n", (uint32_t)(intptr_t)h, code, value);
-	if(value < 0)
-	{
-		Dispose(h);
-		finished = true;
-		return;
-	}
+	printf_s("Notify: socket %p, service code = %d, return %d\n", h, code, value);
+	finished = true;
+	count2Finish = 0;
+	return;
 }
 
 
 
 static void FSPAPI onError2(FSPHANDLE h, FSP_ServiceCode code, int value)
 {
-	printf_s("Notify2: fiber ID = %u, service code = %d, return %d\n", (uint32_t)(intptr_t)h, code, value);
-	Dispose(h);
+	printf_s("Notify2: socket %p, service code = %d, return %d\n", h, code, value);
 	finished = true;
+	count2Finish = 0;
 	return;
 }
 
@@ -45,14 +42,10 @@ static void FSPAPI onError2(FSPHANDLE h, FSP_ServiceCode code, int value)
 //
 static void FSPAPI onFinished(FSPHANDLE h, FSP_ServiceCode code, int value)
 {
-	printf_s("Fiber ID = 0x%X, session was to shut down.\n", (uint32_t)(intptr_t)h);
+	printf_s("Socket %p, session was to shut down.\n", h);
 	if(code != FSP_NotifyRecycled)
-	{
 		printf_s("Should got ON_RECYCLED, but service code = %d, return %d\n", code, value);
-		return;
-	}
 
-	Dispose(h);
 	finished = true;
 	return;
 }
@@ -102,7 +95,7 @@ int main(int argc, char *argv[])
 	memset(& parms, 0, sizeof(parms));
 	parms.onAccepting = onMultiplying;
 	parms.onAccepted = onConnected;
-	parms.onError = onNotice;
+	parms.onError = onError;
 	parms.recvSize = MAX_FSP_SHM_SIZE;	// 4MB
 	parms.sendSize = 0;	// the underlying service would give the minimum, however
 	if(Connect2(REMOTE_APPLAYER_NAME, & parms) == NULL)
@@ -112,15 +105,16 @@ int main(int argc, char *argv[])
 		goto l_bailout;
 	}
 
-	while(! finished)
-		Sleep(1);	// yield CPU out for at least 1ms/one time slice
+	while(count2Finish-- > 0 || !finished)
+		Sleep(50);	// yield CPU out for about 1/20 second
 
 	if(hFile != NULL && hFile != INVALID_HANDLE_VALUE)
 		CloseHandle(hFile);
 
 l_bailout:
 	printf("\n\nPress Enter to exit...");
-	getchar(); // Sleep(3000);	// so that the other thread may send RESET successfully
+	getchar();
+	// Sleep(3000);	// so that the other thread may send RESET successfully
 	exit(result);
 }
 
@@ -128,10 +122,10 @@ l_bailout:
 
 static int	FSPAPI  onConnected(FSPHANDLE h, PFSP_Context ctx)
 {
-	printf_s("\nHandle of FSP session: Fiber ID = 0x%X", (uint32_t)(intptr_t)h);
+	printf_s("\nHandle of FSP session: %p", h);
 	if(h == NULL)
 	{
-		printf_s("\nConnection failure.\n");
+		printf_s("\n\tConnection failed.\n");
 		finished = true;
 		return -1;
 	}

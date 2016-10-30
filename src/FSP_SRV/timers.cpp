@@ -86,34 +86,38 @@ void CSocketItemEx::KeepAlive()
 	{
 		if (!IsInUse())
 		{
-			TRACE_HERE("Lazy garbage collection, in case of leakage");
+			DebugBreak();	//TRACE_HERE("Lazy garbage collection, in case of leakage");
 			Destroy();
 		}
 #ifdef TRACE
-		printf_s("\n#0x%X's KeepAlive not executed due to lack of locks in state %s. InUse: %d\n"
+		printf_s("\nFiber#%u's KeepAlive not executed due to lack of locks in state %s. InUse: %d\n"
 			, fidPair.source, stateNames[lowState], IsInUse());
 #endif
 		return;
 	}
 
 	timestamp_t t1 = NowUTC();
-#if defined(TRACE) && (TRACE & TRACE_HEARTBEAT)
-	TRACE_HERE(" it's time-outed");
-	//DumpTimerInfo(t1);
-#endif
 	switch(lowState)
 	{
 	case NON_EXISTENT:
-		TRACE_HERE("After Destroy it needn't SetReady();");
+#ifdef TRACE
+		printf_s("\nFiber#%u, SCB to be completely disposed\n", fidPair.source);
+#endif
 		if(pControlBlock != NULL)
+		{
+#ifdef TRACE
+			printf_s("\tState of SCB used to be %s[%d]\n"
+				, stateNames[pControlBlock->state], pControlBlock->state);
+#endif
 			pControlBlock->state = NON_EXISTENT;
+		}
 		Destroy();
 		return;
 	// Note that CONNECT_BOOTSTRAP and CONNECT_AFFIRMING are counted into one transient period
 	case CONNECT_BOOTSTRAP:
 	case CONNECT_AFFIRMING:
 	case CHALLENGING:
-		if (t1 - tMigrate > (TRASIENT_STATE_TIMEOUT_ms << 10))
+		if (t1 - tMigrate > (TRANSIENT_STATE_TIMEOUT_ms << 10))
 		{
 #ifdef TRACE
 			printf_s("\nTransient state time out in state %s\n", stateNames[lowState]);
@@ -134,7 +138,7 @@ void CSocketItemEx::KeepAlive()
 #ifdef TRACE
 			printf_s("\nSession time out in the %s state\n", stateNames[lowState]);
 #endif
-			ReplaceTimer(TRASIENT_STATE_TIMEOUT_ms);
+			ReplaceTimer(TRANSIENT_STATE_TIMEOUT_ms);
 			TIMED_OUT();
 		}
 		// If the peer has committed an ACK_FLUSH has accumulatively acknowledged it.
@@ -143,29 +147,35 @@ void CSocketItemEx::KeepAlive()
 			SendKeepAlive();
 		break;
 	case PRE_CLOSED:
-		if((t1 - tMigrate) > (TRASIENT_STATE_TIMEOUT_ms << 10)
+		if((t1 - tMigrate) > (TRANSIENT_STATE_TIMEOUT_ms << 10)
 		 || t1 - tSessionBegin >  (MAXIMUM_SESSION_LIFE_ms << 10) )
 		{
 #ifdef TRACE
 			printf_s("\nTransient state time out in the %s state\n", stateNames[lowState]);
 #endif
-			// UNRESOLVED!? But PRE_CLOSED connection might be resurrected
 			TIMED_OUT();
 		}
 		// UNRESOLVED!? There used to be re-send RELEASE command here
 		break;
+	case CLOSED:	// CLOSED timeout to NON_EXISTENT in a short time
+		if ((t1 - tMigrate) > (TRANSIENT_STATE_TIMEOUT_ms << 10))
+		{
+#ifdef TRACE
+			printf_s("\nTransient state time out in the %s state\n", stateNames[lowState]);
+#endif
+			TIMED_OUT();
+		}
 	case CLOSABLE:	// CLOSABLE does not automatically timeout to CLOSED
-	case CLOSED:
 		if(t1 - tSessionBegin >  (MAXIMUM_SESSION_LIFE_ms << 10))
 		{
-			ReplaceTimer(TRASIENT_STATE_TIMEOUT_ms);
+			ReplaceTimer(TRANSIENT_STATE_TIMEOUT_ms);
 			if(lowState == CLOSABLE)
 				SendPacket<RESET>();	// See also Reject
 			TIMED_OUT();
 		}
 		break;
 	case CLONING:
-		if (t1 - tMigrate > (TRASIENT_STATE_TIMEOUT_ms << 10)
+		if (t1 - tMigrate > (TRANSIENT_STATE_TIMEOUT_ms << 10)
 		 || t1 - tSessionBegin >  (MAXIMUM_SESSION_LIFE_ms << 10) )
 		{
 #ifdef TRACE
@@ -344,9 +354,9 @@ bool CSocketItemEx::SendKeepAlive()
 		return false;
 	}
 #if defined(TRACE) && (TRACE & (TRACE_HEARTBEAT | TRACE_PACKET | TRACE_SLIDEWIN))
-	printf_s("Keep-alive local fiber#0x%X\n"
+	printf_s("Keep-alive: local fiber#%u, peer's fiber#%u\n"
 		"\tAcknowledged seq#%u, keep-alive header size = %d\n"
-		, fidPair.source
+		, fidPair.source, fidPair.peer
 		, snKeepAliveExp
 		, len);
 #endif
@@ -361,7 +371,7 @@ bool CSocketItemEx::SendKeepAlive()
 	//
 	SetIntegrityCheckCode(&buf3.hdr, NULL, 0, buf3.snack.GetSaltValue());
 #if defined(TRACE) && (TRACE & (TRACE_HEARTBEAT | TRACE_PACKET | TRACE_SLIDEWIN))
-	printf_s("To send KEEP_ALIVE seq #%u, acknowledge #%u, source ALFID = 0x%X\n"
+	printf_s("To send KEEP_ALIVE seq #%u, acknowledge #%u\n\tsource ALFID = %u\n"
 		, be32toh(buf3.hdr.sequenceNo)
 		, snKeepAliveExp
 		, fidPair.source);
@@ -392,8 +402,8 @@ bool CSocketItemEx::SendAckFlush()
 	buf2.snack.hs.Set(SELECTIVE_NACK, sizeof(buf2.hdr));
 
 #if defined(TRACE) && (TRACE & (TRACE_HEARTBEAT | TRACE_PACKET | TRACE_SLIDEWIN))
-	printf_s("Acknowledge flush: local fiber#0x%X\tAcknowledged seq#%u\n"
-		, fidPair.source
+	printf_s("Acknowledge flush: local fiber#%u, peer's fiber#%u\n\tAcknowledged seq#%u\n"
+		, fidPair.source, fidPair.peer
 		, pControlBlock->recvWindowNextSN);
 #endif
 
@@ -434,7 +444,7 @@ int LOCALAPI CSocketItemEx::RespondToSNACK(ControlBlock::seq_t expectedSN, FSP_S
 	 ||	sizeof(ControlBlock) + (sizeof(ControlBlock::FSP_SocketBuf) + MAX_BLOCK_SIZE) * capacity > dwMemorySize)
 	{
 #if defined(TRACE)
-		TRACE_HERE("memory overflow");
+		DebugBreak();	//TRACE_HERE("memory overflow");
 		printf_s("Given memory size: %d, wanted limit: %zd\n"
 			, dwMemorySize
 			, sizeof(ControlBlock) + (sizeof(ControlBlock::FSP_SocketBuf) + MAX_BLOCK_SIZE) * capacity);
@@ -445,7 +455,7 @@ int LOCALAPI CSocketItemEx::RespondToSNACK(ControlBlock::seq_t expectedSN, FSP_S
 	const int sentWidth = pControlBlock->CountSentInFlight();
 	if (sentWidth < 0)
 	{
-		TRACE_HERE("send queue internal state error");
+		DebugBreak();	//TRACE_HERE("send queue internal state error");
 		return -EFAULT;
 	}
 	if(sentWidth == 0)

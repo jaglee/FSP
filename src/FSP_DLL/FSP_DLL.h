@@ -104,11 +104,7 @@ class CSocketItemDl: public CSocketItem
 	char			inUse;
 	char			initiatingShutdown : 1;
 	char			lowerLayerRecycled : 1;
-	char			shouldChainTimeout : 1;
-	char			endOfPeerMessage : 1;
-	char			$reserved : 2;
-	char			recvCompressed: 1;
-	char			sendCompressing: 1;
+	char			peerCommitted : 1;
 protected:
 	ALIGN(8)		HANDLE theWaitObject;
 
@@ -163,13 +159,8 @@ protected:
 	ControlBlock::PFSP_SocketBuf LOCALAPI SetHeadPacketIfEmpty(FSPOperationCode c);
 
 	// In Multiplex.cpp
-	static CSocketItemDl * LOCALAPI CSocketItemDl::ToPrepareMultiply(CSocketItemDl *, PFSP_Context, CommandCloneSession &);
-	void ToPrepareMultiply()
-	{
-		SetState(CLONING);
-		SetNewTransaction();
-	}
-	void CompleteMultiply();
+	static CSocketItemDl * LOCALAPI CSocketItemDl::ToPrepareMultiply(CSocketItemDl *, PFSP_Context, CommandCloneConnect &);
+	FSPHANDLE CompleteMultiply(CommandCloneConnect &);
 	bool LOCALAPI ToWelcomeMultiply(BackLogItem &);
 
 	//
@@ -217,21 +208,16 @@ public:
 	FSP_Session_State GetState() const { return pControlBlock->state; }
 	bool InState(FSP_Session_State s) const { return pControlBlock->state == s; }
 	void SetState(FSP_Session_State s) { _InterlockedExchange8((char *) & pControlBlock->state, s); }
-	// For _MSC_ only, as long is considered compatible with enum
 	bool TestSetState(FSP_Session_State s0, FSP_Session_State s2)
 	{
-		return (_InterlockedCompareExchange((long *)& pControlBlock->state, s2, s0) == s0);
+		return (_InterlockedCompareExchange8((char *) & pControlBlock->state, s2, s0) == s0);
 	}
 	bool InIllegalState() const { return pControlBlock->state <= 0 || pControlBlock->state > LARGEST_FSP_STATE; }
 
 	uint64_t GetULASignature() const { return context.signatureULA; }
-	void SetSendCompressing(bool value) { sendCompressing = value ? 1 : 0; }
+	void SetULASignature(uint64_t value) { context.signatureULA = value; }
 	bool WaitUseMutex();
-#if defined(NDEBUG) || !defined(TRACE)
 	void SetMutexFree() { ReleaseSRWLockExclusive(& rtSRWLock); }
-#else
-	void SetMutexFree();
-#endif
 	bool IsInUse() { return (_InterlockedXor8(& inUse, 0) != 0); }
 
 	void SetPeerName(const char *cName, size_t len)
@@ -261,7 +247,7 @@ public:
 	int LOCALAPI InstallKey(BYTE *, int, int32_t);
 
 	int LOCALAPI AcquireSendBuf(int);
-	int LOCALAPI SendInplace(void *, int, int8_t);
+	int LOCALAPI SendInplace(void *, int, bool);
 
 	ControlBlock::PFSP_SocketBuf GetSendBuf() { return pControlBlock->GetSendBuf(); }
 

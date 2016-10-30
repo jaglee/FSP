@@ -42,8 +42,6 @@
 DllExport
 int FSPAPI RecvInline(FSPHANDLE hFSPSocket, CallbackPeeked fp1)
 {
-	TRACE_HERE("called");
-	//
 	register CSocketItemDl * p = (CSocketItemDl *)hFSPSocket;
 	try
 	{
@@ -68,11 +66,8 @@ int FSPAPI RecvInline(FSPHANDLE hFSPSocket, CallbackPeeked fp1)
 // Return
 //	0 if no immediate error, negative if error, positive if it is the length of the available data
 // Remark
-//	ULA should exploit ReadFrom to accept compressed/encrypted data
 //	NotifyOrReturn might report error later even if ReadFrom itself return no error
 //	Return value passed in NotifyOrReturn is number of octets really received
-//	If very large chunk of message is to be received, one should exploit RecvInline()
-//	together with application layer decompression and/or decryption. See also WriteTo()
 DllExport
 int FSPAPI ReadFrom(FSPHANDLE hFSPSocket, void *buf, int capacity, NotifyOrReturn fp1)
 {
@@ -99,17 +94,18 @@ int CSocketItemDl::RecvInline(PVOID fp1)
 
 	if(waitingRecvBuf != NULL)
 	{
-		TRACE_HERE(" -EADDRINUSE most likely by unfinished ReadFrom");
 		SetMutexFree();
 		return -EDEADLK;
 	}
 
 	if(InterlockedExchangePointer((PVOID *) & fpPeeked, fp1) != NULL)
 	{
-		TRACE_HERE("warning: Receive-inline called before previous RecvInline called back");
+#ifdef TRACE
+		printf_s("\nFiber#%u, warning: Receive-inline called before previous RecvInline called back\n", fidPair.source);
+#endif
 	}
 	//
-	endOfPeerMessage = 0;
+	peerCommitted = 0;	// See also ProcessReceiveBuffer()
 	if(!IsRecvBufferEmpty())
 	{
 		SetMutexFree();
@@ -129,6 +125,8 @@ int CSocketItemDl::RecvInline(PVOID fp1)
 //	Register internal
 // Return
 //	0 if no immediate error, negative on error
+//	-EBUSY calling convention error: cannot read the stream before previous ReadFrom called back
+//	-EDEADLK	/-EADDRINUSE most likely by previous ReadFrom
 int LOCALAPI CSocketItemDl::ReadFrom(void * buffer, int capacity, PVOID fp1)
 {
 #ifdef TRACE
@@ -139,7 +137,6 @@ int LOCALAPI CSocketItemDl::ReadFrom(void * buffer, int capacity, PVOID fp1)
 	//
 	if(InterlockedCompareExchangePointer((PVOID *) & fpReceived, fp1, NULL) != NULL)
 	{
-		TRACE_HERE("calling convention error: cannot read the stream before previous ReadFrom called back");
 		SetMutexFree();
 		return -EBUSY;
 	}
@@ -147,15 +144,14 @@ int LOCALAPI CSocketItemDl::ReadFrom(void * buffer, int capacity, PVOID fp1)
 	// Check whether previous ReadFrom finished (no waitingRecvBuf), effectively serialize receiving
 	if(InterlockedCompareExchangePointer((PVOID *) & waitingRecvBuf, buffer, NULL) != NULL)
 	{
-		TRACE_HERE("-EADDRINUSE most likely by previous ReadFrom");
 		SetMutexFree();
 		return -EDEADLK;
 	}
 	// TODO: check whether the buffer overlapped?
 
+	peerCommitted = 0;	// See also FetchReceived()
 	bytesReceived = 0;
 	waitingRecvSize = capacity;
-	endOfPeerMessage = 0;	// See also FetchReceived()
 
 	if(fpPeeked != NULL)
 	{
@@ -176,8 +172,7 @@ int LOCALAPI CSocketItemDl::ReadFrom(void * buffer, int capacity, PVOID fp1)
 
 
 
-// Return number of bytes actually delivered (might be exploding if decompressed and decrypted)
-// TODO: decrypt, decompress
+// Return number of bytes actually delivered
 inline
 int LOCALAPI CSocketItemDl::DeliverData(void *p, int n)
 {
@@ -189,7 +184,7 @@ int LOCALAPI CSocketItemDl::DeliverData(void *p, int n)
 	bytesReceived += n;
 	waitingRecvSize -= n;
 
-	return n;	// TODO: should count into decrypt (sub tag size) decompress
+	return n;
 }
 
 
@@ -231,7 +226,7 @@ int CSocketItemDl::FetchReceived()
 		//
 		if(p->GetFlag<END_OF_TRANSACTION>())
 		{
-			endOfPeerMessage = 1;
+			peerCommitted = 1;
 			break;
 		}
 		// 'be free to accept': both _COMMIT && !END_OF_TRANSACTION and PERSIST && len == 0 && !END_OF_TRANSACTION
@@ -249,12 +244,11 @@ int CSocketItemDl::FetchReceived()
 //	It is meant to be called by the soft interrupt handling entry function where the mutex lock has been obtained
 //	and it sets the mutex lock free on leave.
 //	fpReceived would not be reset if internal memeory allocation error detected
-//	If RecvInline() failed (say, due to compression and/or encryption), data may be picked up by ReadFrom()
 //	ULA should make sure that the socket is freed in the callback function (if recycling is notified)
 void CSocketItemDl::ProcessReceiveBuffer()
 {
 #ifdef TRACE
-	printf_s("Process receive buffer in state %s\n", stateNames[pControlBlock->state]);
+	printf_s("Fiber#%u process receive buffer in %s\n", fidPair.source, stateNames[pControlBlock->state]);
 #endif
 	//
 	CallbackPeeked fp1 = fpPeeked;
@@ -268,20 +262,19 @@ void CSocketItemDl::ProcessReceiveBuffer()
 		bool b;
 		void *p = pControlBlock->InquireRecvBuf(n, b);
 #ifdef TRACE
-		printf_s("Data to deliver: 0x%08X, length = %u, eot = %d\n", (LONG)p, n, (int)b);
+		printf_s("Data to deliver@%p, length = %u, eot = %d\n", p, n, (int)b);
 #endif
 		// If end-of-transaction encountered reset fpPeeked so that RecvInline() may work
 		if(b)
 		{
 #ifdef TRACE
-			printf_s("Message terminated\n");
+			printf_s("Transmit transaction terminated\n");
 #endif
-			endOfPeerMessage = 1;
+			peerCommitted = 1;
 			fpPeeked = NULL;
 		}
 		if(n == 0)	// (n == 0 && !b) when the last message is a payloadless PERSIST with the EoT flag set
 		{
-			TRACE_HERE("Nothing to deliver");
 			SetMutexFree();
 			return;
 		}
@@ -314,7 +307,7 @@ void CSocketItemDl::ProcessReceiveBuffer()
 		return;
 	}
 	//
-	if(endOfPeerMessage || waitingRecvSize <= 0)
+	if(peerCommitted || waitingRecvSize <= 0)
 		FinalizeRead();
 	else
 		SetMutexFree();

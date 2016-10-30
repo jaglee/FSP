@@ -158,9 +158,13 @@ public:
 class CommandCloneSessionSrv: CommandNewSessionSrv
 {
 	friend void Multiply(CommandCloneSessionSrv &);
-	ALFID_T idParent;
+	ALIGN(4)
+	char	isFlushing;
 public:
-	CommandCloneSessionSrv(const CommandToLLS *p): CommandNewSessionSrv(p) { idParent = ((CommandCloneSession *)p)->idParent; }
+	CommandCloneSessionSrv(const CommandToLLS *p): CommandNewSessionSrv(p)
+	{
+		isFlushing = ((CommandCloneConnect *)p)->isFlushing;
+	}
 };
 
 
@@ -267,12 +271,18 @@ class CSocketItemEx: public CSocketItem
 	HANDLE	hSrcMemory;
 	DWORD	idSrcProcess;
 	//
-protected:
-	ICC_Context	contextOfICC;
-	uint8_t	cipherText[MAX_BLOCK_SIZE];
+	void Destroy();	// override that of the base class
+	bool IsPassive() const { return lowState == LISTENING; }
+	void SetPassive() { lowState = LISTENING; }
+	void SetCallable() { pControlBlock->notices.SetHead(NullCommand); }	// clear the 'NOT-returned' notice
 	//
+protected:
 	PktBufferBlock * volatile headPacket;
 	PktBufferBlock * volatile tailPacket;
+
+	ICC_Context	contextOfICC;
+	ALIGN(MAC_ALIGNMENT)
+	uint8_t	cipherText[MAX_BLOCK_SIZE];
 
 	// multihome/mobility/resilence support (see also CInterface::EnumEffectiveAddresses):
 	// MAX_PHY_INTERFACES is hard-coded to 4
@@ -338,17 +348,18 @@ protected:
 			tRoundTrip_us = uint32_t((LAZY_ACK_DELAY_MIN_ms * 1000 + tRoundTrip_us + 1) >> 1);
 	}
 
-	bool IsPassive() const { return lowState == LISTENING; }
-	void SetPassive() { lowState = LISTENING; }
-	void SetState(FSP_Session_State s) 
-	{
-		_InterlockedExchange8((char *) & pControlBlock->state, s);
-		lowState = s;
-		tMigrate = NowUTC();
-	}
 	bool InState(FSP_Session_State s) { return lowState == s; }
 	bool InStates(int n, ...);
-
+	// synchronize the state in the 'cache' and the real state in the session control block
+	void SyncState() { lowState = pControlBlock->state; tMigrate = NowUTC(); }
+	void SetState(FSP_Session_State s) { _InterlockedExchange8((char *)& pControlBlock->state, s); SyncState(); }
+	bool HasBeenCommitted()
+	{
+		bool b = pControlBlock->HasBeenCommitted();
+		if (b)
+			pControlBlock->SnapshotReceiveWindowRightEdge();
+		return b;
+	}
 	bool HandlePeerSubnets(PFSP_HeaderSignature);
 
 	PktBufferBlock *PushPacketBuffer(PktBufferBlock *);
@@ -374,7 +385,6 @@ protected:
 	bool SendKeepAlive();
 	int	 EmitWithICC(ControlBlock::PFSP_SocketBuf, ControlBlock::seq_t);
 
-	void Destroy();	// override that of the base class
 	void DoResend();
 	void KeepAlive();
 	void LazilySendSNACK();
@@ -382,7 +392,6 @@ protected:
 	static VOID NTAPI DoResend(PVOID c, BOOLEAN) { ((CSocketItemEx *)c)->DoResend(); }
 	static VOID NTAPI KeepAlive(PVOID c, BOOLEAN) { ((CSocketItemEx *)c)->KeepAlive(); }
 	static VOID NTAPI LazilySendSNACK(PVOID c, BOOLEAN) { ((CSocketItemEx *)c)->LazilySendSNACK(); }
-
 	//
 public:
 	//
@@ -399,8 +408,8 @@ public:
 	void SetInUse() { _InterlockedExchange8(& inUse, 1); }
 
 	void InstallEphemeralKey();
-	void InstallSessionKey();
-	void DeriveNextKey();
+	void InstallSessionKey(const CommandInstallKey &);
+	void LOCALAPI DeriveNextKey(ControlBlock::seq_t, ControlBlock::seq_t, ALFID_T, ALFID_T);
 
 	bool CheckMemoryBorder(ControlBlock::PFSP_SocketBuf p)
 	{
@@ -503,10 +512,7 @@ public:
 	void ScheduleConnect(CommandNewSessionSrv *);
 
 	// Command of ULA
-	// Connect and Send are special in the sense that it may take such a long time to complete that
-	// if it gains exclusive access of the socket too many packets might be lost
-	// when there are too many packets in the send queue
-	void ProcessCommand(FSP_ServiceCode);
+	void ProcessCommand(CommandToLLS *);
 	void Connect();
 	void Accept();
 	void Start();
@@ -514,7 +520,7 @@ public:
 	void Listen(CommandNewSessionSrv &);
 
 	// Event triggered by the remote peer
-	void OnConnectRequestAck(FSP_AckConnectRequest &, int lenData);
+	void OnConnectRequestAck(PktBufferBlock *, int);
 	void OnGetPersist();	// PERSIST packet might be apparently out-of-band as it might be payloadless
 	void OnGetPureData();	// PURE_DATA
 	void OnGetEOT();		// Used to be a standalone COMMIT packet, now the EoT flag
@@ -530,17 +536,18 @@ public:
 // The backlog of connection multiplication, for buffering the payload piggybacked by the MULTIPLY packet
 // By reuse
 //	cipherText field of CSocketItemEx
-//	tSessionBegin => first two bytes: lenData, last byte: EOM
+//	tSessionBegin: FSP_SocketBuf minus timestamp
 //	contextOfICC.snFirstRecvWithCurrKey => initialSN
 //	SOCKADDR_ALFID and SOCKADDR_HOSTID of sockAddrTo: idRemote and remoteHostID
 class CMultiplyBacklogItem: public CSocketItemEx
 {
 	friend	class CSocketSrvTLB;
 public:
-	void	CopyInPlainText(const uint8_t *buf, int n) { *((uint16_t *)& tSessionBegin) = (uint16_t)n; if(n > 0) memcpy(cipherText, buf, n); }
-	int		CopyOutPlainText(uint8_t *buf) { int n = *((uint16_t *)& tSessionBegin); if(n > 0) memcpy(buf, cipherText, n); return n; }
-	bool	IsEndOfMessage() const { return *((uint8_t *)& tSessionBegin + 3) != 0; }
-	void	SetEndOfMessage(bool value) { *((uint8_t *)& tSessionBegin + 3) = (uint8_t)value; }
+	//
+	void	CopyInPlainText(const uint8_t *buf, int n) { *((int32_t *)& tSessionBegin) = (int32_t)n; if(n > 0) memcpy(cipherText, buf, n); }
+	int		CopyOutPlainText(uint8_t *buf) { int n = *((int32_t *)& tSessionBegin); if(n > 0) memcpy(buf, cipherText, n); return n; }
+	// 'Convert' this to FSP_SocketBuf, and we knew FSP_SocketBuf start with a timestamp_t member
+	ControlBlock::PFSP_SocketBuf TempSocketBuf() { return (ControlBlock::PFSP_SocketBuf)(& tSessionBegin - 1); }
 	//
 	void	ResponseToMultiply();
 };
@@ -737,15 +744,14 @@ DWORD WINAPI HandleSendQ(LPVOID);
 DWORD WINAPI HandleFullICC(LPVOID);
 
 // defined in socket.cpp
-void LOCALAPI DumpHexical(BYTE *, int);
+void LOCALAPI DumpHexical(const void *, int);
 void LOCALAPI DumpNetworkUInt16(uint16_t *, int);
 
-
 // defined in mobile.cpp
-uint64_t LOCALAPI CalculateCookie(BYTE *, int, timestamp_t);
+uint64_t LOCALAPI CalculateCookie(const void *, int, timestamp_t);
 
 // defined in CRC64.c
-extern "C" uint64_t CalculateCRC64(register uint64_t, register uint8_t *, size_t);
+extern "C" uint64_t CalculateCRC64(register uint64_t, register const uint8_t *, size_t);
 
 // power(3, a) 	// less stringent than pow(3, a) ?
 inline double CubicPower(double a) { return a * a * a; }

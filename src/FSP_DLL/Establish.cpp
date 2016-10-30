@@ -47,8 +47,6 @@
 DllSpec
 FSPHANDLE FSPAPI ListenAt(const PFSP_IN6_ADDR listenOn, PFSP_Context psp1)
 { 
-	TRACE_HERE("called");
-
 	// TODO: The welcome message CAN be larger
 	if(psp1->len > MAX_BLOCK_SIZE - sizeof(FSP_AckConnectRequest))
 	{
@@ -64,8 +62,14 @@ FSPHANDLE FSPAPI ListenAt(const PFSP_IN6_ADDR listenOn, PFSP_Context psp1)
 	if(socketItem == NULL)
 		return NULL;
 
-	socketItem->AddOneShotTimer(TRASIENT_STATE_TIMEOUT_ms);
-	socketItem->sendCompressing = psp1->u.st.compressing;
+	if(! socketItem->AddOneShotTimer(TRANSIENT_STATE_TIMEOUT_ms))
+	{
+		REPORT_ERRMSG_ON_TRACE("Cannot set time-out clock for listen");
+		socketsTLB.FreeItem(socketItem);
+		socketItem->Reinitialize();
+		return NULL;
+	}
+
 	socketItem->SetState(LISTENING);
 	// MUST set the state before calling LLS so that event-driven state transition may work properly
 	return socketItem->CallCreate(objCommand, FSP_Listen);
@@ -89,7 +93,6 @@ FSPHANDLE FSPAPI ListenAt(const PFSP_IN6_ADDR listenOn, PFSP_Context psp1)
 DllSpec
 FSPHANDLE FSPAPI Connect2(const char *peerName, PFSP_Context psp1)
 {
-	TRACE_HERE("called");
 	if(psp1->sendSize < 0 || psp1->recvSize < 0 || psp1->sendSize + psp1->recvSize > MAX_FSP_SHM_SIZE + MIN_RESERVED_BUF)
 	{
 		psp1->u.flags = ENOMEM;
@@ -110,8 +113,14 @@ FSPHANDLE FSPAPI Connect2(const char *peerName, PFSP_Context psp1)
 		return NULL;
 	}
 
-	socketItem->AddOneShotTimer(TRASIENT_STATE_TIMEOUT_ms);
-	socketItem->sendCompressing = psp1->u.st.compressing;
+	if(! socketItem->AddOneShotTimer(TRANSIENT_STATE_TIMEOUT_ms))
+	{
+		REPORT_ERRMSG_ON_TRACE("Cannot set time-out clock for connect");
+		socketsTLB.FreeItem(socketItem);
+		socketItem->Reinitialize();
+		return NULL;
+	}
+
 	socketItem->SetPeerName(peerName, strlen(peerName));
 	return socketItem->CallCreate(objCommand, InitConnection);
 }
@@ -132,7 +141,7 @@ void CSocketItemDl::ProcessBacklog()
 		socketItem = PrepareToAccept(*pLogItem, objCommand);
 		if(socketItem == NULL)
 		{
-			TRACE_HERE("Process listening backlog: insufficient system resource?");
+			REPORT_ERRMSG_ON_TRACE("Process listening backlog: insufficient system resource?");
 			this->InitCommand<FSP_Reject>(objCommand);
 			this->Call(objCommand, sizeof(struct CommandToLLS));
 			pControlBlock->backLog.Pop();
@@ -150,7 +159,7 @@ void CSocketItemDl::ProcessBacklog()
 		//
 		if(! socketItem->CallCreate(objCommand, FSP_Accept))
 		{
-			TRACE_HERE("Process listening backlog: cannot synchronize - local IPC error");
+			REPORT_ERRMSG_ON_TRACE("Process listening backlog: cannot synchronize - local IPC error");
 			socketsTLB.FreeItem(socketItem);
 		}
 	}
@@ -274,22 +283,15 @@ void CSocketItemDl::ToConcludeConnect()
 
 	// Deliver the optional payload and skip the ACK_CONNECT_REQ packet
 	// See also ControlBlock::InquireRecvBuf()
-	// UNRESOLVED! Could welcome message be compressed?
-	// TODO: Provide convient compress/decompress help routines
-	// TODO: provide extensibility of customized compression/decompression method?
 	context.welcome = payload;
 	context.len = skb->len;
-
-	this->recvCompressed = skb->GetFlag<IS_COMPRESSED>();
 
 	pControlBlock->SlideRecvWindowByOne();	// ACK_CONNECT_REQUEST, which may carry welcome
 	// But // CONNECT_REQUEST does NOT consume a sequence number
 	// See @LLS::OnGetConnectRequest
 
-	TRACE_HERE("connection request has been accepted");
-	SetMutexFree();
-
 	SetNewTransaction();
+	SetMutexFree();
 	if(context.onAccepted != NULL && context.onAccepted(this, &context) < 0)
 	{
 		Recycle();
@@ -310,8 +312,8 @@ void CSocketItemDl::ToConcludeConnect()
 // Return
 //	The pointer to the header packet's descriptor if the queue used to be non-empty
 //	NULL if the send queue used to be empty
-//	//skb->SetFlag<END_OF_TRANSACTION>();
-//	But the payloadless PERSIST/MULTIPLY does NOT terminate the transmit transaction!
+// Remark
+//	The payloadless PERSIST/MULTIPLY does NOT terminate the transmit transaction
 ControlBlock::PFSP_SocketBuf LOCALAPI CSocketItemDl::SetHeadPacketIfEmpty(FSPOperationCode c)
 {
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend();
@@ -381,15 +383,19 @@ int FSPAPI InstallAuthenticKey(FSPHANDLE h, BYTE * key, int keySize, int32_t key
 //	Normally only in CLOSABLE or COMMITTING2 state may a session key installed
 //	however it is not checked because the function
 //	might be called in the callback function before the right state migration
+//	Take the snapshot of sendBufferNextSN and pass the snapshot as the parameter
+//	because it is perfectly possible that installation of new session key is followed by
+//	sending new data so tight that LLS has not yet excute FSP_InstallKey before the send queue changed.
 int LOCALAPI CSocketItemDl::InstallKey(BYTE *key, int keySize, int32_t keyLife)
 {
 	if(! WaitUseMutex())
 		return -EINTR;
 
+	CommandInstallKey objCommand(pControlBlock->sendBufferNextSN, keyLife);
+	this->InitCommand<FSP_InstallKey>(objCommand);
 	memcpy(& pControlBlock->connectParams, key, keySize);
 	pControlBlock->connectParams.keyLength = keySize;
-	pControlBlock->connectParams.keyLife$initialSN = keyLife;
 
 	SetMutexFree();
-	return Call<FSP_InstallKey>() ? 0 : -EIO;
+	return Call(objCommand, sizeof(objCommand)) ? 0 : -EIO;
 }

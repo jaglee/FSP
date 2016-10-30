@@ -55,7 +55,7 @@ void LOCALAPI Listen(CommandNewSessionSrv &cmd)
 	CSocketItemEx *socketItem = (CLowerInterface::Singleton())->AllocItem(cmd.fiberID);
 	if(socketItem == NULL)
 	{
-		TRACE_HERE("Multiple call to listen on the same local fiber ID?");
+		REPORT_ERRMSG_ON_TRACE("Multiple call to listen on the same local fiber ID?");
 		::SetEvent(cmd.hEvent);
 		return;
 	}
@@ -118,7 +118,7 @@ void LOCALAPI Accept(CommandNewSessionSrv &cmd)
 	CSocketItemEx *socketItem = CLowerInterface::Singleton()->AllocItem(cmd);
 	if(socketItem == NULL)
 	{
-		TRACE_HERE("Internal panic! Cannot map control block of the client into server's memory space");
+		REPORT_ERRMSG_ON_TRACE("Cannot map control block of the client into server's memory space");
 		::SetEvent(cmd.hEvent);
 		return;
 	}
@@ -140,29 +140,27 @@ void Multiply(CommandCloneSessionSrv &cmd)
 		return;
 	}
 
-	CSocketItemEx *srcItem = (* CLowerInterface::Singleton())[cmd.idParent];
+	CSocketItemEx *srcItem = (* CLowerInterface::Singleton())[cmd.fiberID];
 	if(srcItem == NULL)
 	{
-		TRACE_HERE("Cloned connection not found");
+		DebugBreak();	//TRACE_HERE("Cloned connection not found");
 		return;
 	}
 
 	if(! srcItem->WaitUseMutex())
 	{
-		TRACE_HERE("Cloned connect busy");
+		DebugBreak();	//TRACE_HERE("Cloned connect busy");
 		return;
-	}
-
-	if(srcItem->contextOfICC.keyLife == 0)
-	{
-		TRACE_HERE("Only strong-protected session may be cloned");
-		goto l_return;
 	}
 
 	// To make life easier we do not allow clone FSP session across process border
 	if(cmd.idProcess != srcItem->idSrcProcess)
 	{
-		TRACE_HERE("Cannot clone other user's session");
+#ifdef TRACE
+		printf_s("\nCannot clone other user's session, source fiber#%u\n"
+				 "\tsource process id = %u, this process id = %u\n"
+				 , cmd.fiberID, srcItem->idSrcProcess, cmd.idProcess);
+#endif
 		goto l_return;
 	}
 
@@ -172,18 +170,18 @@ void Multiply(CommandCloneSessionSrv &cmd)
 		srcItem->SetMutexFree();
 		if(newItem == NULL)
 		{
-			TRACE_HERE("Internal panic! Cannot allocate new socket slot");
+			REPORT_ERRMSG_ON_TRACE("Cannot allocate new socket slot");
 		}
 		else
 		{
-			TRACE_HERE("Internal panic! Cannot map control block of the client into server's memory space");
+			REPORT_ERRMSG_ON_TRACE("Cannot map control block of the client into server's memory space");
 			(CLowerInterface::Singleton())->FreeItem(newItem);
 		}
 		::SetEvent(cmd.hEvent);
 		return;
 	}
 
-
+	newItem->shouldAppendCommit = cmd.isFlushing;
 	newItem->InitiateMultiply(srcItem);
 l_return:
 	// Only on exception would it signal event to DLL
@@ -193,11 +191,13 @@ l_return:
 
 
 // Given
-//	FSP_ServiceCode		The service command requested by ULA
+//	CommandToLLS		The service command requested by ULA
 // Do
 //	Excute ULA's request
-// UNRESOLVED! In production multi-issue/multi-executation of ULA command shall be implemented.
-void CSocketItemEx::ProcessCommand(FSP_ServiceCode c)
+//	Send, so is connect, is special in the sense that it may take such a long time to complete
+//	that if it gains exclusive access of the socket too many packets might be lost
+//	when there are too many packets in the send queue
+void CSocketItemEx::ProcessCommand(CommandToLLS *pCmd)
 {
 	WaitUseMutex();
 	if(!IsInUse() || lowState <= 0 || lowState > LARGEST_FSP_STATE)
@@ -207,7 +207,7 @@ void CSocketItemEx::ProcessCommand(FSP_ServiceCode c)
 		return;
 	}
 	//
-	switch(c)
+	switch(pCmd->opCode)
 	{
 	case FSP_Reject:
 		RejectOrReset();
@@ -228,11 +228,11 @@ void CSocketItemEx::ProcessCommand(FSP_ServiceCode c)
 		SendPacket<RELEASE>();
 		break;
 	case FSP_InstallKey:
-		InstallSessionKey();
+		InstallSessionKey((CommandInstallKey &)*pCmd);
 		break;
 	default:
 #ifndef NDEUBG
-		printf("Internal error: undefined upper layer application command code %d\n", c);
+		printf("Internal error: undefined upper layer application command code %d\n", pCmd->opCode);
 #endif
 		break;
 	}
@@ -249,7 +249,7 @@ void CSocketItemEx::Listen(CommandNewSessionSrv &cmd)
 {
 	if(! MapControlBlock(cmd))
 	{
-		TRACE_HERE("Fatal situation when to share memory with DLL");
+		REPORT_ERRMSG_ON_TRACE("Fatal situation when to share memory with DLL");
 		(CLowerInterface::Singleton())->FreeItem(this);
 		::SetEvent(cmd.hEvent);
 		return;
@@ -270,7 +270,7 @@ void CSocketItemEx::Listen(CommandNewSessionSrv &cmd)
 void CSocketItemEx::Connect()
 {
 #ifdef TRACE
-	printf_s("Try to make connection to %s (@local fiber#0x%X)\n", PeerName(), fidPair.source);
+	printf_s("Try to make connection to %s (@local fiber#%u)\n", PeerName(), fidPair.source);
 #endif
 	char nodeName[INET6_ADDRSTRLEN];
 	char *peerName = PeerName();
@@ -330,9 +330,7 @@ void CSocketItemEx::Start()
 		, pControlBlock->sendWindowFirstSN
 		, pControlBlock->sendWindowNextSN);
 #endif
-	// synchronize the state in the 'cache' and the real state
-	lowState = pControlBlock->state;
-	//
+	SyncState();
 	EmitStartAndSlide();
 	AddResendTimer(tRoundTrip_us >> 8);
 	// While the KEEP_ALIVE_TIMEOUT was set already in OnConnectRequestAck

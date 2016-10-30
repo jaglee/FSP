@@ -33,7 +33,6 @@
 DllExport
 int FSPAPI Dispose(FSPHANDLE hFSPSocket)
 {
-	TRACE_HERE("called");
 	register CSocketItemDl *p = (CSocketItemDl *)hFSPSocket;
 	try
 	{
@@ -51,7 +50,6 @@ int FSPAPI Dispose(FSPHANDLE hFSPSocket)
 // an ill-behaviored ULA would be punished by dead-lock
 int CSocketItemDl::Recycle()
 {
-	TRACE_HERE("called");
 	if(! IsInUse())
 		return EAGAIN;	// warning: already disposed
 
@@ -89,7 +87,6 @@ int CSocketItemDl::Recycle()
 DllSpec
 int FSPAPI Shutdown(FSPHANDLE hFSPSocket, NotifyOrReturn fp1)
 {
-	TRACE_HERE("called");
 	register CSocketItemDl * p = (CSocketItemDl *)hFSPSocket;
 	try
 	{
@@ -144,7 +141,13 @@ int LOCALAPI CSocketItemDl::Shutdown(NotifyOrReturn fp1)
 	}
 
 	// Send RELEASE and wait echoed RELEASE. LLS to signal FSP_NotifyRecycled, NotifyReset or NotifyTimeout
-	AddOneShotTimer(TRASIENT_STATE_TIMEOUT_ms);
+	if(! AddOneShotTimer(TRANSIENT_STATE_TIMEOUT_ms))
+	{
+		REPORT_ERRMSG_ON_TRACE("Cannot set time-out clock for shutdown");
+		SetMutexFree();
+		return -EFAULT;
+	}
+
 	if (InState(CLOSABLE))
 	{
 		SetState(PRE_CLOSED);

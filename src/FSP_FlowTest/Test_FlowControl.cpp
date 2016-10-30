@@ -133,7 +133,7 @@ void FlowTestAcknowledge()
 	//^ but the expectedSN is impossible for the small sending window!
 	printf_s("RespondToSNACK(FIRST_SN + 0x1000A, gaps, 2):\n"
 		"\tnAck = %d, CountSentInFlight() = %d\n"
-		"\tsendWindowHeadPos, sendWindowFirstSN = %u, sendWindowSize = %d\n"
+		"\tsendWindowHeadPos = %d, sendWindowFirstSN = %u, sendWindowSize = %d\n"
 		, r, pSCB->CountSentInFlight()
 		, pSCB->sendWindowHeadPos, pSCB->sendWindowFirstSN, pSCB->sendWindowSize);
 
@@ -156,7 +156,7 @@ void FlowTestAcknowledge()
 	r = socket.RespondToSNACK(FIRST_SN + MAX_BLOCK_NUM_L + 0xF000, gaps, 2);
 	printf_s("RespondToSNACK(FIRST_SN + MAX_BLOCK_NUM_L + 0xF000, gaps, 2):\n"
 		"\tnAck = %d, CountSentInFlight() = %d\n"
-		"\tsendWindowHeadPos, sendWindowFirstSN = %u, sendWindowSize = %d\n"
+		"\tsendWindowHeadPos = %d, sendWindowFirstSN = %u, sendWindowSize = %d\n"
 		, r, pSCB->CountSentInFlight()
 		, pSCB->sendWindowHeadPos, pSCB->sendWindowFirstSN, pSCB->sendWindowSize);
 }
@@ -250,7 +250,8 @@ void FlowTestRetransmission()
 	//static int32_t guardian1 = 0xAAAAAAAA;
 	//static PktBufferBlock pktBuffer;
 	//static int32_t guardian2 = 0xAAAAAAAA;
-	PktBufferBlock pktBuffer;
+	ALIGN(MAC_ALIGNMENT)
+	static PktBufferBlock pktBuffer;
 	memset(& pktBuffer, 0, sizeof(pktBuffer));
 	struct _KEEP_ALIVE
 	{

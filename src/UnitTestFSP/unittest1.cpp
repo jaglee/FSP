@@ -398,14 +398,11 @@ void UnitTestQuasibitfield()
 
 	acknowledgement.SetFlag<EndOfTransaction>();
 	Assert::AreEqual<int>(acknowledgement.GetFlag<EndOfTransaction>(), 1);
-	acknowledgement.SetFlag<Compressed>();
-	Assert::IsTrue(acknowledgement.flags_ws[3] == 3);
-	Assert::AreEqual<int>(acknowledgement.GetFlag<Compressed>(), 2);
+	Assert::IsTrue(acknowledgement.flags_ws[3] == 1);
 	//
 	acknowledgement.ClearFlag<EndOfTransaction>();
-	Assert::IsTrue(acknowledgement.flags_ws[3] == 2);
-	acknowledgement.ClearFlag<Compressed>();
 	Assert::IsTrue(acknowledgement.flags_ws[3] == 0);
+	Assert::AreEqual<int>(acknowledgement.GetFlag<EndOfTransaction>(), 0);
 }
 
 
@@ -464,7 +461,7 @@ void UnitTestSocketSrvTLB()
 	id = (CLowerInterface::Singleton())->RandALFID(addrList);
 	Assert::IsFalse(id == 0, L"There should be free id space");
 
-	sprintf_s(linebuf, "Allocated ID = %d\n", id);
+	sprintf_s(linebuf, "Allocated ID = %u\n", id);
 	Logger::WriteMessage(linebuf);
 
 #if 0
@@ -526,7 +523,7 @@ void UnitTestSocketRTLB()
 	id = pRTLB->RandALFID(addrList);
 	Assert::IsFalse(id == 0, L"There should be free id space");
 
-	sprintf_s(linebuf, "Allocated ID = %d\n", id);
+	sprintf_s(linebuf, "Allocated ID = %u\n", id);
 	Logger::WriteMessage(linebuf);
 
 	CSocketItemExDbg *p2 = (CSocketItemExDbg *)(*pRTLB)[id];
@@ -643,7 +640,7 @@ void UnitTestOCB_MAC()
 	// the cookie depends on the listening session ID AND the responding session ID
 	cm.salt = request.salt;
 	responseZero.initCheckCode = request.initCheckCode;
-	responseZero.cookie = CalculateCookie((BYTE *) & cm, sizeof(cm), t1);
+	responseZero.cookie = CalculateCookie(& cm, sizeof(cm), t1);
 	responseZero.timeDelta = htobe32((u_long)(t1 - t0)); 
 	responseZero.cookie ^= ((uint64_t)request.salt << 32) | request.salt;
 	responseZero.hs.Set<FSP_Challenge, ACK_INIT_CONNECT>();

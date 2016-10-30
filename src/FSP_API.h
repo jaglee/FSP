@@ -64,7 +64,7 @@ typedef struct FSP_SocketParameter *PFSP_Context;
 typedef enum
 {
 	FSP_GET_SIGNATURE,			// pointer to the placeholder of the 64-bit signature
-	FSP_SET_SEND_COMPRESSING,	// 0: disable, 1: enabled
+	FSP_SET_SIGNATURE,			// pointer to the placeholder of the 64-bit signature
 	FSP_SET_CALLBACK_ON_ERROR,	// NotifyOrReturn
 	FSP_SET_CALLBACK_ON_REQUEST,// CallbackRequested
 	FSP_SET_CALLBACK_ON_CONNECT	// CallbackConnected
@@ -157,8 +157,7 @@ struct FSP_SocketParameter
 		struct
 		{
 			unsigned short	milky:		1;
-			unsigned short	compressing:1;
-			unsigned short	RESERVED:	13;
+			unsigned short	RESERVED:	14;
 			unsigned short	passive:	1;	// internal use only, shall be ignored by ULA
 		} st;
 		unsigned short flags; //[_In_] the requested features [_Out] the error reason
@@ -288,8 +287,6 @@ int FSPAPI SendInline(FSPHANDLE, void *, int, int8_t);
 // Return
 //	0 if no immediate error, negative if it failed, or positive it was warned (I/O pending)
 // Remark
-//	Return value passed in NotifyOrReturn is the number of octets really scheduled to send
-//	which may be less or greater than requested because of compression and/or encryption
 //	Only all data have been buffered may be NotifyOrReturn called.
 DllSpec
 int FSPAPI WriteTo(FSPHANDLE, void *, int, int8_t, NotifyOrReturn);

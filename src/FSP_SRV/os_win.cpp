@@ -700,7 +700,6 @@ CPacketBuffers::CPacketBuffers()
 // it's a thread entry
 DWORD WINAPI CLowerInterface::ProcessRemotePacket(LPVOID lpParameter)
 {
-	TRACE_HERE("to process remote packet");
 	try
 	{
 		((CLowerInterface *)lpParameter)->ProcessRemotePacket();
@@ -721,10 +720,7 @@ inline void CLowerInterface::ProcessRemotePacket()
 	register int i;
 	int r;
 	if(sdSet.fd_count <= 0)
-	{
-		TRACE_HERE("Empty socket set, nowhere listen");
 		throw E_INVALIDARG;
-	}
 	//
 	do
 	{
@@ -788,10 +784,7 @@ inline void CLowerInterface::ProcessRemotePacket()
 			printf_s("\nPacket on socket #%X: processed, result = %d\n", (unsigned)readFDs.fd_array[i], r);
 #endif
 			if (r == E_FAIL)
-			{
-				TRACE_HERE("AcceptAndProcess failed, socket might be closed");
 				DisableSocket(readFDs.fd_array[i]);
-			}
 			else if(r != 0)
 #ifndef TRACE
 				throw -r;	// UNRESOLVED! Unrecoverable?
@@ -861,7 +854,9 @@ int CLowerInterface::AcceptAndProcess(SOCKET sdRecv)
 
 	FSPOperationCode opCode = (FSPOperationCode) pktBuf->hdr.hs.opCode;
 #if defined(TRACE) && (TRACE & TRACE_PACKET)
-	printf_s("Packet of opCode %d[%s] received\n", (int)opCode, opCodeStrings[opCode]);
+	printf_s("#%u(Near end's ALFID): packet %s(%d) received\n\tALFID of packet source is #%u\n"
+		, nearInfo.u.idALF
+		, opCodeStrings[opCode], (int)opCode, pktBuf->idPair.source);
 	printf_s("Remote address:\n");
 	DumpNetworkUInt16((uint16_t *) & addrFrom, sizeof(addrFrom) / 2);
 	printf_s("Near sink:\n");
@@ -888,11 +883,13 @@ int CLowerInterface::AcceptAndProcess(SOCKET sdRecv)
 		//
 		if(! pSocket->WaitUseMutex())
 		{
-			TRACE_HERE("lost ACK_CONNECT_REQ due to lack of locks");
+#ifdef TRACE
+			printf_s("\nFiber#%u, lost ACK_CONNECT_REQ due to lack of locks\n", pSocket->fidPair.source);
+#endif
 			pSocket = NULL;	// FreeBuffer(pktBuf);
 			break;
 		}
-		pSocket->OnConnectRequestAck( *FSP_OperationHeader<FSP_AckConnectRequest>(), countRecv  - sizeof(FSP_AckConnectRequest) );
+		pSocket->OnConnectRequestAck(pktBuf, countRecv);
 		pSocket->SetMutexFree();
 		pSocket = NULL;	// FreeBuffer(pktBuf);
 		break;
@@ -914,14 +911,16 @@ int CLowerInterface::AcceptAndProcess(SOCKET sdRecv)
 		if(pSocket == NULL)
 		{
 #ifdef TRACE
-			printf_s("Cannot map socket for local fiber#0x%X, opCode: %s[%d]\n", GetLocalFiberID(), opCodeStrings[opCode], opCode);
+			printf_s("Cannot map socket for local fiber#%u\n", GetLocalFiberID());
 #endif
 			break;
 		}
-		if(!pSocket->IsInUse() || pSocket->lowState <= 0 || pSocket->lowState >= CLOSED)
+		if(!pSocket->IsInUse() || pSocket->lowState <= 0 || pSocket->lowState > CLOSED)
 		{
 #ifdef TRACE
-			printf_s("Socket for local fiber#%p in non-workable state: %s[%d]\n", pSocket, stateNames[pSocket->lowState], pSocket->lowState);
+			printf_s("Socket#%p for local fiber#%u not in workable state: %s[%d]\n"
+				, pSocket, pSocket->fidPair.source
+				, stateNames[pSocket->lowState], pSocket->lowState);
 #endif
 			break;
 		}
@@ -1029,9 +1028,6 @@ int LOCALAPI CLowerInterface::SendBack(char * buf, int len)
 //	and of course, throttled LISTENING state
 void LOCALAPI CLowerInterface::SendPrematureReset(uint32_t reasons, CSocketItemEx *pSocket)
 {
-#if defined(TRACE) && (TRACE & TRACE_PACKET)
-	TRACE_HERE("called");
-#endif
 	struct FSP_RejectConnect reject;
 	reject.reasons = reasons;
 	reject.hs.Set<FSP_RejectConnect, RESET>();
@@ -1210,17 +1206,17 @@ bool CSocketItemEx::AddLazyAckTimer()
 // A retransmission timer should be hard coded to 4 RTT, with an implementation depended floor value
 bool CSocketItemEx::AddResendTimer(uint32_t rtt_ms)
 {
-#if !defined(TRACE) || !(TRACE & TRACE_PACKET)
 	return (resendTimer == NULL
 		&& ::CreateTimerQueueTimer(&resendTimer, TimerWheel::Singleton()
 			, DoResend
 			, this
+#if !defined(TRACE) || !(TRACE & TRACE_PACKET)
 			, max(LAZY_ACK_DELAY_MIN_ms, rtt_ms)
+#else
+			, INIT_RETRANSMIT_TIMEOUT_ms
+#endif
 			, 0
 			, WT_EXECUTEINTIMERTHREAD));
-#else
-	return true;
-#endif
 }
 
 
@@ -1464,19 +1460,14 @@ int CSocketItemEx::SendPacket(register ULONG n1, ScatteredSendBuffers s)
 			return 0;	// no selectable path
 		}
 		wsaMsg.dwBufferCount = n1;
-#ifndef NDEBUG
-		s.scattered[0].buf = NULL;
-		s.scattered[0].len = 0;
-#endif
 		wsaMsg.lpBuffers = & s.scattered[1];
 		wsaMsg.name = (LPSOCKADDR)sockAddrTo;
 		wsaMsg.namelen = sizeof(sockAddrTo->Ipv6);
-#ifdef _DEBUG
+#ifndef NDEBUG
+		s.scattered[0].buf = NULL;
+		s.scattered[0].len = 0;
 		if(nearInfo.u.idALF != fidPair.source)
-		{
-			TRACE_HERE("nearInfo.u.idALF != fidPair.source");
 			DebugBreak();
-		}
 #endif
 #if defined(TRACE) && (TRACE & TRACE_ADDRESS)
 		printf_s("Near end's address info:\n");
@@ -1485,7 +1476,7 @@ int CSocketItemEx::SendPacket(register ULONG n1, ScatteredSendBuffers s)
 			, (int)nearInfo.pktHdr.cmsg_len
 			, nearInfo.pktHdr.cmsg_level
 			, nearInfo.pktHdr.cmsg_type);
-		DumpHexical((BYTE *)& nearInfo.u, sizeof(nearInfo.u));
+		DumpHexical(& nearInfo.u, sizeof(nearInfo.u));
 		printf_s("Target address:\n\t");
 		DumpNetworkUInt16((uint16_t *)wsaMsg.name, wsaMsg.namelen / 2);
 #endif
@@ -1496,7 +1487,10 @@ int CSocketItemEx::SendPacket(register ULONG n1, ScatteredSendBuffers s)
 		s.scattered[0].buf = (CHAR *)& fidPair;
 		s.scattered[0].len = sizeof(fidPair);
 		n1++;
-		//
+#if defined(TRACE) && (TRACE & TRACE_ADDRESS)
+		printf_s("\nPeer socket address:\n");
+		DumpNetworkUInt16((uint16_t *)sockAddrTo, sizeof(SOCKADDR_IN6) / 2);
+#endif
 		r = WSASendTo(CLowerInterface::Singleton()->sdSend
 			, s.scattered, n1
 			, &n
@@ -1508,23 +1502,13 @@ int CSocketItemEx::SendPacket(register ULONG n1, ScatteredSendBuffers s)
 	}
 
 	tRecentSend = NowUTC();
-#if defined(TRACE) && (TRACE & TRACE_PACKET)
-	printf_s("\nPeer socket address:\n");
-	DumpNetworkUInt16((uint16_t *)sockAddrTo, sizeof(SOCKADDR_IN6) / 2);
-	printf_s("Data to sent:\n----\n");
-	for (register ULONG i = 0; i < n1; i++)
-	{
-		DumpNetworkUInt16((uint16_t *)s.scattered[i].buf, s.scattered[i].len / 2);
-		printf("----\n");
-	}
-#endif
 	if (r != 0)
 	{
 		ReportWSAError("CSocketItemEx::SendPacket");
 		return 0;
 	}
 #if defined(TRACE) && (TRACE & TRACE_PACKET)
-	printf_s("\n%s, line %d, %d bytes sent.\n", __FILE__, __LINE__, n);
+	printf_s("\n#%u(Near end's ALFID): %d bytes sent.\n", fidPair.source, n);
 #endif
 	return n;
 }
@@ -2122,7 +2106,7 @@ inline void CLowerInterface::OnIPv6AddressMayAdded(NET_IFINDEX ifIndex, const SO
 	addresses[i] = sin6Addr;
 	if (::bind(sdRecv, (const sockaddr *)& addresses[i], sizeof(SOCKADDR_IN6)) < 0)
 	{
-		TRACE_HERE("cannot bind to new interface address");
+		REPORT_ERRMSG_ON_TRACE("Cannot bind to new interface address");
 		return;
 	}
 #if defined(TRACE) && (TRACE & TRACE_ADDRESS)
@@ -2233,7 +2217,7 @@ VOID NETIOAPI_API_ OnUnicastIpChanged(PVOID, PMIB_UNICASTIPADDRESS_ROW row, MIB_
 	// As we have already filter out MibInitialNotification
 	if (row == NULL)
 	{
-		TRACE_HERE("Internal panic! Cannot guess which IP interface was changed\n");
+		DebugBreak();	// Cannot guess which IP interface was changed
 		return;
 	}
 

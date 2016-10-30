@@ -72,12 +72,12 @@ int FSPAPI GetSendBuffer(FSPHANDLE hFSPSocket, int m, CallbackBufferReady fp1)
 //	if the buffer is to be continued, its size MUST be multiplier of MAX_BLOCK_SIZE
 //	SendInline could be chained in tandem with GetSendBuffer
 DllExport
-int FSPAPI SendInline(FSPHANDLE hFSPSocket, void * buffer, int len, int8_t eomFlag)
+int FSPAPI SendInline(FSPHANDLE hFSPSocket, void * buffer, int len, int8_t eotFlag)
 {
 	register CSocketItemDl * p = (CSocketItemDl *)hFSPSocket;
 	try
 	{
-		return p->SendInplace(buffer, len, eomFlag);
+		return p->SendInplace(buffer, len, eotFlag != 0);
 	}
 	catch(...)
 	{
@@ -98,8 +98,6 @@ int FSPAPI SendInline(FSPHANDLE hFSPSocket, void * buffer, int len, int8_t eomFl
 // Return
 //	0 if no immediate error, negative if it failed, or positive it was warned (I/O pending)
 // Remark
-//	Return value passed in NotifyOrReturn is the number of octets really scheduled to send
-//	which may be less or greater than requested because of compression and/or encryption
 //	Only all data have been buffered may be NotifyOrReturn called.
 //	Choice of the flag:
 //		0: not finshed more data to follow
@@ -170,7 +168,7 @@ int LOCALAPI CSocketItemDl::AcquireSendBuf(int n)
 // Remark
 //	SendInplace works in tandem with AcquireSendBuf
 //	This is a prototype and thus simultaneous send and receive is not considered
-int LOCALAPI CSocketItemDl::SendInplace(void * buffer, int len, int8_t eomFlag)
+int LOCALAPI CSocketItemDl::SendInplace(void * buffer, int len, bool eot)
 {
 #ifdef TRACE
 	printf_s("SendInplace in state %s[%d]\n", stateNames[GetState()], GetState());
@@ -178,7 +176,7 @@ int LOCALAPI CSocketItemDl::SendInplace(void * buffer, int len, int8_t eomFlag)
 	if(! WaitUseMutex())
 		return -EINTR;
 	//
-	int r = CheckTransmitaction(eomFlag != 0);
+	int r = CheckTransmitaction(eot);
 	if (r < 0)
 	{
 		SetMutexFree();
@@ -186,7 +184,7 @@ int LOCALAPI CSocketItemDl::SendInplace(void * buffer, int len, int8_t eomFlag)
 	}
 	//
 	bytesBuffered = 0;
-	return FinalizeSend(PrepareToSend(buffer, len, eomFlag != 0));
+	return FinalizeSend(PrepareToSend(buffer, len, eot));
 }
 
 
@@ -234,7 +232,7 @@ int LOCALAPI CSocketItemDl::SendStream(void * buffer, int len, bool flag)
  */
 // Return
 //	1 if revert to ACTIVE or PEER_COMMIT state
-//	0 if no state change
+//	0 if no state revertion
 //	-EBADF if the operation is prohibited because the control block is in unrevertible state
 //	-EBUSY if the control block is busy in committing a message
 // Remark
@@ -244,6 +242,9 @@ int LOCALAPI CSocketItemDl::SendStream(void * buffer, int len, bool flag)
 //	See also FinalizeSend()
 int LOCALAPI CSocketItemDl::CheckTransmitaction(bool eotFlag)
 {
+	if(InState(COMMITTING) || InState(COMMITTING2))
+		return -EBUSY;
+
 	if(eotFlag)
 		isFlushing = 1;
 	// else keep the isFlushing flag
@@ -265,9 +266,6 @@ int LOCALAPI CSocketItemDl::CheckTransmitaction(bool eotFlag)
 		return 0;
 	}
 
-	if(InState(COMMITTING) || InState(COMMITTING2))
-		return -EBUSY;
-
 	if (InState(COMMITTED))
 	{
 #ifdef TRACE
@@ -280,7 +278,7 @@ int LOCALAPI CSocketItemDl::CheckTransmitaction(bool eotFlag)
 		else
 		{
 			SetState(ESTABLISHED);
-			SetNewTransaction();
+			newTransaction = 1;	// isFlushing = 0; // SetNewTransaction();
 		}
 		return 1;
 	}
@@ -297,7 +295,7 @@ int LOCALAPI CSocketItemDl::CheckTransmitaction(bool eotFlag)
 		else
 		{
 			SetState(PEER_COMMIT);
-			SetNewTransaction();
+			newTransaction = 1;	// isFlushing = 0; // SetNewTransaction();
 		}
 		return 1;
 	}
@@ -315,7 +313,7 @@ int LOCALAPI CSocketItemDl::CheckTransmitaction(bool eotFlag)
 void CSocketItemDl::ProcessPendingSend()
 {
 #ifdef TRACE
-	printf_s("Process pending send in state %s\n", stateNames[pControlBlock->state]);
+	printf_s("Fiber#%u process pending send in %s\n", fidPair.source, stateNames[pControlBlock->state]);
 #endif
 	// Assume it has taken exclusive access of the socket
 	// WriteTo takes precedence over SendInline. In the contrast to RecvInline takes precedence over ReadFrom
@@ -331,7 +329,7 @@ void CSocketItemDl::ProcessPendingSend()
 		//
 #if defined(_DEBUG)
 		if (fpSent == NULL)
-			TRACE_HERE("Internal panic! Lost way to report WriteTo result");
+			printf_s("\nInternal panic! Lost way to report WriteTo result\n");
 #endif
 	}
 
@@ -365,7 +363,6 @@ void CSocketItemDl::ProcessPendingSend()
 //	int &	[_In_] length of data in pendingSendBuf to send [_Out_] length of data scheduled to send
 // Return
 //	number of bytes buffered in the send queue
-// TODO: encryption and/or compression
 int LOCALAPI CSocketItemDl::BufferData(int len)
 {
 	ControlBlock::PFSP_SocketBuf p = pControlBlock->LockLastBufferedSend();
@@ -374,7 +371,6 @@ int LOCALAPI CSocketItemDl::BufferData(int len)
 	if (m <= 0)
 		return -EDOM;
 	//
-	// pack the byte stream, TODO: compression
 	if(p != NULL && !p->GetFlag<IS_COMPLETED>())
 	{
 #ifndef NDEBUG
@@ -412,8 +408,6 @@ int LOCALAPI CSocketItemDl::BufferData(int len)
 		p->len = min(m, MAX_BLOCK_SIZE);
 		m -= p->len;
 		memcpy(GetSendPtr(p), pendingSendBuf, p->len);
-		// TODO: Compress
-		// TODO: Encrypt
 		bytesBuffered += p->len;
 
 		if(p->len >= MAX_BLOCK_SIZE)

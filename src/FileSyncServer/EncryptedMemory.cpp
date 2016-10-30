@@ -36,7 +36,7 @@ void SendMemoryPatternEncyrpted()
 
 static int FSPAPI onAccepted(FSPHANDLE h, PFSP_Context ctx)
 {
-	printf_s("\nEncyrptedMemory onAccepted: handle of FSP session/Fiber ID = 0x%X\n", (uint32_t)(intptr_t)h);
+	printf_s("\nEncyrptedMemory onAccepted: handle of FSP session %p\n", h);
 	// TODO: check connection context
 
 	ReadFrom(h, bufPeerPublicKey, sizeof(bufPeerPublicKey), onPublicKeyReceived);
@@ -87,8 +87,8 @@ static void FSPAPI onFileNameSent(FSPHANDLE h, FSP_ServiceCode c, int r)
 		return;
 	}
 
-	//// Besides, open another reverse-connection to send the signature
-	//StartToSendSignature(h);
+	// Besides, open another reverse-connection to send the signature
+	StartToSendSignature(h);
 
 	printf_s("And we expected success acknowledgement\n");
 	ReadFrom(h, linebuf, sizeof(linebuf), onResponseReceived);

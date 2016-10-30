@@ -114,9 +114,6 @@ bool CSocketItemDl::WaitUseMutex()
 	if(!IsInUse())
 		return false;
 #ifndef NDEBUG
-#ifdef TRACE
-	printf_s("\nFSPSocket#0x%X  WaitUseMutex\n", (CSocketItem *)this);
-#endif
 	uint64_t t0 = GetTickCount64();
 	while(!TryAcquireSRWLockExclusive(& rtSRWLock))
 	{
@@ -135,16 +132,6 @@ bool CSocketItemDl::WaitUseMutex()
 
 
 
-#if !defined(NDEBUG) && defined(TRACE)
-void CSocketItemDl::SetMutexFree()
-{
-	ReleaseSRWLockExclusive(& rtSRWLock);
-	printf_s("\nFSPSocket#0x%X  SetMutexFree\n", (CSocketItem *)this);
-}
-#endif
-
-
-
 int CSocketItemDl::SelfNotify(FSP_ServiceCode c)
 {
 	uint64_t t0 = GetTickCount64();
@@ -160,7 +147,8 @@ int CSocketItemDl::SelfNotify(FSP_ServiceCode c)
 		Sleep(50);
 	}
 #ifdef TRACE
-	printf_s("Self notice %s[%d] in local fiber#0x%X, state %s\t\n", noticeNames[c], c, fidPair.source, stateNames[pControlBlock->state]);
+	printf_s("Self notice %s[%d] in local fiber#%u, state %s\t\n", noticeNames[c], c
+		, fidPair.source, stateNames[pControlBlock->state]);
 	if(r > 0)
 		printf_s("--- merged ---\n");
 #endif
@@ -183,8 +171,8 @@ int FSPAPI FSPControl(FSPHANDLE hFSPSocket, FSP_ControlCode controlCode, ULONG_P
 		case FSP_GET_SIGNATURE:
 			*(uint64_t *)value = pSocket->GetULASignature();
 			break;
-		case FSP_SET_SEND_COMPRESSING:
-			pSocket->SetSendCompressing(value != 0);
+		case FSP_SET_SIGNATURE:
+			pSocket->SetULASignature(*(uint64_t *)value);
 			break;
 		case FSP_SET_CALLBACK_ON_ERROR:
 			pSocket->SetCallbackOnError((NotifyOrReturn)value);
@@ -264,7 +252,7 @@ int LOCALAPI CSocketItemDl::Initialize(PFSP_Context psp1, char szEventName[MAX_N
 	}
 
 	// make the event name. the control block address, together with the process id, uniquely identify the event
-	sprintf_s(szEventName, MAX_NAME_LENGTH, REVERSE_EVENT_PREFIX "%08X%08X", idThisProcess, (uint32_t)pControlBlock);
+	sprintf_s(szEventName, MAX_NAME_LENGTH, REVERSE_EVENT_PREFIX "%08X%p", idThisProcess, pControlBlock);
 	// system automatically resets the event state to nonsignaled after a single waiting thread has been released
 	hEvent = CreateEventA(& attrSecurity
 		, FALSE // not manual-reset
@@ -272,7 +260,7 @@ int LOCALAPI CSocketItemDl::Initialize(PFSP_Context psp1, char szEventName[MAX_N
 		, szEventName);	// (LPCTSTR)
 
 #ifdef TRACE
-	printf_s("ID of current process is %d, handle of the event is %08X\n", idThisProcess, hEvent);
+	printf_s("ID of current process is %d, handle of the event is %p\n", idThisProcess, hEvent);
 #endif
 	if(hEvent == INVALID_HANDLE_VALUE || hEvent == NULL)
 	{
@@ -288,7 +276,7 @@ int LOCALAPI CSocketItemDl::Initialize(PFSP_Context psp1, char szEventName[MAX_N
 		pControlBlock->Init(psp1->sendSize, psp1->recvSize);
 
 	pControlBlock->notices.SetHead(FSP_IPC_CannotReturn);
-	//^only after the control block is successfully mapped into the memory space of LLS may it be cleared by SetCallable()
+	//^only after the control block is successfully mapped into the memory space of LLS may it be cleared by LLS
 
 	// could be exploited by ULA to make distinguishment of services
 	memcpy(&context, psp1, sizeof(FSP_SocketParameter));
@@ -323,14 +311,14 @@ bool CSocketItemDl::LockAndValidate()
 	if(! WaitUseMutex())
 	{
 		if(IsInUse())
-			DebugBreak();	// TRACE_HERE("deadlock encountered!?");
+			DebugBreak();	//TRACE_HERE("deadlock encountered!?");
 		return false;
 	}
 
 	if(pControlBlock == NULL)
 	{
 #ifndef NDEBUG
-		printf_s("\nDescriptor=0x%X: event to be processed, but the Control Block is missing!\n", (int32_t)(CSocketItem *)this);
+		printf_s("\nDescriptor#%p: event to be processed, but the Control Block is missing!\n", this);
 #endif
 		socketsTLB.FreeItem(this);
 		Reinitialize();
@@ -342,8 +330,8 @@ bool CSocketItemDl::LockAndValidate()
 	{
 #ifndef NDEBUG
 		printf_s(
-			"\nDescriptor=0x%X, event to be processed, but the socket is in state %s[%d]?\n"
-			, (int32_t)(CSocketItem *)this
+			"\nDescriptor#%p, event to be processed, but the socket is in state %s[%d]?\n"
+			, this
 			, stateNames[pControlBlock->state], pControlBlock->state);
 #endif
 		InterlockedExchangePointer((PVOID *)& fpRecycled, NULL);
@@ -370,7 +358,8 @@ void CSocketItemDl::WaitEventToDispatch()
 		}
 
 #ifdef TRACE
-		printf_s("\nIn local fiber#0x%X, state %s\tnotice: %s\n", fidPair.source, stateNames[pControlBlock->state], noticeNames[notice]);
+		printf_s("\nIn local fiber#%u, state %s\tnotice: %s\n"
+			, fidPair.source, stateNames[pControlBlock->state], noticeNames[notice]);
 #endif
 		// If recyled or in the state not earlier than ToFinish, LLS should have recyle the session context mapping already
 		if(notice == FSP_NotifyRecycled || notice >= FSP_NotifyToFinish)
@@ -391,7 +380,6 @@ void CSocketItemDl::WaitEventToDispatch()
 			return;
 		}
 
-		shouldChainTimeout = 1;
 		switch(notice)
 		{
 		case FSP_NotifyAccepting:	// overloaded callback for either CONNECT_REQUEST or MULTIPLY
@@ -440,6 +428,7 @@ void CSocketItemDl::WaitEventToDispatch()
 			break;
 		case FSP_NotifyFlushed:
 			ProcessPendingSend();	// SetMutexFree();
+			isFlushing = 0;
 			if(! LockAndValidate())
 				return;
 			if(InState(CLOSABLE) && initiatingShutdown)
@@ -546,46 +535,54 @@ bool LOCALAPI CSocketItemDl::Call(const CommandToLLS & cmd, int size)
 
 bool LOCALAPI CSocketItemDl::AddOneShotTimer(uint32_t dueTime)
 {
-	shouldChainTimeout = 0;
-	return (timer != NULL
-		? ::ChangeTimerQueueTimer(::timerQueue, timer, dueTime, 0)
-		: ::CreateTimerQueueTimer(& timer, ::timerQueue
+	return (timer == NULL
+		&&::CreateTimerQueueTimer(& timer, ::timerQueue
 			, WaitOrTimeOutCallBack
 			, this		// LPParameter
 			, dueTime
 			, 0
 			, WT_EXECUTEINTIMERTHREAD
-			)
-		) != FALSE;
+			) != FALSE
+		);
 }
 
 
 
 bool CSocketItemDl::CancelTimer()
 {
-	if(::DeleteTimerQueueTimer(::timerQueue, timer, NULL))
-	{
-		timer = NULL;
+	if(timer == NULL)
 		return true;
-	}
-	else
-	{
+
+	if(::DeleteTimerQueueTimer(::timerQueue, timer, NULL) == FALSE)
 		return false;
-	}
+
+	timer = NULL;
+	return true;
 }
 
 
 
+// See also Recycle and RespondToRecycle
 void CSocketItemDl::TimeOut()
 {
-	if(pControlBlock->notices.GetHead() == FSP_IPC_CannotReturn)
-	{
-		Recycle();
+#ifdef TRACE
+	printf_s("\nDescriptor#%p: timed-out ", this);
+	if(pControlBlock == NULL)
+		printf_s("event to be processed, the Control Block has been released.\n");
+	else
+		printf_s("in state %s[%d]\n", stateNames[pControlBlock->state], pControlBlock->state);
+#endif
+	// UNRESOLVED! Should lock and avoid dead-lock here!
+	if(! IsInUse())
 		return;
-	}
-	//
-	if(shouldChainTimeout)
-		AddOneShotTimer(TRASIENT_STATE_TIMEOUT_ms);
+
+	if (! lowerLayerRecycled)
+		Call<FSP_Recycle>();
+
+	socketsTLB.FreeItem(this);
+	Reinitialize();
+	DebugBreak();
+	NotifyError(FSP_NotifyTimeout, -ETIMEDOUT);
 }
 
 
