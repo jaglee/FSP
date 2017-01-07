@@ -143,13 +143,13 @@ void Multiply(CommandCloneSessionSrv &cmd)
 	CSocketItemEx *srcItem = (* CLowerInterface::Singleton())[cmd.fiberID];
 	if(srcItem == NULL)
 	{
-		DebugBreak();	//TRACE_HERE("Cloned connection not found");
+		BREAK_ON_DEBUG();	//TRACE_HERE("Cloned connection not found");
 		return;
 	}
 
 	if(! srcItem->WaitUseMutex())
 	{
-		DebugBreak();	//TRACE_HERE("Cloned connect busy");
+		BREAK_ON_DEBUG();	//TRACE_HERE("Cloned connect busy");
 		return;
 	}
 
@@ -202,8 +202,10 @@ void CSocketItemEx::ProcessCommand(CommandToLLS *pCmd)
 	WaitUseMutex();
 	if(!IsInUse() || lowState <= 0 || lowState > LARGEST_FSP_STATE)
 	{
-		SetMutexFree();
+#ifdef TRACE
 		printf_s("Socket(%p) is not in working state, inUse = %d, %s[%d]\n", this, inUse, stateNames[lowState], lowState);
+#endif
+		SetMutexFree();
 		return;
 	}
 	//
@@ -258,9 +260,7 @@ void CSocketItemEx::Listen(CommandNewSessionSrv &cmd)
 	// bind to the interface as soon as the control block mapped into server's memory space
 	fidPair.source = cmd.fiberID;
 	InitAssociation();
-
-	SetCallable();
-	// everyting run smoothly. no interrupt raised
+	SignalFirstEvent(FSP_NotifyListening);
 }
 
 
@@ -331,7 +331,9 @@ void CSocketItemEx::Start()
 		, pControlBlock->sendWindowNextSN);
 #endif
 	SyncState();
-	EmitStartAndSlide();
+	EmitStart();
+	pControlBlock->SetFirstSendWindowRightEdge();
+	//
 	AddResendTimer(tRoundTrip_us >> 8);
 	// While the KEEP_ALIVE_TIMEOUT was set already in OnConnectRequestAck
 }
@@ -348,18 +350,18 @@ void CSocketItemEx::UrgeCommit()
 		, stateNames[pControlBlock->state], pControlBlock->state);
 #endif
 	// synchronize the state in the 'cache' and the real state
-	if (_InterlockedExchange8((char *) & lowState, pControlBlock->state) != pControlBlock->state)
+	if (_InterlockedExchange8((char *)& lowState, pControlBlock->state) != pControlBlock->state)
 	{
 		if (lowState == COMMITTING || lowState == COMMITTING2)
 			RestartKeepAlive();
 	}
 	//
 	int r = pControlBlock->MarkSendQueueEOT();
-	if(r <= 0)
+	if (r <= 0)
 	{
 		shouldAppendCommit = 1;
 		// See also EmitQ
-		if(resendTimer == NULL)
+		if (resendTimer == NULL)
 			AddResendTimer(tRoundTrip_us >> 8);
 	}
 }

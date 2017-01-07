@@ -63,8 +63,8 @@ int CSocketItemDl::Recycle()
 		return 0;	// Free the socket item when FSP_Recycle called back
 	// Shall be rare:
 	socketsTLB.FreeItem(this);
-	Reinitialize();
-	DebugBreak();
+	Disable();
+	BREAK_ON_DEBUG();
 	return -EIO;
 }
 
@@ -125,14 +125,13 @@ int LOCALAPI CSocketItemDl::Shutdown(NotifyOrReturn fp1)
 		return -EINTR;
 
 	// assert: if the socket is in CLOSED state its LLS image must have been recycled 
-	if(InState(NON_EXISTENT) || InState(CLOSED))
+	if(pControlBlock == NULL || InState(NON_EXISTENT) || InState(CLOSED))
 	{
 		SetMutexFree();
 		return EBADF;	// A warning saying that the socket has already been closed thoroughly
 	}
 
 	initiatingShutdown = 1;
-	isFlushing = 1;
 
 	if (InState(PRE_CLOSED))
 	{
@@ -155,30 +154,49 @@ int LOCALAPI CSocketItemDl::Shutdown(NotifyOrReturn fp1)
 		return (Call<FSP_Shutdown>() ? 0 : -EIO);
 	}
 
+	return Commit();
+}
+
+
+
+// Reserved API for committing/flushing a transmit transaction
+// Assume that it has obtained the mutex lock
+// It is somewhat a little tricky to commit a transmit tranaction:
+// Case 1, it is in sending a stream or obtaining send buffer, and there are yet some data to be buffered
+// Case 2, the send queue is empty at all
+// Case 3, there is set some block to be sent in the send queue
+// Case 4, all blocks have been sent and the tail of the send queue has already been marked EOT
+// Case 5, all blocks have been sent and the tail of the send queue could not set with EOT flag
+int CSocketItemDl::Commit()
+{
+	isFlushing = 1;
+
 	// The last resort: flush sending stream if it has not yet been committed
-	if(InState(COMMITTED))
+	if (InState(COMMITTED))
 	{
 		SetMutexFree();
 		return 0;
 	}
 
-	if(InState(COMMITTING) || InState(COMMITTING2))
+	if (InState(COMMITTING) || InState(COMMITTING2))
 	{
 		SetMutexFree();
 		return EBUSY;	// a warning saying that it is COMMITTING
 	}
 
-	if(! TestSetState(ESTABLISHED, COMMITTING) && ! TestSetState(PEER_COMMIT, COMMITTING2))
+	if (!TestSetState(ESTABLISHED, COMMITTING) && !TestSetState(PEER_COMMIT, COMMITTING2))
 	{
 		SetMutexFree();
 		Recycle();
 		return EDOM;	// A warning say that the connection is aborted actually, for it is not in the proper state
 	}
 
+	bool yetSomeDataToBuffer = (pendingSendSize > 0);
 	SetMutexFree();
-	return (Call<FSP_Commit>() ? 0 : -EIO);
-}
 
+	// Case 1 is handled in DLL while case 2~5 are handled in LLS
+	return yetSomeDataToBuffer ? 0 : (Call<FSP_Commit>() ? 0 : -EIO);
+}
 
 
 // Callback for SHUTDOWN, triggered by the near end, to recycle the socket
@@ -188,7 +206,7 @@ void CSocketItemDl::RespondToRecycle()
 {
 	NotifyOrReturn fp1 = (NotifyOrReturn)InterlockedExchangePointer((PVOID *)& fpRecycled, NULL);
 	socketsTLB.FreeItem(this);
-	Reinitialize();
+	Disable();
 	if (fp1 != NULL)
 		fp1(this, FSP_NotifyRecycled, 0);
 }

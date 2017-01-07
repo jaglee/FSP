@@ -17,6 +17,8 @@ int CompareMemoryPattern(char *fileName)
 		return -2;
 	}
 
+	printf_s("To check word pattern in %s\n", fileName);
+
 	int bytesRead = _read(fd, buf, sizeof(buf));
 	_close(fd);
 	if(bytesRead < 0)
@@ -29,6 +31,8 @@ int CompareMemoryPattern(char *fileName)
 		if(* (uint32_t *) & buf[i * sizeof(uint32_t)] != htobe32(i))
 			__debugbreak();
 	}
+
+	printf_s("Word pattern in %s was checked.\n", fileName);
 
 	return 0;
 }

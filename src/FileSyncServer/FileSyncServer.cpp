@@ -78,9 +78,9 @@ int main(int argc, char * argv[])
 {
 	errno_t	err = 0;
 
-	if(argc != 1 && (argc != 2 || strlen(argv[1]) >= MAX_FILENAME_WITH_PATH_LEN))
+	if(argc != 1 && (argc != 2 || strlen(argv[1]) >= MAX_FILENAME_WITH_PATH_LEN) && argc != 3)
 	{
-		printf_s("Usage: %s <filename>\n", argv[0]);
+		printf_s("Usage: %s <filename> [length-of-memory-pattern]\n", argv[0]);
 		err = -1;
 		goto l_bailout;
 	}
@@ -95,6 +95,17 @@ int main(int argc, char * argv[])
 	if(_stricmp(argv[1], "$memory.^") == 0)
 	{
 		strcpy_s(fileName, sizeof(fileName), argv[1]);
+		if(argc == 3)
+		{
+			sizeOfBuffer = (size_t)_atoi64(argv[2]);
+			if(sizeOfBuffer < 4)
+			{
+				printf_s("Usage: %s <filename> [length-of-memory-pattern]\n", argv[0]);
+				err = -1;
+				goto l_bailout;
+			}
+		}
+		//
 		SendMemoryPatternEncyrpted();
 		goto l_bailout;
 	}

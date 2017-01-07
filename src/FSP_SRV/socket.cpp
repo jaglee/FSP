@@ -466,8 +466,8 @@ l_bailout:
 //	For milky payload this function should never be called
 int32_t LOCALAPI CSocketItemEx::GenerateSNACK(FSP_PreparedKEEP_ALIVE &buf, ControlBlock::seq_t &seq0, int nPrefix)
 {
-	FSP_SelectiveNACK::GapDescriptor *pGaps = buf.gaps;
-	register int n = sizeof(buf.gaps) / sizeof(pGaps[0]);
+	register int n = (sizeof(buf.gaps) - nPrefix + sizeof(FSP_NormalPacketHeader)) / sizeof(buf.gaps[0]);
+	register FSP_SelectiveNACK::GapDescriptor *pGaps = buf.gaps;
 	n = pControlBlock->GetSelectiveNACK(seq0, pGaps, n);
 	if (n < 0)
 	{
@@ -524,7 +524,7 @@ void CSocketItemEx::InitiateConnect()
 	FSP_ConnectRequest *q = (FSP_ConnectRequest *)GetSendPtr(skb);
 	if(q == NULL)
 	{
-		DebugBreak();	//TRACE_HERE("Memory corruption!");
+		BREAK_ON_DEBUG();	//TRACE_HERE("Memory corruption!");
 		return;
 	}
 	q->initCheckCode = initState.initCheckCode;
@@ -552,7 +552,7 @@ void CSocketItemEx::AffirmConnect(const SConnectParam & initState, ALFID_T idLis
 	FSP_ConnectRequest *pkt = (FSP_ConnectRequest *)this->GetSendPtr(skb);
 	if(pkt == NULL)
 	{
-		DebugBreak();	//TRACE_HERE("memory corruption");
+		BREAK_ON_DEBUG();	//TRACE_HERE("memory corruption");
 		return;
 	}
 	tRoundTrip_us = uint32_t(min(UINT32_MAX, NowUTC() - skb->timeSent));
@@ -614,21 +614,27 @@ void CSocketItemEx::InitiateMultiply(CSocketItemEx *srcItem)
 
 	// MULTIPLY can only be the very first packet
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend();
+	void * payload = GetSendPtr(skb);
 	FSP_NormalPacketHeader q;
 	nextOOBSN = ++ srcItem->nextOOBSN;
 	lastOOBSN = 0;	// As the response from the peer, if any, is not an out-of-band packet
 	q.Set(MULTIPLY, sizeof(FSP_NormalPacketHeader), seq0, nextOOBSN, pControlBlock->recvBufferBlockN);
 
-	void * paidLoad = SetIntegrityCheckCode(& q, GetSendPtr(skb), skb->len, q.expectedSN);
-	if (paidLoad == NULL)
+	void * paidLoad = SetIntegrityCheckCode(& q, payload, skb->len, q.expectedSN);
+	if (paidLoad == NULL || skb->len > sizeof(this->cipherText))
 	{
-		DebugBreak();	//TRACE_HERE("Cannot set ICC for the new MULTIPLY command");
+		BREAK_ON_DEBUG();	//TRACE_HERE("Cannot set ICC for the new MULTIPLY command");
 		return;	// but it's an exception!
 	}
-	SendPacket(2, ScatteredSendBuffers(&q, sizeof(FSP_NormalPacketHeader), paidLoad, skb->len));
+	// Buffer the header in the queue for sake of retransmission on time-out. See also EmitStart() and KeepAlive()
+	if (paidLoad != this->cipherText)
+		memcpy(this->cipherText, paidLoad, skb->len);
+	memcpy(payload, &q, sizeof(FSP_NormalPacketHeader));
+	//
+	SendPacket(2, ScatteredSendBuffers(payload, sizeof(FSP_NormalPacketHeader), this->cipherText, skb->len));
+	pControlBlock->SetFirstSendWindowRightEdge();
 	//
 	tSessionBegin = skb->timeSent = NowUTC();	// UNRESOLVED!? But if SendPacket failed?
-	pControlBlock->SlideNextToSend();
 	SetState(CLONING);
 	// tRoundTrip_us would be calculated when PERSIST is got, when tLastRecv is set as well
 	ReplaceTimer(INIT_RETRANSMIT_TIMEOUT_ms);
@@ -662,13 +668,13 @@ bool CSocketItemEx::FinalizeMultiply()
 	}
 	if (!ValidateICC())
 	{
-		DebugBreak();	//TRACE_HERE("Invalid intergrity check code of PERSIST to MULTIPLY!?");
+		BREAK_ON_DEBUG();	//TRACE_HERE("Invalid intergrity check code of PERSIST to MULTIPLY!?");
 		return false;
 	}
 
 #if defined(TRACE) && (TRACE & TRACE_OUTBAND)
 	printf_s("Response of MULTIPLY was received in LLS, recvBufferBlockN = %d\n"
-			"\tParent's fid = 0x%X, allocated fid = 0x%X, peer's fid = 0x%X\n"
+		"\tParent's fiber#%u, allocated fiber#%u, peer's fiber#%u\n"
 		, pControlBlock->recvBufferBlockN
 		, idParent, fidPair.source, fidPair.peer);
 #endif
@@ -743,7 +749,8 @@ void CSocketItemEx::Accept()
 		ReplaceTimer(TRANSIENT_STATE_TIMEOUT_ms);	// The socket slot might be a reused one
 		InstallEphemeralKey();
 		//^ ephemeral session key material was ready when CSocketItemDl::PrepareToAccept
-		SetCallable();	// The success or failure signal is delayed until PERSIST or RESET received
+		pControlBlock->notices.SetHead(NullCommand);
+		//^ The success or failure signal is delayed until PERSIST or RESET received
 	}
 	else
 	{
@@ -754,7 +761,9 @@ void CSocketItemEx::Accept()
 		AddResendTimer(tRoundTrip_us >> 8);	// tRoundTrip_us was set OnGetMultiply
 	}
 	//
-	EmitStartAndSlide();
+	EmitStart();
+	pControlBlock->SetFirstSendWindowRightEdge();
+	//
 	tSessionBegin = tRecentSend;
 }
 
@@ -766,10 +775,7 @@ bool CSocketItemEx::ICCSeqValid()
 {
 	int32_t d = IsOutOfWindow(headPacket->pktSeqNo);
 	if (d > 0 || d <= -MAX_BUFFER_BLOCKS)
-	{
-		DebugBreak();
 		return false;
-	}
 	//
 	return ValidateICC();
 }
@@ -800,19 +806,12 @@ void CSocketItemEx::Destroy()
 		lowState = NON_EXISTENT;	// Donot [SetState(NON_EXISTENT);] as the ULA might do further cleanup
 		RemoveTimers();
 		CSocketItem::Destroy();
-		// Do not process receive buffer further:
-		for(PktBufferBlock *p; headPacket != NULL; headPacket = p)
-		{
-			p = headPacket->next;
-			CLowerInterface::Singleton()->FreeBuffer(headPacket);
-		}
-		tailPacket = NULL;
 		//
 		(CLowerInterface::Singleton())->FreeItem(this);
 	}
 	catch(...)
 	{
-		DebugBreak();
+		BREAK_ON_DEBUG();
 		// UNRESOLVED! trap run-time exception and trace the calling stack, write error log
 	}
 }
@@ -862,6 +861,7 @@ void CSocketItemEx::RejectOrReset()
 	if(WaitUseMutex())
 	{
 		Destroy();
+		SetMutexFree();	// should be redundant, but make it robust
 	}
 	else
 	{

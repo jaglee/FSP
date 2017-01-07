@@ -45,7 +45,7 @@ struct _CookieMaterial
 
 #if defined(TRACE) && (TRACE & TRACE_HEARTBEAT) && (TRACE & TRACE_PACKET)
 #define TRACE_SOCKET()	\
-	(printf_s(__FUNCTION__ ": local fiber#%u in state %s\n", 	\
+	(printf_s(__FUNCTION__ ": local fiber#%u in state %s\n"	\
 		, fidPair.source		\
 		, stateNames[lowState])	\
 	&& pControlBlock->DumpSendRecvWindowInfo())
@@ -421,7 +421,7 @@ bool LOCALAPI CSocketItemEx::ValidateSNACK(ControlBlock::seq_t & ackSeqNo, FSP_S
 			, pControlBlock->recvWindowFirstSN
 			, pControlBlock->recvWindowFirstSN +  pControlBlock->recvBufferBlockN
 			);
-		DebugBreak();
+		BREAK_ON_DEBUG();
 #endif
 		return false;
 	}
@@ -474,7 +474,7 @@ bool LOCALAPI CSocketItemEx::ValidateSNACK(ControlBlock::seq_t & ackSeqNo, FSP_S
 	n = offset - be16toh(pSNACK->hs.hsp) - sizeof(FSP_SelectiveNACK);
 	if (n < 0 || n % sizeof(FSP_SelectiveNACK::GapDescriptor) != 0)
 	{
-		DebugBreak();	//TRACE_HERE("This is a malformed SNACK packet");
+		BREAK_ON_DEBUG();	//TRACE_HERE("This is a malformed SNACK packet");
 		return false;
 	}
 
@@ -501,21 +501,21 @@ void CSocketItemEx::OnConnectRequestAck(PktBufferBlock *pktBuf, int lenData)
 	TRACE_SOCKET();
 	if(! InState(CONNECT_AFFIRMING))
 	{
-		DebugBreak();	//TRACE_HERE("Get wandering ACK_CONNECT_REQ in non CONNECT_AFFIRMING state");
+		BREAK_ON_DEBUG();	//TRACE_HERE("Get wandering ACK_CONNECT_REQ in non CONNECT_AFFIRMING state");
 		return;
 	}
 
 	lenData -= sizeof(FSP_AckConnectRequest);
 	if (lenData < 0 || lenData > MAX_BLOCK_SIZE)
 	{
-		DebugBreak();	//TRACE_HERE("TODO: debug memory corruption error");
+		BREAK_ON_DEBUG();	//TRACE_HERE("TODO: debug memory corruption error");
 		return;
 	}
 
 	FSP_AckConnectRequest & response = *(FSP_AckConnectRequest *)& pktBuf->hdr;
 	if(be32toh(response.expectedSN) != pControlBlock->sendWindowFirstSN)
 	{
-		DebugBreak();	//TRACE_HERE("Get an unexpected/out-of-order ACK_CONNECT_REQ");
+		BREAK_ON_DEBUG();	//TRACE_HERE("Get an unexpected/out-of-order ACK_CONNECT_REQ");
 		return;
 	}	// See also OnGetConnectRequest
 
@@ -525,7 +525,7 @@ void CSocketItemEx::OnConnectRequestAck(PktBufferBlock *pktBuf, int lenData)
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->AllocRecvBuf(pktSeqNo);
 	if(skb == NULL)
 	{
-		DebugBreak();	//TRACE_HERE("What? Cannot allocate the payload buffer for ACK_CONNECT_REQ?");
+		BREAK_ON_DEBUG();	//TRACE_HERE("What? Cannot allocate the payload buffer for ACK_CONNECT_REQ?");
 		return;
 	}
 
@@ -534,7 +534,7 @@ void CSocketItemEx::OnConnectRequestAck(PktBufferBlock *pktBuf, int lenData)
 	BYTE *ubuf;
 	if (skb == NULL || !CheckMemoryBorder(skb) || (ubuf = GetRecvPtr(skb)) == NULL)
 	{
-		DebugBreak();	//TRACE_HERE("TODO: debug memory corruption error");
+		BREAK_ON_DEBUG();	//TRACE_HERE("TODO: debug memory corruption error");
 		HandleMemoryCorruption();
 		return;
 	}
@@ -558,11 +558,12 @@ void CSocketItemEx::OnConnectRequestAck(PktBufferBlock *pktBuf, int lenData)
 	memset(par->allowedPrefixes, 0, sizeof(par->allowedPrefixes));
 	memcpy(par->allowedPrefixes, response.params.subnets, sizeof(response.params.subnets));
 
-	pControlBlock->SetSendWindowSize(response.GetRecvWS());
 	pControlBlock->peerAddr.ipFSP.fiberID = pktBuf->idPair.source;
 	// persistent session key material from the remote end might be ready
 	// as ACK_CONNECT_REQUEST composes a singleton transmit transaction
 	pControlBlock->SnapshotReceiveWindowRightEdge();
+	pControlBlock->sendWindowLimitSN
+		= pControlBlock->sendWindowFirstSN + min(pControlBlock->sendBufferBlockN, response.GetRecvWS());
 
 	// ephemeral session key material was ready OnInitConnectAck
 	InstallEphemeralKey();
@@ -643,7 +644,7 @@ void CSocketItemEx::OnGetPersist()
 	int countPlaced = PlacePayload();
 	if (countPlaced == -EFAULT)
 	{
-		DebugBreak();	//TRACE_HERE("how on earth no buffer in the receive window?!");
+		BREAK_ON_DEBUG();	//TRACE_HERE("how on earth no buffer in the receive window?!");
 		Notify(FSP_NotifyOverflow);
 		return;
 	}
@@ -837,7 +838,7 @@ void CSocketItemEx::OnGetPureData()
 	int r = PlacePayload();
 	if(r == -EFAULT)
 	{
-		DebugBreak();	//TRACE_HERE("No buffer when the receive window is not closed?");
+		BREAK_ON_DEBUG();	//TRACE_HERE("No buffer when the receive window is not closed?");
 		Notify(FSP_NotifyOverflow);
 		return;
 	}
@@ -983,7 +984,7 @@ void CSocketItemEx::OnAckFlush()
 #ifndef NDEBUG
 	if(n != 0)
 	{
-		DebugBreak();	//TRACE_HERE("ACK_FLUSH should carry accumulatively positively acknowledge only");
+		BREAK_ON_DEBUG();	//TRACE_HERE("ACK_FLUSH should carry accumulatively positively acknowledge only");
 		return;
 	}
 #endif
@@ -1021,8 +1022,7 @@ void CSocketItemEx::OnGetRelease()
 	if (headPacket->lenData != 0)
 		return;
 
-	int32_t d = int32_t(headPacket->pktSeqNo - pControlBlock->recvWindowNextSN);
-	if (d != 0)
+	if (headPacket->pktSeqNo != pControlBlock->recvWindowNextSN)
 	{
 #if defined(TRACE) && (TRACE & TRACE_PACKET)
 		printf_s("\nThe RELEASE packet to %u is valid only if it is the last expected\n"
@@ -1035,7 +1035,7 @@ void CSocketItemEx::OnGetRelease()
 
 	if (!ValidateICC())
 	{
-		DebugBreak();	//TRACE_HERE("Invalid intergrity check code!?");
+		BREAK_ON_DEBUG();	//TRACE_HERE("Invalid intergrity check code!?");
 		return;
 	}
 
@@ -1077,7 +1077,10 @@ void CSocketItemEx::OnGetMultiply()
 
 	int32_t d = IsOutOfWindow(headPacket->pktSeqNo);
 	if (d > 0 || d <= -MAX_BUFFER_BLOCKS)
+	{
+		BREAK_ON_DEBUG();
 		return;	// stale packets are silently discarded
+	}
 
 	FSP_NormalPacketHeader *pFH = (FSP_NormalPacketHeader *)headPacket->GetHeaderFSP();	// the fixed header
 	uint32_t remoteHostID = pControlBlock->connectParams.remoteHostID;
@@ -1085,7 +1088,7 @@ void CSocketItemEx::OnGetMultiply()
 	// The out-of-band serial number is stored in p1->expectedSN
 	if (!ValidateICC(pFH, headPacket->lenData, idSource, pFH->expectedSN))
 	{
-		DebugBreak();	//TRACE_HERE("Invalid intergrity check code!?");
+		BREAK_ON_DEBUG();	//TRACE_HERE("Invalid intergrity check code!?");
 		return;
 	}
 
@@ -1108,7 +1111,7 @@ void CSocketItemEx::OnGetMultiply()
 	backlogItem.idRemote = idSource;
 	if (pControlBlock->backLog.Has(&backlogItem))
 	{
-		DebugBreak();	//TRACE_HERE("Duplicate MULTIPLY backlogged already");
+		BREAK_ON_DEBUG();	//TRACE_HERE("Duplicate MULTIPLY backlogged already");
 l_bailout:
 		CLowerInterface::Singleton()->FreeItem(newItem);
 		return;

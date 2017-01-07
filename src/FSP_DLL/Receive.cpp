@@ -106,7 +106,7 @@ int CSocketItemDl::RecvInline(PVOID fp1)
 	}
 	//
 	peerCommitted = 0;	// See also ProcessReceiveBuffer()
-	if(!IsRecvBufferEmpty())
+	if(HasDataToDeliver())
 	{
 		SetMutexFree();
 		return SelfNotify(FSP_NotifyDataReady);
@@ -160,7 +160,7 @@ int LOCALAPI CSocketItemDl::ReadFrom(void * buffer, int capacity, PVOID fp1)
 	}
 	// NO!We do not reset fpPeeked. RecvInline() just takes precedence over ReadFrom()
 
-	if(!IsRecvBufferEmpty())
+	if(HasDataToDeliver())
 	{
 		SetMutexFree();
 		return SelfNotify(FSP_NotifyDataReady);
@@ -199,7 +199,8 @@ int CSocketItemDl::FetchReceived()
 	int m = 0;	// note that left border of the receive window slided in the loop body
 	// firstly, skip those already delivered
 	ControlBlock::PFSP_SocketBuf p;
-	while(!IsRecvBufferEmpty() && (p = pControlBlock->GetFirstReceived())->opCode == 0)
+	// normally the loop body should never be executed
+	while(HasDataToDeliver() && (p = pControlBlock->GetFirstReceived())->opCode == 0)
 	{
 		pControlBlock->SlideRecvWindowByOne();
 	}
@@ -262,7 +263,7 @@ void CSocketItemDl::ProcessReceiveBuffer()
 		bool b;
 		void *p = pControlBlock->InquireRecvBuf(n, b);
 #ifdef TRACE
-		printf_s("Data to deliver@%p, length = %u, eot = %d\n", p, n, (int)b);
+		printf_s("Data to deliver@%p, length = %d, eot = %d\n", p, n, (int)b);
 #endif
 		// If end-of-transaction encountered reset fpPeeked so that RecvInline() may work
 		if(b)
@@ -278,13 +279,20 @@ void CSocketItemDl::ProcessReceiveBuffer()
 			SetMutexFree();
 			return;
 		}
-		// UNRESOLVED!Reset fpPeeked so that crash recovery by chained ReadFrom() is possible if(n < 0) ?
+		// Do not reset fpPeeked because it may require double-deliver if round-robin
 		//
 		SetMutexFree();
 		if(n < 0)
 			fp1(this, NULL, (int32_t)n, false);
 		else
 			fp1(this, p, (int32_t)n, b);
+		WaitUseMutex();
+		// Assume the call-back function did not mess up the receiv queue
+		MarkReceiveFinished(n);
+		if (HasDataToDeliver())
+			SelfNotify(FSP_NotifyDataReady);
+		//
+		SetMutexFree();
 		return;
 	}
 

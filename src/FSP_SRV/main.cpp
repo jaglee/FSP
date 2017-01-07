@@ -88,7 +88,7 @@ int main(int argc, char * argv[])
 	}
 	catch(...)
 	{
-		DebugBreak();
+		BREAK_ON_DEBUG();
 		delete TimerWheel::Singleton();
 		delete CLowerInterface::Singleton();
 	}

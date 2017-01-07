@@ -175,9 +175,7 @@ protected:
 	void FinalizeRead();
 
 public:
-	CSocketItemDl() { InitializeSRWLock(& rtSRWLock); }	// and lazily initialized
-	~CSocketItemDl() { Reinitialize(); }
-	void Reinitialize()
+	void Disable()
 	{
 		register HANDLE h;
 		CancelTimer();
@@ -186,13 +184,8 @@ public:
 		//^NULL: return immediately; INVALID_HANDLE_VALUE: waits for all callback functions to complete before returning
 		//
 		CSocketItem::Destroy();
-		fpSent = NULL;
-		fpPeeked = NULL;
-		fpReceived = NULL;
-		fpRecycled = NULL;
-		InitializeSRWLock(& rtSRWLock); 
 	}
-	int LOCALAPI Initialize(PFSP_Context, char *);
+	int LOCALAPI Initialize(PFSP_Context, char[MAX_NAME_LENGTH]);
 	int Recycle();
 
 	// Convert the relative address in the control block to the address in process space, unchecked
@@ -273,10 +266,13 @@ public:
 
 	int	LOCALAPI RecvInline(PVOID);
 	int LOCALAPI ReadFrom(void *, int, PVOID);
+	int LOCALAPI MarkReceiveFinished(int n) { return pControlBlock->MarkReceivedFree(n); }
 
-	bool IsRecvBufferEmpty()  { return pControlBlock->CountReceived() <= 0; }
+	bool HasDataToDeliver()  { return int32_t(pControlBlock->recvWindowExpectedSN - pControlBlock->recvWindowFirstSN) > 0; }
+	bool HasFreeSendBuffer() { return (pControlBlock->CountSendBuffered() - pControlBlock->sendBufferBlockN < 0); }
 
 	int LOCALAPI Shutdown(NotifyOrReturn);
+	int Commit();
 
 	void SetCallbackOnRequest(CallbackRequested fp1) { context.onAccepting = fp1; }
 	void SetCallbackOnAccept(CallbackConnected fp1) { context.onAccepted = fp1; }

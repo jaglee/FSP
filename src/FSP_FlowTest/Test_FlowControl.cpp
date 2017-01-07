@@ -168,13 +168,17 @@ void PrepareFlowTestResend(CSocketItemExDbg & dbgSocket, PControlBlock & pSCB)
 	// set the begin of the send sequence number for the test to work properly
 	// set the negotiated receive window parameter
 	int memsize = sizeof(ControlBlock) + (sizeof ControlBlock::FSP_SocketBuf + MAX_BLOCK_SIZE) * 8;
+	int32_t s1 = (memsize - sizeof(ControlBlock)) / 2;
+	int32_t s2 = (memsize - sizeof(ControlBlock)) / 2;
+
 	memset(& dbgSocket, 0, sizeof(CSocketItemExDbg));
 	dbgSocket.dwMemorySize = memsize;
 	if(dbgSocket.pControlBlock != NULL)
 		free(dbgSocket.pControlBlock);
 	pSCB = (ControlBlock *)malloc(dbgSocket.dwMemorySize);
 	dbgSocket.pControlBlock = pSCB;
-	pSCB->Init((memsize - sizeof(ControlBlock)) / 2, (memsize - sizeof(ControlBlock)) / 2);
+
+	pSCB->Init(s1, s2);
 	pSCB->recvWindowFirstSN = pSCB->recvWindowNextSN = FIRST_SN;
 
 	pSCB->SetSendWindow(FIRST_SN);
@@ -242,25 +246,24 @@ void FlowTestRetransmission()
 	CSocketItemExDbg dbgSocket;
 	PControlBlock pSCB;
 	
-	PrepareFlowTestResend(dbgSocket, pSCB);
+	PrepareFlowTestResend(dbgSocket, pSCB);	// dbgSocket.tRoundTrip_us == 0;
+	dbgSocket.DoResend();
 
-	// UNRESOLVED! I don't know why it report 'Stack around pktBuffer was corrupted'
-	// what is the content of the selective negative acknowledgement?
-	// See also CSocketItemEx::SendSNACK
-	//static int32_t guardian1 = 0xAAAAAAAA;
-	//static PktBufferBlock pktBuffer;
-	//static int32_t guardian2 = 0xAAAAAAAA;
-	ALIGN(MAC_ALIGNMENT)
-	static PktBufferBlock pktBuffer;
-	memset(& pktBuffer, 0, sizeof(pktBuffer));
+	struct
+	{
+		PktBufferBlock	pktBuffer;
+		int32_t			n;
+	} placeholder;
+	//
 	struct _KEEP_ALIVE
 	{
 		FSP_NormalPacketHeader hdr;
 		FSP_PreparedKEEP_ALIVE ext;
-	} *p = (_KEEP_ALIVE *) & pktBuffer.hdr;
+	} *p = (_KEEP_ALIVE *)& placeholder.pktBuffer.hdr;
+	//
 	ControlBlock::seq_t seq4;
-	////No, GetSelectiveNACK does not corrupt the memory
-	//int n = dbgSocket.pControlBlock->GetSelectiveNACK(seq4, p->ext.gaps, sizeof(p->ext.gaps) / sizeof(p->ext.gaps[0]));
+
+	memset(& placeholder, 0, sizeof(placeholder));
 	int32_t len = dbgSocket.GenerateSNACK(p->ext, seq4, sizeof(FSP_NormalPacketHeader));
 
 	p->hdr.hs.version = THIS_FSP_VERSION;
@@ -277,7 +280,7 @@ void FlowTestRetransmission()
 	dbgSocket.SetIntegrityCheckCode(& p->hdr, NULL, 0, p->ext.GetSaltValue());
 
 	// Firstly emulate receive the packet before emulate OnGetKeepAlive
-	dbgSocket.headPacket = & pktBuffer;
+	dbgSocket.headPacket = & placeholder.pktBuffer;
 	dbgSocket.headPacket->pktSeqNo = FIRST_SN + 3;
 	dbgSocket.headPacket->lenData = 0;
 	dbgSocket.tRoundTrip_us = 1;
@@ -292,12 +295,143 @@ void FlowTestRetransmission()
 
 	dbgSocket.RespondToSNACK(seq5, snack, n);
 
+	dbgSocket.DoResend();
+
 	ControlBlock::PFSP_SocketBuf skb = pSCB->HeadSend();
 	assert(skb->flags == 0);	// GetFlag<IS_ACKNOWLEDGED>()
 	assert((skb + 1)->flags == 0);	// GetFlag<IS_ACKNOWLEDGED>()
 	assert((skb + 3)->GetFlag<IS_ACKNOWLEDGED>());
 	assert(dbgSocket.GetControlBlock()->sendWindowFirstSN == FIRST_SN + 2);
 
-	// TODO: Test round-robin, by slide one...
+	//
+	// Round robin. Firstly, emulate further send.
+	//
+	skb = pSCB->GetSendBuf();
+	assert(skb != NULL);
+	skb->SetFlag<IS_COMPLETED>();
+	assert(pSCB->sendBufferNextSN == FIRST_SN + 5);
+
+	skb = pSCB->GetSendBuf();
+	assert(skb != NULL);
+	skb->SetFlag<IS_COMPLETED>();
+	assert(pSCB->sendBufferNextSN == FIRST_SN + 6);
+
+	// the receive window is slided
+	pSCB->SlideRecvWindowByOne();
+	pSCB->SlideRecvWindowByOne();
+
+	// further receiving
+	skb = pSCB->AllocRecvBuf(FIRST_SN + 4);
+	assert(skb != NULL);
+	skb->SetFlag<IS_FULFILLED>();
+
+	skb = pSCB->AllocRecvBuf(FIRST_SN + 5);
+	assert(skb != NULL);
+	skb->SetFlag<IS_FULFILLED>();
+
+	skb = pSCB->AllocRecvBuf(FIRST_SN + 6);
+	assert(skb == NULL);
+
+	len = dbgSocket.GenerateSNACK(p->ext, seq4, sizeof(FSP_NormalPacketHeader));
+	p->hdr.hs.hsp = htobe16(uint16_t(len));
+
+	p->hdr.sequenceNo = htobe32(pSCB->sendWindowNextSN - 1);
+	p->hdr.expectedSN = htobe32(seq4);
+	p->hdr.ClearFlags();
+	p->hdr.SetRecvWS(pSCB->RecvWindowSize());
+
+	dbgSocket.SetIntegrityCheckCode(&p->hdr, NULL, 0, p->ext.GetSaltValue());
+	// as it is an out-of-band packet, assume pre-set values are kept
+	dbgSocket.tRecentSend = NowUTC() + 3;
+	dbgSocket.ValidateSNACK(seq5, snack, n);
+
+	assert(seq5 == seq4 && n == 1);
+
+	dbgSocket.RespondToSNACK(seq5, snack, n);
+	dbgSocket.DoResend();
+
 	// TODO: Test calculation of RTT and Keep alive timeout 
+}
+
+
+//
+void FlowTestRecvWinRoundRobin()
+{
+	CSocketItemExDbg dbgSocket;
+	PControlBlock pSCB;
+
+	// The send buffer space is fulfilled, while the third receive buffer block is free
+	PrepareFlowTestResend(dbgSocket, pSCB);
+
+	int m = MAX_BLOCK_SIZE - 1;
+	void * buf = pSCB->InquireSendBuf(m);
+	// should be NULL, -ENOMEM
+	printf_s("InquireSendBuf: buf = %p, size = %d\n", buf, m);
+
+	ControlBlock::PFSP_SocketBuf skb = pSCB->HeadRecv();
+	skb->opCode = PURE_DATA;
+	skb->len = MAX_BLOCK_SIZE;
+
+	// FIRST_SN + 1
+	skb++;
+	skb->opCode = PURE_DATA;
+	skb->len = MAX_BLOCK_SIZE;
+
+	// FIRST_SN + 3;
+	skb++;
+	skb++;
+	skb->opCode = PURE_DATA;
+	skb->len = MAX_BLOCK_SIZE;
+
+	// but eot? don't care it yet.
+	bool eot;
+	buf = pSCB->InquireRecvBuf(m, eot);
+	printf_s("Should return the first two blocks:\n"
+		"InquireRecvBuf#1, buf = %p, size = %d, eot = %d\n", buf, m, eot);
+
+	buf = pSCB->InquireRecvBuf(m, eot);
+	printf_s("Encounter a gap, should return the gap address, but size is 0:\n"
+		"InquireRecvBuf#2, buf = %p, size = %d, eot = %d\n", buf, m, eot);
+
+	skb = pSCB->AllocRecvBuf(FIRST_SN + 2);	// used to be free
+	assert(skb != NULL);
+	skb->opCode = PURE_DATA;
+	skb->len = MAX_BLOCK_SIZE;
+	skb->SetFlag<IS_FULFILLED>();
+
+	// Round-robin allocation
+	skb = pSCB->AllocRecvBuf(FIRST_SN + 4);
+	assert(skb != NULL);
+	skb->opCode = PURE_DATA;
+	skb->len = MAX_BLOCK_SIZE;
+	skb->SetFlag<IS_FULFILLED>();
+
+	skb = pSCB->AllocRecvBuf(FIRST_SN + 5);
+	assert(skb != NULL);
+	skb->opCode = PURE_DATA;
+	skb->len = MAX_BLOCK_SIZE;
+	skb->SetFlag<IS_FULFILLED>();
+
+	buf = pSCB->InquireRecvBuf(m, eot);
+	printf_s("Should return the last two blocks:\n"
+		"InquireRecvBuf#3, buf = %p, size = %d, eot = %d\n", buf, m, eot);
+
+	skb = pSCB->AllocRecvBuf(FIRST_SN + 6);
+	skb->opCode = PURE_DATA;
+	skb->len = MAX_BLOCK_SIZE;
+	skb->SetFlag<IS_FULFILLED>();
+
+	skb = pSCB->AllocRecvBuf(FIRST_SN + 7);
+	skb->opCode = PURE_DATA;
+	skb->len = MAX_BLOCK_SIZE;
+	skb->SetFlag<IS_FULFILLED>();
+
+	skb = pSCB->AllocRecvBuf(FIRST_SN + 8);
+	assert(skb == NULL);
+
+	buf = pSCB->InquireRecvBuf(m, eot);
+	printf_s("Should round-robin to the start, return the whole buffer space:\n"
+		"InquireRecvBuf, #4, buf = %p, size = %d, eot = %d\n", buf, m, eot);
+
+	//TODO: more test, now EOT should be taken into care of
 }

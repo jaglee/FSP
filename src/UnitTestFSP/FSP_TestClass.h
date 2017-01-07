@@ -14,10 +14,12 @@ class CSocketItemExDbg: public CSocketItemEx
 public:
 	CSocketItemExDbg()
 	{
+		int32_t ss = MAX_BLOCK_SIZE * 2;
+		int32_t sr = MAX_BLOCK_SIZE * 2;
 		memset(this, 0, sizeof(CSocketItemEx));
 		pControlBlock = (ControlBlock *)malloc
 			(sizeof(ControlBlock) + (sizeof(ControlBlock::FSP_SocketBuf) + MAX_BLOCK_SIZE) * 8);
-		pControlBlock->Init(MAX_BLOCK_SIZE * 2, MAX_BLOCK_SIZE * 2);
+		pControlBlock->Init(ss, sr);
 	};
 	CSocketItemExDbg(int nSend, int nRecv)
 	{
@@ -26,7 +28,10 @@ public:
 		hEvent = NULL;
 		pControlBlock = (ControlBlock *)malloc
 			(sizeof(ControlBlock) + (sizeof(ControlBlock::FSP_SocketBuf) + MAX_BLOCK_SIZE) * (nSend + nRecv));
-		pControlBlock->Init(MAX_BLOCK_SIZE * nSend, MAX_BLOCK_SIZE * nRecv);
+		//
+		nSend *= MAX_BLOCK_SIZE;
+		nRecv *= MAX_BLOCK_SIZE;
+		pControlBlock->Init(nSend, nRecv);
 	};
 	~CSocketItemExDbg()
 	{
@@ -53,7 +58,6 @@ public:
 	friend void UnitTestSocketRTLB();
 	friend void UnitTestICC();
 	friend void UnitTestSocketInState();
-	friend void UnitTestReceiveQueue();
 	friend void FlowTestRetransmission();
 	friend void PrepareFlowTestResend(CSocketItemExDbg &, PControlBlock &);
 };
@@ -63,7 +67,5 @@ public:
 class CLowerInterfaceDbg: public CLowerInterface
 {
 public:
-	PktBufferBlock *CurrentHead() { return freeBufferHead; }
-	friend void UnitTestReceiveQueue();
 	friend void UnitTestSelectPath();
 };

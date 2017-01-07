@@ -111,23 +111,17 @@ BOOL WINAPI DllMain(HINSTANCE hInstance, DWORD dwReason, LPVOID lpvReserved)
 //	Exploit _InterlockedXor8 to keep memory access order as the coded order
 bool CSocketItemDl::WaitUseMutex()
 {
-	if(!IsInUse())
-		return false;
-#ifndef NDEBUG
 	uint64_t t0 = GetTickCount64();
 	while(!TryAcquireSRWLockExclusive(& rtSRWLock))
 	{
 		if(GetTickCount64() - t0 > MAX_LOCK_WAIT_ms)
 		{
-			DebugBreak();	// To trace the call stack, there may be deadlock
+			BREAK_ON_DEBUG();	// To trace the call stack, there may be deadlock
 			return false;
 		}
 		Sleep(50);	// if there is some thread that has exclusive access on the lock, wait patiently
 	}
-#else
-	AcquireSRWLockExclusive(& rtSRWLock);
-#endif
-	return IsInUse();
+	return true;
 }
 
 
@@ -141,7 +135,7 @@ int CSocketItemDl::SelfNotify(FSP_ServiceCode c)
 	{
 		if(GetTickCount64() - t0 > MAX_LOCK_WAIT_ms)
 		{
-			DebugBreak();	// To trace the call stack, there may be deadlock on waiting for free notice slot
+			BREAK_ON_DEBUG();	// To trace the call stack, there may be deadlock on waiting for free notice slot
 			return -EINTR;
 		}
 		Sleep(50);
@@ -311,7 +305,7 @@ bool CSocketItemDl::LockAndValidate()
 	if(! WaitUseMutex())
 	{
 		if(IsInUse())
-			DebugBreak();	//TRACE_HERE("deadlock encountered!?");
+			BREAK_ON_DEBUG();	//TRACE_HERE("deadlock encountered!?");
 		return false;
 	}
 
@@ -321,7 +315,7 @@ bool CSocketItemDl::LockAndValidate()
 		printf_s("\nDescriptor#%p: event to be processed, but the Control Block is missing!\n", this);
 #endif
 		socketsTLB.FreeItem(this);
-		Reinitialize();
+		Disable();
 		NotifyError(FSP_NotifyReset, -EBADF);
 		return false;
 	}
@@ -375,13 +369,17 @@ void CSocketItemDl::WaitEventToDispatch()
 				, stateNames[pControlBlock->state], pControlBlock->state);
 #endif
 			socketsTLB.FreeItem(this);
-			Reinitialize();
+			Disable();
 			NotifyError(FSP_NotifyReset, -EBADF);
 			return;
 		}
 
 		switch(notice)
 		{
+		case FSP_NotifyListening:
+			CancelTimer();			// See also ::ListenAt
+			SetMutexFree();
+			break;
 		case FSP_NotifyAccepting:	// overloaded callback for either CONNECT_REQUEST or MULTIPLY
 			if(pControlBlock->HasBacklog())
 				ProcessBacklog();
@@ -427,8 +425,8 @@ void CSocketItemDl::WaitEventToDispatch()
 			SetMutexFree();
 			break;
 		case FSP_NotifyFlushed:
+			isFlushing = 0;			// Must clear the flag firstly or else transmit transactions is splitted unproperly
 			ProcessPendingSend();	// SetMutexFree();
-			isFlushing = 0;
 			if(! LockAndValidate())
 				return;
 			if(InState(CLOSABLE) && initiatingShutdown)
@@ -447,7 +445,7 @@ void CSocketItemDl::WaitEventToDispatch()
 			return;
 		case FSP_NotifyReset:
 			socketsTLB.FreeItem(this);
-			Reinitialize();
+			Disable();
 			NotifyError(notice, -EINTR);
 			return;
 		case FSP_IPC_CannotReturn:
@@ -475,7 +473,8 @@ void CSocketItemDl::WaitEventToDispatch()
 		case FSP_NotifyNameResolutionFailed:
 			NotifyError(notice, -EINTR);
 			socketsTLB.FreeItem(this);
-			Reinitialize();	// SetMutexFree();
+			Disable();
+			SetMutexFree();
 			return;
 			// UNRESOLVED!? There could be some remedy if name resolution failed?
 		}
@@ -565,6 +564,8 @@ bool CSocketItemDl::CancelTimer()
 // See also Recycle and RespondToRecycle
 void CSocketItemDl::TimeOut()
 {
+	WaitUseMutex();
+
 #ifdef TRACE
 	printf_s("\nDescriptor#%p: timed-out ", this);
 	if(pControlBlock == NULL)
@@ -572,16 +573,19 @@ void CSocketItemDl::TimeOut()
 	else
 		printf_s("in state %s[%d]\n", stateNames[pControlBlock->state], pControlBlock->state);
 #endif
-	// UNRESOLVED! Should lock and avoid dead-lock here!
 	if(! IsInUse())
+	{
+		SetMutexFree();
 		return;
+	}
 
 	if (! lowerLayerRecycled)
 		Call<FSP_Recycle>();
 
 	socketsTLB.FreeItem(this);
-	Reinitialize();
-	DebugBreak();
+	Disable();
+	SetMutexFree();
+	BREAK_ON_DEBUG();
 	NotifyError(FSP_NotifyTimeout, -ETIMEDOUT);
 }
 
@@ -642,6 +646,9 @@ CSocketItemDl * CSocketDLLTLB::AllocItem()
 		, 0
 		, sizeof(CSocketItemDl) - sizeof(CSocketItem));
 	// item->prev = item->next = NULL;	// so does other connection state pointers and flags
+	// We are confident that RTL_SRWLOCK_INIT is all zero
+	// so InitializeSRWLock(& item->rtSRWLock) or assign to SRWLOCK_INIT is unneccessary
+	//
 	pSockets[sizeOfWorkSet++] = item;
 	_InterlockedExchange8(& item->inUse, 1);
 

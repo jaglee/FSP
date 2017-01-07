@@ -164,8 +164,8 @@ struct FSP_SocketParameter
 	} u;
 	int32_t		ifDefault;	// default interface, only for send
 	//
-	int32_t		recvSize;	// default size of the receive window
-	int32_t		sendSize;	// default size of the send window
+	int32_t		recvSize;	// [_In_] default size of the receive window [_Out] size of the allocated receive buffer segment
+	int32_t		sendSize;	// [_In_] default size of the send window	 [_Out] size of the allocated send buffer segment
 	//
 	uint64_t	signatureULA;
 };

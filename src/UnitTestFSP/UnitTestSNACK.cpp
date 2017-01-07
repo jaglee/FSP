@@ -20,10 +20,12 @@ using namespace Microsoft::VisualStudio::CppUnitTestFramework;
 void UnitTestSendRecvWnd()
 {
 	int memsize = sizeof(ControlBlock) + (sizeof ControlBlock::FSP_SocketBuf + MAX_BLOCK_SIZE) * 8;
+	int32_t s1 = (memsize - sizeof(ControlBlock)) / 2;
+	int32_t s2 = (memsize - sizeof(ControlBlock)) / 2;
 	const ControlBlock::seq_t FIRST_SN = 12;
 
 	ControlBlock *pSCB = (ControlBlock *)malloc(memsize);
-	pSCB->Init((memsize - sizeof(ControlBlock))/ 2, (memsize - sizeof(ControlBlock)) / 2);
+	pSCB->Init(s1, s2);
 	//pSCB->sendWindowSize = pSCB->sendBufferSize;	// shall do nothing with send buffer management
 	//^ shall set to min(sendBufferSize, remoteReceiveWindowSize);
 

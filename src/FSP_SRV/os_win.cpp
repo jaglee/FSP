@@ -122,7 +122,7 @@ void CSocketSrvTLB::AcquireMutex()
 	{
 		if(GetTickCount64() - t0 > MAX_LOCK_WAIT_ms)
 		{
-			DebugBreak();	// To trace the call stack
+			BREAK_ON_DEBUG();	// To trace the call stack
 			throw -EDEADLK;
 		}
 		Sleep(50);	// if there is some thread that has exclusive access on the lock, wait patiently
@@ -679,23 +679,6 @@ inline void CLowerInterface::LearnAddresses()
 
 
 
-// multi-threaded buffer meant to keep busy receivers from starving occasional network users
-CPacketBuffers::CPacketBuffers()
-{
-	memset(bufferMemory, 0, sizeof(bufferMemory));
-
-	register PktBufferBlock *p = NULL;
-	for(register int i = MAX_BUFFER_BLOCKS - 1; i >= 0; i--)
-	{
-		bufferMemory[i].next = p;
-		p = & bufferMemory[i];
-	}
-
-	freeBufferHead = p;
-}
-
-
-
 // retrieve message from remote end point
 // it's a thread entry
 DWORD WINAPI CLowerInterface::ProcessRemotePacket(LPVOID lpParameter)
@@ -767,7 +750,7 @@ inline void CLowerInterface::ProcessRemotePacket()
 				continue;
 			}
 			REPORT_WSAERROR_TRACE("select failure");
-			DebugBreak();
+			BREAK_ON_DEBUG();
 			break;	// TODO: crash recovery from select
 		}
 		//
@@ -783,34 +766,26 @@ inline void CLowerInterface::ProcessRemotePacket()
 #if defined(TRACE) && (TRACE & TRACE_PACKET)
 			printf_s("\nPacket on socket #%X: processed, result = %d\n", (unsigned)readFDs.fd_array[i], r);
 #endif
-			if (r == E_FAIL)
+			if (r == EADDRNOTAVAIL)
+			{
 				DisableSocket(readFDs.fd_array[i]);
-			else if(r != 0)
-#ifndef TRACE
-				throw -r;	// UNRESOLVED! Unrecoverable?
-#else
+			}
+			else if (r != 0)	// E_ABORT or ENOMEM
 			{
 				printf_s("AcceptAndProcess error return %d\n", r);
-				continue;	// so it could be debug-recovered
+				if (r == E_ABORT)
+					throw - E_ABORT;
 			}
-#endif
 		}
 	} while(1, 1);
 }
+
 
 
 // The handler's mainbody to accept and process one particular remote packet
 // See also SendPacket
 int CLowerInterface::AcceptAndProcess(SOCKET sdRecv)
 {
-	AcquireMutex();
-	//
-	if((pktBuf = GetBuffer()) == NULL)
-	{
-		ReleaseMutex();
-		return ENOMEM;	
-	}
-
 	// Unfortunately, it was proven that no matter whether there is MSG_PEEK
 	// MSG_PARTIAL is not supported by the underlying raw socket service
 	// FSP is meant to optimize towards IPv6. OVER_UDP_IPv4 is just for conceptual test
@@ -827,9 +802,6 @@ int CLowerInterface::AcceptAndProcess(SOCKET sdRecv)
 
 	if (WSARecvMsg(sdRecv, &mesgInfo, &countRecv, NULL, NULL) < 0)
 	{
-		FreeBuffer(pktBuf);
-		ReleaseMutex();
-		//
 		int err = WSAGetLastError();
 		if (err != WSAENOTSOCK)
 		{
@@ -838,9 +810,8 @@ int CLowerInterface::AcceptAndProcess(SOCKET sdRecv)
 		}
 		// TO DO: other errors which could not undertake crash recovery
 		//
-		return E_FAIL;
+		return EADDRNOTAVAIL;
 	}
-	ReleaseMutex();
 
 	// From the receiver's point of view the local fiber id was stored in the peer fiber id field of the received packet
 #ifdef OVER_UDP_IPv4
@@ -903,10 +874,6 @@ int CLowerInterface::AcceptAndProcess(SOCKET sdRecv)
 	case RELEASE:
 	case MULTIPLY:
 	case KEEP_ALIVE:
-#if defined(_DEBUG) && (TRACE & TRACE_OUTBAND)
-		if(opCode == MULTIPLY)
-			DebugBreak();
-#endif
 		pSocket = MapSocket();
 		if(pSocket == NULL)
 		{
@@ -951,20 +918,10 @@ int CLowerInterface::AcceptAndProcess(SOCKET sdRecv)
 		}
 		// save the source address temporarily as it is not necessariy legitimate
 		pSocket->sockAddrTo[MAX_PHY_INTERFACES] = addrFrom;
-		// only if the queue has not started needs it queue HandleICC
-		if(pSocket->PushPacketBuffer(pktBuf) == NULL)
-			QueueUserWorkItem(HandleFullICC, pSocket, WT_EXECUTELONGFUNCTION);
+		pSocket->HandleFullICC(pktBuf);
 		break;
 		// UNRECOGNIZED packets are simply discarded
 	}
-
-	if(pSocket == NULL)
-	{
-		AcquireMutex();	// Make it lockless as much as possible
-		FreeBuffer(pktBuf);
-		ReleaseMutex();
-	}	
-	// Or else it is in the working thread that the memory block free
 
 	return 0;
 }
@@ -1204,18 +1161,19 @@ bool CSocketItemEx::AddLazyAckTimer()
 
 
 // A retransmission timer should be hard coded to 4 RTT, with an implementation depended floor value
-bool CSocketItemEx::AddResendTimer(uint32_t rtt_ms)
+bool CSocketItemEx::AddResendTimer(uint32_t tPeriod_ms)
 {
+#if !defined(TRACE) || !(TRACE & TRACE_PACKET)
+			tPeriod_ms = max(LAZY_ACK_DELAY_MIN_ms, tPeriod_ms);
+#else
+			tPeriod_ms = INIT_RETRANSMIT_TIMEOUT_ms;
+#endif
 	return (resendTimer == NULL
 		&& ::CreateTimerQueueTimer(&resendTimer, TimerWheel::Singleton()
 			, DoResend
 			, this
-#if !defined(TRACE) || !(TRACE & TRACE_PACKET)
-			, max(LAZY_ACK_DELAY_MIN_ms, rtt_ms)
-#else
-			, INIT_RETRANSMIT_TIMEOUT_ms
-#endif
-			, 0
+			, tPeriod_ms
+			, tPeriod_ms
 			, WT_EXECUTEINTIMERTHREAD));
 }
 
@@ -1238,9 +1196,10 @@ void CSocketItemEx::RemoveTimers()
 
 
 // The OS-depending implementation of scheduling transmission queue
+// Send is effectively non-blocking. +WT_TRANSFER_IMPERSONATION?
 void CSocketItemEx::ScheduleEmitQ()
 {
-	QueueUserWorkItem(HandleSendQ, this, WT_EXECUTELONGFUNCTION);
+	QueueUserWorkItem(HandleSendQ, this, WT_EXECUTEINPERSISTENTTHREAD);
 }
 
 
@@ -1250,6 +1209,52 @@ void CSocketItemEx::ScheduleConnect(CommandNewSessionSrv *pCmd)
 {
 	pCmd->pSocket = this;
 	QueueUserWorkItem(HandleConnect, pCmd, WT_EXECUTELONGFUNCTION);
+}
+
+
+
+// Used to be OS-dependent
+inline 
+void CSocketItemEx::HandleFullICC(PktBufferBlock *hdrPkt)
+{
+	// Because some service call may recycle the FSP socket in a concurrent way
+	if (!WaitUseMutex())
+	{
+		BREAK_ON_DEBUG();
+		return;
+	}
+
+	if (lowState == NON_EXISTENT || pControlBlock == NULL)
+	{
+		SetMutexFree();
+		return;
+	}
+
+	// synchronize the state in the 'cache' and the real state
+	lowState = pControlBlock->state;
+	headPacket = hdrPkt;
+	switch (hdrPkt->GetHeaderFSP()->hs.opCode)
+	{
+	case PERSIST:
+		OnGetPersist();
+		break;
+	case PURE_DATA:
+		OnGetPureData();
+		break;
+	case ACK_FLUSH:
+		OnAckFlush();
+		break;
+	case RELEASE:
+		OnGetRelease();
+		break;
+	case MULTIPLY:
+		OnGetMultiply();
+		break;
+	case KEEP_ALIVE:
+		OnGetKeepAlive();
+	}
+	//
+	SetMutexFree();
 }
 
 
@@ -1269,81 +1274,14 @@ bool CSocketItemEx::WaitUseMutex()
 	return true;
 }
 
-#ifndef NDEBUG
+
+
 void CSocketItemEx::SetMutexFree()
 {
 	if(_InterlockedExchange8(& locked, 0) == 0)
 		printf_s("Warning: to release the spinlock of the socket#0x%p, but it was released\n", this);
-}
-#endif
-
-
-// Given
-//	PktSignature *	the pointer to the next packe buffer to be put into the receive-process queue of the socket
-// Return
-//	Previous tail pointer of the receive-process queue. Null if there is no receive-process queue previously
-inline
-PktBufferBlock * CSocketItemEx::PushPacketBuffer(PktBufferBlock *pNext)
-{
-	if(! WaitUseMutex())
-	{
-		DebugBreak();	// To trace the call stack
-		throw - EDEADLK;
-	}
-
-	PktBufferBlock *p = tailPacket;
-	pNext->next = NULL;
-	if(p == NULL)
-	{
-		headPacket = tailPacket = pNext;
-	}
-	else
-	{
-		tailPacket->next = pNext;
-		tailPacket = pNext;
-	}
-
-	SetMutexFree();
-	return p;
-}
-
-
-
-// PeekLockPacketBuffer MUST be paired with UnlockPacketBuffer/PopUnlockPacketBuffer
-// only if there is some packet in the queue would the socket descriptor be locked
-inline
-FSP_NormalPacketHeader * CSocketItemEx::PeekLockPacketBuffer()
-{
-	if (!WaitUseMutex())
-		return NULL;
-
-	if(headPacket == NULL)
-	{
-		// assert(tailPacket == NULL);
-		SetMutexFree();
-		return NULL;
-	}
-
-	return headPacket->GetHeaderFSP();
-}
-
-
-
-// The packet buffer list might both empty and exclusively locked if the socket is disposed on receiving RELEASE or RESET
-// assume mutex is busy
-inline
-void CSocketItemEx::PopUnlockPacketBuffer()
-{
-	if (headPacket == NULL)
-		goto l_return;		// assert(tailPacket == NULL);
-
-	PktBufferBlock *p = headPacket->next;	// MUST put before FreeBuffer or else it may be overwritten
-	CLowerInterface::Singleton()->FreeBuffer(headPacket);
-
-	if((headPacket = p) == NULL)
-		tailPacket = NULL;
-l_return:
-	SetMutexFree();
+	// yield out the CPU as soon as the mutex is free
+	Sleep(0);
 }
 
 
@@ -1360,54 +1298,6 @@ DWORD WINAPI HandleSendQ(LPVOID p)
 		p0->WaitUseMutex();
 		p0->EmitQ();
 		p0->SetMutexFree();
-		return 1;
-	}
-	catch(...)
-	{
-		return 0;
-	}
-}
-
-
-
-// TODO!! illiminate memory leak / PopUnlockPacketBuffer, if any, when do cleanup!!!!
-// Directedly registered by AcceptAndProcess
-DWORD WINAPI HandleFullICC(LPVOID p)
-{
-	try
-	{
-		CSocketItemEx *p0 = (CSocketItemEx *)p;
-		FSP_NormalPacketHeader *hdr;
-		while(hdr = p0->PeekLockPacketBuffer())
-		{
-			// Because some service call may recycle the FSP socket in a concurrent way
-			if (p0->lowState == NON_EXISTENT || p0->pControlBlock == NULL)
-				goto l_continue;
-			// synchronize the state in the 'cache' and the real state
-			p0->lowState = p0->pControlBlock->state;
-			switch(hdr->hs.opCode)
-			{
-			case PERSIST:
-				p0->OnGetPersist();
-				break;
-			case PURE_DATA:
-				p0->OnGetPureData();
-				break;
-			case ACK_FLUSH:
-				p0->OnAckFlush();
-				break;
-			case RELEASE:
-				p0->OnGetRelease();
-				break;
-			case MULTIPLY:
-				p0->OnGetMultiply();
-				break;
-			case KEEP_ALIVE:
-				p0->OnGetKeepAlive();
-			}
-l_continue:
-			p0->PopUnlockPacketBuffer();
-		}
 		return 1;
 	}
 	catch(...)
@@ -1467,7 +1357,7 @@ int CSocketItemEx::SendPacket(register ULONG n1, ScatteredSendBuffers s)
 		s.scattered[0].buf = NULL;
 		s.scattered[0].len = 0;
 		if(nearInfo.u.idALF != fidPair.source)
-			DebugBreak();
+			BREAK_ON_DEBUG();
 #endif
 #if defined(TRACE) && (TRACE & TRACE_ADDRESS)
 		printf_s("Near end's address info:\n");
@@ -2217,7 +2107,7 @@ VOID NETIOAPI_API_ OnUnicastIpChanged(PVOID, PMIB_UNICASTIPADDRESS_ROW row, MIB_
 	// As we have already filter out MibInitialNotification
 	if (row == NULL)
 	{
-		DebugBreak();	// Cannot guess which IP interface was changed
+		BREAK_ON_DEBUG();	// Cannot guess which IP interface was changed
 		return;
 	}
 

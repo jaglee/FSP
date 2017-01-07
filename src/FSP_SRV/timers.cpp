@@ -34,6 +34,7 @@
  */
 #include "fsp_srv.h"
 #include <assert.h>
+#include <intrin.h>
 #include <math.h>
 #include <time.h>
 
@@ -86,7 +87,7 @@ void CSocketItemEx::KeepAlive()
 	{
 		if (!IsInUse())
 		{
-			DebugBreak();	//TRACE_HERE("Lazy garbage collection, in case of leakage");
+			BREAK_ON_DEBUG();	//TRACE_HERE("Lazy garbage collection, in case of leakage");
 			Destroy();
 		}
 #ifdef TRACE
@@ -112,7 +113,7 @@ void CSocketItemEx::KeepAlive()
 			pControlBlock->state = NON_EXISTENT;
 		}
 		Destroy();
-		return;
+		break;
 	// Note that CONNECT_BOOTSTRAP and CONNECT_AFFIRMING are counted into one transient period
 	case CONNECT_BOOTSTRAP:
 	case CONNECT_AFFIRMING:
@@ -198,53 +199,84 @@ void CSocketItemEx::KeepAlive()
 
 
 
-// The resend timer is a one-shot timer, and it is NOT immediately canceled as soon as the packet is acknowledged
-// but is re-scheduled instead on timed-out *resendTimer = NULL / AddResendTimer
 void CSocketItemEx::DoResend()
 {
-	const int32_t capacity = pControlBlock->sendBufferBlockN;
-	resendTimer = NULL;
-	if(! WaitUseMutex())
+	if (!WaitUseMutex())
 	{
 #ifdef TRACE
 		printf_s("\n#0x%X's DoResend not executed due to lack of locks in state %s. InUse: %d\n"
 			, fidPair.source, stateNames[lowState], IsInUse());
 #endif
-		if(resendTimeoutRetryCount < TIMEOUT_RETRY_MAX_COUNT)
-		{
-			resendTimeoutRetryCount++;
-			AddResendTimer(LAZY_ACK_DELAY_MIN_ms);
-		}
 		return;
 	}
-	resendTimeoutRetryCount = 0;
 
-	if(shouldAppendCommit)
-		SendKeepAlive();
-	//^TODO: optimization! Eliminate the long-interval KEEP_ALIVE, until 
+	// In some risky situation DoResend may be triggered even after the resendTimer handle is set to NULL
+	if (resendTimer == NULL)
+		goto l_return;
+	// assertion: if resendTimer != NULL then pControlBlock != NULL
+	// if the assertion failed, memory access exception might be raised.
 
+	const int32_t		capacity = pControlBlock->sendBufferBlockN;
 	ControlBlock::seq_t seq1 = pControlBlock->sendWindowFirstSN;
-	int32_t index1 = pControlBlock->sendWindowHeadPos;
+	int32_t				index1 = pControlBlock->sendWindowHeadPos;
 	ControlBlock::PFSP_SocketBuf p = pControlBlock->HeadSend() + index1;
-	int32_t n = pControlBlock->CountSentInFlight();	
-	timestamp_t tNow = NowUTC();
-	register int k;
+	int32_t				n = pControlBlock->CountSentInFlight();
+	timestamp_t			tNow = NowUTC();
+
+	// SendKeepAlive would scan the receive buffer, which might be lengthy, and it might hold the lock too long time
+	// So maximum buffer capacity should be limitted anyway
+	if (shouldAppendCommit)
+		SendKeepAlive();
+	//^TODO: optimization: eliminate the long-interval KEEP_ALIVE, until short-interval KEEP_ALIVE is stopped
+
+	SetMutexFree();
+	//^Try to make it lockless
+
+	ControlBlock::seq_t seqHead;
+	register int	k;
 	for (k = 0; k < n; k++)
 	{
+		if (!WaitUseMutex())
+			break;
+
+		if (resendTimer == NULL)
+			goto l_return;
+
 		if (!p->GetFlag<IS_COMPLETED>())	// due to parallism the last 'gap' may include imcomplete buffered data
 		{
 #ifdef TRACE
 			printf_s("Imcomplete packet: SN = %u, index position = %d\n", seq1, index1);
 #endif
+			SetMutexFree();
 			break;
 		}
-		//
-		if (p->GetFlag<IS_ACKNOWLEDGED>())	// Normally it's redundant to check the flag but it makes the implementation robust
-			pControlBlock->SlideSendWindowByOne();
-		else if( (tNow - p->timeSent) < (tRoundTrip_us << 2))	// retransmission time-out is hard coded to 4RTT
+
+		// As a simultaneous ackowledgement may have slided the send window already, check the send window every time
+		// retransmission time-out is hard coded to 4RTT
+		seqHead = _InterlockedOr((long *)&pControlBlock->sendWindowFirstSN, 0);
+		if (int(seq1 - seqHead) < 0 || (tNow - p->timeSent) < (tRoundTrip_us << 2))
+		{
+			SetMutexFree();
 			break;
-		else if(EmitWithICC(p, seq1) <= 0)
-			break;
+		}
+
+		if (!p->GetFlag<IS_ACKNOWLEDGED>())
+		{
+#if defined(TRACE) && (TRACE & TRACE_HEARTBEAT)
+			printf_s("Fiber#%u, to retransmit packet #%u\n", fidPair.source, seq1);
+#endif
+#ifndef UNIT_TEST
+			if (EmitWithICC(p, seq1) <= 0)
+			{
+				SetMutexFree();
+				break;
+			}
+#endif
+		}
+#if defined(UNIT_TEST)
+		else
+			printf_s("Packet #%u has been acknowledged already\n", seq1);
+#endif
 		//
 		++seq1;
 		if (++index1 - capacity >= 0)
@@ -256,13 +288,30 @@ void CSocketItemEx::DoResend()
 		{
 			p++;
 		}
+		//
+		SetMutexFree();
 	}
 
-	if(k < n || shouldAppendCommit)
-		AddResendTimer(uint32_t((tRoundTrip_us  - ((tNow - p->timeSent) >> 2)) >> 8));
-	else
-		EmitQ();	// retry to send those pending on the queue
+	if(shouldAppendCommit)
+		return;
 
+	if (!WaitUseMutex())
+		return;
+
+	if (resendTimer == NULL)
+		goto l_return;
+
+	if(pControlBlock->CountSendBuffered() <= 0)
+	{
+		HANDLE h = (HANDLE)InterlockedExchangePointer(& resendTimer, NULL);
+		::DeleteTimerQueueTimer(TimerWheel::Singleton(), h, NULL);
+	}
+	else
+	{
+		EmitQ();	// retry to send those pending on the queue
+	}
+
+l_return:
 	SetMutexFree();
 }
 
@@ -287,18 +336,12 @@ void CSocketItemEx::LazilySendSNACK()
 	}
 	lazyAckTimeoutRetryCount = 0;
 
-	if(!InState(ESTABLISHED) && !InState(COMMITTING) && !InState(COMMITTED))
-	{
 #ifdef TRACE
-		printf_s("\n#0x%X's LazilySendSNACK not executed due to it has migrated to state %s.\n"
+	if(!InState(ESTABLISHED) && !InState(COMMITTING) && !InState(COMMITTED))
+		printf_s("\n#0x%X's LazilySendSNACK should not execute for it has migrated to state %s.\n"
 			, fidPair.source, stateNames[lowState]);
 #endif
-	}
-	else
-	{
-		SendKeepAlive();
-	}
-
+	SendKeepAlive();
 	SetMutexFree();
 }
 
@@ -312,8 +355,8 @@ void CSocketItemEx::LazilySendSNACK()
 // TODO: suppress rate of sending KEEP_ALIVE
 bool CSocketItemEx::SendKeepAlive()
 {
-	ALIGN(16)
-		struct
+	ALIGN(MAC_ALIGNMENT)
+	struct
 	{
 		FSP_NormalPacketHeader	hdr;
 		FSP_ConnectParam		mp;
@@ -364,7 +407,7 @@ bool CSocketItemEx::SendKeepAlive()
 	buf3.hdr.Set(KEEP_ALIVE, (uint16_t)len
 		, pControlBlock->sendWindowNextSN - 1
 		, snKeepAliveExp
-		, pControlBlock->RecvWindowSize());
+		, pControlBlock->AdRecvWS(pControlBlock->sendWindowNextSN - 1));
 	//
 	if(shouldAppendCommit)
 		buf3.hdr.SetFlag<EndOfTransaction>();
@@ -410,7 +453,7 @@ bool CSocketItemEx::SendAckFlush()
 	buf2.hdr.Set(ACK_FLUSH, (uint16_t)sizeof(buf2)
 		, pControlBlock->sendWindowNextSN - 1
 		, pControlBlock->recvWindowNextSN
-		, pControlBlock->RecvWindowSize());
+		, pControlBlock->AdRecvWS(pControlBlock->sendWindowNextSN - 1));
 	SetIntegrityCheckCode(&buf2.hdr, NULL, 0, buf2.snack.serialNo);
 	return SendPacket(1, ScatteredSendBuffers(&buf2, sizeof(buf2))) > 0;
 }
@@ -444,7 +487,7 @@ int LOCALAPI CSocketItemEx::RespondToSNACK(ControlBlock::seq_t expectedSN, FSP_S
 	 ||	sizeof(ControlBlock) + (sizeof(ControlBlock::FSP_SocketBuf) + MAX_BLOCK_SIZE) * capacity > dwMemorySize)
 	{
 #if defined(TRACE)
-		DebugBreak();	//TRACE_HERE("memory overflow");
+		BREAK_ON_DEBUG();	//TRACE_HERE("memory overflow");
 		printf_s("Given memory size: %d, wanted limit: %zd\n"
 			, dwMemorySize
 			, sizeof(ControlBlock) + (sizeof(ControlBlock::FSP_SocketBuf) + MAX_BLOCK_SIZE) * capacity);
@@ -452,10 +495,10 @@ int LOCALAPI CSocketItemEx::RespondToSNACK(ControlBlock::seq_t expectedSN, FSP_S
 		return -EFAULT;
 	}
 
-	const int sentWidth = pControlBlock->CountSentInFlight();
+	const int32_t sentWidth = pControlBlock->CountSentInFlight();
 	if (sentWidth < 0)
 	{
-		DebugBreak();	//TRACE_HERE("send queue internal state error");
+		BREAK_ON_DEBUG();	//TRACE_HERE("send queue internal state error");
 		return -EFAULT;
 	}
 	if(sentWidth == 0)

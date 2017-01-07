@@ -172,6 +172,7 @@ typedef enum: char
 	FSP_InstallKey,		// install the authenticated encryption key
 	FSP_Multiply,		// clone the connection, make SCB of LLS synchronized with DLL
 	// 16~23: LLS to DLL in the backlog
+	FSP_NotifyListening = FSP_Listen,		// a reverse command to signal success execution of FSP_Listen
 	FSP_NotifyAccepting = FSP_Accept,		// a reverse command to make context ready
 	FSP_NotifyRecycled = FSP_Recycle,		// a reverse command to inform DLL to release resource passively
 	FSP_NotifyMultiplied = FSP_Multiply,	// a reverse command to inform DLL to accept a multiply request

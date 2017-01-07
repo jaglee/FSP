@@ -27,6 +27,7 @@ extern volatile bool	toMultiply;
 extern volatile bool	finished;
 extern FSPHANDLE		hFspListen;
 extern char				linebuf[80];
+extern size_t			sizeOfBuffer;
 
 // Branch controllers
 extern void StartToSendSignature(FSPHANDLE h);

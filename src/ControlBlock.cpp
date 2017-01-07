@@ -38,7 +38,9 @@
 #include "FSP.h"
 #include "FSP_Impl.h"
 
-#ifndef NDEBUG
+//
+// Start Of Reflexation
+//
 // Reflexing string representation of operation code, for debug purpose
 const char * CStringizeOpCode::names[LARGEST_OP_CODE + 1] =
 {
@@ -188,9 +190,9 @@ const char * CStringizeNotice::operator[](int i)
 CStringizeOpCode	opCodeStrings;
 CStringizeState		stateNames;
 CStringizeNotice	noticeNames;
-
-#endif
-
+//
+// End Of Reflexation
+//
 
 
 // Remark
@@ -373,7 +375,7 @@ FSP_ServiceCode LLSNotice::Pop()
 //	0 if no error, negative is the error number
 // Remark
 //	the caller should make sure enough memory has been allocated and zeroed
-int LOCALAPI ControlBlock::Init(int32_t sendSize, int32_t recvSize) 
+int LOCALAPI ControlBlock::Init(int32_t & sendSize, int32_t & recvSize) 
 {
 	memset(this, 0, sizeof(ControlBlock));
 	// notice01 = notice10 = NullCommand;
@@ -383,6 +385,11 @@ int LOCALAPI ControlBlock::Init(int32_t sendSize, int32_t recvSize)
 	sendBufferBlockN = sendSize / MAX_BLOCK_SIZE;
 	if(recvBufferBlockN <= 0 || sendBufferBlockN <= 0)
 		return -EDOM;
+
+	recvBufferBlockN = min(recvBufferBlockN, MAX_BUFFER_BLOCKS);
+	sendBufferBlockN = min(sendBufferBlockN, MAX_BUFFER_BLOCKS);
+	sendSize = MAX_BLOCK_SIZE * sendBufferBlockN;
+	recvSize = MAX_BLOCK_SIZE * recvBufferBlockN;
 
 	// safely assume the buffer blocks and the descriptor blocks of the send and receive queue are continuous
 	int sizeDescriptors = sizeof(FSP_SocketBuf) * (recvBufferBlockN + sendBufferBlockN);
@@ -478,15 +485,16 @@ void * LOCALAPI ControlBlock::InquireSendBuf(int & m)
 
 // Given
 //	FSP_NormalPacketHeader	the place-holder of sequence number and flags
+//	ControlBlock::seq_t		the intent sequence number of the packet
 // Do
 //	Set the default sequence number, expected acknowledgment sequencenumber,
 //	flags and the advertised receive window size field of the FSP header 
-void LOCALAPI ControlBlock::SetSequenceFlags(FSP_NormalPacketHeader *pHdr)
+void LOCALAPI ControlBlock::SetSequenceFlags(FSP_NormalPacketHeader *pHdr, ControlBlock::seq_t seq1)
 {
 	pHdr->expectedSN = htobe32(recvWindowNextSN);
-	pHdr->sequenceNo = htobe32(sendWindowNextSN);
+	pHdr->sequenceNo = htobe32(seq1);
 	pHdr->ClearFlags();
-	pHdr->SetRecvWS(RecvWindowSize());
+	pHdr->SetRecvWS(AdRecvWS(recvWindowNextSN));
 }
 
 
@@ -506,10 +514,10 @@ ControlBlock::PFSP_SocketBuf LOCALAPI ControlBlock::AllocRecvBuf(seq_t seq1)
 	if(int(seq1 - recvWindowExpectedSN) < 0)
 		return NULL;	// an outdated packet received
 	//
-	int d = int(seq1 - recvWindowNextSN);
-	if(d >= RecvWindowSize())
-		return NULL;
+	if(int(seq1 - recvWindowFirstSN - recvBufferBlockN) >= 0)
+		return NULL;	// a packet right to the right edge of the receive window may not be accepted
 
+	int d = int(seq1 - recvWindowNextSN);
 	PFSP_SocketBuf p;
 	if(d == 0)
 	{
@@ -559,59 +567,70 @@ ControlBlock::PFSP_SocketBuf LOCALAPI ControlBlock::AllocRecvBuf(seq_t seq1)
 }
 
 
+
 // Given
 //	int & : [_Out_] place holder of the number of bytes [to be] peeked.
 //	bool &: [_Out_] place holder of the End of Transaction flag
 // Return
 //	Start address of the received message
 // Remark
+//	No receive buffer block is released
 //	If the returned value is NULL, stored in int & [_Out_] is the error number
-//	-EPERM		the parameter value is not permited
-//	-EACCES		the buffer block is corrupted and not accessible
+//	-EACCES		the buffer space is corrupted and unaccessible
 //	-EFAULT		the descriptor is corrupted (illegal payload length:
 //				payload length of an intermediate packet of a message should be MAX_BLOCK_SIZE,
 //				payload length of any packet should be no less than 0 and no greater than MAX_BLOCK_SIZE)
+//	-EAGAIN		some buffer block is double delivered, which breaks the protocol
+//	-EPERM		imconformant to the protocol, which is prohibitted
 void * LOCALAPI ControlBlock::InquireRecvBuf(int & nIO, bool & eotFlag)
 {
-	PFSP_SocketBuf p = GetFirstReceived();
-	void *pMsg = GetRecvPtr(p);
-	//
 	const int tail = recvWindowNextPos;
+	eotFlag = false;
 	if(tail > recvBufferBlockN)
 	{
-		nIO = -EFAULT;
+		nIO = -EACCES;	// -13
 		return NULL;
 	}
 
-	register int i, m;
-	if(tail < recvWindowHeadPos)
-		m = recvBufferBlockN - recvWindowHeadPos;
-	else
-		m = tail - recvWindowHeadPos;
+	PFSP_SocketBuf p = GetFirstReceived();
+	void *pMsg = GetRecvPtr(p);
+	nIO = 0;
 	//
-	if(m <= 0)
+	register int i, m;
+	if(tail > recvWindowHeadPos)
+		m = tail - recvWindowHeadPos;
+	else if(tail < recvWindowHeadPos || recvWindowNextSN != recvWindowFirstSN)
+		m = recvBufferBlockN - recvWindowHeadPos;
+	else 
+		return pMsg;
+	//
+	if(m == 0) 
 	{
-		nIO = -EFAULT;	// Erraneous implementation / memory corruption
-		return NULL;
+#ifdef TRACE
+		printf_s("\nOnly when both recvWindowHeadPos and recvWindowNextPos run to the right edge!\n");
+#endif
+		BREAK_ON_DEBUG();
+		recvWindowHeadPos = recvWindowNextPos = 0;
+		m = recvBufferBlockN;
+		p = HeadRecv();
+		pMsg = GetRecvPtr(p);
 	}
 	//
-	nIO = 0;
-	eotFlag = false;
 	for(i = 0; i < m && p->GetFlag<IS_FULFILLED>(); i++)
 	{
 		if(p->len > MAX_BLOCK_SIZE || p->len < 0)
 		{
-			DebugBreak();	// TRACE_HERE("Unrecoverable error! memory corruption might have occurred");
+			BREAK_ON_DEBUG();	// TRACE_HERE("Unrecoverable error! memory corruption might have occurred");
 			nIO = -EFAULT;
 			return NULL;
 		}
 		//
 		if (_InterlockedExchange8((char *) & p->opCode, 0) == 0)
 		{
-			DebugBreak();	// TRACE_HERE("To double deliver a packet?");
+			BREAK_ON_DEBUG();	// TRACE_HERE("To double deliver a packet?");
+			nIO = -EAGAIN;
 			return NULL;
 		}
-		//
 		nIO += p->len;
 		//
 		if(p->GetFlag<END_OF_TRANSACTION>())
@@ -622,20 +641,71 @@ void * LOCALAPI ControlBlock::InquireRecvBuf(int & nIO, bool & eotFlag)
 		}
 		if(p->len != MAX_BLOCK_SIZE)
 		{
-			DebugBreak();	//TRACE_HERE("Unrecoverable error! Unconform to the protocol");
-			nIO = -EFAULT;
+			BREAK_ON_DEBUG();	//TRACE_HERE("Unrecoverable error! Unconform to the protocol");
+			nIO = -EPERM;
 			return NULL;
 		}
 		//
 		p++;
 	}
 	//
+	return pMsg;
+}
+
+
+// Return
+//	non-negative if number of blocks marked free
+//	negative if error:
+//	-EACCES		the buffer space is corrupted and unaccessible
+//	-EFAULT		the descriptor is corrupted (illegal payload length:
+//				payload length of an intermediate packet of a message should be MAX_BLOCK_SIZE,
+//				payload length of any packet should be no less than 0 and no greater than MAX_BLOCK_SIZE)
+//	-EINTR		the receive queue has been messed up
+//	-EPERM		imconformant to the protocol, which is prohibitted
+//	-EDOM		parameter error
+int LOCALAPI ControlBlock::MarkReceivedFree(int nIO)
+{
+	const int tail = recvWindowNextPos;
+	if (tail > recvBufferBlockN)
+		return -EACCES;
+
+	PFSP_SocketBuf p = GetFirstReceived();
+	//
+	register int i, m;
+	m = (nIO + MAX_BLOCK_SIZE - 1) / MAX_BLOCK_SIZE;
+	//
+	for (i = 0; i < m && p->GetFlag<IS_FULFILLED>(); i++)
+	{
+		if (p->len > MAX_BLOCK_SIZE || p->len < 0)
+			return -EFAULT;
+		//
+		if (p->opCode != 0)
+			return -EINTR;
+		//
+		p->SetFlag<IS_FULFILLED>(false);	// release the buffer
+		nIO -= p->len;
+		//
+		if (p->GetFlag<END_OF_TRANSACTION>())
+		{
+			++i;
+			break;
+		}
+		//
+		if (p->len != MAX_BLOCK_SIZE)
+			return -EPERM;
+		//
+		p++;
+	}
+	//
+	if (nIO != 0 || i != m)
+		return -EDOM;
+
 	recvWindowFirstSN += i;
 	recvWindowHeadPos += i;
-	if(recvWindowHeadPos - recvBufferBlockN >= 0)
+	if (recvWindowHeadPos - recvBufferBlockN >= 0)
 		recvWindowHeadPos -= recvBufferBlockN;
-	//
-	return pMsg;
+
+	return i;
 }
 
 
@@ -679,7 +749,7 @@ int LOCALAPI ControlBlock::GetSelectiveNACK(seq_t & snExpect, FSP_SelectiveNACK:
 	uint32_t	dataLength;
 	uint32_t	gapWidth;
 	int			m = 0;
-	for(buf[0].dataLength = 0; ; ++m)	// termination condition is embedded in the loop body
+	do	// termination condition is embedded in the loop body
 	{
 		for(dataLength = 0; int(seq0 - recvWindowNextSN) < 0 && p->GetFlag<IS_FULFILLED>(); seq0++)
 		{
@@ -713,24 +783,16 @@ int LOCALAPI ControlBlock::GetSelectiveNACK(seq_t & snExpect, FSP_SelectiveNACK:
 			}
 		}
 		//
-		if(m == 0)
-		{
+		if(m <= 0)
 			snExpect = seq0 - gapWidth;	// the accumulative acknowledgment
-			buf[0].gapWidth = gapWidth;
-			if(gapWidth == 0)
-				break;
-		}
-		else if(m >= n || gapWidth == 0)
-		{
-			buf[m - 1].dataLength = dataLength;
-			break;
-		}
 		else
-		{
-			buf[m].gapWidth = gapWidth;
 			buf[m - 1].dataLength = dataLength;
-		}
-	}
+		//
+		if(m >= n || gapWidth == 0)		// m is the number of gaps
+			break;
+		//
+		buf[m++].gapWidth = gapWidth;
+	} while (true);
 	//
 	return m;
 }
@@ -747,7 +809,6 @@ void ControlBlock::SlideSendWindow()
 			break;
 
 		p->flags = 0;
-		sendWindowSize--;
 
 		if(++sendWindowHeadPos - sendBufferBlockN >= 0)
 			sendWindowHeadPos -= sendBufferBlockN;
@@ -804,8 +865,8 @@ int LOCALAPI ControlBlock::DealWithSNACK(seq_t expectedSN, FSP_SelectiveNACK::Ga
 	// Check validity of the control block descriptors to prevent memory corruption propagation
 	const int32_t & capacity = sendBufferBlockN;
 	int32_t	iHead = sendWindowHeadPos;
-	register seq_t seq0 = sendWindowFirstSN;
-	int sentWidth = CountSentInFlight();
+	register seq_t	seq0 = sendWindowFirstSN;
+	int32_t			sentWidth = CountSentInFlight();
 	//
 	PFSP_SocketBuf p = HeadSend() + iHead;
 	int	countAck = 0;
@@ -868,13 +929,48 @@ bool ControlBlock::HasBeenCommitted() const
 	if (d != 0)
 		return false;
 
-	d += recvWindowNextPos - 1;
+	d = recvWindowNextPos - 1;
 	if (d - recvBufferBlockN >= 0)
 		d -= recvBufferBlockN;
 	else if (d < 0)
 		d += recvBufferBlockN;
 
-	return ((HeadRecv() + d)->opCode == _COMMIT);
+	if ((HeadRecv() + d)->opCode != _COMMIT)
+		return false;
+
+	// Now scan the receive queue to found the gap. See also GetSelectiveNACK
+	// Normally recvWindowExpectedSN == recvWindowNextSN if no gap, but...
+#ifndef NDEBUG
+	d = CountReceived();	// gaps included, however
+	if (d <= 0)
+		return true;
+	//
+	register int	iHead = recvWindowNextPos - d; 
+	seq_t			seq0 = recvWindowNextSN - d;	// Because of parallism it is not necessarily recvWindowFirstSN now
+	if (iHead < 0)
+		iHead += recvBufferBlockN;
+	// it is possible that the head packet is the gap because of delivery
+	for (PFSP_SocketBuf	p = HeadRecv() + iHead; int(seq0 - recvWindowNextSN) < 0 && p->GetFlag<IS_FULFILLED>(); seq0++)
+	{
+		iHead++;
+		if (iHead - recvBufferBlockN >= 0)
+		{
+			iHead = 0;
+			p = HeadRecv();
+		}
+		else
+		{
+			p++;
+		}
+	}
+	//
+	if (int(seq0 - recvWindowNextSN) < 0)
+	{
+		BREAK_ON_DEBUG();
+		return false;
+	}
+#endif
+	return true;
 }
 
 
@@ -884,6 +980,7 @@ bool ControlBlock::HasBeenCommitted() const
 //	1 if there existed a sent packet at the tail which has ready marked EOT 
 //	2 if there existed an unsent packet at the tail and it is marked EOT
 //  -1 if there existed a sent packet at the tail which could not be marked EOT
+// See also @LLS::EmitQ()
 int ControlBlock::MarkSendQueueEOT()
 {
 	if(CountSendBuffered() <= 0)
@@ -897,6 +994,7 @@ int ControlBlock::MarkSendQueueEOT()
 		return p->GetFlag<END_OF_TRANSACTION>() ? 1 : -1;
 
 	p->SetFlag<END_OF_TRANSACTION>();
+	p->SetFlag<IS_COMPLETED>();
 	return 2;
 }
 
@@ -909,20 +1007,18 @@ int ControlBlock::MarkSendQueueEOT()
 //	Whether the given sequence number is legitimate
 // Remark
 //	If the given sequence number is legitimate, send window size of the near end is adjusted
-//	See also SlideSendWindow()
+//	advertisement of an out-of order packet about the receive window size is simply ignored
 bool LOCALAPI ControlBlock::ResizeSendWindow(seq_t seq1, unsigned int adRecvWin)
 {
-	// advertisement of an out-of order packet about the receive window size is simply ignored
+	int32_t d = int(seq1 - sendWindowFirstSN);
+	if (d < 0 || d > CountSentInFlight() || (uint64_t)CountSentInFlight() + adRecvWin >= INT32_MAX)
+		return false;	// you cannot acknowledge a packet not sent yet
+	
 	if(int32_t(seq1 - welcomedNextSNtoSend) <= 0)
 		return true;
+
+	sendWindowLimitSN = seq1 + adRecvWin;
 	welcomedNextSNtoSend = seq1;
-
-	assert((uint64_t)CountSentInFlight() + adRecvWin < INT32_MAX);
-	int32_t d = int(seq1 - sendWindowFirstSN);
-	if(d > CountSentInFlight())
-		return false;	// you cannot acknowledge a packet not sent yet
-
-	SetSendWindowSize(int32_t(d + adRecvWin));
 	return true;
 }
 

@@ -554,54 +554,6 @@ void UnitTestSocketRTLB()
 
 
 
-void UnitTestReceiveQueue()
-{
-	CLowerInterfaceDbg *pLowerSrv = (CLowerInterfaceDbg *)CLowerInterface::Singleton();
-	try
-	{
-		if(pLowerSrv == NULL)
-			pLowerSrv = new CLowerInterfaceDbg();
-	}
-	catch(HRESULT x)
-	{
-		sprintf_s(linebuf, sizeof(linebuf), "Exception number 0x%X, cannot access lower interface, aborted.\n", x); 
-		Logger::WriteMessage(linebuf);
-
-		DbgRaiseAssertionFailure();
-	}
-	CLowerInterfaceDbg & lowerSrv = *pLowerSrv;
-	CSocketItemExDbg socket(2, 2);
-
-	PktBufferBlock *p0 = lowerSrv.GetBuffer();
-	PktBufferBlock *p = p0;
-	for(int i = 0; i < MAX_BUFFER_BLOCKS; i++)
-	{
-		Assert::IsTrue(p != NULL);
-		p = lowerSrv.GetBuffer();
-	}
-	Assert::IsTrue(p == NULL);
-	//
-	memset(& socket, 0, sizeof(CSocketItemExDbg));
-
-	socket.PushPacketBuffer(p0);
-
-	// Peek...return the header packet descriptor itself
-	FSP_NormalPacketHeader *hdr = socket.PeekLockPacketBuffer();
-	Assert::IsNotNull(hdr);
-	socket.PopUnlockPacketBuffer();
-
-	// So, p0 has been freed
-	p = p0;
-	for(int i = 0; i < MAX_BUFFER_BLOCKS - 1; i++)
-	{
-		Assert::IsTrue(p == lowerSrv.CurrentHead());	// what? needs it been asserted?
-		p++;
-		lowerSrv.FreeBuffer(p);
-	}
-}
-
-
-
 void UnitTestConnectQueue()
 {
 	static ConnectRequestQueue commandRequests;
@@ -834,11 +786,6 @@ namespace UnitTestFSP
 			UnitTestConnectQueue();
 		}
 
-
-		TEST_METHOD(TestReceiveQueue)
-		{
-			UnitTestReceiveQueue();
-		}
 
 #if 0
 		TEST_METHOD(DerivedClass)

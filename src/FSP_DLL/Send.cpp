@@ -343,8 +343,13 @@ void CSocketItemDl::ProcessPendingSend()
 		SetMutexFree();
 		//
 		// If ULA hinted that sending was not finished yet, continue to use the saved pointer of the callback function
-		if (m < pendingSendSize || fp2 != NULL && fp2(this, p, m) == 0)
+		bool r = (fp2 != NULL && fp2(this, p, m) >= 0);
+		if (m < pendingSendSize || r)
+		{
 			TestSetSendReturn(fp2);
+			if(HasFreeSendBuffer())	// In case of round-robin
+				SelfNotify(FSP_NotifyBufferReady);
+		}
 		//
 		return;
 	}

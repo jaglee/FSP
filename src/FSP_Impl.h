@@ -123,9 +123,11 @@ void TraceLastError(char * fileName, int lineNo, char *funcName, char *s1);
 #ifdef _DEBUG
 # define SCAVENGE_THRESHOLD_ms		180000	// 3 minutes
 # define LAZY_ACK_DELAY_MIN_ms		100		// 100 millisecond, minimum delay for lazy acknowledgement
+# define BREAK_ON_DEBUG()			DebugBreak()
 #else
 # define SCAVENGE_THRESHOLD_ms		1800000	// 30 minutes
 # define LAZY_ACK_DELAY_MIN_ms		1		// 1 millisecond, minimum delay for lazy acknowledgement
+# define BREAK_ON_DEBUG()
 #endif
 
 
@@ -158,6 +160,9 @@ void TraceLastError(char * fileName, int lineNo, char *funcName, char *s1);
 #define FSP_BACKLOG_SIZE	4	// shall be some power of 2
 #define FSP_MAX_NUM_NOTICE	15	// should be a reasonable value, shall be some multiple of 8 minus 1
 #define	MIN_RESERVED_BUF	(MAX_BLOCK_SIZE * 2)
+#ifndef MAX_BUFFER_BLOCKS
+# define	MAX_BUFFER_BLOCKS	0x20000	// maximum buffer size is implementation specific. here about 128MB for FSP over IPv6
+#endif
 
 
 
@@ -613,7 +618,7 @@ struct ControlBlock
 	seq_t		sendBufferNextSN;
 	int32_t		sendBufferNextPos;	// the index number of the block with sendBufferNextSN
 	//
-	int32_t		sendWindowSize;		// width of the send window in blocks
+	int32_t		sendWindowLimitSN;	// the right edge of the send window
 	int32_t		sendBufferBlockN;	// capacity of the send buffer in blocks
 
 	// (head position, receive window first sn) (next position, receive buffer maximum sn)
@@ -708,8 +713,8 @@ struct ControlBlock
 	// See ControlBlock::Init()
 
 	//
-	int CountSendBuffered() const { return int(sendBufferNextSN - sendWindowFirstSN); }
-	int CountSentInFlight() const { return int(sendWindowNextSN - sendWindowFirstSN); }
+	int32_t CountSendBuffered() const { return int32_t(sendBufferNextSN - sendWindowFirstSN); }
+	int32_t CountSentInFlight() const { return int32_t(sendWindowNextSN - sendWindowFirstSN); }
 #if defined(TRACE) && !defined(NDEBUG)
 	int DumpSendRecvWindowInfo() const;
 #else
@@ -748,9 +753,10 @@ struct ControlBlock
 	void RoundSendBufferNextPos() { int32_t m = sendBufferNextPos - sendBufferBlockN; if(m >= 0) sendBufferNextPos = m; }
 	void RoundSendWindowNextPos() { int32_t m = sendWindowNextPos - sendBufferBlockN; if(m >= 0) sendWindowNextPos = m; }
 
-	int32_t CountReceived() const { return int32_t(recvWindowNextSN - recvWindowFirstSN); }
+	int32_t CountReceived() const { return int32_t(recvWindowNextSN - recvWindowFirstSN); }	// gaps included, however
 
-	void LOCALAPI SetSequenceFlags(FSP_NormalPacketHeader *);
+	void LOCALAPI SetSequenceFlags(FSP_NormalPacketHeader *, ControlBlock::seq_t);
+	void LOCALAPI SetSequenceFlags(FSP_NormalPacketHeader *pHdr) { SetSequenceFlags(pHdr, sendWindowNextSN); }
 
 	void * LOCALAPI InquireSendBuf(int &);
 
@@ -773,6 +779,8 @@ struct ControlBlock
 	// Return
 	//	Start address of the received message
 	void * LOCALAPI InquireRecvBuf(int &, bool &);
+	//
+	int	LOCALAPI MarkReceivedFree(int);
 
 	void SetRecvWindow(seq_t pktSeqNo)
 	{
@@ -783,9 +791,8 @@ struct ControlBlock
 	{
 		welcomedNextSNtoSend = sendBufferNextSN = sendWindowNextSN = sendWindowFirstSN = initialSN;
 		sendBufferNextPos = sendWindowNextPos = sendWindowHeadPos = 0;
-		sendWindowSize = 1;
+		sendWindowLimitSN = initialSN + 1;	// for the protocol to work it should allow at least one packet in flight
 	}
-	void SetSendWindowSize(int32_t sz1) { sendWindowSize = min(sendBufferBlockN, sz1); }
 
 	// Whether both the End of Transaction flag is received and there is no receiving gap left
 	bool HasBeenCommitted() const;
@@ -794,6 +801,16 @@ struct ControlBlock
 	void SlideSendWindow();
 	// Slide the send window to skip the head slot, supposing that it has been acknowledged
 	void SlideSendWindowByOne();
+	// Set the right edge of the send window after the very first packet of the queue is sent
+	void SetFirstSendWindowRightEdge()
+	{
+		seq_t k = sendWindowFirstSN;
+		if(_InterlockedCompareExchange((LONG *) & sendWindowNextSN, k + 1, k) == k)
+		{
+			++sendWindowNextPos;
+			RoundSendWindowNextPos();
+		}
+	}
 
 	// return new value of sendWindowNextSN
 	seq_t SlideNextToSend()
@@ -806,15 +823,14 @@ struct ControlBlock
 	bool LOCALAPI ResizeSendWindow(seq_t, unsigned int);
 
 	// Width of the advertisable receive window (i.e. free receive buffers to advertize), in blocks
-	int32_t RecvWindowSize() const
+	int32_t AdRecvWS(seq_t expectedSN) const
 	{
-		int32_t d = CountReceived();
-		return (d < 0 ? 0 : recvBufferBlockN - d);
+		return int32_t(recvWindowFirstSN + recvBufferBlockN - expectedSN);
 	}
 
 	bool HasBacklog() const { return backLog.count > 0; }
 
-	int LOCALAPI	Init(int32_t, int32_t);
+	int LOCALAPI	Init(int32_t &, int32_t &);
 	int	LOCALAPI	Init(uint16_t);
 };
 

@@ -250,8 +250,8 @@ void CSocketItemEx::InstallSessionKey(const CommandInstallKey & cmd)
 //	ALFID_T idResponder				The responder's original ALFID (the parent ALFID)
 // Set the session key for the packet next sent and the next received. KDF counter mode
 // As the NIST SP800-108 recommended, K(i) = PRF(K, [i] || Label || 0x00 || Context || L)
-// Label  ¨C A string that identifies the purpose for the derived keying material, here we set to "FSP connection multiplication"
-// Context - idParent, idRemoteHost 
+// Label  ¨C A string that identifies the purpose for the derived keying material, here we set to "Multiply an FSP connection"
+// Context - idInitiator, idResponder
 // Length -  An integer specifying the length (in bits) of the derived keying material K-output
 // Assume other fields of contextOfICC have been filled properly, especially contextOfICC.prev = contextOfICC.curr
 void LOCALAPI CSocketItemEx::DeriveNextKey(ControlBlock::seq_t sn1, ControlBlock::seq_t ackSN, ALFID_T idInitiator, ALFID_T idResponder)
@@ -529,7 +529,7 @@ bool CSocketItemEx::EmitStart()
 	void  *payload = (FSP_NormalPacketHeader *)this->GetSendPtr(skb);
 	if(payload == NULL)
 	{
-		DebugBreak();	//TRACE_HERE("TODO: debug log memory corruption error");
+		BREAK_ON_DEBUG();	//TRACE_HERE("TODO: debug log memory corruption error");
 		HandleMemoryCorruption();
 		return false;
 	}
@@ -551,18 +551,20 @@ bool CSocketItemEx::EmitStart()
 		result = SendPacket(2, ScatteredSendBuffers(pHdr, sizeof(FSP_NormalPacketHeader), payload, skb->len));
 		break;
 	case PERSIST:	// PERSIST is an in-band control packet with optional payload that confirms a connection
-	case MULTIPLY:
 		result = EmitWithICC(skb, pControlBlock->sendWindowFirstSN);
 		skb->SetFlag<IS_SENT>();
 		break;
 	// Only possible for retransmission
+	case MULTIPLY:	// The MULTIPLY command head is stored in the queue while the encrypted payload is buffered in cipherText
+		result = SendPacket(2, ScatteredSendBuffers(payload, sizeof(FSP_NormalPacketHeader), this->cipherText, skb->len));
+		break;
 	case INIT_CONNECT:
 	case CONNECT_REQUEST:
 		// Header has been included in the payload. See also InitiateConnect() and AffirmConnect()
 		result = SendPacket(1, ScatteredSendBuffers(payload, skb->len));
 		break;
 	default:
-		DebugBreak();
+		BREAK_ON_DEBUG();
 		result = 0;	// unrecognized packet type is simply ignored?!
 	}
 #if defined(TRACE) && (TRACE & TRACE_PACKET)
@@ -576,15 +578,28 @@ bool CSocketItemEx::EmitStart()
 
 // Do
 //	Transmit a packet to the remote end, enforcing secure mobility support
+// Return
+//	Number of octets sent, 0 if nothing sent successfully
+//	Negative if failed otherwise
 // Remark
 //  The IP address of the near end may change dynamically
 int CSocketItemEx::EmitWithICC(ControlBlock::PFSP_SocketBuf skb, ControlBlock::seq_t seq)
 {
+#if (TRACE & TRACE_HEARTBEAT)  || defined(EMULATE_LOSS)
+	UINT vRand;
+	rand_s(& vRand);
+	if (vRand > (UINT_MAX >> 2) + (UINT_MAX >> 1))
+	{
+		printf_s("\nError seed to debug retransmission:\n"
+			"\tA packet %s (%d) is discarded deliberately\n", opCodeStrings[skb->opCode], skb->opCode);
+		return -ECANCELED;	// emulate 33.33% loss rate
+	}
+#endif
 #ifdef _DEBUG
 	if(skb->opCode == INIT_CONNECT || skb->opCode == ACK_INIT_CONNECT || skb->opCode == CONNECT_REQUEST || skb->opCode == ACK_CONNECT_REQ)
 	{
 		printf_s("Assertion failed! %s (opcode: %d) has no ICC field\n", opCodeStrings[skb->opCode], skb->opCode);
-		return 0;
+		return -EDOM;
 	}
 #endif
 	if(contextOfICC.keyLife == 1)
@@ -592,7 +607,7 @@ int CSocketItemEx::EmitWithICC(ControlBlock::PFSP_SocketBuf skb, ControlBlock::s
 #ifdef TRACE
 		printf_s("\nSession#%u key run out of life\n", fidPair.source);
 #endif
-		return 0;
+		return -EACCES;
 	}
 
 	// UNRESOLVED! retransmission consume key life? of course?
@@ -602,25 +617,22 @@ int CSocketItemEx::EmitWithICC(ControlBlock::PFSP_SocketBuf skb, ControlBlock::s
 	void  *payload = (FSP_NormalPacketHeader *)this->GetSendPtr(skb);
 	if(payload == NULL)
 	{
-		DebugBreak();	//TRACE_HERE("TODO: debug log memory corruption error");
+		BREAK_ON_DEBUG();	//TRACE_HERE("TODO: debug log memory corruption error");
 		HandleMemoryCorruption();
-		return 0;
+		return -EFAULT;
 	}
 
 	register FSP_NormalPacketHeader *pHdr = & pControlBlock->tmpHeader;
 	// ICC, if required, is always set just before being sent
-	pHdr->expectedSN = htobe32(pControlBlock->recvWindowNextSN);
-	pHdr->sequenceNo = htobe32(seq);
-	pHdr->ClearFlags();	// pHdr->u.flags = 0;
+	pControlBlock->SetSequenceFlags(pHdr, seq);
 	if (skb->GetFlag<END_OF_TRANSACTION>())
 		pHdr->SetFlag<EndOfTransaction>();
-	// here we needn't check memory corruption as mishavior only harms himself
-	pHdr->SetRecvWS(pControlBlock->RecvWindowSize());
 	pHdr->hs.Set(skb->opCode, sizeof(FSP_NormalPacketHeader));
 
+	// here we needn't check memory corruption as mishavior only harms himself
 	void * paidLoad = SetIntegrityCheckCode(pHdr, (BYTE *)payload, skb->len);
 	if(paidLoad == NULL)
-		return 0;
+		return -EPERM;
 	//
 	if (skb->len > 0)
 		return SendPacket(2, ScatteredSendBuffers(pHdr, sizeof(FSP_NormalPacketHeader), paidLoad, skb->len));
@@ -688,24 +700,26 @@ bool CSocketItemEx::HandlePeerSubnets(PFSP_HeaderSignature optHdr)
 
 // Emit packet in the send queue, by default transmission of new packets takes precedence
 // To make life easier assume it has gain unique access to the LLS socket
-// See also HandleEmitQ, HandleFullICC
+// for the protocol to work it should allow at least one packet in flight
 // TODO: rate-control/quota control
 void CSocketItemEx::EmitQ()
 {
-	ControlBlock::seq_t lastSN = _InterlockedOr((LONG *) & pControlBlock->sendBufferNextSN, 0);
-	ControlBlock::seq_t firstSN = pControlBlock->sendWindowFirstSN;
+	const ControlBlock::seq_t sendBufferNextSN = _InterlockedOr((LONG *) & pControlBlock->sendBufferNextSN, 0);
+	const ControlBlock::seq_t lastSN
+		= int(pControlBlock->sendWindowLimitSN - pControlBlock->sendWindowFirstSN) <= 0
+		? pControlBlock->sendWindowFirstSN + 1
+		: pControlBlock->sendWindowLimitSN;
 	ControlBlock::seq_t & nextSN = pControlBlock->sendWindowNextSN;
-	int32_t winSize = _InterlockedOr((LONG *) & pControlBlock->sendWindowSize, 0);
 	//
 	bool shouldRetry = pControlBlock->CountSendBuffered() > 0;
 	register ControlBlock::PFSP_SocketBuf skb;
-	while (int(nextSN - lastSN) < 0 && int(nextSN - firstSN) <= winSize)
+	while (int(nextSN - sendBufferNextSN) < 0 && int(nextSN - lastSN) < 0)
 	{
 		skb = pControlBlock->HeadSend() + pControlBlock->sendWindowNextPos;
 		if (!skb->GetFlag<IS_COMPLETED>())
 		{
 #if defined(TRACE) && (TRACE & TRACE_PACKET)
-			printf_s("Not ready to send packet SN#%u; next to buffer SN#%u\n", nextSN, lastSN);
+			printf_s("Not ready to send packet SN#%u; next to buffer SN#%u\n", nextSN, sendBufferNextSN);
 #endif 
 			break;
 		}

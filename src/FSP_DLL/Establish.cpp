@@ -66,7 +66,7 @@ FSPHANDLE FSPAPI ListenAt(const PFSP_IN6_ADDR listenOn, PFSP_Context psp1)
 	{
 		REPORT_ERRMSG_ON_TRACE("Cannot set time-out clock for listen");
 		socketsTLB.FreeItem(socketItem);
-		socketItem->Reinitialize();
+		socketItem->Disable();
 		return NULL;
 	}
 
@@ -117,7 +117,7 @@ FSPHANDLE FSPAPI Connect2(const char *peerName, PFSP_Context psp1)
 	{
 		REPORT_ERRMSG_ON_TRACE("Cannot set time-out clock for connect");
 		socketsTLB.FreeItem(socketItem);
-		socketItem->Reinitialize();
+		socketItem->Disable();
 		return NULL;
 	}
 

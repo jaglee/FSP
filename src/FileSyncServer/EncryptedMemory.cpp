@@ -7,7 +7,7 @@ static unsigned char bufPeerPublicKey[CRYPTO_NACL_KEYBYTES];
 
 static char		*fileName = "$memory.^";
 static uint8_t	*bytesToSend;
-static size_t	sizeOfBuffer = TEST_MEM_SIZE;
+size_t			sizeOfBuffer = TEST_MEM_SIZE;
 
 
 void SendMemoryPatternEncyrpted()
@@ -107,18 +107,18 @@ static int FSPAPI toSendNextBlock(FSPHANDLE h, void * batchBuffer, int32_t capac
 
 	int bytesRead = __min(sizeOfBuffer - offset, (size_t)capacity);
 	memcpy(batchBuffer, bytesToSend + offset, bytesRead);
-	printf_s("To send %d bytes to the remote end, %d bytes have been sent\n", bytesRead, offset);
+	printf_s("To send %d bytes to the remote end. %d bytes have been sent before.\n", bytesRead, offset);
 
 	offset += bytesRead;
 
 	// Would wait until acknowledgement is received. Shutdown is called in onResponseReceived
 	bool r = (offset >= (int)sizeOfBuffer);
-	int err = SendInline(h, batchBuffer, bytesRead, (int8_t)r);
+	int n = SendInline(h, batchBuffer, bytesRead, (int8_t)r);
 	if(r)
 	{
 		printf("All content has been sent. To wait acknowledgement and shutdown.\n");
 		return EOF;
 	}
 
-	return err;	// == 0 meaning no error and continue to process next block
+	return n;	// non negative meaning no error and continue to process next block
 }

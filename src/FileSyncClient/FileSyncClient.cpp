@@ -16,14 +16,13 @@ static unsigned char bufPublicKey[CRYPTO_NACL_KEYBYTES];
 static HANDLE hFile;
 static char fileName[MAX_PATH];
 static bool finished;
-extern int32_t count2Finish;	// the reverse socket, count to finish
+extern int32_t ticksToWait;	// the reverse socket, count to finish
 
 
 static void FSPAPI onError(FSPHANDLE h, FSP_ServiceCode code, int value)
 {
 	printf_s("Notify: socket %p, service code = %d, return %d\n", h, code, value);
 	finished = true;
-	count2Finish = 0;
 	return;
 }
 
@@ -33,7 +32,6 @@ static void FSPAPI onError2(FSPHANDLE h, FSP_ServiceCode code, int value)
 {
 	printf_s("Notify2: socket %p, service code = %d, return %d\n", h, code, value);
 	finished = true;
-	count2Finish = 0;
 	return;
 }
 
@@ -105,7 +103,7 @@ int main(int argc, char *argv[])
 		goto l_bailout;
 	}
 
-	while(count2Finish-- > 0 || !finished)
+	while(ticksToWait-- > 0 && !finished)
 		Sleep(50);	// yield CPU out for about 1/20 second
 
 	if(hFile != NULL && hFile != INVALID_HANDLE_VALUE)

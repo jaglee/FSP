@@ -1,6 +1,6 @@
 #include "stdafx.h"
 
-int32_t count2Finish = 2000;	// by default there is no reverse socket and wait for about 100 seconds to wait one. see also main()
+int32_t ticksToWait = 6000;	// by default there is no reverse socket and wait for about 300 seconds to wait one. see also main()
 
 static void FSPAPI onShutdown(FSPHANDLE hRev, FSP_ServiceCode code, int value)
 {
@@ -8,7 +8,6 @@ static void FSPAPI onShutdown(FSPHANDLE hRev, FSP_ServiceCode code, int value)
 	if(code != FSP_NotifyRecycled)
 		printf_s("Should got ON_RECYCLED, but service code = %d, return %d\n", code, value);
 
-	count2Finish = 0;
 	return;
 }
 
@@ -26,7 +25,7 @@ static int FSPAPI  onSignatureReceived(FSPHANDLE hRev, void * buf, int32_t lengt
 // This function is for tracing purpose
 int	FSPAPI onMultiplying(FSPHANDLE hRev, PFSP_SINKINF p, PFSP_IN6_ADDR remoteAddr)
 {
-	count2Finish = INT32_MAX;	// wait shutdown almost forever
+	ticksToWait = INT32_MAX;	// wait shutdown almost forever
 	//
 	printf_s("\nTo accept multiplied handle of FSP session: %p\n", hRev);
 	printf_s("Interface#%d, fiber#%u\n", p->ipi6_ifindex, p->idALF);

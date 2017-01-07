@@ -81,11 +81,13 @@ struct CtrlMsgHdr
 
 
 
-// local header, does not send out
+// Applier should make sure together with the optional header it would be fit in one IPv6 or UDP packet
 struct FSP_PreparedKEEP_ALIVE
 {
-	FSP_SelectiveNACK::GapDescriptor gaps[(MAX_BLOCK_SIZE - sizeof(FSP_SelectiveNACK)) / sizeof(FSP_SelectiveNACK::GapDescriptor)];
+	FSP_SelectiveNACK::GapDescriptor gaps
+		[(MAX_BLOCK_SIZE - sizeof(FSP_SelectiveNACK)) / sizeof(FSP_SelectiveNACK::GapDescriptor)];
 	FSP_SelectiveNACK sentinel;
+	//
 	uint32_t		n;	// n >= 0, number of (gapWidth, dataLength) tuples
 	uint32_t		GetSaltValue() const { return gaps[n].gapWidth; }	// it overlays on serialNo
 };
@@ -124,7 +126,6 @@ inline uint64_t ntohll(uint64_t h)
 #define MAX_CONNECTION_NUM	16	// 256	// must be some power value of 2
 #define MAX_LISTENER_NUM	4
 #define MAX_RETRANSMISSION	8
-#define	MAX_BUFFER_BLOCKS	64	// 65~66KiB, 64bit CPU consumes more // Implementation shall override this
 
 
 
@@ -190,20 +191,13 @@ public:
 
 #include <pshpack1.h>
 
-// we prefer productivity over 'cleverness': read buffer block itself is of fixed size
-struct PktSignature
+
+
+struct PktBufferBlock
 {
-	ALIGN(8)
-	struct PktBufferBlock *next;
-	ALIGN(8)
+	ALIGN(MAC_ALIGNMENT)
 	int32_t	lenData;
 	ControlBlock::seq_t	pktSeqNo;	// in host byte-order
-};
-
-
-
-struct PktBufferBlock: PktSignature
-{
 	PairALFID	idPair;
 	FSP_NormalPacketHeader hdr;
 	BYTE	payload[MAX_BLOCK_SIZE];
@@ -264,8 +258,6 @@ class CSocketItemEx: public CSocketItem
 	friend class CLowerInterface;
 	friend class CSocketSrvTLB;
 
-	// any packet with full-weight integrity-check-code except aforementioned
-	friend DWORD WINAPI HandleFullICC(LPVOID);
 	friend void Multiply(CommandCloneSessionSrv &);
 
 	HANDLE	hSrcMemory;
@@ -274,12 +266,9 @@ class CSocketItemEx: public CSocketItem
 	void Destroy();	// override that of the base class
 	bool IsPassive() const { return lowState == LISTENING; }
 	void SetPassive() { lowState = LISTENING; }
-	void SetCallable() { pControlBlock->notices.SetHead(NullCommand); }	// clear the 'NOT-returned' notice
 	//
 protected:
-	PktBufferBlock * volatile headPacket;
-	PktBufferBlock * volatile tailPacket;
-
+	PktBufferBlock * headPacket;	// But UNRESOLVED! There used to be an independent packet queue for each SCB for sake of fairness
 	ICC_Context	contextOfICC;
 	ALIGN(MAC_ALIGNMENT)
 	uint8_t	cipherText[MAX_BLOCK_SIZE];
@@ -306,8 +295,8 @@ protected:
 	CSocketItemEx * next;
 	CSocketItemEx * prevSame;
 
-	uint32_t	tRoundTrip_us;	// round trip time evaluated in microseconds
-	uint32_t	tKeepAlive_ms;	// keep-alive time-out limit in milliseconds
+	uint32_t	tRoundTrip_us;	// round trip time evaluated in microsecond
+	uint32_t	tKeepAlive_ms;	// keep-alive time-out limit in millisecond
 	HANDLE		timer;			// the repeating timer
 	HANDLE		resendTimer;	// retransmission timer
 	HANDLE		lazyAckTimer;	// an one-shot timer, typically for sending snack lazily
@@ -320,7 +309,6 @@ protected:
 	uint32_t	lastOOBSN;	// host byte order, the serial number of peer's last out-of-band packet
 
 	int8_t		lazyAckTimeoutRetryCount;
-	int8_t		resendTimeoutRetryCount;
 	//
 	bool AddLazyAckTimer();
 	bool AddResendTimer(uint32_t);
@@ -362,25 +350,11 @@ protected:
 	}
 	bool HandlePeerSubnets(PFSP_HeaderSignature);
 
-	PktBufferBlock *PushPacketBuffer(PktBufferBlock *);
-	FSP_NormalPacketHeader *PeekLockPacketBuffer();
-	void PopUnlockPacketBuffer();
-
 	// return -EEXIST if overriden, -EFAULT if memory error, or payload effectively placed
 	int	PlacePayload();
 
 	int	 SendPacket(register ULONG, ScatteredSendBuffers);
 	bool EmitStart();
-	void EmitStartAndSlide()
-	{
-		ControlBlock::seq_t k = pControlBlock->sendWindowFirstSN;
-		if(EmitStart() 
-		&& _InterlockedCompareExchange((LONG *) & pControlBlock->sendWindowNextSN, k + 1, k) == k)
-		{
-			++pControlBlock->sendWindowNextPos;
-			pControlBlock->RoundSendWindowNextPos();
-		}
-	}
 	bool SendAckFlush();
 	bool SendKeepAlive();
 	int	 EmitWithICC(ControlBlock::PFSP_SocketBuf, ControlBlock::seq_t);
@@ -399,11 +373,7 @@ public:
 	void InitAssociation();
 
 	bool WaitUseMutex();
-#ifdef NDEBUG
-	void SetMutexFree() { _InterlockedExchange8(& locked, 0); }
-#else
 	void SetMutexFree();
-#endif
 	bool IsInUse() { return (_InterlockedOr8(& inUse, 0) != 0); }
 	void SetInUse() { _InterlockedExchange8(& inUse, 1); }
 
@@ -528,6 +498,8 @@ public:
 	void OnGetRelease();	// RELEASE may not carry payload
 	void OnGetMultiply();	// MULTIPLY is in-band at the initiative side, out-of-band at the passive side
 	void OnGetKeepAlive();	// KEEP_ALIVE is always out-of-band
+
+	void HandleFullICC(PktBufferBlock *);
 };
 
 #include <poppack.h>
@@ -596,36 +568,8 @@ public:
 
 
 
-// Dual stack support: FSP over UDP/IPv4 and FSP over IPv6 require buffer block of different size
-struct CPacketBuffers
-{
-	ALIGN(8) PktBufferBlock bufferMemory[MAX_BUFFER_BLOCKS];
-	PktBufferBlock *freeBufferHead;
-
-	PktBufferBlock	*GetBuffer()
-	{
-		register PktBufferBlock *p = freeBufferHead;
-		if(p == NULL)
-			return NULL;
-		//
-		freeBufferHead = p->next;
-		return p;
-	}
-
-	void	FreeBuffer(PktBufferBlock *p)
-	{
-		p->next = freeBufferHead;
-		freeBufferHead = p;
-	}
-
-	// OS-dependent
-	CPacketBuffers();
-};
-
-
-
 // A singleton
-class CLowerInterface: public CSocketSrvTLB, protected CPacketBuffers
+class CLowerInterface: public CSocketSrvTLB
 {
 private:
 	friend class CSocketItemEx;
@@ -655,8 +599,8 @@ private:
 #endif
 
 	// intermediate buffer to hold the fixed packet header, the optional header and the data
+	PktBufferBlock	pktBuf[1];
 	DWORD	countRecv;
-	PktBufferBlock *pktBuf;
 
 	// storage location part of the particular receipt of a remote packet, respectively
 	// remote-end address and near-end address
@@ -741,7 +685,6 @@ public:
 // OS-specific thread-pool related, for Windows LPTHREAD_START_ROUTINE function
 DWORD WINAPI HandleConnect(LPVOID);
 DWORD WINAPI HandleSendQ(LPVOID);
-DWORD WINAPI HandleFullICC(LPVOID);
 
 // defined in socket.cpp
 void LOCALAPI DumpHexical(const void *, int);

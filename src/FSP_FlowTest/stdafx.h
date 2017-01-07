@@ -32,5 +32,6 @@ void UnitTestTweetNacl();
 
 void FlowTestAcknowledge();
 void FlowTestRetransmission();
+void FlowTestRecvWinRoundRobin();
 
 void TrySRP6();
