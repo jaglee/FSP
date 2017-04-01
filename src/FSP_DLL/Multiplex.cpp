@@ -1,7 +1,6 @@
 /*
  * DLL to service FSP upper layer application
- * Session control functions: Multiplication/Commitment/Resumption
- * Milk-transport is only implented on multiplicated secondary connection
+ * Multiplication of Connection
  *
     Copyright (c) 2012, Jason Gao
     All rights reserved.
@@ -36,16 +35,16 @@
 //	FSPHANDLE		the handle of the parent FSP socket to be multiplied
 //	PFSP_Context	the pointer to the parameter structure of the socket to create by multiplication
 //	int8_t	
-//		0:		do not terminate the transmit transaction
-//		EOF:	terminate the transaction
-//	NotifyOrReturn	the callback function pointer
+//		0:			do not terminate the transmit transaction
+//		EOF:		or other non-zero value: terminate the transaction
+//	NotifyOrReturn	the pointer to the callback function
 // Return
 //	the handle of the new created socket
 //	or NULL if there is some immediate error, more information may be got from the flags set in the context parameter
 // Remark
 //	The payload piggybacked should be specified by the 'welcome' message, where might be of zero length
 //	Even the function return no immediate error, the callback function may be called with a NULL FSPHANDLE
-//	which indicate some error has happened. In that case ULA might make further investigation by calling GetLastFSPError()
+//	which indicate some error has happened.
 //	See also SendStream, FinalizeSend
 DllExport
 FSPHANDLE FSPAPI MultiplyAndWrite(FSPHANDLE hFSP, PFSP_Context psp1, int8_t flag, NotifyOrReturn fp1)
@@ -99,7 +98,7 @@ FSPHANDLE FSPAPI MultiplyAndGetSendBuffer(FSPHANDLE hFSP, PFSP_Context psp1, int
 		void *buf = p->pControlBlock->InquireSendBuf(*pSize);
 		if(buf == NULL)
 		{
-			socketsTLB.FreeItem(p);
+			CSocketItemDl::FreeItem(p);
 			return NULL;
 		}
 		//
@@ -115,7 +114,7 @@ FSPHANDLE FSPAPI MultiplyAndGetSendBuffer(FSPHANDLE hFSP, PFSP_Context psp1, int
 // Given
 //	CSocketItemDl *		The parent socket item
 //	PFSP_Context		The context of the new child connection
-//	CommandCloneConnect [out] The connection multiplication command structure
+//	CommandCloneConnect & [_Out_] The connection multiplication command structure
 // Return
 //	The new socket item
 // Remark
@@ -124,16 +123,16 @@ CSocketItemDl * LOCALAPI CSocketItemDl::ToPrepareMultiply(CSocketItemDl *p, PFSP
 {
 	if(p == NULL)
 	{
-		psp1->u.flags = EBADF;
+		psp1->flags = -EBADF;
 		return NULL;
 	}
 
 	IN6_ADDR addrAny = IN6ADDR_ANY_INIT;
-	psp1->u.st.passive = 0;	// override what is provided by ULA
+	psp1->passive = 0;	// override what is provided by ULA
 	CSocketItemDl * socketItem = CSocketItemDl::CreateControlBlock((PFSP_IN6_ADDR) & addrAny, psp1, objCommand);
 	if(socketItem == NULL)
 	{
-		psp1->u.flags = EBADF;	// E_HANDLE;
+		psp1->flags = -EBADF;	// -E_HANDLE?
 		return NULL;
 	}
 
@@ -160,8 +159,9 @@ CSocketItemDl * LOCALAPI CSocketItemDl::ToPrepareMultiply(CSocketItemDl *p, PFSP
 }
 
 
+
 // Given
-//	CommandCloneConnect &		The command context whose shared memory and event handlers have been prepared
+//	CommandCloneConnect & [_InOut_]	The command context whose shared memory and event handlers have been prepared
 // Do
 //	Fill in the MULTPLY packet, construct and pass command to LLS
 FSPHANDLE CSocketItemDl::CompleteMultiply(CommandCloneConnect & cmd)
@@ -174,7 +174,7 @@ FSPHANDLE CSocketItemDl::CompleteMultiply(CommandCloneConnect & cmd)
 	}
 	// See also InitCommand, CallCreate
 	cmd.fiberID = pControlBlock->idParent;
-	cmd.idProcess = ::idThisProcess;
+	cmd.idProcess = idThisProcess;
 	cmd.hMemoryMap = hMemoryMap;
 	cmd.dwMemorySize = dwMemorySize;
 	//
@@ -191,14 +191,13 @@ FSPHANDLE CSocketItemDl::CompleteMultiply(CommandCloneConnect & cmd)
 
 
 
-//{ACTIVE, COMMITTING, PEER_COMMIT, COMMITTING2, COMMITTED, CLOSABLE}
+//{ESTABLISHED, COMMITTING, PEER_COMMIT, COMMITTING2, COMMITTED, CLOSABLE}
 //	|-->/MULTIPLY/-->[API{Callback}]
-//	|-->[{Return Accept}]-->{new context}ACTIVE/COMMITTING
-//		-->[Send PERSIST]{start keep-alive}
-//	|-->[{Return}:Reject]-->[Send RESET] {abort creating new context}
-// UNRESOLVED!
-//	Multiply: but the upper layer application may still throttle it?
-//	..context.onAccepting CANNOT read or write anything!?
+//		|-->[{Return Accept}]-->{new context}ESTABLISHED/COMMITTING
+//			-->[Send PERSIST]{start keep-alive}
+//		|-->[{Return}:Reject]-->[Send RESET] {abort creating new context}
+// Remark
+//	To make life easy the call back function ...context.onAccepting MAYNOT read or write anything
 bool LOCALAPI CSocketItemDl::ToWelcomeMultiply(BackLogItem & backLog)
 {
 	PFSP_IN6_ADDR remoteAddr = (PFSP_IN6_ADDR) & pControlBlock->peerAddr.ipFSP.allowedPrefixes[MAX_PHY_INTERFACES - 1];	

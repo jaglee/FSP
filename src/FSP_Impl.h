@@ -51,7 +51,7 @@
 // borrow intrinsic pragmas
 #include "gcm-aes.h"
 #define	MAC_ALIGNMENT	16
-#define COOKIE_KEY_LEN	16
+#define COOKIE_KEY_LEN	20	// salt include, as in RFC4543 5.4
 
 #if (_MSC_VER >= 1600)
 #pragma intrinsic(_InterlockedCompareExchange8, _InterlockedExchange8)
@@ -142,6 +142,9 @@ void TraceLastError(char * fileName, int lineNo, char *funcName, char *s1);
 #endif
 
 
+// Return the number of microseconds elapsed since Jan 1, 1970 (unix epoch time)
+extern "C" timestamp_t NowUTC();
+
 
 /**
  * Implemented system limit
@@ -218,13 +221,13 @@ struct $FSP_HeaderSignature: FSP_HeaderSignature
 {
 	template<typename THdr, FSPOperationCode opCode1> void Set()
 	{
-		version = THIS_FSP_VERSION;
+		major = THIS_FSP_VERSION;
 		opCode = opCode1;
 		hsp = htobe16(sizeof(THdr));
 	}
 	void Set(FSPOperationCode opCode1, int len1)
 	{
-		version = THIS_FSP_VERSION;
+		major = THIS_FSP_VERSION;
 		opCode = opCode1;
 		hsp = htobe16(len1);
 	}
@@ -459,7 +462,7 @@ struct FSP_PKTINFO_EX : FSP_SINKINF
 
 struct SConnectParam	// MUST be aligned on 64-bit words!
 {
-	// the first four fields are to be initiaized with random value
+	// the first 3 fields, together with initialSN, are to be initiaized with random value
 	uint64_t	initCheckCode;
 	uint64_t	cookie;
 	uint32_t	salt;
@@ -497,13 +500,23 @@ struct BackLogItem: SConnectParam
 
 
 
-class LLSNotice
+class CLightMutex
+{
+	volatile char		mutex;
+public:
+	bool WaitSetMutex();
+	void SetMutexFree() { _InterlockedExchange8(&mutex, 0); }
+};
+
+
+
+class LLSNotice: public CLightMutex
 {
 	friend struct ControlBlock;
+	// volatile char	mutex;	// in CLightMutex
 protected:
 	// 4: The (very short, roll-out) queue of returned notices
 	FSP_ServiceCode q[FSP_MAX_NUM_NOTICE];
-	volatile char	mutex;
 public:
 	void SetHead(FSP_ServiceCode c) { q[0] = c; }
 	FSP_ServiceCode GetHead() { return q[0]; }
@@ -515,11 +528,10 @@ public:
 
 
 
-class LLSBackLog
+class LLSBackLog: public CLightMutex
 {
 	friend struct ControlBlock;
 
-	volatile char		mutex;
 	ALIGN(8)
 	int32_t				capacity;
 	volatile int32_t	headQ;
@@ -529,13 +541,10 @@ class LLSBackLog
 	ALIGN(8)
 	BackLogItem			q[MIN_QUEUED_INTR];
 	//
-	void InitSize() { capacity = MIN_QUEUED_INTR; mutex = 0; }	// assume memory has been zeroized
+	void InitSize() { capacity = MIN_QUEUED_INTR; }	// assume memory has been zeroized
 	int	InitSize(int);
 
-	void WaitSetMutex() { while(_InterlockedCompareExchange8(& mutex, 1, 0)) Sleep(0); }
-	void SetMutexFree() { _InterlockedExchange8(& mutex, 0); }
 public:
-	void Clear() { count = 0; headQ = tailQ; mutex = 0; }
 	bool LOCALAPI Has(const BackLogItem *p);
 	BackLogItem * Peek() { return count <= 0 ? NULL : q  + headQ; }
 	int Pop();
@@ -619,7 +628,7 @@ struct ControlBlock
 	int32_t		sendBufferNextPos;	// the index number of the block with sendBufferNextSN
 	//
 	int32_t		sendWindowLimitSN;	// the right edge of the send window
-	int32_t		sendBufferBlockN;	// capacity of the send buffer in blocks
+	int32_t		sendCongestWindow;	// UNRESOLVED! Reserved yet.
 
 	// (head position, receive window first sn) (next position, receive buffer maximum sn)
 	// are managed independently for maximum parallism in DLL and LLS
@@ -632,7 +641,7 @@ struct ControlBlock
 	seq_t		welcomedNextSNtoSend;
 	seq_t		recvWindowExpectedSN;
 	//
-	int32_t		recvWindowSize;		// UNRESOLVED! Reserved yet. To be meaningful it could be less than recvBufferBlockN
+	int32_t		sendBufferBlockN;	// capacity of the send buffer in blocks
 	int32_t		recvBufferBlockN;	// capacity of the receive buffer
 
 	int32_t		sendBufDescriptors;	// relative to start of the control block, may be updated via memory map
@@ -756,7 +765,6 @@ struct ControlBlock
 	int32_t CountReceived() const { return int32_t(recvWindowNextSN - recvWindowFirstSN); }	// gaps included, however
 
 	void LOCALAPI SetSequenceFlags(FSP_NormalPacketHeader *, ControlBlock::seq_t);
-	void LOCALAPI SetSequenceFlags(FSP_NormalPacketHeader *pHdr) { SetSequenceFlags(pHdr, sendWindowNextSN); }
 
 	void * LOCALAPI InquireSendBuf(int &);
 
@@ -779,7 +787,10 @@ struct ControlBlock
 	// Return
 	//	Start address of the received message
 	void * LOCALAPI InquireRecvBuf(int &, bool &);
-	//
+	// Given
+	//	int :	the number of bytes peeked to be free
+	// Return
+	//	Number of blocks that were free
 	int	LOCALAPI MarkReceivedFree(int);
 
 	void SetRecvWindow(seq_t pktSeqNo)

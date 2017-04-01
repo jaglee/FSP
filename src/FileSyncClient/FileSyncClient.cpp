@@ -1,5 +1,7 @@
-// This is the main project file for VC++ application project 
-// generated using an Application Wizard.
+/**
+  Usage 1, passively accept a file transfered the FileSyncServer <FileSyncClient> 
+  Usage 2, check memory pattern of a file transfered and saved <FileSyncClient> $memory.^ 
+ **/
 
 #include "stdafx.h"
 
@@ -10,15 +12,28 @@
 #define REMOTE_APPLAYER_NAME "E000:AAAA::1"
 //#define REMOTE_APPLAYER_NAME "E000:BBBB::1"
 
+// the reverse socket, count to finish
+extern int32_t ticksToWait;
+
+// Branch controllers
+extern int	CompareMemoryPattern(char	*fileName);
+extern int	FSPAPI onMultiplying(FSPHANDLE, PFSP_SINKINF, PFSP_IN6_ADDR);
+
 static unsigned char bufPrivateKey[CRYPTO_NACL_KEYBYTES];
-static unsigned char bufPublicKey[CRYPTO_NACL_KEYBYTES];
 
 static HANDLE hFile;
 static char fileName[MAX_PATH];
 static bool finished;
-extern int32_t ticksToWait;	// the reverse socket, count to finish
+
+// Forward declarations
+static int	FSPAPI onConnected(FSPHANDLE, PFSP_Context);
+static void FSPAPI onPublicKeySent(FSPHANDLE, FSP_ServiceCode, int);
+static void FSPAPI onReceiveFileNameReturn(FSPHANDLE, FSP_ServiceCode, int);
+static int	FSPAPI onReceiveNextBlock(FSPHANDLE, void *, int32_t, BOOL);
+static void FSPAPI onAcknowledgeSent(FSPHANDLE, FSP_ServiceCode, int);
 
 
+// The call back function on exception notified. Just report error and simply abort the program.
 static void FSPAPI onError(FSPHANDLE h, FSP_ServiceCode code, int value)
 {
 	printf_s("Notify: socket %p, service code = %d, return %d\n", h, code, value);
@@ -27,7 +42,7 @@ static void FSPAPI onError(FSPHANDLE h, FSP_ServiceCode code, int value)
 }
 
 
-
+// A clone of onError. For test of FSPControl FSP_SET_CALLBACK_ON_ERROR
 static void FSPAPI onError2(FSPHANDLE h, FSP_ServiceCode code, int value)
 {
 	printf_s("Notify2: socket %p, service code = %d, return %d\n", h, code, value);
@@ -37,7 +52,7 @@ static void FSPAPI onError2(FSPHANDLE h, FSP_ServiceCode code, int value)
 
 
 
-//
+// Forward definition of the callback function that handles the event of Connection Released (Shutdown)
 static void FSPAPI onFinished(FSPHANDLE h, FSP_ServiceCode code, int value)
 {
 	printf_s("Socket %p, session was to shut down.\n", h);
@@ -46,32 +61,6 @@ static void FSPAPI onFinished(FSPHANDLE h, FSP_ServiceCode code, int value)
 
 	finished = true;
 	return;
-}
-
-
-
-static int ReportLastError()
-{
-	int	err = GetLastError();
-	LPVOID lpMsgBuf;
-
-	printf_s("Error code = %d\n", err);
-	if (FormatMessage( 
-		FORMAT_MESSAGE_ALLOCATE_BUFFER | 
-		FORMAT_MESSAGE_FROM_SYSTEM | 
-		FORMAT_MESSAGE_IGNORE_INSERTS,
-		NULL,
-		err,
-		MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), // Default language
-		(LPTSTR) &lpMsgBuf,
-		0,
-		NULL )) 
-	{
-		printf("\tError: %s\n", lpMsgBuf);
-		LocalFree( lpMsgBuf );
-	}
-
-	return err;
 }
 
 
@@ -118,6 +107,9 @@ l_bailout:
 
 
 
+// On connected, send the public key to the remote end. We save the public key
+// temporarily on the stack because we're sure that there is at least one
+// buffer block available and the public key fits in one buffer block 
 static int	FSPAPI  onConnected(FSPHANDLE h, PFSP_Context ctx)
 {
 	printf_s("\nHandle of FSP session: %p", h);
@@ -143,10 +135,12 @@ static int	FSPAPI  onConnected(FSPHANDLE h, PFSP_Context ctx)
 		return 0;
 	}
 
-	CryptoNaClKeyPair(bufPublicKey, bufPrivateKey);
-
+	unsigned char bufPublicKey[CRYPTO_NACL_KEYBYTES];
 	unsigned char bufPeersKey[CRYPTO_NACL_KEYBYTES];
 	unsigned char bufSharedKey[CRYPTO_NACL_KEYBYTES];
+
+	CryptoNaClKeyPair(bufPublicKey, bufPrivateKey);
+
 	memset(bufPeersKey, 0, CRYPTO_NACL_KEYBYTES);
 	memcpy(bufPeersKey, (const char *)ctx->welcome + mLen, CRYPTO_NACL_KEYBYTES);
 
@@ -165,12 +159,13 @@ static int	FSPAPI  onConnected(FSPHANDLE h, PFSP_Context ctx)
 
 
 
+// On acknowledgement that the public key has been sent read the name of the file
+// that the remote end is to send and is to be saved by the near end
 static void FSPAPI onPublicKeySent(FSPHANDLE h, FSP_ServiceCode c, int r)
 {
 	printf_s("Result of sending public key: %d\n", r);
 	if(r < 0)
 	{
-		finished = true;
 		Dispose(h);
 		return;
 	}
@@ -178,7 +173,6 @@ static void FSPAPI onPublicKeySent(FSPHANDLE h, FSP_ServiceCode c, int r)
 	printf_s("\nTo read filename...\t");
 	if(ReadFrom(h, fileName, sizeof(fileName), onReceiveFileNameReturn) < 0)
 	{
-		finished = true;
 		Dispose(h);
 		return;
 	}
@@ -186,12 +180,13 @@ static void FSPAPI onPublicKeySent(FSPHANDLE h, FSP_ServiceCode c, int r)
 
 
 
+// On receive the name of the remote file prepare to accept the content by receive 'inline'
+// here 'inline' means ULA shares buffer memory with LLS
 static void FSPAPI onReceiveFileNameReturn(FSPHANDLE h, FSP_ServiceCode resultCode, int resultValue)
 {
 	if(resultCode != FSP_NotifyDataReady)
 	{
 		printf("\nUnknown result code %d returned by FSP LLS, returned = %\n", resultCode, resultValue);
-		finished = true;
 		Dispose(h);
 		return;
 	}
@@ -221,7 +216,6 @@ static void FSPAPI onReceiveFileNameReturn(FSPHANDLE h, FSP_ServiceCode resultCo
 			int c = toupper(linebuf[0]);
 			if(c != 'Y')
 			{
-				finished = true;
 				Dispose(h);
 				return;
 			}
@@ -237,7 +231,6 @@ static void FSPAPI onReceiveFileNameReturn(FSPHANDLE h, FSP_ServiceCode resultCo
 			if(hFile == INVALID_HANDLE_VALUE)
 			{
 				ReportLastError();	// "Cannot create the new file"
-				finished = true;
 				Dispose(h);
 				return;
 			}
@@ -248,22 +241,21 @@ static void FSPAPI onReceiveFileNameReturn(FSPHANDLE h, FSP_ServiceCode resultCo
 	}
 	catch(...)
 	{
-		// TODO...
-		finished = true;
-		Dispose(h);	// may raise second-chance exceptions?
+		Dispose(h);
 	}
 }
 
 
 
+// The iteration body that accept continuous segments of the file content one by one
+// The 'eot' (End of Transaction) flag is to indicate the end of the file
+// A reverse application layer acknowledgement message is written back to the remote end
 static int FSPAPI onReceiveNextBlock(FSPHANDLE h, void *buf, int32_t len, BOOL eot)
 {
 	if(buf == NULL)
 	{
 		printf("FSP Internal panic? Receive nothing when calling the CallbackPeeked?\n");
-		finished = true;
 		Dispose(h);
-		DebugBreak();
 		return -1;
 	}
 
@@ -273,9 +265,7 @@ static int FSPAPI onReceiveNextBlock(FSPHANDLE h, void *buf, int32_t len, BOOL e
 	if(! WriteFile(hFile, buf, len, & bytesWritten, NULL))
 	{
 		ReportLastError();
-		finished = true;
 		Dispose(h);
-		DebugBreak();
 		return -1;
 	}
 
@@ -293,13 +283,13 @@ static int FSPAPI onReceiveNextBlock(FSPHANDLE h, void *buf, int32_t len, BOOL e
 }
 
 
+
 // This time it is really shutdown
 static void FSPAPI onAcknowledgeSent(FSPHANDLE h, FSP_ServiceCode c, int r)
 {
 	printf_s("Result of sending the acknowledgement: %d\n", r);
 	if(r < 0)
 	{
-		finished = true;
 		Dispose(h);
 		return;
 	}
@@ -308,6 +298,32 @@ static void FSPAPI onAcknowledgeSent(FSPHANDLE h, FSP_ServiceCode c, int r)
 	{
 		printf_s("Cannot shutdown gracefully in the final stage.\n");
 		Dispose(h);
-		finished = true;
 	}
+}
+
+
+
+// A auxilary function
+int ReportLastError()
+{
+	int	err = GetLastError();
+	LPVOID lpMsgBuf;
+
+	printf_s("Error code = %d\n", err);
+	if (FormatMessage( 
+		FORMAT_MESSAGE_ALLOCATE_BUFFER | 
+		FORMAT_MESSAGE_FROM_SYSTEM | 
+		FORMAT_MESSAGE_IGNORE_INSERTS,
+		NULL,
+		err,
+		MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), // Default language
+		(LPTSTR) &lpMsgBuf,
+		0,
+		NULL )) 
+	{
+		printf("\tError: %s\n", lpMsgBuf);
+		LocalFree( lpMsgBuf );
+	}
+
+	return err;
 }

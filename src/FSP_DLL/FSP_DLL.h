@@ -82,6 +82,29 @@ typedef CSocketItem * PSocketItem;
 // per-session connection limit. thereotically any connectable socket might be listener
 #define MAX_CONNECTION_NUM	16	// 256	// must be some power value of 2
 
+
+// A internal class of CSocketItemDl, it should be
+class CSocketItemDl;
+class CSocketDLLTLB
+{
+	SRWLOCK	srwLock;
+	int		countAllItems;
+	int		sizeOfWorkSet;
+	CSocketItemDl * pSockets[MAX_CONNECTION_NUM];
+	CSocketItemDl * head;
+	CSocketItemDl * tail;
+public:
+	CSocketItemDl * AllocItem();
+	void FreeItem(CSocketItemDl *);
+
+	// Application Layer Fiber ID (ALFID) === fiberID
+	CSocketItemDl * operator [] (ALFID_T fiberID);
+	CSocketItemDl * operator [] (int i) { return pSockets[i]; }
+
+	CSocketDLLTLB();
+};
+
+
 class CSocketItemDl: public CSocketItem
 {
 	friend class	CSocketDLLTLB;
@@ -92,6 +115,9 @@ class CSocketItemDl: public CSocketItem
 	friend FSPHANDLE FSPAPI MultiplyAndWrite(FSPHANDLE, PFSP_Context, int8_t, NotifyOrReturn);
 	friend FSPHANDLE FSPAPI MultiplyAndGetSendBuffer(FSPHANDLE, PFSP_Context, int *, CallbackBufferReady);
 
+	static	CSocketDLLTLB socketsTLB;
+	static	DWORD	idThisProcess;
+
 	SRWLOCK			rtSRWLock;
 	HANDLE			timer;
 	//
@@ -99,12 +125,14 @@ class CSocketItemDl: public CSocketItem
 	CSocketItemDl	*prev;
 	// for sake of incarnating new accepted connection
 	FSP_SocketParameter context;
+	char			isInCritical;	// prevent the second notice processed before the first one was finished
 	char			newTransaction;	// it may simultaneously start a transmit transaction and flush/commit it
-	char			isFlushing;
 	char			inUse;
 	char			initiatingShutdown : 1;
+	char			isFlushing : 1;
 	char			lowerLayerRecycled : 1;
 	char			peerCommitted : 1;
+	char			isDisposing: 1;
 protected:
 	ALIGN(8)		HANDLE theWaitObject;
 
@@ -123,6 +151,7 @@ protected:
 	int				waitingRecvSize;
 	int				bytesReceived;
 
+	// Pair of functions meant to mimic hardware vector interrupt. It is yet OS-dependent, however
 	static VOID NTAPI WaitOrTimeOutCallBack(PVOID param, BOOLEAN isTimeout)
 	{
 		if(isTimeout)
@@ -172,7 +201,6 @@ protected:
 	int LOCALAPI BufferData(int);
 	int LOCALAPI DeliverData(void *, int);
 	int FetchReceived();
-	void FinalizeRead();
 
 public:
 	void Disable()
@@ -185,8 +213,16 @@ public:
 		//
 		CSocketItem::Destroy();
 	}
+	void DisableAndFree()
+	{
+		FreeItem(this);
+		Disable();
+		SetMutexFree();
+	}
+
 	int LOCALAPI Initialize(PFSP_Context, char[MAX_NAME_LENGTH]);
 	int Recycle();
+	int Dispose() { isDisposing = 1; return Recycle(); }
 
 	// Convert the relative address in the control block to the address in process space, unchecked
 	BYTE * GetSendPtr(const ControlBlock::PFSP_SocketBuf skb) const
@@ -223,7 +259,7 @@ public:
 	template<FSP_ServiceCode cmd> void InitCommand(CommandToLLS & objCommand)
 	{
 		objCommand.fiberID = fidPair.source;
-		objCommand.idProcess = ::idThisProcess;
+		objCommand.idProcess = idThisProcess;
 		objCommand.opCode = cmd;
 	}
 	bool LOCALAPI Call(const CommandToLLS &, int);
@@ -264,8 +300,8 @@ public:
 		return (Call<FSP_Send>() ? r : -EIO);
 	}
 
-	int	LOCALAPI RecvInline(PVOID);
-	int LOCALAPI ReadFrom(void *, int, PVOID);
+	int	LOCALAPI RecvInline(CallbackPeeked);
+	int LOCALAPI ReadFrom(void *, int, NotifyOrReturn);
 	int LOCALAPI MarkReceiveFinished(int n) { return pControlBlock->MarkReceivedFree(n); }
 
 	bool HasDataToDeliver()  { return int32_t(pControlBlock->recvWindowExpectedSN - pControlBlock->recvWindowFirstSN) > 0; }
@@ -285,45 +321,7 @@ public:
 
 	// defined in DllEntry.cpp:
 	static CSocketItemDl * LOCALAPI CreateControlBlock(const PFSP_IN6_ADDR, PFSP_Context, CommandNewSession &);
+	static DWORD GetProcessId() { return idThisProcess; }
+	static DWORD SaveProcessId() { return (idThisProcess = GetCurrentProcessId()); }
+	static void FreeItem(CSocketItemDl * p) { socketsTLB.FreeItem(p); }
 };
-
-
-
-class CSocketDLLTLB
-{
-	SRWLOCK	srwLock;
-	int		countAllItems;
-	int		sizeOfWorkSet;
-	CSocketItemDl * pSockets[MAX_CONNECTION_NUM];
-	CSocketItemDl * head;
-	CSocketItemDl * tail;
-public:
-	CSocketItemDl * AllocItem();
-	void FreeItem(CSocketItemDl *);
-	bool ReuseItem(CSocketItemDl *);
-
-	// Application Layer Fiber ID (ALFID) === fiberID
-	CSocketItemDl * operator [] (ALFID_T fiberID);
-	CSocketItemDl * operator [] (int i) { return pSockets[i]; }
-
-	CSocketDLLTLB()
-	{
-		InitializeSRWLock(& srwLock);
-		countAllItems = 0;
-		sizeOfWorkSet = 0;
-		head = tail = NULL;
-	}
-
-	~CSocketDLLTLB()
-	{
-		//
-	}
-};
-
-
-// defined in DllEntry.cpp for shared across module files
-extern int __lastFSPError;
-extern HANDLE _mdService;
-extern DWORD idThisProcess;
-
-extern CSocketDLLTLB socketsTLB;

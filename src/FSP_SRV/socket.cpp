@@ -30,11 +30,8 @@
 #include "fsp_srv.h"
 #include <assert.h>
 
-// defined in os_win.cpp
-extern bool IsProcessAlive(DWORD);
 
-
-
+// Translation-Lookaside-Buffer of the Service Sockets, the constructor
 CSocketSrvTLB::CSocketSrvTLB()
 {
 	memset(listenerSlots, 0, sizeof(listenerSlots));
@@ -59,6 +56,7 @@ CSocketSrvTLB::CSocketSrvTLB()
 }
 
 
+
 // allocate from the free list
 CSocketItemEx * CSocketSrvTLB::AllocItem()
 {
@@ -68,16 +66,25 @@ CSocketItemEx * CSocketSrvTLB::AllocItem()
 	if(p != NULL)
 	{
 		headFreeSID = p->next;
-		if(headFreeSID == NULL)
+		if (headFreeSID == NULL)
 			tailFreeSID = NULL;
-		// See also Destroy()
-		if(_InterlockedExchange8(& p->inUse, 1))
-		{
-			p->RemoveTimers();
-			p->Destroy();
-		}
-		//
+		if (!p->TestSetInUse())
+			BREAK_ON_DEBUG();
 		p->next = NULL;
+	}
+	else
+	{
+		register int i;
+		// forceful garbage collection: it might be better to tune the time-out?
+		for (i = 0, p = itemStorage; i < MAX_CONNECTION_NUM; i++, p++)
+		{
+			if (!p->IsProcessAlive())
+			{
+				p->AbortLLS(true);
+				p->TestSetInUse();
+				break;
+			}
+		}
 	}
 
 	ReleaseMutex();
@@ -85,63 +92,54 @@ CSocketItemEx * CSocketSrvTLB::AllocItem()
 }
 
 
-// allocate in the listner space
+
+// registeration of passive socket: it is assumed that performance is out of question for a conceptual prototype
+// allocate in the listeners' socket space
 CSocketItemEx * CSocketSrvTLB::AllocItem(ALFID_T idListener)
 {
 	AcquireMutex();
 
 	CSocketItemEx *p = NULL;
-	// registeration of passive socket: it is assumed that performance is seldom a concern, at least initially
-	// detect duplication fiber ID.
+	// detect duplication fiber ID, remove 'brain-dead' socket
 	for(register int i = 0; i < MAX_LISTENER_NUM; i++)
 	{
-		if(! listenerSlots[i].inUse && p == NULL)
+		if (listenerSlots[i].TestSetInUse())
 		{
-			p = & listenerSlots[i];
-			p->SetPassive();
-			p->fidPair.source = idListener;
-			p->SetInUse();
+			if (p != NULL)
+				p->ClearInUse();
+			p = &listenerSlots[i];
 			// do not break, for purpose of duplicate allocation detection
 		}
-		else if(listenerSlots[i].inUse && listenerSlots[i].fidPair.source == idListener)
+		else if (!listenerSlots[i].IsProcessAlive())
 		{
-			if(p != NULL)
-				p->inUse = 0;
-			// we may reuse of a socket created by a terminated process
-			p = & listenerSlots[i];
-			if(IsProcessAlive(p->idSrcProcess))
-			{
+			// we may reuse a socket created indirectly by a terminated process
+			if (p != NULL)
+				p->ClearInUse();
+			p = &listenerSlots[i];
+			p->AbortLLS(true);
+			p->TestSetInUse();
+			// do not break, for purpose of duplicate allocation detection
+		}
+		else if (listenerSlots[i].fidPair.source == idListener)
+		{
 #ifdef TRACE
-				printf_s("\nCollision of listener fiber#%u detected for process#%u\n", idListener, p->idSrcProcess);
+			printf_s("\nCollision detected:\n"
+					 "\twith process#%u, listener fiber#%u\n", listenerSlots[i].idSrcProcess, idListener);
 #endif
-				p = NULL;
-			}
+			p = NULL;
 			break;
 		}
+		else
+		{
+			continue;
+		}
+		//
+		p->SetPassive();
+		p->fidPair.source = idListener;
 	}
 
-	if(p != NULL)
-	{
-		int k = be32toh(idListener) & (MAX_CONNECTION_NUM - 1);
-		CSocketItemEx *p0 = tlbSockets[k];
-		register CSocketItemEx *p1;
-		// TODO: UNRESOLVED! Is it unnecessary to detect the stale entry?
-		for(p1 = p0; p1 != NULL; p1 = p1->prevSame)
-		{
-			if(p == p1) break;
-			//
-			if(p->fidPair.source == p1->fidPair.source)
-			{
-				p = NULL;
-				break;
-			}
-		}
-		if(p1 == NULL && p != NULL)
-		{
-			p->prevSame = p0;
-			tlbSockets[k] = p;
-		}
-	}
+	if (p != NULL)
+		PutToListenTLB(p, be32toh(idListener) & (MAX_CONNECTION_NUM - 1));
 
 	ReleaseMutex();
 	return p;
@@ -150,20 +148,53 @@ CSocketItemEx * CSocketSrvTLB::AllocItem(ALFID_T idListener)
 
 
 // Given
+//	CSocketItemEx *		pointer to the socket item to be inserted, might be updated
+//	int					the'compressed' hash key for searching the socket item
+// Do
+//	Insert the given socket item into the translation-look-aside buffer of listening sockets
+void CSocketSrvTLB::PutToListenTLB(CSocketItemEx * p, int k)
+{
+	CSocketItemEx *p0 = tlbSockets[k];
+	register CSocketItemEx *p1;
+	// TODO: UNRESOLVED! Is it unnecessary to detect the stale entry?
+	for (p1 = p0; p1 != NULL; p1 = p1->prevSame)
+	{
+		if (p == p1)
+			return;
+		//
+		if (p->fidPair.source == p1->fidPair.source)
+		{
+			REPORT_ERRMSG_ON_TRACE("collision found when put sockt into sockets TLB");
+			return;
+		}
+	}
+	assert(p1 == NULL && p != NULL);
+	p->prevSame = p0;
+	tlbSockets[k] = p;
+}
+
+
+
+// Given
 //	CSocketItemEx	The pointer to the socket item to free
 // Do
 //	Put the given socket item onto the free list
-void CSocketSrvTLB::FreeItem(CSocketItemEx *p)
+// Remark
+//	Assume having obtained the lock of TLB. Will free the lock in the end.
+void CSocketSrvTLB::FreeItemDonotCareLock(CSocketItemEx *p)
 {
-	AcquireMutex();
-	//
+	p->ClearInUse();	// might be redundant, but it does little harm
 	// if it is allocated by AllocItem(ALFID_T idListener):
 	if(p->IsPassive())
 	{
 		int k = be32toh(p->fidPair.source) & (MAX_CONNECTION_NUM - 1);
 		register CSocketItemEx *p1 = tlbSockets[k];
 		// detach it from the hash collision list
-		if(p1 != p)
+		if(p1 == p)
+		{
+			tlbSockets[k] = p1->prevSame;
+		}
+		else
 		{
 			while(p1 != NULL)
 			{
@@ -174,15 +205,12 @@ void CSocketSrvTLB::FreeItem(CSocketItemEx *p)
 				}
 				p1 = p1->prevSame;
 			}
+			//^it provides a safe-net to check whether p1 == NULL firstly
 			if(p1 == NULL)
 				REPORT_ERRMSG_ON_TRACE("A passive socket to be free is not an instance allocated properly");
 		}
-		else if(p1->prevSame != NULL)
-		{
-			tlbSockets[k] = p1->prevSame;
-		}
-		// else keep at least one entry in the context-addressing TLB
-		goto l_return;
+		//
+		return;
 	}
 
 	// if it is allocated by AllocItem() [by assigning a pseudo-random fiber ID]
@@ -196,10 +224,6 @@ void CSocketSrvTLB::FreeItem(CSocketItemEx *p)
 		tailFreeSID = p;
 		p->next = NULL;	// in case it is not
 	}
-	//
-l_return:
-	ReleaseMutex();
-	_InterlockedExchange8(& p->inUse, 0);
 }
 
 
@@ -236,7 +260,7 @@ CSocketItemEx * CSocketSrvTLB::AllocItem(const CommandNewSessionSrv & cmd)
 	if(p != NULL)
 	{
 		// We allow a socket slot waiting scavenge to be reused ealier than recycled. See also KeepAlive
-		if(_InterlockedCompareExchange8((char *) & p->inUse, 1, 0) != 0 && p->lowState != NON_EXISTENT)
+		if(!p->TestSetInUse() && p->lowState != NON_EXISTENT)
 		{
 			p = NULL;
 			goto l_return;
@@ -244,7 +268,7 @@ CSocketItemEx * CSocketSrvTLB::AllocItem(const CommandNewSessionSrv & cmd)
 		if(! p->MapControlBlock(cmd))
 		{
 			REPORT_ERRMSG_ON_TRACE("Control block shall be created by the ULA via DLL call already");
-			p->inUse = 0;	// No, you cannot 'FreeItem(p);' because mutex is SHARED_BUSY
+			p->ClearInUse();	// No, you cannot 'FreeItem(p);' because mutex is SHARED_BUSY
 			p = NULL;
 			goto l_return;
 		}
@@ -259,7 +283,7 @@ l_return:
 // Given
 //	CSocketItemEx * The pointer to the socket that to be put into the Remote Translate Look-aside Buffer
 // Return
-//	true if success
+//	true if succeeded
 //	false if failed
 // Remark
 //	Assume the remote application layer fiber ID HAS been stored in the fidPair
@@ -381,8 +405,13 @@ void CSocketItemEx::SetRemoteFiberID(ALFID_T id)
 
 
 
+// Given
+//	CommandNewSessionSrv	the command context
 // Clone the control block whose handle is passed by the command and bind the interfaces
 // Initialize near and remote fiber ID as well
+// Return
+//	true if suceeded
+//	false if failed
 bool CSocketItemEx::MapControlBlock(const CommandNewSessionSrv &cmd)
 {
 #ifndef NDEBUG
@@ -456,7 +485,7 @@ l_bailout:
 
 
 // Given
-//	FSP_PreparedKEEP_ALIVE& 	the placeholder for the returned gap descriptors, shall be at of at least MAX_BLOCK_SIZE bytes
+//	FSP_PreparedKEEP_ALIVE& 	the placeholder for the returned gap descriptors, shall be of at least MAX_BLOCK_SIZE bytes
 //	seq_t &						the placeholder for the returned maximum expected sequence number
 //	int							the number of bytes that prefix the SNACK header
 // Return
@@ -545,7 +574,16 @@ void CSocketItemEx::InitiateConnect()
 
 
 // CONNECT_REQUEST, timestamp, Cookie, Salt, ephemeral-key, half-connection parameters [, resource requirement]
+// Given
+//	SConnectParam	the initial state
+//	ALFID_T			the responder's Application Layer Fiber ID
+// Do
+//	Make and send the CONNECT_REQUEST command
+// Remark
+//	Because CONNECT_REQUEST overlays INIT_CONNECT these three fields are reused: timeStamp, initCheckCode, salt
 // It is assumed that exclusive access to the socket has been gained
+// Safely suppose that internal processing takes orders of magnitude less time than network propagation
+// TODO: UNRESOLVED! For FSP over IPv6, attach inititator's resource reservation...
 void CSocketItemEx::AffirmConnect(const SConnectParam & initState, ALFID_T idListener)
 {
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend(); // Reuse what's occupied by INIT_CONNECT
@@ -557,10 +595,6 @@ void CSocketItemEx::AffirmConnect(const SConnectParam & initState, ALFID_T idLis
 	}
 	tRoundTrip_us = uint32_t(min(UINT32_MAX, NowUTC() - skb->timeSent));
 
-	// Because CONNECT_REQUEST overlay INIT_CONNECT these three fields are reused
-	//pkt->timeStamp = initState.nboTimeStamp;
-	//pkt->initCheckCode = initState.initCheckCode;
-	//pkt->salt = initState.salt;
 	pkt->initialSN = htobe32(initState.initialSN);
 	pkt->timeDelta = htobe32(initState.timeDelta);
 	pkt->cookie = initState.cookie;
@@ -574,9 +608,6 @@ void CSocketItemEx::AffirmConnect(const SConnectParam & initState, ALFID_T idLis
 	skb->opCode = CONNECT_REQUEST;
 	skb->len = sizeof(FSP_ConnectRequest);
 
-	// TODO: UNRESOLVED! For FSP over IPv6, attach inititator's resource reservation...
-
-	// Safely suppose that internal processing takes orders of magnitude less time than network propagation
 	SetState(CONNECT_AFFIRMING);
 	SendPacket(1, ScatteredSendBuffers(pkt, skb->len));	// it would set tRecentSend
 }
@@ -696,7 +727,7 @@ void CMultiplyBacklogItem::ResponseToMultiply()
 	BYTE *ubuf = GetRecvPtr(skb);
 	if(ubuf == NULL)
 	{
-		HandleMemoryCorruption();
+		AbortLLS();		// Used to be HandleMemoryCorruption();
 		return;
 	}
 
@@ -734,12 +765,13 @@ void CMultiplyBacklogItem::ResponseToMultiply()
 
 
 
+// Do
+//	Acknowledge the connection/multiplication of connection request by sending the head packet in the send queue
 // Remark
-//	For sake of congestion control only one packet is sent presently
+//	Send the first packet in the send queuea only, for sake of congestion control
+//	ACK_CONNECT_REQUEST is resent on requested only.
 // See also
 //	CSocketItemEx::Start(), OnConnectRequestAck(); CSocketItemDl::ToWelcomeConnect(), ToWelcomeMultiply()
-// Remark
-//	ACK_CONNECT_REQUEST is resent on requested only.
 void CSocketItemEx::Accept()
 {
 	// bind to the interface as soon as the control block mapped into server's memory space
@@ -781,6 +813,31 @@ bool CSocketItemEx::ICCSeqValid()
 }
 
 
+
+// Send the normal 'RELEASE' command
+bool CSocketItemEx::SendRelease()
+{
+	FSP_NormalPacketHeader hdr;		// See also AffirmConnect and EmitStart
+	pControlBlock->SetSequenceFlags(& hdr, pControlBlock->sendWindowNextSN);
+	hdr.hs.Set<FSP_NormalPacketHeader, RELEASE>();
+	SetIntegrityCheckCode(& hdr);
+	return (SendPacket(1, ScatteredSendBuffers(&hdr, sizeof(hdr))) >= 0);
+}
+
+
+
+// Send the abnormal 'RESET' command
+void CSocketItemEx::SendReset()
+{
+	FSP_NormalPacketHeader hdr;		// See also SendKeepAlive and SendAckFlush
+	pControlBlock->SetSequenceFlags(& hdr, pControlBlock->sendWindowNextSN - 1);
+	hdr.hs.Set<FSP_NormalPacketHeader, RESET>();
+	SetIntegrityCheckCode(& hdr);
+	SendPacket(1, ScatteredSendBuffers(&hdr, sizeof(hdr)));
+}
+
+
+
 // Dispose on the demand of the remote peer. Let the garbage collector recycle the resource occupied
 // See also Destroy() and *::KeepAlive case NON_EXISTENT
 void CSocketItemEx::DisposeOnReset()
@@ -793,8 +850,7 @@ void CSocketItemEx::DisposeOnReset()
 
 
 
-// Do
-//	Set the state to 'NON_EXISTENT', and make the resources be safely recyclable
+// Set the state to 'NON_EXISTENT', and make the resources be safely recyclable
 // See also ~::KeepAlive case NON_EXISTENT
 void CSocketItemEx::Destroy()
 {
@@ -805,6 +861,7 @@ void CSocketItemEx::Destroy()
 #endif
 		lowState = NON_EXISTENT;	// Donot [SetState(NON_EXISTENT);] as the ULA might do further cleanup
 		RemoveTimers();
+		ClearInUse();
 		CSocketItem::Destroy();
 		//
 		(CLowerInterface::Singleton())->FreeItem(this);
@@ -818,9 +875,35 @@ void CSocketItemEx::Destroy()
 
 
 
+// Given
+//	bool		whether having obtained the mutex lock of the TLB
 // Do
-//	Recycle the socket
-//	Send RESET to the remote peer if not in CLOSED state
+//	Abort the session at the LLS layer.
+// Remark
+//	Might send RESET packet to the remote end
+void CSocketItemEx::AbortLLS(bool haveTLBLocked)
+{
+	if (pControlBlock != NULL
+	&& InStates(7, ESTABLISHED, COMMITTING, COMMITTED, COMMITTING2, PEER_COMMIT, CLOSABLE, PRE_CLOSED))
+	{
+		SendReset();
+	}
+	//
+	if (!haveTLBLocked)
+	{
+		Destroy();
+	}
+	else
+	{
+		RemoveTimers();
+		CSocketItem::Destroy();
+		(CLowerInterface::Singleton())->FreeItemDonotCareLock(this);
+	}
+}
+
+
+
+// Recycle the socket, send RESET to the remote peer if not in CLOSED state
 void CSocketItemEx::Recycle()
 {
 	if(!IsInUse())
@@ -846,33 +929,24 @@ void CSocketItemEx::Recycle()
 
 
 
-// Do
-//	Send RESET to the remote peer in the certain states (not guaranteed to be received)
-// See also ~::KeepAlive case NON_EXISTENT
+// Send RESET to the remote peer in the certain states (not guaranteed to be received)
+// See also DisposeOnReset, Recycle
 void CSocketItemEx::RejectOrReset()
 {
 	if(lowState == CHALLENGING || lowState == CONNECT_AFFIRMING)
 		CLowerInterface::Singleton()->SendPrematureReset(EINTR, this);
 	else if(InStates(6, ESTABLISHED, COMMITTING, PEER_COMMIT, COMMITTING2, COMMITTED, CLOSABLE))
-		SendPacket<RESET>();
+		SendReset();
 	// Do not [pControlBlock->state = NON_EXISTENT;] as the ULA might do further cleanup
 	SignalFirstEvent(FSP_NotifyRecycled);
-	// See also DisposeOnReset, Recycle
-	if(WaitUseMutex())
-	{
-		Destroy();
-		SetMutexFree();	// should be redundant, but make it robust
-	}
-	else
-	{
-		// It could be lazily Destroyed
-		lowState = NON_EXISTENT;
-		ReplaceTimer(TRANSIENT_STATE_TIMEOUT_ms);
-	}
+	Destroy();	// MUST signal event before Destroy
 }
 
 
 
+// Given
+//	const void *	pointer to the buffer block to dump to the stdout stream
+//	int				number of octets to be dumped
 void LOCALAPI DumpHexical(const void *buf, int len)
 {
 	for(register int i = 0; i < len; i++)
@@ -884,6 +958,9 @@ void LOCALAPI DumpHexical(const void *buf, int len)
 
 
 
+// Given
+//	uint16_t *	pointer to the buffer block to dump to the stdout stream
+//	int			number of 16-bit short words to be dumped
 void LOCALAPI DumpNetworkUInt16(uint16_t * buf, int len)
 {
 	for(register int i = 0; i < len; i++)

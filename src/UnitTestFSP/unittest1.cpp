@@ -43,8 +43,6 @@ void UnitTestOpCodeStateNoticeNames()
 // Just test stubs
 void CSocketItemEx::Connect() { }
 
-CommandNewSessionSrv::CommandNewSessionSrv(const CommandToLLS *p1) { }
-
 void CommandNewSessionSrv::DoConnect() { }
 
 
@@ -425,6 +423,11 @@ void UnitTestSocketInState()
 	socket.SetState(CLOSABLE);
 	r = socket.InStates(4, COMMITTING2, CLONING, PRE_CLOSED, CLOSED);
 	Assert::IsFalse(r);
+#if _MSC_VER >= 1800
+	// VS2013 and above support variadic template
+	r = socket.NotInStates(COMMITTING2, CLONING, PRE_CLOSED, CLOSED);
+	Assert::IsTrue(r);
+#endif
 }
 
 

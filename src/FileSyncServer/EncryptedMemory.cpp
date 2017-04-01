@@ -1,18 +1,20 @@
+/**
+ * A group of chained functions within FileSyncServer. The group meant to send
+ * to the remote end a large memory block filled with some certern pattern
+ * with encryption turned on.
+ */
+
 #include "stdafx.h"
-
-
-// assume that address space layout randomization keep the secret hard to find
-static unsigned char bufPrivateKey[CRYPTO_NACL_KEYBYTES];
-static unsigned char bufPeerPublicKey[CRYPTO_NACL_KEYBYTES];
+#include "defs.h"
 
 static char		*fileName = "$memory.^";
 static uint8_t	*bytesToSend;
-size_t			sizeOfBuffer = TEST_MEM_SIZE;
+static size_t	sizeOfBuffer;
 
 
-void SendMemoryPatternEncyrpted()
+void PrepareMemoryPattern(size_t sz1)
 {
-	bytesToSend = (uint8_t *)malloc(sizeOfBuffer);
+	bytesToSend = (uint8_t *)malloc(sizeOfBuffer = sz1);
 	if(bytesToSend == NULL)
 	{
 		printf_s("Cannot allocate memory block size of %zu bytes\n", sizeOfBuffer);
@@ -23,18 +25,11 @@ void SendMemoryPatternEncyrpted()
 	{
 		* (uint32_t *) & bytesToSend[i * sizeof(uint32_t)] = htobe32(i);
 	}
-
-	unsigned short mLen = (unsigned short)strlen(defaultWelcome) + 1;
-	char *thisWelcome = (char *)_alloca(mLen + CRYPTO_NACL_KEYBYTES);
-	unsigned char *bufPublicKey = (unsigned char *)thisWelcome + mLen;;
-	memcpy(thisWelcome, defaultWelcome, mLen);	//+\000012345678901234567890123456789012
-	CryptoNaClKeyPair(bufPublicKey, bufPrivateKey);
-
-	WaitConnection(thisWelcome, mLen + CRYPTO_NACL_KEYBYTES, onAccepted);
 }
 
 
-static int FSPAPI onAccepted(FSPHANDLE h, PFSP_Context ctx)
+
+int FSPAPI SendMemory_onAccepted(FSPHANDLE h, PFSP_Context ctx)
 {
 	printf_s("\nEncyrptedMemory onAccepted: handle of FSP session %p\n", h);
 	// TODO: check connection context
@@ -44,11 +39,13 @@ static int FSPAPI onAccepted(FSPHANDLE h, PFSP_Context ctx)
 }
 
 
+// On receive peer's public key establish the shared session key
+// and write to the remote end the hard-coded special filename
+// for memory pattern this is a 'virtual' filename
 static void FSPAPI onPublicKeyReceived(FSPHANDLE h, FSP_ServiceCode c, int r)
 {
 	if(r < 0)
 	{
-		finished = true;
 		Dispose(h);
 		return;
 	}
@@ -64,12 +61,12 @@ static void FSPAPI onPublicKeyReceived(FSPHANDLE h, FSP_ServiceCode c, int r)
 }
 
 
-// for memory pattern this is a 'virtual' filename
+
+// Besides, open another reverse-connection to send the signature
 static void FSPAPI onFileNameSent(FSPHANDLE h, FSP_ServiceCode c, int r)
 {
 	if(r < 0)
 	{
-		finished = true;
 		Dispose(h);
 		return;
 	}
@@ -82,12 +79,10 @@ static void FSPAPI onFileNameSent(FSPHANDLE h, FSP_ServiceCode c, int r)
 	if(r < 0)
 	{
 		printf_s("Cannot get send buffer onFileNameSent, error code: %d\n", r);
-		finished = true;
 		Dispose(h);
 		return;
 	}
 
-	// Besides, open another reverse-connection to send the signature
 	StartToSendSignature(h);
 
 	printf_s("And we expected success acknowledgement\n");
@@ -96,12 +91,13 @@ static void FSPAPI onFileNameSent(FSPHANDLE h, FSP_ServiceCode c, int r)
 
 
 
+// the iteration body that transfer to the remote end the segments of the memory block one by one
 static int FSPAPI toSendNextBlock(FSPHANDLE h, void * batchBuffer, int32_t capacity)
 {
 	static int offset = 0;
 	if(capacity <= 0)
 	{
-		finished = true;
+		Dispose(h);
 		return -ENOMEM;
 	}
 

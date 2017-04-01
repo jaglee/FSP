@@ -1,6 +1,6 @@
 /*
- * FSP lower-layer service program, do processing triggered by packets sent from far-end peer,
- * deliver them to the upper layer application on demand
+ * FSP lower-layer service program, process packets sent from the remote end
+ * trigger DLL to fetch the data delivered on demand
  *
     Copyright (c) 2012, Jason Gao
     All rights reserved.
@@ -37,16 +37,16 @@
 struct _CookieMaterial
 {
 	uint32_t	salt;
-	ALFID_T	idALF;
-	ALFID_T	idListener;
+	ALFID_T		idALF;
+	ALFID_T		idListener;
 };
 
 
 
 #if defined(TRACE) && (TRACE & TRACE_HEARTBEAT) && (TRACE & TRACE_PACKET)
 #define TRACE_SOCKET()	\
-	(printf_s(__FUNCTION__ ": local fiber#%u in state %s\n"	\
-		, fidPair.source		\
+	(printf_s(__FUNCTION__ ": local fiber#%u(_%X_) in state %s\n"	\
+		, fidPair.source, be32toh(fidPair.source)		\
 		, stateNames[lowState])	\
 	&& pControlBlock->DumpSendRecvWindowInfo())
 #else
@@ -54,7 +54,9 @@ struct _CookieMaterial
 #endif
 
 
-// Allas! it would be very concise in the Swift language
+
+// Variadic template is not necessarily more efficient that parameter list of variable length in C
+// VS2013 and above support variadic template
 inline
 bool CSocketItemEx::InStates(int n, ...)
 {
@@ -78,6 +80,15 @@ bool CSocketItemEx::InStates(int n, ...)
 
 
 
+// Given
+//	FSP_ServiceCode		the code of the notification to alert DLL
+// Do
+//	Put the notification code into the notice queue
+// Return
+//	true if the notification was put into the queue successfully
+//	false if it failed
+// Remark
+//	Successive notifications of the same code are automatically merged
 bool CSocketItemEx::Notify(FSP_ServiceCode n)
 {
 	int r = pControlBlock->notices.Put(n);
@@ -113,16 +124,40 @@ bool CSocketItemEx::Notify(FSP_ServiceCode n)
 //	|<-->[Rcv.INIT_CONNECT && {resource available}: Send ACK_INIT_CONNECT]
 //	|<-->[Rcv.INIT_CONNECT && {resource unavailable}: Send RESET]
 // Do
-//  Allocate a new Session ID randomly there might be collision in a high-load responder
 //	ACK_INIT_CONNECT, Cookie, initiator's check code echo, time difference
 //		or
 //	RESET, Timestamp echo, initiator's check code echo, reason
+// Remark
+//  Usually an FSP node allocate a new ALFID randomly and respond with the new ALFID, not the listening ALFID.
+//	Collision might occur o allocating the new ALFID in a high-load responder, but the possibility is low enough.
+//	For a low-power IoT device the listener may accept only one connection request, and thus respond with the listening ALFID.
+// TODO: there should be some connection initiation throttle control in RandALFID
+// TODO: UNRESOLVED! admission-control here?
+// TODO: UNRESOLVED! For FSP over IPv6, attach responder's resource reservation...
 void LOCALAPI CLowerInterface::OnGetInitConnect()
 {
 	// Silently discard connection request to blackhole, and avoid attacks alike 'port scan'
 	CSocketItemEx *pSocket = MapSocket();
-	if(pSocket == NULL || ! pSocket->IsPassive() || ! pSocket->IsInUse())
+	if (pSocket == NULL || !pSocket->IsPassive())
+	{
+		BREAK_ON_DEBUG();
 		return;
+	}
+
+	// In case ULA is manipulating the socket
+	if (!pSocket->WaitUseMutex())
+	{
+#ifdef TRACE
+		printf_s("\nFiber#%u, lost INIT_CONNECT due to lack of locks\n", GetLocalFiberID());
+#endif
+		return;
+	}
+	// In case ULA has terminated
+	if (!pSocket->IsProcessAlive())
+	{
+		pSocket->AbortLLS();
+		goto l_return;
+	}
 
 	// control structure, specified the local address (the Application Layer Thread ID part)
 	// echo back the message at the same interface of receiving, only ALFID changed
@@ -141,9 +176,6 @@ void LOCALAPI CLowerInterface::OnGetInitConnect()
 		hdrInfo.u.idALF = fiberID;
 	}
 
-	// TODO: there should be some connection initiation throttle control in RandALFID
-	// TODO: UNRESOLVED! admission-control here?
-	// TODO: UNRESOLVED! For FSP over IPv6, attach responder's resource reservation...
 	if(fiberID == 0)
 	{
 		SendPrematureReset(ENOENT);
@@ -169,6 +201,9 @@ void LOCALAPI CLowerInterface::OnGetInitConnect()
 
 	SetLocalFiberID(fiberID);
 	SendBack((char *) & challenge, sizeof(challenge));
+
+l_return:
+	pSocket->SetMutexFree();
 }
 
 
@@ -177,6 +212,9 @@ void LOCALAPI CLowerInterface::OnGetInitConnect()
 //	-->CONNECT_AFFIRMING-->[Send CONNECT_REQUEST]
 // Do
 //	Check the inititiator's cookie, make the formal connection request towards the responder
+// Remark
+//	It does not matter whether idListener == GetRemoteFiberID()
+// TODO: UNRESOLVED!? get resource reservation requirement from IPv6 extension header
 void LOCALAPI CLowerInterface::OnInitConnectAck()
 {
 	//	find the socket item firstly
@@ -185,12 +223,19 @@ void LOCALAPI CLowerInterface::OnInitConnectAck()
 	if(pSocket == NULL)
 		return;
 
+	// In case DLL is manipulating the socket
 	if(! pSocket->WaitUseMutex())
 	{
 #ifdef TRACE
 		printf_s("\nFiber#%u, lost ACK_INIT_CONNECT due to lack of locks\n", GetLocalFiberID());
 #endif
 		return;
+	}
+	// In case ULA has terminated
+	if (!pSocket->IsProcessAlive())
+	{
+		pSocket->AbortLLS();
+		goto l_return;
 	}
 
 	SConnectParam & initState = pSocket->pControlBlock->connectParams;
@@ -202,11 +247,9 @@ void LOCALAPI CLowerInterface::OnInitConnectAck()
 	if(initState.initCheckCode != pkt->initCheckCode)
 		goto l_return;
 
-	// TODO: UNRESOLVED!? get resource reservation requirement from IPv6 extension header
 	pSocket->SetRemoteFiberID(initState.idRemote = this->GetRemoteFiberID());
 	//^ set to new peer fiber ID: to support multihome it is necessary even for IPv6
 	pSocket->SetNearEndInfo(nearInfo);
-	// UNRESOLVED!? To check: the remote peer should register its own interface that made the connection in the backlog
 
 	initState.timeDelta = be32toh(pkt->timeDelta);
 	initState.cookie = pkt->cookie;
@@ -217,6 +260,7 @@ void LOCALAPI CLowerInterface::OnInitConnectAck()
 l_return:
 	pSocket->SetMutexFree();
 }
+
 
 
 /**
@@ -231,9 +275,7 @@ l_return:
 //	|-->[{return}Accept]
 //		-->{new context}CHALLENGING-->[Send ACK_CONNECT_REQ]
 //	|-->[{return}Reject]-->[Send RESET]{abort creating new context}
-//CLOSED-->/CONNECT_REQUEST/-->[API{callback}]
-//	|-->[{return}Accept]-->CHALLENGING-->[Send ACK_CONNECT_REQ]
-//	|-->[{return}Reject]-->NON_EXISTENT-->[Send RESET]
+// UNRESOLVED!? Should queuing the request in case of single thread congestion because of WaitUseMutex
 void LOCALAPI CLowerInterface::OnGetConnectRequest()
 {
 	FSP_ConnectRequest *q = FSP_OperationHeader<FSP_ConnectRequest>();
@@ -253,20 +295,23 @@ void LOCALAPI CLowerInterface::OnGetConnectRequest()
 		return;
 	}
 
-	// Silently discard the request onto illegal or non-listening socket 
-	if (pSocket == NULL || ! pSocket->IsInUse())
-	{
-		pSocket = (*this)[q->params.listenerID];	// a dialect of MapSocket
-		if (pSocket == NULL || !pSocket->IsPassive())
-			return;
-	}
+	// Silently discard the request onto illegal or non-listening socket
+	pSocket = (*this)[q->params.listenerID];	// a dialect of MapSocket
+	if (pSocket == NULL || !pSocket->IsPassive())
+		return;
 
-	if (! pSocket->WaitUseMutex())
+	if (!pSocket->WaitUseMutex())
 	{
 #ifdef TRACE
 		printf_s("\nFiber#%u, lost of CONNECT_REQUEST due to lack of locks\n", pSocket->fidPair.source);
 #endif
 		return;
+	}
+	//
+	if (!pSocket->IsProcessAlive())
+	{
+		pSocket->AbortLLS();
+		goto l_return;
 	}
 
 	// cf. OnInitConnectAck() and SocketItemEx::AffirmConnect()
@@ -384,7 +429,8 @@ void LOCALAPI CLowerInterface::OnGetResetSignal()
 	}
 	else if(! pSocket->InState(LISTENING) && ! pSocket->InState(CLOSED))
 	{
-		if(pSocket->IsOutOfWindow(be32toh(reject.u.sn.initial)) != 0
+		int32_t offset = pSocket->IsOutOfWindow(be32toh(reject.u.sn.initial));
+		if ( (offset == 0 || offset == -1)	// RESET is out-of-band
 		&& pSocket->ValidateICC((FSP_NormalPacketHeader *) & reject, 0, pSocket->fidPair.peer, 0))
 		{
 			pSocket->DisposeOnReset();
@@ -398,7 +444,17 @@ void LOCALAPI CLowerInterface::OnGetResetSignal()
 
 
 
-// Check wether KEEP_ALIVE or it special norm, ACK_FLUSH, is valid
+// Given
+//	ControlBlock::seq_t &		the accumulative acknowledgement
+//	GapDescriptor * &			[_out_] the gap descriptor list
+//	int &						[_out_] number of gap descriptors in the list
+// Do
+//	Check wether KEEP_ALIVE or it special norm, ACK_FLUSH, is valid and output the gap descriptor list
+// Return
+//	true if the header packet, which is assumed to be KEEP_ALIVE or ACK_FLUSH packet, is valid
+//	false if it is not
+// Remark
+//	A KEEP_ALIVE or ACK_FLUSH packet may carry an out-of-band End-Of-transmit-Transaction flag. The flag is treated here
 // Side effect: if it is valid the gap descriptors are transformed to host byte order
 bool LOCALAPI CSocketItemEx::ValidateSNACK(ControlBlock::seq_t & ackSeqNo, FSP_SelectiveNACK::GapDescriptor * & gaps, int & n)
 {
@@ -410,7 +466,7 @@ bool LOCALAPI CSocketItemEx::ValidateSNACK(ControlBlock::seq_t & ackSeqNo, FSP_S
 #endif
 		return false;
 	}
-	// UNRESOLVED! Suppress duplication of KEEP_ALIVE or ACK_FLUSH
+
 	int32_t offset = IsOutOfWindow(headPacket->pktSeqNo);
 	if (offset > 0 || offset < -1)
 	{
@@ -491,6 +547,11 @@ bool LOCALAPI CSocketItemEx::ValidateSNACK(ControlBlock::seq_t & ackSeqNo, FSP_S
 
 
 
+// Given
+//	PktBufferBlock *	the packet buffer that holds ACK_CONNECT_REQ which might carry payload
+//	int					the content length of the packet buffer, which holds both the header and the optional payload
+// Do
+//	Check the validity of the ackowledgement to the CONNECT_REQUEST command and establish the ephemeral session key
 // Remark
 //	CONNECT_AFFIRMING-->/ACK_CONNECT_REQ/-->[API{callback}]
 //		|-->{Return Accept}-->PEER_COMMIT-->[Send PERSIST]{start keep-alive}
@@ -499,24 +560,40 @@ bool LOCALAPI CSocketItemEx::ValidateSNACK(ControlBlock::seq_t & ackSeqNo, FSP_S
 void CSocketItemEx::OnConnectRequestAck(PktBufferBlock *pktBuf, int lenData)
 {
 	TRACE_SOCKET();
+	if (!WaitUseMutex())
+	{
+#ifdef TRACE
+		printf_s("\nFiber#%u, lost ACK_CONNECT_REQ due to lack of locks\n", fidPair.source);
+#endif
+		return;
+	}
+	//
+	if (!IsProcessAlive())
+	{
+		AbortLLS();
+		goto l_return;
+	}
+
 	if(! InState(CONNECT_AFFIRMING))
 	{
-		BREAK_ON_DEBUG();	//TRACE_HERE("Get wandering ACK_CONNECT_REQ in non CONNECT_AFFIRMING state");
-		return;
+#ifdef TRACE
+		printf_s("\nFiber#%u, Get wandering ACK_CONNECT_REQ in non CONNECT_AFFIRMING state", fidPair.source);
+#endif
+		goto l_return;
 	}
 
 	lenData -= sizeof(FSP_AckConnectRequest);
 	if (lenData < 0 || lenData > MAX_BLOCK_SIZE)
 	{
 		BREAK_ON_DEBUG();	//TRACE_HERE("TODO: debug memory corruption error");
-		return;
+		goto l_return;
 	}
 
 	FSP_AckConnectRequest & response = *(FSP_AckConnectRequest *)& pktBuf->hdr;
 	if(be32toh(response.expectedSN) != pControlBlock->sendWindowFirstSN)
 	{
 		BREAK_ON_DEBUG();	//TRACE_HERE("Get an unexpected/out-of-order ACK_CONNECT_REQ");
-		return;
+		goto l_return;
 	}	// See also OnGetConnectRequest
 
 	ControlBlock::seq_t pktSeqNo = be32toh(response.sequenceNo);
@@ -526,7 +603,7 @@ void CSocketItemEx::OnConnectRequestAck(PktBufferBlock *pktBuf, int lenData)
 	if(skb == NULL)
 	{
 		BREAK_ON_DEBUG();	//TRACE_HERE("What? Cannot allocate the payload buffer for ACK_CONNECT_REQ?");
-		return;
+		goto l_return;
 	}
 
 	// ACK_CONNECT_REQ was not pushed into the queue so headpacket was not set
@@ -534,9 +611,9 @@ void CSocketItemEx::OnConnectRequestAck(PktBufferBlock *pktBuf, int lenData)
 	BYTE *ubuf;
 	if (skb == NULL || !CheckMemoryBorder(skb) || (ubuf = GetRecvPtr(skb)) == NULL)
 	{
-		BREAK_ON_DEBUG();	//TRACE_HERE("TODO: debug memory corruption error");
-		HandleMemoryCorruption();
-		return;
+		REPORT_ERRMSG_ON_TRACE("TODO: debug memory corruption error");
+		Recycle();			// Used to be HandleMemoryCorruption();
+		goto l_return;
 	}
 
 	// Now the packet can be legitimately accepted
@@ -567,36 +644,49 @@ void CSocketItemEx::OnConnectRequestAck(PktBufferBlock *pktBuf, int lenData)
 
 	// ephemeral session key material was ready OnInitConnectAck
 	InstallEphemeralKey();
-
 	SignalFirstEvent(FSP_NotifyAccepted);	// The initiator may cancel data transmission, however
+
+l_return:
+	SetMutexFree();
 }
 
 
 
 //PERSIST is the acknowledgement to ACK_CONNECT_REQ or MULTIPLY, and/or start a new transmit transaction
 //	CHALLENGING-->/PERSIST/
-//		--{EOT}-->[Send ACK_FLUSH]-->CLOSABLE-->[Notify]
+//		--{EOT}-->CLOSABLE-->[Send ACK_FLUSH]-->[Notify]
 //		--{otherwise}-->COMMITTED{start keep-alive}-->[Notify]
 //	ESTABLISHED-->/PERSIST/
-//		--{EOT}-->[Send ACK_FLUSH]PEER_COMMIT-->[Notify]
+//		--{EOT}-->PEER_COMMIT-->[Send ACK_FLUSH]-->[Notify]
 //		--{otherwise}-->[Send SNACK]{keep state}
 //	PEER_COMMIT-->/PERSIST/
 //		--[EOT]-->[Send ACK_FLUSH]{keep state}
+//			|-->{Not a new transaction}[End.]
+//			|-->{A new transaction}-->[Notify]
 //		--{otherwise}-->ACTIVE{restart keep-alive}
 //	COMMITTING2-->/PERSIST/
 //		--[EOT]-->[Send ACK_FLUSH]{keep state}
+//			|-->{Not a new transaction}[End.]
+//			|-->{A new transaction}-->[Notify]
 //		--{otherwise}-->COMMITTING{restart keep-alive}
 //	COMMITTED-->/PERSIST/
-//		--{EOT}-->[Send ACK_FLUSH]-->CLOSABLE-->[Notify]
+//		--{EOT}-->CLOSABLE-->[Send ACK_FLUSH]-->[Notify]
 //		--{otherwise}-->[Send SNACK]-->{keep state}
 //	CLOSABLE-->/PERSIST/
-//		--{EOT}-->[Send ACK_FLUSH]-->{keep state}
-//		--{otherwise}-->COMMITTED{restart keep_alive}{KEEP_ALIVE}
+//		|--{EOT}-->{keep state}[Send ACK_FLUSH]
+//			|-->{Not a new transaction}[End.]
+//			|-->{A new transaction}-->[Notify]
+//		|--{otherwise}-->COMMITTED{restart keep_alive}{KEEP_ALIVE}
 //  CLONING-->/PERSIST/
-//		--[EOT]-->[[Send ACK_FLUSH]-->PEER_COMMIT
-//		--{otherwise}-->ACTIVE-->[Send SNACK]
-// Remark
-//	PERSIST is instantly acknowledged to avoid possible dead-lock. See also KeepAlive()
+//		|-->{EOT}
+//			|-->{Not ULA-flushing}-->PEER_COMMIT
+//			|-->{ULA-flushing}-->CLOSABLE
+//		  >-->{stop keep-alive}[Send ACK_FLUSH]
+//		|-->{otherwise}
+//			|-->{Not ULA-flushing}-->ACTIVE
+//			|-->{ULA-flushing}-->COMMITTED
+//		  >-->[Send SNACK]
+//	  >-->[Notify]
 void CSocketItemEx::OnGetPersist()
 {
 	TRACE_SOCKET();
@@ -669,7 +759,6 @@ void CSocketItemEx::OnGetPersist()
 	bool committed = HasBeenCommitted();
 	if(committed)
 	{
-		SendAckFlush();	// UNRESOLVED! Suppress rate of sending ACK_FLUSH or KEEP_ALIVE
 		switch(lowState)
 		{
 		case CHALLENGING:
@@ -755,9 +844,10 @@ void CSocketItemEx::OnGetPersist()
 
 
 // KEEP_ALIVE is out-of-band and may carry a special optional header for multi-homed mobility support
-//	{ACTIVE, COMMITTING, PEER_COMMIT, COMMITTING2}-->/KEEP_ALIVE/
-//		<-->{keep state}[Retransmit selectively]
+//	{ACTIVE, COMMITTING, PEER_COMMIT, COMMITTING2}-->/KEEP_ALIVE/<-->{keep state}[Notify]
 //	{COMMITTED, CLOSABLE, PRE_CLOSED}-->/KEEP_ALIVE/<-->{keep state}{Update Peer's Authorized Addresses}
+// Remark
+//	KEEP_ALIVE may carry out-of-band EoT flag. See also ValidateSNACK
 void CSocketItemEx::OnGetKeepAlive()
 {
 #if defined(TRACE) && (TRACE & (TRACE_HEARTBEAT | TRACE_PACKET | TRACE_SLIDEWIN))
@@ -968,6 +1058,8 @@ void CSocketItemEx::OnGetEOT()
 // ACK_FLUSH, now a pure out-of-band control packet. A special norm of KEEP_ALIVE
 //	COMMITTING-->/ACK_FLUSH/-->COMMITTED-->[Notify]
 //	COMMITTING2-->/ACK_FLUSH/-->{stop keep-alive}CLOSABLE-->[Notify]
+// Remark
+//	Like KEEP_ALIVE, ACK_FLUSH may carry out-of-band EoT flag. See also OnGetEOT
 void CSocketItemEx::OnAckFlush()
 {
 	// As ACK_FLUSH is rare we trace every appearance
@@ -1007,12 +1099,13 @@ void CSocketItemEx::OnAckFlush()
 
 
 
-// RELEASE, no payload but consuming sequence space to fight back play - back DoS attack(via ValidateICC())
-//	tLastRecv is not modified
 // CLOSABLE-->/RELEASE/-->CLOSED-->[Send RELEASE]-->[Notify]
 // {COMMITTING2, PRE_CLOSED}-->/RELEASE/
 //    -->{stop keep-alive}CLOSED-->[Send RELEASE]-->[Notify]
-// Because duplicate RELEASE might be received AFTER the control block has been released already, do not TRACE_PACKET before check state
+// Remark
+//	RELEASE carries no payload but consumes the sequence space via ValidateICC to fight against play-back DoS attack
+//	Duplicate RELEASE might be received AFTER the control block has been released already, so check before trace
+// UNRESOLVED! To support connection context reuse/connection resurrection should not destroy the connection context
 void CSocketItemEx::OnGetRelease()
 {
 	if (!InState(COMMITTING2) && !InState(CLOSABLE) && !InState(PRE_CLOSED) && !InState(CLOSED))
@@ -1051,20 +1144,18 @@ void CSocketItemEx::OnGetRelease()
 
 	// There used to be 'connection resurrection'; might send redundant RELEASE, but it makes robustness
 	SetState(CLOSED);
+	SendRelease();
 	Notify(FSP_NotifyToFinish);
-	// As the acknowledgement
-	SendPacket<RELEASE>();
 	//
 	ReplaceTimer(TRANSIENT_STATE_TIMEOUT_ms);
 }
 
 
 
-//{ACTIVE, COMMITTING, PEER_COMMIT, COMMITTING2, COMMITTED, CLOSABLE, PRE_CLOSED, CLOSED}
+//{ACTIVE, COMMITTING, PEER_COMMIT, COMMITTING2, COMMITTED, CLOSABLE}
 //	|<-->/MULTIPLY/{duplication detected: retransmit acknowledgement}
 //	|<-->/MULTIPLY/{collision detected}[Send RESET]
 //	|-->/MULTIPLY/-->[API{Callback}]
-//	{COMMITTING, CLOSABLE}<-->/MULTIPLY/[Send RESET]
 // Remark
 //	It is assumed that ULA/DLL implements connection multiplication throttle control
 //	See also OnGetConnectRequest()
@@ -1072,7 +1163,7 @@ void CSocketItemEx::OnGetMultiply()
 {
 	TRACE_SOCKET();
 
-	if (!InStates(8, ESTABLISHED, COMMITTING, PEER_COMMIT, COMMITTING2, COMMITTED, CLOSABLE, PRE_CLOSED, CLOSED))
+	if (!InStates(6, ESTABLISHED, COMMITTING, PEER_COMMIT, COMMITTING2, COMMITTED, CLOSABLE))
 		return;
 
 	int32_t d = IsOutOfWindow(headPacket->pktSeqNo);
@@ -1148,7 +1239,7 @@ l_bailout:
 	newItem->CopyInPlainText((BYTE *)pFH + be16toh(pFH->hs.hsp), headPacket->lenData);
 
 	ControlBlock::PFSP_SocketBuf skb = ((CMultiplyBacklogItem *)newItem)->TempSocketBuf();
-	skb->version = pFH->hs.version;
+	skb->version = pFH->hs.major;
 	skb->opCode = pFH->hs.opCode;
 	skb->SetFlag<IS_FULFILLED>();
 	//^See also PlacePayload
@@ -1202,7 +1293,7 @@ int CSocketItemEx::PlacePayload()
 		memcpy(ubuf, (BYTE *)pHdr + be16toh(pHdr->hs.hsp), headPacket->lenData);
 		skb->SetFlag<END_OF_TRANSACTION>((pHdr->GetFlag<EndOfTransaction>() != 0));
 	}
-	skb->version = pHdr->hs.version;
+	skb->version = pHdr->hs.major;
 	// Force the last packet descriptor of the transaction in the receive buffer to be _COMMIT.
 	// See also Check HasBeenCommitted()
 	skb->opCode = skb->GetFlag<END_OF_TRANSACTION>() ? _COMMIT : pHdr->hs.opCode;

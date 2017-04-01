@@ -1,3 +1,32 @@
+/*
+ * FSP lower-layer service program, collection of the platform-dependent
+ * / IPC-machanism-dependent functions
+ *
+    Copyright (c) 2012, Jason Gao
+    All rights reserved.
+
+    Redistribution and use in source and binary forms, with or without modification,
+    are permitted provided that the following conditions are met:
+
+    - Redistributions of source code must retain the above copyright notice,
+      this list of conditions and the following disclaimer.
+
+    - Redistributions in binary form must reproduce the above copyright notice,
+      this list of conditions and the following disclaimer in the documentation
+	  and/or other materials provided with the distribution.
+
+    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+    AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+    IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+    ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+    LIABLE FOR ANY DIRECT, INDIRECT,INCIDENTAL, SPECIAL, EXEMPLARY, OR
+    CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+    SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+    INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+    CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+    ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+    POSSIBILITY OF SUCH DAMAGE.
+ */
 #include "fsp_srv.h"
 
 #include <MSTcpIP.h>
@@ -7,53 +36,16 @@
 #include <Psapi.h>
 #include <tchar.h>
 
+#pragma comment(lib, "Iphlpapi.lib")
+#pragma comment(lib, "Ws2_32.lib")
+#pragma comment(lib, "User32.lib")
+
+
 
 #define REPORT_WSAERROR_TRACE(s) (\
 	printf("\n/**\n * %s, line# %d\n * %s\n */\n", __FILE__, __LINE__, __FUNCDNAME__), \
 	ReportWSAError(s)\
 	)
-
-#pragma comment(lib, "Iphlpapi.lib")
-#pragma comment(lib, "Ws2_32.lib")
-#pragma comment(lib, "User32.lib")
-
-#if 0	// a reference declaration of packet header of IPv6 network layer, might be applicable in the kernel mode socket service
-#pragma pack(1)
-struct IPv6_HEADER
-{
-	union
-	{
-		struct
-		{
-			unsigned int version : 4;
-			unsigned int traffic_class : 8;
-			unsigned int flowLabel : 20;
-		};
-		unsigned long version_traffic_flow;
-	};
-	unsigned short payloadLenth;
-	unsigned char nextHeader;	// should be IPPROTO_FSP
-	unsigned char hopLimit;		// should be 255, the maximum
-	IN6_ADDR srcAddr;
-	IN6_ADDR dstAddr;
-	//
-	void Set(int m, const IN6_ADDR *a0, const IN6_ADDR *a1)
-	{
-#if ARCH_BIG_ENDIAN
-		version = 6;	// TODO: regres test under big-endian architecture
-#else
-		version_traffic_flow = 6 << 4;	// in network byte order, it would be correct
-#endif
-		payloadLenth = htobe16(m);
-		nextHeader = IPPROTO_FSP;
-		hopLimit = 255;		// hard-coded here
-		srcAddr = *a0;
-		dstAddr = *a1;
-	}
-};
-
-#pragma pack()
-#endif
 
 
 // The reference to the singleton instance of the lower service interface 
@@ -836,7 +828,7 @@ int CLowerInterface::AcceptAndProcess(SOCKET sdRecv)
 	DumpNetworkUInt16((uint16_t *) & pktBuf->hdr, sizeof(pktBuf->hdr) / 2);
 #endif
 	CSocketItemEx *pSocket = NULL;
-	switch(opCode)
+	switch (opCode)
 	{
 	case INIT_CONNECT:
 		OnGetInitConnect();
@@ -849,25 +841,14 @@ int CLowerInterface::AcceptAndProcess(SOCKET sdRecv)
 		break;
 	case ACK_CONNECT_REQ:	// connect request acknowledged
 		pSocket = MapSocket();
-		if(pSocket == NULL)
+		if (pSocket == NULL)
 			break;
-		//
-		if(! pSocket->WaitUseMutex())
-		{
-#ifdef TRACE
-			printf_s("\nFiber#%u, lost ACK_CONNECT_REQ due to lack of locks\n", pSocket->fidPair.source);
-#endif
-			pSocket = NULL;	// FreeBuffer(pktBuf);
-			break;
-		}
 		pSocket->OnConnectRequestAck(pktBuf, countRecv);
-		pSocket->SetMutexFree();
-		pSocket = NULL;	// FreeBuffer(pktBuf);
 		break;
 	case RESET:
 		OnGetResetSignal();
 		break;
-	// TODO: get hint of explicit congest notification
+		// TODO: get hint of explicit congest notification
 	case PERSIST:
 	case PURE_DATA:
 	case ACK_FLUSH:
@@ -875,50 +856,25 @@ int CLowerInterface::AcceptAndProcess(SOCKET sdRecv)
 	case MULTIPLY:
 	case KEEP_ALIVE:
 		pSocket = MapSocket();
-		if(pSocket == NULL)
+		if (pSocket == NULL)
 		{
 #ifdef TRACE
-			printf_s("Cannot map socket for local fiber#%u\n", GetLocalFiberID());
+			printf_s("Cannot map socket for local fiber#%u(_%X_)\n", GetLocalFiberID(), be32toh(GetLocalFiberID()));
 #endif
 			break;
 		}
-		if(!pSocket->IsInUse() || pSocket->lowState <= 0 || pSocket->lowState > CLOSED)
-		{
-#ifdef TRACE
-			printf_s("Socket#%p for local fiber#%u not in workable state: %s[%d]\n"
-				, pSocket, pSocket->fidPair.source
-				, stateNames[pSocket->lowState], pSocket->lowState);
-#endif
-			break;
-		}
-		// MULTIPLY is semi-out-of-band COMMAND starting from a fresh new ALFID. Note that pktBuf is the received
-		// In the CLONING state only PERSIST is the legitimate acknowledgement to MULTIPLY,
-		// while the acknowledgement itself shall typically originate from some new ALFID.
-		if(pSocket->fidPair.peer != pktBuf->idPair.source	// it should be rare
-		&& opCode != MULTIPLY && (pSocket->lowState != CLONING || opCode != PERSIST)
-		)
-		{
-#ifdef TRACE
-			printf_s("Source fiber ID #%u the packet does not matched context\n", GetRemoteFiberID());
-#endif
-			break;
-		}
-		//
 		pktBuf->lenData = countRecv - be16toh(pktBuf->GetHeaderFSP()->hs.hsp);
+		if (pktBuf->lenData < 0 || pktBuf->lenData > MAX_BLOCK_SIZE)
+			break;
+		// illegal packet is simply discarded!
 		pktBuf->pktSeqNo = be32toh(pktBuf->GetHeaderFSP()->sequenceNo);
 #if defined(TRACE) && (TRACE & TRACE_PACKET)
 		printf_s("%s[%d] packet #%u\n\tpayload length %d, to put onto the queue\n"
 			, opCodeStrings[opCode], opCode, pktBuf->pktSeqNo, pktBuf->lenData);
 #endif
-		if(pktBuf->lenData < 0 || pktBuf->lenData > MAX_BLOCK_SIZE)
-		{
-			pSocket->HandleMemoryCorruption();
-			pSocket = NULL;	// FreeBuffer(pktBuf);
-			break;
-		}
 		// save the source address temporarily as it is not necessariy legitimate
 		pSocket->sockAddrTo[MAX_PHY_INTERFACES] = addrFrom;
-		pSocket->HandleFullICC(pktBuf);
+		pSocket->HandleFullICC(pktBuf, opCode);
 		break;
 		// UNRECOGNIZED packets are simply discarded
 	}
@@ -1004,7 +960,13 @@ void LOCALAPI CLowerInterface::SendPrematureReset(uint32_t reasons, CSocketItemE
 }
 
 
-// return the WSA error number, which is greater than zero. may be zero if no error at all.
+
+// Given
+//	char *		The error message prefix string in multi-byte character set
+// Do
+//	Print the system message mapped to the last error to the standard output, prefixed by the given message prefix
+// Return
+//	the WSA error number, which is greater than zero. may be zero if no error at all.
 static int LOCALAPI ReportWSAError(char * msg)
 {
 	int	err = WSAGetLastError();
@@ -1016,6 +978,11 @@ static int LOCALAPI ReportWSAError(char * msg)
 }
 
 
+
+// Given
+//	int		the known error number
+// Do
+//	Print the standard system error message mapped to the error number to the standard output
 static void LOCALAPI ReportErrorAsMessage(int err)
 {
 	LPVOID lpMsgBuf;
@@ -1036,6 +1003,7 @@ static void LOCALAPI ReportErrorAsMessage(int err)
 }
 
 
+
 // Defined here only because this source file is shared across modules
 # define ERROR_SIZE	1024	// FormatMessage buffer size, no dynamic increase
 void TraceLastError(char * fileName, int lineNo, char *funcName, char *s1)
@@ -1048,45 +1016,6 @@ void TraceLastError(char * fileName, int lineNo, char *funcName, char *s1)
 		printf((char *)buffer);
 }
 
-
-
-/**
- *	POSIX gettimeofday(); get current UTC time
- */
-
-// Return the number of microseconds elapsed since Jan 1, 1970 UTC (unix epoch)
-timestamp_t NowUTC()
-{
-	// return the number of 100-nanosecond intervals since January 1, 1601 (UTC), in host byte order
-	FILETIME systemTime;
-	GetSystemTimeAsFileTime(& systemTime);
-
-	timestamp_t & t = *(timestamp_t *) & systemTime;
-	t /= 10;
-	return (t - DELTA_EPOCH_IN_MICROSECS);
-}
-    
-
-
-// Given
-//	DWORD	the process ID
-// Return
-//	Whether the identified process is still alive
-// Remark
-//	It is assumed that process ID is 'almost never' reused
-bool IsProcessAlive(DWORD idProcess)
-{
-	// PROCESS_QUERY_LIMITED_INFORMATION
-	HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION, false, idProcess);
-	DWORD exitCode;
-	if(hProcess == NULL)
-		return false;	// no such process at all. maybe information may not be queried, but it is rare
-	//
-	BOOL r = GetExitCodeProcess(hProcess, & exitCode);
-	CloseHandle(hProcess);
-
-	return (r && exitCode == STILL_ACTIVE);
-}
 
 
 /**
@@ -1111,6 +1040,28 @@ TimerWheel::~TimerWheel()
 
 
 
+// Return
+//	Whether the ULA process assocated with the LLS socket is still alive
+// Remark
+//	It is assumed that process ID is 'almost never' reused
+bool CSocketItemEx::IsProcessAlive()
+{
+	// PROCESS_QUERY_LIMITED_INFORMATION
+	HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION, false, idSrcProcess);
+	DWORD exitCode;
+	if (hProcess == NULL)
+		return false;	// no such process at all. maybe information may not be queried, but it is rare
+
+	BOOL r = GetExitCodeProcess(hProcess, &exitCode);
+	CloseHandle(hProcess);
+
+	return (r && exitCode == STILL_ACTIVE);
+}
+
+
+
+// Return
+//	true if the timer was set, false if it failed.
 bool CSocketItemEx::AddTimer()
 {
 	return (
@@ -1123,6 +1074,7 @@ bool CSocketItemEx::AddTimer()
 			) != FALSE
 		);
 }
+
 
 
 // Given
@@ -1146,6 +1098,9 @@ bool LOCALAPI CSocketItemEx::ReplaceTimer(uint32_t period)
 
 
 
+// Return
+//	true if the timer was set, false if it failed.
+// Remark
 // A lazy acknowledgement is hard coded to one RTT, with an implementation depended floor value
 bool CSocketItemEx::AddLazyAckTimer()
 {
@@ -1160,6 +1115,9 @@ bool CSocketItemEx::AddLazyAckTimer()
 
 
 
+// Return
+//	true if the timer was set, false if it failed.
+// Remark
 // A retransmission timer should be hard coded to 4 RTT, with an implementation depended floor value
 bool CSocketItemEx::AddResendTimer(uint32_t tPeriod_ms)
 {
@@ -1196,10 +1154,9 @@ void CSocketItemEx::RemoveTimers()
 
 
 // The OS-depending implementation of scheduling transmission queue
-// Send is effectively non-blocking. +WT_TRANSFER_IMPERSONATION?
 void CSocketItemEx::ScheduleEmitQ()
 {
-	QueueUserWorkItem(HandleSendQ, this, WT_EXECUTEINPERSISTENTTHREAD);
+	QueueUserWorkItem(HandleSendQ, this, WT_EXECUTEDEFAULT);
 }
 
 
@@ -1213,27 +1170,58 @@ void CSocketItemEx::ScheduleConnect(CommandNewSessionSrv *pCmd)
 
 
 
-// Used to be OS-dependent
+// Given
+//	PktBufferBlock *	Pointer to the buffer block that holds the remote packet received by the underling network service
+//	FSPOperationCode	The code point of the remote 'operation'
+// Do
+//	Process the packet saved in the buffer that is assumed to have a full ICC
+// Remark
+//	Used to be OS-dependent. TODO: fight against single thread congestion (because of WaitUseMutex) of the socket pool
 inline 
-void CSocketItemEx::HandleFullICC(PktBufferBlock *hdrPkt)
+void CSocketItemEx::HandleFullICC(PktBufferBlock *pktBuf, FSPOperationCode opCode)
 {
-	// Because some service call may recycle the FSP socket in a concurrent way
 	if (!WaitUseMutex())
-	{
-		BREAK_ON_DEBUG();
 		return;
+	// Because some service call may recycle the FSP socket in a concurrent way
+	if (lowState <= 0 || lowState > LARGEST_FSP_STATE)
+	{
+#ifdef TRACE
+		printf_s("Socket#%p for local fiber#%u(_%X_) not in use or not in workable state: %s[%d]\n"
+			, this, fidPair.source, be32toh(fidPair.source)
+			, stateNames[lowState], lowState);
+#endif
+		goto l_return;
+	}
+	// We assume that it costs neglectible time to test whether the ULA process is alive
+	if (!IsProcessAlive())
+	{
+#ifdef TRACE
+		printf_s("Socket#%p for local fiber#%u(_%X_), ULA not alive. State: %s[%d]\n"
+			, this, fidPair.source, be32toh(fidPair.source)
+			, stateNames[lowState], lowState);
+#endif
+		AbortLLS();
+		goto l_return;
 	}
 
-	if (lowState == NON_EXISTENT || pControlBlock == NULL)
+	// MULTIPLY is semi-out-of-band COMMAND starting from a fresh new ALFID. Note that pktBuf is the received
+	// In the CLONING state only PERSIST is the legitimate acknowledgement to MULTIPLY,
+	// while the acknowledgement itself shall typically originate from some new ALFID.
+	if (fidPair.peer != pktBuf->idPair.source	// it should be rare
+		&& opCode != MULTIPLY && (lowState != CLONING || opCode != PERSIST)
+		)
 	{
-		SetMutexFree();
-		return;
+#ifdef TRACE
+		printf_s("Source fiber ID #%u the packet does not matched context\n", pktBuf->idPair.source);
+#endif
+		goto l_return;
 	}
+	//
 
 	// synchronize the state in the 'cache' and the real state
 	lowState = pControlBlock->state;
-	headPacket = hdrPkt;
-	switch (hdrPkt->GetHeaderFSP()->hs.opCode)
+	headPacket = pktBuf;
+	switch (opCode)
 	{
 	case PERSIST:
 		OnGetPersist();
@@ -1254,24 +1242,28 @@ void CSocketItemEx::HandleFullICC(PktBufferBlock *hdrPkt)
 		OnGetKeepAlive();
 	}
 	//
+l_return:
 	SetMutexFree();
 }
 
 
 
-/**
- *	The backlog of accepted remote packets
- */
+// Return true if successed to obtain the mutex lock, false if waited but timed-out
 bool CSocketItemEx::WaitUseMutex()
 {
 	uint64_t t0 = GetTickCount64();
 	while (_InterlockedCompareExchange8(& locked, 1, 0) != 0)
 	{
-		if (GetTickCount64() - t0 > MAX_LOCK_WAIT_ms)
+		if (! IsInUse() || GetTickCount64() - t0 > MAX_LOCK_WAIT_ms)
 			return false;
 		Sleep(50);	// if there is some thread that has exclusive access on the lock, wait patiently
 	}
-	return true;
+
+	if(IsInUse())
+		return true;
+	//
+	locked = 0;
+	return false;
 }
 
 
@@ -1286,9 +1278,24 @@ void CSocketItemEx::SetMutexFree()
 
 
 
+/*
+ * The OS-dependent CommandNewSessionSrv constructor
+ */
+CommandNewSessionSrv::CommandNewSessionSrv(const CommandToLLS *p1)
+{
+	CommandNewSession *pCmd = (CommandNewSession *)p1;
+	memcpy(this, pCmd, sizeof(CommandToLLS));
+	hMemoryMap = pCmd->hMemoryMap;
+	dwMemorySize = pCmd->dwMemorySize;
+	hEvent = OpenEvent(EVENT_MODIFY_STATE, FALSE, (LPCSTR)pCmd->szEventName);
+}
+
+
+
 /**
  *	The OS-depending callback functions of QueueUserWorkItem
  */
+
 // For ScheduleEmitQ
 DWORD WINAPI HandleSendQ(LPVOID p)
 {
@@ -1328,6 +1335,7 @@ DWORD WINAPI HandleConnect(LPVOID p)
 // TODO: UNRESOLVED! is it multi-home awared?
 // Given
 //	ULONG	number of WSABUF descriptor to gathered in sending
+//	ScatteredSendBuffers
 // Return
 //	number of bytes sent, or 0 if error
 int CSocketItemEx::SendPacket(register ULONG n1, ScatteredSendBuffers s)
@@ -1409,6 +1417,21 @@ int CSocketItemEx::SendPacket(register ULONG n1, ScatteredSendBuffers s)
  *	Manipulation of connection request queue
  */
 
+bool CLightMutex::WaitSetMutex()
+{
+	uint64_t t0 = GetTickCount64();
+	while(_InterlockedCompareExchange8(& mutex, 1, 0))
+	{
+		if(GetTickCount64() - t0 > MAX_LOCK_WAIT_ms)
+		{
+			BREAK_ON_DEBUG();
+			return false;
+		}
+		//
+		Sleep(0);	// if there is some thread that has exclusive access on the lock, wait patiently
+	}
+	return true;
+}
 
 
 // Given
@@ -1445,9 +1468,14 @@ int ConnectRequestQueue::Push(const CommandNewSessionSrv *p)
 //	-1	if no item could be removed
 int ConnectRequestQueue::Remove(int i)
 {
+	WaitSetMutex();
 	// 
-	if(tail < 0 || tail >= CONNECT_BACKLOG_SIZE)
+	if (tail < 0 || tail >= CONNECT_BACKLOG_SIZE)
+	{
 		REPORT_ERRMSG_ON_TRACE("check tail in case of falling into dead loop");
+		SetMutexFree();
+		return -1;
+	}
 	//
 	if(mayFull == 0 && head == tail)
 	{
@@ -1735,7 +1763,9 @@ l_bailout:
 }
 
 
-
+/**
+ * Mobility support, in FSP over IPv6 only.
+ */
 #ifndef OVER_UDP_IPv4
 // Mark sdRecv as disabled
 inline void	CLowerInterface::DisableSocket(SOCKET sdRecv)
@@ -1769,7 +1799,7 @@ inline bool CLowerInterface::IsPrefixDuplicated(int ifIndex, PIN6_ADDR p)
 }
 
 
-//
+
 // Given
 //	PFSP_SINKINF 		[out] pointer to the local 'sink' info to be filled
 //	ALFID_T				the intent ALFID
@@ -1785,8 +1815,6 @@ inline bool CLowerInterface::IsPrefixDuplicated(int ifIndex, PIN6_ADDR p)
 //	false if no path exists, typically because all interfaces were disabled
 /**
  * Remark
-
-
 	Prefix/Precedence/Label/Usage
 	::1/128			50 0 Localhost 
 	::/0			40 1 Default unicast 
@@ -1797,16 +1825,6 @@ inline bool CLowerInterface::IsPrefixDuplicated(int ifIndex, PIN6_ADDR p)
 	::/96 1			3 IPv4-compatible addresses (deprecated) 
 	fec0::/10		1 11 Site-local address (deprecated) 
 	3ffe::/16		1 12 6bone (returned) 
-
-	#define IN6ADDR_LINKLOCALPREFIX_INIT { 0xfe, 0x80, }
-	#define IN6ADDR_ULAPREFIX_INIT {0xfc }	// A unique local address (ULA) is an IPv6 address in the block fc00::/7
-
-	#define IN6ADDR_6TO4PREFIX_INIT { 0x20, 0x02, }
-	#define IN6ADDR_TEREDOPREFIX_INIT { 0x20, 0x01, 0x00, 0x00, }
-
-	extern CONST IN6_ADDR in6addr_linklocalprefix;
-	extern CONST IN6_ADDR in6addr_6to4prefix;
-	extern CONST IN6_ADDR in6addr_teredoprefix;
  */
 bool LOCALAPI CLowerInterface::SelectPath(PFSP_SINKINF pNear, ALFID_T nearId, NET_IFINDEX ifIndex, const SOCKADDR_INET *sockAddrTo)
 {
@@ -1890,40 +1908,6 @@ l_matched:
 
 
 
-// The ALFID part == 0 is reserved as the network identifier
-// == 1 TCP Port Service Multiplexer(TCPMUX)
-/**
-	The port numbers in the range from 0 to 1023 are the well - known ports or system ports.
-	0 UDP Reserved Official
-	1 TCP UDP TCP Port Service Multiplexer(TCPMUX) Official
-	7 TCP UDP Echo Protocol Official
-	13 TCP UDP Daytime Protocol(RFC 867) Official
-	22
-		TCP
-		SCTP
-		UDP Secure Shell(SSH), secure logins, file transfers(scp, sftp) and port forwarding Official
-	37 TCP UDP Time Protocol Official
-	39 TCP UDP Resource Location Protocol[10](RLP)
-		¡ªused for determining the location of higher level services from hosts on a network Official
-	42 TCP UDP ARPA Host Name Server Protocol Official
-	43 TCP UDP WHOIS protocol Official
-	53 TCP UDP Domain Name System(DNS) Official
-	67 TCP UDP Bootstrap Protocol(BOOTP) server; also used by Dynamic Host Configuration Protocol(DHCP) Official
-	68 TCP UDP Bootstrap Protocol(BOOTP) client; also used by Dynamic Host Configuration Protocol(DHCP) Official
-	69 TCP UDP Trivial File Transfer Protocol(TFTP) Official
-	70 TCP UDP Gopher protocol Official
-	79 TCP UDP Finger protocol Official
-	80
-		TCP
-		SCTP
-		UDP Hypertext Transfer Protocol(HTTP)[13] Official
-	80  UDP QUIC(from Chromium) for HTTP Unofficial
-	443
-		TCP
-		SCTP
-		UDP Hypertext Transfer Protocol over TLS / SSL(HTTPS) Official
-		UDP QUIC(from Chromium) for HTTPS Unofficial
- **/
 // Note that at run time adding an IPv6 address is done when MibParameterChange event is received
 // This simple algorithm support adding new IPv6 address once only!
 inline void CLowerInterface::OnAddingIPv6Address(NET_IFINDEX ifIndex, const SOCKADDR_IN6 & sin6Addr)

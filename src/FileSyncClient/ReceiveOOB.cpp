@@ -1,10 +1,17 @@
+/**
+ * A small group of functions in FileSyncClient. The group meant to handle the connection multiplication instance
+ */
 #include "stdafx.h"
 
+
+// A shared global parameter to configure the time to wait the connection multiplication request is sent and acknowledged:
 int32_t ticksToWait = 6000;	// by default there is no reverse socket and wait for about 300 seconds to wait one. see also main()
 
+
+// Forward definition of the call back function to be executed when the clone connection is closed
 static void FSPAPI onShutdown(FSPHANDLE hRev, FSP_ServiceCode code, int value)
 {
-	printf_s("Socket %p, the clone session has been shutdown.\n", hRev);
+	printf_s("Socket %p, the clone connection has been shutdown.\n", hRev);
 	if(code != FSP_NotifyRecycled)
 		printf_s("Should got ON_RECYCLED, but service code = %d, return %d\n", code, value);
 
@@ -12,6 +19,9 @@ static void FSPAPI onShutdown(FSPHANDLE hRev, FSP_ServiceCode code, int value)
 }
 
 
+
+// Forward definition of the call back function to be executed when
+// data expected in the clone connection has been received.
 static int FSPAPI  onSignatureReceived(FSPHANDLE hRev, void * buf, int32_t length, BOOL eot)
 {
 	printf_s("Socket %p, %d bytes received, message:\n", hRev, length);
@@ -22,7 +32,8 @@ static int FSPAPI  onSignatureReceived(FSPHANDLE hRev, void * buf, int32_t lengt
 }
 
 
-// This function is for tracing purpose
+
+// The entry function of the group. Most statements in this function is for tracing purpose.
 int	FSPAPI onMultiplying(FSPHANDLE hRev, PFSP_SINKINF p, PFSP_IN6_ADDR remoteAddr)
 {
 	ticksToWait = INT32_MAX;	// wait shutdown almost forever

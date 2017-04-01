@@ -152,16 +152,17 @@ struct FSP_SocketParameter
 	//
 	const void *	welcome;		// default welcome message, may be NULL
 	unsigned short	len;			// length of the default welcome message
-	union USocketFlags
+	union
 	{
 		struct
 		{
 			unsigned short	milky:		1;
-			unsigned short	RESERVED:	14;
+			unsigned short	RESERVED:	13;
 			unsigned short	passive:	1;	// internal use only, shall be ignored by ULA
-		} st;
-		unsigned short flags; //[_In_] the requested features [_Out] the error reason
-	} u;
+			unsigned short	isError:	1;	// if set, 'flags' is the error reason
+		};
+		short flags;	// [_In_: >= 0] the requested features [_Out_: might < 0] the error reason
+	};
 	int32_t		ifDefault;	// default interface, only for send
 	//
 	int32_t		recvSize;	// [_In_] default size of the receive window [_Out] size of the allocated receive buffer segment

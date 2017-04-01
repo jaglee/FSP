@@ -94,20 +94,31 @@ void GCM_AES_SetIV(GCM_AES_CTX *ctx, const uint8_t *IV)
 
 
 
+// Given
+//	GCM_AES_CTX *	pointer to the security context to set
+//	const uint8_t * pointer to the key input buffer
+//	int				number of octets the key occupied in the input buffer
+// Do
+//	Initialize the security context with the given key
+// Remark
+//	Salt is OPTIONAL. It is exploited as described in RFC4543
+//	bytesK must be 16, 24 or 32 without salt, or 20, 28, 40 with salt
 void GCM_AES_SetKey(GCM_AES_CTX *ctx, const uint8_t *K, int bytesK)
 {
 	// AES key schedule
-	ctx->rounds = rijndaelKeySetupEnc(ctx->K, K, bytesK * 8);
+	ctx->rounds = rijndaelKeySetupEnc(ctx->K, K, (bytesK & 0xF8) * 8);
 
 	// The HASH sub-key
 	bzero(ctx->H, GCM_BLOCK_LEN);
 	bzero(ctx->X, GCM_BLOCK_LEN);
 	rijndaelEncrypt(ctx->K, ctx->rounds, ctx->X, ctx->H);
 
-	// Salt of J0/pre-Initial Counter Block, as to RFC4543
-	// assert(GMAC_SALT_LEN == sizeof(uint32_t));
-	*(uint32_t *)ctx->J = *(uint32_t *)ctx->H ^ *(uint32_t *)K;
+	if ((bytesK & 7))
+		*(uint32_t *)ctx->J = *(uint32_t *)(K + (bytesK & 0xF8));
+	else
+		*(uint32_t *)ctx->J = *(uint32_t *)ctx->H ^ *(uint32_t *)K;;
 }
+
 
 
 

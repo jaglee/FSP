@@ -1,6 +1,6 @@
 /*
  * DLL to service FSP upper layer application
- * part of the SessionCtrl class, Reset and Shutdown
+ * Shutdown, Dispose and related functions
  *
     Copyright (c) 2012, Jason Gao
     All rights reserved.
@@ -36,7 +36,7 @@ int FSPAPI Dispose(FSPHANDLE hFSPSocket)
 	register CSocketItemDl *p = (CSocketItemDl *)hFSPSocket;
 	try
 	{
-		return p->Recycle();
+		return p->Dispose();
 	}
 	catch(...)
 	{
@@ -47,7 +47,7 @@ int FSPAPI Dispose(FSPHANDLE hFSPSocket)
 
 
 // return 0 if no error, negative if error, positive if warning
-// an ill-behaviored ULA would be punished by dead-lock
+// an ill-behaviored ULA could be punished by dead-lock
 int CSocketItemDl::Recycle()
 {
 	if(! IsInUse())
@@ -62,8 +62,7 @@ int CSocketItemDl::Recycle()
 	if(b)
 		return 0;	// Free the socket item when FSP_Recycle called back
 	// Shall be rare:
-	socketsTLB.FreeItem(this);
-	Disable();
+	SelfNotify(FSP_NotifyRecycled);
 	BREAK_ON_DEBUG();
 	return -EIO;
 }
@@ -99,12 +98,12 @@ int FSPAPI Shutdown(FSPHANDLE hFSPSocket, NotifyOrReturn fp1)
 }
 
 
+
 // [API:Shutdown]
-//	ESTABLISHED-->COMMITTING {chain async-shutdown}
-//	COMMITTING <--> {chain async-shutdown}
-//	PEER_COMMIT-->COMMITTING2{chain async-shutdown}
-//	COMMITTING2<--> {chain async-shutdown}
 //	CLOSABLE-->PRE_CLOSED-->[Send RELEASE]
+//	PRE_CLOSED<-->{keep state}
+//	{ESTABLISHED, COMMITTING, PEER_COMMIT, COMMITTED, COMMITTING2}{try to commit first, chain async-shutdown}
+//	{otherwise: connection not ever established yet}-->{Treat 'Shutdown' command as 'Abort'}
 //	ALWAYS assume that only after it has finished receiving is shutdown called
 int LOCALAPI CSocketItemDl::Shutdown(NotifyOrReturn fp1)
 {
@@ -199,14 +198,18 @@ int CSocketItemDl::Commit()
 }
 
 
+
 // Callback for SHUTDOWN, triggered by the near end, to recycle the socket
 // Important! ULA should not access the socket itself anyway
-// UNRESOLVED!? Should it be thread-safe?!
+// Assume that the caller make the decision whether it should be thread-safe
+// In responding to recycle request, normal Shutdown takes precedence over Abort
 void CSocketItemDl::RespondToRecycle()
 {
 	NotifyOrReturn fp1 = (NotifyOrReturn)InterlockedExchangePointer((PVOID *)& fpRecycled, NULL);
-	socketsTLB.FreeItem(this);
+	CSocketItemDl::FreeItem(this);
 	Disable();
 	if (fp1 != NULL)
 		fp1(this, FSP_NotifyRecycled, 0);
+	else if(isDisposing)
+		NotifyError(FSP_NotifyRecycled, 0);
 }

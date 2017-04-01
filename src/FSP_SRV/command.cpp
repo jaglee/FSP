@@ -1,6 +1,6 @@
 /*
  * FSP lower-layer service program, handle command given by the upper layer application
- * Platform-dependent / IPC-machanism-dependent
+ * This module meant to be platform-independent part while platform-dependent part
  *
     Copyright (c) 2012, Jason Gao
     All rights reserved.
@@ -39,11 +39,14 @@ static ConnectRequestQueue connectRequests;
 
 // Register a passive FSP socket
 // Given
-//	_In_ pCmd point to the command context given by ULA
-// Return
-//	Nothing
+//	CommandNewSessionSrv&	the command context given by ULA
+// Do
+//	Register a listening FSP socket at the specific applicatio layer fiberID
 // Remark
-//	NON_EXISTENT-->LISTENING
+//	If the command context memory block cannot be mapped into the LLS's memory space the function fails
+//	The notice queue of the command context is prefilled with the FSP_IPC_CannotReturn notice
+//	If 'Listen' succeeds the notice will be replaced by FSP_NotifyListening
+//	or else LLS triggers the upper layer DLL to handle the prefilled notice
 void LOCALAPI Listen(CommandNewSessionSrv &cmd)
 {
 	if(cmd.hEvent == NULL)
@@ -56,57 +59,76 @@ void LOCALAPI Listen(CommandNewSessionSrv &cmd)
 	if(socketItem == NULL)
 	{
 		REPORT_ERRMSG_ON_TRACE("Multiple call to listen on the same local fiber ID?");
-		::SetEvent(cmd.hEvent);
-		return;
+		goto l_bailout1;
 	}
 
-	socketItem->Listen(cmd);
+	if (!socketItem->MapControlBlock(cmd))
+	{
+		REPORT_ERRMSG_ON_TRACE("Fatal situation when to share memory with DLL");
+		goto l_bailout2;
+	}
+
+	socketItem->Listen();
+	return;
+
+l_bailout2:
+	(CLowerInterface::Singleton())->FreeItem(socketItem);
+l_bailout1:
+	::SetEvent(cmd.hEvent);
+	return;
 }
 
 
 
 // Register an initiative FSP socket
 // Given
-//	_In_ pCmd point to the command context given by ULA
-// Return
-//	Nothing
+//	CommandNewSessionSrv&	the command context given by ULA
+// Do
+//	Map the command context and put the connect request into the queue
+//	LLS try to make the connection request to the remote end in the queued thread
+// Remark
+//	If the command context memory block cannot be mapped into LLS's memory space the function fails
+//	The notice queue of the command context is prefilled with an FSP_IPC_CannotReturn notice
+//	If the function succeeds the notice will be replaced by FSP_NotifyListening
+//	or else LLS triggers the upper layer DLL to handle the prefilled notice
 void LOCALAPI Connect(CommandNewSessionSrv &cmd)
 {
 	if(cmd.hEvent == NULL)
 		return;		// Do not trace, in case logging is overwhelmed
 
-	if( (cmd.index = connectRequests.Push(&cmd)) < 0)
-l_return:
-	{
-		::SetEvent(cmd.hEvent);
-		return;
-	}
+	if ((cmd.index = connectRequests.Push(&cmd)) < 0)
+		goto l_bailout1;
 
 	CSocketItemEx *socketItem = (CLowerInterface::Singleton())->AllocItem();
-	if(socketItem == NULL)
-		goto l_return;	// Do not trace, in case logging is overwhelmed
+	if (socketItem == NULL)
+		goto l_bailout2;
 
-	if(! socketItem->MapControlBlock(cmd))
-	{
-		(CLowerInterface::Singleton())->FreeItem(socketItem);
-		goto l_return;	// Do not trace, in case logging is overwhelmed
-	}
+	if (!socketItem->MapControlBlock(cmd))
+		goto l_bailout3;
 
 	socketItem->ScheduleConnect(&cmd);
+	return;
+
+l_bailout3:
+	(CLowerInterface::Singleton())->FreeItem(socketItem);
+l_bailout2:
+	connectRequests.Remove(cmd.index);
+l_bailout1:
+	::SetEvent(cmd.hEvent);
 }
 
 
 
-// Register an incarnated FSP socket
 // Given
-//	CommandNewSession	the synchronization command context
+//	CommandNewSessionSrv&	the synchronization command context
 // Do
-//	Lookup the SCB item according to the give fiber ID in the command context, if an existing busy item
-//	was found (it is a rare but possible collision) return failure
-//	if a free item was found, map the control block into process space of LLS
-//	and go on to emit the command and optional data packets in the send queue
+//	Map the control block into process space of LLS and go on to emit the head packet of the send queue
+//	Register an incarnated FSP socket
 // Remark
-//	An FSP socket is incarnated when a connection is cloned, or a listening socket is forked on CONNECT_REQUEST or MULTIPLY received
+//	By lookup the SCB item according to the give fiber ID in the command context, the rare but possible
+//	collision of the near-end ALFID would be filtered out firstly
+//	An FSP socket is incarnated when a listening socket is forked on CONNECT_REQUEST,
+//	or a connection is cloned on MULTIPLY received
 void LOCALAPI Accept(CommandNewSessionSrv &cmd)
 {
 	if(cmd.hEvent == NULL)
@@ -194,13 +216,18 @@ l_return:
 //	CommandToLLS		The service command requested by ULA
 // Do
 //	Excute ULA's request
-//	Send, so is connect, is special in the sense that it may take such a long time to complete
-//	that if it gains exclusive access of the socket too many packets might be lost
-//	when there are too many packets in the send queue
+// TODO: add it to the task queue to avoid head congestion
 void CSocketItemEx::ProcessCommand(CommandToLLS *pCmd)
 {
-	WaitUseMutex();
-	if(!IsInUse() || lowState <= 0 || lowState > LARGEST_FSP_STATE)
+	if (!WaitUseMutex())
+	{
+#ifdef TRACE
+		printf_s("ProcessCommand of socket %p: possible dead-lock, inUse = %d\n", this, inUse);
+#endif
+		return;
+	}
+
+	if(lowState <= 0 || lowState > LARGEST_FSP_STATE)
 	{
 #ifdef TRACE
 		printf_s("Socket(%p) is not in working state, inUse = %d, %s[%d]\n", this, inUse, stateNames[lowState], lowState);
@@ -227,10 +254,20 @@ void CSocketItemEx::ProcessCommand(CommandToLLS *pCmd)
 		UrgeCommit();
 		break;
 	case FSP_Shutdown:
-		SendPacket<RELEASE>();
+		SendRelease();
 		break;
 	case FSP_InstallKey:
 		InstallSessionKey((CommandInstallKey &)*pCmd);
+		break;
+	case FSP_AdRecvWindow:
+		if (InState(PEER_COMMIT) || InState(COMMITTING2) || InState(CLOSABLE))
+			SendAckFlush();
+		else if (InState(ESTABLISHED) || InState(COMMITTING) || InState(COMMITTED))
+			SendKeepAlive();
+#ifndef NDEUBG
+		else
+			printf_s("Implementation error: maynot advertise receive window size in state %s(%d)\n", stateNames[lowState], lowState);
+#endif
 		break;
 	default:
 #ifndef NDEUBG
@@ -243,23 +280,13 @@ void CSocketItemEx::ProcessCommand(CommandToLLS *pCmd)
 }
 
 
-// Given
-//	CommandNewSession
-// Do
-//	Routine works of registering a passive FSP socket
-void CSocketItemEx::Listen(CommandNewSessionSrv &cmd)
-{
-	if(! MapControlBlock(cmd))
-	{
-		REPORT_ERRMSG_ON_TRACE("Fatal situation when to share memory with DLL");
-		(CLowerInterface::Singleton())->FreeItem(this);
-		::SetEvent(cmd.hEvent);
-		return;
-	}
 
-	// bind to the interface as soon as the control block mapped into server's memory space
-	fidPair.source = cmd.fiberID;
+// Do
+//	Bind to the interface as soon as the control block mapped into server's memory space
+void CSocketItemEx::Listen()
+{
 	InitAssociation();
+	lowState = LISTENING;
 	SignalFirstEvent(FSP_NotifyListening);
 }
 
@@ -270,7 +297,7 @@ void CSocketItemEx::Listen(CommandNewSessionSrv &cmd)
 void CSocketItemEx::Connect()
 {
 #ifdef TRACE
-	printf_s("Try to make connection to %s (@local fiber#%u)\n", PeerName(), fidPair.source);
+	printf_s("Try to make connection to %s (@local fiber#%u(_%X_)\n", PeerName(), fidPair.source, be32toh(fidPair.source));
 #endif
 	char nodeName[INET6_ADDRSTRLEN];
 	char *peerName = PeerName();
@@ -464,17 +491,6 @@ int CSocketItemEx::ResolveToIPv6(const char *nodeName)
 
 	freeaddrinfo(pAddrInfo);
 	return n;
-}
-
-
-// UNRESOLVED! It is OS-dependent, however.
-CommandNewSessionSrv::CommandNewSessionSrv(const CommandToLLS *p1)
-{
-	CommandNewSession *pCmd = (CommandNewSession *)p1;
-	memcpy(this, pCmd, sizeof(CommandToLLS));
-	hMemoryMap = pCmd->hMemoryMap;
-	dwMemorySize = pCmd->dwMemorySize;
-	hEvent = OpenEvent(EVENT_MODIFY_STATE, FALSE, (LPCSTR)pCmd->szEventName);
 }
 
 

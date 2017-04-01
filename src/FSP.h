@@ -171,6 +171,7 @@ typedef enum: char
 	FSP_Shutdown,		// close the connection
 	FSP_InstallKey,		// install the authenticated encryption key
 	FSP_Multiply,		// clone the connection, make SCB of LLS synchronized with DLL
+	FSP_AdRecvWindow,	// force to advertise the receive window ONCE by send a SNACK/ACK_FLUSH
 	// 16~23: LLS to DLL in the backlog
 	FSP_NotifyListening = FSP_Listen,		// a reverse command to signal success execution of FSP_Listen
 	FSP_NotifyAccepting = FSP_Accept,		// a reverse command to make context ready
@@ -263,9 +264,9 @@ struct PairALFID
 
 typedef	struct FSP_HeaderSignature
 {
-	uint8_t				version;
-	FSPOperationCode	opCode;
 	uint16_t			hsp;
+	uint8_t				major;
+	FSPOperationCode	opCode;
 } *PFSP_HeaderSignature;
 
 

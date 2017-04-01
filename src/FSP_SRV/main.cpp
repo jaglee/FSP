@@ -3,6 +3,7 @@
  * AND the security related issues.
  * Platform-dependent / IPC-machanism-dependent
  * Garbage Collection is treated as a security-related issue.
+ * The FSP Finite State Machine is splitted across command.cpp, remote.cpp and timers.cpp
  *
     Copyright (c) 2012, Jason Gao
     All rights reserved.
@@ -42,7 +43,6 @@ static void GetServiceSA(PSECURITY_ATTRIBUTES);
 // forward declaration of the top-level routine to process the ULA's commands
 static void LOCALAPI ProcessCommand(HANDLE);
 
-// The FSP Finite State Machine is splitted across command.cpp, remote.cpp and timers.cpp
 extern "C"
 int main(int argc, char * argv[])
 {
@@ -197,8 +197,12 @@ static void LOCALAPI ProcessCommand(HANDLE md)
 		if(nBytesRead < sizeof(struct CommandToLLS))
 			continue;
 #if defined(TRACE) && (TRACE & TRACE_ULACALL)
-		printf_s("\n\n#%d command, fiber#%u, %s(code = %d, size = %d)\n"
-			, n, pCmd->fiberID, noticeNames[pCmd->opCode], pCmd->opCode, nBytesRead);
+		printf_s("\n\n#%d command"
+			", fiber#%X(_%u_)"
+			", %s(code = %d, size = %d)\n"
+			, n
+			, pCmd->fiberID, be32toh(pCmd->fiberID)
+			, noticeNames[pCmd->opCode], pCmd->opCode, nBytesRead);
 #endif
 		//
 		switch(pCmd->opCode)
@@ -232,10 +236,10 @@ static void LOCALAPI ProcessCommand(HANDLE md)
 			if(pSocket == NULL)
 			{
 #if defined(TRACE) && (TRACE & TRACE_ULACALL)
-				printf_s("Erratic!%s (code = %d) called for invalid local fiber#%u\n"
+				printf_s("Erratic!%s (code = %d) called for invalid local fiber#%u(_%X_)\n"
 					, opCodeStrings[pCmd->opCode]
 					, pCmd->opCode
-					, pCmd->fiberID);
+					, pCmd->fiberID, be32toh(pCmd->fiberID));
 #endif
 				break;
 			}
@@ -255,10 +259,3 @@ static void LOCALAPI ProcessCommand(HANDLE md)
 	printf("Fatal! Read mailslot error, command channel broken\n");
 #endif
 }
-
-
-//
-// TODO: garbage collector, those whose parent process is inactive should be collected!
-// Non-empty notice queue
-// IsProcessAlive
-//

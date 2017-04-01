@@ -1,6 +1,6 @@
 /*
  * DLL to service FSP upper layer application
- * Session control functions: the passive and initiative creation of FSP connection
+ * Establishment of the FSP connections
  *
     Copyright (c) 2012, Jason Gao
     All rights reserved.
@@ -32,11 +32,11 @@
 #include <stdlib.h>
 #include <tchar.h>
 
+
 //[API: Listen]
 //	NON_EXISTENT-->LISTENING
 // Given
-//	const PFSP_IN6_ADDR		list of IPv6 addresses that the passive socket to listen at.
-//							terminated with IN6ADDR_ANY_INIT or IN6ADDR_LOOPBACK_INIT
+//	const PFSP_IN6_ADDR		the pointer to the IPv6 address that the passive socket to listen at
 //	PFSP_Context			the pointer to the parameter structure of the socket to create
 // Return
 //	NULL if it fails immediately, or else 
@@ -50,12 +50,12 @@ FSPHANDLE FSPAPI ListenAt(const PFSP_IN6_ADDR listenOn, PFSP_Context psp1)
 	// TODO: The welcome message CAN be larger
 	if(psp1->len > MAX_BLOCK_SIZE - sizeof(FSP_AckConnectRequest))
 	{
+		psp1->flags = -EDOM;
 		// UNRESOLVED! Set last error?
 		return NULL;
 	}
 
-	// TODO: UNRESOLVED! if srcAddr is NULL, allocate an interface IP automatically
-	psp1->u.st.passive = 1;	// override what is provided by ULA
+	psp1->passive = 1;	// override what is provided by ULA
 	CommandNewSession objCommand;
 	//
 	CSocketItemDl *socketItem = CSocketItemDl::CreateControlBlock(listenOn, psp1, objCommand);
@@ -65,8 +65,8 @@ FSPHANDLE FSPAPI ListenAt(const PFSP_IN6_ADDR listenOn, PFSP_Context psp1)
 	if(! socketItem->AddOneShotTimer(TRANSIENT_STATE_TIMEOUT_ms))
 	{
 		REPORT_ERRMSG_ON_TRACE("Cannot set time-out clock for listen");
-		socketsTLB.FreeItem(socketItem);
 		socketItem->Disable();
+		CSocketItemDl::FreeItem(socketItem);
 		return NULL;
 	}
 
@@ -87,7 +87,7 @@ FSPHANDLE FSPAPI ListenAt(const PFSP_IN6_ADDR listenOn, PFSP_Context psp1)
 //	or NULL if there is some immediate error, more information may be got from the flags set in the context parameter
 // Remark
 //	Socket address of the remote end would be resolved by LLS and stored in the control block
-//	CallbackConnected() function whose pointer was given in the structure pointed by PSP_SocketParameter
+//	the call back function whose pointer 'onConnected' was given in the structure pointed by PSP_SocketParameter
 //  would report later error by passing a NULL FSP handle as the first parameter
 //	and a negative integer, which is the error number, as the second parameter if connection failed
 DllSpec
@@ -95,29 +95,29 @@ FSPHANDLE FSPAPI Connect2(const char *peerName, PFSP_Context psp1)
 {
 	if(psp1->sendSize < 0 || psp1->recvSize < 0 || psp1->sendSize + psp1->recvSize > MAX_FSP_SHM_SIZE + MIN_RESERVED_BUF)
 	{
-		psp1->u.flags = ENOMEM;
+		psp1->flags = -ENOMEM;
 		return NULL;
 	}
 
 	IN6_ADDR addrAny = IN6ADDR_ANY_INIT;
 	CommandNewSession objCommand;
 
-	psp1->u.st.passive = 0;	// override what is provided by ULA
+	psp1->passive = 0;		// override what is provided by ULA
 	psp1->welcome = NULL;	// an active connection request shall have no welcome message
 	psp1->len = 0;			// or else memory access exception may occur
 
 	CSocketItemDl * socketItem = CSocketItemDl::CreateControlBlock((PFSP_IN6_ADDR) & addrAny, psp1, objCommand);
 	if(socketItem == NULL)
 	{
-		psp1->u.flags = EBADF;	// E_HANDLE;
+		psp1->flags = -EBADF;	// -E_HANDLE ?
 		return NULL;
 	}
 
 	if(! socketItem->AddOneShotTimer(TRANSIENT_STATE_TIMEOUT_ms))
 	{
 		REPORT_ERRMSG_ON_TRACE("Cannot set time-out clock for connect");
-		socketsTLB.FreeItem(socketItem);
 		socketItem->Disable();
+		CSocketItemDl::FreeItem(socketItem);
 		return NULL;
 	}
 
@@ -182,7 +182,7 @@ CSocketItemDl * CSocketItemDl::PrepareToAccept(BackLogItem & backLog, CommandNew
 	// Inherit the NotifyOrReturn functions onError,
 	// the CallbackConnected function onAccepted
 	// but not CallbackRequested/onAccepting
-	if(! this->context.u.st.passive)
+	if(! this->context.passive)
 	{
 		newContext.welcome = NULL;
 		newContext.len = 0;
@@ -190,7 +190,7 @@ CSocketItemDl * CSocketItemDl::PrepareToAccept(BackLogItem & backLog, CommandNew
 	else // this->InState(LISTENING)
 	{
 		newContext.onAccepting = NULL;
-		newContext.u.st.passive = 0;
+		newContext.passive = 0;
 	}
 	// If the incarnated connection could be cloned, onAccepting shall be set by FSPControl
 
@@ -218,10 +218,14 @@ CSocketItemDl * CSocketItemDl::PrepareToAccept(BackLogItem & backLog, CommandNew
 }
 
 
+
 // Given
 //	BackLogItem &	the reference to the acception backlog item
 // Do
 //	(ACK_CONNECT_REQ, Initial SN, Expected SN, Timestamp, Receive Window[, responder's half-connection parameter[, payload])
+// Return
+//	true if to accept the connection
+//	false if to reject
 bool LOCALAPI CSocketItemDl::ToWelcomeConnect(BackLogItem & backLog)
 {
 	PFSP_IN6_ADDR p = (PFSP_IN6_ADDR) & pControlBlock->peerAddr.ipFSP.allowedPrefixes[MAX_PHY_INTERFACES - 1];
@@ -305,15 +309,16 @@ void CSocketItemDl::ToConcludeConnect()
 }
 
 
+
 // Given
 //	FSPOperationCode the header packet's operation code
 // Do
 //	Set the head packet
 // Return
-//	The pointer to the header packet's descriptor if the queue used to be non-empty
+//	The pointer to the descriptor of the original header packet, or
 //	NULL if the send queue used to be empty
 // Remark
-//	The payloadless PERSIST/MULTIPLY does NOT terminate the transmit transaction
+//	The payloadless PERSIST/MULTIPLY does NOT necessarily terminate the transmit transaction
 ControlBlock::PFSP_SocketBuf LOCALAPI CSocketItemDl::SetHeadPacketIfEmpty(FSPOperationCode c)
 {
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend();
@@ -339,7 +344,7 @@ ControlBlock::PFSP_SocketBuf LOCALAPI CSocketItemDl::SetHeadPacketIfEmpty(FSPOpe
 // Return
 //	the pointer to the place holder of host-id which might be set/updated later
 // Remark
-//	make the rule-adhered IPv6 address, the result is placed in the given pointed place holder
+//	make the rule-adhered IPv6 address, the result is placed at the address given
 DllSpec
 uint32_t * FSPAPI TranslateFSPoverIPv4(PFSP_IN6_ADDR p, uint32_t dwIPv4, uint32_t fiberID)
 {
@@ -352,6 +357,16 @@ uint32_t * FSPAPI TranslateFSPoverIPv4(PFSP_IN6_ADDR p, uint32_t dwIPv4, uint32_
 
 
 
+// Given
+//	FSPHANDLE	the FSP socket handle
+//	BYTE *		the new session key assumed to have been established by ULA
+//	int			the size of the key, number of octets
+//	int32_t		the intent life of the key, number of packets the key could be applied at most
+// Do
+//	Manage to call LLS to apply the new session key
+// Return
+//	0 if no error
+//	negative: the error number
 DllSpec
 int FSPAPI InstallAuthenticKey(FSPHANDLE h, BYTE * key, int keySize, int32_t keyLife)
 {

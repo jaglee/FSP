@@ -53,8 +53,6 @@
 #define TRACE_SLIDEWIN	8
 #define TRACE_ULACALL	16
 #define TRACE_OUTBAND	32	// Other than KEEP_ALIVE
-// Return the number of microseconds elapsed since Jan 1, 1970 (unix epoch time)
-timestamp_t NowUTC();	// it seems that a global property 'Now' is not as clear as this function format
 
 
 // random generatator is somehow dependent on implementation. hardware prefered.
@@ -170,26 +168,22 @@ public:
 
 
 
-// Implemented in os_....cpp because light-weight IPC mutual-locks are OS-dependent
-class ConnectRequestQueue
-{
-	CommandNewSessionSrv q[CONNECT_BACKLOG_SIZE];
-	int	head;
-	int tail;
-	char mayFull;
-	volatile char mutex;
-public:
-	// ConnectRequestQueue() { head = tail = 0; mayFull = 0; mutex = SHARED_FREE; }
-	int Push(const CommandNewSessionSrv *);
-	int Remove(int);
-	// Connect to remote end might be time-consuming
-	void WaitSetMutex() { while(_InterlockedCompareExchange8(& mutex, 1, 0)) Sleep(0); }
-	void SetMutexFree() { _InterlockedExchange8(& mutex, 0); }
-};
-
-
 
 #include <pshpack1.h>
+
+
+// Implemented in os_....cpp because light-weight IPC mutual-locks are OS-dependent
+class ConnectRequestQueue : public CLightMutex
+{
+	// volatile char mutex;	// in CLightMutex
+	char mayFull;
+	int	head;
+	int tail;
+	CommandNewSessionSrv q[CONNECT_BACKLOG_SIZE];
+public:
+	int Push(const CommandNewSessionSrv *);
+	int Remove(int);
+};
 
 
 
@@ -223,7 +217,7 @@ struct ScatteredSendBuffers
 
 
 
-// Context management of 
+// Context management of integrity check code
 struct ICC_Context
 {
 #ifndef NDEBUG
@@ -310,6 +304,8 @@ protected:
 
 	int8_t		lazyAckTimeoutRetryCount;
 	//
+	void AbortLLS(bool haveTLBLocked = false);
+
 	bool AddLazyAckTimer();
 	bool AddResendTimer(uint32_t);
 	bool AddTimer();
@@ -357,6 +353,8 @@ protected:
 	bool EmitStart();
 	bool SendAckFlush();
 	bool SendKeepAlive();
+	bool SendRelease();
+	void SendReset();
 	int	 EmitWithICC(ControlBlock::PFSP_SocketBuf, ControlBlock::seq_t);
 
 	void DoResend();
@@ -368,6 +366,7 @@ protected:
 	static VOID NTAPI LazilySendSNACK(PVOID c, BOOLEAN) { ((CSocketItemEx *)c)->LazilySendSNACK(); }
 	//
 public:
+	bool IsProcessAlive();
 	//
 	bool MapControlBlock(const CommandNewSessionSrv &);
 	void InitAssociation();
@@ -375,7 +374,8 @@ public:
 	bool WaitUseMutex();
 	void SetMutexFree();
 	bool IsInUse() { return (_InterlockedOr8(& inUse, 0) != 0); }
-	void SetInUse() { _InterlockedExchange8(& inUse, 1); }
+	void ClearInUse() { _InterlockedExchange8(&inUse, 0); }
+	bool TestSetInUse() { return (_InterlockedCompareExchange8(& inUse, 1, 0) == 0); }
 
 	void InstallEphemeralKey();
 	void InstallSessionKey(const CommandInstallKey &);
@@ -428,7 +428,6 @@ public:
 	void InitiateMultiply(CSocketItemEx *);
 	bool FinalizeMultiply();
 
-	void HandleMemoryCorruption() {	Destroy(); }
 	void AffirmConnect(const SConnectParam &, ALFID_T);
 
 	// Compare the given sequence with the left and right edge of the receive window
@@ -455,16 +454,6 @@ public:
 		return pControlBlock->ResizeSendWindow(seq1, adRecvWS);
 	}
 
-	template<FSPOperationCode c> int SendPacket()
-	{
-		// See also SendKeepAlive, AffirmConnect and SendAckFlush
-		FSP_NormalPacketHeader hdr;
-		pControlBlock->SetSequenceFlags(& hdr);
-		hdr.hs.Set<FSP_NormalPacketHeader, c>();
-		SetIntegrityCheckCode(& hdr);
-		return SendPacket(1, ScatteredSendBuffers(&hdr, sizeof(hdr)));
-	}
-
 	// Given the fixed header, the content (plaintext), the length of the context and the xor-value of salt
 	void * LOCALAPI SetIntegrityCheckCode(FSP_NormalPacketHeader *, void * = NULL, int32_t = 0, uint32_t = 0);
 	// Solid input,  the payload, if any, is copied later
@@ -483,11 +472,11 @@ public:
 
 	// Command of ULA
 	void ProcessCommand(CommandToLLS *);
+	void Listen();
 	void Connect();
 	void Accept();
 	void Start();
 	void UrgeCommit();
-	void Listen(CommandNewSessionSrv &);
 
 	// Event triggered by the remote peer
 	void OnConnectRequestAck(PktBufferBlock *, int);
@@ -499,7 +488,7 @@ public:
 	void OnGetMultiply();	// MULTIPLY is in-band at the initiative side, out-of-band at the passive side
 	void OnGetKeepAlive();	// KEEP_ALIVE is always out-of-band
 
-	void HandleFullICC(PktBufferBlock *);
+	void HandleFullICC(PktBufferBlock *, FSPOperationCode);
 };
 
 #include <poppack.h>
@@ -557,10 +546,12 @@ public:
 	CSocketItemEx * AllocItem(const CommandNewSessionSrv &);
 	CSocketItemEx * AllocItem(ALFID_T);
 	CSocketItemEx * AllocItem();
-	void FreeItem(CSocketItemEx *r);
+	void FreeItemDonotCareLock(CSocketItemEx *r);
+	void FreeItem(CSocketItemEx *r) { AcquireMutex(); FreeItemDonotCareLock(r); ReleaseMutex(); }
 
 	CSocketItemEx * operator[](ALFID_T);
 
+	void PutToListenTLB(CSocketItemEx *, int);
 	bool PutToRemoteTLB(CMultiplyBacklogItem *);
 	// Given the remote host Id, the remote ALFID and the near end's parent id return the matching
 	CMultiplyBacklogItem * FindByRemoteId(uint32_t, ALFID_T, ALFID_T);
@@ -669,6 +660,7 @@ public:
 
 	static CLowerInterface * Singleton() { return pSingleInstance; }
 };
+
 
 
 // OS-specific time wheel management

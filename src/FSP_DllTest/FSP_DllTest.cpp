@@ -16,7 +16,7 @@ CSocketItemDbg *GetPreparedSocket()
 	parms.onError = NULL;
 	parms.recvSize = MAX_FSP_SHM_SIZE;	// 4MB
 	parms.sendSize = 0;	// the underlying service would give the minimum, however
-	parms.u.st.passive = 0;	// override what is provided by ULA
+	parms.passive = 0;	// override what is provided by ULA
 	parms.welcome = NULL;	// an active connection request shall have no welcome message
 	parms.len = 0;			// or else memory access exception may occur
 

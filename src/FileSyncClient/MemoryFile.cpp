@@ -1,3 +1,6 @@
+/**
+ * A short module in FileSyncClient, which meant to check the memory pattern saved in the designated file is right
+ */
 #include "stdafx.h"
 
 // "$memory.^";

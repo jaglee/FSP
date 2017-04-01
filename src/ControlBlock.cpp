@@ -39,7 +39,7 @@
 #include "FSP_Impl.h"
 
 //
-// Start Of Reflexation
+// Start Of Reflection
 //
 // Reflexing string representation of operation code, for debug purpose
 const char * CStringizeOpCode::names[LARGEST_OP_CODE + 1] =
@@ -66,8 +66,11 @@ const char * CStringizeOpCode::names[LARGEST_OP_CODE + 1] =
 } ;
 
 
-// Reflexing string representation of FSP_Session_State and FSP_ServiceCode, for debug purpose
-// Place here because value of the state or notice/servic code is stored in the control block
+
+/**
+	Reflecting string representation of FSP_Session_State and FSP_ServiceCode, for debug purpose
+	Place here because value of the state or notice/servic code is stored in the control block
+ */
 const char * CStringizeState::names[LARGEST_FSP_STATE + 1] =
 {
 	"NON_EXISTENT",
@@ -122,13 +125,14 @@ const char * CStringizeNotice::names[LARGEST_FSP_NOTICE + 1] =
 	"FSP_Shutdown",		// close the connection
 	"FSP_InstallKey",	// install the authenticated encryption key
 	"FSP_Multiply",		// clone the connection, make SCB of LLS synchronized with DLL
-	// 12-15, 4 reserved
-	"Reserved12",
+	"FSP_AdRecvWindow",	// force to advertise the receive window ONCE by send a SNACK/ACK_FLUSH
+	// 13-15, 3 reserved
 	"Reserved13",
 	"Reserved14",
 	"Reserved15",
 	// 16~23: LLS to DLL in the backlog
-	//FSP_NotifyAccepting = FSP_Accept,	// a reverse command to make context ready
+	//FSP_NotifyListening = FSP_Listen,		// a reverse command to signal success execution of FSP_Listen
+	//FSP_NotifyAccepting = FSP_Accept,		// a reverse command to make context ready
 	//FSP_NotifyRecycled = FSP_Recycle,		// a reverse command to inform DLL to release resource passively
 	//FSP_NotifyMultiplied = FSP_Multiply,	// a reverse command to inform DLL to accept a multiply request
 	"FSP_NotifyAccepted",
@@ -191,10 +195,35 @@ CStringizeOpCode	opCodeStrings;
 CStringizeState		stateNames;
 CStringizeNotice	noticeNames;
 //
-// End Of Reflexation
+// End Of Reflection
 //
 
 
+
+/**
+ *	POSIX gettimeofday(); get current UTC time
+ */
+// Return the number of microseconds elapsed since Jan 1, 1970 UTC (unix epoch)
+extern "C" timestamp_t NowUTC()
+{
+	// return the number of 100-nanosecond intervals since January 1, 1601 (UTC), in host byte order
+	FILETIME systemTime;
+	GetSystemTimeAsFileTime(&systemTime);
+
+	timestamp_t & t = *(timestamp_t *)& systemTime;
+	t /= 10;
+	return (t - DELTA_EPOCH_IN_MICROSECS);
+}
+
+
+
+
+// Given
+//	int		intent capacity of the backlog. Should be no less than 2
+// Do
+//	Initialize the size/capacity, i.e. maximum number of entries of the backlog
+// Return
+//	The real capacity of the backlog. Trim the input value to the largest value of power of 2
 // Remark
 //	There would be at least two item in the queue
 int LLSBackLog::InitSize(int n)
@@ -206,7 +235,6 @@ int LLSBackLog::InitSize(int n)
 		m++;
 	// assume memory has been zeroed
 	capacity = 1 << m;
-	mutex = 0;
 	return capacity;
 }
 
@@ -220,7 +248,8 @@ int LLSBackLog::InitSize(int n)
 //	capacity must be some power of 2
 int LOCALAPI LLSBackLog::Put(const BackLogItem *p)
 {
-	WaitSetMutex();
+	if (!WaitSetMutex())
+		return -EINTR;
 
 	if(count >= capacity)
 	{
@@ -238,18 +267,19 @@ int LOCALAPI LLSBackLog::Put(const BackLogItem *p)
 }
 
 
+
 // Do
 //	Remove the head log item in the queue
 // Return
+//	-EINTR	if internal panic arise
 //	-ENOENT if the queue is empty
 //	non-negative on success
 // Remark
-//	should replace stack with real queue
 //	capacity must be some power of 2
-//	It is assumed that there is only one producer(optimistic push) but may be multiple consumer(conservative pop)
 int LLSBackLog::Pop()
 {
-	WaitSetMutex();
+	if (!WaitSetMutex())
+		return -EINTR;
 
 	register int i = headQ;
 	if(count == 0)
@@ -267,14 +297,17 @@ int LLSBackLog::Pop()
 
 
 
-// Remark
-//	It is assumed that there is only one producer(optimistic push) but may be multiple consumer(conservative pop)
-//	here we rely on a conservative memory model to make sure q[i] is written before tailQ is set
-//	UNRESOLVED!? disable certain compiler optimization, out-of-order execution may break the assumption
-//	If provider lock could not be obtained it will return true ('collision found') instead of raising an 'EBUSY' exception
+// Given
+//	const BackLogItem *		pointer to the backlog item to match
+// Do
+//	Search the backlog item that matches the given one. 'Match' means idRemote as well as salt of the two items are equal.
+// Return
+//	true if the given backlog item is matched with some item in the queue
+//	false if no match found
 bool LOCALAPI LLSBackLog::Has(const BackLogItem *p)
 {
-	WaitSetMutex();
+	if (!WaitSetMutex())
+		throw - EINTR;
 
 	if(count <= 0)
 	{
@@ -311,19 +344,19 @@ bool LOCALAPI LLSBackLog::Has(const BackLogItem *p)
 //	NullCommand cannot be put
 int LOCALAPI LLSNotice::Put(FSP_ServiceCode c)
 {
-	while(_InterlockedCompareExchange8(& mutex, 1, 0) != 0)
-		Sleep(0);
+	if (!WaitSetMutex())
+		return -EINTR;
 	//
 	register char *p = (char *) & q[FSP_MAX_NUM_NOTICE - 1];
 	if(*p != NullCommand)
 	{
-		_InterlockedExchange8(& mutex, 0);
+		SetMutexFree();
 		return -ENOMEM;
 	}
 
 	if(c == NullCommand)
 	{
-		_InterlockedExchange8(& mutex, 0);
+		SetMutexFree();
 		return -EDOM;
 	}
 
@@ -333,13 +366,13 @@ int LOCALAPI LLSNotice::Put(FSP_ServiceCode c)
 	{
 		if(*p == c)
 		{
-			_InterlockedExchange8(& mutex, 0);
+			SetMutexFree();
 			return FSP_MAX_NUM_NOTICE;
 		}
 	} while(*p == NullCommand && --p - (char *)q >= 0);
 	_InterlockedExchange8(p + 1, c);
 	//
-	_InterlockedExchange8(& mutex, 0);
+	SetMutexFree();
 	return int(p + 1 - (char *)q);
 }
 
@@ -350,8 +383,8 @@ int LOCALAPI LLSNotice::Put(FSP_ServiceCode c)
 //	ULA should know that notices are out-of-band, emergent messages which might be processed out-of-order
 FSP_ServiceCode LLSNotice::Pop()
 {
-	while(_InterlockedCompareExchange8(& mutex, 1, 0) != 0)
-		Sleep(0);
+	if (!WaitSetMutex())
+		throw - EINTR;
 	//
 	register char *p = (char *) & q[FSP_MAX_NUM_NOTICE - 1];
 	register char c = NullCommand;
@@ -360,7 +393,7 @@ FSP_ServiceCode LLSNotice::Pop()
 		c = _InterlockedExchange8(p, c);
 	} while(--p - (char *)q >= 0);
 	//
-	_InterlockedExchange8(& mutex, 0);
+	SetMutexFree();
 	return FSP_ServiceCode(c);
 }
 
@@ -408,6 +441,7 @@ int LOCALAPI ControlBlock::Init(int32_t & sendSize, int32_t & recvSize)
 }
 
 
+
 // Given
 //	uint16_t	the upper limit of the capacity of the backlog, should be no greater than USHRT_MAX
 // Do
@@ -423,6 +457,7 @@ int LOCALAPI ControlBlock::Init(uint16_t nLog)
 	int n = backLog.InitSize(nLog);
 	return (n <= 0 ? -ENOMEM : 0);
 }
+
 
 
 // Return
@@ -444,6 +479,7 @@ ControlBlock::PFSP_SocketBuf ControlBlock::GetSendBuf()
 
 	return p;
 }
+
 
 
 // Given
@@ -484,7 +520,7 @@ void * LOCALAPI ControlBlock::InquireSendBuf(int & m)
 
 
 // Given
-//	FSP_NormalPacketHeader	the place-holder of sequence number and flags
+//	FSP_NormalPacketHeader*	the place-holder of sequence number and flags
 //	ControlBlock::seq_t		the intent sequence number of the packet
 // Do
 //	Set the default sequence number, expected acknowledgment sequencenumber,
@@ -571,6 +607,10 @@ ControlBlock::PFSP_SocketBuf LOCALAPI ControlBlock::AllocRecvBuf(seq_t seq1)
 // Given
 //	int & : [_Out_] place holder of the number of bytes [to be] peeked.
 //	bool &: [_Out_] place holder of the End of Transaction flag
+// Do
+//	Peek the receive buffer, figure out not only the start address but also the length of the next message
+//	till the end of receive buffer space, the last of the received packets, or the first buffer block
+//	with the End of Transaction flag set, inclusively, whichever meets first.
 // Return
 //	Start address of the received message
 // Remark
@@ -653,6 +693,11 @@ void * LOCALAPI ControlBlock::InquireRecvBuf(int & nIO, bool & eotFlag)
 }
 
 
+
+// Given
+//	int			the number of bytes be free, shall equal the value passed out by InquireRecvBuf
+// Do
+//	Free the packet buffer blocks that cover at least the given number of bytes.
 // Return
 //	non-negative if number of blocks marked free
 //	negative if error:
@@ -672,7 +717,7 @@ int LOCALAPI ControlBlock::MarkReceivedFree(int nIO)
 	PFSP_SocketBuf p = GetFirstReceived();
 	//
 	register int i, m;
-	m = (nIO + MAX_BLOCK_SIZE - 1) / MAX_BLOCK_SIZE;
+	m = nIO <= 0 ? 1 : (nIO - 1) / MAX_BLOCK_SIZE + 1;
 	//
 	for (i = 0; i < m && p->GetFlag<IS_FULFILLED>(); i++)
 	{
@@ -819,7 +864,8 @@ void ControlBlock::SlideSendWindow()
 
 
 
-void ControlBlock::SlideSendWindowByOne()	// shall be atomic!
+// Slide the left border of the send window by one, shall be atomic!
+void ControlBlock::SlideSendWindowByOne()
 {
 	if(++sendWindowHeadPos - sendBufferBlockN >= 0)
 		sendWindowHeadPos -= sendBufferBlockN;
@@ -851,7 +897,7 @@ void ControlBlock::SlideSendWindowByOne()	// shall be atomic!
 //	ControlBlock::seq_t		the sequence number that was accumulatively acknowledged
 //	const GapDescriptor *	array of the gap descriptors
 //	int						number of gap descriptors
-//	timestamp_t & [In, Out]	In: the timestamp of Now. Out: 
+//	timestamp_t & [In, Out]	In: the timestamp of Now. Out: average round-robin time in microseconds, if some packet is acknowledged
 // Do
 //	Make acknowledgement, maybe accumulatively if number of gap descriptors is 0
 // Return
@@ -1001,8 +1047,8 @@ int ControlBlock::MarkSendQueueEOT()
 
 
 // Given
-//	seq_t	The sequence number of the packet that mostly expected by the remote end
-//	unsigned int		The advertised size of the receive window, start from aforementioned most expected packet
+//	seq_t			The sequence number of the packet that mostly expected by the remote end
+//	unsigned int	The advertised size of the receive window, start from aforementioned most expected packet
 // Return
 //	Whether the given sequence number is legitimate
 // Remark

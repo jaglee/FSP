@@ -69,6 +69,7 @@ void UnitTestSendRecvWnd()
 	uint8_t *recvBuf2 = (uint8_t *)pSCB->InquireRecvBuf(m2, b);
 	Assert::IsTrue(recvBuf2 == recvBuf);
 	Assert::IsTrue(m2 == MAX_BLOCK_SIZE - 13);
+	pSCB->MarkReceivedFree(m2);
 	Assert::IsTrue(pSCB->recvWindowFirstSN == FIRST_SN + 1);
 
 	ControlBlock::PFSP_SocketBuf skb5 = pSCB->AllocRecvBuf(FIRST_SN);
@@ -197,7 +198,7 @@ void UnitTestGenerateSNACK()
 	Assert::IsTrue(pSCB->recvWindowNextSN == FIRST_SN + 3);
 
 	r = pSCB->GetSelectiveNACK(seq0, gaps, MAX_GAPS_NUM);
-	Assert::IsTrue(r == 1 && seq0 == FIRST_SN + 1);
+	Assert::IsTrue(r == 1 && seq0 == FIRST_SN + 1 && gaps[0].gapWidth == 1 && gaps[0].dataLength == 1);
 
 	// when a very large gap among small continuous data segments found
 	skb1 = socket.AllocRecvBuf(FIRST_SN + 0x10003);
@@ -207,9 +208,12 @@ void UnitTestGenerateSNACK()
 	Assert::IsTrue(pSCB->recvWindowNextSN == FIRST_SN + 0x10004);
 
 	r = pSCB->GetSelectiveNACK(seq0, gaps, MAX_GAPS_NUM);
-	Assert::IsTrue(r == 2 && seq0 == FIRST_SN + 1);
+	// gap1: 1, data1: 2, gap2: 3~0x10002(inclusive), data2: 0x10003
+	Assert::IsTrue(r == 2 && seq0 == FIRST_SN + 1
+		&& gaps[0].gapWidth == 1 && gaps[0].dataLength == 1
+		&& gaps[1].gapWidth == 0x10000 && gaps[1].dataLength == 1
+	);
 
-	// when capacity of gap descriptors overflow
 	skb1 = socket.AllocRecvBuf(FIRST_SN + 0x8003);
 	Assert::IsNotNull(skb1);
 	skb1->opCode = PURE_DATA;
@@ -217,7 +221,11 @@ void UnitTestGenerateSNACK()
 	Assert::IsTrue(pSCB->recvWindowNextSN == FIRST_SN + 0x10004);
 
 	r = pSCB->GetSelectiveNACK(seq0, gaps, MAX_GAPS_NUM);
-	Assert::IsTrue(r == 2 && seq0 == FIRST_SN + 1);
+	// gap1: 1, data1: 2, gap2: 3~0x8002(inclusive), data2: 0x8003
+	Assert::IsTrue(r == 2 && seq0 == FIRST_SN + 1
+		&& gaps[0].gapWidth == 1 && gaps[0].dataLength == 1
+		&& gaps[1].gapWidth == 0x8000 && gaps[1].dataLength == 1
+	);
 
 	// when a very large continuous data segment among small gaps
 	for(int i = 4; i < 0x10003U; i++)
@@ -234,6 +242,8 @@ void UnitTestGenerateSNACK()
 	bool b;	// Used to be test for 'To be Continued', now for 'End of Transaction'
 	pSCB->InquireRecvBuf(r, b);
 	Assert::IsTrue(b);
+	Assert::IsTrue(pSCB->recvWindowHeadPos == 0 && pSCB->recvWindowFirstSN == FIRST_SN);
+	pSCB->MarkReceivedFree(r);
 	Assert::IsTrue(pSCB->recvWindowHeadPos == 1 && pSCB->recvWindowFirstSN == (FIRST_SN + 1));
 
 	skb1 = socket.AllocRecvBuf(FIRST_SN + 1);
@@ -246,6 +256,7 @@ void UnitTestGenerateSNACK()
 	(++p)->len = MAX_BLOCK_SIZE;
 
 	pSCB->InquireRecvBuf(r, b);
+	pSCB->MarkReceivedFree(r);
 	Assert::IsTrue(!b && r == MAX_BLOCK_SIZE * 2);	// positon 0 skipped; position 3 is the gap
 
 	skb1 = socket.AllocRecvBuf(FIRST_SN + 3);
@@ -262,6 +273,7 @@ void UnitTestGenerateSNACK()
 	void * buf = pSCB->InquireRecvBuf(r, b);
 	Assert::IsNotNull(buf);
 	Assert::IsFalse(b);
+	pSCB->MarkReceivedFree(r);
 	Assert::IsTrue(pSCB->recvWindowHeadPos == 0x10002 && pSCB->recvWindowFirstSN == (FIRST_SN + 0x10002));
 
 	//
@@ -275,8 +287,9 @@ void UnitTestGenerateSNACK()
 	r = pSCB->GetSelectiveNACK(seq0, gaps, MAX_GAPS_NUM);
 	// there's a continuous data block which is not delivered yet. however, it is not considered needing a gap descriptor
 	Assert::IsTrue(r == 2 && seq0 == FIRST_SN + 0x10002);	// because position 0x10003's NOT IS_FULFILLED was cleared
+	// gap1: 0x10002, data1: 0x10003, gap2: 0x10004~0x20000 (inclusive), data2: 0x20001
 	Assert::IsTrue(gaps[0].gapWidth == 1 && gaps[0].dataLength == 1
-				&& gaps[1].gapWidth == 0xFFFC && gaps[1].dataLength == 2);
+				&& gaps[1].gapWidth == 0xFFFD && gaps[1].dataLength == 1);
 }
 
 

@@ -40,8 +40,15 @@ ALFID_T CLowerInterface::SetLocalFiberID(ALFID_T value)
 
 
 
-// return the fiber ID, or 0 if no more slot available
-ALFID_T LOCALAPI CLowerInterface::RandALFID(PIN6_ADDR addrList)
+// Given
+//	PIN6_ADDR	the pointer to placeholder of the [in,out] hint address
+// Do
+//	Get the head item from the free ALFID list.
+//	If the hint address is IN6_ANY, by default the first interface is exploit and the hint address is updated accordingly
+//	If the hint address is not IN6_ANY, alter ALFID_T part of it if the prefix part matched the prefix of some interface
+// Return
+//	the fiber ID, or 0 if no more slot available or hint-address prefix, if any, has no matching interface
+ALFID_T LOCALAPI CLowerInterface::RandALFID(PIN6_ADDR hintAddr)
 {
 	CSocketItemEx *p = headFreeSID;
 	int ifIndex;
@@ -52,9 +59,8 @@ ALFID_T LOCALAPI CLowerInterface::RandALFID(PIN6_ADDR addrList)
 		return 0;
 	}
 
-	register BYTE *s = addrList->u.Byte;
-	// if there's at least one hint, the ALFID_T part of the hint address will be altered if prefix matched
-	if(*(uint64_t *)addrList->u.Byte != 0)
+	register BYTE *s = hintAddr->u.Byte;
+	if(*(uint64_t *)s != 0)
 	{
 		bool isEffective = false;
 		for(register u_int j = 0; j < sdSet.fd_count; j++)
@@ -182,6 +188,12 @@ uint64_t LOCALAPI CalculateCookie(const void *header, int sizeHdr, timestamp_t t
 
 
 // The ephemeral key is weakly securely established. It is a 64-bit value meant to make obfuscation in calcuate the CRC64 tag
+// The algorithm:
+//	Take 'fidPair' as the initial accumulative CRC64 value,
+//	accumulate 'initCheckCode', 'cookie', 'salt', 'timeDelta' and 'nboTimeStamp' to the CRC64 tag.
+//	fidPair is composed of the source ALFID and the peer ALFID
+//	where on send side the source is the near-end and the peer is the far-end
+//	while on receive side the source is the far-end and the 'peer' is the near-end actually. 
 void CSocketItemEx::InstallEphemeralKey()
 {
 #if defined(TRACE) && (TRACE & (TRACE_SLIDEWIN | TRACE_ULACALL))
@@ -194,7 +206,6 @@ void CSocketItemEx::InstallEphemeralKey()
 #endif
 	// contextOfICC.savedCRC = true; // don't care
 	contextOfICC.keyLife = 0;
-	// Overlay with 'initCheckCode', 'cookie', 'salt', 'initialSN' and 'timeStamp'
 	contextOfICC.curr.precomputedICC[0] 
 		=  CalculateCRC64(* (uint64_t *) & fidPair, (uint8_t *) & pControlBlock->connectParams, FSP_MAX_KEY_SIZE);
 
@@ -212,6 +223,15 @@ void CSocketItemEx::InstallEphemeralKey()
 }
 
 
+
+// Given
+//	const CommandInstallKey&	Parameter given by ULA
+// Do
+//	Put the new session key effective starting from the sequence nubmer designated in the parameter given by ULA
+// Remark
+//	The key length and the first sequence number exploiting the new session key at the receive side next
+//	are designated in the control block while the key life and the first sequence number exploiting
+//	the new session key at the send side are given in the parameter
 // See @DLL::InstallKey
 void CSocketItemEx::InstallSessionKey(const CommandInstallKey & cmd)
 {
@@ -250,6 +270,7 @@ void CSocketItemEx::InstallSessionKey(const CommandInstallKey & cmd)
 //	ALFID_T idResponder				The responder's original ALFID (the parent ALFID)
 // Set the session key for the packet next sent and the next received. KDF counter mode
 // As the NIST SP800-108 recommended, K(i) = PRF(K, [i] || Label || 0x00 || Context || L)
+// Psuedo-Random-Function is GCM_SecureHash, with the nonce set to sn1 concated with ackSN (sn1 || ackSN)
 // Label  ¨C A string that identifies the purpose for the derived keying material, here we set to "Multiply an FSP connection"
 // Context - idInitiator, idResponder
 // Length -  An integer specifying the length (in bits) of the derived keying material K-output
@@ -369,28 +390,20 @@ void * LOCALAPI CSocketItemEx::SetIntegrityCheckCode(FSP_NormalPacketHeader *p1,
 	ALIGN(MAC_ALIGNMENT) uint64_t tag[FSP_TAG_SIZE / sizeof(uint64_t)];
 	void * buf;
 	uint32_t seqNo = be32toh(p1->sequenceNo);
-//#if defined(TRACE) && (TRACE & TRACE_PACKET)
-//	printf_s("\nBefore GCM_AES_AuthenticatedEncrypt: ptLen = %d\n", ptLen);
-//	DumpNetworkUInt16((uint16_t *)p1, sizeof(FSP_NormalPacketHeader) / 2);
-//#endif
+#if defined(TRACE) && (TRACE & TRACE_PACKET)
+	printf_s("\nBefore GCM_AES_AuthenticatedEncrypt: ptLen = %d\n", ptLen);
+	DumpNetworkUInt16((uint16_t *)p1, sizeof(FSP_NormalPacketHeader) / 2);
+#endif
 
 	// CRC64
 	if(contextOfICC.keyLife == 0)
 	{
-//#if defined(TRACE) && (TRACE & TRACE_PACKET)
-//		printf_s("\nPrecomputed ICC: ");
-//		DumpNetworkUInt16((uint16_t *) & contextOfICC.curr.precomputedICC[0], sizeof(uint64_t) / 2);
-//#endif
 		p1->integrity.code = contextOfICC.curr.precomputedICC[0];
 		tag[0] = CalculateCRC64(0, (uint8_t *)p1, sizeof(FSP_NormalPacketHeader));
 		buf = content;
 	}
 	else if(int32_t(seqNo - contextOfICC.snFirstSendWithCurrKey) < 0 && contextOfICC.savedCRC)
 	{
-//#if defined(TRACE) && (TRACE & TRACE_PACKET)
-//		printf_s("\nPrecomputed ICC: ");
-//		DumpNetworkUInt16((uint16_t *) & contextOfICC.prev.precomputedICC[0], sizeof(uint64_t) / 2);
-//#endif
 		p1->integrity.code = contextOfICC.prev.precomputedICC[0];
 		tag[0] = CalculateCRC64(0, (uint8_t *)p1, sizeof(FSP_NormalPacketHeader));
 		buf = content;
@@ -421,9 +434,9 @@ void * LOCALAPI CSocketItemEx::SetIntegrityCheckCode(FSP_NormalPacketHeader *p1,
 	}
 
 	p1->integrity.code = tag[0];
-//#if defined(TRACE) && (TRACE & TRACE_PACKET)
-//	printf_s("After GCM_AES_AuthenticatedEncrypt:\n");	DumpNetworkUInt16((uint16_t *)p1, sizeof(FSP_NormalPacketHeader) / 2);
-//#endif
+#if defined(TRACE) && (TRACE & TRACE_PACKET)
+	printf_s("After GCM_AES_AuthenticatedEncrypt:\n");	DumpNetworkUInt16((uint16_t *)p1, sizeof(FSP_NormalPacketHeader) / 2);
+#endif
 	return buf;
 }
 
@@ -453,20 +466,12 @@ bool LOCALAPI CSocketItemEx::ValidateICC(FSP_NormalPacketHeader *p1, int32_t ctL
 	// CRC64
 	if(contextOfICC.keyLife == 0)
 	{
-#if defined(TRACE) && (TRACE & TRACE_PACKET)
-		printf_s("\nPrecomputed ICC: ");
-		DumpNetworkUInt16((uint16_t *) & contextOfICC.curr.precomputedICC[1], sizeof(uint64_t) / 2);
-#endif
 		// CRC64 is the initial integrity check algorithm
 		p1->integrity.code = contextOfICC.curr.precomputedICC[1];
 		r = (tag[0] == CalculateCRC64(0, (uint8_t *)p1, sizeof(FSP_NormalPacketHeader)));
 	}
 	else if(int32_t(seqNo - contextOfICC.snFirstRecvWithCurrKey) < 0 && contextOfICC.savedCRC)
 	{
-#if defined(TRACE) && (TRACE & TRACE_PACKET)
-		printf_s("\nPrecomputed ICC: ");
-		DumpNetworkUInt16((uint16_t *) & contextOfICC.prev.precomputedICC[1], sizeof(uint64_t) / 2);
-#endif
 		// well, well, send is not the same as receive...
 		p1->integrity.code = contextOfICC.prev.precomputedICC[1];
 		r = (tag[0] == CalculateCRC64(0, (uint8_t *)p1, sizeof(FSP_NormalPacketHeader)));
@@ -496,6 +501,10 @@ bool LOCALAPI CSocketItemEx::ValidateICC(FSP_NormalPacketHeader *p1, int32_t ctL
 		return false;
 
 	ChangeRemoteValidatedIP();
+#if defined(TRACE) && (TRACE & TRACE_PACKET)
+	printf_s("After GCM_AES_AuthenticateAndDecrypt:\n");
+	DumpNetworkUInt16((uint16_t *)p1, sizeof(FSP_NormalPacketHeader) / 2);
+#endif
 	return true;
 }
 
@@ -517,7 +526,6 @@ bool LOCALAPI CSocketItemEx::ValidateICC(FSP_NormalPacketHeader *p1, int32_t ctL
 	RELEASE				temporary		/ temporary: one-shot only
 	MULTIPLY			payload buffer	/ payload buffer: initiator of clone operation may retransmit it actively
  *
- *
  */
 // Do
 //	Transmit the head packet in the send queue to the remote end
@@ -529,8 +537,8 @@ bool CSocketItemEx::EmitStart()
 	void  *payload = (FSP_NormalPacketHeader *)this->GetSendPtr(skb);
 	if(payload == NULL)
 	{
-		BREAK_ON_DEBUG();	//TRACE_HERE("TODO: debug log memory corruption error");
-		HandleMemoryCorruption();
+		REPORT_ERRMSG_ON_TRACE("TODO: debug log memory corruption error");
+		AbortLLS();			// Used to be HandleMemoryCorruption();
 		return false;
 	}
 
@@ -540,7 +548,7 @@ bool CSocketItemEx::EmitStart()
 	switch (skb->opCode)
 	{
 	case ACK_CONNECT_REQ:
-		pControlBlock->SetSequenceFlags(pHdr);
+		pControlBlock->SetSequenceFlags(pHdr, pControlBlock->sendWindowNextSN);
 		pHdr->integrity.code = htobe64(skb->timeSent);
 
 		CLowerInterface::Singleton()->EnumEffectiveAddresses(pControlBlock->connectParams.allowedPrefixes);
@@ -576,6 +584,9 @@ bool CSocketItemEx::EmitStart()
 
 
 
+// Given
+//	ControlBlock::PFSP_SocketBuf	pointer to the buffer descriptor of the packet to send
+//	ControlBlock::seq_t				the sequence number assigned to the packet to send
 // Do
 //	Transmit a packet to the remote end, enforcing secure mobility support
 // Return
@@ -587,11 +598,10 @@ int CSocketItemEx::EmitWithICC(ControlBlock::PFSP_SocketBuf skb, ControlBlock::s
 {
 #if (TRACE & TRACE_HEARTBEAT)  || defined(EMULATE_LOSS)
 	UINT vRand;
-	rand_s(& vRand);
-	if (vRand > (UINT_MAX >> 2) + (UINT_MAX >> 1))
+	if(rand_s(&vRand) == 0 && vRand > (UINT_MAX >> 2) + (UINT_MAX >> 1))
 	{
 		printf_s("\nError seed to debug retransmission:\n"
-			"\tA packet %s (%d) is discarded deliberately\n", opCodeStrings[skb->opCode], skb->opCode);
+			"\tA packet %s (#%u) is discarded deliberately\n", opCodeStrings[skb->opCode], seq);
 		return -ECANCELED;	// emulate 33.33% loss rate
 	}
 #endif
@@ -617,8 +627,8 @@ int CSocketItemEx::EmitWithICC(ControlBlock::PFSP_SocketBuf skb, ControlBlock::s
 	void  *payload = (FSP_NormalPacketHeader *)this->GetSendPtr(skb);
 	if(payload == NULL)
 	{
-		BREAK_ON_DEBUG();	//TRACE_HERE("TODO: debug log memory corruption error");
-		HandleMemoryCorruption();
+		REPORT_ERRMSG_ON_TRACE("TODO: debug log memory corruption error");
+		AbortLLS();			// Used to be HandleMemoryCorruption();
 		return -EFAULT;
 	}
 
@@ -649,7 +659,7 @@ void CSocketItemEx::OnLocalAddressChanged()
 {
 	if (!WaitUseMutex())
 		return;
-	if (!IsInUse() || IsPassive())
+	if (IsPassive())
 		goto l_return;
 	
 	SendKeepAlive();
@@ -670,11 +680,13 @@ l_return:
 
 
 // Given
-//	PFSP_HeaderSignature	the MOBILE_PARAM header
+//	PFSP_HeaderSignature	point to the signature part of the PEER_SUBNETS header
 // Do
 //	Process the getting remote address event
 // Remark
-//	Although the subnet that the host belong to could be mobile, the ID of the host should be persistent
+//	Although the subnet that the host belong to could be mobile, the hostID should be stable
+//	PEER_SUBNETS used to be MOBILE_PARAM
+//	TODO: prove that FSP is compatible with Identifier-Locator-Addressing
 bool CSocketItemEx::HandlePeerSubnets(PFSP_HeaderSignature optHdr)
 {
 	if (optHdr == NULL || optHdr->opCode != PEER_SUBNETS)

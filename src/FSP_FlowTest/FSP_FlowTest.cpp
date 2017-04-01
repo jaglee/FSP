@@ -164,7 +164,7 @@ void UnitTestICC()
 	printf_s("Size of the SNACK header = %d, expected SN = %u, salt=0x%X\n", sizeSNACK, seq0, salt);
 
 	mp.hdr.hs.Set(KEEP_ALIVE, sizeof(FSP_NormalPacketHeader) + sizeSNACK);
-	pSCB->SetSequenceFlags(& mp.hdr);
+	pSCB->SetSequenceFlags(& mp.hdr, pSCB->sendWindowNextSN);
 	mp.hdr.expectedSN = htobe32(seq0);
 	//
 	socketR2.SetIntegrityCheckCode(& mp.hdr, NULL, 0, salt);
@@ -219,7 +219,58 @@ void UnitTestTweetNacl()
 	DumpNetworkUInt16((uint16_t *)bufSharedKey, CRYPTO_NACL_KEYBYTES / 2);
 }
 
+#include <pshpack1.h>
+struct FREWS
+{
+	uint32_t	adRecvWS : 24;
+	uint32_t	flags : 8;
+};
+struct FSP_FixedHeader
+{
+	uint32_t		sequenceNo;
+	uint32_t		expectedSN;
+	union
+	{
+		uint64_t	 code;	// ICC
+		struct
+		{
+			uint32_t source;
+			uint32_t peer;
+		} id;
+	} integrity;
+	//
+	struct FREWS frews;
+	//
+	uint8_t		version;
+	uint8_t		opCode;		// Operation Code
+	uint16_t	hsp;		// Header Stack Pointer
+};
+#include <poppack.h>
 
+void UnitTestByteOrderDefinitin()
+{
+	FSP_HeaderSignature fhs;
+	uint32_t & rFHS = *(uint32_t *)& fhs;
+
+	fhs.opCode = _FSP_Operation_Code(1);
+	fhs.major = 0;
+	fhs.hsp = 0;
+
+	printf_s("FHS = %08x\n", rFHS);	// 01 00 00 00 
+
+	fhs.opCode = (_FSP_Operation_Code)2;
+	fhs.major = 1;
+	fhs.hsp = 0x303;
+
+	printf_s("FHS = %08x\n", rFHS);	// 02 01 03 03
+
+	FSP_FixedHeader fh;
+	printf_s("size of fixed header: %d\n", sizeof(fh)); // 24
+
+	fh.frews.flags = 1;
+	fh.frews.adRecvWS = 2;
+	printf_s("Frews = %08x\n", *(uint32_t *)& fh.frews);	// 0x01000002
+}
 
 /**
  * 
@@ -227,7 +278,7 @@ void UnitTestTweetNacl()
 int _tmain(int argc, _TCHAR* argv[])
 {
 	//FlowTestAcknowledge();
-	FlowTestRetransmission();
+	//FlowTestRetransmission();
 	//FlowTestRecvWinRoundRobin();
 
 	//UnitTestCRC();
@@ -235,6 +286,8 @@ int _tmain(int argc, _TCHAR* argv[])
 
 	//TrySRP6();
 	//UnitTestTweetNacl();
+	TryCHAKE();
+	//UnitTestByteOrderDefinitin();
 	//
 	// TODO: UnitTest of SendInplace, SendStream
 

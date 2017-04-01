@@ -1,8 +1,13 @@
+/**
+ * A small group of functions in FileSyncServer. The group meant to handle the connection multiplication instance
+ */
 #include "stdafx.h"
+#include "defs.h"
 
-bool r2Finish = true;	// by default there is no reverse socket and it is assume to be finished
+volatile bool	r2Finish = true;	// by default there is no reverse socket and it is assume to be finished
 static	char	signature[] = "the session is finished";
-//
+
+// The call back function for reporting progress during connection multiplication
 static int FSPAPI onMultiplied(FSPHANDLE hRev, PFSP_Context ctx)
 {
 	printf_s("\nHandle of the FSP session clone: %p\n", hRev);
@@ -17,9 +22,10 @@ static int FSPAPI onMultiplied(FSPHANDLE hRev, PFSP_Context ctx)
 
 
 
+// The function called back when the FSP clone connection was released. Parameters are self-describing
 static void FSPAPI onShutdown(FSPHANDLE hRev, FSP_ServiceCode code, int value)
 {
-	printf_s("Socket %p, the session has been shutdown.\n", hRev);
+	printf_s("Socket %p, the clone session has been shutdown.\n", hRev);
 	if(code != FSP_NotifyRecycled)
 		printf_s("Should got ON_RECYCLED, but service code = %d, return %d\n", code, value);
 
@@ -28,12 +34,14 @@ static void FSPAPI onShutdown(FSPHANDLE hRev, FSP_ServiceCode code, int value)
 }
 
 
+
 static void FSPAPI onError(FSPHANDLE hRev, FSP_ServiceCode code, int value)
 {
-	printf_s("Socket %p, the session has been reset (%d, %d).\n", hRev, code, value);
+	printf_s("Socket %p, the clone session has been reset (%d, %d).\n", hRev, code, value);
 	r2Finish = true;
 	return;
 }
+
 
 
 // The near end finished the work, close the socket
@@ -46,6 +54,7 @@ static void FSPAPI onSignatureSent(FSPHANDLE hRev, FSP_ServiceCode c, int r)
 
 
 
+// The sub-toplevel function that inaugurate connection multipliction
 void StartToSendSignature(FSPHANDLE h)
 {
 	r2Finish = false;	// there IS a reverse socket so we may not assume it is finished

@@ -1,6 +1,6 @@
 /*
  * DLL to service FSP upper layer application
- * part of the SessionCtrl class, Recv, Peek and UnlockPeeded
+ * Receive/Read/Fetch functions
  *
     Copyright (c) 2012, Jason Gao
     All rights reserved.
@@ -32,13 +32,16 @@
 
 // Given
 //	FSPHandle		the socket handle
-//	PeekCallback	the callback function pointer, mandatory
+//	CallbackPeeked	the pointer of the function called back when some data is available
 // Do
-//	Get the start pointer and the data length in the receive buffer,
-//	If there are data available, call back the given function.
-//  If there is no data availabe, register the call back function and return immediately
+//	Register the call back function. Trigger a software interrupt
+//	to call back the given function if there are data available immediately.
+//  Return immediately if there is no data available.
 // Return
 //	0 if no error, negative if error detected on calling the function
+// Remark
+//	The the start pointer and the available data size in the receive buffer
+//	are returned by passing as the parameters of the callback function
 DllExport
 int FSPAPI RecvInline(FSPHANDLE hFSPSocket, CallbackPeeked fp1)
 {
@@ -87,7 +90,7 @@ int FSPAPI ReadFrom(FSPHANDLE hFSPSocket, void *buf, int capacity, NotifyOrRetur
 
 
 // See ::RecvInline()
-int CSocketItemDl::RecvInline(PVOID fp1)
+int CSocketItemDl::RecvInline(CallbackPeeked fp1)
 {
 	if(! WaitUseMutex())
 		return -EINTR;
@@ -121,13 +124,16 @@ int CSocketItemDl::RecvInline(PVOID fp1)
 // Given
 //	void *			the start pointer of the receive buffer
 //	int				the capacity in byte of the receive buffer
+//	NotifyOrReturn	the pointer of the function called back
 // Do
-//	Register internal
+//	Register internal function pointer
 // Return
 //	0 if no immediate error, negative on error
 //	-EBUSY calling convention error: cannot read the stream before previous ReadFrom called back
 //	-EDEADLK	/-EADDRINUSE most likely by previous ReadFrom
-int LOCALAPI CSocketItemDl::ReadFrom(void * buffer, int capacity, PVOID fp1)
+// See ::RecvFrom()
+// TODO: check whether the buffer overlapped?
+int LOCALAPI CSocketItemDl::ReadFrom(void * buffer, int capacity, NotifyOrReturn fp1)
 {
 #ifdef TRACE
 	printf_s("ReadFrom the FSP pipe to 0x%08X: byte[%d]\n", (LONG)buffer,  capacity);
@@ -147,18 +153,17 @@ int LOCALAPI CSocketItemDl::ReadFrom(void * buffer, int capacity, PVOID fp1)
 		SetMutexFree();
 		return -EDEADLK;
 	}
-	// TODO: check whether the buffer overlapped?
 
 	peerCommitted = 0;	// See also FetchReceived()
 	bytesReceived = 0;
 	waitingRecvSize = capacity;
 
+	// We do not reset fpPeeked. RecvInline() just takes precedence over ReadFrom()
 	if(fpPeeked != NULL)
 	{
 		SetMutexFree();
 		return 0;
 	}
-	// NO!We do not reset fpPeeked. RecvInline() just takes precedence over ReadFrom()
 
 	if(HasDataToDeliver())
 	{
@@ -172,6 +177,11 @@ int LOCALAPI CSocketItemDl::ReadFrom(void * buffer, int capacity, PVOID fp1)
 
 
 
+// Given
+//	void *	the pointer of the source payload
+//	int		number of octets to be copied
+// Do
+//	Copy given content to the receive buffer provided by ULA 
 // Return number of bytes actually delivered
 inline
 int LOCALAPI CSocketItemDl::DeliverData(void *p, int n)
@@ -192,13 +202,14 @@ int LOCALAPI CSocketItemDl::DeliverData(void *p, int n)
 // Return
 //	-EDOM	(-33)	if the packet size does not comform to the protocol
 //	-EFAULT (-14)	if the packet buffer was broken
-//	positive or zero if no error
+//	non-negative: number of octets fetched. might be zero
+// Remark
+//	Left border of the receive window is slided if RecvInline has been called but the inquired receive buffer has not been unlocked
 inline
 int CSocketItemDl::FetchReceived()
 {
-	int m = 0;	// note that left border of the receive window slided in the loop body
-	// firstly, skip those already delivered
 	ControlBlock::PFSP_SocketBuf p;
+	int m = 0;
 	// normally the loop body should never be executed
 	while(HasDataToDeliver() && (p = pControlBlock->GetFirstReceived())->opCode == 0)
 	{
@@ -244,8 +255,6 @@ int CSocketItemDl::FetchReceived()
 // Remark
 //	It is meant to be called by the soft interrupt handling entry function where the mutex lock has been obtained
 //	and it sets the mutex lock free on leave.
-//	fpReceived would not be reset if internal memeory allocation error detected
-//	ULA should make sure that the socket is freed in the callback function (if recycling is notified)
 void CSocketItemDl::ProcessReceiveBuffer()
 {
 #ifdef TRACE
@@ -274,7 +283,7 @@ void CSocketItemDl::ProcessReceiveBuffer()
 			peerCommitted = 1;
 			fpPeeked = NULL;
 		}
-		if(n == 0)	// (n == 0 && !b) when the last message is a payloadless PERSIST with the EoT flag set
+		else if(n == 0) // when the last message is a payloadless PERSIST without the EoT flag set
 		{
 			SetMutexFree();
 			return;
@@ -283,15 +292,19 @@ void CSocketItemDl::ProcessReceiveBuffer()
 		//
 		SetMutexFree();
 		if(n < 0)
+		{
 			fp1(this, NULL, (int32_t)n, false);
-		else
-			fp1(this, p, (int32_t)n, b);
+			return;
+		}
+		//
+		fp1(this, p, (int32_t)n, b);
 		WaitUseMutex();
 		// Assume the call-back function did not mess up the receiv queue
 		MarkReceiveFinished(n);
 		if (HasDataToDeliver())
 			SelfNotify(FSP_NotifyDataReady);
 		//
+		Call<FSP_AdRecvWindow>();
 		SetMutexFree();
 		return;
 	}
@@ -314,21 +327,20 @@ void CSocketItemDl::ProcessReceiveBuffer()
 		SetMutexFree();
 		return;
 	}
+	if(n > 0)
+		Call<FSP_AdRecvWindow>();
 	//
 	if(peerCommitted || waitingRecvSize <= 0)
-		FinalizeRead();
-	else
+	{
+		NotifyOrReturn fp1 = (NotifyOrReturn)InterlockedExchangePointer((PVOID *) & fpReceived, NULL);
+		waitingRecvBuf = NULL;
 		SetMutexFree();
-}
-
-
-
-void CSocketItemDl::FinalizeRead()
-{
-	NotifyOrReturn fp1 = (NotifyOrReturn)InterlockedExchangePointer((PVOID *) & fpReceived, NULL);
-	waitingRecvBuf = NULL;
-	SetMutexFree();
-	// due to multi-task nature it could be already reset in the caller although fpReceived has been checked here
-	if(fp1 != NULL)
-		fp1(this, FSP_NotifyDataReady, bytesReceived);
+		// due to multi-task nature it could be already reset in the caller although fpReceived has been checked here
+		if(fp1 != NULL)
+			fp1(this, FSP_NotifyDataReady, bytesReceived);
+	}
+	else
+	{
+		SetMutexFree();
+	}
 }

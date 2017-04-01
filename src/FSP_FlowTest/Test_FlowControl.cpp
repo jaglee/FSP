@@ -30,7 +30,6 @@ void FlowTestAcknowledge()
 	pSCB->SetSendWindow(FIRST_SN);
 	ControlBlock::PFSP_SocketBuf skb = pSCB->GetSendBuf();
 	//Assert::IsNotNull(skb);
-	assert(pSCB->sendWindowSize == 1);
 	assert(pSCB->sendBufferNextSN == FIRST_SN + 1);
 	skb->SetFlag<IS_COMPLETED>();
 	skb->Lock();
@@ -49,14 +48,13 @@ void FlowTestAcknowledge()
 
 	// emulate sending, assume 3 packets sent
 	pSCB->sendWindowNextSN += 3;
-	pSCB->sendWindowSize = MAX_BLOCK_NUM;	// don't let size of send window limit the test
+	pSCB->sendWindowLimitSN = FIRST_SN + MAX_BLOCK_NUM;	// don't let size of send window limit the test
 	assert(pSCB->sendWindowNextSN == FIRST_SN + 3);
 
 	// acknowledge the first two
 	r = socket.RespondToSNACK(FIRST_SN + 2, NULL, 0);
 	assert(r == 2 && pSCB->sendWindowFirstSN == FIRST_SN + 2);
 	assert(pSCB->CountSentInFlight() >= 0);
-	assert(pSCB->sendWindowSize == MAX_BLOCK_NUM - 2);
 
 	// Now, more test...
 	for(int i = 3; i < MAX_BLOCK_NUM; i++)
@@ -77,7 +75,6 @@ void FlowTestAcknowledge()
 	skb->SetFlag<IS_COMPLETED>();
 	skb = pSCB->GetSendBuf();	// no space in the send buffer.
 	assert(skb == NULL);
-	assert(pSCB->sendWindowSize == MAX_BLOCK_NUM - 2);
 
 	// assume the third is a gap...
 	gaps[0].dataLength = htobe32(1);
@@ -133,9 +130,9 @@ void FlowTestAcknowledge()
 	//^ but the expectedSN is impossible for the small sending window!
 	printf_s("RespondToSNACK(FIRST_SN + 0x1000A, gaps, 2):\n"
 		"\tnAck = %d, CountSentInFlight() = %d\n"
-		"\tsendWindowHeadPos = %d, sendWindowFirstSN = %u, sendWindowSize = %d\n"
+		"\tsendWindowHeadPos = %d, sendWindowFirstSN = %u, sendWindowLimitSN = %u\n"
 		, r, pSCB->CountSentInFlight()
-		, pSCB->sendWindowHeadPos, pSCB->sendWindowFirstSN, pSCB->sendWindowSize);
+		, pSCB->sendWindowHeadPos, pSCB->sendWindowFirstSN, pSCB->sendWindowLimitSN);
 
 	// Test round-robin...
 	for(int i = MAX_BLOCK_NUM_L + 2; i < MAX_BLOCK_NUM_L + 0x10000; i++)
@@ -156,9 +153,9 @@ void FlowTestAcknowledge()
 	r = socket.RespondToSNACK(FIRST_SN + MAX_BLOCK_NUM_L + 0xF000, gaps, 2);
 	printf_s("RespondToSNACK(FIRST_SN + MAX_BLOCK_NUM_L + 0xF000, gaps, 2):\n"
 		"\tnAck = %d, CountSentInFlight() = %d\n"
-		"\tsendWindowHeadPos = %d, sendWindowFirstSN = %u, sendWindowSize = %d\n"
+		"\tsendWindowHeadPos = %d, sendWindowFirstSN = %u, sendWindowLimitSN = %u\n"
 		, r, pSCB->CountSentInFlight()
-		, pSCB->sendWindowHeadPos, pSCB->sendWindowFirstSN, pSCB->sendWindowSize);
+		, pSCB->sendWindowHeadPos, pSCB->sendWindowFirstSN, pSCB->sendWindowLimitSN);
 }
 
 
@@ -266,8 +263,8 @@ void FlowTestRetransmission()
 	memset(& placeholder, 0, sizeof(placeholder));
 	int32_t len = dbgSocket.GenerateSNACK(p->ext, seq4, sizeof(FSP_NormalPacketHeader));
 
-	p->hdr.hs.version = THIS_FSP_VERSION;
 	p->hdr.hs.opCode = KEEP_ALIVE;
+	p->hdr.hs.major = THIS_FSP_VERSION;
 	p->hdr.hs.hsp = htobe16(uint16_t(len));
 
 	// Both KEEP_ALIVE and ACK_FLUSH are payloadless out-of-band control block which always apply current session key
@@ -275,8 +272,8 @@ void FlowTestRetransmission()
 	p->hdr.sequenceNo = htobe32(pSCB->sendWindowNextSN - 1);
 	p->hdr.expectedSN = htobe32(seq4);
 	p->hdr.ClearFlags();
-	p->hdr.SetRecvWS(pSCB->RecvWindowSize());
-	
+	p->hdr.SetRecvWS(pSCB->AdRecvWS(seq4));
+
 	dbgSocket.SetIntegrityCheckCode(& p->hdr, NULL, 0, p->ext.GetSaltValue());
 
 	// Firstly emulate receive the packet before emulate OnGetKeepAlive
@@ -338,7 +335,7 @@ void FlowTestRetransmission()
 	p->hdr.sequenceNo = htobe32(pSCB->sendWindowNextSN - 1);
 	p->hdr.expectedSN = htobe32(seq4);
 	p->hdr.ClearFlags();
-	p->hdr.SetRecvWS(pSCB->RecvWindowSize());
+	p->hdr.SetRecvWS(pSCB->AdRecvWS(seq4));
 
 	dbgSocket.SetIntegrityCheckCode(&p->hdr, NULL, 0, p->ext.GetSaltValue());
 	// as it is an out-of-band packet, assume pre-set values are kept

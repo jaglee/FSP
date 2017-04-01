@@ -1,6 +1,6 @@
 /*
  * DLL to service FSP upper layer application
- * part of the SessionCtrl class, Send and Flush
+ * Send/Write/Transmit functions
  *
     Copyright (c) 2012, Jason Gao
     All rights reserved.
@@ -31,11 +31,14 @@
 #include <time.h>
 
 
+
 // Given
-//	FSPHANDLE	the socket handle
-//	NotifyOrReturn	the pointer to the function called back when enough buffer available
+//	FSPHANDLE			the socket handle
+//	int					minimal buffer size requested
+//	CallbackBufferReady	the pointer to the function called back when enough buffer available
 // Return
-//	Size of free send bufffe in bytes, 0 if no free, negative if error
+//	size of free send buffer available immediately, might be 0 which is not an error
+//	negative if exception arised
 DllExport
 int FSPAPI GetSendBuffer(FSPHANDLE hFSPSocket, int m, CallbackBufferReady fp1)
 {
@@ -63,14 +66,14 @@ int FSPAPI GetSendBuffer(FSPHANDLE hFSPSocket, int m, CallbackBufferReady fp1)
 //	int			the number of octets to send
 //	int8_t	
 //		0:		do not terminate the transmit transaction
-//		EOF:	terminate the transaction
+//		EOF(typical non-zero): terminate the transaction
 // Return
 //	number of octets really scheduled to send
 // Remark
-//	The buffer MUST begin from what GetSendBuffer has returned and
-//	may not exceed the capacity that GetSendBuffer has returned
+//	SendInline is typically chained in tandem with GetSendBuffer
+//	The buffer MUST begin from what the callback function of GetSendBuffer has returned and
+//	may not exceed the capacity that the callback function of GetSendBuffer has returned
 //	if the buffer is to be continued, its size MUST be multiplier of MAX_BLOCK_SIZE
-//	SendInline could be chained in tandem with GetSendBuffer
 DllExport
 int FSPAPI SendInline(FSPHANDLE hFSPSocket, void * buffer, int len, int8_t eotFlag)
 {
@@ -93,16 +96,14 @@ int FSPAPI SendInline(FSPHANDLE hFSPSocket, void * buffer, int len, int8_t eotFl
 //	int			the number of octets to send
 //	int8_t	
 //		0:		do not terminate the transmit transaction
-//		EOF:	terminate the transaction
+//		EOF(typical non-zero): terminate the transaction
 //	NotifyOrReturn	the callback function pointer
 // Return
-//	0 if no immediate error, negative if it failed, or positive it was warned (I/O pending)
+//	0 if no immediate error
+//	negative if it failed
+//	positive it was warned (I/O pending)
 // Remark
 //	Only all data have been buffered may be NotifyOrReturn called.
-//	Choice of the flag:
-//		0: not finshed more data to follow
-//		1: it is the trail of the containing message
-//		2: it is the last message of the session of the particular transmit direction
 DllExport
 int FSPAPI WriteTo(FSPHANDLE hFSPSocket, void * buffer, int len, int8_t flag, NotifyOrReturn fp1)
 {
@@ -160,9 +161,7 @@ int LOCALAPI CSocketItemDl::AcquireSendBuf(int n)
 // Given
 //	void *		the buffer pointer
 //	int			the number of octets to send
-//	int8_t	
-//		0:		do not terminate the transmit transaction
-//		EOF:	terminate the transaction
+//	bool		whether to terminate the transmit transaction
 // Return
 //	number of octets really scheduled to send
 // Remark
@@ -192,7 +191,7 @@ int LOCALAPI CSocketItemDl::SendInplace(void * buffer, int len, bool eot)
 // Given
 //	void * 	the pointer to the source data buffer
 //	int		the size of the source data in bytes
-//	bool	whether terminate the transaction
+//	bool	whether to terminate the transmit transaction
 // Return
 //	Number of bytes put on the send queue
 //	negative on error
@@ -365,9 +364,11 @@ void CSocketItemDl::ProcessPendingSend()
 
 
 // Given
-//	int &	[_In_] length of data in pendingSendBuf to send [_Out_] length of data scheduled to send
+//	int		number of octets in pendingSendBuf to put into the send queue
 // Return
 //	number of bytes buffered in the send queue
+// Remark
+//	Side-effect: set the value of pendingSendSize to number of octets yet to be buffered
 int LOCALAPI CSocketItemDl::BufferData(int len)
 {
 	ControlBlock::PFSP_SocketBuf p = pControlBlock->LockLastBufferedSend();
@@ -462,7 +463,7 @@ l_finish:
 // Given
 //	void *	the pointer to the in-place buffer to be marked in the send queue
 //	int		the size of the buffer in bytes
-//	bool	whether terminate the transaction
+//	bool	whether to terminate the transmit transaction
 // Return
 //	number of blocks split
 //	-EFAULT if the first parameter is illegal
@@ -496,6 +497,7 @@ int LOCALAPI CSocketItemDl::PrepareToSend(void * buf, int len, bool eotFlag)
 	p = pControlBlock->HeadSend() + pControlBlock->sendBufferNextPos;
 	// p now is the descriptor of the first available buffer block
 	m = (len - 1) / MAX_BLOCK_SIZE;
+
 	register ControlBlock::PFSP_SocketBuf p0 = p;
 	for(int j = 0; j < m; j++)
 	{

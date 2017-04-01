@@ -128,7 +128,7 @@ extern "C" {
 // Given
 //	GCM_AES_CTX *	pointer to the GCM context
 //	const uint8_t *	byte array representation of AES key
-//	int				length in bytes of the key, must be 16, 24 or 32
+//	int				length in bytes of the key, must be 16, 24, 32 (without salt) or 20, 28, 40 (with salt)
 void	GCM_AES_SetKey(GCM_AES_CTX *, const uint8_t *, int);
 
 // Given
@@ -200,9 +200,9 @@ int	GCM_AES_AuthenticateAndDecrypt(GCM_AES_CTX *ctx, uint64_t IV
 //	GCM_AES_CTX *	pointer to the GCM context
 //	uint64_t		the initial vector, limit to 64-bit
 //	const uint8_t * A, the byte string input to calculate secure hash, must be 64-bit aligned!
-//	uint32_t		length of the inputted byte string to have secure hash calculated
-//	uint8_t *		placeholder of the tag(secure digest). the buffe size MAYNOT be less than bytesT
-//	int				capacity in byte of the tag buffer
+//	uint32_t		length of the input byte string to have secure hash calculated
+//	uint8_t *		placeholder of the tag(secure digest). the capacity of the buffer MAYNOT be less than bytesT
+//	int				intent length of the tag
 // Do
 //	Encrypt the plaintext into ciphertext, store the ciphertext into the buffer specified by C
 //	and calculte the authenticate tag, store the tag into the buffer specified by T 

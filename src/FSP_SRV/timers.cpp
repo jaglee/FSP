@@ -1,11 +1,5 @@
 /*
  * FSP lower-layer service program, software time-wheel, might be accelerated by hardware
- * heartbeat callback and its related functions to
- * - retransmit INITIATE_CONNECT, CONNECT_REQUEST, PERSIST or MULTIPLY
- * - send heartbeat signal KEEP_ALIVE
- * - idle timeout of CONNECT_BOOTSTRAP, CONNECT_AFFIRMING, CLONING or CHALLENGING,
- * - as well as ACTIVE, COMMITTING, COMMITTING2, or PRE_CLOSED state
- * - and finally, 'lazy' garbage collecting of CLOSABLE or CLOSED state
  *
     Copyright (c) 2012, Jason Gao
     All rights reserved.
@@ -38,39 +32,12 @@
 #include <math.h>
 #include <time.h>
 
-/**
-  Continual KEEP_ALIVE packets are sent as heartbeat signals. PERSIST may be retransmitted in the heartbeat interval
-  ACK_CONNECT_REQ, PURE_DATA or ACK_FLUSH is retransmitted on demand.
-  ACK_INIT_CONNECT is never retransmitted.
 
-  Timeout is almost always notified to ULA
-  
-  Implementation should start garbage collecting as soon as it switches into NON_EXSISTENT state.
-
-  [Idle Timeout]
-	  ACTIVE-->NON_EXISTENT
-	  PEER_COMMIT-->NON_EXISTENT
-	  COMMITTED-->NON_EXISTENT
-
-  [Free Timeout]
-	  CLOSED-->NON_EXISTENT
-
-  Heartbeat_Interval_0 = RTT0 << 2
-  RTT_N = Max(1, Average(persist_time - send_time) - Heartbeat_Interval_N)
-  Heartbeat_Interval_(N+1) = Heartbeat_Interval_N  - (Heartbeat_Interval_N >> 2) + RTT_N
-  The actual heartbeat interval should be no less than one OS time slice interval 
-
-  timeouts:
-	- transaction commit [LLS: send EoT flag to ACK_FLUSH]
-	  {COMMITTING, COMMITTING2}-->NON_EXISTENT
-	- transient state
-	  CLONING-->NON_EXISTENT
-	- retransmit: connect request, update peer's home address
-	  {CONNECT_BOOTSTRAP, CHALLENGING, CONNECT_AFFIRMING}-->NON_EXISTENT
-	- shutdown
-	  {PRE_CLOSED}-->NON_EXISTENT
-	- keep-alive
-**/
+//
+// TODO: garbage collector, those whose parent process is inactive should be collected!
+// Non-empty notice queue
+// IsProcessAlive
+//
 
 // let calling of Destroy() in the NON_EXISTENT state to do cleanup 
 #define TIMED_OUT() \
@@ -80,20 +47,39 @@
 		return
 
 
-// A low frequence KEEP_ALIVE is a MUST
+// Main purpose is to send the mandatory low-frequence KEEP_ALIVE
+/**
+  [Idle Timeout]
+	ACTIVE-->NON_EXISTENT
+	PEER_COMMIT-->NON_EXISTENT
+	COMMITTED-->NON_EXISTENT
+	CLOSABLE-->NON_EXISTENT
+
+  Retransmission time-out in CONNECT_BOOTSTRAP, CONNECT_AFFIRMING
+  Transient state time-out in CHALLENGING, CLONING
+
+  But the transaction commit time-out is handled in DLL, i.e. in ULA's work set.
+	{COMMITTING, COMMITTING2}-->NON_EXISTENT
+  So does the shutdown time-out:
+	PRE_CLOSED-->NON_EXISTENT
+ */
 void CSocketItemEx::KeepAlive()
 {
 	if(! WaitUseMutex())
 	{
-		if (!IsInUse())
-		{
-			BREAK_ON_DEBUG();	//TRACE_HERE("Lazy garbage collection, in case of leakage");
-			Destroy();
-		}
 #ifdef TRACE
 		printf_s("\nFiber#%u's KeepAlive not executed due to lack of locks in state %s. InUse: %d\n"
 			, fidPair.source, stateNames[lowState], IsInUse());
 #endif
+		if (!IsInUse())
+			REPORT_ERRMSG_ON_TRACE("Lazy garbage collection found possible dead-lock");
+		return;
+	}
+
+	if (!IsProcessAlive())
+	{
+		AbortLLS();		// shall pair with free-lock in one function!?
+		SetMutexFree();
 		return;
 	}
 
@@ -114,7 +100,7 @@ void CSocketItemEx::KeepAlive()
 		}
 		Destroy();
 		break;
-	// Note that CONNECT_BOOTSTRAP and CONNECT_AFFIRMING are counted into one transient period
+	//
 	case CONNECT_BOOTSTRAP:
 	case CONNECT_AFFIRMING:
 	case CHALLENGING:
@@ -125,10 +111,11 @@ void CSocketItemEx::KeepAlive()
 #endif
 			TIMED_OUT();
 		}
-		// TO BE TESTED...
+		// CONNECT_BOOTSTRAP and CONNECT_AFFIRMING are counted into one transient period
 		if(lowState != CHALLENGING)
 			EmitStart();
 		break;
+	//
 	case ESTABLISHED:
 	case COMMITTING:
 	case COMMITTED:
@@ -147,17 +134,7 @@ void CSocketItemEx::KeepAlive()
 		if (lowState != PEER_COMMIT)
 			SendKeepAlive();
 		break;
-	case PRE_CLOSED:
-		if((t1 - tMigrate) > (TRANSIENT_STATE_TIMEOUT_ms << 10)
-		 || t1 - tSessionBegin >  (MAXIMUM_SESSION_LIFE_ms << 10) )
-		{
-#ifdef TRACE
-			printf_s("\nTransient state time out in the %s state\n", stateNames[lowState]);
-#endif
-			TIMED_OUT();
-		}
-		// UNRESOLVED!? There used to be re-send RELEASE command here
-		break;
+	//
 	case CLOSED:	// CLOSED timeout to NON_EXISTENT in a short time
 		if ((t1 - tMigrate) > (TRANSIENT_STATE_TIMEOUT_ms << 10))
 		{
@@ -166,15 +143,17 @@ void CSocketItemEx::KeepAlive()
 #endif
 			TIMED_OUT();
 		}
+	case PRE_CLOSED:
 	case CLOSABLE:	// CLOSABLE does not automatically timeout to CLOSED
 		if(t1 - tSessionBegin >  (MAXIMUM_SESSION_LIFE_ms << 10))
 		{
 			ReplaceTimer(TRANSIENT_STATE_TIMEOUT_ms);
 			if(lowState == CLOSABLE)
-				SendPacket<RESET>();	// See also Reject
+				SendReset();	// See also RejectOrReset
 			TIMED_OUT();
 		}
 		break;
+	//
 	case CLONING:
 		if (t1 - tMigrate > (TRANSIENT_STATE_TIMEOUT_ms << 10)
 		 || t1 - tSessionBegin >  (MAXIMUM_SESSION_LIFE_ms << 10) )
@@ -199,6 +178,7 @@ void CSocketItemEx::KeepAlive()
 
 
 
+// Retransmission time-out handler
 void CSocketItemEx::DoResend()
 {
 	if (!WaitUseMutex())
@@ -317,7 +297,7 @@ l_return:
 
 
 
-// Send the selective negative acknowledgement on laziness timed-out
+// The lazy selective negative acknowledgement time-out handler
 void CSocketItemEx::LazilySendSNACK()
 {
 	lazyAckTimer = NULL;
@@ -462,7 +442,7 @@ bool CSocketItemEx::SendAckFlush()
 
 // Given
 //	ControlBlock::seq_t		the accumulatedly acknowledged sequence number
-//	const GapDescriptor *	array of the gap descriptors
+//	GapDescriptor *			array of the gap descriptors
 //	int						number of gap descriptors
 // Do
 //	Make acknowledgement, maybe accumulatively if number of gap descriptors is 0
@@ -476,6 +456,7 @@ bool CSocketItemEx::SendAckFlush()
 //	Milky payload might be retansmitted on demand, but it isn't implemented here
 //  It is an accumulative acknowledgment if n == 0
 //	Memory integrity is checked here as well
+//	Side effect: the integer value in the gap descriptors are translated to host byte order here
 int LOCALAPI CSocketItemEx::RespondToSNACK(ControlBlock::seq_t expectedSN, FSP_SelectiveNACK::GapDescriptor *gaps, int n)
 {
 	const ControlBlock::seq_t headSN = pControlBlock->sendWindowFirstSN;

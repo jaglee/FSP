@@ -43,6 +43,20 @@ public:
 	//}
 	void SetState(FSP_Session_State s) { CSocketItemEx::SetState(s); }
 
+	bool NotInStates(FSP_Session_State first, FSP_Session_State second)
+	{
+		return lowState != first && lowState != second;
+	}
+
+#if _MSC_VER >= 1800
+	// VS2013 and above support variadic template
+	template<typename... States>
+	bool NotInStates(FSP_Session_State first, States ... rest)
+	{
+		return lowState != first && NotInStates(rest...);
+	}
+#endif
+
 	PControlBlock GetControlBlock() const { return PControlBlock(pControlBlock); }
 	ControlBlock::PFSP_SocketBuf AllocRecvBuf(ControlBlock::seq_t seq1) { return pControlBlock->AllocRecvBuf(seq1); }
 	void InstallSessionKey(BYTE key[FSP_MIN_KEY_SIZE])
