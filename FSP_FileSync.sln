@@ -20,6 +20,10 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CSharpAPI", "src\CSharpAPI\
 	EndProjectSection
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "FSP_Sciter", "src\FSP_Sciter\FSP_Sciter.vcxproj", "{668E8AC4-C4ED-406C-B5EB-D1CCBE65590B}"
+	ProjectSection(ProjectDependencies) = postProject
+		{E4F996A5-837A-4B6F-8524-D35EC41D6BAD} = {E4F996A5-837A-4B6F-8524-D35EC41D6BAD}
+		{DC63E2B4-BA8D-4540-936A-63106FFCB999} = {DC63E2B4-BA8D-4540-936A-63106FFCB999}
+	EndProjectSection
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -104,6 +108,7 @@ Global
 		{668E8AC4-C4ED-406C-B5EB-D1CCBE65590B}.Debug|Mixed Platforms.ActiveCfg = Debug|Win32
 		{668E8AC4-C4ED-406C-B5EB-D1CCBE65590B}.Debug|Mixed Platforms.Build.0 = Debug|Win32
 		{668E8AC4-C4ED-406C-B5EB-D1CCBE65590B}.Debug|Win32.ActiveCfg = Debug|Win32
+		{668E8AC4-C4ED-406C-B5EB-D1CCBE65590B}.Debug|Win32.Build.0 = Debug|Win32
 		{668E8AC4-C4ED-406C-B5EB-D1CCBE65590B}.Debug|x64.ActiveCfg = Debug|x64
 		{668E8AC4-C4ED-406C-B5EB-D1CCBE65590B}.Debug|x64.Build.0 = Debug|x64
 		{668E8AC4-C4ED-406C-B5EB-D1CCBE65590B}.Release|Any CPU.ActiveCfg = Release|Win32

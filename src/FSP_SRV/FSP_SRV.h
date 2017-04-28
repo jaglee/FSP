@@ -59,6 +59,8 @@
 // might be optimized by loop unrolling
 inline void	 rand_w32(uint32_t *p, int n) { for (register int i = 0; i < min(n, 32); i++) { rand_s(p + i); } }
 
+// Return the number of microseconds elapsed since Jan 1, 1970 (unix epoch time)
+extern "C" timestamp_t NowUTC();
 
 /**
 * It requires Advanced IPv6 API support to get the application layer thread ID from the IP packet control structure

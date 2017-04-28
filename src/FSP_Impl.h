@@ -142,10 +142,6 @@ void TraceLastError(char * fileName, int lineNo, char *funcName, char *s1);
 #endif
 
 
-// Return the number of microseconds elapsed since Jan 1, 1970 (unix epoch time)
-extern "C" timestamp_t NowUTC();
-
-
 /**
  * Implemented system limit
  */
@@ -735,6 +731,7 @@ struct ControlBlock
 
 	// Return the head packet even if the send queue is empty
 	PFSP_SocketBuf GetSendQueueHead() const { return HeadSend() + sendWindowHeadPos; }
+
 	// Return the descriptor of the last buffered packet in the send buffer, NULL if the send queue is empty or cannot obtain the lock
 	// The imcomplete last buffered packet, if any, is implictly locked
 	// but a complete packet MUST be explicitly locked at first here to make the send queue stable enough
@@ -747,6 +744,7 @@ struct ControlBlock
 		// An invalid packet buffer might be locked
 		return CountSendBuffered() <= 0 ? NULL : p;
 	}
+
 	// Return
 	//	0 if used to be no packet at all
 	//	1 if there existed a sent packet at the tail which has ready marked EOT 
@@ -772,8 +770,9 @@ struct ControlBlock
 	int LOCALAPI GetSelectiveNACK(seq_t &, FSP_SelectiveNACK::GapDescriptor *, int) const;
 	int LOCALAPI DealWithSNACK(seq_t, FSP_SelectiveNACK::GapDescriptor *, int, timestamp_t &);
 
-	// Return the last received packet, which might be already delivered
+	// Return the locked descriptor of the receive buffer block with the given sequence number
 	PFSP_SocketBuf LOCALAPI AllocRecvBuf(seq_t);
+
 	// Slide the left border of the receive window by one slot
 	void SlideRecvWindowByOne()	// shall be atomic!
 	{
@@ -781,6 +780,7 @@ struct ControlBlock
 			recvWindowHeadPos -= recvBufferBlockN;
 		InterlockedIncrement((LONG *) & recvWindowFirstSN);
 	}
+
 	// Given
 	//	int & : [_Out_] place holder of the number of bytes [to be] peeked.
 	//	bool &: [_Out_] place holder of the End of Transaction flag
@@ -812,6 +812,7 @@ struct ControlBlock
 	void SlideSendWindow();
 	// Slide the send window to skip the head slot, supposing that it has been acknowledged
 	void SlideSendWindowByOne();
+
 	// Set the right edge of the send window after the very first packet of the queue is sent
 	void SetFirstSendWindowRightEdge()
 	{

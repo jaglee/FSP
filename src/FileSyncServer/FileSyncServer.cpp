@@ -17,7 +17,8 @@ volatile bool	finished = false;
 FSPHANDLE		hFspListen;
 char			linebuf[80];
 // assume that address space layout randomization keep the secret hard to find
-unsigned char bufPrivateKey[CRYPTO_NACL_KEYBYTES];
+unsigned char	bufPrivateKey[CRYPTO_NACL_KEYBYTES];
+unsigned char * bufPublicKey;
 
 static char		fileName[MAX_FILENAME_WITH_PATH_LEN];
 static int		fd;
@@ -110,8 +111,8 @@ int main(int argc, char * argv[])
 	
 	unsigned short mLen = (unsigned short)strlen(defaultWelcome) + 1;
 	char *thisWelcome = (char *)_alloca(mLen + CRYPTO_NACL_KEYBYTES);
-	unsigned char *bufPublicKey = (unsigned char *)thisWelcome + mLen;;
-	memcpy(thisWelcome, defaultWelcome, mLen);	//+\000012345678901234567890123456789012
+	bufPublicKey = (unsigned char *)thisWelcome + mLen;;
+	memcpy(thisWelcome, defaultWelcome, mLen);
 	CryptoNaClKeyPair(bufPublicKey, bufPrivateKey);
 
 	if(_stricmp(argv[1], "$memory.^") == 0)

@@ -1019,6 +1019,23 @@ void TraceLastError(char * fileName, int lineNo, char *funcName, char *s1)
 
 
 /**
+ *	POSIX gettimeofday(); get current UTC time
+ */
+// Return the number of microseconds elapsed since Jan 1, 1970 UTC (unix epoch)
+extern "C" timestamp_t NowUTC()
+{
+	// return the number of 100-nanosecond intervals since January 1, 1601 (UTC), in host byte order
+	FILETIME systemTime;
+	GetSystemTimeAsFileTime(&systemTime);
+
+	timestamp_t & t = *(timestamp_t *)& systemTime;
+	t /= 10;
+	return (t - DELTA_EPOCH_IN_MICROSECS);
+}
+
+
+
+/**
  *	The timer queue
  */
 TimerWheel::TimerWheel()

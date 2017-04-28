@@ -5,6 +5,16 @@
 
 #include "sciter-x.h"
 
+extern int Download(char *remoteAppURL);
+
+//#define REMOTE_APPLAYER_NAME "localhost:80"
+// #define REMOTE_APPLAYER_NAME "lt-x61t:80"
+// #define REMOTE_APPLAYER_NAME "lt-at4:80"
+// #define REMOTE_APPLAYER_NAME "lt-ux31e:80"
+#define REMOTE_APPLAYER_NAME "E000:AAAA::1"
+//#define REMOTE_APPLAYER_NAME "E000:BBBB::1"
+
+
 HINSTANCE ghInstance = 0;
 
 // generate BGRA image
@@ -15,8 +25,8 @@ void GenerateBGRATestsImage(HWND hSciter) {
 
   // signature
   packedData[0] = 'B';
-	packedData[1] = 'G';
-	packedData[2] = 'R';
+  packedData[1] = 'G';
+  packedData[2] = 'R';
   packedData[3] = 'A';
 
   // width/height
@@ -26,10 +36,10 @@ void GenerateBGRATestsImage(HWND hSciter) {
   // image data
   for ( int i = 0; i < 10 * 10 * 4; i += 4)
   {
-			packedData[4 + 4 + 4 + i] = i / 4;
-      packedData[4 + 4 + 4 + i + 1] = 255 - i / 4;
-      packedData[4 + 4 + 4 + i + 2] = 255;
-      packedData[4 + 4 + 4 + i + 3] = 255;
+     packedData[4 + 4 + 4 + i] = i / 4;
+     packedData[4 + 4 + 4 + i + 1] = 255 - i / 4;
+     packedData[4 + 4 + 4 + i + 2] = 255;
+     packedData[4 + 4 + 4 + i + 3] = 255;
   }
   ::SciterDataReady( hSciter, WSTR("in-memory:test"), packedData,  sizeof(packedData));
 }
@@ -46,17 +56,20 @@ UINT DoLoadData(LPSCN_LOAD_DATA pnmld)
   }
   else if(wu.like(WSTR("res:*")))
   {
-    // then by calling possibly overloaded load_resource_data method
+     // then by calling possibly overloaded load_resource_data method
     if(sciter::load_resource_data(ghInstance,wu.start+4, pb, cb))
-      ::SciterDataReady( pnmld->hwnd, pnmld->uri, pb,  cb);
+       ::SciterDataReady( pnmld->hwnd, pnmld->uri, pb,  cb);
   } else if(wu.like(WSTR("this://app/*"))) {
     // try to get them from archive (if any, you need to call sciter::archive::open() first)
     aux::bytes adata = sciter::archive::instance().get(wu.start+11);
     if(adata.length)
       ::SciterDataReady( pnmld->hwnd, pnmld->uri, adata.start, adata.length);
+  } else if(wu.like(WSTR("fsp://localhost/*"))) {
+	Download((char *)(wu.start+17));	// TODO: wide-char to MBSC
   }
   return LOAD_OK;
 }
+
 
 // fulfill SC_ATTACH_BEHAVIOR request 
 UINT DoAttachBehavior( LPSCN_ATTACH_BEHAVIOR lpab )
@@ -70,6 +83,7 @@ UINT DoAttachBehavior( LPSCN_ATTACH_BEHAVIOR lpab )
   }
   return FALSE;
 }
+
 
 UINT SC_CALLBACK SciterCallback( LPSCITER_CALLBACK_NOTIFICATION pns, LPVOID callbackParam )
 {
@@ -95,14 +109,15 @@ UINT SC_CALLBACK SciterCallback( LPSCITER_CALLBACK_NOTIFICATION pns, LPVOID call
 //	-- In the same time, load resource file on demand, might be in parallel. Background refresh
 //	-- Exploit connection multiplication to download resource file that must be refreshed
 //	-- A resource file must be refreshed first if the local tag mismatch with the value specified in the index
-LPCWSTR GetUrl() {
+LPCWSTR GetUrl()
+{
   static WCHAR url[MAX_PATH] = {0};
 
-  wcscpy(url,L"file://");
-  GetModuleFileName(NULL,url+7,MAX_PATH-7);
+  wcscpy(url, L"file://");
+  GetModuleFileName(NULL, url+7, MAX_PATH-7);
   WCHAR* t = wcsrchr(url,'\\');
   assert(t);
-  wcscpy(t + 1,L"minimal.htm");
+  wcscpy(t + 1, L"minimal.htm");
   return url;
 }
 

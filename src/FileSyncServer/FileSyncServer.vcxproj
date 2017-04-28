@@ -195,6 +195,7 @@
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="CHAKA.h" />
     <ClInclude Include="defs.h" />
     <ClInclude Include="resource.h" />
     <ClInclude Include="stdafx.h" />

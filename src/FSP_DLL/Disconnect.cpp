@@ -121,7 +121,7 @@ int LOCALAPI CSocketItemDl::Shutdown(NotifyOrReturn fp1)
 #endif
 
 	if(! WaitUseMutex())
-		return -EINTR;
+		return -EDEADLK;
 
 	// assert: if the socket is in CLOSED state its LLS image must have been recycled 
 	if(pControlBlock == NULL || InState(NON_EXISTENT) || InState(CLOSED))

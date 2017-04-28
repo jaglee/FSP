@@ -7,7 +7,7 @@
 #include "stdafx.h"
 #include "defs.h"
 
-static char		*fileName = "$memory.^";
+static char	*fileName = "$memory.^";
 static uint8_t	*bytesToSend;
 static size_t	sizeOfBuffer;
 
@@ -57,7 +57,7 @@ static void FSPAPI onPublicKeyReceived(FSPHANDLE h, FSP_ServiceCode c, int r)
 	InstallAuthenticKey(h, bufSharedKey, CRYPTO_NACL_KEYBYTES, INT32_MAX);
 
 	printf_s("\tTo send filename to the remote end...\n");
-	WriteTo(h, fileName, (int)strlen(fileName) + 1, EOF, onFileNameSent);
+	WriteTo(h, fileName, strlen(fileName) + 1, EOF, onFileNameSent);	// multi-byte character set only
 }
 
 

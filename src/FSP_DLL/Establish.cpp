@@ -404,7 +404,7 @@ int FSPAPI InstallAuthenticKey(FSPHANDLE h, BYTE * key, int keySize, int32_t key
 int LOCALAPI CSocketItemDl::InstallKey(BYTE *key, int keySize, int32_t keyLife)
 {
 	if(! WaitUseMutex())
-		return -EINTR;
+		return -EDEADLK;
 
 	CommandInstallKey objCommand(pControlBlock->sendBufferNextSN, keyLife);
 	this->InitCommand<FSP_InstallKey>(objCommand);

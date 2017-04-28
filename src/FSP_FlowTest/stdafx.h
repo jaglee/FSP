@@ -35,4 +35,4 @@ void FlowTestRetransmission();
 void FlowTestRecvWinRoundRobin();
 
 void TrySRP6();
-void TryCHAKE();
+void TryCHAKA();

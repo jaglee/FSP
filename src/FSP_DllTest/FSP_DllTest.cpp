@@ -273,6 +273,110 @@ void UnitTestPrepareToSend()
 
 
 
+//
+void UnitTestFetchReceived()
+{
+	CSocketItemDbg *pSocketItem = GetPreparedSocket();	// assume the receive buffer is fulfilled
+	ControlBlock *pSCB = pSocketItem->GetControlBlock();
+	pSCB->state = ESTABLISHED;
+	pSCB->SetRecvWindow(FIRST_SN);
+	pSCB->SetSendWindow(FIRST_SN);
+
+	// prepare the receive buffer
+	ControlBlock::PFSP_SocketBuf skb = pSCB->HeadRecv();
+	BYTE *preparedTestData = pSocketItem->GetRecvPtr(skb);
+	for (register int i = 0; i < MAX_FSP_SHM_SIZE; i += sizeof(int))
+	{
+		*(int *)(preparedTestData + i) = i;
+	}
+
+	while ((skb = pSCB->AllocRecvBuf(pSCB->recvWindowNextSN)) != NULL)
+	{
+		skb->len = MAX_BLOCK_SIZE;
+		skb->opCode = PURE_DATA;
+		skb->SetFlag<IS_FULFILLED>();
+	}
+	// pSCB->recvWindowNextSN == pSCB->recvWindowFirstSN + pSCB->recvBufferBlockN;
+	// And pSCB->recvWindowNextPos is rounded
+	printf_s("After initialization, receive next SN = %u\n\n", pSCB->recvWindowNextSN);
+
+	int capacity = MAX_BLOCK_SIZE * 4;
+	// void * buffer = malloc(capacity);
+	void * buffer = _alloca(capacity);
+	if (buffer == NULL)
+	{
+		printf_s("Stack overflow in " __FUNCDNAME__  "\n");
+		return;
+	}
+
+	// The 1st segment:
+	pSocketItem->waitingRecvBuf = (BYTE *)buffer;
+	// pSocketItem->peerCommitted = 0;	// See also FetchReceived()
+	pSocketItem->bytesReceived = 0;
+	pSocketItem->waitingRecvSize = MAX_BLOCK_SIZE / 2;
+
+	int r = pSocketItem->FetchReceived();
+	printf_s("Receive first SN = %u\n", pSCB->recvWindowFirstSN);
+	printf_s("FetchReceived return %d, bytesReceived = %d\n", r, pSocketItem->bytesReceived);
+
+	// the 2nd segment:
+	pSocketItem->waitingRecvBuf = (BYTE *)buffer;
+	// pSocketItem->peerCommitted = 0;	// See also FetchReceived()
+	pSocketItem->bytesReceived = 0;
+	pSocketItem->waitingRecvSize = MAX_BLOCK_SIZE / 4;
+
+	r = pSocketItem->FetchReceived();
+	printf_s("Receive first SN = %u\n", pSCB->recvWindowFirstSN);
+	printf_s("FetchReceived return %d, bytesReceived = %d\n", r, pSocketItem->bytesReceived);
+
+	// the 3rd segment: last one in one buffer block
+	pSocketItem->waitingRecvBuf = (BYTE *)buffer;
+	// pSocketItem->peerCommitted = 0;	// See also FetchReceived()
+	pSocketItem->bytesReceived = 0;
+	pSocketItem->waitingRecvSize = MAX_BLOCK_SIZE / 4;
+
+	r = pSocketItem->FetchReceived();
+	printf_s("Receive first SN = %u\n", pSCB->recvWindowFirstSN);
+	printf_s("FetchReceived return %d, bytesReceived = %d\n", r, pSocketItem->bytesReceived);
+
+	// the 4th: as the first segment
+	pSocketItem->waitingRecvBuf = (BYTE *)buffer;
+	// pSocketItem->peerCommitted = 0;	// See also FetchReceived()
+	pSocketItem->bytesReceived = 0;
+	pSocketItem->waitingRecvSize = MAX_BLOCK_SIZE / 2;
+
+	r = pSocketItem->FetchReceived();
+	printf_s("Receive first SN = %u\n", pSCB->recvWindowFirstSN);
+	printf_s("FetchReceived return %d, bytesReceived = %d\n", r, pSocketItem->bytesReceived);
+
+	// the 5th: cross one buffer block border
+	pSocketItem->waitingRecvBuf = (BYTE *)buffer;
+	// pSocketItem->peerCommitted = 0;	// See also FetchReceived()
+	pSocketItem->bytesReceived = 0;
+	pSocketItem->waitingRecvSize = MAX_BLOCK_SIZE;
+
+	r = pSocketItem->FetchReceived();
+	printf_s("Receive first SN = %u\n", pSCB->recvWindowFirstSN);
+	printf_s("FetchReceived return %d, bytesReceived = %d\n", r, pSocketItem->bytesReceived);
+
+	// the 6th: cross two buffer block border
+	pSocketItem->waitingRecvBuf = (BYTE *)buffer;
+	// pSocketItem->peerCommitted = 0;	// See also FetchReceived()
+	pSocketItem->bytesReceived = 0;
+	pSocketItem->waitingRecvSize = MAX_BLOCK_SIZE * 2;
+
+	r = pSocketItem->FetchReceived();
+	printf_s("Receive first SN = %u\n", pSCB->recvWindowFirstSN);
+	printf_s("FetchReceived return %d, bytesReceived = %d\n", r, pSocketItem->bytesReceived);
+
+	// To be tested in the real, blockable function:
+	// the 7th: reach EoT prematurely
+	// the 8th: buffer full
+	// free(buffer);	// a heap has been corrupted!... well, InterlockedCompareExchangePointer...
+}
+
+
+
 int _tmain(int argc, _TCHAR* argv[])
 {
 	UnitTestCheckedRevertCommit();
@@ -280,6 +384,8 @@ int _tmain(int argc, _TCHAR* argv[])
 	UnitTestBufferData();
 
 	UnitTestPrepareToSend();
+
+	UnitTestFetchReceived();
 
 	return 0;
 }

@@ -48,11 +48,13 @@
 
 #pragma comment(lib, "crypt32.lib")
 
-void randombytes(BYTE * buf, size_t len)
+
+DllSpec
+void randombytes(void *buf, size_t len)
 {
 	HCRYPTPROV   hCryptProv;
 	CryptAcquireContext(&hCryptProv, NULL, NULL, PROV_RSA_FULL, 0);
-	CryptGenRandom(hCryptProv, (DWORD)len, buf);
+	CryptGenRandom(hCryptProv, (DWORD)len, (BYTE *)buf);
 	// Why PROV_RNG does not work? Elliptic Curve Nyberg-Rueppel Analog (ECNRA)?
 }
 
@@ -86,14 +88,21 @@ int FSPAPI CryptoNaClGetSharedSecret(unsigned char *s, const unsigned char *pk, 
 	return crypto_box_beforenm(s, pk, sk);
 }
 
+//
+// Not implemented in tweetnacl
+//
+//DllSpec
+//int FSPAPI CryptoNaClHash256(unsigned char *buf, const unsigned char *input, unsigned long long len)
+//{
+//	return crypto_hash_sha256(buf, input, len);
+//}
 
 
 DllSpec
-int FSPAPI CryptoNaClHash(unsigned char *buf, const unsigned char *input, unsigned long long len)
+int FSPAPI CryptoNaClHash(unsigned char *buf, const unsigned char *input, size_t len)
 {
 	return crypto_hash(buf, input, len);
 }
-
 
 
 
@@ -102,6 +111,7 @@ int FSPAPI CryptoNaClScalarMult(unsigned char *buf, const unsigned char *exp, co
 {
 	return crypto_scalarmult(buf, exp, base);
 }
+
 
 
 DllSpec

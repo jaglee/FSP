@@ -286,7 +286,7 @@ int _tmain(int argc, _TCHAR* argv[])
 
 	//TrySRP6();
 	//UnitTestTweetNacl();
-	TryCHAKE();
+	TryCHAKA();
 	//UnitTestByteOrderDefinitin();
 	//
 	// TODO: UnitTest of SendInplace, SendStream

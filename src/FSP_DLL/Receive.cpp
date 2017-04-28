@@ -78,10 +78,10 @@ int FSPAPI ReadFrom(FSPHANDLE hFSPSocket, void *buf, int capacity, NotifyOrRetur
 	try
 	{
 		if(fp1 == NULL)
-			return -EDOM;
-		return p->ReadFrom(buf, capacity, fp1);
+return -EDOM;
+return p->ReadFrom(buf, capacity, fp1);
 	}
-	catch(...)
+	catch (...)
 	{
 		return -EFAULT;
 	}
@@ -92,16 +92,16 @@ int FSPAPI ReadFrom(FSPHANDLE hFSPSocket, void *buf, int capacity, NotifyOrRetur
 // See ::RecvInline()
 int CSocketItemDl::RecvInline(CallbackPeeked fp1)
 {
-	if(! WaitUseMutex())
-		return -EINTR;
+	if (!WaitUseMutex())
+		return -EDEADLK;
 
-	if(waitingRecvBuf != NULL)
+	if (waitingRecvBuf != NULL)
 	{
 		SetMutexFree();
-		return -EDEADLK;
+		return -EADDRINUSE;
 	}
 
-	if(InterlockedExchangePointer((PVOID *) & fpPeeked, fp1) != NULL)
+	if (InterlockedExchangePointer((PVOID *)& fpPeeked, fp1) != NULL)
 	{
 #ifdef TRACE
 		printf_s("\nFiber#%u, warning: Receive-inline called before previous RecvInline called back\n", fidPair.source);
@@ -109,7 +109,7 @@ int CSocketItemDl::RecvInline(CallbackPeeked fp1)
 	}
 	//
 	peerCommitted = 0;	// See also ProcessReceiveBuffer()
-	if(HasDataToDeliver())
+	if (HasDataToDeliver())
 	{
 		SetMutexFree();
 		return SelfNotify(FSP_NotifyDataReady);
@@ -128,7 +128,9 @@ int CSocketItemDl::RecvInline(CallbackPeeked fp1)
 // Do
 //	Register internal function pointer
 // Return
-//	0 if no immediate error, negative on error
+//	positive, the number of octets received immediately
+//	0 if no immediate error
+//	negative on error:
 //	-EBUSY calling convention error: cannot read the stream before previous ReadFrom called back
 //	-EDEADLK	/-EADDRINUSE most likely by previous ReadFrom
 // See ::RecvFrom()
@@ -136,22 +138,22 @@ int CSocketItemDl::RecvInline(CallbackPeeked fp1)
 int LOCALAPI CSocketItemDl::ReadFrom(void * buffer, int capacity, NotifyOrReturn fp1)
 {
 #ifdef TRACE
-	printf_s("ReadFrom the FSP pipe to 0x%08X: byte[%d]\n", (LONG)buffer,  capacity);
+	printf_s("ReadFrom the FSP pipe to 0x%08X: byte[%d]\n", (LONG)buffer, capacity);
 #endif
-	if(! WaitUseMutex())
-		return -EINTR;
+	if (!WaitUseMutex())
+		return -EDEADLK;
 	//
-	if(InterlockedCompareExchangePointer((PVOID *) & fpReceived, fp1, NULL) != NULL)
+	if (InterlockedCompareExchangePointer((PVOID *)& fpReceived, fp1, NULL) != NULL)
 	{
 		SetMutexFree();
 		return -EBUSY;
 	}
 
 	// Check whether previous ReadFrom finished (no waitingRecvBuf), effectively serialize receiving
-	if(InterlockedCompareExchangePointer((PVOID *) & waitingRecvBuf, buffer, NULL) != NULL)
+	if (InterlockedCompareExchangePointer((PVOID *)& waitingRecvBuf, buffer, NULL) != NULL)
 	{
 		SetMutexFree();
-		return -EDEADLK;
+		return -EADDRINUSE;
 	}
 
 	peerCommitted = 0;	// See also FetchReceived()
@@ -159,36 +161,65 @@ int LOCALAPI CSocketItemDl::ReadFrom(void * buffer, int capacity, NotifyOrReturn
 	waitingRecvSize = capacity;
 
 	// We do not reset fpPeeked. RecvInline() just takes precedence over ReadFrom()
-	if(fpPeeked != NULL)
+	if (fpPeeked != NULL)
 	{
 		SetMutexFree();
 		return 0;
 	}
 
-	if(HasDataToDeliver())
+	// blocking mode: loop until EoT reached, or the buffer is full
+	if (fpReceived != NULL)
 	{
+		bool b = HasDataToDeliver();
 		SetMutexFree();
-		return SelfNotify(FSP_NotifyDataReady);
+		return b ? SelfNotify(FSP_NotifyDataReady) : 0;
 	}
 
+	// If it is blocking, wait until every slot in the receive buffer has been filled
+	// or the peer has committed the transmit transaction
+	uint64_t t0 = GetTickCount64();
+	int r;
+	while ((r = FetchReceived()) >= 0 && bytesReceived < capacity)
+	{
+		do
+		{
+			if (peerCommitted)
+				goto l_postloop;
+			SetMutexFree();
+			Sleep(50);
+			if (GetTickCount64() - t0 > MAX_LOCK_WAIT_ms)
+				return -EDEADLK;
+			if (!WaitUseMutex())
+				return -EDEADLK;
+		} while (!HasDataToDeliver());
+	}
+l_postloop:
+	waitingRecvBuf = NULL;
 	SetMutexFree();
-	return 0;
+	//
+	if (r < 0)
+		return r;
+	return bytesReceived;
 }
 
 
-
+ 
 // Given
 //	void *	the pointer of the source payload
 //	int		number of octets to be copied
 // Do
 //	Copy given content to the receive buffer provided by ULA 
-// Return number of bytes actually delivered
+// Return
+//	Number of bytes actually delivered
+// TODO? on-the-wire decompression
 inline
 int LOCALAPI CSocketItemDl::DeliverData(void *p, int n)
 {
-	if(n > waitingRecvSize)
-		return -ENOMEM;
-	//
+	if (n > waitingRecvSize)
+		n = waitingRecvSize;
+	if (n <= 0)
+		return n;
+
 	memcpy(waitingRecvBuf, p, n);
 	waitingRecvBuf += n;
 	bytesReceived += n;
@@ -216,19 +247,28 @@ int CSocketItemDl::FetchReceived()
 		pControlBlock->SlideRecvWindowByOne();
 	}
 	//
+	if (!HasDataToDeliver())
+		return 0;
+	//
 	for(; p->opCode != 0 && p->GetFlag<IS_FULFILLED>(); p = pControlBlock->GetFirstReceived())
 	{
 		if(p->len > MAX_BLOCK_SIZE || p->len < 0)
 			return -EFAULT;
 		//
-		if(p->len > 0)
+		if(p->len > offsetInLastRecvBlock)
 		{
-			if(DeliverData(GetRecvPtr(p), p->len) < 0)
+			int n = DeliverData(GetRecvPtr(p) + offsetInLastRecvBlock, p->len - offsetInLastRecvBlock);
+			if(n <= 0)
 				break;
 			//
-			m += p->len;
+			m += n;
+			offsetInLastRecvBlock += n;
+			//
+			if (p->len > offsetInLastRecvBlock)
+				break;
 		}
 		//
+		offsetInLastRecvBlock = 0;
 		p->SetFlag<IS_FULFILLED>(false);	// release the buffer
 		// Slide the left border of the receive window before possibly set the flag 'end of received message'
 		pControlBlock->SlideRecvWindowByOne();

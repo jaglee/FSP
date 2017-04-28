@@ -1,9 +1,9 @@
 #include "stdafx.h"
 
-//Challenge-responde Handshake Authenticated Key Establishment [/Signature: certificate is out-of-band]
-//	S --> C, [in FSP's ACK_CONNECT_REQUEST]: /identity of S/Public Key_S/Timestamp_S/Random_S
-//	C --> S, [in FSP's PERSIST, had better with EoT]: /identity of C/Public Key_C/Timestamp_C
-//	S --> C, [PERSIST]: the salt, S's response to the C's challenge
+//Challenge-responde Handshake Authenticated Key Agreement [/Signature: certificate is out-of-band]
+//	S --> C, [in FSP's ACK_CONNECT_REQUEST]: /Welcome and identity of S/Public Key_S
+//	C --> S, [in FSP's PERSIST, had better with EoT]: /Greeting and identity of C/Public Key_C/Timestamp_C
+//	S --> C, [PERSIST]: the salt, Timestamp_S, Random_S, S's response to the C's challenge
 //		Suppose salted_password = HASH(salt | registered password)
 //		Response: HASH(salted_password | HASH((C's public key, C's timestamp) XOR S's random(repeated))))
 //	[C get the shared secret]
@@ -15,7 +15,7 @@
 // To be implemented: EdDSA?
 // CryptoNaClScalarMult();	// the signaure?
 // HMAC: H(K XOR opad, H(K XOR ipad, text))
-void TryCHAKE()
+void TryCHAKA()
 {
 	const int CRYPT_NACL_HASHBYTES = 64;
 	//^ crypto_hash_sha512_tweet_BYTES
@@ -32,15 +32,10 @@ void TryCHAKE()
 	memcpy(shadowMaterial + strlen(salt), password, strlen(password));
 	CryptoNaClHash(passwordHash, shadowMaterial, strlen(salt) + strlen(password));
 
-	// prepare the random bits (as an alternative to HMAC)
-	uint32_t serverRandom[2];
-	rand_w32(serverRandom, 2);
-
 	// first round S->C
 	ALIGN(8)
 	static uint8_t serverPrivateKey[CRYPTO_NACL_KEYBYTES];
 	static uint8_t serverPublicKey[CRYPTO_NACL_KEYBYTES];
-	timestamp_t serverNonce = NowUTC();
 	CryptoNaClKeyPair(serverPublicKey, serverPrivateKey);
 
 	// first round C->S
@@ -51,8 +46,11 @@ void TryCHAKE()
 	// together with client's identity
 
 	// TODO: the server should precheck validity of nonce. If clock 'difference is too high'(?), reject the request
-
-	// UNERSOLVED! Put client's identity for hashing?
+	// TODO: the server should make sure that the clientPublicKey is not a reflection of serverPublicKey
+	timestamp_t serverNonce = NowUTC();
+	// prepare the random bits (as an alternative to HMAC)
+	uint32_t serverRandom[2];
+	rand_w32(serverRandom, 2);
 	// second round S->C
 	ALIGN(8)
 	uint8_t serverResponseMaterial[CRYPTO_NACL_KEYBYTES + sizeof(clientNonce)];

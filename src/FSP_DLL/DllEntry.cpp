@@ -108,6 +108,24 @@ BOOL WINAPI DllMain(HINSTANCE hInstance, DWORD dwReason, LPVOID lpvReserved)
 
 
 
+/**
+ *	POSIX gettimeofday(); get current UTC time
+ */
+// Return the number of microseconds elapsed since Jan 1, 1970 UTC (unix epoch)
+DllSpec
+timestamp_t NowUTC()
+{
+	// return the number of 100-nanosecond intervals since January 1, 1601 (UTC), in host byte order
+	FILETIME systemTime;
+	GetSystemTimeAsFileTime(&systemTime);
+
+	timestamp_t & t = *(timestamp_t *)& systemTime;
+	t /= 10;
+	return (t - DELTA_EPOCH_IN_MICROSECS);
+}
+
+
+
 // Given
 //	FSPHANDLE			the handle to the FSP socket
 //	FSP_ControlCode		the code of the control point
@@ -140,6 +158,9 @@ int FSPAPI FSPControl(FSPHANDLE hFSPSocket, FSP_ControlCode controlCode, ULONG_P
 			break;
 		case FSP_SET_CALLBACK_ON_CONNECT:
 			pSocket->SetCallbackOnAccept((CallbackConnected)value);
+			break;
+		case FSP_GET_PEER_COMMITTED:
+			*((int *)value) = pSocket->HasPeerCommitted() ? 1 : 0;
 			break;
 		default:
 			return -EDOM;

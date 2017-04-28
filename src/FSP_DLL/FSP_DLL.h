@@ -144,12 +144,18 @@ protected:
 	CallbackPeeked	fpPeeked;
 	CallbackBufferReady fpSent;
 
-	BYTE * volatile	pendingSendBuf;
-	int				pendingSendSize;
-	int				bytesBuffered;
-	BYTE * volatile waitingRecvBuf;
-	int				waitingRecvSize;
-	int				bytesReceived;
+	// For network streaming *Buf is not NULL
+	BYTE *			pendingSendBuf;
+	BYTE *			waitingRecvBuf;
+	// the count of to send or to receive
+	int32_t			pendingSendSize;
+	int32_t			waitingRecvSize;
+	// the count of sent or received
+	int32_t			bytesBuffered;
+	int32_t			bytesReceived;
+	// For sake of scattered I/O and online compression, a block may include multiple message segment 
+	// int32_t		offsetInLastSendBlock;	// TODO? reserved for on-the-wire compression
+	int32_t			offsetInLastRecvBlock;
 
 	// Pair of functions meant to mimic hardware vector interrupt. It is yet OS-dependent, however
 	static VOID NTAPI WaitOrTimeOutCallBack(PVOID param, BOOLEAN isTimeout)
@@ -245,6 +251,9 @@ public:
 
 	uint64_t GetULASignature() const { return context.signatureULA; }
 	void SetULASignature(uint64_t value) { context.signatureULA = value; }
+
+	bool HasPeerCommitted() const { return peerCommitted != 0; }
+
 	bool WaitUseMutex();
 	void SetMutexFree() { ReleaseSRWLockExclusive(& rtSRWLock); }
 	bool IsInUse() { return (_InterlockedXor8(& inUse, 0) != 0); }
@@ -290,13 +299,14 @@ public:
 	//
 	int LOCALAPI FinalizeSend(int r)
 	{
-		SetMutexFree();
-		// Prevent premature FSP_Send
-		if (r < 0 || InState(CONNECT_AFFIRMING) || InState(CHALLENGING))
+		// Prevent premature FSP_Send	// Just prebuffer.
+		if (r < 0 || InState(CONNECT_AFFIRMING) || InState(CHALLENGING) || InState(CLONING))
+		{
+			SetMutexFree();
 			return r;
-		if (InState(CLONING))	// Just prebuffer.
-			return r;
+		}
 		//
+		SetMutexFree();
 		return (Call<FSP_Send>() ? r : -EIO);
 	}
 

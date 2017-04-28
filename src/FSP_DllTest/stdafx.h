@@ -23,4 +23,6 @@ public:
 
 	friend void UnitTestPrepareToSend();
 	friend void UnitTestBufferData();
+
+	friend void UnitTestFetchReceived();
 };

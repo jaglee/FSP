@@ -134,7 +134,7 @@ int LOCALAPI CSocketItemDl::AcquireSendBuf(int n)
 	if (n <= 0)
 		return -EDOM;
 	if (! WaitUseMutex())
-		return -EINTR;
+		return -EDEADLK;
 
 	if(pendingSendBuf != NULL)
 	{
@@ -173,7 +173,7 @@ int LOCALAPI CSocketItemDl::SendInplace(void * buffer, int len, bool eot)
 	printf_s("SendInplace in state %s[%d]\n", stateNames[GetState()], GetState());
 #endif
 	if(! WaitUseMutex())
-		return -EINTR;
+		return -EDEADLK;
 	//
 	int r = CheckTransmitaction(eot);
 	if (r < 0)
@@ -203,7 +203,7 @@ int LOCALAPI CSocketItemDl::SendStream(void * buffer, int len, bool flag)
 	printf_s("SendStream in state %s[%d]\n", stateNames[GetState()], GetState());
 #endif
 	if(! WaitUseMutex())
-		return -EINTR;
+		return -EDEADLK;
 
 	int r = CheckTransmitaction(flag);
 	if (r < 0)
@@ -215,11 +215,47 @@ int LOCALAPI CSocketItemDl::SendStream(void * buffer, int len, bool flag)
 	if(InterlockedCompareExchangePointer((PVOID *) & pendingSendBuf, buffer, NULL) != NULL)
 	{
 		SetMutexFree();
-		return -EDEADLK;	//  EADDRINUSE
+		return -EADDRINUSE;  
 	}
 	bytesBuffered = 0;
 
-	return FinalizeSend(BufferData(len));	// pendingSendSize = len;
+	// By default it should be asynchronous:
+	if (fpSent != NULL)
+		return FinalizeSend(BufferData(len));	// pendingSendSize = len;
+
+	// If it is blocking, wait until every byte has been put into the queue
+	uint64_t t0 = GetTickCount64();
+	while ((r = BufferData(len)) >= 0)
+	{
+		if (!InState(CONNECT_AFFIRMING) && !InState(CHALLENGING) && !InState(CLONING)
+		 && !Call<FSP_Send>())
+		{
+			r = -EIO;
+			break;
+		}
+		//
+		if (r >= len)
+			break;
+		// Here wait LLS to free some send buffer block
+		do
+		{
+			SetMutexFree();
+			Sleep(50);
+			if (GetTickCount64() - t0 > MAX_LOCK_WAIT_ms)
+				return -EDEADLK;
+			if (!WaitUseMutex())
+				return -EDEADLK;
+		} while (!HasFreeSendBuffer());
+		//
+		len = pendingSendSize;
+	}
+	pendingSendBuf = NULL;
+	SetMutexFree();
+	//
+	if (r < 0)
+		return r;
+	//
+	return bytesBuffered;
 }
 
 
@@ -369,23 +405,19 @@ void CSocketItemDl::ProcessPendingSend()
 //	number of bytes buffered in the send queue
 // Remark
 //	Side-effect: set the value of pendingSendSize to number of octets yet to be buffered
+// UNRESOLVED! milky-payload: apply FIFD instead of FIFO
 int LOCALAPI CSocketItemDl::BufferData(int len)
 {
-	ControlBlock::PFSP_SocketBuf p = pControlBlock->LockLastBufferedSend();
-	// UNRESOLVED! milky-payload: apply FIFD instead of FIFO
 	int m = len;
 	if (m <= 0)
 		return -EDOM;
 	//
+	ControlBlock::PFSP_SocketBuf p = pControlBlock->LockLastBufferedSend();
 	if(p != NULL && !p->GetFlag<IS_COMPLETED>())
 	{
-#ifndef NDEBUG
 		if (p->len < 0 || p->len >= MAX_BLOCK_SIZE)
-		{
-			printf_s("Internal panic! Length of an incomplete packet is %d, while requested BUfferData len is %d?\n", p->len, m);
-			return 0;
-		}
-#endif
+			return -EFAULT;
+		//
 		int k = min(m, MAX_BLOCK_SIZE - p->len);
 		memcpy(GetSendPtr(p) + p->len, pendingSendBuf, k);
 		m -= k;

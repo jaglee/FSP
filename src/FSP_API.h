@@ -58,6 +58,7 @@
     typedef unsigned long ulong_ptr;
 #endif
 
+typedef unsigned char octet;
 
 typedef struct FSP_SocketParameter *PFSP_Context;
 
@@ -67,7 +68,8 @@ typedef enum
 	FSP_SET_SIGNATURE,			// pointer to the placeholder of the 64-bit signature
 	FSP_SET_CALLBACK_ON_ERROR,	// NotifyOrReturn
 	FSP_SET_CALLBACK_ON_REQUEST,// CallbackRequested
-	FSP_SET_CALLBACK_ON_CONNECT	// CallbackConnected
+	FSP_SET_CALLBACK_ON_CONNECT,// CallbackConnected
+	FSP_GET_PEER_COMMITTED,
 } FSP_ControlCode;
 
 
@@ -289,6 +291,8 @@ int FSPAPI SendInline(FSPHANDLE, void *, int, int8_t);
 //	0 if no immediate error, negative if it failed, or positive it was warned (I/O pending)
 // Remark
 //	Only all data have been buffered may be NotifyOrReturn called.
+//	If NotifyOrReturn is NULL the function is blocking, i.e.
+//	waiting until every octet in the given buffer has been passed to LLS. See also ReadFrom
 DllSpec
 int FSPAPI WriteTo(FSPHANDLE, void *, int, int8_t, NotifyOrReturn);
 
@@ -317,7 +321,9 @@ int FSPAPI RecvInline(FSPHANDLE, CallbackPeeked);
 //	NotifyOrReturn is called when receive buffer is full OR end of transaction encountered
 //	NotifyOrReturn might report error later even if ReadFrom itself return no error
 //	Return value passed in NotifyOrReturn is number of octets really received
-//	ULA should check whether the message is completed by calling DLL FSPControl. See also WriteTo()
+//	If NotifyOrReturn is NULL the function is blocking, i.e.
+//	waiting until either the buffer is fulfilled or the peer's transmit transactin has been committed
+//	ULA should check whether the transmit transaction is committed by calling FSPControl. See also WriteTo
 DllSpec
 int FSPAPI ReadFrom(FSPHANDLE, void *, int, NotifyOrReturn);
 
@@ -326,7 +332,7 @@ int FSPAPI ReadFrom(FSPHANDLE, void *, int, NotifyOrReturn);
 // Return 0 if no immediate error, or else the error number
 // The callback function might return code of delayed error
 DllSpec
-int FSPAPI Shutdown(FSPHANDLE hFSPSocket, NotifyOrReturn);
+int FSPAPI Shutdown(FSPHANDLE, NotifyOrReturn);
 
 
 // return 0 if no zero, negative if error, positive if warning
@@ -350,6 +356,13 @@ DllSpec
 int FSPAPI FSPControl(FSPHANDLE, FSP_ControlCode, ulong_ptr);
 
 
+// Exported by the DLL
+DllSpec
+timestamp_t NowUTC();
+
+DllSpec
+void randombytes(void *, size_t);
+
 // Given
 //	pointer to the buffer of exported public key
 //	pointer to the buffer of exported private key
@@ -358,7 +371,7 @@ int FSPAPI FSPControl(FSPHANDLE, FSP_ControlCode, ulong_ptr);
 // Return
 //	0 (always succeed in presumed constant time)
 DllSpec
-int FSPAPI CryptoNaClKeyPair(unsigned char *bufPublicKey, unsigned char *bufPrivateKey);
+int FSPAPI CryptoNaClKeyPair(octet *, octet *);
 
 
 // Given
@@ -370,7 +383,7 @@ int FSPAPI CryptoNaClKeyPair(unsigned char *bufPublicKey, unsigned char *bufPriv
 // Return
 //	0 (always succeed in presumed constant time)
 DllSpec
-int FSPAPI CryptoNaClGetSharedSecret(unsigned char *bufSharedSecret, const unsigned char *peersPublicKey, const unsigned char *nearPrivateKey);
+int FSPAPI CryptoNaClGetSharedSecret(octet *, const octet *, const octet *);
 
 
 // Given
@@ -382,7 +395,7 @@ int FSPAPI CryptoNaClGetSharedSecret(unsigned char *bufSharedSecret, const unsig
 // Return
 //	0 (always succeed in presumed constant time)
 DllSpec
-int FSPAPI CryptoNaClHash(unsigned char *buf, const unsigned char *input, unsigned long long len);
+int FSPAPI CryptoNaClHash(octet *, const octet *, size_t);
 
 #ifdef __cplusplus
 	}
