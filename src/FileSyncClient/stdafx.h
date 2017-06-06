@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <share.h>
 #include "../FSP_API.h"
+#include "../Crypto/CryptoStub.h"
 
 // Forward declaration of an auxilary function
 int ReportLastError();

@@ -182,30 +182,25 @@
     </Reference>
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="..\Crypto\CryptoStub.c" />
+    <ClCompile Include="..\Crypto\sm3.c" />
+    <ClCompile Include="..\Crypto\tweetnacl.c" />
     <ClCompile Include="EncryptedMemory.cpp" />
     <ClCompile Include="FileSyncServer.cpp" />
     <ClCompile Include="MemoryFile.cpp" />
     <ClCompile Include="SignatureOOB.cpp" />
     <ClCompile Include="SimpleAWS.cpp" />
-    <ClCompile Include="stdafx.cpp">
-      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">Create</PrecompiledHeader>
-      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">Create</PrecompiledHeader>
-      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">Create</PrecompiledHeader>
-      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">Create</PrecompiledHeader>
-    </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="CHAKA.h" />
+    <ClInclude Include="..\Crypto\CHAKA.h" />
+    <ClInclude Include="..\Crypto\CryptoStub.h" />
+    <ClInclude Include="..\Crypto\sm3.h" />
+    <ClInclude Include="..\Crypto\tweetnacl.h" />
     <ClInclude Include="defs.h" />
-    <ClInclude Include="resource.h" />
     <ClInclude Include="stdafx.h" />
   </ItemGroup>
   <ItemGroup>
-    <None Include="app.ico" />
     <None Include="ReadMe.txt" />
-  </ItemGroup>
-  <ItemGroup>
-    <ResourceCompile Include="app.rc" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

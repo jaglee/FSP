@@ -2,9 +2,9 @@
  * Predefinitions of the callback functions in FileSyncServer.
  * Shared configurational globals are defined here as well
  */
+#include <tchar.h>
 #include "../FSP_API.h"
-
-#define MAX_FILENAME_WITH_PATH_LEN	260
+#include "../Crypto/CHAKA.h"
 
 #ifndef TEST_MEM_SIZE
 # define TEST_MEM_SIZE	0x20000		// 128KB
@@ -32,7 +32,7 @@ extern int	FSPAPI SendOneFile_onAccepted(FSPHANDLE, PFSP_Context);
 
 // Branch auxilary functions
 extern void PrepareMemoryPattern(size_t);
-extern void	PrepareServiceSAWS(const char *);
+extern void	PrepareServiceSAWS(LPCTSTR);
 
 // Shared call-backs
 extern void FSPAPI WaitConnection(const char *, unsigned short, CallbackConnected);

@@ -4,6 +4,7 @@
  **/
 
 #include "stdafx.h"
+#include "tchar.h"
 
 //#define REMOTE_APPLAYER_NAME "localhost:80"
 // #define REMOTE_APPLAYER_NAME "lt-x61t:80"
@@ -16,13 +17,15 @@
 extern int32_t ticksToWait;
 
 // Branch controllers
-extern int	CompareMemoryPattern(char	*fileName);
+extern int	CompareMemoryPattern(TCHAR *fileName);
+extern int	ToAcceptPushedDirectory(char *);
 extern int	FSPAPI onMultiplying(FSPHANDLE, PFSP_SINKINF, PFSP_IN6_ADDR);
 
 static unsigned char bufPrivateKey[CRYPTO_NACL_KEYBYTES];
 
+static char fileName[sizeof(TCHAR) * MAX_PATH + 4];
 static HANDLE hFile;
-static char fileName[MAX_PATH];
+
 static bool finished;
 
 // Forward declarations
@@ -52,31 +55,28 @@ static void FSPAPI onError2(FSPHANDLE h, FSP_ServiceCode code, int value)
 
 
 
-// Forward definition of the callback function that handles the event of Connection Released (Shutdown)
-static void FSPAPI onFinished(FSPHANDLE h, FSP_ServiceCode code, int value)
-{
-	printf_s("Socket %p, session was to shut down.\n", h);
-	if(code != FSP_NotifyRecycled)
-		printf_s("Should got ON_RECYCLED, but service code = %d, return %d\n", code, value);
-
-	finished = true;
-	return;
-}
-
-
-
 // the server would send the filename in the first message. the client should change the name
 // in case it is in the same directory of the same machine 
-int main(int argc, char *argv[])
+int _tmain(int argc, TCHAR *argv[])
 {
-	int result = 0;
-	if(argc == 2)
+	int result = -1;
+	if(argc > 2)
+	{
+		_tprintf_s(_T("Usage: %s [. | <filename>]\n"), argv[0]);
+		goto l_bailout;
+	}
+	if(argc == 2 && (argv[1][0] != _T('.') || _tcslen(argv[1]) > 1))
 	{
 		result = CompareMemoryPattern(argv[1]);
 		goto l_bailout;
 	}
 
 	Sleep(2000);	// wait the server up when debug simultaneously
+	if(argc == 2)	//  && argv[1][0] isString "."
+	{
+		result = ToAcceptPushedDirectory(REMOTE_APPLAYER_NAME);
+		goto l_bailout;
+	}
 
 	FSP_SocketParameter parms;
 	memset(& parms, 0, sizeof(parms));
@@ -88,7 +88,6 @@ int main(int argc, char *argv[])
 	if(Connect2(REMOTE_APPLAYER_NAME, & parms) == NULL)
 	{
 		printf("Failed to initialize the connection in the very beginning\n");
-		result = -1;
 		goto l_bailout;
 	}
 
@@ -97,7 +96,9 @@ int main(int argc, char *argv[])
 
 	if(hFile != NULL && hFile != INVALID_HANDLE_VALUE)
 		CloseHandle(hFile);
-
+	//
+	result = 0;
+	//
 l_bailout:
 	printf("\n\nPress Enter to exit...");
 	getchar();
@@ -112,6 +113,10 @@ l_bailout:
 // buffer block available and the public key fits in one buffer block 
 static int	FSPAPI  onConnected(FSPHANDLE h, PFSP_Context ctx)
 {
+	unsigned char bufPublicKey[CRYPTO_NACL_KEYBYTES];
+	unsigned char bufPeersKey[CRYPTO_NACL_KEYBYTES];
+	unsigned char bufSharedKey[CRYPTO_NACL_KEYBYTES];
+
 	printf_s("\nHandle of FSP session: %p", h);
 	if(h == NULL)
 	{
@@ -134,25 +139,21 @@ static int	FSPAPI  onConnected(FSPHANDLE h, PFSP_Context ctx)
 		}
 		return 0;
 	}
-
-	unsigned char bufPublicKey[CRYPTO_NACL_KEYBYTES];
-	unsigned char bufPeersKey[CRYPTO_NACL_KEYBYTES];
-	unsigned char bufSharedKey[CRYPTO_NACL_KEYBYTES];
-
-	CryptoNaClKeyPair(bufPublicKey, bufPrivateKey);
-
-	memset(bufPeersKey, 0, CRYPTO_NACL_KEYBYTES);
 	memcpy(bufPeersKey, (const char *)ctx->welcome + mLen, CRYPTO_NACL_KEYBYTES);
 
-	CryptoNaClGetSharedSecret(bufSharedKey, bufPeersKey, bufPrivateKey);
+	CryptoNaClKeyPair(bufPublicKey, bufPrivateKey);
 
 	FSPControl(h, FSP_SET_CALLBACK_ON_ERROR, (ulong_ptr)onError2);
 
 	printf_s("\nTo send the key material for shared key agreement...\n");
 	WriteTo(h, bufPublicKey, CRYPTO_NACL_KEYBYTES, EOF, onPublicKeySent);
 
+	CryptoNaClGetSharedSecret(bufSharedKey, bufPeersKey, bufPrivateKey);
+
 	printf_s("\tTo install the shared key instantly...\n");
-	InstallAuthenticKey(h, bufSharedKey, CRYPTO_NACL_KEYBYTES, INT32_MAX);
+	octet prfKey[32];
+	CryptoZhCnHash256(prfKey, bufSharedKey, CRYPTO_NACL_KEYBYTES);
+	InstallAuthenticKey(h, prfKey, 32, INT32_MAX);
 
 	return 0;
 }
@@ -191,16 +192,22 @@ static void FSPAPI onReceiveFileNameReturn(FSPHANDLE h, FSP_ServiceCode resultCo
 		return;
 	}
 
+	TCHAR finalFileName[MAX_PATH];
+#ifdef _MBCS
+	UTF8ToLocalMBCS(finalFileName, MAX_PATH, fileName);
+#else
+	UTF8ToWideChars(finalFileName, MAX_PATH, fileName, strlen(fileName) + 1);
+#endif
 	// try to create a new file of the same name. if failed on error file already exists, 
 	// try to change the filename by append a 'C'[if it does not have suffix].
 	// if the new filename exceed MAX_PATH, confuscate the last character
-	printf_s("done.\nRemote filename: %s\n", fileName);
+	_tprintf_s(_T("done.\nRemote filename: %s\n"), finalFileName);
 	try
 	{
  		// TODO: exploit to GetDiskFreeSpace to take use of SECTOR size
 		// _aligned_malloc
 		// the client should take use of 'FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH' for ultimate integrity
-		hFile = CreateFile(fileName
+		hFile = CreateFile(finalFileName
 			, GENERIC_WRITE
 			, 0	// shared none
 			, NULL
@@ -220,7 +227,7 @@ static void FSPAPI onReceiveFileNameReturn(FSPHANDLE h, FSP_ServiceCode resultCo
 				return;
 			}
 			//
-			hFile = CreateFile(fileName
+			hFile = CreateFile(finalFileName
 				, GENERIC_WRITE
 				, 0	// shared none
 				, NULL
@@ -294,11 +301,14 @@ static void FSPAPI onAcknowledgeSent(FSPHANDLE h, FSP_ServiceCode c, int r)
 		return;
 	}
 
-	if(Shutdown(h, onFinished) < 0)
+	// On server side we test asynchronous mode
+	if(Shutdown(h, NULL) < 0)
 	{
 		printf_s("Cannot shutdown gracefully in the final stage.\n");
 		Dispose(h);
 	}
+
+	finished = true;
 }
 
 

@@ -29,7 +29,7 @@
     <ConfigurationType>Application</ConfigurationType>
     <UseDebugLibraries>true</UseDebugLibraries>
     <PlatformToolset>v110</PlatformToolset>
-    <CharacterSet>MultiByte</CharacterSet>
+    <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
     <ConfigurationType>Application</ConfigurationType>
@@ -160,13 +160,12 @@
   <ItemGroup>
     <ClInclude Include="..\FSP_API.h" />
     <ClInclude Include="..\FSP_SRV\fsp_srv.h" />
+    <ClInclude Include="..\KeyExchange\CryptoStub.h" />
     <ClInclude Include="stdafx.h" />
     <ClInclude Include="targetver.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="..\ControlBlock.cpp" />
-    <ClCompile Include="..\FSP_DLL\CryptoStub.c" />
-    <ClCompile Include="..\FSP_DLL\tweetnacl.c" />
     <ClCompile Include="..\FSP_SRV\command.cpp" />
     <ClCompile Include="..\FSP_SRV\CRC64.c" />
     <ClCompile Include="..\FSP_SRV\CubicRoot.c" />
@@ -176,12 +175,15 @@
     <ClCompile Include="..\FSP_SRV\socket.cpp" />
     <ClCompile Include="..\FSP_SRV\timers.cpp" />
     <ClCompile Include="..\gcm-aes.c" />
+    <ClCompile Include="..\KeyExchange\CryptoStub.c" />
+    <ClCompile Include="..\KeyExchange\tweetnacl.c" />
     <ClCompile Include="..\rijndael-alg-fst.c" />
     <ClCompile Include="FSP_FlowTest.cpp" />
     <ClCompile Include="stdafx.cpp" />
     <ClCompile Include="Test_FlowControl.cpp" />
     <ClCompile Include="Test_TryCHAKA.cpp" />
     <ClCompile Include="Test_TrySRP.cpp" />
+    <ClCompile Include="Test_TryWideChar.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

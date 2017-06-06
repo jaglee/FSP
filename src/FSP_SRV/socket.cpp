@@ -712,7 +712,7 @@ bool CSocketItemEx::FinalizeMultiply()
 	RestartKeepAlive();
 	// And continue to accept the payload in the caller
 	pControlBlock->SetRecvWindow(headPacket->pktSeqNo);
-	return CLowerInterface::Singleton()->PutToRemoteTLB((CMultiplyBacklogItem *)this);
+	return CLowerInterface::Singleton.PutToRemoteTLB((CMultiplyBacklogItem *)this);
 }
 
 
@@ -845,7 +845,7 @@ void CSocketItemEx::DisposeOnReset()
 	lowState = NON_EXISTENT;	// But the ULA's state is kept
 	// It is somewhat an NMI to ULA
 	SignalFirstEvent(FSP_NotifyReset);
-	ReplaceTimer(TRANSIENT_STATE_TIMEOUT_ms);
+	ReplaceTimer(DEINIT_WAIT_TIMEOUT_ms);
 }
 
 
@@ -864,7 +864,7 @@ void CSocketItemEx::Destroy()
 		ClearInUse();
 		CSocketItem::Destroy();
 		//
-		(CLowerInterface::Singleton())->FreeItem(this);
+		CLowerInterface::Singleton.FreeItem(this);
 	}
 	catch(...)
 	{
@@ -897,7 +897,7 @@ void CSocketItemEx::AbortLLS(bool haveTLBLocked)
 	{
 		RemoveTimers();
 		CSocketItem::Destroy();
-		(CLowerInterface::Singleton())->FreeItemDonotCareLock(this);
+		CLowerInterface::Singleton.FreeItemDonotCareLock(this);
 	}
 }
 
@@ -914,8 +914,9 @@ void CSocketItemEx::Recycle()
 #ifdef TRACE
 		printf_s("Recycle called in %s(%d) state\n", stateNames[lowState], lowState);
 #endif
-		// It is legitimate to recycle in CLOSABLE or PRE_CLOSED state to support timeout in the upper layer
-		if (lowState != PRE_CLOSED && lowState != CLOSABLE)
+		// It is legitimate to recycle in PRE_CLOSED state unilaterally to support timeout in the upper layer
+		// UNRESOLVED!?!
+		if (lowState != PRE_CLOSED)
 		{
 			RejectOrReset();
 			return;
@@ -934,7 +935,7 @@ void CSocketItemEx::Recycle()
 void CSocketItemEx::RejectOrReset()
 {
 	if(lowState == CHALLENGING || lowState == CONNECT_AFFIRMING)
-		CLowerInterface::Singleton()->SendPrematureReset(EINTR, this);
+		CLowerInterface::Singleton.SendPrematureReset(EINTR, this);
 	else if(InStates(6, ESTABLISHED, COMMITTING, PEER_COMMIT, COMMITTING2, COMMITTED, CLOSABLE))
 		SendReset();
 	// Do not [pControlBlock->state = NON_EXISTENT;] as the ULA might do further cleanup

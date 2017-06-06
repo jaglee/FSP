@@ -1,0 +1,180 @@
+#ifndef _CRYPTO_STUB_H
+#define _CRYPTO_STUB_H
+
+/*
+ * Provide stubs to some interesting crypto functions in tweetnacl
+ *
+    Copyright (c) 2017, Jason Gao
+    All rights reserved.
+
+    Redistribution and use in source and binary forms, with or without modification,
+    are permitted provided that the following conditions are met:
+
+    - Redistributions of source code must retain the above copyright notice,
+      this list of conditions and the following disclaimer.
+
+    - Redistributions in binary form must reproduce the above copyright notice,
+      this list of conditions and the following disclaimer in the documentation
+	  and/or other materials provided with the distribution.
+
+    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+    AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+    IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+    ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+    LIABLE FOR ANY DIRECT, INDIRECT,INCIDENTAL, SPECIAL, EXEMPLARY, OR
+    CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+    SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+    INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+    CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+    ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+    POSSIBILITY OF SUCH DAMAGE.
+ */
+#define CRYPTO_NACL_KEYBYTES	32
+#define CRYPTO_NACL_HASHBYTES	64
+
+// but assume size_t has been defined
+typedef unsigned char octet;
+
+#include "sm3.h"
+
+#ifdef _MSC_VER
+#define FSPAPI __stdcall
+#else
+#define FSPAPI
+#endif
+
+// inline functions
+#ifdef __cplusplus
+#define SINLINE static inline
+#else
+#define SINLINE static __inline__
+#endif
+
+#define crypto_box_curve25519xsalsa20poly1305_beforenm crypto_box_curve25519xsalsa20poly1305_tweet_beforenm
+#define crypto_box_curve25519xsalsa20poly1305_keypair crypto_box_curve25519xsalsa20poly1305_tweet_keypair
+#define crypto_hash_sha512 crypto_hash_sha512_tweet
+
+#define crypto_box_beforenm crypto_box_curve25519xsalsa20poly1305_beforenm
+#define crypto_box_keypair crypto_box_curve25519xsalsa20poly1305_keypair
+#define crypto_hash crypto_hash_sha512
+
+
+#ifdef __cplusplus
+extern "C"
+{
+#endif
+
+// Given
+//	void *		the pointer of the buffer to hold the random octets
+//	size_t		number of the random octets to generate
+// Do
+//	Generate a string of random octets of given size, save it in the given buffer
+void randombytes(void *, size_t);
+
+// WideCharToMultiByte and MultiByteToWideChar have severe security issues handled in these functions:
+
+// Given
+//	octet[]		the pointer of the buffer to hold the output string in UTF-8 encoding
+//	int			the capacity of the buffer, typically not exceed 32767, in octets
+//	LPCWCH		the wide-character string which is NUL-terminated
+// Do
+//	translate the wide-character string to string encoded in the UTF-8 character set
+// Return
+//	Number of output octets, including the terminate NUL
+int WideStringToUTF8(octet[], int, LPCWCH);
+
+// Given
+//	char[]		the pointer of the buffer to hold the output string encoded in UTF8
+//	int			the capacity of the buffer, typically not exceed 32767, in octets
+//	LPCSTR		the source string in multi-byte character set, which is not necessarily NUL-terminated
+// Do
+//	translate the locale string encoded in multi-byte character set to UTF-8 encoded string
+// Return
+//	Number of output single-byte characters
+int LocalMBCSToUTF8(octet[], int, LPCSTR);
+
+// Given
+//	char[]		the pointer of the buffer to hold the output locale string encoded in multi-byte character set
+//	int			the capacity of the buffer, typically not exceed 32767, in octets
+//	LPCSTR		the source string in UTF-8 code set, which is not necessarily NUL-terminated
+// Do
+//	translate the UTF-8 encoded string to locale string encoded in multi-byte character set
+// Return
+//	Number of output single-byte characters
+int UTF8ToLocalMBCS(char[], int, LPCSTR);
+
+// Given
+//	wchar_t[]	the pointer of the buffer to hold the output wide character string (in UTF16)
+//	int			the capacity of the buffer, typically not exceed 32767, in wchar_ts
+//	LPCSTR		the source string in UTF-8 code set, which is not necessarily NUL-terminated
+//	int			number of octets to be translated in the source string
+// Do
+//	translate the UTF-8 encoded string to Unicode wide character string (UTF16)
+// Return
+//	Number of output wide characters
+int UTF8ToWideChars(wchar_t[], int, LPCSTR, int);
+
+// in tweetnacl.c:
+int crypto_box_curve25519xsalsa20poly1305_tweet_keypair(unsigned char *,unsigned char *);
+int crypto_box_curve25519xsalsa20poly1305_tweet_beforenm(unsigned char *,const unsigned char *,const unsigned char *);
+int crypto_hash_sha512_tweet(unsigned char *,const unsigned char *,unsigned long long);
+
+#ifdef __cplusplus
+}
+#endif
+
+
+// Given
+//	pointer to the buffer of exported public key
+//	pointer to the buffer of exported private key
+// Do
+//	Generate the public-private key pair
+// Return
+//	0 (always succeed in presumed constant time)
+SINLINE int FSPAPI CryptoNaClKeyPair(octet *pk, octet *sk)
+{
+	return crypto_box_keypair(pk, sk);
+}
+
+
+// Given
+//	pointer to the buffer of the shared secret, crypto_core_hsalsa20_tweet_KEYBYTES = 32 bytes
+//	the byte string of the peer's public key
+//	the byte string of the near end's private key
+// Do
+//	Derive the shared secret
+// Return
+//	0 (always succeed in presumed constant time)
+SINLINE int FSPAPI CryptoNaClGetSharedSecret(octet *s, const octet *pk, const octet *sk)
+{
+	return crypto_box_beforenm(s, pk, sk);
+}
+
+
+
+// Given
+//	pointer to the buffer of the output hash, 64 bytes
+//	the input byte string to calculate the hash
+//	the length of the byte string
+// Do
+//	get the SHA512 result
+// Return
+//	0 (always succeed in presumed constant time)
+SINLINE int FSPAPI CryptoNaClHash(octet *buf, const octet *input, size_t len)
+{
+	return crypto_hash(buf, input, len);
+}
+
+
+
+// Given
+//	pointer to the buffer of the output hash, 64 bytes
+//	the input byte string to calculate the hash
+//	the length of the byte string
+// Do
+//	get the secure hash value in 256 bits, calculated by the 'Zh-Cn' locale standard hash algorithm 'sm3'
+SINLINE void FSPAPI CryptoZhCnHash256(octet *buf, const octet *input, size_t len)
+{
+	sm3((unsigned char *)input, (int)len, buf);
+}
+#endif

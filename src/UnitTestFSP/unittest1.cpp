@@ -434,34 +434,28 @@ void UnitTestSocketInState()
 
 void UnitTestSocketSrvTLB()
 {
-	try
+	if(! CLowerInterface::Singleton.Initialize())
 	{
-		new CLowerInterface();
-	}
-	catch(HRESULT x)
-	{
-		sprintf_s(linebuf, sizeof(linebuf), "Exception number 0x%X, cannot access lower interface, aborted.\n", x); 
-		Logger::WriteMessage(linebuf);
-
+		Logger::WriteMessage("Cannot access lower interface, aborted.\n");
 		DbgRaiseAssertionFailure();
 	}
 
-	CSocketItemEx *p1 = (CSocketItemEx *)(CLowerInterface::Singleton())->AllocItem(2);
+	CSocketItemEx *p1 = (CSocketItemEx *)CLowerInterface::Singleton.AllocItem(2);
 	Assert::IsNotNull(p1, L"There should be free item slot for listener");
 
-	CSocketItemEx *p = (CSocketItemEx *)(*CLowerInterface::Singleton())[2];
+	CSocketItemEx *p = (CSocketItemEx *)CLowerInterface::Singleton[2];
 	Assert::IsTrue(p == p1, L"The remapped listening socket should be the same as the allocated");
 
-	p = (CSocketItemEx *)(CLowerInterface::Singleton())->AllocItem();
+	p = (CSocketItemEx *)CLowerInterface::Singleton.AllocItem();
 	Assert::IsNotNull(p, L"There should be free item slot");
 
 	IN6_ADDR addrList[MAX_PHY_INTERFACES];
 	// no hint
 	memset(addrList, 0, sizeof(addrList));
-	ALFID_T id = (CLowerInterface::Singleton())->RandALFID();
+	ALFID_T id = CLowerInterface::Singleton.RandALFID();
 	Assert::IsFalse(id == 0, L"There should be free id space");
 
-	id = (CLowerInterface::Singleton())->RandALFID(addrList);
+	id = CLowerInterface::Singleton.RandALFID(addrList);
 	Assert::IsFalse(id == 0, L"There should be free id space");
 
 	sprintf_s(linebuf, "Allocated ID = %u\n", id);
@@ -475,13 +469,13 @@ void UnitTestSocketSrvTLB()
 	}
 #endif
 
-	CSocketItemEx *p2 = (CSocketItemEx *)(*CLowerInterface::Singleton())[id];
+	CSocketItemEx *p2 = (CSocketItemEx *)CLowerInterface::Singleton[id];
 	Assert::IsFalse(p2 == p1, L"RandID shouldn't alloc the same item as AllocItem for listener");
 	Assert::IsFalse(p2 == p, L"RandID shouldn't alloc the same item as AllocItem");
 
-	(CLowerInterface::Singleton())->FreeItem(p1);
-	(CLowerInterface::Singleton())->FreeItem(p);
-	(CLowerInterface::Singleton())->FreeItem(p2);
+	CLowerInterface::Singleton.FreeItem(p1);
+	CLowerInterface::Singleton.FreeItem(p);
+	CLowerInterface::Singleton.FreeItem(p2);
 
 #if 0	// should invent another test method
 	CommandSyncSessionTestSub *pCmd = new CommandSyncSessionTestSub(id);
@@ -494,19 +488,13 @@ void UnitTestSocketSrvTLB()
 
 void UnitTestSocketRTLB()
 {
-	try
+	if(! CLowerInterfaceDbg::Singleton.Initialize())
 	{
-		new CLowerInterfaceDbg();
-	}
-	catch(HRESULT x)
-	{
-		sprintf_s(linebuf, sizeof(linebuf), "Exception number 0x%X, cannot access lower interface, aborted.\n", x); 
-		Logger::WriteMessage(linebuf);
-
+		Logger::WriteMessage("Cannot access lower interface, aborted.\n");
 		DbgRaiseAssertionFailure();
 	}
 	
-	CLowerInterfaceDbg *pRTLB = (CLowerInterfaceDbg *)(CLowerInterface::Singleton());
+	CLowerInterfaceDbg *pRTLB = (CLowerInterfaceDbg *) & CLowerInterface::Singleton;
 
 	CSocketItemExDbg *p1 = (CSocketItemExDbg *)pRTLB->AllocItem(2);
 	Assert::IsNotNull(p1, L"There should be free item slot for listener");
@@ -630,16 +618,10 @@ void UnitTestOCB_MAC()
 // But this is NOT a comprehensive coverage test of SelectPath
 void UnitTestSelectPath()
 {
-	CLowerInterfaceDbg *pSrv;
-	try
+	CLowerInterfaceDbg *pSrv = (CLowerInterfaceDbg *) & CLowerInterfaceDbg::Singleton;
+	if(! pSrv->Initialize())
 	{
-		pSrv = new CLowerInterfaceDbg();
-	}
-	catch(HRESULT x)
-	{
-		sprintf_s(linebuf, sizeof(linebuf), "Exception number 0x%X, cannot access lower interface, aborted.\n", x); 
-		Logger::WriteMessage(linebuf);
-
+		Logger::WriteMessage("Cannot access lower interface, aborted.\n");
 		DbgRaiseAssertionFailure();
 	}
 

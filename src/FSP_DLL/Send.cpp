@@ -99,25 +99,27 @@ int FSPAPI SendInline(FSPHANDLE hFSPSocket, void * buffer, int len, int8_t eotFl
 //		EOF(typical non-zero): terminate the transaction
 //	NotifyOrReturn	the callback function pointer
 // Return
-//	0 if no immediate error
-//	negative if it failed
-//	positive it was warned (I/O pending)
+//	non-negative if it is the number of octets put into the queue immediately. might be 0 of course.
+//	-EBUSY if previous asynchronous Write operation has not completed
+//	-EFAULT if some ridiculous exception has arised
+//	-EDEADLK if it cannot obtain mutual exclusive lock
+//	-EBADF if the socket is in unknown state
+//	-EADDRINUSE if previous blocking Write operation has not completed
+//	-EIO if immediate sending operation failed
 // Remark
 //	Only all data have been buffered may be NotifyOrReturn called.
+//	If NotifyOrReturn is NULL the function is blocking, i.e.
+//	waiting until every octet in the given buffer has been passed to LLS. See also ReadFrom
 DllExport
 int FSPAPI WriteTo(FSPHANDLE hFSPSocket, void * buffer, int len, int8_t flag, NotifyOrReturn fp1)
 {
 	register CSocketItemDl * p = (CSocketItemDl *)hFSPSocket;
 	try
 	{
-		if(fp1 == NULL)
-			return -EDOM;
-		//
 		if(!p->TestSetSendReturn(fp1))
 			return -EBUSY;
 		//
-		int r = p->SendStream(buffer, len, flag != 0);
-		return (r < len ? E2BIG : 0);	// Error too BIG is a warning here, however
+		return p->SendStream(buffer, len, flag != 0);
 	}
 	catch(...)
 	{

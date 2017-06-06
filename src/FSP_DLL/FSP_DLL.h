@@ -136,11 +136,11 @@ class CSocketItemDl: public CSocketItem
 protected:
 	ALIGN(8)		HANDLE theWaitObject;
 
-	NotifyOrReturn	fpRecycled;	// Callback for SHUT_DOWN
-
+	// On ACK_FLUSH Callback for FSPAPI COMMIT, and overloaded for SHUT_DOWN
+	NotifyOrReturn	fpCommitted;
 	// to support full-duplex send and receive does not share the same call back function
 	NotifyOrReturn	fpReceived;
-	// to support surveillance RecvInline() over ReadFrom() make CallbackPeeked an independent function
+	// to support superior RecvInline() over ReadFrom() make CallbackPeeked an independent function
 	CallbackPeeked	fpPeeked;
 	CallbackBufferReady fpSent;
 
@@ -198,14 +198,13 @@ protected:
 	FSPHANDLE CompleteMultiply(CommandCloneConnect &);
 	bool LOCALAPI ToWelcomeMultiply(BackLogItem &);
 
-	//
+	// In Send.cpp
 	void ProcessPendingSend();
-	void ProcessReceiveBuffer();
-	//
-	void RespondToRecycle();
-
 	int LOCALAPI BufferData(int);
 	int LOCALAPI DeliverData(void *, int);
+
+	// In Receive.cpp
+	void ProcessReceiveBuffer();
 	int FetchReceived();
 
 public:
@@ -228,7 +227,6 @@ public:
 
 	int LOCALAPI Initialize(PFSP_Context, char[MAX_NAME_LENGTH]);
 	int Recycle();
-	int Dispose() { isDisposing = 1; return Recycle(); }
 
 	// Convert the relative address in the control block to the address in process space, unchecked
 	BYTE * GetSendPtr(const ControlBlock::PFSP_SocketBuf skb) const
@@ -318,6 +316,7 @@ public:
 	bool HasFreeSendBuffer() { return (pControlBlock->CountSendBuffered() - pControlBlock->sendBufferBlockN < 0); }
 
 	int LOCALAPI Shutdown(NotifyOrReturn);
+	int LOCALAPI Commit(NotifyOrReturn);
 	int Commit();
 
 	void SetCallbackOnRequest(CallbackRequested fp1) { context.onAccepting = fp1; }

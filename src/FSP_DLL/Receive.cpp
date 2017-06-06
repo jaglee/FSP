@@ -67,19 +67,26 @@ int FSPAPI RecvInline(FSPHANDLE hFSPSocket, CallbackPeeked fp1)
 //	NotifyOrReturn	the function called back when either EoT reached,
 //					connection terminated or receive buffer fulfilled
 // Return
-//	0 if no immediate error, negative if error, positive if it is the length of the available data
+//	positive if it is the length of the available data
+//	0 if no immediate error
+//	-EFAULT if some ridiculous exception has arised
+//	-EBUSY if previous asynchronous Read operation has not completed
+//	-EDEADLK if cannot obtain the mutual exclusive lock
+//	-EADDRINUSE if previous ReadFrom has not completed
 // Remark
+//	NotifyOrReturn is called when receive buffer is full OR end of transaction encountered
 //	NotifyOrReturn might report error later even if ReadFrom itself return no error
 //	Return value passed in NotifyOrReturn is number of octets really received
+//	If NotifyOrReturn is NULL the function is blocking, i.e.
+//	waiting until either the buffer is fulfilled or the peer's transmit transactin has been committed
+//	ULA should check whether the transmit transaction is committed by calling FSPControl. See also WriteTo
 DllExport
 int FSPAPI ReadFrom(FSPHANDLE hFSPSocket, void *buf, int capacity, NotifyOrReturn fp1)
 {
 	register CSocketItemDl *p = (CSocketItemDl *)hFSPSocket;
 	try
 	{
-		if(fp1 == NULL)
-return -EDOM;
-return p->ReadFrom(buf, capacity, fp1);
+		return p->ReadFrom(buf, capacity, fp1);
 	}
 	catch (...)
 	{
@@ -130,9 +137,7 @@ int CSocketItemDl::RecvInline(CallbackPeeked fp1)
 // Return
 //	positive, the number of octets received immediately
 //	0 if no immediate error
-//	negative on error:
-//	-EBUSY calling convention error: cannot read the stream before previous ReadFrom called back
-//	-EDEADLK	/-EADDRINUSE most likely by previous ReadFrom
+//	negative on error
 // See ::RecvFrom()
 // TODO: check whether the buffer overlapped?
 int LOCALAPI CSocketItemDl::ReadFrom(void * buffer, int capacity, NotifyOrReturn fp1)
@@ -295,6 +300,8 @@ int CSocketItemDl::FetchReceived()
 // Remark
 //	It is meant to be called by the soft interrupt handling entry function where the mutex lock has been obtained
 //	and it sets the mutex lock free on leave.
+//	LLS FSP_AdRecvWindow may be called before DLL SetMutexFree.
+//	Advertise the receive window size to the peer unless error encountered, even if nothing is delivered.
 void CSocketItemDl::ProcessReceiveBuffer()
 {
 #ifdef TRACE
@@ -325,6 +332,7 @@ void CSocketItemDl::ProcessReceiveBuffer()
 		}
 		else if(n == 0) // when the last message is a payloadless PERSIST without the EoT flag set
 		{
+			Call<FSP_AdRecvWindow>();
 			SetMutexFree();
 			return;
 		}
@@ -342,10 +350,16 @@ void CSocketItemDl::ProcessReceiveBuffer()
 		// Assume the call-back function did not mess up the receiv queue
 		MarkReceiveFinished(n);
 		if (HasDataToDeliver())
+		{
+			SetMutexFree();
 			SelfNotify(FSP_NotifyDataReady);
+		}
+		else
+		{
+			SetMutexFree();
+		}
 		//
 		Call<FSP_AdRecvWindow>();
-		SetMutexFree();
 		return;
 	}
 
@@ -367,8 +381,8 @@ void CSocketItemDl::ProcessReceiveBuffer()
 		SetMutexFree();
 		return;
 	}
-	if(n > 0)
-		Call<FSP_AdRecvWindow>();
+
+	Call<FSP_AdRecvWindow>();
 	//
 	if(peerCommitted || waitingRecvSize <= 0)
 	{

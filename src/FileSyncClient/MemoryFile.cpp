@@ -2,25 +2,26 @@
  * A short module in FileSyncClient, which meant to check the memory pattern saved in the designated file is right
  */
 #include "stdafx.h"
+#include "tchar.h"
 
 // "$memory.^";
-int CompareMemoryPattern(char *fileName)
+int CompareMemoryPattern(TCHAR *fileName)
 {
 	static	uint8_t	buf[0x20000];	// 128KB
 
 	int fd;
-	errno_t	err = _sopen_s(& fd
+	errno_t	err = _tsopen_s(& fd
 			, fileName
 			, _O_BINARY | _O_RDONLY | _O_SEQUENTIAL
 			, _SH_DENYWR
 			, 0);
 	if(err != 0)
 	{
-		printf_s("Error number = %d: cannot open file %s\n", err, fileName);
+		_tprintf_s(_T("Error number = %d: cannot open file %s\n"), err, fileName);
 		return -2;
 	}
 
-	printf_s("To check word pattern in %s\n", fileName);
+	_tprintf_s(_T("To check word pattern in %s\n"), fileName);
 
 	int bytesRead = _read(fd, buf, sizeof(buf));
 	_close(fd);
@@ -35,7 +36,7 @@ int CompareMemoryPattern(char *fileName)
 			__debugbreak();
 	}
 
-	printf_s("Word pattern in %s was checked.\n", fileName);
+	_tprintf_s(_T("Word pattern in %s was checked.\n"), fileName);
 
 	return 0;
 }

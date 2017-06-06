@@ -41,6 +41,7 @@
 
 // let calling of Destroy() in the NON_EXISTENT state to do cleanup 
 #define TIMED_OUT() \
+		ReplaceTimer(DEINIT_WAIT_TIMEOUT_ms);	\
 		Notify(FSP_NotifyTimeout);	\
 		lowState = NON_EXISTENT;	\
 		SetMutexFree();	\
@@ -71,8 +72,11 @@ void CSocketItemEx::KeepAlive()
 		printf_s("\nFiber#%u's KeepAlive not executed due to lack of locks in state %s. InUse: %d\n"
 			, fidPair.source, stateNames[lowState], IsInUse());
 #endif
-		if (!IsInUse())
+		if (lowState == NON_EXISTENT)
+		{
 			REPORT_ERRMSG_ON_TRACE("Lazy garbage collection found possible dead-lock");
+			Destroy();
+		}
 		return;
 	}
 
@@ -126,7 +130,6 @@ void CSocketItemEx::KeepAlive()
 #ifdef TRACE
 			printf_s("\nSession time out in the %s state\n", stateNames[lowState]);
 #endif
-			ReplaceTimer(TRANSIENT_STATE_TIMEOUT_ms);
 			TIMED_OUT();
 		}
 		// If the peer has committed an ACK_FLUSH has accumulatively acknowledged it.
@@ -135,8 +138,8 @@ void CSocketItemEx::KeepAlive()
 			SendKeepAlive();
 		break;
 	//
-	case CLOSED:	// CLOSED timeout to NON_EXISTENT in a short time
-		if ((t1 - tMigrate) > (TRANSIENT_STATE_TIMEOUT_ms << 10))
+	case CLOSED:
+		if ((t1 - tMigrate) > (RECYCLABLE_TIMEOUT_ms << 10))
 		{
 #ifdef TRACE
 			printf_s("\nTransient state time out in the %s state\n", stateNames[lowState]);
@@ -147,8 +150,7 @@ void CSocketItemEx::KeepAlive()
 	case CLOSABLE:	// CLOSABLE does not automatically timeout to CLOSED
 		if(t1 - tSessionBegin >  (MAXIMUM_SESSION_LIFE_ms << 10))
 		{
-			ReplaceTimer(TRANSIENT_STATE_TIMEOUT_ms);
-			if(lowState == CLOSABLE)
+			if(lowState != CLOSED)
 				SendReset();	// See also RejectOrReset
 			TIMED_OUT();
 		}
@@ -222,20 +224,31 @@ void CSocketItemEx::DoResend()
 		if (resendTimer == NULL)
 			goto l_return;
 
+		// As a simultaneous ackowledgement may have slided the send window already, check the send window every time
+		seqHead = _InterlockedOr((long *)&pControlBlock->sendWindowFirstSN, 0);
+		if (int(seqHead - seq1) > 0)
+		{
+			k += seqHead - seq1;
+			if (k >= n)
+				break;
+			seq1 = seqHead;
+			//
+			index1 = pControlBlock->sendWindowHeadPos;
+			p = pControlBlock->HeadSend() + index1;
+		}
+
+		// retransmission time-out is hard coded to 4RTT
+		if ((tNow - p->timeSent) < (tRoundTrip_us << 2))
+		{
+			SetMutexFree();
+			break;
+		}
+
 		if (!p->GetFlag<IS_COMPLETED>())	// due to parallism the last 'gap' may include imcomplete buffered data
 		{
 #ifdef TRACE
 			printf_s("Imcomplete packet: SN = %u, index position = %d\n", seq1, index1);
 #endif
-			SetMutexFree();
-			break;
-		}
-
-		// As a simultaneous ackowledgement may have slided the send window already, check the send window every time
-		// retransmission time-out is hard coded to 4RTT
-		seqHead = _InterlockedOr((long *)&pControlBlock->sendWindowFirstSN, 0);
-		if (int(seq1 - seqHead) < 0 || (tNow - p->timeSent) < (tRoundTrip_us << 2))
-		{
 			SetMutexFree();
 			break;
 		}
@@ -272,7 +285,7 @@ void CSocketItemEx::DoResend()
 		SetMutexFree();
 	}
 
-	if(shouldAppendCommit)
+	if (shouldAppendCommit)
 		return;
 
 	if (!WaitUseMutex())
@@ -344,14 +357,14 @@ bool CSocketItemEx::SendKeepAlive()
 	} buf3;	// a buffer with three headers
 	FSP_ConnectParam &mp = buf3.mp;	// this alias make the code a little concise
 
-	u_int k = CLowerInterface::Singleton()->sdSet.fd_count;
+	u_int k = CLowerInterface::Singleton.sdSet.fd_count;
 	u_int j = 0;
-	LONG w = CLowerInterface::Singleton()->disableFlags;
+	LONG w = CLowerInterface::Singleton.disableFlags;
 	for (register u_int i = 0; i < k; i++)
 	{
 		if (!BitTest(&w, i))
 		{
-			mp.subnets[j++] = SOCKADDR_SUBNET(&CLowerInterface::Singleton()->addresses[i]);
+			mp.subnets[j++] = SOCKADDR_SUBNET(&CLowerInterface::Singleton.addresses[i]);
 			if (j >= sizeof(mp.subnets) / sizeof(uint64_t))
 				break;
 		}
@@ -366,7 +379,7 @@ bool CSocketItemEx::SendKeepAlive()
 		j++;
 	}
 	//^Let's the compiler do loop-unrolling
-	mp.idHost = SOCKADDR_HOSTID(&CLowerInterface::Singleton()->addresses[0]);
+	mp.idHost = SOCKADDR_HOSTID(&CLowerInterface::Singleton.addresses[0]);
 	mp.hs.Set(PEER_SUBNETS, sizeof(FSP_NormalPacketHeader));
 
 	ControlBlock::seq_t	snKeepAliveExp;
@@ -389,7 +402,7 @@ bool CSocketItemEx::SendKeepAlive()
 		, snKeepAliveExp
 		, pControlBlock->AdRecvWS(pControlBlock->sendWindowNextSN - 1));
 	//
-	if(shouldAppendCommit)
+	if (shouldAppendCommit)
 		buf3.hdr.SetFlag<EndOfTransaction>();
 	//
 	SetIntegrityCheckCode(&buf3.hdr, NULL, 0, buf3.snack.GetSaltValue());

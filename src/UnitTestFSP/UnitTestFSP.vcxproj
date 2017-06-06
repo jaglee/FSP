@@ -173,8 +173,6 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="..\ControlBlock.cpp" />
-    <ClCompile Include="..\FSP_DLL\CryptoStub.c" />
-    <ClCompile Include="..\FSP_DLL\tweetnacl.c" />
     <ClCompile Include="..\FSP_SRV\CRC64.c" />
     <ClCompile Include="..\FSP_SRV\CubicRoot.c" />
     <ClCompile Include="..\FSP_SRV\mobile.cpp" />

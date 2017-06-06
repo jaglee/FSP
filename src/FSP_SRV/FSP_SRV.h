@@ -55,9 +55,11 @@
 #define TRACE_OUTBAND	32	// Other than KEEP_ALIVE
 
 
-// random generatator is somehow dependent on implementation. hardware prefered.
-// might be optimized by loop unrolling
-inline void	 rand_w32(uint32_t *p, int n) { for (register int i = 0; i < min(n, 32); i++) { rand_s(p + i); } }
+ // random generatator is somehow dependent on implementation. hardware prefered.
+ // might be optimized by loop unrolling
+static inline
+void rand_w32(uint32_t *p, int n) { for (register int i = 0; i < min(n, 32); i++) { rand_s(p + i); } }
+
 
 // Return the number of microseconds elapsed since Jan 1, 1970 (unix epoch time)
 extern "C" timestamp_t NowUTC();
@@ -346,6 +348,7 @@ protected:
 			pControlBlock->SnapshotReceiveWindowRightEdge();
 		return b;
 	}
+	inline void TransitOnPeerCommit();
 	bool HandlePeerSubnets(PFSP_HeaderSignature);
 
 	// return -EEXIST if overriden, -EFAULT if memory error, or payload effectively placed
@@ -489,6 +492,7 @@ public:
 	void OnGetRelease();	// RELEASE may not carry payload
 	void OnGetMultiply();	// MULTIPLY is in-band at the initiative side, out-of-band at the passive side
 	void OnGetKeepAlive();	// KEEP_ALIVE is always out-of-band
+	void LOCALAPI OnGetReset(FSP_RejectConnect &);
 
 	void HandleFullICC(PktBufferBlock *, FSPOperationCode);
 };
@@ -568,7 +572,6 @@ private:
 	friend class CSocketItemEx;
 
 	static const u_int SD_SETSIZE = 32;	// hard-coded, bit number of LONG; assume FD_SETSIZE >= 32
-	static CLowerInterface *pSingleInstance;
 
 	HANDLE	thReceiver;	// the handle of the thread that listens
 	HANDLE	hMobililty;	// handling mobility, the handle of the address-changed event
@@ -616,7 +619,6 @@ protected:
 	void LOCALAPI OnGetInitConnect();
 	void LOCALAPI OnInitConnectAck();
 	void LOCALAPI OnGetConnectRequest();
-	void LOCALAPI OnGetResetSignal();
 
 	// defined in mobile.cpp
 	int LOCALAPI EnumEffectiveAddresses(uint64_t *);
@@ -627,8 +629,9 @@ protected:
 	static DWORD WINAPI ProcessRemotePacket(LPVOID);
 
 public:
-	CLowerInterface();
-	~CLowerInterface();
+	~CLowerInterface() { Destroy(); }
+	bool Initialize();
+	void Destroy();
 
 	// return the least possible overriden random fiber ID:
 	ALFID_T LOCALAPI RandALFID(PIN6_ADDR);
@@ -638,7 +641,7 @@ public:
 	void LOCALAPI SendPrematureReset(uint32_t = 0, CSocketItemEx * = NULL);
 
 	inline bool IsPrefixDuplicated(int, PIN6_ADDR);
-	inline void LearnAddresses();
+	inline bool LearnAddresses();
 	inline void MakeALFIDsPool();
 	inline void ProcessRemotePacket();
 	//^ the thread entry function for processing packet sent from the remote-end peer
@@ -660,7 +663,7 @@ public:
 	bool SelectPath(PFSP_SINKINF, ALFID_T, ULONG, const SOCKADDR_INET *) { return false; }
 #endif
 
-	static CLowerInterface * Singleton() { return pSingleInstance; }
+	static CLowerInterface Singleton;	// this class is effectively a namespace
 };
 
 

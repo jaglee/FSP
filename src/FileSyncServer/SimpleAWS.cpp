@@ -1,9 +1,43 @@
 /*
- * Simple Artcrafted Web Site
+ * Demonstration of the Challenge-response Handshake Authenticated Key Agreement protocol, the server side
+ *
+    Copyright (c) 2017, Jason Gao
+    All rights reserved.
+
+    Redistribution and use in source and binary forms, with or without modification,
+    are permitted provided that the following conditions are met:
+
+    - Redistributions of source code must retain the above copyright notice,
+      this list of conditions and the following disclaimer.
+
+    - Redistributions in binary form must reproduce the above copyright notice,
+      this list of conditions and the following disclaimer in the documentation
+	  and/or other materials provided with the distribution.
+
+    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+    AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+    IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+    ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+    LIABLE FOR ANY DIRECT, INDIRECT,INCIDENTAL, SPECIAL, EXEMPLARY, OR
+    CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+    SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+    INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+    CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+    ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+    POSSIBILITY OF SUCH DAMAGE.
  */
+// *S --> C, [in FSP's ACK_CONNECT_REQUEST]: /Welcome and identity of S/Public Key_S
+// *C --> S, [in FSP's PERSIST, had better with EoT]: /Public Key_C/Timestamp_C/Greeting and identity of C
+//	S --> C, [PERSIST]: the salt, Timestamp_S, Random_S, S's response to the C's challenge
+//		Suppose salted_password = HASH(salt | registered password)
+//		Response: HASH(salted_password | HASH((C's public key, C's timestamp) XOR S's random(repeated))))
+//	[C get the shared secret][hmac_sm3(salted_password, Curve25519-shared secret)]
+//	C --> S, [PERSIST]: C's reponse to the S's challenge
+//		Let salted_input_password = HASH(salt | inputted password)
+//		Reponse: HASH(salted_input_password | HASH((S's public key, S's timestamp) XOR S's random(repeated)))
+//	[S get the shared secret][hmac_sm3(salted_password, Curve25519-shared secret)]
 #include "stdafx.h"
 #include "defs.h"
-#include "CHAKA.h"
 
 # define REPORT_ERROR_ON_TRACE() \
 	TraceLastError(__FILE__, __LINE__, __FUNCDNAME__, "ERROR REPORT")
@@ -11,27 +45,30 @@
 	TraceLastError(__FILE__, __LINE__, __FUNCDNAME__, (s1))
 void TraceLastError(char * fileName, int lineNo, const char *funcName, const char *s1);
 
+// The path to be searched. It could be patterned.
+static TCHAR pattern[MAX_PATH];
 
 /**
  * The key agreement block
  */
-// TODO: should associated it with the session!
-const char *salt = "\001\002\003\004\005\006\007\010";
+// TODO: should associated salt, password and passwordHash with the session!
+const octet salt[CRYPTO_SALT_LENGTH] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
 const char *password = "Passw0rd";
 ALIGN(8)
-static uint8_t passwordHash[CRYPT_NACL_HASHBYTES];
+static uint8_t passwordHash[CRYPTO_NACL_HASHBYTES];
 
 static SCHAKAPublicInfo chakaPubInfo;
 static char sessionClientIdString[_MAX_PATH];
 
 static void FSPAPI onServerResponseSent(FSPHANDLE h, FSP_ServiceCode c, int r);
-
 static void FSPAPI onClientResponseReceived(FSPHANDLE h, FSP_ServiceCode c, int r);
+static void FSPAPI onFileListSent(FSPHANDLE h, FSP_ServiceCode c, int r);
+
 
 //
 // by default return the file 'index.saws' under the given path
 //
-void PrepareServiceSAWS(const TCHAR *pathName)
+void PrepareServiceSAWS(LPCTSTR pathName)
 {
 	HANDLE h = CreateFile(pathName
 		, GENERIC_READ
@@ -45,77 +82,43 @@ void PrepareServiceSAWS(const TCHAR *pathName)
 		REPORT_ERRMSG_ON_TRACE("path not accessible");
 		return;
 	}
-	//
 	CloseHandle(h);
-	//
-	WIN32_FIND_DATA findFileData;
-	TCHAR pattern[MAX_PATH];
-	strcpy_s(pattern, pathName);
-	strcat_s(pattern, "\\*");
-	h = FindFirstFile(pattern, & findFileData); 
-	if(h == INVALID_HANDLE_VALUE)
-	{
-		printf_s("Directory is empty: %s\n", pathName);
-		return;
-	}
-	// Should filter out "." and ".."
-	do
-	{
-		printf_s("File or directory: %s\n", findFileData.cFileName);
-	} while(FindNextFile(h, & findFileData));
-	//
-	FindClose(h);
 
-	// prepare password shadow
-	uint8_t *shadowMaterial = (uint8_t *)_alloca(strlen(salt) + strlen(password));
-	memcpy(shadowMaterial, salt, strlen(salt));
-	memcpy(shadowMaterial + strlen(salt), password, strlen(password));
-	CryptoNaClHash(passwordHash, shadowMaterial, strlen(salt) + strlen(password));
+	_tcscpy_s(pattern, pathName);
+	_tcscat_s(pattern, _T("\\*"));
+	//
+	MakeSaltedPassword(passwordHash, salt, password);
 }
 
 
 
 // On connected, send the public key and the client nonce to the remote end.
-//Challenge-responde Handshake Authenticated Key Establishment [/Signature: certificate is out-of-band]
-// *S --> C, [in FSP's ACK_CONNECT_REQUEST]: /Welcome and identity of S/Public Key_S
-//	C --> S, [in FSP's PERSIST, had better with EoT]: /Greeting and identity of C/Public Key_C/Timestamp_C
-//	S --> C, [PERSIST]: the salt, Timestamp_S, Random_S, S's response to the C's challenge
-//		Suppose salted_password = HASH(salt | registered password)
-//		Response: HASH(salted_password | HASH((C's public key, C's timestamp) XOR S's random(repeated))))
-//	[C get the shared secret]
-//	C --> S, [PERSIST]: C's reponse to the S's challenge
-//		Let salted_input_password = HASH(salt | inputted password)
-//		Reponse: HASH(salted_input_password | HASH((S's public key, S's timestamp) XOR S's random(repeated)))
-//	[S get the shared secret]
 int FSPAPI ServiceSAWS_onAccepted(FSPHANDLE h, PFSP_Context ctx)
 {
-	printf_s("\nEncyrptedMemory onAccepted: handle of FSP session %p\n", h);
-	// TODO: check connection context
+	printf_s("\nSimple AWS onAccepted: handle of FSP session %p\n", h);
 
-	ReadFrom(h, & chakaPubInfo.clientPublicKey, sizeof(chakaPubInfo.clientPublicKey), onPublicKeyReceived);
+	// TODO: check connection context
+	extern unsigned char * bufPublicKey;
+	InitCHAKAServer(chakaPubInfo, bufPublicKey);
+
+	ReadFrom(h, & chakaPubInfo.peerPublicKey, sizeof(chakaPubInfo.peerPublicKey), onPublicKeyReceived);
 	return 0;
 }
 
 
 
-//	S --> C, [in FSP's ACK_CONNECT_REQUEST]: /Welcome and identity of S/Public Key_S
-// *C --> S, [in FSP's PERSIST, had better with EoT]: /Timestamp_C/Greeting and identity of C/Public Key_C
-// *S --> C, [PERSIST]: the salt, Timestamp_S, Random_S, S's response to the C's challenge
-//		Suppose salted_password = HASH(salt | registered password)
-//		Response: HASH(salted_password | HASH((C's public key, C's timestamp) XOR S's random(repeated))))
-//	[C get the shared secret]
-//	C --> S, [PERSIST]: C's reponse to the S's challenge
-//		Let salted_input_password = HASH(salt | inputted password)
-//		Reponse: HASH(salted_input_password | HASH((S's public key, S's timestamp) XOR S's random(repeated)))
-//	[S get the shared secret]
-//
-//
 // Get the client's ID and nonce, fetch the salted password
 static void FSPAPI onPublicKeyReceived(FSPHANDLE h, FSP_ServiceCode c, int r)
 {
 	ReadFrom(h, & chakaPubInfo.clientNonce, sizeof(chakaPubInfo.clientNonce), NULL);
-	// TODO: read varible-length string
-	ReadFrom(h, & sessionClientIdString, sizeof(sessionClientIdString), NULL);
+
+	octet buf[sizeof(sessionClientIdString)];
+	int nBytes = ReadFrom(h, buf, sizeof(buf), NULL);
+	// assert(nBytes <= sizeof(sessionClientIdString));
+	ChakaStreamcrypt((octet *)sessionClientIdString
+		, chakaPubInfo.clientNonce
+		, buf, nBytes
+		, chakaPubInfo.peerPublicKey, bufPrivateKey);
 
 	FSPControl(h, FSP_GET_PEER_COMMITTED, (ULONG_PTR) & r);
 	if(r == 0)
@@ -125,43 +128,19 @@ static void FSPAPI onPublicKeyReceived(FSPHANDLE h, FSP_ServiceCode c, int r)
 		return;
 	}
 
-	// prepare the random bits (as an alternative to HMAC), should associated with 'h' - per session random
-	randombytes(& chakaPubInfo.serverRandom, sizeof(chakaPubInfo.serverRandom));
-	chakaPubInfo.serverNonce = htobe64(NowUTC());
+	//TODO: map the client's id to its salt and password hash value
 
-	// The server precheck validity of nonce. If clock 'difference is too high'(?), reject the request
-	int64_t d = be64toh(chakaPubInfo.serverNonce) - be64toh(chakaPubInfo.clientNonce);
-	if(d < -60000000 || d > 60000000)	// i.e. 60 seconds
+	octet serverResponse[CRYPTO_NACL_HASHBYTES];
+	if(! CHAKAChallengeByServer(chakaPubInfo, serverResponse, passwordHash))
 	{
-		printf_s("Protocol is broken: timer difference exceeds 1 minute.\n");
 		Dispose(h);
 		return;
 	}
-
-	// UNERSOLVED! Put client's identity for hashing?
-	// second round S->C
-	ALIGN(8)
-	uint8_t serverResponseMaterial[CRYPTO_NACL_KEYBYTES + sizeof(chakaPubInfo.clientNonce)];
-	uint8_t serverPresponse[CRYPT_NACL_HASHBYTES * 2];
-	uint8_t serverResponse[CRYPT_NACL_HASHBYTES];
-	memcpy(serverResponseMaterial, chakaPubInfo.clientPublicKey, CRYPTO_NACL_KEYBYTES);
-	*(uint64_t *)(serverResponseMaterial + CRYPTO_NACL_KEYBYTES) = chakaPubInfo.clientNonce;
-	// we're definitely sure that the length of serverResponseMaterial is some multiplication of 8-octect
-	for (register int i = 0; i < sizeof(serverResponseMaterial) / sizeof(chakaPubInfo.serverRandom); i++)
-	{
-		((uint64_t *)serverResponseMaterial)[i] ^= chakaPubInfo.serverRandom;
-	}
-
-	CryptoNaClHash(serverPresponse + CRYPT_NACL_HASHBYTES, serverResponseMaterial, sizeof(serverResponseMaterial));
-	memcpy(serverPresponse, passwordHash, CRYPT_NACL_HASHBYTES);
-	CryptoNaClHash(serverResponse, serverPresponse, sizeof(serverPresponse));
-
 	memcpy(chakaPubInfo.salt, salt, sizeof(salt));	// should read from database
-	// TODO: NotifyOrReturn might be NULL!
+
 	WriteTo(h, chakaPubInfo.salt, sizeof(chakaPubInfo.salt) + sizeof(chakaPubInfo.serverNonce) + sizeof(chakaPubInfo.serverRandom), 0, NULL);
 	WriteTo(h, serverResponse, sizeof(serverResponse), EOF, onServerResponseSent);
 }
-
 
 
 
@@ -172,49 +151,61 @@ static void FSPAPI onServerResponseSent(FSPHANDLE h, FSP_ServiceCode c, int r)
 
 
 
-//	S --> C, [in FSP's ACK_CONNECT_REQUEST]: /Welcome and identity of S/Public Key_S
-//	C --> S, [in FSP's PERSIST, had better with EoT]: /Greeting and identity of C/Public Key_C/Timestamp_C
-//	S --> C, [PERSIST]: the salt, Timestamp_S, Random_S, S's response to the C's challenge
-//		Suppose salted_password = HASH(salt | registered password)
-//		Response: HASH(salted_password | HASH((C's public key, C's timestamp) XOR S's random(repeated))))
-//	[C get the shared secret]
-// *C --> S, [PERSIST]: C's reponse to the S's challenge
-//		Let salted_input_password = HASH(salt | inputted password)
-//		Reponse: HASH(salted_input_password | HASH((S's public key, S's timestamp) XOR S's random(repeated)))
-// *[S get the shared secret]
-//
-//
-// Validate the client's response, write back the Simple Artcrafted Web Site description file
-//...
 static void FSPAPI onClientResponseReceived(FSPHANDLE h, FSP_ServiceCode c, int r)
 {
-	// TODO: the client should precheck validity of nonce. If clock 'difference is too high'(?), reject the request
-	// The client check the response of the server
-	ALIGN(8)
-	uint8_t clientResponseMaterial[CRYPTO_NACL_KEYBYTES + sizeof(chakaPubInfo.serverNonce)];
-	uint8_t expectedPresponse[CRYPT_NACL_HASHBYTES * 2];
-	uint8_t expectedResponse[CRYPT_NACL_HASHBYTES];
-
-	memcpy(clientResponseMaterial, chakaPubInfo.serverPublicKey, CRYPTO_NACL_KEYBYTES);
-	*(uint64_t *)(clientResponseMaterial + CRYPTO_NACL_KEYBYTES) = (uint64_t)htobe64(chakaPubInfo.serverNonce);
-	// we're definitely sure that the length of clientResponseMaterial is some multiplication of 8-octect
-	for (register int i = 0; i < sizeof(clientResponseMaterial) / sizeof(chakaPubInfo.serverRandom); i++)
-	{
-		((uint64_t *)clientResponseMaterial)[i] ^= chakaPubInfo.serverRandom;
-	}
-	CryptoNaClHash(expectedPresponse + CRYPT_NACL_HASHBYTES, clientResponseMaterial, sizeof(clientResponseMaterial));
-	memcpy(expectedPresponse, passwordHash, CRYPT_NACL_HASHBYTES);
-	CryptoNaClHash(expectedResponse, expectedPresponse, sizeof(expectedPresponse));
-
-	r = memcmp(expectedResponse, chakaPubInfo.peerResponse, CRYPT_NACL_HASHBYTES);
-	if(r != 0)
+	if(! CHAKAValidateByServer(chakaPubInfo, passwordHash))
 	{
 		Dispose(h);
 		return;
 	}
-	// TODO: write back the Mark down file!
+	//
+	printf_s("\tTo install the session key instantly...\n");
+	octet bufSharedKey[SESSION_KEY_SIZE];
+	ChakaDeriveKey(bufSharedKey, passwordHash, chakaPubInfo, bufPrivateKey);
+	InstallAuthenticKey(h, bufSharedKey, SESSION_KEY_SIZE, INT32_MAX);
+
+	// To list files remotely
+	WIN32_FIND_DATA findFileData;
+	HANDLE hFind = FindFirstFile(pattern, & findFileData); 
+	if(hFind == INVALID_HANDLE_VALUE)
+	{
+		_tprintf_s(_T("Directory is empty: %s\n"), pattern);
+		return;
+	}
+	//
+	octet buffer[MAX_PATH * 2 + 2];
+	do
+	{
+		TCHAR *fName = findFileData.cFileName;
+		_tprintf_s(_T("File or directory: %s\n"), fName);
+		if(_tcscmp(fName, _T(".")) == 0 || _tcscmp(fName, _T("..")) == 0)
+			continue;
+#ifdef _MBCS
+		int nBytes = LocalMBCSToUTF8(buffer, sizeof(buffer), fName);
+#else
+		int nBytes = WideStringToUTF8(buffer, sizeof(buffer), fName);
+#endif
+		WriteTo(h, buffer, nBytes, 0, NULL);
+	} while (FindNextFile(hFind, &findFileData));
+	//
+	FindClose(hFind);
+
+	Commit(h, onFileListSent);
 }
 
+
+
+//
+static void FSPAPI onFileListSent(FSPHANDLE h, FSP_ServiceCode c, int r)
+{
+	if(r < 0)
+	{
+		Dispose(h);
+		return;
+	}
+
+	ReadFrom(h, linebuf, sizeof(linebuf), onResponseReceived);
+}
 
 
 

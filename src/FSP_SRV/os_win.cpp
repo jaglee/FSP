@@ -41,15 +41,14 @@
 #pragma comment(lib, "User32.lib")
 
 
-
 #define REPORT_WSAERROR_TRACE(s) (\
 	printf("\n/**\n * %s, line# %d\n * %s\n */\n", __FILE__, __LINE__, __FUNCDNAME__), \
 	ReportWSAError(s)\
 	)
 
 
-// The reference to the singleton instance of the lower service interface 
-CLowerInterface	* CLowerInterface::pSingleInstance;
+// The singleton instance of the lower service interface 
+CLowerInterface	CLowerInterface::Singleton;
 
 // The hanlde of the timer queue singleton instance
 HANDLE	TimerWheel::timerQueue;
@@ -124,21 +123,24 @@ void CSocketSrvTLB::AcquireMutex()
 
 
 
-// The constructor of the lower service interface instance
+// To initialize:
 //	- Startup the socket service
 //	- Create rule entries in the firewall setting to enable FSP traffic
 //	- Bind the listening sockets besides the default sending socket
 //	- Pre-allocate Application Layer Fiber ID pool
 //	- Enable acception and processing of the remote FSP packets
 //	- Enable mobility detection
-CLowerInterface::CLowerInterface()
+bool CLowerInterface::Initialize()
 {
 	WSADATA wsaData;
 	int r;
 
 	// initializw windows socket support
-	if((r = WSAStartup(0x202, & wsaData)) < 0)
-		throw (HRESULT)r;
+	if ((r = WSAStartup(0x202, &wsaData)) < 0)
+	{
+		BREAK_ON_DEBUG();
+		return false;
+	}
 
 	CreateFWRules();
 
@@ -147,7 +149,10 @@ CLowerInterface::CLowerInterface()
 #ifndef OVER_UDP_IPv4
 	sdSend = socket(AF_INET6, SOCK_RAW, IPPROTO_FSP);
 	if (sdSend == INVALID_SOCKET)
-		throw E_HANDLE;
+	{
+		BREAK_ON_DEBUG();
+		return false;
+	}
 	//
 	nearInfo.pktHdr.cmsg_type = IPV6_PKTINFO;
 	nearInfo.pktHdr.cmsg_level = IPPROTO_IPV6;
@@ -155,14 +160,18 @@ CLowerInterface::CLowerInterface()
 #else
 	sdSend = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 	if (sdSend == INVALID_SOCKET)
-		throw E_HANDLE;
+	{
+		BREAK_ON_DEBUG();
+		return false;
+	}
 	//
 	nearInfo.pktHdr.cmsg_type = IP_PKTINFO;
 	nearInfo.pktHdr.cmsg_level = IPPROTO_IP;
 	nearInfo.pktHdr.cmsg_len = sizeof(nearInfo.pktHdr) + sizeof(struct in_pktinfo);
 #endif
 
-	LearnAddresses();
+	if(! LearnAddresses())
+		return false;
 	MakeALFIDsPool();
 	// This is a workaround (because of limitation under user-mode socket programming)
 #ifndef OVER_UDP_IPv4
@@ -175,13 +184,13 @@ CLowerInterface::CLowerInterface()
 	if((r = GetPointerOfWSARecvMsg(sdSend)) != 0)
 	{
 		REPORT_WSAERROR_TRACE("Cannot get function pointer WSARecvMsg");
-		throw (HRESULT)r;
+		return false;
 	}
 #if (_WIN32_WINNT < 0x0600)
 	if((r = GetPointerOfWSASendMsg(sdSend)) != 0)
 	{
 		REPORT_WSAERROR_TRACE("Cannot get function pointer WSASendMsg");
-		throw (HRESULT)r;
+		return false;
 	}
 #endif
 
@@ -189,8 +198,6 @@ CLowerInterface::CLowerInterface()
 	mesgInfo.namelen = sizeof(addrFrom);
 	mesgInfo.Control.buf = (char *) & nearInfo;
 	mesgInfo.Control.len = sizeof(nearInfo);
-
-	pSingleInstance = this;
 
 	// only after the required fields initialized may the listener thread started
 	// fetch message from remote endpoint and deliver them to upper layer application
@@ -212,12 +219,13 @@ CLowerInterface::CLowerInterface()
 	disableFlags = 0;
 	NotifyUnicastIpAddressChange(AF_INET6, OnUnicastIpChanged, NULL, FALSE, &hMobililty);
 #endif
+	return true;
 }
 
 
 
-// The destructor: kill the listening thread at first?
-CLowerInterface::~CLowerInterface()
+// The body of the class destructor
+void CLowerInterface::Destroy()
 {
 	CancelMibChangeNotify2(hMobililty);
 	TerminateThread(thReceiver, 0);
@@ -252,9 +260,14 @@ inline void CLowerInterface::MakeALFIDsPool()
 		// See also LearnAddresses, operator::[], AllocItem, FreeItem
 		do
 		{
-			rand_w32(&id, 1);
-			k = be32toh(id) & (MAX_CONNECTION_NUM - 1);
-		} while (be32toh(id) <= LAST_WELL_KNOWN_ALFID || tlbSockets[k]->fidPair.source != 0);
+			do
+			{
+				rand_w32(&id, 1);
+				k = be32toh(id);
+			} while (k <= LAST_WELL_KNOWN_ALFID);
+			//
+			k &= MAX_CONNECTION_NUM - 1;
+		} while (tlbSockets[k]->fidPair.source != 0);
 		//
 		tlbSockets[k]->fidPair.source = preallocatedIDs[i] = id;
 	}
@@ -323,6 +336,7 @@ int	DisablePromiscuous()
 }
 
 
+
 // There's the document glich when this code snippet was written: the output buffer MUST be specified
 // Given
 //	SOCKET		the socket that bind the interface to be set into promiscuous mode
@@ -382,6 +396,7 @@ inline int CLowerInterface::SetInterfaceOptions(SOCKET sd)
 }
 
 
+
 // learn all configured IPv6 addresses
 // figure out the associated interface number of each address block(individual prefix)
 // and do house-keeping
@@ -390,7 +405,7 @@ inline int CLowerInterface::SetInterfaceOptions(SOCKET sd)
 //	E_OUTOFMEMORY if no enough address buffer
 //	E_ABORT if bind failure in the middle way
 //	E_HANDLE if cannot allocate enough socket handle
-inline void CLowerInterface::LearnAddresses()
+inline bool CLowerInterface::LearnAddresses()
 {
 	PMIB_UNICASTIPADDRESS_TABLE table;
 	PIN6_ADDR p;
@@ -400,7 +415,9 @@ inline void CLowerInterface::LearnAddresses()
 	FD_ZERO(&sdSet);
 	memset(addresses, 0, sizeof(addresses));
 
-	GetUnicastIpAddressTable(AF_INET6, &table);
+	if(GetUnicastIpAddressTable(AF_INET6, &table) != NO_ERROR)
+		return false;
+
 	k = 0;
 	for (register long i = table->NumEntries - 1; i >= 0; i--)
 	{
@@ -421,7 +438,9 @@ inline void CLowerInterface::LearnAddresses()
 		if (table->Table[i].ScopeId.Value != 0)
 			continue;
 
-		if (table->Table[i].DadState != IpDadStatePreferred)
+		if (table->Table[i].DadState == IpDadStateDuplicate)
+			printf_s("Warning: this is a duplicate address on the subnet.\n");
+		else if (table->Table[i].DadState != IpDadStatePreferred)
 			continue;
 
 		// Loopback, IPv4-compatible or IPv4-mapped IPv6 addresses are NOT compatible with FSP
@@ -440,7 +459,10 @@ inline void CLowerInterface::LearnAddresses()
 			continue;
 
 		if (k >= SD_SETSIZE)
-			throw E_OUTOFMEMORY;
+		{
+			printf_s("Has more than %d IPv6 addresses?\n", k);
+			return false;
+		}
 
 		interfaces[k] = table->Table[i].InterfaceIndex;
 		addresses[k].sin6_family = AF_INET6;
@@ -451,7 +473,7 @@ inline void CLowerInterface::LearnAddresses()
 		if (::bind(sdSend, (const struct sockaddr *)& addresses[k], sizeof(SOCKADDR_IN6)) != 0)
 		{
 			REPORT_WSAERROR_TRACE("Bind failure");
-			throw E_ABORT;
+			return false;
 		}
 		//
 		if(SetInterfaceOptions(sdSend) == 0)
@@ -462,16 +484,20 @@ inline void CLowerInterface::LearnAddresses()
 
 		sdSend = socket(AF_INET6, SOCK_RAW, IPPROTO_FSP);
 		if (sdSend == INVALID_SOCKET)
-			throw E_HANDLE;
+		{
+			REPORT_WSAERROR_TRACE("Cannot create new socket");
+			return false;
+		}
 	}
 	if (k == 0)
 	{
-		printf_s("IPv6 not enabled?");
-		throw E_NOINTERFACE;
+		printf_s("IPv6 not enabled?\n");
+		return false;
 	}
 
 	// note that k is alias of fd_count of the socket set for this instance
 	FreeMibTable(table);
+	return true;
 }
 
 
@@ -599,7 +625,7 @@ int CLowerInterface::BindSendRecv(const SOCKADDR_IN *pAddrListen, int k)
 //	E_OUTOFMEMORY if no enough address buffer
 //	E_ABORT if bind failure in the middle way
 //	E_HANDLE if cannot allocate enough socket handle
-inline void CLowerInterface::LearnAddresses()
+inline bool CLowerInterface::LearnAddresses()
 {
 	struct {
 	    INT iAddressCount;
@@ -686,6 +712,7 @@ DWORD WINAPI CLowerInterface::ProcessRemotePacket(LPVOID lpParameter)
 	}
 	return 0;
 }
+
 
 
 // the real top-level handler to accept and process the remote packets
@@ -846,7 +873,10 @@ int CLowerInterface::AcceptAndProcess(SOCKET sdRecv)
 		pSocket->OnConnectRequestAck(pktBuf, countRecv);
 		break;
 	case RESET:
-		OnGetResetSignal();
+		pSocket = MapSocket();
+		if (pSocket == NULL || !pSocket->IsInUse())
+			break;
+		pSocket->OnGetReset(*FSP_OperationHeader<FSP_RejectConnect>());
 		break;
 		// TODO: get hint of explicit congest notification
 	case PERSIST:
@@ -947,14 +977,14 @@ void LOCALAPI CLowerInterface::SendPrematureReset(uint32_t reasons, CSocketItemE
 	if(pSocket)
 	{
 		// In CHALLENGING, CONNECT_AFFIRMING where the peer address is known
-		reject.u.timeStamp = htobe64(NowUTC());
+		reject.timeStamp = htobe64(NowUTC());
 		// See also CSocketItemEx::Emit() and SetIntegrityCheckCode():
-		reject.u2.fidPair = pSocket->fidPair;
+		reject.fidPair = pSocket->fidPair;
 		pSocket->SendPacket(1, ScatteredSendBuffers(&reject, sizeof(reject)));
 	}
 	else
 	{
-		memcpy(& reject, pktBuf->GetHeaderFSP(), sizeof(reject.u) + sizeof(reject.u2));
+		memcpy(& reject, pktBuf->GetHeaderFSP(), sizeof(reject.sn) + sizeof(reject.fidPair));
 		SendBack((char *) & reject, sizeof(reject));
 	}
 }
@@ -1008,12 +1038,12 @@ static void LOCALAPI ReportErrorAsMessage(int err)
 # define ERROR_SIZE	1024	// FormatMessage buffer size, no dynamic increase
 void TraceLastError(char * fileName, int lineNo, char *funcName, char *s1)
 {
-	char buffer[ERROR_SIZE];
+	TCHAR buffer[ERROR_SIZE];
 	DWORD err = GetLastError();
 	FormatMessage(FORMAT_MESSAGE_FROM_SYSTEM, NULL, err, 0, buffer, ERROR_SIZE, NULL);
-	printf("\n/**\n * %s, line %d\n * %s\n * %s\n */\n", fileName, lineNo, funcName, s1);
+	printf_s("\n/**\n * %s, line %d\n * %s\n * %s\n */\n", fileName, lineNo, funcName, s1);
 	if(buffer[0] != 0)
-		printf((char *)buffer);
+		_tprintf_s((TCHAR *)buffer);
 }
 
 
@@ -1304,7 +1334,7 @@ CommandNewSessionSrv::CommandNewSessionSrv(const CommandToLLS *p1)
 	memcpy(this, pCmd, sizeof(CommandToLLS));
 	hMemoryMap = pCmd->hMemoryMap;
 	dwMemorySize = pCmd->dwMemorySize;
-	hEvent = OpenEvent(EVENT_MODIFY_STATE, FALSE, (LPCSTR)pCmd->szEventName);
+	hEvent = OpenEventA(EVENT_MODIFY_STATE, FALSE, (LPCSTR)pCmd->szEventName);
 }
 
 
@@ -1368,8 +1398,8 @@ int CSocketItemEx::SendPacket(register ULONG n1, ScatteredSendBuffers s)
 		//
 		wsaMsg.Control.buf = (CHAR *)& nearInfo;
 		wsaMsg.Control.len = sizeof(nearInfo);
-		nearInfo.pktHdr = CLowerInterface::Singleton()->nearInfo.pktHdr;
-		if(! CLowerInterface::Singleton()->SelectPath
+		nearInfo.pktHdr = CLowerInterface::Singleton.nearInfo.pktHdr;
+		if(! CLowerInterface::Singleton.SelectPath
 			(& nearInfo.u, fidPair.source, pControlBlock->nearEndInfo.ipi6_ifindex, sockAddrTo))
 		{
 			return 0;	// no selectable path
@@ -1395,7 +1425,7 @@ int CSocketItemEx::SendPacket(register ULONG n1, ScatteredSendBuffers s)
 		printf_s("Target address:\n\t");
 		DumpNetworkUInt16((uint16_t *)wsaMsg.name, wsaMsg.namelen / 2);
 #endif
-		r = WSASendMsg(CLowerInterface::Singleton()->sdSend, & wsaMsg, 0, &n, NULL, NULL);
+		r = WSASendMsg(CLowerInterface::Singleton.sdSend, & wsaMsg, 0, &n, NULL, NULL);
 	}
 	else
 	{
@@ -1406,7 +1436,7 @@ int CSocketItemEx::SendPacket(register ULONG n1, ScatteredSendBuffers s)
 		printf_s("\nPeer socket address:\n");
 		DumpNetworkUInt16((uint16_t *)sockAddrTo, sizeof(SOCKADDR_IN6) / 2);
 #endif
-		r = WSASendTo(CLowerInterface::Singleton()->sdSend
+		r = WSASendTo(CLowerInterface::Singleton.sdSend
 			, s.scattered, n1
 			, &n
 			, 0
@@ -1449,6 +1479,7 @@ bool CLightMutex::WaitSetMutex()
 	}
 	return true;
 }
+
 
 
 // Given
@@ -2113,11 +2144,11 @@ VOID NETIOAPI_API_ OnUnicastIpChanged(PVOID, PMIB_UNICASTIPADDRESS_ROW row, MIB_
 	}
 
 	if (notificationType == MibAddInstance)
-		CLowerInterface::Singleton()->OnAddingIPv6Address(row->InterfaceIndex, row->Address.Ipv6);
+		CLowerInterface::Singleton.OnAddingIPv6Address(row->InterfaceIndex, row->Address.Ipv6);
 	else if (notificationType == MibParameterNotification)
-		CLowerInterface::Singleton()->OnIPv6AddressMayAdded(row->InterfaceIndex, row->Address.Ipv6);
+		CLowerInterface::Singleton.OnIPv6AddressMayAdded(row->InterfaceIndex, row->Address.Ipv6);
 	else if (notificationType == MibDeleteInstance)
-		CLowerInterface::Singleton()->OnRemoveIPv6Address(row->InterfaceIndex, row->Address.Ipv6.sin6_addr);
+		CLowerInterface::Singleton.OnRemoveIPv6Address(row->InterfaceIndex, row->Address.Ipv6.sin6_addr);
 	// else just ignore
 }
 #endif

@@ -107,5 +107,7 @@ void TryCHAKA()
 	CryptoNaClHash(expectedResponse, expectedPresponse, sizeof(expectedPresponse));
 
 	int r = memcmp(expectedResponse, clientResponse, CRYPT_NACL_HASHBYTES);
+	if (r != 0)
+		printf_s("Input password is wrong!\n");
 	assert(strcmp(inputPassword, password) == 0 && r == 0 || strcmp(inputPassword, password) != 0 && r != 0);
 }

@@ -401,7 +401,6 @@ bool CSocketItemDl::LockAndValidate()
 			, this
 			, stateNames[pControlBlock->state], pControlBlock->state);
 #endif
-		InterlockedExchangePointer((PVOID *)& fpRecycled, NULL);
 		this->Recycle();
 		SetMutexFree();
 		NotifyError(FSP_NotifyReset, -EBADF);
@@ -512,23 +511,43 @@ void CSocketItemDl::WaitEventToDispatch()
 				goto l_return;
 			//
 			if(InState(CLOSABLE) && initiatingShutdown)
+			{
+				SetMutexFree();
 				Call<FSP_Shutdown>();
-			SetMutexFree();
+			}
+			else if(!initiatingShutdown	// See also Commit(NotifyOrReturn):
+				&& (InState(COMMITTED) || InState(CLOSABLE) || InState(PRE_CLOSED) || InState(CLOSED)))
+			{
+				NotifyOrReturn fp1 = (NotifyOrReturn)InterlockedExchangePointer((PVOID *)& fpCommitted, NULL);
+				CancelTimer();		// If any
+				SetMutexFree();
+				if (fp1 != NULL)
+					fp1(this, FSP_NotifyFlushed, 0);
+			}
+			else
+			{
+				SetMutexFree();
+			}
 			break;
 		case FSP_NotifyToFinish:
 			if(initiatingShutdown)
-				RespondToRecycle();
-			else
+			{
+				NotifyOrReturn fp1 = (NotifyOrReturn)InterlockedExchangePointer((PVOID *)& fpCommitted, NULL);
 				SetMutexFree();
+				if (fp1 != NULL)
+					fp1(this, FSP_NotifyRecycled, 0);
+				//
+				Recycle();	// in this function it checks whether isDisposing
+			}
+			else
+			{
+				SetMutexFree();
+			}
 			break;
 		case FSP_NotifyRecycled:
 			CancelTimer();	// If any; typically for Shutdown 
-			RespondToRecycle();
-			goto l_return;
-		case FSP_NotifyReset:
-			socketsTLB.FreeItem(this);
-			Disable();
-			NotifyError(notice, -EINTR);
+			Recycle();
+			SetMutexFree();
 			goto l_return;
 		case FSP_IPC_CannotReturn:
 			if (pControlBlock->state == LISTENING)
@@ -538,25 +557,22 @@ void CSocketItemDl::WaitEventToDispatch()
 			}
 			else if (pControlBlock->state == CONNECT_BOOTSTRAP || pControlBlock->state == CONNECT_AFFIRMING)
 			{
+				CancelTimer();	// If any
 				SetMutexFree();
 				context.onAccepted(NULL, &context);		// general error
 			}
-#ifdef TRACE
-			else	// else just ignore the dist
+			else
 			{
 				SetMutexFree();
-				printf_s("Get FSP_IPC_CannotReturn in the state %s\n", stateNames[pControlBlock->state]);
 			}
-#endif
 			goto l_return;
 		case FSP_MemoryCorruption:
 		case FSP_NotifyOverflow:
 		case FSP_NotifyTimeout:
 		case FSP_NotifyNameResolutionFailed:
+		case FSP_NotifyReset:
+			DisableAndFree();	// The error handler needn't do further clean-up work
 			NotifyError(notice, -EINTR);
-			socketsTLB.FreeItem(this);
-			Disable();
-			SetMutexFree();
 			goto l_return;
 			// UNRESOLVED!? There could be some remedy if name resolution failed?
 		}
@@ -664,7 +680,7 @@ bool CSocketItemDl::CancelTimer()
 
 
 // The function called back as soon as the one-shot timer counts down to 0
-// See also Recycle and RespondToRecycle
+// See also Recycle
 void CSocketItemDl::TimeOut()
 {
 	WaitUseMutex();

@@ -50,7 +50,6 @@
 #endif
 
 #define MAX_FSP_SHM_SIZE		0x400000	// 4MB
-#define CRYPTO_NACL_KEYBYTES	32
 
 #if defined(_M_X64) || defined(_M_IA64)
     typedef unsigned __int64 ulong_ptr;
@@ -288,7 +287,8 @@ int FSPAPI SendInline(FSPHANDLE, void *, int, int8_t);
 //		EOF:	terminate the transaction
 //	NotifyOrReturn	the callback function pointer
 // Return
-//	0 if no immediate error, negative if it failed, or positive it was warned (I/O pending)
+//	non-negative if it is the number of octets put into the queue immediately. might be 0 of course.
+//	negative if it failed
 // Remark
 //	Only all data have been buffered may be NotifyOrReturn called.
 //	If NotifyOrReturn is NULL the function is blocking, i.e.
@@ -316,7 +316,9 @@ int FSPAPI RecvInline(FSPHANDLE, CallbackPeeked);
 //	NotifyOrReturn	the function called back when either EoT reached,
 //					connection terminated or receive buffer fulfilled
 // Return
-//	0 if no immediate error, negative if error
+//	positive if it is the number of octets received immediately
+//	0 if no immediate error while NotifyOrReturn is not NULL
+//	negative if error
 // Remark
 //	NotifyOrReturn is called when receive buffer is full OR end of transaction encountered
 //	NotifyOrReturn might report error later even if ReadFrom itself return no error
@@ -328,9 +330,41 @@ DllSpec
 int FSPAPI ReadFrom(FSPHANDLE, void *, int, NotifyOrReturn);
 
 
-// Try to terminate the session gracefully, automatically commit if not yet 
-// Return 0 if no immediate error, or else the error number
-// The callback function might return code of delayed error
+
+// Given
+//	FSPHANDLE		the FSP socket
+//	NotifyOrReturn	the function pointer for call back
+// Return
+//	EBUSY warning if it is COMMITTING
+//	0 if no error
+//	-EDEADLK if no mutual-exclusive lock available
+//	-EBADF if the socket is in abnormal state
+//	-EAGAIN if commit more than once, which may render dead-lock
+//	-EFAULT if internal resource error encountered, typical time-out clock unavailable
+//	-EIO if the packet piggyback EoT flag cannot be sent
+DllSpec
+int FSPAPI Commit(FSPHANDLE, NotifyOrReturn);
+
+
+
+// Given
+//	FSPHANDLE		the FSP socket
+//	NotifyOrReturn	the function pointer for call back
+// Return
+//	EDOM warning if the connection is to shutdown prematurely, i.e. it is a RESET actually
+//	EBUSY warning if it is COMMITTING
+//	EAGAIN warning if the connection is already in the progress of shutdown
+//	0 if no error
+//	-EDEADLK if no mutual-exclusive lock available
+//	-EBADF if the socket is in abnormal state
+//	-EFAULT if internal resource error encountered, typical time-out clock unavailable
+//	-EIO if the shutdown packet cannot be sent
+// Remark
+//	It is assumed that when Shutdown was called ULA did not expect further data from the remote end
+//	The caller should make sure Shutdown is not carelessly called more than once
+//	in a multi-thread continual communication context or else connection reuse(resurrection) may be broken
+// If the pointer of the callback function is null, 
+// blocks until it reaches the state that the transmit transaction has been comitted
 DllSpec
 int FSPAPI Shutdown(FSPHANDLE, NotifyOrReturn);
 
@@ -359,43 +393,6 @@ int FSPAPI FSPControl(FSPHANDLE, FSP_ControlCode, ulong_ptr);
 // Exported by the DLL
 DllSpec
 timestamp_t NowUTC();
-
-DllSpec
-void randombytes(void *, size_t);
-
-// Given
-//	pointer to the buffer of exported public key
-//	pointer to the buffer of exported private key
-// Do
-//	Generate the public-private key pair
-// Return
-//	0 (always succeed in presumed constant time)
-DllSpec
-int FSPAPI CryptoNaClKeyPair(octet *, octet *);
-
-
-// Given
-//	pointer to the buffer of the shared secret, crypto_core_hsalsa20_tweet_KEYBYTES = 32 bytes
-//	the byte string of the peer's public key
-//	the byte string of the near end's private key
-// Do
-//	Derive the shared secret
-// Return
-//	0 (always succeed in presumed constant time)
-DllSpec
-int FSPAPI CryptoNaClGetSharedSecret(octet *, const octet *, const octet *);
-
-
-// Given
-//	pointer to the buffer of the output hash, 64 bytes
-//	the input byte string to calculate the hash
-//	the length of the byte string
-// Do
-//	get the SHA512 result
-// Return
-//	0 (always succeed in presumed constant time)
-DllSpec
-int FSPAPI CryptoNaClHash(octet *, const octet *, size_t);
 
 #ifdef __cplusplus
 	}

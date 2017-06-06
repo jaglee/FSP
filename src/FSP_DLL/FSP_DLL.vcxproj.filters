@@ -8,8 +8,6 @@
     <ClCompile Include="Multiplex.cpp" />
     <ClCompile Include="Receive.cpp" />
     <ClCompile Include="Send.cpp" />
-    <ClCompile Include="tweetnacl.c" />
-    <ClCompile Include="CryptoStub.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\FSP.h">
@@ -22,6 +20,9 @@
       <Filter>Headers</Filter>
     </ClInclude>
     <ClInclude Include="..\FSP_Impl.h">
+      <Filter>Headers</Filter>
+    </ClInclude>
+    <ClInclude Include="..\KeyExchange\CHAKA.h">
       <Filter>Headers</Filter>
     </ClInclude>
   </ItemGroup>

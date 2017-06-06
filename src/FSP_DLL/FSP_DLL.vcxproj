@@ -153,7 +153,7 @@
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
     <ClCompile>
-      <PreprocessorDefinitions>OVER_UDP_IPv4;WIN32;NDEBUG;_WINDOWS;_USRDLL;FSP_DLL_EXPORTS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>WIN32;NDEBUG;_WINDOWS;_USRDLL;FSP_DLL_EXPORTS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
       <PrecompiledHeader>
       </PrecompiledHeader>
@@ -193,18 +193,17 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="..\ControlBlock.cpp" />
-    <ClCompile Include="CryptoStub.c" />
     <ClCompile Include="Disconnect.cpp" />
     <ClCompile Include="DllEntry.cpp" />
     <ClCompile Include="Establish.cpp" />
     <ClCompile Include="Multiplex.cpp" />
     <ClCompile Include="Receive.cpp" />
     <ClCompile Include="Send.cpp" />
-    <ClCompile Include="tweetnacl.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\FSP.h" />
     <ClInclude Include="..\FSP_API.h" />
+    <ClInclude Include="..\KeyExchange\CHAKA.h" />
     <ClInclude Include="FSP_DLL.h" />
     <ClInclude Include="..\FSP_Impl.h" />
   </ItemGroup>

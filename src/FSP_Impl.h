@@ -121,10 +121,12 @@ void TraceLastError(char * fileName, int lineNo, char *funcName, char *s1);
  */
 
 #ifdef _DEBUG
+# define DEINIT_WAIT_TIMEOUT_ms		15000	// 15 seconds
 # define SCAVENGE_THRESHOLD_ms		180000	// 3 minutes
 # define LAZY_ACK_DELAY_MIN_ms		100		// 100 millisecond, minimum delay for lazy acknowledgement
 # define BREAK_ON_DEBUG()			DebugBreak()
 #else
+# define DEINIT_WAIT_TIMEOUT_ms		5000	// 5 seconds
 # define SCAVENGE_THRESHOLD_ms		1800000	// 30 minutes
 # define LAZY_ACK_DELAY_MIN_ms		1		// 1 millisecond, minimum delay for lazy acknowledgement
 # define BREAK_ON_DEBUG()
@@ -370,7 +372,7 @@ struct FSP_RejectConnect
 			uint32_t initial;
 			uint32_t expected;
 		} sn;
-	} u;
+	};
 	//
 	union
 	{
@@ -378,7 +380,7 @@ struct FSP_RejectConnect
 		uint64_t cookie;
 		uint64_t initCheckCode;
 		PairALFID fidPair;
-	} u2;
+	};
 	//
 	uint32_t reasons;	// bit field(?)
 	$FSP_HeaderSignature hs;

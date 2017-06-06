@@ -60,14 +60,9 @@ int main(int argc, char * argv[])
 	}
 
 	// also create the receiver
-	try
+	if(!CLowerInterface::Singleton.Initialize())
 	{
-		new CLowerInterface();
-	}
-	catch(HRESULT x)
-	{
-		// TODO: UNRESOLVED!handle the exception?!
-		printf("In main: exception number 0x%X, cannot access lower interface, aborted.\n", x); 
+		printf("In main cannot access lower interface, aborted.\n"); 
 		goto l_bailout;
 	}
 
@@ -90,7 +85,7 @@ int main(int argc, char * argv[])
 	{
 		BREAK_ON_DEBUG();
 		delete TimerWheel::Singleton();
-		delete CLowerInterface::Singleton();
+		CLowerInterface::Singleton.Destroy();
 	}
 
 l_bailout:
@@ -232,7 +227,7 @@ static void LOCALAPI ProcessCommand(HANDLE md)
 			Multiply(CommandCloneSessionSrv(pCmd));
 			break;
 		default:
-			pSocket = (CSocketItemEx *)(*CLowerInterface::Singleton())[pCmd->fiberID];
+			pSocket = (CSocketItemEx *)CLowerInterface::Singleton[pCmd->fiberID];
 			if(pSocket == NULL)
 			{
 #if defined(TRACE) && (TRACE & TRACE_ULACALL)

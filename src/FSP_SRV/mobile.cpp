@@ -551,7 +551,7 @@ bool CSocketItemEx::EmitStart()
 		pControlBlock->SetSequenceFlags(pHdr, pControlBlock->sendWindowNextSN);
 		pHdr->integrity.code = htobe64(skb->timeSent);
 
-		CLowerInterface::Singleton()->EnumEffectiveAddresses(pControlBlock->connectParams.allowedPrefixes);
+		CLowerInterface::Singleton.EnumEffectiveAddresses(pControlBlock->connectParams.allowedPrefixes);
 		memcpy((BYTE *)payload, pControlBlock->connectParams.allowedPrefixes, sizeof(uint64_t) * MAX_PHY_INTERFACES);
 
 		pHdr->hs.Set<FSP_AckConnectRequest, ACK_CONNECT_REQ>();
@@ -597,12 +597,16 @@ bool CSocketItemEx::EmitStart()
 int CSocketItemEx::EmitWithICC(ControlBlock::PFSP_SocketBuf skb, ControlBlock::seq_t seq)
 {
 #if (TRACE & TRACE_HEARTBEAT)  || defined(EMULATE_LOSS)
-	UINT vRand;
-	if(rand_s(&vRand) == 0 && vRand > (UINT_MAX >> 2) + (UINT_MAX >> 1))
+	volatile unsigned int vRand = 0;
+	if (rand_s((unsigned int *)&vRand) == 0 && vRand > (UINT_MAX >> 2) + (UINT_MAX >> 1))
 	{
-		printf_s("\nError seed to debug retransmission:\n"
-			"\tA packet %s (#%u) is discarded deliberately\n", opCodeStrings[skb->opCode], seq);
+		printf_s("\nError seed = 0x%X for debug retransmission\n"
+			"\tA packet %s (#%u) is discarded deliberately\n", vRand, opCodeStrings[skb->opCode], seq);
 		return -ECANCELED;	// emulate 33.33% loss rate
+	}
+	else
+	{
+		printf_s("Error seed = 0x%X, going to send %s (#%u)\n", vRand, opCodeStrings[skb->opCode], seq);
 	}
 #endif
 #ifdef _DEBUG
@@ -668,7 +672,7 @@ void CSocketItemEx::OnLocalAddressChanged()
 	// UNRESOLVED!? The default interface should be the one that is set to promiscuous
 	if (SOCKADDR_SUBNET(sockAddrTo) == 0 && SOCKADDR_HOSTID(sockAddrTo) == 0)
 	{
-		PSOCKADDR_IN6 p = CLowerInterface::Singleton()->addresses + CLowerInterface::Singleton()->iRecvAddr;
+		PSOCKADDR_IN6 p = CLowerInterface::Singleton.addresses + CLowerInterface::Singleton.iRecvAddr;
 		SOCKADDR_SUBNET(sockAddrTo) = SOCKADDR_SUBNET(p);
 		SOCKADDR_HOSTID(sockAddrTo) = SOCKADDR_HOSTID(p);
 	}

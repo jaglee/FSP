@@ -168,11 +168,11 @@ void LOCALAPI CLowerInterface::OnGetInitConnect()
 	memcpy(&hdrInfo, mesgInfo.Control.buf, min(mesgInfo.Control.len, sizeof(hdrInfo)));
 	if (hdrInfo.IsIPv6())
 	{
-		fiberID = CLowerInterface::Singleton()->RandALFID((PIN6_ADDR) & hdrInfo.u);
+		fiberID = CLowerInterface::Singleton.RandALFID((PIN6_ADDR) & hdrInfo.u);
 	}
 	else
 	{
-		fiberID = CLowerInterface::Singleton()->RandALFID();
+		fiberID = CLowerInterface::Singleton.RandALFID();
 		hdrInfo.u.idALF = fiberID;
 	}
 
@@ -389,57 +389,62 @@ l_return:
 // PRE_CLOSED, CLONING}-->/RESET/
 //    -->NON_EXISTENT-->[Notify]
 //{NON_EXISTENT, LISTENING, CLOSED, Otherwise}<-->/RESET/{Ignore}
-void LOCALAPI CLowerInterface::OnGetResetSignal()
+// UNRESOLVED! Lost of RESET is siliently ignored?
+// TODO: put the RESET AND other meaningful packet on the stack/queue
+// The first RESET should be push onto the top. Repeated RESET should be append at the tail.
+void LOCALAPI CSocketItemEx::OnGetReset(FSP_RejectConnect & reject)
 {
-	FSP_RejectConnect & reject = *FSP_OperationHeader<FSP_RejectConnect>();
-	CSocketItemEx *pSocket = MapSocket();
-	if(pSocket == NULL || ! pSocket->IsInUse())	// RESET is never locked out
-		return;
-
 #ifdef TRACE
-	printf_s("\nRESET got, in state %s\n\n", stateNames[pSocket->lowState]);
+	printf_s("\nRESET got, in state %s\n\n", stateNames[lowState]);
 #endif
+	// No, we cannot reset a socket without validation
+	if (!WaitUseMutex())
+		return;
+	if (!IsInUse() || pControlBlock == NULL)
+		goto l_bailout;
 
-	if(pSocket->InState(CONNECT_BOOTSTRAP))
+	if(InState(CONNECT_BOOTSTRAP))
 	{
-		if(reject.u.timeStamp == pSocket->pControlBlock->connectParams.nboTimeStamp
-		&& reject.u2.initCheckCode == pSocket->pControlBlock->connectParams.initCheckCode)
+		if(reject.timeStamp == pControlBlock->connectParams.nboTimeStamp
+		&& reject.initCheckCode == pControlBlock->connectParams.initCheckCode)
 		{
-			pSocket->DisposeOnReset();
+			DisposeOnReset();
 		}
 		// otherwise simply ignore
 	}
-	else if(pSocket->InState(CONNECT_AFFIRMING))
+	else if(InState(CONNECT_AFFIRMING))
 	{
-		if(reject.u.timeStamp == pSocket->pControlBlock->connectParams.nboTimeStamp
-		&& reject.u2.cookie == pSocket->pControlBlock->connectParams.cookie)
+		if(reject.timeStamp == pControlBlock->connectParams.nboTimeStamp
+		&& reject.cookie == pControlBlock->connectParams.cookie)
 		{
-			pSocket->DisposeOnReset();
+			DisposeOnReset();
 		}
 		// otherwise simply ignore
 	}
-	else if(pSocket->InState(CHALLENGING))
+	else if(InState(CHALLENGING))
 	{
-		if(reject.u.sn.initial == htobe32(pSocket->pControlBlock->connectParams.initialSN)
-		&& reject.u2.cookie == pSocket->pControlBlock->connectParams.cookie)
+		if(reject.sn.initial == htobe32(pControlBlock->connectParams.initialSN)
+		&& reject.cookie == pControlBlock->connectParams.cookie)
 		{
-			pSocket->DisposeOnReset();
+			DisposeOnReset();
 		}
 		// otherwise simply ignore
 	}
-	else if(! pSocket->InState(LISTENING) && ! pSocket->InState(CLOSED))
+	else if(! InState(LISTENING) && ! InState(CLOSED))
 	{
-		int32_t offset = pSocket->IsOutOfWindow(be32toh(reject.u.sn.initial));
+		int32_t offset = IsOutOfWindow(be32toh(reject.sn.initial));
 		if ( (offset == 0 || offset == -1)	// RESET is out-of-band
-		&& pSocket->ValidateICC((FSP_NormalPacketHeader *) & reject, 0, pSocket->fidPair.peer, 0))
+		&& ValidateICC((FSP_NormalPacketHeader *) & reject, 0, fidPair.peer, 0))
 		{
-			pSocket->DisposeOnReset();
+			DisposeOnReset();
 		}
 		// otherwise simply ignore.
 	}
 	// InStates ESTABLISHED, COMMITTING, PEER_COMMIT, COMMITTING2, COMMITTED, CLOSABLE, PRE_CLOSED, CLONING
 	// besides, those states are recoverable.
 	// LISTENING state is not affected by reset signal
+l_bailout:
+	SetMutexFree();
 }
 
 
@@ -741,7 +746,7 @@ void CSocketItemEx::OnGetPersist()
 	// Make acknowledgement, in case previous acknowledgement is lost
 	if (countPlaced == -ENOENT || countPlaced == -EEXIST)
 	{
-		AddLazyAckTimer();
+		SendKeepAlive();	// AddLazyAckTimer();	// PERSIST needs an instant response to enhance efficiency
 		return;
 	}
 
@@ -759,31 +764,7 @@ void CSocketItemEx::OnGetPersist()
 	bool committed = HasBeenCommitted();
 	if(committed)
 	{
-		switch(lowState)
-		{
-		case CHALLENGING:
-			SetState(CLOSABLE);
-			break;
-		case ESTABLISHED:
-			SetState(PEER_COMMIT);
-			break;
-		case COMMITTING:
-			SetState(COMMITTING2);
-			break;
-		case COMMITTED:
-			StopKeepAlive();
-			SetState(CLOSABLE);
-			break;
-		case CLONING:
-			StopKeepAlive();
-			SetState(_InterlockedExchange8(&shouldAppendCommit, 0) ? CLOSABLE : PEER_COMMIT);
-#ifdef TRACE
-			printf_s("\nTransit to %s state from CLONING\n", stateNames[lowState]);
-#endif
-			break;
-		//default:	//case CLOSABLE: case PEER_COMMIT: // keep state
-		}
-		SendAckFlush();
+		TransitOnPeerCommit();
 	}
 	else
 	{
@@ -958,26 +939,7 @@ void CSocketItemEx::OnGetPureData()
 	// State transition signaled to DLL CSocketItemDl::WaitEventToDispatch()
 	if(HasBeenCommitted())
 	{
-		if (lowState == COMMITTING)
-		{
-			SetState(COMMITTING2);
-		}
-		else if (lowState == COMMITTED)
-		{
-			StopKeepAlive();
-			SetState(CLOSABLE);
-		}
-		else // if (InState(ESTABLISHED))
-		{
-#ifdef TRACE
-			printf_s("\nTransit to PEER_COMMIT from %s, %s\n\n"
-				, stateNames[lowState]
-				, stateNames[pControlBlock->state]);
-#endif
-			StopKeepAlive();
-			SetState(PEER_COMMIT);
-		}
-		SendAckFlush();
+		TransitOnPeerCommit();
 		Notify(FSP_NotifyToCommit);
 	}
 	// PURE_DATA cannot start a transmit transaction, so in state like CLONING just prebuffer
@@ -1024,10 +986,27 @@ void CSocketItemEx::OnGetEOT()
 	// if(skb->opCode == 0) every packet has been delivered. EOT make it committed
 	// slightly different against CSocketItemEx::HasBeenCommitted
 	pControlBlock->SnapshotReceiveWindowRightEdge();
-	switch(lowState)
+	TransitOnPeerCommit();
+	Notify(FSP_NotifyToCommit);
+}
+
+
+
+
+// Make state transition on end-of-transmit-transaction got from the peer
+// Side-effect: send ACK_FLUSH immediately
+void CSocketItemEx::TransitOnPeerCommit()
+{
+#ifdef TRACE
+	printf_s("\nEoT got, transit from state %s to ", stateNames[lowState]);
+#endif
+	switch (lowState)
 	{
 	case CHALLENGING:
 		SetState(CLOSABLE);
+		break;
+	case ESTABLISHED:
+		SetState(PEER_COMMIT);
 		break;
 	case COMMITTING:
 		SetState(COMMITTING2);
@@ -1036,21 +1015,16 @@ void CSocketItemEx::OnGetEOT()
 		SetState(CLOSABLE);
 		StopKeepAlive();
 		break;
-	case ESTABLISHED:
 	case CLONING:
-#ifdef TRACE
-		printf_s("\nTransit to PEER_COMMIT from %s, %s\n\n"
-			, stateNames[lowState]
-			, stateNames[pControlBlock->state]);
-#endif
 		StopKeepAlive();
-		SetState(PEER_COMMIT);
+		SetState(_InterlockedExchange8(&shouldAppendCommit, 0) ? CLOSABLE : PEER_COMMIT);
 		break;
-	// default:	// case PEER_COMMIT: case COMMITTING2: case CLOSABLE:	// keep state
+		// default:	// case PEER_COMMIT: case COMMITTING2: case CLOSABLE:	// keep state
 	}
-	//
+#ifdef TRACE
+	printf_s("%s\n", stateNames[lowState]);
+#endif
 	SendAckFlush();
-	Notify(FSP_NotifyToCommit);
 }
 
 
@@ -1132,6 +1106,7 @@ void CSocketItemEx::OnGetRelease()
 		return;
 	}
 
+	// Note that if ever a duplicate RELEASE packet is received, the socket context may not be reused(non-recyclable)
 	if (InState(CLOSED))
 	{
 		Destroy();	// LLS 
@@ -1147,7 +1122,7 @@ void CSocketItemEx::OnGetRelease()
 	SendRelease();
 	Notify(FSP_NotifyToFinish);
 	//
-	ReplaceTimer(TRANSIENT_STATE_TIMEOUT_ms);
+	ReplaceTimer(RECYCLABLE_TIMEOUT_ms);
 }
 
 
@@ -1185,13 +1160,13 @@ void CSocketItemEx::OnGetMultiply()
 
 	// Check whether the request is already put into the multiplication backlog
 	// Check whether it is a collision!?
-	CMultiplyBacklogItem *newItem  = CLowerInterface::Singleton()->FindByRemoteId(remoteHostID, idSource, fidPair.source);
+	CMultiplyBacklogItem *newItem  = CLowerInterface::Singleton.FindByRemoteId(remoteHostID, idSource, fidPair.source);
 	// Unlike ACK_CONNECT_REQUEST, response to MULTIPLY is retranmitted on timed-out, not on demand
 	if (newItem != NULL)
 		return;
 
 	// See also CLowerInterface::OnGetInitConnect
-	newItem = (CMultiplyBacklogItem *)CLowerInterface::Singleton()->AllocItem();
+	newItem = (CMultiplyBacklogItem *)CLowerInterface::Singleton.AllocItem();
 	if(newItem == NULL)
 	{
 		REPORT_ERRMSG_ON_TRACE("Cannot allocate new socket slot for multiplication");
@@ -1204,7 +1179,7 @@ void CSocketItemEx::OnGetMultiply()
 	{
 		BREAK_ON_DEBUG();	//TRACE_HERE("Duplicate MULTIPLY backlogged already");
 l_bailout:
-		CLowerInterface::Singleton()->FreeItem(newItem);
+		CLowerInterface::Singleton.FreeItem(newItem);
 		return;
 	}
 

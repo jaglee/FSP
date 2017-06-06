@@ -15,6 +15,7 @@
 // MUST include local header before stdio or else _CRT_RAND_S is not defined properly
 #include "../UnitTestFSP/FSP_TestClass.h"
 #include "../FSP_API.h"
+#include "../KeyExchange/CryptoStub.h"
 
 #include <WinSock2.h>
 #include <WS2tcpip.h>
@@ -36,3 +37,5 @@ void FlowTestRecvWinRoundRobin();
 
 void TrySRP6();
 void TryCHAKA();
+
+void TryWideChar();

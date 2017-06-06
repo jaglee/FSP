@@ -55,7 +55,7 @@ void LOCALAPI Listen(CommandNewSessionSrv &cmd)
 		return;
 	}
 
-	CSocketItemEx *socketItem = (CLowerInterface::Singleton())->AllocItem(cmd.fiberID);
+	CSocketItemEx *socketItem = CLowerInterface::Singleton.AllocItem(cmd.fiberID);
 	if(socketItem == NULL)
 	{
 		REPORT_ERRMSG_ON_TRACE("Multiple call to listen on the same local fiber ID?");
@@ -72,7 +72,7 @@ void LOCALAPI Listen(CommandNewSessionSrv &cmd)
 	return;
 
 l_bailout2:
-	(CLowerInterface::Singleton())->FreeItem(socketItem);
+	CLowerInterface::Singleton.FreeItem(socketItem);
 l_bailout1:
 	::SetEvent(cmd.hEvent);
 	return;
@@ -99,7 +99,7 @@ void LOCALAPI Connect(CommandNewSessionSrv &cmd)
 	if ((cmd.index = connectRequests.Push(&cmd)) < 0)
 		goto l_bailout1;
 
-	CSocketItemEx *socketItem = (CLowerInterface::Singleton())->AllocItem();
+	CSocketItemEx *socketItem = CLowerInterface::Singleton.AllocItem();
 	if (socketItem == NULL)
 		goto l_bailout2;
 
@@ -110,7 +110,7 @@ void LOCALAPI Connect(CommandNewSessionSrv &cmd)
 	return;
 
 l_bailout3:
-	(CLowerInterface::Singleton())->FreeItem(socketItem);
+	CLowerInterface::Singleton.FreeItem(socketItem);
 l_bailout2:
 	connectRequests.Remove(cmd.index);
 l_bailout1:
@@ -137,7 +137,7 @@ void LOCALAPI Accept(CommandNewSessionSrv &cmd)
 		return;
 	}
 
-	CSocketItemEx *socketItem = CLowerInterface::Singleton()->AllocItem(cmd);
+	CSocketItemEx *socketItem = CLowerInterface::Singleton.AllocItem(cmd);
 	if(socketItem == NULL)
 	{
 		REPORT_ERRMSG_ON_TRACE("Cannot map control block of the client into server's memory space");
@@ -162,7 +162,7 @@ void Multiply(CommandCloneSessionSrv &cmd)
 		return;
 	}
 
-	CSocketItemEx *srcItem = (* CLowerInterface::Singleton())[cmd.fiberID];
+	CSocketItemEx *srcItem = CLowerInterface::Singleton[cmd.fiberID];
 	if(srcItem == NULL)
 	{
 		BREAK_ON_DEBUG();	//TRACE_HERE("Cloned connection not found");
@@ -186,7 +186,7 @@ void Multiply(CommandCloneSessionSrv &cmd)
 		goto l_return;
 	}
 
-	CSocketItemEx *newItem = (CLowerInterface::Singleton())->AllocItem();
+	CSocketItemEx *newItem = CLowerInterface::Singleton.AllocItem();
 	if (newItem == NULL || !newItem->MapControlBlock(cmd))
 	{
 		srcItem->SetMutexFree();
@@ -197,7 +197,7 @@ void Multiply(CommandCloneSessionSrv &cmd)
 		else
 		{
 			REPORT_ERRMSG_ON_TRACE("Cannot map control block of the client into server's memory space");
-			(CLowerInterface::Singleton())->FreeItem(newItem);
+			CLowerInterface::Singleton.FreeItem(newItem);
 		}
 		::SetEvent(cmd.hEvent);
 		return;
@@ -387,7 +387,8 @@ void CSocketItemEx::UrgeCommit()
 	if (r <= 0)
 	{
 		shouldAppendCommit = 1;
-		// See also EmitQ
+		SendKeepAlive();
+		// See also EmitQ, DoResend
 		if (resendTimer == NULL)
 			AddResendTimer(tRoundTrip_us >> 8);
 	}

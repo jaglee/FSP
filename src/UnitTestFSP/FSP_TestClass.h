@@ -1,4 +1,5 @@
 #include "../FSP_SRV/fsp_srv.h"
+#include "../KeyExchange/CryptoStub.h"
 
 #ifdef MAX_CONNECTION_NUM
 #undef MAX_CONNECTION_NUM

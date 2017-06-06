@@ -294,43 +294,5 @@ namespace CSharpAPI
         // yet to be documented
         [DllImport("FSP_DLL")]
         public static extern int FSPControl(IntPtr handle, FSP_ControlCode code, IntPtr value);
-
-        // Given
-        //	pointer to the buffer of exported public key
-        //	pointer to the buffer of exported private key
-        // Do
-        //	Generate the public-private key pair
-        // Return
-        //	0 (always succeed in presumed constant time)
-        [DllImport("FSP_DLL")]
-        public static extern int CryptoNaClKeyPair(
-              [MarshalAs(UnmanagedType.LPArray, SizeConst = CRYPTO_NACL_KEYBYTES)]byte[] bufPublicKey
-            , [MarshalAs(UnmanagedType.LPArray, SizeConst = CRYPTO_NACL_KEYBYTES)]byte[] bufPrivateKey);
-
-        // Given
-        //	pointer to the buffer of the shared secret, crypto_core_hsalsa20_tweet_KEYBYTES = 32 bytes
-        //	the byte string of the peer's public key
-        //	the byte string of the near end's private key
-        // Do
-        //	Derive the shared secret
-        // Return
-        //	0 (always succeed in presumed constant time)
-        [DllImport("FSP_DLL")]
-        public static extern int CryptoNaClGetSharedSecret(
-              [MarshalAs(UnmanagedType.LPArray, SizeConst = CRYPTO_NACL_KEYBYTES)]byte[] bufSharedSecret
-            , [MarshalAs(UnmanagedType.LPArray, SizeConst = CRYPTO_NACL_KEYBYTES)]byte[] peersPublicKey
-            , [MarshalAs(UnmanagedType.LPArray, SizeConst = CRYPTO_NACL_KEYBYTES)]byte[] nearPrivateKey);
-
-        // Given
-        //	pointer to the buffer of the output hash, 64 bytes
-        //	the input byte string to calculate the hash
-        //	the length of the byte string
-        // Do
-        //	get the SHA512 result
-        // Return
-        //	0 (always succeed in presumed constant time)
-        [DllImport("FSP_DLL")]
-        public static extern int CryptoNaClHash([MarshalAs(UnmanagedType.LPArray, SizeConst = 64)]byte[] buf    // crypto_hash_sha512
-            , [MarshalAs(UnmanagedType.LPArray, SizeParamIndex = 2)]byte[] input, UInt64 len);
     }
 }

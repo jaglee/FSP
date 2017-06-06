@@ -20,8 +20,9 @@ char			linebuf[80];
 unsigned char	bufPrivateKey[CRYPTO_NACL_KEYBYTES];
 unsigned char * bufPublicKey;
 
-static char		fileName[MAX_FILENAME_WITH_PATH_LEN];
+static TCHAR	fileName[MAX_PATH];
 static int		fd;
+
 
 // The callback function to handle general notification of LLS. Parameters are self-describing.
 void FSPAPI onNotice(FSPHANDLE h, FSP_ServiceCode code, int value)
@@ -32,6 +33,7 @@ void FSPAPI onNotice(FSPHANDLE h, FSP_ServiceCode code, int value)
 		r2Finish = finished = true;
 		return;
 	}
+	//
 }
 
 
@@ -92,19 +94,19 @@ void FSPAPI WaitConnection(const char *thisWelcome, unsigned short mLen, Callbac
 // Case 2: for test, send memory pattern with encryption, the length might be specified at command line
 // Case 3: for test, send content of a given file to the remote end
 // Case 4: the file server prototype of the Simple Artcrafted Web Site
-int main(int argc, char * argv[])
+int _tmain(int argc, TCHAR * argv[])
 {
 	errno_t	err = 0;
 
-	if(argc != 1 && (argc != 2 || strlen(argv[1]) >= MAX_FILENAME_WITH_PATH_LEN) && argc != 3)
+	if(argc != 1 && (argc != 2 || _tcslen(argv[1]) >= MAX_PATH) && argc != 3)
 	{
-		printf_s("Usage: %s [<filename> [length-of-memory-pattern]]\n", argv[0]);
+		_tprintf_s(_T("Usage: %s [<filename> [length-of-memory-pattern]]\n"), argv[0]);
 		return -1;
 	}
 
 	if(argc == 1)
 	{
-		strcpy_s(fileName, sizeof(fileName), "$memory.^");
+		_tcscpy_s(fileName, MAX_PATH, _T("$memory.^"));
 		SendMemoryPattern();
 		goto l_return;
 	}
@@ -115,15 +117,15 @@ int main(int argc, char * argv[])
 	memcpy(thisWelcome, defaultWelcome, mLen);
 	CryptoNaClKeyPair(bufPublicKey, bufPrivateKey);
 
-	if(_stricmp(argv[1], "$memory.^") == 0)
+	if(_tcsicmp(argv[1], _T("$memory.^")) == 0)
 	{
-		strcpy_s(fileName, sizeof(fileName), argv[1]);
+		_tcscpy_s(fileName, MAX_PATH, argv[1]);
 		if(argc == 3)
 		{
-			size_t sizeOfBuffer = (size_t)_atoi64(argv[2]);
+			size_t sizeOfBuffer = (size_t)_ttoi64(argv[2]);
 			if(sizeOfBuffer < 4)
 			{
-				printf_s("Usage: %s <filename> [length-of-memory-pattern]\n", argv[0]);
+				_tprintf_s(_T("Usage: %s <filename> [length-of-memory-pattern]\n"), argv[0]);
 				err = -1;
 				goto l_return;
 			}
@@ -138,9 +140,9 @@ int main(int argc, char * argv[])
 		goto l_return;
 	}
 
-	strcpy_s(fileName, sizeof(fileName), argv[1]);
+	_tcscpy_s(fileName, MAX_PATH, argv[1]);
 
-	err = _sopen_s(& fd
+	err = _tsopen_s(& fd
 		, fileName
 		, _O_BINARY | _O_RDONLY | _O_SEQUENTIAL
 		, _SH_DENYWR
@@ -157,7 +159,7 @@ int main(int argc, char * argv[])
 	}
 	else
 	{
-		printf_s("Error number = %d: cannot open file %s\n", err, fileName);
+		_tprintf_s(_T("Error number = %d: cannot open file %s\n"), err, fileName);
 	}
 
 l_return:
@@ -165,7 +167,7 @@ l_return:
 		_close(fd);
 
 	printf("\n\nPress Enter to exit...");
-	getchar();
+	_getts_s(fileName, MAX_PATH);
 	return err;
 }
 
@@ -209,7 +211,13 @@ static void FSPAPI onPublicKeyReceived(FSPHANDLE h, FSP_ServiceCode c, int r)
 	InstallAuthenticKey(h, bufSharedKey, CRYPTO_NACL_KEYBYTES, INT32_MAX);
 
 	printf_s("\tTo send filename to the remote end...\n");
+#ifdef _MBCS
 	WriteTo(h, fileName, (int)strlen(fileName) + 1, EOF, onFileNameSent);
+#else
+	octet buffer[sizeof(wchar_t) * MAX_PATH + 4];
+	int len = WideStringToUTF8(buffer, sizeof(buffer), fileName);
+	WriteTo(h, buffer, len, EOF, onFileNameSent);
+#endif
 }
 
 
