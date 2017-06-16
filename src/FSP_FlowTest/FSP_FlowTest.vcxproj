@@ -88,8 +88,7 @@
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
-      <PrecompiledHeader>
-      </PrecompiledHeader>
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <WarningLevel>Level3</WarningLevel>
       <Optimization>Disabled</Optimization>
       <PreprocessorDefinitions>TRACE=14;UNIT_TEST;WIN32;_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
@@ -117,8 +116,7 @@
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
-      <PrecompiledHeader>
-      </PrecompiledHeader>
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <Optimization>MaxSpeed</Optimization>
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
@@ -166,20 +164,20 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="..\ControlBlock.cpp" />
+    <ClCompile Include="..\Crypto\CryptoStub.c" />
+    <ClCompile Include="..\Crypto\tweetnacl.c" />
+    <ClCompile Include="..\FSP_SRV\blake2b.c" />
     <ClCompile Include="..\FSP_SRV\command.cpp" />
     <ClCompile Include="..\FSP_SRV\CRC64.c" />
     <ClCompile Include="..\FSP_SRV\CubicRoot.c" />
+    <ClCompile Include="..\FSP_SRV\gcm-aes.c" />
     <ClCompile Include="..\FSP_SRV\mobile.cpp" />
     <ClCompile Include="..\FSP_SRV\os_win.cpp" />
     <ClCompile Include="..\FSP_SRV\remote.cpp" />
+    <ClCompile Include="..\FSP_SRV\rijndael-alg-fst.c" />
     <ClCompile Include="..\FSP_SRV\socket.cpp" />
     <ClCompile Include="..\FSP_SRV\timers.cpp" />
-    <ClCompile Include="..\gcm-aes.c" />
-    <ClCompile Include="..\KeyExchange\CryptoStub.c" />
-    <ClCompile Include="..\KeyExchange\tweetnacl.c" />
-    <ClCompile Include="..\rijndael-alg-fst.c" />
     <ClCompile Include="FSP_FlowTest.cpp" />
-    <ClCompile Include="stdafx.cpp" />
     <ClCompile Include="Test_FlowControl.cpp" />
     <ClCompile Include="Test_TryCHAKA.cpp" />
     <ClCompile Include="Test_TrySRP.cpp" />

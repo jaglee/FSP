@@ -4,7 +4,8 @@
   Usage 3, transfer the name and content of a given file: <FileSyncServer> filename
   Usage 4, act as the prototyped file server for the Simple Artcrafted Web Site in the given work path: <FileSyncServer> pathname 
  **/
-
+// If compiled in Debug mode with the '_DEBUG' macro predefined by default, it tests FSP over UDP/IPv4
+// If compiled in Release mode, or anyway without the '_DEBUG' macro predefined, it tests FSP over IPv6
 #include "stdafx.h"
 #include "defs.h"
 
@@ -72,11 +73,13 @@ void FSPAPI WaitConnection(const char *thisWelcome, unsigned short mLen, Callbac
 	params.sendSize = MAX_FSP_SHM_SIZE;
 	params.recvSize = 0;	// minimal receiving for download server
 
-	//TranslateFSPoverIPv4(& atAddress, 0, 80);	//INADDR_ANY
-	atAddress.u.subnet = 0xAAAA00E0;	// 0xE0 00 AA AA	// shall be learned
-	//atAddress.u.subnet = 0xBBBB00E0;	// 0xE0 00 BB BB	// shall be learned
+#ifdef _DEBUG
+	TranslateFSPoverIPv4(& atAddress, 0, 80);	//INADDR_ANY
+#else
+	atAddress.subnet = 0xAAAA00E0;	// 0xE0 00 AA AA	// shall be learned
 	atAddress.idHost = 0;
 	atAddress.idALF = 0x01000000;		// 0x01 [well, it should be the well-known service number...] 
+#endif
 
 	hFspListen = ListenAt(& atAddress, & params);
 
@@ -179,7 +182,7 @@ int	FSPAPI onAccepting(FSPHANDLE h, PFSP_SINKINF p, PFSP_IN6_ADDR remoteAddr)
 	printf_s("\nTo accept handle of FSP session: %p\n", h);
 	printf_s("Interface#%d, fiber#%u\n", p->ipi6_ifindex, p->idALF);
 	// no be32toh() for local; note that for IPv6 network, little-endian CPU, the peer's remoteAddr->idALF wouldn't match it
-	printf_s("Remote address: 0x%llX::%X::%X\n", be64toh(remoteAddr->u.subnet), be32toh(remoteAddr->idHost), be32toh(remoteAddr->idALF));
+	printf_s("Remote address: 0x%llX::%X::%X\n", be64toh(remoteAddr->subnet), be32toh(remoteAddr->idHost), be32toh(remoteAddr->idALF));
 	return 0;	// no opposition
 }
 

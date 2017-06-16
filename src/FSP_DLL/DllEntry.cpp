@@ -333,7 +333,10 @@ int LOCALAPI CSocketItemDl::Initialize(PFSP_Context psp1, char szEventName[MAX_N
 		pControlBlock->Init(FSP_BACKLOG_SIZE);
 	else
 		pControlBlock->Init(psp1->sendSize, psp1->recvSize);
-
+	//
+	pControlBlock->milky = psp1->milky;
+	pControlBlock->noEncrypt = psp1->noEncrypt;
+	//
 	pControlBlock->notices.SetHead(FSP_IPC_CannotReturn);
 	//^only after the control block is successfully mapped into the memory space of LLS may it be cleared by LLS
 
@@ -608,11 +611,11 @@ CSocketItemDl * LOCALAPI CSocketItemDl::CreateControlBlock(const PFSP_IN6_ADDR n
 	socketItem->fidPair.source = nearAddr->idALF;
 	//
 	FSP_PKTINFO_EX & nearEnd = socketItem->pControlBlock->nearEndInfo;
-	if(nearAddr->u.st.prefix == PREFIX_FSP_IP6to4)
+	if(nearAddr->_6to4.prefix == PREFIX_FSP_IP6to4)
 	{
 		nearEnd.InitUDPoverIPv4(psp1->ifDefault);
 		nearEnd.idALF = nearAddr->idALF;
-		nearEnd.ipi_addr = nearAddr->u.st.ipv4;
+		nearEnd.ipi_addr = nearAddr->_6to4.ipv4;
 	}
 	else
 	{

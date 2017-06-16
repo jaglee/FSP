@@ -178,6 +178,137 @@ void UnitTestICC()
 
 
 
+void UnitTestHMAC()
+{
+	static const ControlBlock::seq_t FIRST_SN = 12;
+	const ALFID_T nearFID = 4321;
+	struct
+	{
+		ALIGN(MAC_ALIGNMENT) FSP_NormalPacketHeader	hdr;
+		BYTE	payload[40];
+	} storage, storage2, storage3;
+	BYTE samplekey[16] = { 0, 0xB1, 0xC2, 3, 4, 5, 6, 7, 8, 0xD9, 10, 11, 12, 13, 14, 15 };
+	CSocketItemExDbg socket;
+	CSocketItemExDbg socketR2;
+	ControlBlock *pSCB = socket.GetControlBlock();
+	ControlBlock *pCBR = socketR2.GetControlBlock();
+
+	for (register int i = 0; i < sizeof(storage.payload); i++)
+	{
+		storage.payload[i] = (BYTE)('0' + i);
+		storage2.payload[i] = (BYTE)('A' + i);
+	}
+
+	// HMAC only
+	pSCB->noEncrypt = 1;
+	pCBR->noEncrypt = 1;
+
+	// emulate negotiation of sequence number and the session key
+	rand_w32((uint32_t *)& pSCB->connectParams, FSP_MAX_KEY_SIZE / 4);		// 256 bits
+	memcpy(&pCBR->connectParams, &pSCB->connectParams, FSP_MAX_KEY_SIZE);	// 256 bits
+	//^when install session key the original connection parameter is destroyed
+	// so it must be copied beforehand
+	DumpNetworkUInt16((uint16_t *)& pCBR->connectParams, FSP_MAX_KEY_SIZE / 2);
+
+	pSCB->SetSendWindow(FIRST_SN);
+	socket.SetPairOfFiberID(nearFID, htobe32(LAST_WELL_KNOWN_ALFID));
+	socket.InstallEphemeralKey();	// initializtion
+	socket.InstallSessionKey(samplekey);
+
+	pCBR->SetRecvWindow(FIRST_SN);
+	socketR2.SetPairOfFiberID(htobe32(LAST_WELL_KNOWN_ALFID), nearFID);
+	socketR2.InstallEphemeralKey();	// initializtion
+	pCBR->recvWindowNextSN++;		// == FIRST_SN + 1
+	socketR2.InstallSessionKey(samplekey);
+
+	// So, the packet with FIRST_SN shall be calculated with CRC64
+	// firstly, test recorded CRC mode
+	// packet with sequence number less than FIRST_SN should be applied with CRC64
+	FSP_NormalPacketHeader &request = storage.hdr;
+	request.hs.Set<FSP_NormalPacketHeader, PURE_DATA>();
+
+	request.sequenceNo = FIRST_SN;
+	socket.SetIntegrityCheckCode(&request);
+	//
+	bool checked = socketR2.ValidateICC(&request, 0, nearFID, 0);
+	assert(checked);
+
+	request.sequenceNo = FIRST_SN - 1;
+	socket.SetIntegrityCheckCode(&request);
+	//
+	checked = socketR2.ValidateICC(&request, 0, nearFID, 0);
+	assert(checked);
+
+	// should apply BLAKE2
+	request.sequenceNo = FIRST_SN + 1;
+	socket.SetIntegrityCheckCode(&request);
+	//
+	checked = socketR2.ValidateICC(&request, 0, nearFID, 0);
+	assert(checked);
+
+	// partially scattered I/O
+	// make it a gap of one qword
+	BYTE *payload = (BYTE *)& request + sizeof(FSP_NormalPacketHeader) + 8;
+	socket.SetIntegrityCheckCode(&request, payload, 9);	// arbitrary length in the stack
+	checked = socketR2.ValidateICC(&request, 9, nearFID, 0);
+	assert(!checked);	// because of the gap
+
+	// continuous calculation of ICC should not have negative effect 
+	void *buf;
+	socket.SetIntegrityCheckCode(&request, payload, 19);
+	buf = socket.SetIntegrityCheckCode(&request, payload, 21);
+	assert(buf == payload);	// AH only
+
+	memcpy(&storage2, &storage, sizeof(FSP_NormalPacketHeader));
+	memcpy(storage2.payload, &storage.payload[8], sizeof(FSP_NormalPacketHeader));	// make received 'solidified'
+
+	storage2.payload[0] ^= 1;
+	checked = socketR2.ValidateICC(&storage2.hdr, 21, nearFID, 0);
+	assert(!checked);
+
+	storage2.payload[0] ^= 1;
+	checked = socketR2.ValidateICC(&storage2.hdr, 21, nearFID, 0);
+	assert(checked);
+
+	memcpy(&storage3, &storage, sizeof(FSP_NormalPacketHeader) + 21);
+	checked = socketR2.ValidateICC(&storage3.hdr, 21, nearFID, 0);
+	assert(!checked);	// because of the gap
+
+	memcpy(storage3.payload, &storage.payload[8], 21);
+	checked = socketR2.ValidateICC(&storage3.hdr, 21, nearFID, 0);
+	assert(checked);
+
+	// Merge the KEEP_ALIVE packet testing...
+	// It's most complicated in the sense that 
+	ControlBlock::PFSP_SocketBuf skb1 = socketR2.AllocRecvBuf(FIRST_SN + 1);
+	skb1->SetFlag<IS_FULFILLED>();
+
+	// See also: timer.cpp::KeepAlive
+	ControlBlock::seq_t seq0;
+	struct
+	{
+		FSP_NormalPacketHeader hdr;
+		FSP_PreparedKEEP_ALIVE buf;
+	} mp;
+	int sizeSNACK = socketR2.GenerateSNACK(mp.buf, seq0, sizeof(FSP_NormalPacketHeader));
+	uint32_t salt = mp.buf.sentinel.serialNo;
+	printf_s("Size of the SNACK header = %d, expected SN = %u, salt=0x%X\n", sizeSNACK, seq0, salt);
+
+	mp.hdr.hs.Set(KEEP_ALIVE, sizeof(FSP_NormalPacketHeader) + sizeSNACK);
+	pSCB->SetSequenceFlags(&mp.hdr, pSCB->sendWindowNextSN);
+	mp.hdr.expectedSN = htobe32(seq0);
+	//
+	socketR2.SetIntegrityCheckCode(&mp.hdr, NULL, 0, salt);
+
+	checked = socket.ValidateICC(&mp.hdr, 0, socketR2.fidPair.source, salt);
+	assert(checked);
+
+	checked = socket.ValidateICC(&mp.hdr, 0, socket.fidPair.peer, salt);
+	assert(checked);
+}
+
+
+
 void UnitTestTweetNacl()
 {
 	// the default welcome message, with CYRPTO_NACL_KEYBYTES (32 bytes, 256 bits) place holder for the static public key
@@ -282,12 +413,13 @@ int _tmain(int argc, _TCHAR* argv[])
 	//FlowTestRecvWinRoundRobin();
 
 	//UnitTestCRC();
-	//UnitTestICC();
+	UnitTestICC();
+	UnitTestHMAC();
 
 	//TrySRP6();
 	//UnitTestTweetNacl();
 	//TryCHAKA();
-	TryWideChar();
+	//TryWideChar();
 	//UnitTestByteOrderDefinitin();
 	//
 	// TODO: UnitTest of SendInplace, SendStream

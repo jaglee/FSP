@@ -29,13 +29,14 @@
  */
 
 #include "fsp_srv.h"
+#include "blake2b.h"
 
 // From the receiver's point of view the local fiber id was stored in the peer fiber id field of the received packet
 ALFID_T CLowerInterface::SetLocalFiberID(ALFID_T value)
 {
 	if(nearInfo.IsIPv6())
 		nearInfo.u.idALF = value;
-	return _InterlockedExchange((volatile LONG *) & pktBuf->idPair.peer, value);
+	return _InterlockedExchange((volatile LONG *) & pktBuf->fidPair.peer, value);
 }
 
 
@@ -204,12 +205,11 @@ void CSocketItemEx::InstallEphemeralKey()
 	printf_s("Session key materials:\n");
 	DumpNetworkUInt16((uint16_t *)  & pControlBlock->connectParams, FSP_MAX_KEY_SIZE / 2);
 #endif
-	// contextOfICC.savedCRC = true; // don't care
 	contextOfICC.keyLife = 0;
 	contextOfICC.curr.precomputedICC[0] 
 		=  CalculateCRC64(* (uint64_t *) & fidPair, (uint8_t *) & pControlBlock->connectParams, FSP_MAX_KEY_SIZE);
 
-	PairALFID recvFIDPair;
+	ALFIDPair recvFIDPair;
 	recvFIDPair.peer = fidPair.source;
 	recvFIDPair.source = fidPair.peer;
 	contextOfICC.curr.precomputedICC[1]
@@ -254,7 +254,16 @@ void CSocketItemEx::InstallSessionKey(const CommandInstallKey & cmd)
 #endif
 	contextOfICC.savedCRC = (contextOfICC.keyLife == 0);
 	contextOfICC.prev = contextOfICC.curr;
-	GCM_AES_SetKey(& contextOfICC.curr.gcm_aes, (uint8_t *) & pControlBlock->connectParams, pControlBlock->connectParams.keyLength);
+	contextOfICC.noEncrypt = (pControlBlock->noEncrypt != 0);
+	if (contextOfICC.noEncrypt)
+	{
+		contextOfICC.curr.keyLength = pControlBlock->connectParams.keyLength;
+		memcpy(contextOfICC.curr.rawKey, & pControlBlock->connectParams, contextOfICC.curr.keyLength);
+	}
+	else
+	{
+		GCM_AES_SetKey(&contextOfICC.curr.gcm_aes, (uint8_t *)& pControlBlock->connectParams, pControlBlock->connectParams.keyLength);
+	}
 
 	contextOfICC.keyLife = cmd.keyLife;
 	contextOfICC.snFirstSendWithCurrKey = cmd.nextSendSN;
@@ -387,36 +396,46 @@ inline void CSocketItemEx::ChangeRemoteValidatedIP()
 //	This function is NOT multi-thread safe
 void * LOCALAPI CSocketItemEx::SetIntegrityCheckCode(FSP_NormalPacketHeader *p1, void *content, int32_t ptLen, uint32_t salt)
 {
-	ALIGN(MAC_ALIGNMENT) uint64_t tag[FSP_TAG_SIZE / sizeof(uint64_t)];
-	void * buf;
+	uint32_t byteA = be16toh(p1->hs.hsp);	// number of octets that 'additional data' in Galois Counter Mode
+	if (byteA < sizeof(FSP_NormalPacketHeader) || byteA > MAX_LLS_BLOCK_SIZE || (byteA & (sizeof(uint64_t) - 1)) != 0)
+		return NULL;
+	//
 	uint32_t seqNo = be32toh(p1->sequenceNo);
 #if defined(TRACE) && (TRACE & TRACE_PACKET)
-	printf_s("\nBefore GCM_AES_AuthenticatedEncrypt: ptLen = %d\n", ptLen);
+	printf_s("\nBefore SetIntegrityCheckCode: ptLen = %d\n", ptLen);
 	DumpNetworkUInt16((uint16_t *)p1, sizeof(FSP_NormalPacketHeader) / 2);
 #endif
 
+	void * buf = content;
 	// CRC64
 	if(contextOfICC.keyLife == 0)
 	{
 		p1->integrity.code = contextOfICC.curr.precomputedICC[0];
-		tag[0] = CalculateCRC64(0, (uint8_t *)p1, sizeof(FSP_NormalPacketHeader));
-		buf = content;
+		p1->integrity.code = CalculateCRC64(0, (uint8_t *)p1, byteA);
 	}
 	else if(int32_t(seqNo - contextOfICC.snFirstSendWithCurrKey) < 0 && contextOfICC.savedCRC)
 	{
 		p1->integrity.code = contextOfICC.prev.precomputedICC[0];
-		tag[0] = CalculateCRC64(0, (uint8_t *)p1, sizeof(FSP_NormalPacketHeader));
-		buf = content;
+		p1->integrity.code = CalculateCRC64(0, (uint8_t *)p1, byteA);
+	}
+	else if (contextOfICC.noEncrypt)
+	{
+		p1->integrity.id = fidPair;
+		//
+		blake2b_ctx ctx;
+		memset(& ctx, sizeof(ctx), 0);
+		blake2b_init(&ctx, sizeof(p1->integrity), contextOfICC.curr.rawKey, contextOfICC.curr.keyLength);
+		blake2b_update(&ctx, p1, byteA);
+		blake2b_update(&ctx, content, ptLen);
+		blake2b_final(&ctx, &p1->integrity.code);
 	}
 	else
 	{
 		GCM_AES_CTX *pCtx = int32_t(seqNo - contextOfICC.snFirstSendWithCurrKey) < 0
 			? & contextOfICC.prev.gcm_aes
 			: & contextOfICC.curr.gcm_aes;
-		uint32_t byteA = be16toh(p1->hs.hsp);
-		if(byteA < sizeof(FSP_NormalPacketHeader) || byteA > MAX_LLS_BLOCK_SIZE || (byteA & (sizeof(uint64_t) - 1)) != 0)
-			return NULL;
 
+		ALIGN(MAC_ALIGNMENT) uint64_t tag[FSP_TAG_SIZE / sizeof(uint64_t)];
 		p1->integrity.id = fidPair;
 		GCM_AES_XorSalt(pCtx, salt);
 		if(GCM_AES_AuthenticatedEncrypt(pCtx, *(uint64_t *)p1
@@ -431,11 +450,12 @@ void * LOCALAPI CSocketItemEx::SetIntegrityCheckCode(FSP_NormalPacketHeader *p1,
 		}
 		GCM_AES_XorSalt(pCtx, salt);
 		buf = this->cipherText;
+		p1->integrity.code = tag[0];
 	}
 
-	p1->integrity.code = tag[0];
 #if defined(TRACE) && (TRACE & TRACE_PACKET)
-	printf_s("After GCM_AES_AuthenticatedEncrypt:\n");	DumpNetworkUInt16((uint16_t *)p1, sizeof(FSP_NormalPacketHeader) / 2);
+	printf_s("After SetIntegrityCheckCode:\n");
+	DumpNetworkUInt16((uint16_t *)p1, sizeof(FSP_NormalPacketHeader) / 2);
 #endif
 	return buf;
 }
@@ -455,11 +475,14 @@ void * LOCALAPI CSocketItemEx::SetIntegrityCheckCode(FSP_NormalPacketHeader *p1,
 bool LOCALAPI CSocketItemEx::ValidateICC(FSP_NormalPacketHeader *p1, int32_t ctLen, ALFID_T idSource, uint32_t salt)
 {
 	ALIGN(MAC_ALIGNMENT) uint64_t tag[FSP_TAG_SIZE / sizeof(uint64_t)];
+	uint32_t byteA = be16toh(p1->hs.hsp);
+	if (byteA < sizeof(FSP_NormalPacketHeader) || byteA > MAX_LLS_BLOCK_SIZE || (byteA & (sizeof(uint64_t) - 1)) != 0)
+		return false;
 
 	tag[0] = p1->integrity.code;
 #if defined(TRACE) && (TRACE & TRACE_PACKET)
-	printf_s("Before GCM_AES_AuthenticateAndDecrypt:\n");
-	DumpNetworkUInt16((uint16_t *)p1, sizeof(FSP_NormalPacketHeader) / 2);
+	printf_s("Before ValidateICC:\n");
+	DumpNetworkUInt16((uint16_t *)p1, byteA / 2 + 4);
 #endif
 	uint32_t seqNo = be32toh(p1->sequenceNo);
 	register bool r;
@@ -468,13 +491,25 @@ bool LOCALAPI CSocketItemEx::ValidateICC(FSP_NormalPacketHeader *p1, int32_t ctL
 	{
 		// CRC64 is the initial integrity check algorithm
 		p1->integrity.code = contextOfICC.curr.precomputedICC[1];
-		r = (tag[0] == CalculateCRC64(0, (uint8_t *)p1, sizeof(FSP_NormalPacketHeader)));
+		r = (tag[0] == CalculateCRC64(0, (uint8_t *)p1, byteA));
 	}
 	else if(int32_t(seqNo - contextOfICC.snFirstRecvWithCurrKey) < 0 && contextOfICC.savedCRC)
 	{
 		// well, well, send is not the same as receive...
 		p1->integrity.code = contextOfICC.prev.precomputedICC[1];
-		r = (tag[0] == CalculateCRC64(0, (uint8_t *)p1, sizeof(FSP_NormalPacketHeader)));
+		r = (tag[0] == CalculateCRC64(0, (uint8_t *)p1, byteA));
+	}
+	else if (contextOfICC.noEncrypt)
+	{
+		p1->integrity.id.source = idSource;
+		p1->integrity.id.peer = fidPair.source;
+		//
+		uint64_t tagOut;
+		blake2b(&tagOut, sizeof(tagOut)
+			, contextOfICC.curr.rawKey, contextOfICC.curr.keyLength
+			, p1, byteA + ctLen);
+		//
+		r = (tagOut == tag[0]);
 	}
 	else
 	{
@@ -496,15 +531,15 @@ bool LOCALAPI CSocketItemEx::ValidateICC(FSP_NormalPacketHeader *p1, int32_t ctL
 			== 0);
 		GCM_AES_XorSalt(pCtx, salt);
 	}
+#if defined(TRACE) && (TRACE & TRACE_PACKET)
+	printf_s("After ValidateICC:\n");
+	DumpNetworkUInt16((uint16_t *)p1, byteA / 2 + 4);
+#endif
 	p1->integrity.code = tag[0];
 	if(! r)
 		return false;
 
 	ChangeRemoteValidatedIP();
-#if defined(TRACE) && (TRACE & TRACE_PACKET)
-	printf_s("After GCM_AES_AuthenticateAndDecrypt:\n");
-	DumpNetworkUInt16((uint16_t *)p1, sizeof(FSP_NormalPacketHeader) / 2);
-#endif
 	return true;
 }
 

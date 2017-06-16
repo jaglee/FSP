@@ -296,7 +296,7 @@ void LOCALAPI CLowerInterface::OnGetConnectRequest()
 	}
 
 	// Silently discard the request onto illegal or non-listening socket
-	pSocket = (*this)[q->params.listenerID];	// a dialect of MapSocket
+	pSocket = (*this)[q->params.idListener];	// a dialect of MapSocket
 	if (pSocket == NULL || !pSocket->IsPassive())
 		return;
 
@@ -317,7 +317,7 @@ void LOCALAPI CLowerInterface::OnGetConnectRequest()
 	// cf. OnInitConnectAck() and SocketItemEx::AffirmConnect()
 	ALFID_T fiberID = GetLocalFiberID();
 	struct _CookieMaterial cm;
-	cm.idListener = q->params.listenerID;
+	cm.idListener = q->params.idListener;
 	cm.idALF = fiberID;
 	cm.salt = q->salt;
 	// UNRESOLVED! TODO: search the cookie blacklist at first
@@ -346,9 +346,9 @@ void LOCALAPI CLowerInterface::OnGetConnectRequest()
 	else
 	{	// FSP over UDP/IPv4
 		register PFSP_IN6_ADDR fspAddr = (PFSP_IN6_ADDR) & backlogItem.acceptAddr;
-		fspAddr->u.st.prefix = PREFIX_FSP_IP6to4;
-		fspAddr->u.st.ipv4 = pHdr->u.ipi_addr;
-		fspAddr->u.st.port = DEFAULT_FSP_UDPPORT;
+		fspAddr->_6to4.prefix = PREFIX_FSP_IP6to4;
+		fspAddr->_6to4.ipv4 = pHdr->u.ipi_addr;
+		fspAddr->_6to4.port = DEFAULT_FSP_UDPPORT;
 		fspAddr->idHost = 0;	// no for IPv4 no virtual host might be specified
 		fspAddr->idALF = fiberID;
 		backlogItem.acceptAddr.ipi6_ifindex = pHdr->u.ipi_ifindex;
@@ -640,7 +640,7 @@ void CSocketItemEx::OnConnectRequestAck(PktBufferBlock *pktBuf, int lenData)
 	memset(par->allowedPrefixes, 0, sizeof(par->allowedPrefixes));
 	memcpy(par->allowedPrefixes, response.params.subnets, sizeof(response.params.subnets));
 
-	pControlBlock->peerAddr.ipFSP.fiberID = pktBuf->idPair.source;
+	pControlBlock->peerAddr.ipFSP.fiberID = pktBuf->fidPair.source;
 	// persistent session key material from the remote end might be ready
 	// as ACK_CONNECT_REQUEST composes a singleton transmit transaction
 	pControlBlock->SnapshotReceiveWindowRightEdge();
@@ -1150,7 +1150,7 @@ void CSocketItemEx::OnGetMultiply()
 
 	FSP_NormalPacketHeader *pFH = (FSP_NormalPacketHeader *)headPacket->GetHeaderFSP();	// the fixed header
 	uint32_t remoteHostID = pControlBlock->connectParams.remoteHostID;
-	ALFID_T idSource = headPacket->idPair.source;
+	ALFID_T idSource = headPacket->fidPair.source;
 	// The out-of-band serial number is stored in p1->expectedSN
 	if (!ValidateICC(pFH, headPacket->lenData, idSource, pFH->expectedSN))
 	{

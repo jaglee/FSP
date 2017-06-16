@@ -30,8 +30,7 @@
 #ifndef _CH_AUTH_KEY_AGREEMENT_H
 #define _CH_AUTH_KEY_AGREEMENT_H
 
-// To borrow some stdint definitions
-#include "../gcm-aes.h"
+#include "../Intrins.h"
 
 #include "CryptoStub.h"
 #include "sm3.h"
