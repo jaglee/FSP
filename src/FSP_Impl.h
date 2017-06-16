@@ -48,10 +48,7 @@
 #include <errno.h>
 #include <stdio.h>
 
-// borrow intrinsic pragmas
-#include "gcm-aes.h"
-#define	MAC_ALIGNMENT	16
-#define COOKIE_KEY_LEN	20	// salt include, as in RFC4543 5.4
+#include "Intrins.h"
 
 #if (_MSC_VER >= 1600)
 #pragma intrinsic(_InterlockedCompareExchange8, _InterlockedExchange8)
@@ -81,6 +78,11 @@ FORCEINLINE char _InterlockedExchange16(volatile short * a, short b)
 	__asm xchg	AX, word ptr[ecx];
 }
 #endif
+
+
+
+#define	MAC_ALIGNMENT	16
+#define COOKIE_KEY_LEN	20	// salt include, as in RFC4543 5.4
 
 
 
@@ -249,7 +251,7 @@ struct FSP_NormalPacketHeader
 	union
 	{
 		uint64_t	code;
-		PairALFID	id;
+		ALFIDPair	id;
 	} integrity;
 	//
 	UINT8	flags_ws[4];
@@ -258,7 +260,7 @@ struct FSP_NormalPacketHeader
 	// Given the opCode, total length of all the headers, sequenceNo, expectedNo and receive window size
 	void LOCALAPI Set(FSPOperationCode, uint16_t, uint32_t, uint32_t, int32_t);
 
-	// A bruteforce but safe method of set or retrieve recvWS, with byte order translation
+	// A bruteforce but safe method of set or retrieve receive window size, with byte order translation
 	int32_t GetRecvWS() const { return ((int32_t)flags_ws[0] << 16) + (flags_ws[1] << 8) + flags_ws[2]; }
 	void SetRecvWS(int32_t v) { flags_ws[0] = (UINT8)(v >> 16); flags_ws[1] = (UINT8)(v >> 8); flags_ws[2] = (UINT8)v; }
 
@@ -316,15 +318,19 @@ struct FSP_Challenge
 struct FSP_ConnectParam
 {
 	uint64_t	subnets[MAX_PHY_INTERFACES];
-	ALFID_T		listenerID;
+	ALFID_T		idListener;
+	ALFID_T		idHost;
 	//
-	// host id of the application layer fiber, alias of listenerID
-	__declspec(property(get=getHostID, put=setHostID))
-	uint32_t	idHost;
-	uint32_t	getHostID() const { return listenerID; }
-	void		setHostID(uint32_t value) { listenerID = value; }
-	//
+	UINT8	flags_ws[4];
 	$FSP_HeaderSignature hs;
+
+	// A bruteforce but safe method of set or retrieve receive window size, with byte order translation
+	int32_t GetRecvWS() const { return ((int32_t)flags_ws[0] << 16) + (flags_ws[1] << 8) + flags_ws[2]; }
+	void SetRecvWS(int32_t v) { flags_ws[0] = (UINT8)(v >> 16); flags_ws[1] = (UINT8)(v >> 8); flags_ws[2] = (UINT8)v; }
+
+	// Block size are counted in 512-byte sectors, actually
+	int GetBlockSize() const { return (int)flags_ws[4] << 9; }
+	void SetBlockSize(int n) { flags_ws[4] = (UINT8)(n >> 9); }
 };
 
 
@@ -379,7 +385,7 @@ struct FSP_RejectConnect
 		uint64_t integrityCode;
 		uint64_t cookie;
 		uint64_t initCheckCode;
-		PairALFID fidPair;
+		ALFIDPair fidPair;
 	};
 	//
 	uint32_t reasons;	// bit field(?)
@@ -855,7 +861,7 @@ struct ControlBlock
 class CSocketItem
 {
 protected:
-	PairALFID	fidPair;
+	ALFIDPair	fidPair;
 	HANDLE	hEvent;
 	HANDLE	hMemoryMap;
 	DWORD	dwMemorySize;	// size of the shared memory, in the mapped view

@@ -619,12 +619,6 @@ int CLowerInterface::BindSendRecv(const SOCKADDR_IN *pAddrListen, int k)
 
 
 // learn all configured IPv4 address (for FSP over UDP)
-// throws
-//	HRESULT of WSAIOCtrl if cannot query the address
-//	E_FAIL if no valid address configured
-//	E_OUTOFMEMORY if no enough address buffer
-//	E_ABORT if bind failure in the middle way
-//	E_HANDLE if cannot allocate enough socket handle
 inline bool CLowerInterface::LearnAddresses()
 {
 	struct {
@@ -639,11 +633,14 @@ inline bool CLowerInterface::LearnAddresses()
 	if((r = WSAIoctl(sdSend, SIO_ADDRESS_LIST_QUERY, NULL, 0, & listAddress, sizeof(listAddress), & n, NULL, NULL)) != 0)
 	{
 		REPORT_WSAERROR_TRACE("Cannot query list of addresses");
-		throw (HRESULT)r;
+		return false;
 	}
 
 	if (listAddress.iAddressCount < 0)
-		throw E_FAIL;
+	{
+		REPORT_ERRMSG_ON_TRACE("Cannot figure out interface address");
+		return false;
+	}
 
 	u_int & k = sdSet.fd_count;
 	register PSOCKADDR_IN p;
@@ -652,25 +649,37 @@ inline bool CLowerInterface::LearnAddresses()
 	{
 		p = (PSOCKADDR_IN)listAddress.Address[i].lpSockaddr;
 		if (p->sin_family != AF_INET)
-			throw E_UNEXPECTED;	// memory corruption!
+		{
+			REPORT_ERRMSG_ON_TRACE("memory corruption!");
+			return false;
+		}
 		//
 		if (k >= SD_SETSIZE)
-			throw E_OUTOFMEMORY;
+		{
+			REPORT_ERRMSG_ON_TRACE("out of memory");
+			return false;
+		}
 		//
 		p->sin_port = DEFAULT_FSP_UDPPORT;
 		if(BindSendRecv(p, k) != 0)
 		{
 			REPORT_WSAERROR_TRACE("Bind failure");
-			throw E_ABORT;
+			return false;
 		}
 
 		sdSend = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-		if(sdSend == INVALID_SOCKET)
-			throw E_HANDLE;
+		if (sdSend == INVALID_SOCKET)
+		{
+			REPORT_ERRMSG_ON_TRACE("run out of handle space?!");
+			return false;
+		}
 		// On BindInterface, k++; as k is the alias of sdSet.fd_count
 	}
 	if (k >= SD_SETSIZE)
-		throw E_OUTOFMEMORY;
+	{
+		REPORT_ERRMSG_ON_TRACE("run out of socket set space");
+		return false;
+	}
 
 	// Set the loopback address as the last resort of receiving
 	SOCKADDR_IN loopback;
@@ -682,16 +691,20 @@ inline bool CLowerInterface::LearnAddresses()
 	if (BindSendRecv(p, k) != 0)
 	{
 		REPORT_WSAERROR_TRACE("Fail to bind on loopback interface");
-		throw E_ABORT;
+		return false;
 	}
 
 	sdSend = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 	if (sdSend == INVALID_SOCKET)
-		throw E_HANDLE;
+	{
+		REPORT_ERRMSG_ON_TRACE("run out of handle space?!");
+		return false;
+	}
 	// Set the INADDR_ANY for transmission; reuse storage of loopback address
 	p->sin_addr.S_un.S_addr = INADDR_ANY;
 	::bind(sdSend, (const struct sockaddr *)p, sizeof(SOCKADDR_IN));
 	// SetInterfaceOptions(sdSend);	// unnecessary
+	return true;
 }
 #endif
 
@@ -811,7 +824,7 @@ int CLowerInterface::AcceptAndProcess(SOCKET sdRecv)
 	// NO! We don't intend to support dual-stack in FSP.
 	WSABUF	scatteredBuf[1];
 #ifdef OVER_UDP_IPv4
-	scatteredBuf[0].buf = (CHAR *) & pktBuf->idPair;
+	scatteredBuf[0].buf = (CHAR *) & pktBuf->fidPair;
 #else
 	scatteredBuf[0].buf = (CHAR *) & pktBuf->hdr;
 #endif
@@ -834,19 +847,19 @@ int CLowerInterface::AcceptAndProcess(SOCKET sdRecv)
 
 	// From the receiver's point of view the local fiber id was stored in the peer fiber id field of the received packet
 #ifdef OVER_UDP_IPv4
-	countRecv -= sizeof(PairALFID);	// extra prefixed bytes are substracted
-	nearInfo.u.idALF = pktBuf->idPair.peer;
-	SOCKADDR_ALFID(mesgInfo.name) = pktBuf->idPair.source;
+	countRecv -= sizeof(ALFIDPair);	// extra prefixed bytes are substracted
+	nearInfo.u.idALF = pktBuf->fidPair.peer;
+	SOCKADDR_ALFID(mesgInfo.name) = pktBuf->fidPair.source;
 #else
-	pktBuf->idPair.peer = nearInfo.u.idALF;
-	pktBuf->idPair.source = SOCKADDR_ALFID(mesgInfo.name);
+	pktBuf->fidPair.peer = nearInfo.u.idALF;
+	pktBuf->fidPair.source = SOCKADDR_ALFID(mesgInfo.name);
 #endif
 
 	FSPOperationCode opCode = (FSPOperationCode) pktBuf->hdr.hs.opCode;
 #if defined(TRACE) && (TRACE & TRACE_PACKET)
 	printf_s("#%u(Near end's ALFID): packet %s(%d) received\n\tALFID of packet source is #%u\n"
 		, nearInfo.u.idALF
-		, opCodeStrings[opCode], (int)opCode, pktBuf->idPair.source);
+		, opCodeStrings[opCode], (int)opCode, pktBuf->fidPair.source);
 	printf_s("Remote address:\n");
 	DumpNetworkUInt16((uint16_t *) & addrFrom, sizeof(addrFrom) / 2);
 	printf_s("Near sink:\n");
@@ -932,9 +945,9 @@ int LOCALAPI CLowerInterface::SendBack(char * buf, int len)
 #ifdef OVER_UDP_IPv4
 	// Store the local(near end) fiber ID as the source, the remote end fiber ID as
 	// the destination fiber ID in the given fiber ID association
-	pktBuf->idPair.peer = _InterlockedExchange((LONG *) & pktBuf->idPair.source, pktBuf->idPair.peer);
-	wsaData[0].buf = (char *) & pktBuf->idPair;
-	wsaData[0].len = sizeof(pktBuf->idPair);
+	pktBuf->fidPair.peer = _InterlockedExchange((LONG *) & pktBuf->fidPair.source, pktBuf->fidPair.peer);
+	wsaData[0].buf = (char *) & pktBuf->fidPair;
+	wsaData[0].len = sizeof(pktBuf->fidPair);
 	int r = WSASendTo(sdSend
 		, wsaData, 2, &n
 		, 0
@@ -1254,12 +1267,12 @@ void CSocketItemEx::HandleFullICC(PktBufferBlock *pktBuf, FSPOperationCode opCod
 	// MULTIPLY is semi-out-of-band COMMAND starting from a fresh new ALFID. Note that pktBuf is the received
 	// In the CLONING state only PERSIST is the legitimate acknowledgement to MULTIPLY,
 	// while the acknowledgement itself shall typically originate from some new ALFID.
-	if (fidPair.peer != pktBuf->idPair.source	// it should be rare
+	if (fidPair.peer != pktBuf->fidPair.source	// it should be rare
 		&& opCode != MULTIPLY && (lowState != CLONING || opCode != PERSIST)
 		)
 	{
 #ifdef TRACE
-		printf_s("Source fiber ID #%u the packet does not matched context\n", pktBuf->idPair.source);
+		printf_s("Source fiber ID #%u the packet does not matched context\n", pktBuf->fidPair.source);
 #endif
 		goto l_return;
 	}
@@ -2063,7 +2076,7 @@ inline void CLowerInterface::OnRemoveIPv6Address(NET_IFINDEX ifIndex, const IN6_
 		if (be32toh(((PFSP_IN6_ADDR)& in6Addr)->idALF) <= LAST_WELL_KNOWN_ALFID
 		&& interfaces[i] == ifIndex
 		&& ((PFSP_IN6_ADDR)& in6Addr)->idHost == SOCKADDR_HOSTID(addresses + i)
-		&& ((PFSP_IN6_ADDR)& in6Addr)->u.subnet == SOCKADDR_SUBNET(addresses + i))
+		&& ((PFSP_IN6_ADDR)& in6Addr)->subnet == SOCKADDR_SUBNET(addresses + i))
 		{
 			if (!InterlockedBitTestAndSet(&disableFlags, i))
 			{
@@ -2088,7 +2101,7 @@ inline void CLowerInterface::OnRemoveIPv6Address(NET_IFINDEX ifIndex, const IN6_
 				printf_s("To disable a effective loopback socket for connection#%d @%d\n", j, i);
 #endif
 				if (SOCKADDR_HOSTID(itemStorage[j].sockAddrTo) == ((PFSP_IN6_ADDR)& in6Addr)->idHost
-				 && SOCKADDR_SUBNET(itemStorage[j].sockAddrTo) == ((PFSP_IN6_ADDR)& in6Addr)->u.subnet)
+				 && SOCKADDR_SUBNET(itemStorage[j].sockAddrTo) == ((PFSP_IN6_ADDR)& in6Addr)->subnet)
 				{
 					SOCKADDR_HOSTID(itemStorage[j].sockAddrTo) = 0;
 					SOCKADDR_SUBNET(itemStorage[j].sockAddrTo) = 0;

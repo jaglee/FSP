@@ -23,7 +23,7 @@
     <Keyword>Win32Proj</Keyword>
     <RootNamespace>UnitTestFSP</RootNamespace>
     <ProjectGuid>{784EC836-76E4-4254-A7DE-2730131FEFEE}</ProjectGuid>
-    <WindowsTargetPlatformVersion>10.0.14393.0</WindowsTargetPlatformVersion>
+    <WindowsTargetPlatformVersion>10.0.10586.0</WindowsTargetPlatformVersion>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="Configuration">
@@ -167,7 +167,6 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClInclude Include="..\rijndael-alg-fst.h" />
     <ClInclude Include="targetver.h" />
     <ClInclude Include="FSP_TestClass.h" />
   </ItemGroup>
@@ -175,13 +174,13 @@
     <ClCompile Include="..\ControlBlock.cpp" />
     <ClCompile Include="..\FSP_SRV\CRC64.c" />
     <ClCompile Include="..\FSP_SRV\CubicRoot.c" />
+    <ClCompile Include="..\FSP_SRV\gcm-aes.c" />
     <ClCompile Include="..\FSP_SRV\mobile.cpp" />
     <ClCompile Include="..\FSP_SRV\os_win.cpp" />
     <ClCompile Include="..\FSP_SRV\remote.cpp" />
+    <ClCompile Include="..\FSP_SRV\rijndael-alg-fst.c" />
     <ClCompile Include="..\FSP_SRV\socket.cpp" />
     <ClCompile Include="..\FSP_SRV\timers.cpp" />
-    <ClCompile Include="..\gcm-aes.c" />
-    <ClCompile Include="..\rijndael-alg-fst.c" />
     <ClCompile Include="unittest1.cpp" />
     <ClCompile Include="UnitTestSNACK.cpp" />
   </ItemGroup>

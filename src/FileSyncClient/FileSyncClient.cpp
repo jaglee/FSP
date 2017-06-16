@@ -2,16 +2,19 @@
   Usage 1, passively accept a file transfered the FileSyncServer <FileSyncClient> 
   Usage 2, check memory pattern of a file transfered and saved <FileSyncClient> $memory.^ 
  **/
-
 #include "stdafx.h"
 #include "tchar.h"
 
-//#define REMOTE_APPLAYER_NAME "localhost:80"
+// If compiled in Debug mode with the '_DEBUG' macro predefined by default, it tests FSP over UDP/IPv4
+// If compiled in Release mode, or anyway without the '_DEBUG' macro predefined, it tests FSP over IPv6
+#ifdef _DEBUG
+# define REMOTE_APPLAYER_NAME "localhost:80"
 // #define REMOTE_APPLAYER_NAME "lt-x61t:80"
 // #define REMOTE_APPLAYER_NAME "lt-at4:80"
 // #define REMOTE_APPLAYER_NAME "lt-ux31e:80"
-#define REMOTE_APPLAYER_NAME "E000:AAAA::1"
-//#define REMOTE_APPLAYER_NAME "E000:BBBB::1"
+#else
+# define REMOTE_APPLAYER_NAME "E000:AAAA::1"
+#endif
 
 // the reverse socket, count to finish
 extern int32_t ticksToWait;

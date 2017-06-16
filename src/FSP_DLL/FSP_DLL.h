@@ -65,7 +65,6 @@ UnregisterWaitEx(
 
 #include "../FSP.h"
 #include "../FSP_Impl.h"
-#include "../gcm-aes.h"
 
 // prepare pre-defined macros before including FSP_API.h
 // effectively avoid double-definition of API by customization

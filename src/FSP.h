@@ -29,17 +29,16 @@
     ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
     POSSIBILITY OF SUCH DAMAGE.
  */
+#include "Intrins.h"
 
 #define THIS_FSP_VERSION	0	// current version
 #define IPPROTO_FSP			144	// value of protocol field for FSP over IPv6
 
 #define ARCH_BIG_ENDIAN		0	// by default it works for little-endian architecture
 
-// To borrow some stdint definitions
-#include "gcm-aes.h"
-
+// Application Layer Fiber ID, the equivalent phrase is Upper Layer Thread ID
 typedef uint32_t ALFID_T;
-
+typedef ALFID_T	 ULTID_T;
 
 #if ARCH_BIG_ENDIAN
 // in network byte order on a big-endian host
@@ -223,7 +222,7 @@ typedef uint64_t timestamp_t;
 /**
  * struct FSP_IN6_ADDR * may be converted to struct in6_addr *
  */
-// FSP_IN4_ADDR: <'0x2002'><IPv4><FSP UDP Port := 18003><32-bit host-id := 0><32-bit ALT id>
+// FSP_IN4_ADDR: <'0x2002'><IPv4><FSP UDP Port := 18003><32-bit host-id := 0><32-bit ALFid>
 typedef struct FSP_IN4_ADDR_PREFIX
 {
 	uint16_t	prefix;
@@ -235,9 +234,9 @@ typedef struct FSP_IN6_ADDR
 {
 	union
 	{
-		FSP_IN4_ADDR_PREFIX st;
+		FSP_IN4_ADDR_PREFIX _6to4;
 		uint64_t		subnet;	
-	} u;
+	};
 	uint32_t	idHost;
 	ALFID_T		idALF;
 } *PFSP_IN6_ADDR;
@@ -256,7 +255,7 @@ typedef	struct FSP_SINKINF
 
 
 // FSP in UDP over IPv4
-struct PairALFID
+struct ALFIDPair
 {
 	ALFID_T source;
 	ALFID_T peer;

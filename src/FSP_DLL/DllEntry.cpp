@@ -608,11 +608,11 @@ CSocketItemDl * LOCALAPI CSocketItemDl::CreateControlBlock(const PFSP_IN6_ADDR n
 	socketItem->fidPair.source = nearAddr->idALF;
 	//
 	FSP_PKTINFO_EX & nearEnd = socketItem->pControlBlock->nearEndInfo;
-	if(nearAddr->u.st.prefix == PREFIX_FSP_IP6to4)
+	if(nearAddr->_6to4.prefix == PREFIX_FSP_IP6to4)
 	{
 		nearEnd.InitUDPoverIPv4(psp1->ifDefault);
 		nearEnd.idALF = nearAddr->idALF;
-		nearEnd.ipi_addr = nearAddr->u.st.ipv4;
+		nearEnd.ipi_addr = nearAddr->_6to4.ipv4;
 	}
 	else
 	{

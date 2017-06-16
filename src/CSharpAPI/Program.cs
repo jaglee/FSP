@@ -77,9 +77,8 @@ namespace CSharpAPI
 
             Array.Copy(original, mLen, bufPeersKey, 0, FSPAPI.CRYPTO_NACL_KEYBYTES);
 
-            FSPAPI.CryptoNaClKeyPair(bufPublicKey, bufPrivateKey);
-            FSPAPI.CryptoNaClGetSharedSecret(bufSharedKey, bufPeersKey, bufPrivateKey);
-        	FSPAPI.InstallAuthenticKey(handle, bufSharedKey, FSPAPI.CRYPTO_NACL_KEYBYTES, Int32.MaxValue, FlagEndOfMessage.NOT_END_ANYWAY);
+
+            FSPAPI.InstallAuthenticKey(handle, bufSharedKey, FSPAPI.CRYPTO_NACL_KEYBYTES, Int32.MaxValue, FlagEndOfMessage.NOT_END_ANYWAY);
 
             FSPAPI.FSPControl(handle
                 , FSP_ControlCode.FSP_SET_CALLBACK_ON_ERROR
@@ -87,6 +86,7 @@ namespace CSharpAPI
             FSPAPI.WriteTo(handle, bufPublicKey, FSPAPI.CRYPTO_NACL_KEYBYTES
                 , FlagEndOfMessage.END_OF_MESSAGE
                 , new NotifyOrReturn(onPublicKeySent));
+
             return 0;
 
 l_nokey:

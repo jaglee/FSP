@@ -2,7 +2,6 @@
 <Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup>
     <ClCompile Include="..\ControlBlock.cpp" />
-    <ClCompile Include="..\rijndael-alg-fst.c" />
     <ClCompile Include="command.cpp" />
     <ClCompile Include="CubicRoot.c" />
     <ClCompile Include="main.cpp" />
@@ -11,8 +10,10 @@
     <ClCompile Include="remote.cpp" />
     <ClCompile Include="socket.cpp" />
     <ClCompile Include="timers.cpp" />
-    <ClCompile Include="..\gcm-aes.c" />
     <ClCompile Include="CRC64.c" />
+    <ClCompile Include="blake2b.c" />
+    <ClCompile Include="gcm-aes.c" />
+    <ClCompile Include="rijndael-alg-fst.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\FSP.h">
@@ -27,7 +28,13 @@
     <ClInclude Include="fsp_srv.h">
       <Filter>Headers</Filter>
     </ClInclude>
-    <ClInclude Include="..\gcm-aes.h">
+    <ClInclude Include="blake2b.h">
+      <Filter>Headers</Filter>
+    </ClInclude>
+    <ClInclude Include="gcm-aes.h">
+      <Filter>Headers</Filter>
+    </ClInclude>
+    <ClInclude Include="..\Intrins.h">
       <Filter>Headers</Filter>
     </ClInclude>
   </ItemGroup>

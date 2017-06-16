@@ -107,7 +107,7 @@
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
       <Optimization>Disabled</Optimization>
-      <PreprocessorDefinitions>MAX_BUFFER_BLOCKS=3;TRACE_PACKET;WIN32;TRACE;_DEBUG;_WINDOWS;_USRDLL;FSP_DLL_EXPORTS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>MAX_BUFFER_BLOCKS=3;OVER_UDP_IPv4;TRACE_PACKET;WIN32;TRACE;_DEBUG;_WINDOWS;_USRDLL;FSP_DLL_EXPORTS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <MinimalRebuild>true</MinimalRebuild>
       <BasicRuntimeChecks>EnableFastChecks</BasicRuntimeChecks>
       <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
@@ -203,7 +203,6 @@
   <ItemGroup>
     <ClInclude Include="..\FSP.h" />
     <ClInclude Include="..\FSP_API.h" />
-    <ClInclude Include="..\KeyExchange\CHAKA.h" />
     <ClInclude Include="FSP_DLL.h" />
     <ClInclude Include="..\FSP_Impl.h" />
   </ItemGroup>

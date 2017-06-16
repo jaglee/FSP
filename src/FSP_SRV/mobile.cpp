@@ -35,7 +35,7 @@ ALFID_T CLowerInterface::SetLocalFiberID(ALFID_T value)
 {
 	if(nearInfo.IsIPv6())
 		nearInfo.u.idALF = value;
-	return _InterlockedExchange((volatile LONG *) & pktBuf->idPair.peer, value);
+	return _InterlockedExchange((volatile LONG *) & pktBuf->fidPair.peer, value);
 }
 
 
@@ -209,7 +209,7 @@ void CSocketItemEx::InstallEphemeralKey()
 	contextOfICC.curr.precomputedICC[0] 
 		=  CalculateCRC64(* (uint64_t *) & fidPair, (uint8_t *) & pControlBlock->connectParams, FSP_MAX_KEY_SIZE);
 
-	PairALFID recvFIDPair;
+	ALFIDPair recvFIDPair;
 	recvFIDPair.peer = fidPair.source;
 	recvFIDPair.source = fidPair.peer;
 	contextOfICC.curr.precomputedICC[1]

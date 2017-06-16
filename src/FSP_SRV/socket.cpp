@@ -377,7 +377,7 @@ void CSocketItemEx::InitAssociation()
 			pFarEnd[i].Ipv6.sin6_flowinfo = 0;
 			pFarEnd[i].Ipv6.sin6_port = 0;
 			pFarEnd[i].Ipv6.sin6_scope_id = 0;
-			((PFSP_IN6_ADDR) & (pFarEnd[i].Ipv6.sin6_addr))->u.subnet
+			((PFSP_IN6_ADDR) & (pFarEnd[i].Ipv6.sin6_addr))->subnet
 				= pControlBlock->peerAddr.ipFSP.allowedPrefixes[i];
 			((PFSP_IN6_ADDR) & (pFarEnd[i].Ipv6.sin6_addr))->idHost = idRemoteHost;
 			((PFSP_IN6_ADDR) & (pFarEnd[i].Ipv6.sin6_addr))->idALF = fidPair.peer;
@@ -600,7 +600,7 @@ void CSocketItemEx::AffirmConnect(const SConnectParam & initState, ALFID_T idLis
 	pkt->cookie = initState.cookie;
 	// assert(sizeof(initState.allowedPrefixes) >= sizeof(varParams.subnets));
 	memcpy(pkt->params.subnets , initState.allowedPrefixes, sizeof(pkt->params.subnets));
-	pkt->params.listenerID = idListener;
+	pkt->params.idListener = idListener;
 	pkt->params.hs.Set(PEER_SUBNETS, sizeof(FSP_ConnectRequest) - sizeof(FSP_ConnectParam));
 	pkt->hs.Set<FSP_ConnectRequest, CONNECT_REQUEST>();
 
@@ -677,10 +677,10 @@ void CSocketItemEx::InitiateMultiply(CSocketItemEx *srcItem)
 // so that the derived new session key is put into effect
 bool CSocketItemEx::FinalizeMultiply()
 {
-	ALFID_T idPeerParent = _InterlockedExchange((long *)&pControlBlock->peerAddr.ipFSP.fiberID, headPacket->idPair.source);
+	ALFID_T idPeerParent = _InterlockedExchange((long *)&pControlBlock->peerAddr.ipFSP.fiberID, headPacket->fidPair.source);
 	contextOfICC.snFirstRecvWithCurrKey = headPacket->pktSeqNo;
 	InitAssociation();	// reinitialize with new peer's ALFID
-	assert(fidPair.peer == headPacket->idPair.source);
+	assert(fidPair.peer == headPacket->fidPair.source);
 #if defined(TRACE) && (TRACE & TRACE_PACKET)
 	printf_s("\nGet the acknowledgement PERSIST to MULTIPLY in LLS, ICC context:\n"
 		"\tsend start SN = %09u, recv start sn = %09u\n"

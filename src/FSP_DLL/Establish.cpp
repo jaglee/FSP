@@ -247,7 +247,7 @@ bool LOCALAPI CSocketItemDl::ToWelcomeConnect(BackLogItem & backLog)
 	//
 	memcpy(& pControlBlock->connectParams, & backLog, FSP_MAX_KEY_SIZE);
 
-	params->listenerID = pControlBlock->idParent;
+	params->idListener = pControlBlock->idParent;
 	params->hs.Set(PEER_SUBNETS, sizeof(FSP_NormalPacketHeader));
 	//
 	skb->version = THIS_FSP_VERSION;
@@ -348,9 +348,9 @@ ControlBlock::PFSP_SocketBuf LOCALAPI CSocketItemDl::SetHeadPacketIfEmpty(FSPOpe
 DllSpec
 uint32_t * FSPAPI TranslateFSPoverIPv4(PFSP_IN6_ADDR p, uint32_t dwIPv4, uint32_t fiberID)
 {
-	p->u.st.prefix = PREFIX_FSP_IP6to4;
-	p->u.st.ipv4 = dwIPv4;
-	p->u.st.port = DEFAULT_FSP_UDPPORT;
+	p->_6to4.prefix = PREFIX_FSP_IP6to4;
+	p->_6to4.ipv4 = dwIPv4;
+	p->_6to4.port = DEFAULT_FSP_UDPPORT;
 	p->idALF = htobe32(fiberID);
 	return & p->idHost;
 }

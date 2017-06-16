@@ -40,6 +40,8 @@
 #include "../FSP.h"
 #include "../FSP_Impl.h"
 
+#include "gcm-aes.h"
+
 #pragma intrinsic(_InterlockedCompareExchange, _InterlockedCompareExchange8)
 #pragma intrinsic(_InterlockedExchange, _InterlockedExchange16, _InterlockedExchange8)
 #pragma intrinsic(_InterlockedIncrement, _InterlockedOr, _InterlockedOr8)
@@ -119,7 +121,7 @@ inline uint64_t ntohll(uint64_t h)
 /**
  * Get the application layer thread ID from the (IPv6 raw-)socket address
  */
-#define SOCKADDR_SUBNET(s)  (((PFSP_IN6_ADDR) & ((PSOCKADDR_IN6)(s))->sin6_addr)->u.subnet)
+#define SOCKADDR_SUBNET(s)  (((PFSP_IN6_ADDR) & ((PSOCKADDR_IN6)(s))->sin6_addr)->subnet)
 #define SOCKADDR_ALFID(s)  (((PFSP_IN6_ADDR) & ((PSOCKADDR_IN6)(s))->sin6_addr)->idALF)
 #define SOCKADDR_HOSTID(s)  (((PFSP_IN6_ADDR) & ((PSOCKADDR_IN6)(s))->sin6_addr)->idHost)
 
@@ -196,7 +198,7 @@ struct PktBufferBlock
 	ALIGN(MAC_ALIGNMENT)
 	int32_t	lenData;
 	ControlBlock::seq_t	pktSeqNo;	// in host byte-order
-	PairALFID	idPair;
+	ALFIDPair	fidPair;
 	FSP_NormalPacketHeader hdr;
 	BYTE	payload[MAX_BLOCK_SIZE];
 	//
@@ -584,9 +586,9 @@ private:
 	friend void UnitTestSelectPath();
 #endif
 
+	LONG	disableFlags;	// harf of the default FD_SETSIZE
 #ifndef OVER_UDP_IPv4
 	ULONG	iRecvAddr;		// index into addresses
-	LONG	disableFlags;	// harf of the default FD_SETSIZE
 	inline	void DisableSocket(SOCKET);
 #else
 	// For FSP over UDP/IPv4 bind the UDP-socket

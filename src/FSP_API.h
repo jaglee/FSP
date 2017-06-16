@@ -377,13 +377,13 @@ int FSPAPI Dispose(FSPHANDLE hFSPSocket);
 // Given
 //	PFSP_IN6_ADDR	the place holder of the output FSP/IPv6 address
 //	uint32_t		the 32-bit integer representation of the IPv4 address to be translated
-//	ALFID_T			the application layer fiber ID, in neutral byte order
+//	ULTID_T			the upper layer thread ID/application layer fiber ID, in neutral byte order
 // Return
 //	the pointer to the place holder of host-id which might be set/updated later
 // Remark
 //	make the rule-adhered IPv6 address, the result is placed in the given pointed place holder
 DllSpec
-uint32_t * FSPAPI TranslateFSPoverIPv4(PFSP_IN6_ADDR, uint32_t, ALFID_T);
+uint32_t * FSPAPI TranslateFSPoverIPv4(PFSP_IN6_ADDR, uint32_t, ULTID_T);
 
 
 DllSpec
