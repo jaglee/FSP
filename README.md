@@ -1,6 +1,5 @@
-
-# FSP
-## A concept implementation of Flexible Session Protocol
+# Flexible Session Protocol
+https://pan.wps.cn/l/syd6nyq
 
 ### Abstract
 
@@ -68,7 +67,7 @@ It is flexible for the application layer protocols to adopt much wider range of 
 To utilize IPv6 address space more efficiently FSP makes some slight tuning of address architecture when working over the IPv6 network. In an IPv6 packet that carries FSP payload each of the source and destination 128-bit IPv6 address is split into three parts: the 64-bit network prefix, the 32-bit aggregation host id and the 32-bit ULTID. 
 
 It requires some further subtle tuning of the IPv6 architecture:
-o Each physically network interface that has IPv6 address configured SHALL NOT have the network prefix configured longer than 96 bits, no matter that the IPv6 address is assigned by Stateless Address Autoconfiguration ([RFC4862]), stateful Dynamic Host Configuration Protocol for IPv6 ([RFC3315], [RFC3633]) or by some other means.
+0o Each physically network interface that has IPv6 address configured SHALL NOT have the network prefix configured longer than 96 bits, no matter that the IPv6 address is assigned by Stateless Address Autoconfiguration ([RFC4862]), stateful Dynamic Host Configuration Protocol for IPv6 ([RFC3315], [RFC3633]) or by some other means.
 
 o The ULA is the ultimate IPv6 end-point.
 o Every network node is effectively a router. Especially when FSP over UDP in the IPv4 network is exploited the two end point host nodes are treated as if they were routers connecting the IPv6 addressed ULAs across the IPv4 network.
@@ -78,7 +77,7 @@ And thus it may be argued that the routing scalability problem does not exist at
 ##### Zero round-trip connection cloning
 An FSP connection MAY be multiplied to get a clone or clones of the connection. In this version of FSP a clone connection MAY NOT be cloned further, and only the connection where authencity of the packets is crytographically protected may be multiplied.
 The packet that carries the command to multiply an established FSP connection MUST be sent from a new allocated local ULTID towards the destination ULTID of the cloned connection. It is an out-of-band packet in the context of the cloned connection and it MUST be crytographically protected by the secret key of the cloned connection. The packet MAY carry payload as it usually does.
-The receiver of the packet MUST allocate a new local ULTID, accept the optional payload in the new context associated with the new ULTID, derive a new secret key from the secret key of the cloned connection, and responds from the new context. The response MAY carry payload as it usually does. The very first response packet MUST be protected by the new secret key. The sender of the multiply command packet MUST automatically inaugurate the same secret key, derived from the secret key of the same cloned connection. And it MUST treat the response packet as though a transmit transaction have been committed by the responder, i.e. authencity of the response packet is verified with the new secret key.
+2The receiver of the packet MUST allocate a new local ULTID, accept the optional payload in the new context associated with the new ULTID, derive a new secret key from the secret key of the cloned connection, and responds from the new context. The response MAY carry payload as it usually does. The very first response packet MUST be protected by the new secret key. The sender of the multiply command packet MUST automatically inaugurate the same secret key, derived from the secret key of the same cloned connection. And it MUST treat the response packet as though a transmit transaction have been committed by the responder, i.e. authencity of the response packet is verified with the new secret key.
 Thus the new clone connection is established at a new pair of ULTIDs with zero round-trip overhead. This mechanism may be exploited to provide expedited data transfer service or parallel data transfer.
 
 #### Normative References
@@ -118,3 +117,23 @@ Thus the new clone connection is established at a new pair of ULTIDs with zero r
 [Gao2002]	Gao, J., "Fuzzy-layering and its suggestion", IETF Mail Archive, September 2002, https://mailarchive.ietf.org/arch/msg/ietf/u-6i-6f-Etuvh80-SUuRbSCDTwg
 
 ...
+
+## How to compile conceptual implementation of Flexible Session Protocol
+
+This project roughly implements core concepts of FSP, written in Microsoft Visual Studio 2012/2015/2017, targeting at Windows 7 and above version.  It implements FSP by split the core functions across two sub-layers: the Lower Layer Service and the Dynamic Linked Library.  The core source codes are put into two directories, FSP_SRV and FSP_DLL, respectively. 
+
+FSP_SRV implements the Lower Layer Service (LLS). When compiled targeting at Win32, it implements FSP over UDP/IPv4. When compiled targeting  at x64, it implements FSP over IPv6. However, FSP connection number in IPv6 network is limitted. LLS means to implement function modules that are expected to be hardware-accelerated or implemented in the kernel.
+
+If compiling to target at Win32, Microsoft Visual Studio 2012 Desktop Edition should work. If compiling to target at x64, it requires Microsoft Visual Studio 2015 Communitity Edition or above version. The solution file to open is FSP.sln.
+
+FSP_DLL implements the Dynamic Linked Library part of the conceptual implementation. DLL means to implement function modules that relate to application programming interface, buffer management, data delivery  and optionally on-the-wire compression (not included in the source code committed yet).
+
+Currently the DLL is targeting at Win32 only. It requires Microsoft Visual Studio 2012 or versions above. Desktop Edition or Communitity Edition works. The solution file to open is FSP_FileSync.sln
+
+The solution file FSP_FileSync.sln also includes two test projects that should work together with the DLL: FileSyncClient and FileSyncServer. When compiling in Debug mode, the solution tests FSP over UDP/IPv4. When compiling in Release mode, the solution tests FSP over IPv6.
+
+It should work as well if upgrading FSP_FileSync.sln to Visual Studio 2017 edition and compiling to target at x64.
+
+Please note that the macro OVER_UDP_IPv4 shall be predefined both in the FSP_SRV project and the FSP_DLL project if to test FSP over UDP/IPv4, and it shall be neither defined in the FSP_SRV project nor in the FSP_DLL project if to test FSP over IPv6.
+
+##### Visual Studio is the trademark of Microsoft.
