@@ -166,7 +166,10 @@
     <ClCompile Include="..\ControlBlock.cpp" />
     <ClCompile Include="..\Crypto\CryptoStub.c" />
     <ClCompile Include="..\Crypto\tweetnacl.c" />
+<<<<<<< HEAD
     <ClCompile Include="..\FSP_SRV\blake2b.c" />
+=======
+>>>>>>> deaae64e49030a17db814919ae574e325b572745
     <ClCompile Include="..\FSP_SRV\command.cpp" />
     <ClCompile Include="..\FSP_SRV\CRC64.c" />
     <ClCompile Include="..\FSP_SRV\CubicRoot.c" />

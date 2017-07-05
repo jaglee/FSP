@@ -17,11 +17,14 @@ typedef struct {
 } blake2b_ctx;
 
 
+<<<<<<< HEAD
 #ifdef __cplusplus
 extern "C"
 {
 #endif
 
+=======
+>>>>>>> deaae64e49030a17db814919ae574e325b572745
 // Initialize the hashing context "ctx" with optional key "key".
 //      1 <= outlen <= 64 gives the digest size in bytes.
 //      Secret key (also <= 64 bytes) is optional (keylen = 0).
@@ -41,8 +44,11 @@ int blake2b(void *out, size_t outlen,   // return buffer for digest
     const void *key, size_t keylen,     // optional secret key
     const void *in, size_t inlen);      // data to be hashed
 
+<<<<<<< HEAD
 #ifdef __cplusplus
 };
 #endif
 
+=======
+>>>>>>> deaae64e49030a17db814919ae574e325b572745
 #endif
