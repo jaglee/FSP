@@ -56,7 +56,7 @@ static void FSPAPI onPublicKeyReceived(FSPHANDLE h, FSP_ServiceCode c, int r)
 	printf_s("\nTo install the negotiated shared key instantly...\n");
 	octet prfKey[32];
 	CryptoZhCnHash256(prfKey, bufSharedKey, CRYPTO_NACL_KEYBYTES);
-	InstallAuthenticKey(h, prfKey, 32, INT32_MAX);
+	InstallSessionKey(h, prfKey, 32, INT32_MAX);
 
 	printf_s("\tTo send filename to the remote end...\n");
 	WriteTo(h, fileName, strlen(fileName) + 1, EOF, onFileNameSent);	// multi-byte character set only
@@ -77,7 +77,7 @@ static void FSPAPI onFileNameSent(FSPHANDLE h, FSP_ServiceCode c, int r)
 		"to get send buffer for reading file and sending inline...\n");
 
 	// We insisted on sending even if only a small buffer of 1 octet is available
-	r = GetSendBuffer(h, 1, toSendNextBlock);
+	r = GetSendBuffer(h, sizeOfBuffer, toSendNextBlock);
 	if(r < 0)
 	{
 		printf_s("Cannot get send buffer onFileNameSent, error code: %d\n", r);
@@ -97,7 +97,7 @@ static void FSPAPI onFileNameSent(FSPHANDLE h, FSP_ServiceCode c, int r)
 static int FSPAPI toSendNextBlock(FSPHANDLE h, void * batchBuffer, int32_t capacity)
 {
 	static int offset = 0;
-	if(capacity <= 0)
+	if(capacity < 0)
 	{
 		Dispose(h);
 		return -ENOMEM;

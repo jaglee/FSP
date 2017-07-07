@@ -368,7 +368,7 @@ uint32_t * FSPAPI TranslateFSPoverIPv4(PFSP_IN6_ADDR p, uint32_t dwIPv4, uint32_
 //	0 if no error
 //	negative: the error number
 DllSpec
-int FSPAPI InstallAuthenticKey(FSPHANDLE h, BYTE * key, int keySize, int32_t keyLife)
+int FSPAPI InstallSessionKey(FSPHANDLE h, BYTE * key, int keySize, int32_t keyLife)
 {
 	if(keySize < FSP_MIN_KEY_SIZE || keySize > FSP_MAX_KEY_SIZE || keySize % sizeof(uint64_t) != 0 || keyLife <= 0)
 		return -EDOM;

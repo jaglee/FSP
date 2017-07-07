@@ -473,15 +473,18 @@ ControlBlock::PFSP_SocketBuf ControlBlock::GetSendBuf()
 // Remark
 //	It is assumed that the caller have gain exclusive access on the control block among providers
 //	However, LLS may change (sendWindowHeadPos, sendWindowFirstSN) simultaneously, non-atomically
-void * LOCALAPI ControlBlock::InquireSendBuf(int & m)
+void * LOCALAPI ControlBlock::InquireSendBuf(int *p_m)
 {
+	int & m = *p_m;
 	if (m <= 0)
 	{
 		m = -EDOM;
 		return NULL;
 	}
-	if(m > MAX_BLOCK_SIZE * (sendBufferBlockN - CountSendBuffered()))
+	if((m - 1) / MAX_BLOCK_SIZE + 1 > (sendBufferBlockN - CountSendBuffered()))
 	{
+		int r = CountSendBuffered();
+		BREAK_ON_DEBUG();
 		m = -ENOMEM;
 		return NULL;
 	}

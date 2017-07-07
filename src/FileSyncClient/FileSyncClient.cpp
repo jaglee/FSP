@@ -156,7 +156,7 @@ static int	FSPAPI  onConnected(FSPHANDLE h, PFSP_Context ctx)
 	printf_s("\tTo install the shared key instantly...\n");
 	octet prfKey[32];
 	CryptoZhCnHash256(prfKey, bufSharedKey, CRYPTO_NACL_KEYBYTES);
-	InstallAuthenticKey(h, prfKey, 32, INT32_MAX);
+	InstallSessionKey(h, prfKey, 32, INT32_MAX);
 
 	return 0;
 }

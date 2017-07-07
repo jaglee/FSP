@@ -55,7 +55,7 @@ static void FSPAPI onFileNameSent(FSPHANDLE h, FSP_ServiceCode c, int r)
 	printf("Filename has been sent to remote end,\n"
 		"to get send buffer for reading file and sending inline...\n");
 
-	r = GetSendBuffer(h, 1, toSendNextBlock);
+	r = GetSendBuffer(h, sizeof(bytesToSend), toSendNextBlock);
 	if(r < 0)
 	{
 		printf_s("Cannot get send buffer onFileNameSent, error code: %d\n", r);
@@ -74,7 +74,7 @@ static void FSPAPI onFileNameSent(FSPHANDLE h, FSP_ServiceCode c, int r)
 static int FSPAPI toSendNextBlock(FSPHANDLE h, void * batchBuffer, int32_t capacity)
 {
 	static int offset = 0;
-	if(capacity <= 0)
+	if(capacity < 0)
 	{
 		Dispose(h);
 		return -ENOMEM;

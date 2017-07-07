@@ -455,6 +455,7 @@ void CSocketItemDl::WaitEventToDispatch()
 			break;
 		}
 		//
+		NotifyOrReturn fp1;
 		switch(notice)
 		{
 		case FSP_NotifyListening:
@@ -540,7 +541,7 @@ void CSocketItemDl::WaitEventToDispatch()
 				if (fp1 != NULL)
 					fp1(this, FSP_NotifyRecycled, 0);
 				//
-				Recycle();	// in this function it checks whether isDisposing
+				Recycle();
 			}
 			else
 			{
@@ -548,9 +549,12 @@ void CSocketItemDl::WaitEventToDispatch()
 			}
 			break;
 		case FSP_NotifyRecycled:
+			fp1 = isDisposing ? context.onError : NULL;
 			CancelTimer();	// If any; typically for Shutdown 
 			Recycle();
 			SetMutexFree();
+			if(fp1 != NULL)
+				fp1(this, notice, -EINTR);
 			goto l_return;
 		case FSP_IPC_CannotReturn:
 			if (pControlBlock->state == LISTENING)

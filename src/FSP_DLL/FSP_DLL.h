@@ -225,7 +225,7 @@ public:
 	}
 
 	int LOCALAPI Initialize(PFSP_Context, char[MAX_NAME_LENGTH]);
-	int Recycle();
+	int Recycle(bool reportError = false);
 
 	// Convert the relative address in the control block to the address in process space, unchecked
 	BYTE * GetSendPtr(const ControlBlock::PFSP_SocketBuf skb) const

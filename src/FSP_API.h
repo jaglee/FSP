@@ -247,13 +247,13 @@ FSPHANDLE FSPAPI MultiplyAndGetSendBuffer(FSPHANDLE, PFSP_Context, int *, Callba
 //	-EINTR	if cannot obtain the right lock
 //	-EIO	if cannot trigger LLS to do the installation work through I/O
 DllSpec
-int FSPAPI InstallAuthenticKey(FSPHANDLE, uint8_t *, int, int32_t);
+int FSPAPI InstallSessionKey(FSPHANDLE, uint8_t *, int, int32_t);
 
 
 
 // given
 //	the handle of the FSP socket to request send buffer for,
-//	the minimum requested size of the buffer,
+//	the requested size of the buffer,
 //	the pointer to the callback function
 // return
 //	negative if error, or the capacity of immediately available buffer (might be 0)

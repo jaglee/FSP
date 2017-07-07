@@ -95,7 +95,7 @@ FSPHANDLE FSPAPI MultiplyAndGetSendBuffer(FSPHANDLE hFSP, PFSP_Context psp1, int
 	{
 		p->pendingSendSize = *pSize;
 		//
-		void *buf = p->pControlBlock->InquireSendBuf(*pSize);
+		void *buf = p->pControlBlock->InquireSendBuf(pSize);
 		if(buf == NULL)
 		{
 			CSocketItemDl::FreeItem(p);

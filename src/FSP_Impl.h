@@ -778,7 +778,7 @@ struct ControlBlock
 
 	void LOCALAPI SetSequenceFlags(FSP_NormalPacketHeader *, ControlBlock::seq_t);
 
-	void * LOCALAPI InquireSendBuf(int &);
+	void * LOCALAPI InquireSendBuf(int *);
 
 	PFSP_SocketBuf GetFirstReceived() const { return HeadRecv() + recvWindowHeadPos; }
 	int LOCALAPI GetSelectiveNACK(seq_t &, FSP_SelectiveNACK::GapDescriptor *, int) const;

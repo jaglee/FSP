@@ -36,7 +36,7 @@ int FSPAPI Dispose(FSPHANDLE hFSPSocket)
 	register CSocketItemDl *p = (CSocketItemDl *)hFSPSocket;
 	try
 	{
-		return p->Recycle();
+		return p->Recycle(true);
 	}
 	catch(...)
 	{
@@ -48,15 +48,15 @@ int FSPAPI Dispose(FSPHANDLE hFSPSocket)
 
 // return 0 if no error, positive if some warning
 // an ill-behaviored ULA could be punished by dead-lock
-int CSocketItemDl::Recycle()
+int CSocketItemDl::Recycle(bool reportError)
 {
-	if(! IsInUse() || isDisposing)
+	if(! IsInUse())
 		return EAGAIN;	// warning: already disposed
 
 	register int r = 0;
-	isDisposing = 1;
 	if (! lowerLayerRecycled)
 	{
+		isDisposing = reportError ? 1 : 0;
 		bool b = Call<FSP_Recycle>();
 		if(b)
 			return r;	// Free the socket item when FSP_Recycle called back
@@ -64,8 +64,11 @@ int CSocketItemDl::Recycle()
 		r = EIO;		// LLS would eventually timed-out
 	}
 	//
+	NotifyOrReturn fp1 = context.onError;
 	CSocketItemDl::FreeItem(this);
 	Disable();
+	if(reportError && fp1 != NULL)
+		fp1(this, FSP_Recycle, -EINTR);
 	return r;
 }
 

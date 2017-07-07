@@ -34,7 +34,7 @@
 
 // Given
 //	FSPHANDLE			the socket handle
-//	int					minimal buffer size requested
+//	int					buffer size requested
 //	CallbackBufferReady	the pointer to the function called back when enough buffer available
 // Return
 //	size of free send buffer available immediately, might be 0 which is not an error
@@ -145,8 +145,8 @@ int LOCALAPI CSocketItemDl::AcquireSendBuf(int n)
 	}
 
 	pendingSendSize = n;
-
-	void *buf = pControlBlock->InquireSendBuf(n);
+	n = 1;
+	void *buf = pControlBlock->InquireSendBuf(& n);
 	SetMutexFree();
 	if(buf != NULL)
 	{
@@ -375,14 +375,25 @@ void CSocketItemDl::ProcessPendingSend()
 
 	if (pendingSendSize > 0)	// while pendingSendBuf == NULL: pending GetSendBuffere()
 	{
-		int m = pendingSendSize;	// the size of the requested buffer
-		void * p = pControlBlock->InquireSendBuf(m);
+		int m = 1;				// minimum block works perfect
+		void * p = pControlBlock->InquireSendBuf(& m);
 		SetMutexFree();
-		//
-		// If ULA hinted that sending was not finished yet, continue to use the saved pointer of the callback function
-		bool r = (fp2 != NULL && fp2(this, p, m) >= 0);
-		if (m < pendingSendSize || r)
+		// If FSP_NotifyBufferReady catched but even a minimal buffer block is unavailable,
+		// it must be in chaotic memory situation. However, race condition does exist.
+		if(p == NULL)
 		{
+			TestSetSendReturn(fp2);
+			BREAK_ON_DEBUG();
+			if(HasFreeSendBuffer())
+				SelfNotify(FSP_NotifyBufferReady);
+			return;
+		}
+		// If ULA hinted that sending was not finished yet,
+		// continue to use the saved pointer of the callback function
+		bool r = (fp2 != NULL && fp2(this, p, m) >= 0);
+		if (pendingSendSize - m > 0 || r)
+		{
+			pendingSendSize = (pendingSendSize - m > 0 ? pendingSendSize - m : 0);
 			TestSetSendReturn(fp2);
 			if(HasFreeSendBuffer())	// In case of round-robin
 				SelfNotify(FSP_NotifyBufferReady);
@@ -392,11 +403,12 @@ void CSocketItemDl::ProcessPendingSend()
 	}
 
 	// pending WriteTo(), or pending Commit()
-	pendingSendBuf = NULL;	// So that WriteTo() chaining is possible, see also BufferData()
-	//
+	void *p =  InterlockedExchangePointer(& pendingSendBuf, NULL);	// So that WriteTo() chaining is possible, see also BufferData()
 	SetMutexFree();
-	if (fp2 != NULL)
+	//
+	if(p != NULL && fp2 != NULL)
 		((NotifyOrReturn)fp2)(this, FSP_Send, bytesBuffered);
+	// Or else SendInplace silently finished.
 }
 
 
@@ -522,8 +534,8 @@ int LOCALAPI CSocketItemDl::PrepareToSend(void * buf, int len, bool eotFlag)
 		p->Unlock();
 	}
 
-	register int m = len;
-	if(pControlBlock->InquireSendBuf(m) != buf)	// 'm' is an in-out parameter
+	int m = len;
+	if(pControlBlock->InquireSendBuf(& m) != buf)	// 'm' is an in-out parameter
 		return -EFAULT;
 	if(m < len)
 		return -ENOMEM;
