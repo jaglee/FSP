@@ -158,7 +158,6 @@
     <ClCompile Include="..\FSP_DLL\Receive.cpp" />
     <ClCompile Include="..\FSP_DLL\Send.cpp" />
     <ClCompile Include="FSP_DllTest.cpp" />
-    <ClCompile Include="stdafx.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

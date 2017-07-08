@@ -403,7 +403,7 @@ void CSocketItemDl::ProcessPendingSend()
 	}
 
 	// pending WriteTo(), or pending Commit()
-	void *p =  InterlockedExchangePointer(& pendingSendBuf, NULL);	// So that WriteTo() chaining is possible, see also BufferData()
+	void *p = InterlockedExchangePointer((PVOID *)& pendingSendBuf, NULL);	// So that WriteTo() chaining is possible, see also BufferData()
 	SetMutexFree();
 	//
 	if(p != NULL && fp2 != NULL)
@@ -524,7 +524,7 @@ int LOCALAPI CSocketItemDl::PrepareToSend(void * buf, int len, bool eotFlag)
 
 	// Automatically mark the last unsent packet as completed. See also BufferData()
 	register ControlBlock::PFSP_SocketBuf p = pControlBlock->LockLastBufferedSend();
-	if(p != NULL)
+	if(p != NULL && !p->GetFlag<IS_COMPLETED>())
 	{
 #ifdef TRACE
 		printf_s("SendInline automatically closes previous packet sent by WriteTo() or implicit welcome\n");

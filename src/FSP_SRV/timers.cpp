@@ -400,7 +400,7 @@ bool CSocketItemEx::SendKeepAlive()
 	buf3.hdr.Set(KEEP_ALIVE, (uint16_t)len
 		, pControlBlock->sendWindowNextSN - 1
 		, snKeepAliveExp
-		, pControlBlock->AdRecvWS(pControlBlock->sendWindowNextSN - 1));
+		, pControlBlock->AdRecvWS(pControlBlock->recvWindowNextSN - 1));
 	//
 	if (shouldAppendCommit)
 		buf3.hdr.SetFlag<EndOfTransaction>();
@@ -446,7 +446,7 @@ bool CSocketItemEx::SendAckFlush()
 	buf2.hdr.Set(ACK_FLUSH, (uint16_t)sizeof(buf2)
 		, pControlBlock->sendWindowNextSN - 1
 		, pControlBlock->recvWindowNextSN
-		, pControlBlock->AdRecvWS(pControlBlock->sendWindowNextSN - 1));
+		, pControlBlock->AdRecvWS(pControlBlock->recvWindowNextSN - 1));
 	SetIntegrityCheckCode(&buf2.hdr, NULL, 0, buf2.snack.serialNo);
 	return SendPacket(1, ScatteredSendBuffers(&buf2, sizeof(buf2))) > 0;
 }

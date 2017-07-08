@@ -1,10 +1,8 @@
 Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio 15
-VisualStudioVersion = 15.0.26206.0
+VisualStudioVersion = 15.0.26430.14
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "UnitTestFSP", "src\UnitTestFSP\UnitTestFSP.vcxproj", "{784EC836-76E4-4254-A7DE-2730131FEFEE}"
-EndProject
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "FSP_FlowTest", "src\FSP_FlowTest\FSP_FlowTest.vcxproj", "{F56F346F-658D-4837-ABE2-51DC53164753}"
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "FSP_DllTest", "src\FSP_DllTest\FSP_DllTest.vcxproj", "{DFB5060F-BE3F-4DEC-ACCD-2978E1170C12}"
 EndProject
@@ -24,13 +22,6 @@ Global
 		{784EC836-76E4-4254-A7DE-2730131FEFEE}.Release|Win32.Build.0 = Release|Win32
 		{784EC836-76E4-4254-A7DE-2730131FEFEE}.Release|x64.ActiveCfg = Release|x64
 		{784EC836-76E4-4254-A7DE-2730131FEFEE}.Release|x64.Build.0 = Release|x64
-		{F56F346F-658D-4837-ABE2-51DC53164753}.Debug|Win32.ActiveCfg = Debug|Win32
-		{F56F346F-658D-4837-ABE2-51DC53164753}.Debug|x64.ActiveCfg = Debug|x64
-		{F56F346F-658D-4837-ABE2-51DC53164753}.Debug|x64.Build.0 = Debug|x64
-		{F56F346F-658D-4837-ABE2-51DC53164753}.Release|Win32.ActiveCfg = Release|Win32
-		{F56F346F-658D-4837-ABE2-51DC53164753}.Release|Win32.Build.0 = Release|Win32
-		{F56F346F-658D-4837-ABE2-51DC53164753}.Release|x64.ActiveCfg = Release|x64
-		{F56F346F-658D-4837-ABE2-51DC53164753}.Release|x64.Build.0 = Release|x64
 		{DFB5060F-BE3F-4DEC-ACCD-2978E1170C12}.Debug|Win32.ActiveCfg = Debug|Win32
 		{DFB5060F-BE3F-4DEC-ACCD-2978E1170C12}.Debug|Win32.Build.0 = Debug|Win32
 		{DFB5060F-BE3F-4DEC-ACCD-2978E1170C12}.Debug|x64.ActiveCfg = Debug|x64

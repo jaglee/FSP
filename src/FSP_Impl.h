@@ -263,13 +263,13 @@ struct FSP_NormalPacketHeader
 	void LOCALAPI Set(FSPOperationCode, uint16_t, uint32_t, uint32_t, int32_t);
 
 	// A bruteforce but safe method of set or retrieve receive window size, with byte order translation
-	int32_t GetRecvWS() const { return ((int32_t)flags_ws[0] << 16) + (flags_ws[1] << 8) + flags_ws[2]; }
-	void SetRecvWS(int32_t v) { flags_ws[0] = (UINT8)(v >> 16); flags_ws[1] = (UINT8)(v >> 8); flags_ws[2] = (UINT8)v; }
+	int32_t GetRecvWS()	const { return ((int32_t)flags_ws[1] << 16) + ((unsigned)flags_ws[2] << 8) + flags_ws[3]; }
+	void SetRecvWS(int32_t v) { flags_ws[1] = (UINT8)(v >> 16); flags_ws[2] = (UINT8)(v >> 8); flags_ws[3] = (UINT8)v; }
 
-	void ClearFlags() { flags_ws[3] = 0; }
-	template<FSP_FlagPosition pos> void SetFlag() { flags_ws[3] |= (1 << pos); }
-	template<FSP_FlagPosition pos> void ClearFlag() { flags_ws[3] &= ~(1 << pos); }
-	template<FSP_FlagPosition pos> int GetFlag() const { return flags_ws[3] & (1 << pos); }
+	void ClearFlags() { flags_ws[0] = 0; }
+	template<FSP_FlagPosition pos> void SetFlag() { flags_ws[0] |= (1 << pos); }
+	template<FSP_FlagPosition pos> void ClearFlag() { flags_ws[0] &= ~(1 << pos); }
+	template<FSP_FlagPosition pos> int GetFlag() const { return flags_ws[0] & (1 << pos); }
 
 	// Get the first extension header
 	PFSP_HeaderSignature PFirstExtHeader() const { return (PFSP_HeaderSignature)((uint8_t *)this + be16toh(hs.hsp) - sizeof(FSP_HeaderSignature)); }
@@ -326,13 +326,13 @@ struct FSP_ConnectParam
 	UINT8	flags_ws[4];
 	$FSP_HeaderSignature hs;
 
-	// A bruteforce but safe method of set or retrieve receive window size, with byte order translation
-	int32_t GetRecvWS() const { return ((int32_t)flags_ws[0] << 16) + (flags_ws[1] << 8) + flags_ws[2]; }
-	void SetRecvWS(int32_t v) { flags_ws[0] = (UINT8)(v >> 16); flags_ws[1] = (UINT8)(v >> 8); flags_ws[2] = (UINT8)v; }
-
 	// Block size are counted in 512-byte sectors, actually
-	int GetBlockSize() const { return (int)flags_ws[4] << 9; }
-	void SetBlockSize(int n) { flags_ws[4] = (UINT8)(n >> 9); }
+	int GetBlockSize() const { return (int)flags_ws[0] << 9; }
+	void SetBlockSize(int n) { flags_ws[0] = (UINT8)(n >> 9); }
+
+	// A bruteforce but safe method of set or retrieve receive window size, with byte order translation
+	int32_t GetRecvWS() const { return ((int32_t)flags_ws[1] << 16) + ((unsigned)flags_ws[2] << 8) + flags_ws[3]; }
+	void SetRecvWS(int32_t v) { flags_ws[1] = (UINT8)(v >> 16); flags_ws[2] = (UINT8)(v >> 8); flags_ws[3] = (UINT8)v; }
 };
 
 
@@ -732,8 +732,20 @@ struct ControlBlock
 	// See ControlBlock::Init()
 
 	//
-	int32_t CountSendBuffered() const { return int32_t(sendBufferNextSN - sendWindowFirstSN); }
-	int32_t CountSentInFlight() const { return int32_t(sendWindowNextSN - sendWindowFirstSN); }
+	int32_t CountSendBuffered()
+	{
+		register int32_t a, b;
+		a = _InterlockedOr((volatile LONG *)&sendBufferNextSN, 0);
+		b = _InterlockedOr((volatile LONG *)&sendWindowFirstSN, 0);
+		return a - b;
+	}
+	int32_t CountSentInFlight()
+	{
+		register int32_t a, b;
+		a = _InterlockedOr((volatile LONG *)&sendWindowNextSN, 0);
+		b = _InterlockedOr((volatile LONG *)&sendWindowFirstSN, 0);
+		return a - b;
+	}
 #if defined(TRACE) && !defined(NDEBUG)
 	int DumpSendRecvWindowInfo() const;
 #else
@@ -749,9 +761,10 @@ struct ControlBlock
 	// Return the descriptor of the last buffered packet in the send buffer, NULL if the send queue is empty or cannot obtain the lock
 	// The imcomplete last buffered packet, if any, is implictly locked
 	// but a complete packet MUST be explicitly locked at first here to make the send queue stable enough
-	PFSP_SocketBuf LockLastBufferedSend() const
+	PFSP_SocketBuf LockLastBufferedSend()
 	{
-		register int i = sendBufferNextPos - 1;
+		register int i = _InterlockedOr((volatile LONG *)&sendBufferNextPos, 0);
+		i--;
 		register PFSP_SocketBuf p = HeadSend() + (i < 0 ? sendBufferBlockN - 1 : i);
 		if(! p->Lock())
 			return NULL;
@@ -780,7 +793,12 @@ struct ControlBlock
 
 	void * LOCALAPI InquireSendBuf(int *);
 
-	PFSP_SocketBuf GetFirstReceived() const { return HeadRecv() + recvWindowHeadPos; }
+	PFSP_SocketBuf GetFirstReceived()
+	{
+		register int32_t a = _InterlockedOr((volatile LONG *)& recvWindowHeadPos, 0);
+		return HeadRecv() + a;
+	}
+
 	int LOCALAPI GetSelectiveNACK(seq_t &, FSP_SelectiveNACK::GapDescriptor *, int) const;
 	int LOCALAPI DealWithSNACK(seq_t, FSP_SelectiveNACK::GapDescriptor *, int, timestamp_t &);
 
@@ -841,17 +859,19 @@ struct ControlBlock
 	// return new value of sendWindowNextSN
 	seq_t SlideNextToSend()
 	{
-		if(++sendWindowNextPos - sendBufferBlockN >= 0)
-			sendWindowNextPos -= sendBufferBlockN;
+		register seq_t a = _InterlockedIncrement((LONG *)& sendWindowNextPos);
+		if(a - sendBufferBlockN >= 0)
+			sendWindowNextPos = a - sendBufferBlockN;
 		return _InterlockedIncrement((LONG *) & sendWindowNextSN);
 	}
 	//
 	bool LOCALAPI ResizeSendWindow(seq_t, unsigned int);
 
 	// Width of the advertisable receive window (i.e. free receive buffers to advertize), in blocks
-	int32_t AdRecvWS(seq_t expectedSN) const
+	int32_t AdRecvWS(seq_t expectedSN)
 	{
-		return int32_t(recvWindowFirstSN + recvBufferBlockN - expectedSN);
+		seq_t a = _InterlockedOr((LONG *) & recvWindowFirstSN, 0);
+		return int32_t(a + recvBufferBlockN - expectedSN);
 	}
 
 	bool HasBacklog() const { return backLog.count > 0; }
