@@ -849,35 +849,6 @@ void ControlBlock::SlideSendWindow()
 
 
 
-// Slide the left border of the send window by one, shall be atomic!
-void ControlBlock::SlideSendWindowByOne()
-{
-	if(++sendWindowHeadPos - sendBufferBlockN >= 0)
-		sendWindowHeadPos -= sendBufferBlockN;
-	_InterlockedIncrement((LONG *) & sendWindowFirstSN);
-
-	// UNRESOLVED! But it shall never happen!?
-	if(int(sendWindowNextSN - sendWindowFirstSN) < 0)
-	{
-#if defined(TRACE)
-		printf_s("sendWindowNextSN(%u) out of sync on SlideSendWindow, set to %u\n", sendWindowNextSN, sendWindowFirstSN);
-#endif
-		sendWindowNextSN = sendWindowFirstSN;
-		sendWindowNextPos = sendWindowHeadPos;
-	}
-	// UNRESOLVED! But it shall never happen!?
-	if(int(sendBufferNextSN - sendWindowFirstSN) < 0)
-	{
-#if defined(TRACE)
-		printf_s("sendBufferNextSN(%u) out of sync on SlideSendWindow, set to %u\n", sendBufferNextSN, sendWindowFirstSN);
-#endif
-		sendBufferNextSN = sendWindowFirstSN;
-		sendBufferNextPos = sendWindowHeadPos;
-	}
-}
-
-
-
 // Given
 //	ControlBlock::seq_t		the sequence number that was accumulatively acknowledged
 //	const GapDescriptor *	array of the gap descriptors

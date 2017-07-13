@@ -761,12 +761,13 @@ void CSocketItemEx::EmitQ()
 		? pControlBlock->sendWindowFirstSN + 1
 		: pControlBlock->sendWindowLimitSN;
 	ControlBlock::seq_t & nextSN = pControlBlock->sendWindowNextSN;
-	//
 	bool shouldRetry = pControlBlock->CountSendBuffered() > 0;
-	register ControlBlock::PFSP_SocketBuf skb;
+	//
+	const int32_t maxPos = pControlBlock->sendBufferBlockN;
+	LONG *pNextPos = (LONG *)& pControlBlock->sendWindowNextPos;
 	while (int(nextSN - sendBufferNextSN) < 0 && int(nextSN - lastSN) < 0)
 	{
-		skb = pControlBlock->HeadSend() + pControlBlock->sendWindowNextPos;
+		register ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend() + *pNextPos;
 		if (!skb->GetFlag<IS_COMPLETED>())
 		{
 #if defined(TRACE) && (TRACE & TRACE_PACKET)
@@ -790,8 +791,13 @@ void CSocketItemEx::EmitQ()
 		}
 		skb->SetFlag<IS_SENT>();
 		skb->timeSent = NowUTC();	// not necessarily tRecentSend
-		pControlBlock->SlideNextToSend();
+
+		register int32_t a = _InterlockedIncrement(pNextPos) - maxPos;
+		if (a >= 0)
+			_InterlockedExchange(pNextPos, a);
+		nextSN++;
 	}
+	//
 	if(shouldRetry)
 		AddResendTimer(tRoundTrip_us >> 8);
 }

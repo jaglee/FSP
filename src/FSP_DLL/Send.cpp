@@ -533,6 +533,10 @@ int LOCALAPI CSocketItemDl::PrepareToSend(void * buf, int len, bool eotFlag)
 		//^it might be redundant, but do little harm
 		p->Unlock();
 	}
+	else if (p != NULL)	// && p->GetFlag<IS_COMPLETED>()
+	{
+		p->Unlock();
+	}
 
 	int m = len;
 	if(pControlBlock->InquireSendBuf(& m) != buf)	// 'm' is an in-out parameter
@@ -545,15 +549,13 @@ int LOCALAPI CSocketItemDl::PrepareToSend(void * buf, int len, bool eotFlag)
 	m = (len - 1) / MAX_BLOCK_SIZE;
 
 	register ControlBlock::PFSP_SocketBuf p0 = p;
-	for(int j = 0; j < m; j++)
+	for(register int j = 0; j < m; j++)
 	{
 		p->InitFlags();	// and locked
 		p->version = THIS_FSP_VERSION;
 		p->opCode = PURE_DATA;
 		p->len = MAX_BLOCK_SIZE;
 		p->SetFlag<IS_COMPLETED>();
-		if(p != p0)			// keep p0 locked until the tail pointer is adjusted
-			p->Unlock();	// to keep the co-routine EmitQ of LLS from flounder
 		p++;
 	}
 	//
@@ -567,12 +569,15 @@ int LOCALAPI CSocketItemDl::PrepareToSend(void * buf, int len, bool eotFlag)
 	pControlBlock->sendBufferNextPos += m + 1;
 	pControlBlock->RoundSendBufferNextPos();
 	pControlBlock->sendBufferNextSN += m + 1;
-	// Slightly differ from BufferData; Unlock the start packet only when 
+
 	if(_InterlockedCompareExchange8(& newTransaction, 0, 1) != 0)
 		p0->opCode = PERSIST;
-	//
-	p->Unlock();	// delay unlock p in case p == p0
-	p0->Unlock();	// might be redundant, but it doesn't matter
+	// unlock them in a batch
+	p = p0;
+	for(register int j = 0; j <= m; j++)
+	{
+		(p++)->Unlock();
+	}
 
 	return (m + 1);
 }

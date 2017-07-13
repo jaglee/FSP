@@ -842,8 +842,16 @@ struct ControlBlock
 
 	// Slide the send window to skip all of the acknowledged
 	void SlideSendWindow();
+
 	// Slide the send window to skip the head slot, supposing that it has been acknowledged
-	void SlideSendWindowByOne();
+	void ControlBlock::SlideSendWindowByOne()
+	{
+		register int32_t a = _InterlockedIncrement((LONG *)& sendWindowHeadPos) - sendBufferBlockN;
+		if (a >= 0)
+			_InterlockedExchange((LONG *)& sendWindowHeadPos, a);
+		//
+		_InterlockedIncrement((LONG *)& sendWindowFirstSN);
+	}
 
 	// Set the right edge of the send window after the very first packet of the queue is sent
 	void SetFirstSendWindowRightEdge()
@@ -856,14 +864,6 @@ struct ControlBlock
 		}
 	}
 
-	// return new value of sendWindowNextSN
-	seq_t SlideNextToSend()
-	{
-		register seq_t a = _InterlockedIncrement((LONG *)& sendWindowNextPos);
-		if(a - sendBufferBlockN >= 0)
-			sendWindowNextPos = a - sendBufferBlockN;
-		return _InterlockedIncrement((LONG *) & sendWindowNextSN);
-	}
 	//
 	bool LOCALAPI ResizeSendWindow(seq_t, unsigned int);
 
