@@ -674,8 +674,8 @@ int CSocketItemEx::EmitWithICC(ControlBlock::PFSP_SocketBuf skb, ControlBlock::s
 	register FSP_NormalPacketHeader *pHdr = & pControlBlock->tmpHeader;
 	// ICC, if required, is always set just before being sent
 	pControlBlock->SetSequenceFlags(pHdr, seq);
-	if (skb->GetFlag<END_OF_TRANSACTION>())
-		pHdr->SetFlag<EndOfTransaction>();
+	if (skb->GetFlag<TransactionEnded>())
+		pHdr->SetFlag<TransactionEnded>();
 	pHdr->hs.Set(skb->opCode, sizeof(FSP_NormalPacketHeader));
 
 	// here we needn't check memory corruption as mishavior only harms himself

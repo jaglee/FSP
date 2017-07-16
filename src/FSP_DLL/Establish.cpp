@@ -265,6 +265,7 @@ bool LOCALAPI CSocketItemDl::ToWelcomeConnect(BackLogItem & backLog)
 	}
 	// else let ProcessPendingSend eventually transmit the welcome message, if any
 	skb->SetFlag<IS_COMPLETED>();
+	skb->SetFlag<TransactionEnded>();
 	// the packet is still locked
 
 	return true;
@@ -290,7 +291,7 @@ void CSocketItemDl::ToConcludeConnect()
 	context.welcome = payload;
 	context.len = skb->len;
 
-	pControlBlock->SlideRecvWindowByOne();	// ACK_CONNECT_REQUEST, which may carry welcome
+	pControlBlock->SlideRecvWindowByOne();	// ACK_CONNECT_REQ, which may carry welcome
 	// But // CONNECT_REQUEST does NOT consume a sequence number
 	// See @LLS::OnGetConnectRequest
 
@@ -359,7 +360,7 @@ uint32_t * FSPAPI TranslateFSPoverIPv4(PFSP_IN6_ADDR p, uint32_t dwIPv4, uint32_
 
 // Given
 //	FSPHANDLE	the FSP socket handle
-//	BYTE *		the new session key assumed to have been established by ULA
+//	octet *		the new session key assumed to have been established by ULA
 //	int			the size of the key, number of octets
 //	int32_t		the intent life of the key, number of packets the key could be applied at most
 // Do
@@ -368,7 +369,7 @@ uint32_t * FSPAPI TranslateFSPoverIPv4(PFSP_IN6_ADDR p, uint32_t dwIPv4, uint32_
 //	0 if no error
 //	negative: the error number
 DllSpec
-int FSPAPI InstallSessionKey(FSPHANDLE h, BYTE * key, int keySize, int32_t keyLife)
+int FSPAPI InstallSessionKey(FSPHANDLE h, octet * key, int keySize, int32_t keyLife)
 {
 	if(keySize < FSP_MIN_KEY_SIZE || keySize > FSP_MAX_KEY_SIZE || keySize % sizeof(uint64_t) != 0 || keyLife <= 0)
 		return -EDOM;

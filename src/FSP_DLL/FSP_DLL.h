@@ -33,7 +33,7 @@
 #define STRICT
 #include <Windows.h>
 #include <conio.h>
-
+#include "lz4.h"
 
 // excluded by WIN32_LEAN_AND_MEAN under VS2003??
 #if (_MSC_VER < 1400)
@@ -78,7 +78,7 @@ typedef CSocketItem * PSocketItem;
 // or else the includer is assumed as a caller, not an implementation
 #include "../FSP_API.h"
 
-// per-session connection limit. thereotically any connectable socket might be listener
+// per-session connection limit. theoretically any connectible socket might be listener
 #define MAX_CONNECTION_NUM	16	// 256	// must be some power value of 2
 
 
@@ -104,6 +104,7 @@ public:
 };
 
 
+
 class CSocketItemDl: public CSocketItem
 {
 	friend class	CSocketDLLTLB;
@@ -122,17 +123,30 @@ class CSocketItemDl: public CSocketItem
 	//
 	CSocketItemDl	*next;
 	CSocketItemDl	*prev;
+
+	// optional on-the-wire compression/decompression
+	// Forward declaration for compression-decompression
+	struct SStreamState;
+	struct SDecodeState;
+	// 
+	SStreamState	* pStreamState;
+	SDecodeState	* pDecodeState;
+
 	// for sake of incarnating new accepted connection
 	FSP_SocketParameter context;
+
 	char			isInCritical;	// prevent the second notice processed before the first one was finished
-	char			newTransaction;	// it may simultaneously start a transmit transaction and flush/commit it
 	char			inUse;
+	char			newTransaction;	// it may simultaneously start a transmit transaction and flush/commit it
+	//
 	char			initiatingShutdown : 1;
+	char			isDisposing : 1;
 	char			isFlushing : 1;
 	char			lowerLayerRecycled : 1;
+	char			peerCommitPending : 1;
 	char			peerCommitted : 1;
-	char			isDisposing: 1;
 protected:
+	//
 	ALIGN(8)		HANDLE theWaitObject;
 
 	// On ACK_FLUSH Callback for FSPAPI COMMIT, and overloaded for SHUT_DOWN
@@ -153,7 +167,7 @@ protected:
 	int32_t			bytesBuffered;
 	int32_t			bytesReceived;
 	// For sake of scattered I/O and online compression, a block may include multiple message segment 
-	// int32_t		offsetInLastSendBlock;	// TODO? reserved for on-the-wire compression
+	int32_t			pendingStreamingSize;
 	int32_t			offsetInLastRecvBlock;
 
 	// Pair of functions meant to mimic hardware vector interrupt. It is yet OS-dependent, however
@@ -200,11 +214,19 @@ protected:
 	// In Send.cpp
 	void ProcessPendingSend();
 	int LOCALAPI BufferData(int);
-	int LOCALAPI DeliverData(void *, int);
 
 	// In Receive.cpp
 	void ProcessReceiveBuffer();
 	int FetchReceived();
+
+	// In IOControl.cpp
+	bool AllocStreamState();
+	bool AllocDecodeState();
+	int	 Compress(void *, int &, const void *, int);
+	int	 Decompress(void *, int &, const void *, int);
+	bool HasPendingSend();
+	bool FlushDecodeState();
+	void FreeStreamState() { if(pStreamState != NULL) { free(pStreamState); pStreamState = NULL; } }
 
 public:
 	void Disable()
@@ -287,7 +309,7 @@ public:
 	ControlBlock::PFSP_SocketBuf GetSendBuf() { return pControlBlock->GetSendBuf(); }
 
 	int LOCALAPI PrepareToSend(void *, int, bool);
-	int LOCALAPI SendStream(void *, int, bool);
+	int LOCALAPI SendStream(void *, int, bool, bool);
 	bool TestSetSendReturn(PVOID fp1)
 	{
 		return InterlockedCompareExchangePointer((PVOID *) & fpSent, fp1, NULL) == NULL; 
@@ -322,7 +344,8 @@ public:
 	void SetCallbackOnAccept(CallbackConnected fp1) { context.onAccepted = fp1; }
 
 	void SetNewTransaction() { isFlushing = 0; newTransaction = 1; }
-	
+	void SetEndTransaction() { isFlushing = 1; }
+
 	int SelfNotify(FSP_ServiceCode c);
 	void SetCallbackOnError(NotifyOrReturn fp1) { context.onError = fp1; }
 	void NotifyError(FSP_ServiceCode c, int e = 0) { if (context.onError != NULL) context.onError(this, c, e); }

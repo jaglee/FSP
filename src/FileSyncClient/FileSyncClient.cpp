@@ -149,7 +149,7 @@ static int	FSPAPI  onConnected(FSPHANDLE h, PFSP_Context ctx)
 	FSPControl(h, FSP_SET_CALLBACK_ON_ERROR, (ulong_ptr)onError2);
 
 	printf_s("\nTo send the key material for shared key agreement...\n");
-	WriteTo(h, bufPublicKey, CRYPTO_NACL_KEYBYTES, EOF, onPublicKeySent);
+	WriteTo(h, bufPublicKey, CRYPTO_NACL_KEYBYTES, TO_END_TRANSACTION, onPublicKeySent);
 
 	CryptoNaClGetSharedSecret(bufSharedKey, bufPeersKey, bufPrivateKey);
 
@@ -286,7 +286,7 @@ static int FSPAPI onReceiveNextBlock(FSPHANDLE h, void *buf, int32_t len, BOOL e
 	{
 		printf_s("All data have been received, to acknowledge...\n");
 		// Respond with a code saying no error
-		return WriteTo(h, "0000", 4, EOF, onAcknowledgeSent);
+		return WriteTo(h, "0000", 4, TO_END_TRANSACTION, onAcknowledgeSent);
 	}
 
 	return 1;

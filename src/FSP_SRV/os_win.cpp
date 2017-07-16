@@ -208,7 +208,7 @@ bool CLowerInterface::Initialize()
 		, this		// LPVOID lpParameter
 		, 0			// DWORD dwCreationFlags: run on creation
 		, & idReceiver);	// LPDWORD lpThreadId
-	printf_s("Thead ID of the receiver of the packet from the remote end point = %d\r\n", idReceiver);
+	printf_s("Thread ID of the receiver of the packet from the remote end point = %d\r\n", idReceiver);
 	if(thReceiver == NULL)
 	{
 		REPORT_ERROR_ON_TRACE();

@@ -162,7 +162,7 @@ static int	FSPAPI  onConnected(FSPHANDLE h, PFSP_Context ctx)
 		, chakaPubInfo.clientNonce
 		, (octet *)theUserId, nBytes
 		, chakaPubInfo.peerPublicKey, bufPrivateKey);
-	WriteTo(h, buf, nBytes, EOF, NULL);
+	WriteTo(h, buf, nBytes, TO_END_TRANSACTION, NULL);
 
 	ReadFrom(h, chakaPubInfo.salt, sizeof(chakaPubInfo.salt), onServerResponseReceived);
 	return 0;

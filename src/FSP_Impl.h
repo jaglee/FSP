@@ -235,13 +235,14 @@ struct $FSP_HeaderSignature: FSP_HeaderSignature
 
 
 
-// position start from 0, the rightmost one
-enum FSP_FlagPosition: UINT8
+// position start from 7, the leftmost one
+enum FSP_FlagPosition: uint8_t
 {
-	EndOfTransaction = 0,
-	MinimalDelay = 1,
-	CryptoHashAsMAC = 2,
-	CongestionAlarm = 3,	// Accurate ECN/Scalable Congestion Control
+	TransactionEnded = 7,	// share with the buffer block descriptor
+	Compressed = 6,			// In this version of FSP, LZ4 is exploited
+	CongestionAlarm = 5,	// Accurate ECN/Scalable Congestion Control
+	// 4: reserved for protocol use
+	// 3, 2, 1, 0: reserved for internal use
 };
 
 
@@ -262,7 +263,7 @@ struct FSP_NormalPacketHeader
 	// Given the opCode, total length of all the headers, sequenceNo, expectedNo and receive window size
 	void LOCALAPI Set(FSPOperationCode, uint16_t, uint32_t, uint32_t, int32_t);
 
-	// A bruteforce but safe method of set or retrieve receive window size, with byte order translation
+	// A brute-force but safe method of set or retrieve receive window size, with byte order translation
 	int32_t GetRecvWS()	const { return ((int32_t)flags_ws[1] << 16) + ((unsigned)flags_ws[2] << 8) + flags_ws[3]; }
 	void SetRecvWS(int32_t v) { flags_ws[1] = (UINT8)(v >> 16); flags_ws[2] = (UINT8)(v >> 8); flags_ws[3] = (UINT8)v; }
 
@@ -330,7 +331,7 @@ struct FSP_ConnectParam
 	int GetBlockSize() const { return (int)flags_ws[0] << 9; }
 	void SetBlockSize(int n) { flags_ws[0] = (UINT8)(n >> 9); }
 
-	// A bruteforce but safe method of set or retrieve receive window size, with byte order translation
+	// A brute-force but safe method of set or retrieve receive window size, with byte order translation
 	int32_t GetRecvWS() const { return ((int32_t)flags_ws[1] << 16) + ((unsigned)flags_ws[2] << 8) + flags_ws[3]; }
 	void SetRecvWS(int32_t v) { flags_ws[1] = (UINT8)(v >> 16); flags_ws[2] = (UINT8)(v >> 8); flags_ws[3] = (UINT8)v; }
 };
@@ -356,7 +357,7 @@ struct FSP_AckConnectRequest: FSP_NormalPacketHeader
 
 
 // Mandatory additional header for KEEP_ALIVE
-// minumum constituent of a SNACK header
+// minimum constituent of a SNACK header
 struct FSP_SelectiveNACK
 {
 	struct GapDescriptor
@@ -562,15 +563,15 @@ public:
 /**
  * Session Control Block is meant to be shared by LLS and DLL. Shall be prefixed with 'volatile' if LLS is implemented in hardware
  */
-enum SocketBufFlagBitPosition
+enum: uint8_t
 {
 	EXCLUSIVE_LOCK = 0,
 	IS_ACKNOWLEDGED = 1,
 	IS_COMPLETED = 2,
 	IS_SENT = 3,
 	IS_FULFILLED = IS_COMPLETED,// mutual-mirroring flags for send and receive
-	// 4, 5, 6 : reserved
-	END_OF_TRANSACTION = 7
+	// 4, 5, 6, 7 : reserved for protocol use. See also enum FSP_FlagPosition
+	// Name of the flags for protocol use are in camel-case. The flags for internal buffering are in upper case
 };
 
 
@@ -669,7 +670,7 @@ struct ControlBlock
 		FSPOperationCode opCode;// should be the same as in the FSP fixed header
 		//
 #if ARCH_BIG_ENDIAN
-		template<SocketBufFlagBitPosition i>
+		template<uint8_t i>
 		bool SetFlag(bool value = true)
 		{
 			return (value
@@ -677,10 +678,10 @@ struct ControlBlock
 				: InterlockedBitTestAndReset((LONG *) & flags, i + 16)
 				) != 0;
 		}
-		template<SocketBufFlagBitPosition i>
+		template<uint8_t i>
 		bool GetFlag() { return BitTest((LONG *) & flags, i + 16) != 0; }
 #else
-		template<SocketBufFlagBitPosition i>
+		template<uint8_t i>
 		bool SetFlag(bool value = true)
 		{
 			return (value
@@ -689,7 +690,7 @@ struct ControlBlock
 				) != 0;
 		}
 		//
-		template<SocketBufFlagBitPosition i>
+		template<uint8_t i>
 		bool GetFlag() { return BitTest((LONG *) & flags, i) != 0; }
 #endif
 		bool Lock()	{ return ! SetFlag<EXCLUSIVE_LOCK>(); }

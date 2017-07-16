@@ -403,7 +403,7 @@ bool CSocketItemEx::SendKeepAlive()
 		, pControlBlock->AdRecvWS(pControlBlock->recvWindowNextSN - 1));
 	//
 	if (shouldAppendCommit)
-		buf3.hdr.SetFlag<EndOfTransaction>();
+		buf3.hdr.SetFlag<TransactionEnded>();
 	//
 	SetIntegrityCheckCode(&buf3.hdr, NULL, 0, buf3.snack.GetSaltValue());
 #if defined(TRACE) && (TRACE & (TRACE_HEARTBEAT | TRACE_PACKET | TRACE_SLIDEWIN))

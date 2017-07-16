@@ -110,8 +110,14 @@ int FSPAPI ServiceSAWS_onAccepted(FSPHANDLE h, PFSP_Context ctx)
 // Get the client's ID and nonce, fetch the salted password
 static void FSPAPI onPublicKeyReceived(FSPHANDLE h, FSP_ServiceCode c, int r)
 {
-	ReadFrom(h, & chakaPubInfo.clientNonce, sizeof(chakaPubInfo.clientNonce), NULL);
+	if(r < 0)
+	{
+		printf_s("Previous ReadFrom@ServiceSAWS_onAccepted asynchronously return %d.\n", r);
+		Dispose(h);
+		return;
+	}
 
+	ReadFrom(h, & chakaPubInfo.clientNonce, sizeof(chakaPubInfo.clientNonce), NULL);
 	octet buf[sizeof(sessionClientIdString)];
 	int nBytes = ReadFrom(h, buf, sizeof(buf), NULL);
 	// assert(nBytes <= sizeof(sessionClientIdString));
@@ -138,8 +144,9 @@ static void FSPAPI onPublicKeyReceived(FSPHANDLE h, FSP_ServiceCode c, int r)
 	}
 	memcpy(chakaPubInfo.salt, salt, sizeof(salt));	// should read from database
 
-	WriteTo(h, chakaPubInfo.salt, sizeof(chakaPubInfo.salt) + sizeof(chakaPubInfo.serverNonce) + sizeof(chakaPubInfo.serverRandom), 0, NULL);
-	WriteTo(h, serverResponse, sizeof(serverResponse), EOF, onServerResponseSent);
+	int n = sizeof(chakaPubInfo.salt) + sizeof(chakaPubInfo.serverNonce) + sizeof(chakaPubInfo.serverRandom);
+	WriteTo(h, chakaPubInfo.salt, n, 0, NULL);
+	WriteTo(h, serverResponse, sizeof(serverResponse), TO_END_TRANSACTION, onServerResponseSent);
 }
 
 
@@ -153,6 +160,13 @@ static void FSPAPI onServerResponseSent(FSPHANDLE h, FSP_ServiceCode c, int r)
 
 static void FSPAPI onClientResponseReceived(FSPHANDLE h, FSP_ServiceCode c, int r)
 {
+	if(r < 0)
+	{
+		printf_s("Previous ReadFrom@onServerResponseSent asynchronously return %d.\n", r);
+		Dispose(h);
+		return;
+	}
+
 	if(! CHAKAValidateByServer(chakaPubInfo, passwordHash))
 	{
 		Dispose(h);
@@ -185,7 +199,7 @@ static void FSPAPI onClientResponseReceived(FSPHANDLE h, FSP_ServiceCode c, int 
 #else
 		int nBytes = WideStringToUTF8(buffer, sizeof(buffer), fName);
 #endif
-		WriteTo(h, buffer, nBytes, 0, NULL);
+		WriteTo(h, buffer, nBytes, TO_COMPRESS_STREAM, NULL);
 	} while (FindNextFile(hFind, &findFileData));
 	//
 	FindClose(hFind);

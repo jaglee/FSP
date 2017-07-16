@@ -376,30 +376,30 @@ void UnitTestQuasibitfield()
 	FSP_AckConnectRequest acknowledgement;
 
 	acknowledgement.SetRecvWS(0x1);
-	Assert::IsTrue(acknowledgement.flags_ws[0] == 0
-		&& acknowledgement.flags_ws[1] == 0
-		&& acknowledgement.flags_ws[2] == 1);
+	Assert::IsTrue(acknowledgement.flags_ws[1] == 0
+		&& acknowledgement.flags_ws[2] == 0
+		&& acknowledgement.flags_ws[3] == 1);
 	acknowledgement.SetRecvWS(0x201);
-	Assert::IsTrue(acknowledgement.flags_ws[0] == 0
-		&& acknowledgement.flags_ws[1] == 2
-		&& acknowledgement.flags_ws[2] == 1);
+	Assert::IsTrue(acknowledgement.flags_ws[1] == 0
+		&& acknowledgement.flags_ws[2] == 2
+		&& acknowledgement.flags_ws[3] == 1);
 	acknowledgement.SetRecvWS(0x30201);
-	Assert::IsTrue(acknowledgement.flags_ws[0] == 3
-		&& acknowledgement.flags_ws[1] == 2
-		&& acknowledgement.flags_ws[2] == 1);
+	Assert::IsTrue(acknowledgement.flags_ws[1] == 3
+		&& acknowledgement.flags_ws[2] == 2
+		&& acknowledgement.flags_ws[3] == 1);
 	acknowledgement.SetRecvWS(0x4030201);
-	Assert::IsTrue(acknowledgement.flags_ws[0] == 3
-		&& acknowledgement.flags_ws[1] == 2
-		&& acknowledgement.flags_ws[2] == 1);
+	Assert::IsTrue(acknowledgement.flags_ws[1] == 3
+		&& acknowledgement.flags_ws[2] == 2
+		&& acknowledgement.flags_ws[3] == 1);
 
 	acknowledgement.ClearFlags();
 
 	acknowledgement.SetFlag<EndOfTransaction>();
-	Assert::AreEqual<int>(acknowledgement.GetFlag<EndOfTransaction>(), 1);
-	Assert::IsTrue(acknowledgement.flags_ws[3] == 1);
+	Assert::AreEqual<int>(acknowledgement.GetFlag<EndOfTransaction>(), 128);
+	Assert::IsTrue(acknowledgement.flags_ws[0] == 128);
 	//
 	acknowledgement.ClearFlag<EndOfTransaction>();
-	Assert::IsTrue(acknowledgement.flags_ws[3] == 0);
+	Assert::IsTrue(acknowledgement.flags_ws[0] == 0);
 	Assert::AreEqual<int>(acknowledgement.GetFlag<EndOfTransaction>(), 0);
 }
 

@@ -246,7 +246,7 @@ int LOCALAPI CSocketItemDl::Commit(NotifyOrReturn fp1)
 
 int CSocketItemDl::Commit()
 {
-	isFlushing = 1;
+	SetEndTransaction();
 
 	// The last resort: flush sending stream if it has not yet been committed
 	if (InState(COMMITTED))
@@ -268,7 +268,7 @@ int CSocketItemDl::Commit()
 		return EDOM;	// A warning say that the connection is aborted actually, for it is not in the proper state
 	}
 
-	bool yetSomeDataToBuffer = (pendingSendSize > 0);
+	bool yetSomeDataToBuffer = HasPendingSend();
 	SetMutexFree();
 
 	if(fpCommitted == NULL)

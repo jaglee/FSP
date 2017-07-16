@@ -25,4 +25,5 @@ public:
 	friend void UnitTestBufferData();
 
 	friend void UnitTestFetchReceived();
+	friend void UnitTestCompressAndDecode();
 };

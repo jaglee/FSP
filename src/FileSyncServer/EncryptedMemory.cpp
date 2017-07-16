@@ -59,7 +59,8 @@ static void FSPAPI onPublicKeyReceived(FSPHANDLE h, FSP_ServiceCode c, int r)
 	InstallSessionKey(h, prfKey, 32, INT32_MAX);
 
 	printf_s("\tTo send filename to the remote end...\n");
-	WriteTo(h, fileName, strlen(fileName) + 1, EOF, onFileNameSent);	// multi-byte character set only
+	// multi-byte character set only:
+	WriteTo(h, fileName, strlen(fileName) + 1, TO_END_TRANSACTION, onFileNameSent);
 }
 
 

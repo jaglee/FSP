@@ -126,55 +126,6 @@ timestamp_t NowUTC()
 
 
 
-// Given
-//	FSPHANDLE			the handle to the FSP socket
-//	FSP_ControlCode		the code of the control point
-//	ULONG_PTR			the value to be set
-// Do
-//	Set the value of the control point designated by the code
-// Return
-//	0 if no error
-//	-EDOM if some parameter is out of scope
-//	-EINTR if exception thrown
-DllExport
-int FSPAPI FSPControl(FSPHANDLE hFSPSocket, FSP_ControlCode controlCode, ULONG_PTR value)
-{
-	try
-	{
-		CSocketItemDl *pSocket = (CSocketItemDl *)hFSPSocket;
-		switch(controlCode)
-		{
-		case FSP_GET_SIGNATURE:
-			*(uint64_t *)value = pSocket->GetULASignature();
-			break;
-		case FSP_SET_SIGNATURE:
-			pSocket->SetULASignature(*(uint64_t *)value);
-			break;
-		case FSP_SET_CALLBACK_ON_ERROR:
-			pSocket->SetCallbackOnError((NotifyOrReturn)value);
-			break;
-		case FSP_SET_CALLBACK_ON_REQUEST:
-			pSocket->SetCallbackOnRequest((CallbackRequested)value);
-			break;
-		case FSP_SET_CALLBACK_ON_CONNECT:
-			pSocket->SetCallbackOnAccept((CallbackConnected)value);
-			break;
-		case FSP_GET_PEER_COMMITTED:
-			*((int *)value) = pSocket->HasPeerCommitted() ? 1 : 0;
-			break;
-		default:
-			return -EDOM;
-		}
-		return 0;
-	}
-	catch(...)
-	{
-		return -EINTR;
-	}
-}
-
-
-
 
 // Return
 //	true if obtained the mutual-exclusive lock

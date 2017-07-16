@@ -72,6 +72,12 @@ typedef enum
 } FSP_ControlCode;
 
 
+typedef enum: uint8_t
+{
+	TO_END_TRANSACTION = 0x80,
+	TO_COMPRESS_STREAM = 0x40,
+} FSP_SendOption;
+
 
 #ifdef __cplusplus
 	extern "C" {
@@ -247,7 +253,7 @@ FSPHANDLE FSPAPI MultiplyAndGetSendBuffer(FSPHANDLE, PFSP_Context, int *, Callba
 //	-EINTR	if cannot obtain the right lock
 //	-EIO	if cannot trigger LLS to do the installation work through I/O
 DllSpec
-int FSPAPI InstallSessionKey(FSPHANDLE, uint8_t *, int, int32_t);
+int FSPAPI InstallSessionKey(FSPHANDLE, octet *, int, int32_t);
 
 
 
@@ -265,9 +271,7 @@ int FSPAPI GetSendBuffer(FSPHANDLE, int, CallbackBufferReady);
 //	FSPHANDLE	the socket handle
 //	void *		the buffer pointer
 //	int			the number of octets to send
-//	int8_t	
-//		0:		do not terminate the transmit transaction
-//		EOF:	terminate the transaction
+//	bool		whether terminate the transmit transaction
 // Return
 //	number of octets really scheduled to send
 // Remark
@@ -276,16 +280,14 @@ int FSPAPI GetSendBuffer(FSPHANDLE, int, CallbackBufferReady);
 //	if the buffer is to be continued, its size MUST be multiplier of MAX_BLOCK_SIZE
 //	SendInline could be chained in tandem with GetSendBuffer
 DllSpec
-int FSPAPI SendInline(FSPHANDLE, void *, int, int8_t);
+int FSPAPI SendInline(FSPHANDLE, void *, int, bool);
 
 
 // Given
 //	FSPHANDLE	the socket handle
 //	void *		the buffer pointer
 //	int			the number of octets to send
-//	int8_t	
-//		0:		do not terminate the transmit transaction
-//		EOF:	terminate the transaction
+//	int8_t		the send options (TO_END_TRANSACTION, TO_COMPRESS_STREAM)
 //	NotifyOrReturn	the callback function pointer
 // Return
 //	non-negative if it is the number of octets put into the queue immediately. might be 0 of course.

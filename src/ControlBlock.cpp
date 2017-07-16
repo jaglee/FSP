@@ -658,7 +658,7 @@ void * LOCALAPI ControlBlock::InquireRecvBuf(int & nIO, bool & eotFlag)
 		}
 		nIO += p->len;
 		//
-		if(p->GetFlag<END_OF_TRANSACTION>())
+		if(p->GetFlag<TransactionEnded>())
 		{
 			eotFlag = true;
 			i++;
@@ -666,7 +666,7 @@ void * LOCALAPI ControlBlock::InquireRecvBuf(int & nIO, bool & eotFlag)
 		}
 		if(p->len != MAX_BLOCK_SIZE)
 		{
-			BREAK_ON_DEBUG();	//TRACE_HERE("Unrecoverable error! Unconform to the protocol");
+			BREAK_ON_DEBUG();	//TRACE_HERE("Unrecoverable error! Not conform to the protocol");
 			nIO = -EPERM;
 			return NULL;
 		}
@@ -715,7 +715,7 @@ int LOCALAPI ControlBlock::MarkReceivedFree(int nIO)
 		p->SetFlag<IS_FULFILLED>(false);	// release the buffer
 		nIO -= p->len;
 		//
-		if (p->GetFlag<END_OF_TRANSACTION>())
+		if (p->GetFlag<TransactionEnded>())
 		{
 			++i;
 			break;
@@ -993,9 +993,9 @@ int ControlBlock::MarkSendQueueEOT()
 	p = HeadSend() + (i < 0 ? sendBufferBlockN - 1 : i);
 
 	if(p->GetFlag<IS_SENT>())
-		return p->GetFlag<END_OF_TRANSACTION>() ? 1 : -1;
+		return p->GetFlag<TransactionEnded>() ? 1 : -1;
 
-	p->SetFlag<END_OF_TRANSACTION>();
+	p->SetFlag<TransactionEnded>();
 	p->SetFlag<IS_COMPLETED>();
 	return 2;
 }

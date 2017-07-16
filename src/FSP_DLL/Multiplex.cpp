@@ -34,9 +34,7 @@
 // Given
 //	FSPHANDLE		the handle of the parent FSP socket to be multiplied
 //	PFSP_Context	the pointer to the parameter structure of the socket to create by multiplication
-//	int8_t	
-//		0:			do not terminate the transmit transaction
-//		EOF:		or other non-zero value: terminate the transaction
+//	int8_t			whether (TO_END_TRANSACTION, STREAM_COMPERSSION)
 //	NotifyOrReturn	the pointer to the callback function
 // Return
 //	the handle of the new created socket
@@ -59,7 +57,9 @@ FSPHANDLE FSPAPI MultiplyAndWrite(FSPHANDLE hFSP, PFSP_Context psp1, int8_t flag
 	{
 		p->pendingSendBuf = (BYTE *)psp1->welcome;
 		p->bytesBuffered = 0;
-		p->CheckTransmitaction(flag != 0);
+		p->CheckTransmitaction((flag & TO_END_TRANSACTION) != 0);
+		if((flag & TO_COMPRESS_STREAM) && !p->AllocStreamState())
+			return NULL;
 		// pendingSendSize set in BufferData
 		p->BufferData(psp1->len);
 	}

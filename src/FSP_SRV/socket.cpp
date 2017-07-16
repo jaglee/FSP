@@ -733,7 +733,7 @@ void CMultiplyBacklogItem::ResponseToMultiply()
 
 	*(& skb->len + 1) = *(& TempSocketBuf()->len + 1);
 	skb->len = CopyOutPlainText(ubuf);
-	if (skb->GetFlag<END_OF_TRANSACTION>())
+	if (skb->GetFlag<TransactionEnded>())
 		SetState(pControlBlock->state == COMMITTING ? COMMITTING2 : PEER_COMMIT);
 	else
 		SyncState();

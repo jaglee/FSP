@@ -529,7 +529,7 @@ bool LOCALAPI CSocketItemEx::ValidateSNACK(ControlBlock::seq_t & ackSeqNo, FSP_S
 		return false;
 	}
 
-	if(p1->GetFlag<EndOfTransaction>())
+	if(p1->GetFlag<TransactionEnded>())
 		OnGetEOT();
 
 	n = offset - be16toh(pSNACK->hs.hsp) - sizeof(FSP_SelectiveNACK);
@@ -642,7 +642,7 @@ void CSocketItemEx::OnConnectRequestAck(PktBufferBlock *pktBuf, int lenData)
 
 	pControlBlock->peerAddr.ipFSP.fiberID = pktBuf->fidPair.source;
 	// persistent session key material from the remote end might be ready
-	// as ACK_CONNECT_REQUEST composes a singleton transmit transaction
+	// as ACK_CONNECT_REQ composes a singleton transmit transaction
 	pControlBlock->SnapshotReceiveWindowRightEdge();
 	pControlBlock->sendWindowLimitSN
 		= pControlBlock->sendWindowFirstSN + min(pControlBlock->sendBufferBlockN, response.GetRecvWS());
@@ -972,13 +972,13 @@ void CSocketItemEx::OnGetEOT()
 		: pControlBlock->HeadRecv() + pControlBlock->recvBufferBlockN - 1;
 
 	// Unnecessary EOT is simply ignored
-	if(skb->opCode == _COMMIT || skb->GetFlag<END_OF_TRANSACTION>())
+	if(skb->opCode == _COMMIT || skb->GetFlag<TransactionEnded>())
 		return;
 
 	// but maynot change the opCode as it is mark of delivery
 	if(skb->opCode != 0)
 	{
-		skb->SetFlag<END_OF_TRANSACTION>();
+		skb->SetFlag<TransactionEnded>();
 		skb->opCode = _COMMIT;
 		if(! pControlBlock->HasBeenCommitted())
 			return;
@@ -1161,7 +1161,7 @@ void CSocketItemEx::OnGetMultiply()
 	// Check whether the request is already put into the multiplication backlog
 	// Check whether it is a collision!?
 	CMultiplyBacklogItem *newItem  = CLowerInterface::Singleton.FindByRemoteId(remoteHostID, idSource, fidPair.source);
-	// Unlike ACK_CONNECT_REQUEST, response to MULTIPLY is retranmitted on timed-out, not on demand
+	// Unlike ACK_CONNECT_REQ, response to MULTIPLY is retranmitted on timed-out, not on demand
 	if (newItem != NULL)
 		return;
 
@@ -1219,7 +1219,7 @@ l_bailout:
 	skb->SetFlag<IS_FULFILLED>();
 	//^See also PlacePayload
 	// Be free to accept: we accept an imcomplete MULTIPLY
-	skb->SetFlag<END_OF_TRANSACTION>(pFH->GetFlag<EndOfTransaction>() || headPacket->lenData != MAX_BLOCK_SIZE);
+	skb->SetFlag<TransactionEnded>(pFH->GetFlag<TransactionEnded>() || headPacket->lenData != MAX_BLOCK_SIZE);
 
 	// The first packet received is in the parent's session key while the very first responding packet shall be sent in the derived key!
 	newItem->contextOfICC.snFirstRecvWithCurrKey = headPacket->pktSeqNo + 1;
@@ -1266,12 +1266,12 @@ int CSocketItemEx::PlacePayload()
 			return -EFAULT;
 		//
 		memcpy(ubuf, (BYTE *)pHdr + be16toh(pHdr->hs.hsp), headPacket->lenData);
-		skb->SetFlag<END_OF_TRANSACTION>((pHdr->GetFlag<EndOfTransaction>() != 0));
+		skb->SetFlag<TransactionEnded>((pHdr->GetFlag<TransactionEnded>() != 0));
 	}
 	skb->version = pHdr->hs.major;
 	// Force the last packet descriptor of the transaction in the receive buffer to be _COMMIT.
 	// See also Check HasBeenCommitted()
-	skb->opCode = skb->GetFlag<END_OF_TRANSACTION>() ? _COMMIT : pHdr->hs.opCode;
+	skb->opCode = skb->GetFlag<TransactionEnded>() ? _COMMIT : pHdr->hs.opCode;
 	skb->len = headPacket->lenData;
 	skb->SetFlag<IS_FULFILLED>();
 

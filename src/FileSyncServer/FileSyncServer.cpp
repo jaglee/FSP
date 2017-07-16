@@ -215,11 +215,11 @@ static void FSPAPI onPublicKeyReceived(FSPHANDLE h, FSP_ServiceCode c, int r)
 
 	printf_s("\tTo send filename to the remote end...\n");
 #ifdef _MBCS
-	WriteTo(h, fileName, (int)strlen(fileName) + 1, EOF, onFileNameSent);
+	WriteTo(h, fileName, (int)strlen(fileName) + 1, TO_END_TRANSACTION, onFileNameSent);
 #else
 	octet buffer[sizeof(wchar_t) * MAX_PATH + 4];
 	int len = WideStringToUTF8(buffer, sizeof(buffer), fileName);
-	WriteTo(h, buffer, len, EOF, onFileNameSent);
+	WriteTo(h, buffer, len, TO_END_TRANSACTION, onFileNameSent);
 #endif
 }
 
@@ -286,7 +286,7 @@ static int FSPAPI toSendNextBlock(FSPHANDLE h, void * batchBuffer, int32_t capac
 
 	printf_s("To send %d bytes to the remote end\n", bytesRead);
 
-	int err = SendInline(h, batchBuffer, bytesRead, (int8_t)r);
+	int err = SendInline(h, batchBuffer, bytesRead, r != 0);
 	return (r ? -1 : err);	// if EOF, tell DLL to terminate send
 }
 
