@@ -394,13 +394,13 @@ void UnitTestQuasibitfield()
 
 	acknowledgement.ClearFlags();
 
-	acknowledgement.SetFlag<EndOfTransaction>();
-	Assert::AreEqual<int>(acknowledgement.GetFlag<EndOfTransaction>(), 128);
+	acknowledgement.SetFlag<TransactionEnded>();
+	Assert::AreEqual<int>(acknowledgement.GetFlag<TransactionEnded>(), 128);
 	Assert::IsTrue(acknowledgement.flags_ws[0] == 128);
 	//
-	acknowledgement.ClearFlag<EndOfTransaction>();
+	acknowledgement.ClearFlag<TransactionEnded>();
 	Assert::IsTrue(acknowledgement.flags_ws[0] == 0);
-	Assert::AreEqual<int>(acknowledgement.GetFlag<EndOfTransaction>(), 0);
+	Assert::AreEqual<int>(acknowledgement.GetFlag<TransactionEnded>(), 0);
 }
 
 

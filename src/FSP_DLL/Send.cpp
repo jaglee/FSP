@@ -90,7 +90,7 @@ int FSPAPI SendInline(FSPHANDLE hFSPSocket, void * buffer, int len, bool eotFlag
 
 // Given
 //	FSPHANDLE	the socket handle
-//	void *		the buffer pointer
+//	const void *the buffer pointer
 //	int			the number of octets to send
 //	int8_t		the send options
 //	NotifyOrReturn	the callback function pointer
@@ -107,7 +107,7 @@ int FSPAPI SendInline(FSPHANDLE hFSPSocket, void * buffer, int len, bool eotFlag
 //	If NotifyOrReturn is NULL the function is blocking, i.e.
 //	waiting until every octet in the given buffer has been passed to LLS. See also ReadFrom
 DllExport
-int FSPAPI WriteTo(FSPHANDLE hFSPSocket, void * buffer, int len, int8_t flags, NotifyOrReturn fp1)
+int FSPAPI WriteTo(FSPHANDLE hFSPSocket, const void * buffer, int len, int8_t flags, NotifyOrReturn fp1)
 {
 	register CSocketItemDl * p = (CSocketItemDl *)hFSPSocket;
 	try
@@ -187,7 +187,7 @@ int LOCALAPI CSocketItemDl::SendInplace(void * buffer, int len, bool eot)
 
 
 // Given
-//	void * 	the pointer to the source data buffer
+//	const void * 	the pointer to the source data buffer
 //	int		the size of the source data in bytes
 //	bool	whether to terminate the transmit transaction
 // Return
@@ -195,7 +195,7 @@ int LOCALAPI CSocketItemDl::SendInplace(void * buffer, int len, bool eot)
 //	negative on error
 // Remark
 //	This is a prototype and thus simultaneous send and receive is not considered
-int LOCALAPI CSocketItemDl::SendStream(void * buffer, int len, bool eot, bool toCompress)
+int LOCALAPI CSocketItemDl::SendStream(const void * buffer, int len, bool eot, bool toCompress)
 {
 #ifdef TRACE
 	printf_s("SendStream in state %s[%d]\n", stateNames[GetState()], GetState());
@@ -210,7 +210,7 @@ int LOCALAPI CSocketItemDl::SendStream(void * buffer, int len, bool eot, bool to
 		return -EBADF;
 	}
 
-	if(InterlockedCompareExchangePointer((PVOID *) & pendingSendBuf, buffer, NULL) != NULL)
+	if(InterlockedCompareExchangePointer((PVOID *) & pendingSendBuf, (PVOID)buffer, NULL) != NULL)
 	{
 		SetMutexFree();
 		return -EADDRINUSE;  

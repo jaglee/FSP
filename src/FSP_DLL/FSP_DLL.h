@@ -309,7 +309,7 @@ public:
 	ControlBlock::PFSP_SocketBuf GetSendBuf() { return pControlBlock->GetSendBuf(); }
 
 	int LOCALAPI PrepareToSend(void *, int, bool);
-	int LOCALAPI SendStream(void *, int, bool, bool);
+	int LOCALAPI SendStream(const void *, int, bool, bool);
 	bool TestSetSendReturn(PVOID fp1)
 	{
 		return InterlockedCompareExchangePointer((PVOID *) & fpSent, fp1, NULL) == NULL; 

@@ -61,7 +61,7 @@ void UnitTestSendRecvWnd()
 	// TODO: SCB buffer pointer to user space pointer
 	skb4->opCode = PURE_DATA;
 	skb4->len = MAX_BLOCK_SIZE - 13;
-	skb4->SetFlag<END_OF_TRANSACTION>();
+	skb4->SetFlag<TransactionEnded>();
 	skb4->SetFlag<IS_FULFILLED>();
 
 	int m2;	// onReturn it should == skb4->len, i.e. MAX_BLOCK_SIZE - 13
@@ -88,7 +88,7 @@ void UnitTestSendRecvWnd()
 
 	skb5->opCode = PURE_DATA;
 	skb5->len = MAX_BLOCK_SIZE - 13;
-	skb5->SetFlag<END_OF_TRANSACTION>();
+	skb5->SetFlag<TransactionEnded>();
 	skb5->SetFlag<IS_FULFILLED>();
 	skb5->Lock();
 
@@ -98,7 +98,7 @@ void UnitTestSendRecvWnd()
 
 	skb5->opCode = PURE_DATA;
 	skb5->len = MAX_BLOCK_SIZE;
-	skb5->SetFlag<END_OF_TRANSACTION>(false);
+	skb5->SetFlag<TransactionEnded>(false);
 	skb5->SetFlag<IS_FULFILLED>();
 	skb5->Lock();
 
@@ -111,7 +111,7 @@ void UnitTestSendRecvWnd()
 
 	skb5->opCode = PURE_DATA;
 	skb5->len = MAX_BLOCK_SIZE - 13;
-	skb5->SetFlag<END_OF_TRANSACTION>();
+	skb5->SetFlag<TransactionEnded>();
 	skb5->SetFlag<IS_FULFILLED>();
 
 	// what is the content of the selective negative acknowledgement?
@@ -138,7 +138,7 @@ void UnitTestSendRecvWnd()
 	{
 		pSCB->SlideRecvWindowByOne();
 		p->SetFlag<IS_FULFILLED>(false);	// so that it would not be re-delivered
-		if(p->GetFlag<END_OF_TRANSACTION>())
+		if(p->GetFlag<TransactionEnded>())
 			break;
 		p = pSCB->GetFirstReceived();
 	}
@@ -188,7 +188,7 @@ void UnitTestGenerateSNACK()
 	Assert::IsNotNull(skb1);
 	skb1->opCode = PURE_DATA;
 	skb1->SetFlag<IS_FULFILLED>();
-	skb1->SetFlag<END_OF_TRANSACTION>();
+	skb1->SetFlag<TransactionEnded>();
 	Assert::IsTrue(pSCB->recvWindowNextSN == FIRST_SN + 1);
 
 	skb1 = socket.AllocRecvBuf(FIRST_SN + 2);

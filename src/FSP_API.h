@@ -285,7 +285,7 @@ int FSPAPI SendInline(FSPHANDLE, void *, int, bool);
 
 // Given
 //	FSPHANDLE	the socket handle
-//	void *		the buffer pointer
+//	const void *the buffer pointer
 //	int			the number of octets to send
 //	int8_t		the send options (TO_END_TRANSACTION, TO_COMPRESS_STREAM)
 //	NotifyOrReturn	the callback function pointer
@@ -297,7 +297,7 @@ int FSPAPI SendInline(FSPHANDLE, void *, int, bool);
 //	If NotifyOrReturn is NULL the function is blocking, i.e.
 //	waiting until every octet in the given buffer has been passed to LLS. See also ReadFrom
 DllSpec
-int FSPAPI WriteTo(FSPHANDLE, void *, int, int8_t, NotifyOrReturn);
+int FSPAPI WriteTo(FSPHANDLE, const void *, int, int8_t, NotifyOrReturn);
 
 
 // given
