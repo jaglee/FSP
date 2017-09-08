@@ -35,7 +35,7 @@
 // but assume size_t has been defined
 typedef unsigned char octet;
 
-#include "sm3.h"
+#include "sha256.h"
 
 #ifdef _MSC_VER
 #define FSPAPI __stdcall
@@ -56,7 +56,6 @@ typedef unsigned char octet;
 
 #define crypto_box_beforenm crypto_box_curve25519xsalsa20poly1305_beforenm
 #define crypto_box_keypair crypto_box_curve25519xsalsa20poly1305_keypair
-#define crypto_hash crypto_hash_sha512
 
 
 #ifdef __cplusplus
@@ -115,9 +114,9 @@ int UTF8ToLocalMBCS(char[], int, LPCSTR);
 int UTF8ToWideChars(wchar_t[], int, LPCSTR, int);
 
 // in tweetnacl.c:
-int crypto_box_curve25519xsalsa20poly1305_tweet_keypair(unsigned char *,unsigned char *);
-int crypto_box_curve25519xsalsa20poly1305_tweet_beforenm(unsigned char *,const unsigned char *,const unsigned char *);
-int crypto_hash_sha512_tweet(unsigned char *,const unsigned char *,unsigned long long);
+int crypto_box_beforenm(unsigned char *,const unsigned char *,const unsigned char *);
+int crypto_box_keypair(unsigned char *,unsigned char *);
+int crypto_hash_sha512(unsigned char *,const unsigned char *,unsigned long long);
 
 #ifdef __cplusplus
 }
@@ -162,19 +161,37 @@ SINLINE int FSPAPI CryptoNaClGetSharedSecret(octet *s, const octet *pk, const oc
 //	0 (always succeed in presumed constant time)
 SINLINE int FSPAPI CryptoNaClHash(octet *buf, const octet *input, size_t len)
 {
-	return crypto_hash(buf, input, len);
+	return crypto_hash_sha512(buf, input, len);
 }
 
 
 
-// Given
-//	pointer to the buffer of the output hash, 64 bytes
-//	the input byte string to calculate the hash
-//	the length of the byte string
-// Do
-//	get the secure hash value in 256 bits, calculated by the 'Zh-Cn' locale standard hash algorithm 'sm3'
-SINLINE void FSPAPI CryptoZhCnHash256(octet *buf, const octet *input, size_t len)
+// A very simple HMAC-SHA256 here
+// ipad = the byte 0x36 repeated B times
+// opad = the byte 0x5C repeated B times.
+// H(K XOR opad, H(K XOR ipad, text))
+SINLINE
+void hmac_sha256_key512(octet *output, const octet *key, const octet *input, size_t len)
 {
-	sm3((unsigned char *)input, (int)len, buf);
+	sha256_t ctx;
+	struct
+	{
+		octet padk[CRYPTO_NACL_HASHBYTES];
+		octet ih[SHA256_DIGEST_SIZE];
+	} km;
+	for(register int i = 0; i < CRYPTO_NACL_HASHBYTES; i++)
+		km.padk[i] = key[i] ^ 0x36;
+	//
+	sha256_init(& ctx);
+	sha256_update(& ctx, km.padk, sizeof(km.padk));
+	sha256_update(& ctx, input, len);
+	sha256_final(& ctx, km.ih);
+	//
+	for(register int i = 0; i < CRYPTO_NACL_HASHBYTES; i++)
+		km.padk[i] = key[i] ^ 0x5C;
+	//
+	sha256_init(& ctx);
+	sha256_update(& ctx, (octet *) & km, sizeof(km));
+	sha256_final(& ctx, output);
 }
 #endif

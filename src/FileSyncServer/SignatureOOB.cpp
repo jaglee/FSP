@@ -68,7 +68,7 @@ void StartToSendSignature(FSPHANDLE h)
 	parms.sendSize = MAX_FSP_SHM_SIZE;	// 4MB
 	parms.welcome = signature;
 	parms.len = (unsigned short)sizeof(signature);
-	if(MultiplyAndWrite(h, & parms, EOF, onSignatureSent) == NULL)
+	if(MultiplyAndWrite(h, & parms, TO_END_TRANSACTION, onSignatureSent) == NULL)
 	{
 		printf("Warning!? Failed to multiply the connection.\n");
 		return;

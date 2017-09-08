@@ -72,7 +72,6 @@ FSPHANDLE FSPAPI MultiplyAndWrite(FSPHANDLE hFSP, PFSP_Context psp1, int8_t flag
 // given
 //	the handle of the FSP socket whose connection is to be duplicated,
 //	the pointer to the socket parameter
-//	[inout] pointer to the placeholder of an integer specifying the the minimum requested size of the buffer
 //	the pointer to the callback function
 // return
 //	the handle of the new created socket
@@ -84,26 +83,24 @@ FSPHANDLE FSPAPI MultiplyAndWrite(FSPHANDLE hFSP, PFSP_Context psp1, int8_t flag
 //	As it is in CLONING state if onBufferReady is specified, it would be called but data would just be prebuffered
 //	See also InquireSendBuf, SendInplace, FinalizeSend
 DllExport
-FSPHANDLE FSPAPI MultiplyAndGetSendBuffer(FSPHANDLE hFSP, PFSP_Context psp1, int *pSize, CallbackBufferReady onBufferReady)
+FSPHANDLE FSPAPI MultiplyAndGetSendBuffer(FSPHANDLE hFSP, PFSP_Context psp1, CallbackBufferReady onBufferReady)
 {
 	CommandCloneConnect objCommand;
 	CSocketItemDl *p = CSocketItemDl::ToPrepareMultiply((CSocketItemDl *)hFSP, psp1, objCommand);
 	if(p == NULL)
 		return p;
 
-	if(pSize != NULL && *pSize > 0)
+	if(onBufferReady != NULL)
 	{
-		p->pendingSendSize = *pSize;
-		//
-		void *buf = p->pControlBlock->InquireSendBuf(pSize);
+		int32_t m;
+		void *buf = p->pControlBlock->InquireSendBuf(& m);
 		if(buf == NULL)
 		{
 			CSocketItemDl::FreeItem(p);
 			return NULL;
 		}
 		//
-		if(onBufferReady != NULL)
-			onBufferReady(p, buf, *pSize);
+		onBufferReady(p, buf, m);
 	}
 
 	return p->CompleteMultiply(objCommand);
@@ -197,19 +194,22 @@ FSPHANDLE CSocketItemDl::CompleteMultiply(CommandCloneConnect & cmd)
 //			-->[Send PERSIST]{start keep-alive}
 //		|-->[{Return}:Reject]-->[Send RESET] {abort creating new context}
 // Remark
-//	To make life easy the call back function ...context.onAccepting MAYNOT read or write anything
+//	Unlike in ToWelcomeConnect, context.onAccepting MAY read or write here as multiplication is of 0-RTT
+// See also
+//	ToConcludeConnect()
 bool LOCALAPI CSocketItemDl::ToWelcomeMultiply(BackLogItem & backLog)
 {
 	PFSP_IN6_ADDR remoteAddr = (PFSP_IN6_ADDR) & pControlBlock->peerAddr.ipFSP.allowedPrefixes[MAX_PHY_INTERFACES - 1];	
+	SetState(ESTABLISHED);
 	SetNewTransaction();
-	if( context.onAccepting == NULL	// This is NOT the same policy as ToWelcomeConnect
-	 || context.onAccepting(this, & backLog.acceptAddr, remoteAddr) < 0 )
+	if (context.onAccepting != NULL	|| context.onAccepting(this, & backLog.acceptAddr, remoteAddr) < 0)
 	{
 		Recycle();
 		return false;
 	}
 	SetHeadPacketIfEmpty(PERSIST);
-	SetState(isFlushing ? COMMITTING : ESTABLISHED); // See also ToConcludeConnect()
+	if(isFlushing)
+		SetState(COMMITTING);
 
 	return true;
 }

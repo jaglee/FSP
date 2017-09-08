@@ -55,7 +55,7 @@ static void FSPAPI onPublicKeyReceived(FSPHANDLE h, FSP_ServiceCode c, int r)
 
 	printf_s("\nTo install the negotiated shared key instantly...\n");
 	octet prfKey[32];
-	CryptoZhCnHash256(prfKey, bufSharedKey, CRYPTO_NACL_KEYBYTES);
+	sha256_hash(prfKey, bufSharedKey, CRYPTO_NACL_KEYBYTES);
 	InstallSessionKey(h, prfKey, 32, INT32_MAX);
 
 	printf_s("\tTo send filename to the remote end...\n");
@@ -78,7 +78,7 @@ static void FSPAPI onFileNameSent(FSPHANDLE h, FSP_ServiceCode c, int r)
 		"to get send buffer for reading file and sending inline...\n");
 
 	// We insisted on sending even if only a small buffer of 1 octet is available
-	r = GetSendBuffer(h, sizeOfBuffer, toSendNextBlock);
+	r = GetSendBuffer(h, toSendNextBlock);
 	if(r < 0)
 	{
 		printf_s("Cannot get send buffer onFileNameSent, error code: %d\n", r);
@@ -112,7 +112,7 @@ static int FSPAPI toSendNextBlock(FSPHANDLE h, void * batchBuffer, int32_t capac
 
 	// Would wait until acknowledgement is received. Shutdown is called in onResponseReceived
 	bool r = (offset >= (int)sizeOfBuffer);
-	int n = SendInline(h, batchBuffer, bytesRead, (int8_t)r);
+	int n = SendInline(h, batchBuffer, bytesRead, r);
 	if(r)
 	{
 		printf("All content has been sent. To wait acknowledgement and shutdown.\n");

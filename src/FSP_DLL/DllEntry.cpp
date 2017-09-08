@@ -143,7 +143,7 @@ bool CLightMutex::WaitSetMutex()
 			return false;
 		}
 		//
-		Sleep(0);
+		Sleep(50);
 	}
 	return true;
 }
@@ -369,10 +369,7 @@ bool CSocketItemDl::LockAndValidate()
 // The asynchronous, multi-thread friendly soft interrupt handler
 void CSocketItemDl::WaitEventToDispatch()
 {
-	while (_InterlockedCompareExchange8(&isInCritical, 1, 0) != 0)
-	{
-		Sleep(1);
-	}
+	_InterlockedExchange8(&isInCritical, 1);
 	//
 	while(LockAndValidate())
 	{
@@ -414,8 +411,8 @@ void CSocketItemDl::WaitEventToDispatch()
 			SetMutexFree();
 			break;
 		case FSP_NotifyAccepting:	// overloaded callback for either CONNECT_REQUEST or MULTIPLY
-			if(pControlBlock->HasBacklog())
-				ProcessBacklog();
+			if(context.onAccepting != NULL && pControlBlock->HasBacklog())
+				ProcessBacklogs();
 			SetMutexFree();
 			break;
 		case FSP_NotifyAccepted:
@@ -538,6 +535,18 @@ void CSocketItemDl::WaitEventToDispatch()
 	//
 l_return:
 	_InterlockedExchange8(&isInCritical, 0);
+	// There might be memory leak if it relies on longRunCallback to release dynamically allocated
+	// resource recorded by context.signuatureULA!
+	if(IsInUse())
+	{
+		LongRunCallback fp1 = (LongRunCallback)InterlockedExchangePointer(& longRunCallback, NULL);
+		if(fp1 != NULL)
+			fp1(this, context.signatureULA);
+	}
+	else
+	{
+		CSocketItem::Destroy();	// delayed destroy
+	}
 }
 
 
@@ -739,6 +748,7 @@ CSocketItemDl * CSocketDLLTLB::AllocItem()
 	// so InitializeSRWLock(& item->rtSRWLock) or assign to SRWLOCK_INIT is unneccessary
 	//
 	pSockets[sizeOfWorkSet++] = item;
+	item->isInCritical = 0;
 	_InterlockedExchange8(& item->inUse, 1);
 
 l_bailout:

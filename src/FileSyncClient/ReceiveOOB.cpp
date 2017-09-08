@@ -8,7 +8,7 @@
 int32_t ticksToWait = 6000;	// by default there is no reverse socket and wait for about 300 seconds to wait one. see also main()
 
 
-// Forward definition of the call back function to be executed when the clone connection is closed
+// The call back function to be executed when the clone connection is closed
 static void FSPAPI onShutdown(FSPHANDLE hRev, FSP_ServiceCode code, int value)
 {
 	printf_s("Socket %p, the clone connection has been shutdown.\n", hRev);
@@ -20,9 +20,8 @@ static void FSPAPI onShutdown(FSPHANDLE hRev, FSP_ServiceCode code, int value)
 
 
 
-// Forward definition of the call back function to be executed when
-// data expected in the clone connection has been received.
-static int FSPAPI  onSignatureReceived(FSPHANDLE hRev, void * buf, int32_t length, BOOL eot)
+// The call back function to be executed when data expected in the clone connection has been received.
+static bool FSPAPI onSignatureReceived(FSPHANDLE hRev, void * buf, int32_t length, bool eot)
 {
 	printf_s("Socket %p, %d bytes received, message:\n", hRev, length);
 	printf_s("%s\n", (CHAR *)buf);

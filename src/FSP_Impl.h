@@ -136,6 +136,7 @@ void TraceLastError(char * fileName, int lineNo, char *funcName, char *s1);
 
 
 #define MAX_LOCK_WAIT_ms			60000	// one minute
+#define TIMER_SLICE_ms				50		// 1/20 second
 #define	TIMEOUT_RETRY_MAX_COUNT		5
 
 
@@ -792,7 +793,7 @@ struct ControlBlock
 
 	void LOCALAPI SetSequenceFlags(FSP_NormalPacketHeader *, ControlBlock::seq_t);
 
-	void * LOCALAPI InquireSendBuf(int *);
+	void * LOCALAPI InquireSendBuf(int32_t *);
 
 	PFSP_SocketBuf GetFirstReceived()
 	{
@@ -819,12 +820,12 @@ struct ControlBlock
 	//	bool &: [_Out_] place holder of the End of Transaction flag
 	// Return
 	//	Start address of the received message
-	void * LOCALAPI InquireRecvBuf(int &, bool &);
+	void * LOCALAPI InquireRecvBuf(int32_t &, bool &);
 	// Given
 	//	int :	the number of bytes peeked to be free
 	// Return
 	//	Number of blocks that were free
-	int	LOCALAPI MarkReceivedFree(int);
+	int	LOCALAPI MarkReceivedFree(int32_t);
 
 	void SetRecvWindow(seq_t pktSeqNo)
 	{

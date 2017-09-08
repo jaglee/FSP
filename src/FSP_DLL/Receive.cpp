@@ -183,7 +183,7 @@ int LOCALAPI CSocketItemDl::ReadFrom(void * buffer, int capacity, NotifyOrReturn
 	// If it is blocking, wait until every slot in the receive buffer has been filled
 	// or the peer has committed the transmit transaction
 	uint64_t t0 = GetTickCount64();
-	int r;
+	int32_t r;
 	while ((r = FetchReceived()) >= 0 && bytesReceived < capacity)
 	{
 		do
@@ -220,7 +220,7 @@ l_postloop:
 // Remark
 //	Left border of the receive window is slided if RecvInline has been called but the inquired receive buffer has not been unlocked
 inline
-int CSocketItemDl::FetchReceived()
+int32_t CSocketItemDl::FetchReceived()
 {
 	ControlBlock::PFSP_SocketBuf p;
 	int n, sum = 0;
@@ -318,20 +318,20 @@ void CSocketItemDl::ProcessReceiveBuffer()
 #endif
 	//
 	CallbackPeeked fp1 = fpPeeked;
-	int n;
+	int32_t n;
 	// RecvInline takes precedence
 	if(fp1 != NULL)
 	{
 #ifdef TRACE
 		printf_s("RecvInline...\n");
 #endif
-		bool b;
-		void *p = pControlBlock->InquireRecvBuf(n, b);
+		bool eot;
+		void *p = pControlBlock->InquireRecvBuf(n, eot);
 #ifdef TRACE
-		printf_s("Data to deliver@%p, length = %d, eot = %d\n", p, n, (int)b);
+		printf_s("Data to deliver@%p, length = %d, eot = %d\n", p, n, (int)eot);
 #endif
 		// If end-of-transaction encountered reset fpPeeked so that RecvInline() may work
-		if(b)
+		if(eot)
 		{
 #ifdef TRACE
 			printf_s("Transmit transaction terminated\n");
@@ -345,16 +345,15 @@ void CSocketItemDl::ProcessReceiveBuffer()
 			SetMutexFree();
 			return;
 		}
-		// Do not reset fpPeeked because it may require double-deliver if round-robin
 		//
 		SetMutexFree();
+
+		bool b = fp1(this, p, (int32_t)n, eot);
+		if (!b)
+			fpPeeked = NULL;
 		if(n < 0)
-		{
-			fp1(this, NULL, (int32_t)n, false);
 			return;
-		}
-		//
-		fp1(this, p, (int32_t)n, b);
+
 		WaitUseMutex();
 		// Assume the call-back function did not mess up the receive queue
 		MarkReceiveFinished(n);

@@ -9,8 +9,6 @@
 #include "stdafx.h"
 #include "defs.h"
 
-#pragma warning(disable:4996)	// disable complaint of _sleep
-
 const char		*defaultWelcome = "File synchronizer based on Flexible Session Protocol, version 0.1";
 unsigned char	bufPeerPublicKey[CRYPTO_NACL_KEYBYTES];
 
@@ -84,7 +82,7 @@ void FSPAPI WaitConnection(const char *thisWelcome, unsigned short mLen, Callbac
 	hFspListen = ListenAt(& atAddress, & params);
 
 	while(!r2Finish || !finished)
-		_sleep(1);	// yield CPU out for at least 1ms/one time slice
+		Sleep(1);	// yield CPU out for at least 1ms/one time slice
 
 	if(hFspListen != NULL)
 		Dispose(hFspListen);
@@ -240,7 +238,7 @@ static void FSPAPI onFileNameSent(FSPHANDLE h, FSP_ServiceCode c, int r)
 		"to get send buffer for reading file and sending inline...\n");
 	//UNRESOLVED! spawn an implicit thread to receive remote feed-back
 
-	r = GetSendBuffer(h, 1, toSendNextBlock);
+	r = GetSendBuffer(h, toSendNextBlock);
 	if(r < 0)
 	{
 		printf_s("Cannot get send buffer onFileNameSent, error code: %d\n", r);

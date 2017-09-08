@@ -34,13 +34,12 @@
 
 // Given
 //	FSPHANDLE			the socket handle
-//	int					buffer size requested
 //	CallbackBufferReady	the pointer to the function called back when enough buffer available
 // Return
 //	size of free send buffer available immediately, might be 0 which is not an error
 //	negative if exception has arisen
 DllExport
-int FSPAPI GetSendBuffer(FSPHANDLE hFSPSocket, int m, CallbackBufferReady fp1)
+int32_t FSPAPI GetSendBuffer(FSPHANDLE hFSPSocket, CallbackBufferReady fp1)
 {
 	register CSocketItemDl * p = (CSocketItemDl *)hFSPSocket;
 	try
@@ -50,7 +49,7 @@ int FSPAPI GetSendBuffer(FSPHANDLE hFSPSocket, int m, CallbackBufferReady fp1)
 			return -EBADF;
 		if (!p->TestSetSendReturn(fp1))
 			return -EBUSY;
-		return p->AcquireSendBuf(m);
+		return p->AcquireSendBuf();
 	}
 	catch(...)
 	{
@@ -63,7 +62,7 @@ int FSPAPI GetSendBuffer(FSPHANDLE hFSPSocket, int m, CallbackBufferReady fp1)
 // Given
 //	FSPHANDLE	the socket handle
 //	void *		the buffer pointer
-//	int			the number of octets to send
+//	int32_t		the number of octets to send
 //	bool		whether to terminate the transmit transaction
 // Return
 //	number of octets really scheduled to send
@@ -73,7 +72,7 @@ int FSPAPI GetSendBuffer(FSPHANDLE hFSPSocket, int m, CallbackBufferReady fp1)
 //	may not exceed the capacity that the callback function of GetSendBuffer has returned
 //	if the buffer is to be continued, its size MUST be multiplier of MAX_BLOCK_SIZE
 DllExport
-int FSPAPI SendInline(FSPHANDLE hFSPSocket, void * buffer, int len, bool eotFlag)
+int32_t FSPAPI SendInline(FSPHANDLE hFSPSocket, void * buffer, int32_t len, bool eotFlag)
 {
 	register CSocketItemDl * p = (CSocketItemDl *)hFSPSocket;
 	try
@@ -127,10 +126,8 @@ int FSPAPI WriteTo(FSPHANDLE hFSPSocket, const void * buffer, int len, int8_t fl
 
 // Return
 //	Size of currently available free send buffer
-int LOCALAPI CSocketItemDl::AcquireSendBuf(int n)
+int32_t LOCALAPI CSocketItemDl::AcquireSendBuf()
 {
-	if (n <= 0)
-		return -EDOM;
 	if (! WaitUseMutex())
 		return -EDEADLK;
 
@@ -140,9 +137,7 @@ int LOCALAPI CSocketItemDl::AcquireSendBuf(int n)
 		return -EBUSY;
 	}
 
-	pendingSendSize = n;
-	n = 1;
-	void *buf = pControlBlock->InquireSendBuf(& n);
+	void *buf = pControlBlock->InquireSendBuf(& pendingSendSize);
 	SetMutexFree();
 	if(buf != NULL)
 	{
@@ -151,21 +146,21 @@ int LOCALAPI CSocketItemDl::AcquireSendBuf(int n)
 			return -EFAULT;
 	}
 
-	return n;
+	return pendingSendSize;
 }
 
 
 
 // Given
 //	void *		the buffer pointer
-//	int			the number of octets to send
+//	int32_t		the number of octets to send
 //	bool		whether to terminate the transmit transaction
 // Return
 //	number of octets really scheduled to send
 // Remark
 //	SendInplace works in tandem with AcquireSendBuf
 //	This is a prototype and thus simultaneous send and receive is not considered
-int LOCALAPI CSocketItemDl::SendInplace(void * buffer, int len, bool eot)
+int LOCALAPI CSocketItemDl::SendInplace(void * buffer, int32_t len, bool eot)
 {
 #ifdef TRACE
 	printf_s("SendInplace in state %s[%d]\n", stateNames[GetState()], GetState());
@@ -366,17 +361,7 @@ void CSocketItemDl::ProcessPendingSend()
 			return;	// As there's no thread is waiting free send buffer
 		}
 		//
-		if(pendingSendSize <= 0)
-		{
-			SetMutexFree();
-#ifdef _DEBUG
-			printf_s("Waiting for a null buffer? It should not have happened!\n");
-#endif
-			fp2(this, NULL, 0);
-			return;
-		}
-		//
-		int m = 1;				// minimum block works perfect
+		int32_t m;
 		void * p = pControlBlock->InquireSendBuf(& m);
 		SetMutexFree();
 		// If FSP_NotifyBufferReady caught but even a minimal buffer block is unavailable,
@@ -391,10 +376,8 @@ void CSocketItemDl::ProcessPendingSend()
 		}
 		// If ULA hinted that sending was not finished yet,
 		// continue to use the saved pointer of the callback function
-		bool r = (pendingSendSize - m > 0);
-		if (fp2(this, p, m) >= 0 || r)
+		if (fp2(this, p, m) >= 0)
 		{
-			pendingSendSize = (pendingSendSize - m > 0 ? pendingSendSize - m : 0);
 			TestSetSendReturn(fp2);
 			if(HasFreeSendBuffer())	// In case of round-robin
 				SelfNotify(FSP_NotifyBufferReady);
@@ -595,7 +578,7 @@ l_finish:
 
 // Given
 //	void *	the pointer to the in-place buffer to be marked in the send queue
-//	int		the size of the buffer in bytes
+//	int32_t	the size of the buffer in bytes
 //	bool	whether to terminate the transmit transaction
 // Return
 //	number of blocks split
@@ -604,7 +587,7 @@ l_finish:
 //	-EDOM if the second or third parameter is illegal
 // Remark
 //	Would automatically mark the previous last packet as completed
-int LOCALAPI CSocketItemDl::PrepareToSend(void * buf, int len, bool eotFlag)
+int LOCALAPI CSocketItemDl::PrepareToSend(void * buf, int32_t len, bool eotFlag)
 {
 	if(len <= 0 || len % MAX_BLOCK_SIZE != 0 && ! eotFlag)
 		return -EDOM;
@@ -618,8 +601,8 @@ int LOCALAPI CSocketItemDl::PrepareToSend(void * buf, int len, bool eotFlag)
 		p->Unlock();
 	}
 
-	int m = len;
-	if(pControlBlock->InquireSendBuf(& m) != buf)	// 'm' is an in-out parameter
+	int32_t m;
+	if(pControlBlock->InquireSendBuf(& m) != buf)
 		return -EFAULT;
 	if(m < len)
 		return -ENOMEM;

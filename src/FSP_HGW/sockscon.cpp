@@ -1,12 +1,6 @@
 /**
   FSP http accelerator, SOCKS gateway and tunnel server
 
-	SOCKS4a extends the SOCKS4 protocol to allow a client to specify a destination domain name rather than an IP address;
-	This is useful when the client itself cannot resolve the destination host's domain name to an IP address.
-	client should set the first three bytes of DSTIP to NULL and the last byte to a non-zero value.
-	Following the NULL byte terminating USERID, the client must send the destination domain name
-	and terminate it with another NULL byte. This is used for both "connect" and "bind" requests.
-
 	Client to SOCKS server:
 
 	field 1: SOCKS version number, 1 byte, must be 0x04 for this version
@@ -14,9 +8,8 @@
 	0x01 = establish a TCP/IP stream connection
 	0x02 = establish a TCP/IP port binding
 	field 3: port number, 2 bytes
-	field 4: deliberate invalid IP address, 4 bytes, first three must be 0x00 and the last one must not be 0x00
+	field 4: IPv4 address, 4 bytes
 	field 5: the user ID string, variable length, terminated with a null (0x00)
-	field 6: the domain name of the host to contact, variable length, terminated with a null (0x00)
 
 	Server to SOCKS client:
 
@@ -26,12 +19,8 @@
 		0x5B = request rejected or failed
 		0x5C = request failed because client is not running identd (or not reachable from the server)
 		0x5D = request failed because client's identd could not confirm the user ID string in the request
-	field 3: port number, 2 bytes (in network byte order)
-	field 4: IP address, 4 bytes (in network byte order)
-
-	A server using protocol SOCKS4a must check the DSTIP in the request packet.
-	If it represents address 0.0.0.x with nonzero x, the server must read in the domain name that the client sends in the packet.
-	The server should resolve the domain name and make connection to the destination host if it can.
+	field 3: 2 bytes (should better be zero)
+	field 4: 4 bytes (should better be zero)
 
   Process
 	### IPv4: check ruleset
@@ -41,25 +30,6 @@
 	   if not in white-list, try search PTR, [DnsQuery], if get the _FSP exception-list: direct connect
 	   }
 	   not in the white-list: FSP-relay
-
-	### domain name: favor FSP/IPv6
-	search the 'white list' (local memory cache), make FSP connection if matched;
-	otherwise
-	  if port number = 18003 ('F''S'), try to resolve AAAA only
-	    if succeeded, make FSP connection first
-		  if succeeded, put into white list
-		--if failed, fall to resolve IPv4 address
-	  otherwise if started with '_FSP.', try to resolve AAAA only
-	    if succeeded, make FSP connection first
-		  if succeeded, put into white list
-		--if failed, fall to resolve IPv4 address
-	otherwise, try to resolve both AAAA AND A address
-	  if there's IPv6 address resolved, try to make FSP connection
-	    if succeeded, put into white list
-	  --if failed, try IPv4 address
-	if IPv4 address resolving failed, or TCP connect failed, return failure information
-
-
 
   Further streaming:
     transparent HTTP acceleration!
@@ -74,66 +44,32 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 
-#ifdef WIN32
-#include <WinSock2.h>
-#include <mstcpip.h>
-#include <MSWSock.h>
-#include "../FSP_API.h"
-#include "../Crypto/CryptoStub.h"
-#pragma comment(lib, "Ws2_32.lib")
+#include "defs.h"
+
+// If compiled in Debug mode with the '_DEBUG' macro predefined by default, it tests FSP over UDP/IPv4
+// If compiled in Release mode, or anyway without the '_DEBUG' macro predefined, it tests FSP over IPv6
+#ifdef _DEBUG
+# define REMOTE_APPLAYER_NAME "localhost:80"
+// #define REMOTE_APPLAYER_NAME "lt-x61t:80"
+// #define REMOTE_APPLAYER_NAME "lt-at4:80"
+// #define REMOTE_APPLAYER_NAME "lt-ux31e:80"
 #else
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <unistd.h>
-#include <strings.h>
-#include <pthread.h>
-#include <sys/wait.h>
-#define _strcmpi strcasecmp
+# define REMOTE_APPLAYER_NAME "E000:AAAA::1"
 #endif
 
-#define SOCKS_VERSION		4
-#define MAX_WORKING_THREAD	4	// fine tuning this value to half number of workable hyper-thread of the platform
-#define RECV_TIME_OUT		30	// half a miniute
+static unsigned char bufPrivateKey[CRYPTO_NACL_KEYBYTES];
+static FSPHANDLE hClientMaster;
 
+// shared by master connection and child connection
+static void FSPAPI onError(FSPHANDLE, FSP_ServiceCode, int);
 
-enum ERepCode: octet
-{
-	REP_SUCCEEDED = 0x5A,
-	REP_REJECTED = 0x5B,
-	REP_NO_IDENTD = 0x5C,
-	REP_AUTH_FAILED = 0x5D
-};
+// for master connection
+static int	FSPAPI onConnected(FSPHANDLE, PFSP_Context);
+static void FSPAPI onPublicKeySent(FSPHANDLE, FSP_ServiceCode, int);
+static bool	FSPAPI onResponseReceived(FSPHANDLE, void *, int32_t, bool);
 
-#define SOCKS_CMD_CONNECT 1	// only support CONNECT
-
-#include <pshpack1.h>
-typedef struct SRequestResponse
-{
-	union
-	{
-		octet version;	// for request
-		octet _reserved;// for response
-	};
-	union
-	{
-		octet cmd;
-		octet rep;
-	};
-	uint16_t nboPort;	// port number in network byte order
-	in_addr inet4Addr;
-	// char	userId[2];	// just a placeholder
-	// char _dName[2];	// just a placeholder
-} *PRequestResponse;
-#include <poppack.h>
-
-
-void ProcessIPv4Connect(SOCKET, PRequestResponse);
-void ProcessDNameConnect(SOCKET, PRequestResponse);
-
-//
-FSPHANDLE TunnelForInet4(in_addr, uint16_t);
-void ReportErrorToClient(SOCKET, ERepCode);
+// for child connection
+static void FSPAPI onMultiplyReturn(FSPHANDLE, FSP_ServiceCode, int);
 
 
 //
@@ -191,6 +127,24 @@ VOID CALLBACK TpWorkCallBack(PTP_CALLBACK_INSTANCE, PVOID, PTP_WORK Work);
 
 void ToServeSOCKS(int port)
 {
+	FSP_SocketParameter parms;
+	memset(& parms, 0, sizeof(parms));
+	parms.onAccepting = NULL;
+	parms.onAccepted = onConnected;
+	parms.onError = onError;
+	parms.recvSize = MAX_FSP_SHM_SIZE;
+	parms.sendSize = MAX_FSP_SHM_SIZE;
+	hClientMaster = Connect2(REMOTE_APPLAYER_NAME, & parms);
+	if(hClientMaster == NULL)
+	{
+		printf_s("Failed to initialize the connection in the very beginning\n");
+		return;
+	}
+	//
+
+	if(! requestPool.Init(MAX_WORKING_THREADS))
+		return;
+
     PTP_POOL pool = NULL;
     TP_CALLBACK_ENVIRON envCallBack;
     PTP_CLEANUP_GROUP cleanupgroup = NULL;
@@ -207,7 +161,7 @@ void ToServeSOCKS(int port)
 		return;
 	}
 
-    SetThreadpoolThreadMaximum(pool, MAX_WORKING_THREAD);
+    SetThreadpoolThreadMaximum(pool, MAX_WORKING_THREADS);
     bRet = SetThreadpoolThreadMinimum(pool, 1);
     if (!bRet)
 	{
@@ -303,13 +257,13 @@ l_bailout4:
 	//SetThreadpoolTimer(timer, NULL, 0, 0); // cancel waiting queued callback
 	//WaitForThreadpoolTimerCallbacks(timer, true);
 	////CloseThreadpoolTimer(timer); // unnecessary.
-l_bailout3:
+//l_bailout3:
 	// CloseThreadpoolCleanupGroupMembers also releases objects
 	// that are members of the cleanup group, so it is not necessary 
 	// to call close functions on individual objects 
 	// after calling CloseThreadpoolCleanupGroupMembers.
     CloseThreadpoolCleanupGroupMembers(cleanupgroup, FALSE, NULL);
-l_bailout2:
+//l_bailout2:
 	CloseThreadpoolCleanupGroup(cleanupgroup);
 l_bailout1:
     CloseThreadpool(pool);
@@ -325,13 +279,20 @@ TpWorkCallBack(PTP_CALLBACK_INSTANCE Instance, PVOID parameter, PTP_WORK Work)
     UNREFERENCED_PARAMETER(Instance);
     UNREFERENCED_PARAMETER(Work);
 
+	PRequestPoolItem p = requestPool.AllocItem();
 	SOCKET client = (SOCKET)parameter;
-	SRequestResponse req;
+	if(p == NULL)
+	{
+		ReportErrorToClient(client, REP_REJECTED);
+		return;
+	}	
+	SRequestResponse & req = p->req;
 
 	int r = recv(client, (char *) & req, sizeof(req), 0);
 	if(r == SOCKET_ERROR)
 	{  
         printf_s("recv() socks version failed with error: %d\n", WSAGetLastError());
+		requestPool.FreeItem(p);
 		ReportErrorToClient(client, REP_REJECTED);
         return;
     }
@@ -340,12 +301,14 @@ TpWorkCallBack(PTP_CALLBACK_INSTANCE Instance, PVOID parameter, PTP_WORK Work)
 	if(req.version != SOCKS_VERSION)
 	{
         printf_s("%d: unsupport version\n", req.version);
+		requestPool.FreeItem(p);
 		ReportErrorToClient(client, REP_REJECTED);
 		return;
 	}
 	if(req.cmd != SOCKS_CMD_CONNECT)
 	{
         printf_s("%d: unsupport command\n", req.version);
+		requestPool.FreeItem(p);
 		ReportErrorToClient(client, REP_REJECTED);
 		return;
 	}
@@ -363,110 +326,33 @@ TpWorkCallBack(PTP_CALLBACK_INSTANCE Instance, PVOID parameter, PTP_WORK Work)
 	if(r < 0)
 	{
 		printf_s("recv() failed with error: %d\n", WSAGetLastError());
+		requestPool.FreeItem(p);
 		ReportErrorToClient(client, REP_REJECTED);
 		return;
 	}
 	printf_s("\n");
-
-	const in_addr & a = req.inet4Addr;
-	if(a.S_un.S_un_w.s_w1 == 0 && a.S_un.S_un_b.s_b3 == 0 && a.S_un.S_un_b.s_b4 != 0)
-		ProcessDNameConnect(client, & req);
-	else if(a.S_un.S_addr != 0)
-		ProcessIPv4Connect(client, & req);
-	else
-		ReportErrorToClient(client, REP_REJECTED);
-}
-
-
-
-void ProcessIPv4Connect(SOCKET client, PRequestResponse req)
-{
-	struct timeval timeout;
-	timeout.tv_sec = RECV_TIME_OUT;
-	timeout.tv_usec = 0;
-	setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, sizeof(timeout));
-	//FSPHANDLE hTunnel = TunnelForInet4(req->inet4Addr, req->nboPort);
-	// tunnel the address to the remote end, directly
-
-	// following code should be put in the remote end point
-	SOCKET toServer = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-	if(toServer == SOCKET_ERROR)
-	{
-        printf_s("remote socket() failed with error: %d\n", WSAGetLastError());
-		ReportErrorToClient(client, REP_REJECTED);
-	}
-
-	sockaddr_in remoteEnd;
-	remoteEnd.sin_addr = req->inet4Addr;
-	remoteEnd.sin_family = AF_INET;
-	remoteEnd.sin_port = req->nboPort;
-
-	printf_s("Try to connect to %s:%d\n", inet_ntoa(remoteEnd.sin_addr), ntohs(remoteEnd.sin_port));
-
-	int r = connect(toServer, (PSOCKADDR) & remoteEnd, sizeof(remoteEnd)); 
-	if(r != 0)
-	{
-        printf_s("connect() failed with error: %d\n", WSAGetLastError());
-		ReportErrorToClient(client, REP_REJECTED);
-	}
-	// Should be tunneled
-	ReportErrorToClient(client, REP_SUCCEEDED);
-
-	char buf[BUFSIZ];
-
-	// following are prototype, actually
-	FD_SET rdSet;
-	do
-	{
-		FD_ZERO(& rdSet);
-		FD_SET(client, & rdSet);
-		FD_SET(toServer, & rdSet);
-		if(select(0, & rdSet, NULL, NULL, NULL) <= 0)
-		{
-	        printf_s("select() failed with error: %d\n", WSAGetLastError());
-			break;
-		}
-		if(FD_ISSET(client, & rdSet))
-		{
-			r = recv(client, buf, sizeof(buf), 0);
-			if(r <= 0)
-				break;
-			r = send(toServer, buf, r, 0);
-			if(r <= 0)
-				break;
-		}
-		if(FD_ISSET(toServer, & rdSet))
-		{
-			r = recv(toServer, buf, sizeof(buf), 0);
-			if(r <= 0)
-				break;
-			r = send(client, buf, r, 0);
-			if(r <= 0)
-				break;
-		}
-	} while(true);
-	//ReportErrorToClient(client, REP_REJECTED);
-
-	// The shutdown function does not block regardless of the SO_LINGER setting on the socket.
-	shutdown(toServer, SD_SEND);
 	//
-	shutdown(client, SD_SEND);
-	while(r > 0)
+	p->hSocket = client;
+
+	FSP_SocketParameter parms;
+	memset(& parms, 0, sizeof(parms));
+	parms.onAccepting = NULL;
+	parms.onAccepted = NULL;
+	parms.onError = onError;
+	parms.recvSize = BUFFER_POOL_SIZE;
+	parms.sendSize = BUFFER_POOL_SIZE;
+	parms.welcome = &p->req;
+	parms.len = (unsigned short)sizeof(p->req);
+	parms.signatureULA = (ulong_ptr)p;
+
+	FSPHANDLE h = MultiplyAndWrite(hClientMaster, & parms, TO_END_TRANSACTION, onMultiplyReturn);
+	if(h == NULL)
 	{
-		r = recv(client, buf, sizeof(buf), 0);
+		requestPool.FreeItem(p);
+		ReportErrorToClient(client, REP_REJECTED);
 	}
-	// until either nothing may be received or the peer has closed the connection
-	closesocket(client);
-	//
-	closesocket(toServer);
 }
 
-
-
-void ProcessDNameConnect(SOCKET client, PRequestResponse buf)
-{
-	printf_s("Unimplemented yet.\n");
-}
 
 
 void ReportErrorToClient(SOCKET client, ERepCode code)
@@ -477,6 +363,190 @@ void ReportErrorToClient(SOCKET client, ERepCode code)
 
 	int r = send(client, (char *) & rep, sizeof(rep), 0);
 	if(r == SOCKET_ERROR)
+	{
         printf_s("send() socks response failed with error: %d\n", WSAGetLastError());
-	// or just silently return?
+		closesocket(client);
+	}
+	else if(code != REP_SUCCEEDED)
+	{
+		CloseClient(client, false);
+	}
+}
+
+
+
+void CloseClient(SOCKET client, bool forceful)
+{
+	int r = forceful ? 1 : 0;
+	struct timeval timeout;
+	timeout.tv_sec = RECV_TIME_OUT;
+	timeout.tv_usec = 0;
+	setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, sizeof(timeout));
+	//
+	shutdown(client, SD_SEND);
+	while(r > 0)
+	{
+		char c;
+		r = recv(client, & c, 1, 0);
+	}
+	// until either nothing may be received or the peer has closed the connection
+	closesocket(client);
+}
+
+
+//
+// 
+//
+
+// The call back function on exception notified. Just report error and simply abort the program.
+static void FSPAPI onError(FSPHANDLE h, FSP_ServiceCode code, int value)
+{
+#ifdef TRACE
+	printf_s("Notify: socket %p, service code = %d, return %d\n", h, code, value);
+#endif
+	if(h == hClientMaster)
+	{
+		Dispose(h);
+		hClientMaster = NULL;
+	}
+	return;
+}
+
+
+
+// On connected, send the public key to the remote end. We save the public key
+// temporarily on the stack because we're sure that there is at least one
+// buffer block available and the public key fits in one buffer block 
+static int	FSPAPI  onConnected(FSPHANDLE h, PFSP_Context ctx)
+{
+	unsigned char bufPublicKey[CRYPTO_NACL_KEYBYTES];
+	unsigned char bufPeersKey[CRYPTO_NACL_KEYBYTES];
+	unsigned char bufSharedKey[CRYPTO_NACL_KEYBYTES];
+#ifdef TRACE
+	printf_s("\nHandle of FSP session: %p", h);
+#endif
+	if(h == NULL)
+	{
+		printf_s("\n\tConnection failed.\n");
+		return -1;
+	}
+
+	int mLen = strlen((const char *)ctx->welcome) + 1;
+#ifdef TRACE
+	printf_s("\tWelcome message length: %d\n", ctx->len);
+	printf_s("%s\n", ctx->welcome);
+#endif
+	memcpy(bufPeersKey, (const char *)ctx->welcome + mLen, CRYPTO_NACL_KEYBYTES);
+
+	CryptoNaClKeyPair(bufPublicKey, bufPrivateKey);
+
+#ifdef TRACE
+	printf_s("\nTo send the key material for shared key agreement...\n");
+#endif
+	WriteTo(h, bufPublicKey, CRYPTO_NACL_KEYBYTES, TO_END_TRANSACTION, onPublicKeySent);
+
+#ifdef TRACE
+	printf_s("\tTo install the shared key instantly...\n");
+#endif
+	CryptoNaClGetSharedSecret(bufSharedKey, bufPeersKey, bufPrivateKey);
+	octet prfKey[32];
+	sha256_hash(prfKey, bufSharedKey, CRYPTO_NACL_KEYBYTES);
+	InstallSessionKey(h, prfKey, 32, INT32_MAX);
+
+	return 0;
+}
+
+
+
+static void FSPAPI onPublicKeySent(FSPHANDLE h, FSP_ServiceCode c, int r)
+{
+#ifdef TRACE
+	printf_s("Result of sending public key: %d\n", r);
+#endif
+	if(r < 0)
+	{
+		Dispose(h);
+		return;
+	}
+
+	// TODO: client's side authentication & authorization
+	if(RecvInline(h, onResponseReceived) < 0)
+	{
+		Dispose(h);
+		return;
+	}
+}
+
+
+
+// On receive the name of the remote file prepare to accept the content by receive 'inline'
+// here 'inline' means ULA shares buffer memory with LLS
+static bool FSPAPI onResponseReceived(FSPHANDLE h, void * buf, int32_t len, bool eot)
+{
+	if(buf == NULL || len <= 0 || h != hClientMaster)
+	{
+		Dispose(h);
+		return FALSE;
+	}
+	//
+	// TODO: process the buffer!
+	//
+	if(eot && RecvInline(h, onResponseReceived) < 0)
+		Dispose(h);
+
+	return TRUE;
+}
+
+
+
+void MakeInet4TunnelRequest(SOCKET client, PRequestResponse req)
+{
+	PRequestPoolItem p = requestPool.AllocItem();
+	p->hSocket = client;
+	memcpy(&p->req, req, sizeof(req));
+
+	FSP_SocketParameter parms;
+	memset(& parms, 0, sizeof(parms));
+	parms.onAccepting = NULL;
+	parms.onAccepted = NULL;
+	parms.onError = onError;
+	parms.recvSize = 0;	// the underlying service would give the minimum, however
+	parms.sendSize = MAX_FSP_SHM_SIZE;	// 4MB
+	parms.welcome = &p->req;
+	parms.len = (unsigned short)sizeof(p->req);
+	parms.signatureULA = (ulong_ptr)p;
+
+	FSPHANDLE h = MultiplyAndWrite(hClientMaster, & parms, TO_END_TRANSACTION, onMultiplyReturn);
+	if(h == NULL)
+		ReportErrorToClient(client, REP_REJECTED);
+}
+
+
+
+static void FSPAPI onMultiplyReturn(FSPHANDLE h, FSP_ServiceCode c, int value)
+{
+	PRequestPoolItem p;
+	FSPControl(h, FSP_GET_SIGNATURE, (ulong_ptr) & p);
+	if(p == NULL)
+	{
+		Dispose(h);
+		return;
+	}
+	if(p->hSocket == INVALID_SOCKET)
+	{
+		requestPool.FreeItem(p);
+		Dispose(h);
+		return;
+	}
+	if(value < 0)
+	{
+		ReportErrorToClient(p->hSocket, REP_REJECTED);
+		requestPool.FreeItem(p);
+		Dispose(h);
+		return;
+	}
+	//
+	p->hFSP = h;
+	RecvInline(h, onFSPDataAvailable);
+	GetSendBuffer(h, toReadTCPData);
 }

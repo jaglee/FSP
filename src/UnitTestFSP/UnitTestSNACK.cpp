@@ -38,7 +38,7 @@ void UnitTestSendRecvWnd()
 	Assert::IsNotNull(skb);
 	Assert::IsTrue(pSCB->sendBufferNextSN == FIRST_SN + 1);
 
-	int m = MAX_BLOCK_SIZE;
+	int32_t m;
 	void *inplaceBuf = pSCB->InquireSendBuf(& m);
 	Assert::IsNotNull(inplaceBuf);	// it might fail if memsize is too small
 	Assert::IsTrue(m > 0);			// it might fail if memsize is too small

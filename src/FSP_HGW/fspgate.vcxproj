@@ -77,14 +77,16 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="..\Crypto\CryptoStub.c" />
-    <ClCompile Include="..\Crypto\sm3.c" />
+    <ClCompile Include="..\Crypto\sha256.c" />
     <ClCompile Include="..\Crypto\tweetnacl.c" />
     <ClCompile Include="fcgi.cpp" />
     <ClCompile Include="httpd.cpp" />
+    <ClCompile Include="RequestPool.cpp" />
     <ClCompile Include="sockscon.cpp" />
     <ClCompile Include="tunnel.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="defs.h" />
     <ClInclude Include="errstrs.hpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

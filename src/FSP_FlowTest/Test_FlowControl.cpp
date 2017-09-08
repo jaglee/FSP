@@ -360,8 +360,8 @@ void FlowTestRecvWinRoundRobin()
 	// The send buffer space is fulfilled, while the third receive buffer block is free
 	PrepareFlowTestResend(dbgSocket, pSCB);
 
-	int m = MAX_BLOCK_SIZE - 1;
-	void * buf = pSCB->InquireSendBuf(m);
+	int32_t m;
+	void * buf = pSCB->InquireSendBuf(& m);
 	// should be NULL, -ENOMEM
 	printf_s("InquireSendBuf: buf = %p, size = %d\n", buf, m);
 

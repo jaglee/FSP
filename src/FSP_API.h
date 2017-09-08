@@ -33,6 +33,8 @@
  */
 #include "FSP.h"
 
+// About bool type: assume the compiler support C99, or <stdbool.h> is included
+
 #ifdef _MSC_VER
 #define FSPAPI __stdcall
 #else
@@ -69,6 +71,7 @@ typedef enum
 	FSP_SET_CALLBACK_ON_REQUEST,// CallbackRequested
 	FSP_SET_CALLBACK_ON_CONNECT,// CallbackConnected
 	FSP_GET_PEER_COMMITTED,
+	FSP_SET_LONGRUN_CALLBACK,
 } FSP_ControlCode;
 
 
@@ -90,7 +93,7 @@ typedef enum: uint8_t
 //					exploit CMSG_FIRSTHDR, CMSG_NXTHDR and WSA_CMSG_DATA (CMSG_DATA) to access the header
 //	PFSP_IN6_ADDR	the remote address that make the connection (address has been converted if IPv4)
 // Return
-//	unity (positive integer) is to do a transactional send-receive),
+//	unity (positive integer) is to do a transactional send-receive,
 //	zero if to continue,
 //	negative if to abort
 typedef int (FSPAPI *CallbackRequested)(FSPHANDLE, PFSP_SINKINF, PFSP_IN6_ADDR);
@@ -116,13 +119,13 @@ typedef int (FSPAPI *CallbackConnected)(FSPHANDLE, PFSP_Context);
 //	FSPHANDLE		the handle of the FSP socket (the context)
 //	void *			the pointer to the (partial) message buffer
 //	int32_t			the length of the available (partial) message in bytes
-//	BOOL			whether the peer has committed the tansmit transaction
+//	bool			whether the peer has committed the tansmit transaction
 // Return
-//	true(positive non-zero) if processing is successful and the buffer should be release
-//	false(zero) if processing has not finished and the receive buffer should be held
+//	true if processing is successful and the buffer should be release
+//	false if processing has not finished and the receive buffer should be held
 // Remark
 //	the caller shall make the callback function thread-safe
-typedef int (FSPAPI *CallbackPeeked)(FSPHANDLE, void *, int32_t, BOOL);
+typedef bool (FSPAPI *CallbackPeeked)(FSPHANDLE, void *, int32_t, bool);
 
 
 // The pointer of the function callbacked when some inline send buffer is available
@@ -146,6 +149,11 @@ typedef int (FSPAPI *CallbackBufferReady)(FSPHANDLE, void *, int32_t);
 //	int				the intent returned value
 typedef void (FSPAPI *NotifyOrReturn)(FSPHANDLE, FSP_ServiceCode, int);
 
+// The function meant to be called at the end of the internal event handler that calls back.
+// Given
+//	FSPHANDLE		the handle of the FSP socket (the context)
+//	ulong_ptr		optional parameter
+typedef void (FSPAPI *LongRunCallback)(FSPHANDLE, ulong_ptr);
 #ifdef __cplusplus
 	};
 #endif
@@ -153,9 +161,9 @@ typedef void (FSPAPI *NotifyOrReturn)(FSPHANDLE, FSP_ServiceCode, int);
 
 struct FSP_SocketParameter
 {
-	CallbackRequested	onAccepting;	// may be NULL, cannot be NULL for cloning offspring
-	CallbackConnected	onAccepted;		// cannot be NULL
-	NotifyOrReturn		onError;		// should be non-NULL
+	CallbackRequested	onAccepting;	// NULL if synchronously accepting, non-NULL if asynchronous
+	CallbackConnected	onAccepted;		// SHOULD be non-NULL for sake of piggybacking payload
+	NotifyOrReturn		onError;		// SHOULD be non-NULL
 	//
 	const void *	welcome;		// default welcome message, may be NULL
 	unsigned short	len;			// length of the default welcome message
@@ -197,6 +205,17 @@ DllSpec
 FSPHANDLE FSPAPI ListenAt(const PFSP_IN6_ADDR, PFSP_Context);
 
 
+// Given
+//	FSPHANDLE	the listening socket
+// Return
+//	One FSP socket that accepts remote connection request
+// Remark
+//	This function is blocking, called only
+//	when the function pointer onAccepting is NULL in the socket parameter of ListenAt.
+DllSpec
+FSPHANDLE FSPAPI Accept1(FSPHANDLE);
+
+
 // given
 //	the string name of the remote end, which might be the string representation of an IPv6 addresses or a DNS entry
 //	the pointer to the socket parameter
@@ -229,7 +248,6 @@ FSPHANDLE FSPAPI MultiplyAndWrite(FSPHANDLE, PFSP_Context, int8_t, NotifyOrRetur
 // given
 //	the handle of the FSP socket whose connection is to be duplicated,
 //	the pointer to the socket parameter
-//	[inout] pointer to the placeholder of an integer specifying the the minimum requested size of the buffer
 //	the pointer to the callback function
 // return
 //	the handle of the new created socket
@@ -238,7 +256,7 @@ FSPHANDLE FSPAPI MultiplyAndWrite(FSPHANDLE, PFSP_Context, int8_t, NotifyOrRetur
 //	The handle returned might be useless, if CallbackConnected report error laterly
 //	the capacity of immediately available buffer (might be 0) is outputted in the reference
 DllSpec
-FSPHANDLE FSPAPI MultiplyAndGetSendBuffer(FSPHANDLE, PFSP_Context, int *, CallbackBufferReady);
+FSPHANDLE FSPAPI MultiplyAndGetSendBuffer(FSPHANDLE, PFSP_Context, CallbackBufferReady);
 
 
 // given
@@ -259,18 +277,17 @@ int FSPAPI InstallSessionKey(FSPHANDLE, octet *, int, int32_t);
 
 // given
 //	the handle of the FSP socket to request send buffer for,
-//	the requested size of the buffer,
 //	the pointer to the callback function
 // return
 //	negative if error, or the capacity of immediately available buffer (might be 0)
 DllSpec
-int FSPAPI GetSendBuffer(FSPHANDLE, int, CallbackBufferReady);
+int FSPAPI GetSendBuffer(FSPHANDLE, CallbackBufferReady);
 
 
 // Given
 //	FSPHANDLE	the socket handle
 //	void *		the buffer pointer
-//	int			the number of octets to send
+//	int32_t		the number of octets to send
 //	bool		whether terminate the transmit transaction
 // Return
 //	number of octets really scheduled to send
@@ -280,7 +297,7 @@ int FSPAPI GetSendBuffer(FSPHANDLE, int, CallbackBufferReady);
 //	if the buffer is to be continued, its size MUST be multiplier of MAX_BLOCK_SIZE
 //	SendInline could be chained in tandem with GetSendBuffer
 DllSpec
-int FSPAPI SendInline(FSPHANDLE, void *, int, bool);
+int32_t FSPAPI SendInline(FSPHANDLE, void *, int32_t, bool);
 
 
 // Given

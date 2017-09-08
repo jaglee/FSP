@@ -33,7 +33,6 @@
 #include "../Intrins.h"
 
 #include "CryptoStub.h"
-#include "sm3.h"
 
 #define CRYPTO_SALT_LENGTH	16	// 128 bits
 #define SESSION_KEY_SIZE	32	// 256 bits
@@ -209,6 +208,9 @@ bool CHAKAValidateByServer(SCHAKAPublicInfo &chakaPubInfo, const octet passwordH
 
 
 
+// It takes use of trivally more memory but lets length of the key
+// agreed de-coupled with length of the key HMACed.
+// assert(SHA256_DIGEST_SIZE == SESSION_KEY_SIZE);
 SINLINE
 void ChakaDeriveKey(octet sessionKey[SESSION_KEY_SIZE]
 	, const octet saltedPassword[CRYPTO_NACL_HASHBYTES]
@@ -216,15 +218,9 @@ void ChakaDeriveKey(octet sessionKey[SESSION_KEY_SIZE]
 	, const octet bufPrivateKey[CRYPTO_NACL_KEYBYTES])
 {
 	octet bufSharedKey[CRYPTO_NACL_KEYBYTES];
-	sm3_context ctx;
 	CryptoNaClGetSharedSecret(bufSharedKey, chakaPubInfo.peerPublicKey, bufPrivateKey);
-	//
-	sm3_hmac_starts(& ctx, (octet *)saltedPassword, CRYPTO_NACL_HASHBYTES);
-	sm3_hmac_update(& ctx, bufSharedKey, sizeof(bufSharedKey));
-	sm3_hmac_update(& ctx, (octet *)& chakaPubInfo.serverRandom, sizeof(uint64_t));
-	sm3_hmac_finish(& ctx, sessionKey);
+	hmac_sha256_key512(sessionKey, saltedPassword, bufSharedKey, sizeof(bufSharedKey));
 }
-
 
 
 // A very simple stream encryption/decryption meant to protect privacy of a short message such as a user's name/client's id
@@ -234,27 +230,37 @@ void ChakaStreamcrypt(octet *buf
 	, const octet *input, int32_t len
 	, const octet peerPublicKey[CRYPTO_NACL_KEYBYTES], const octet bufPrivateKey[CRYPTO_NACL_KEYBYTES])
 {
-	const int HASH_BLOCK_SIZE = 32;
-	octet bufSharedKey[CRYPTO_NACL_KEYBYTES];
-	CryptoNaClGetSharedSecret(bufSharedKey, peerPublicKey, bufPrivateKey);
-
-	octet hashValue[HASH_BLOCK_SIZE];
-	octet hashAsInput[HASH_BLOCK_SIZE];
-
-	sm3_hmac(bufSharedKey, CRYPTO_NACL_KEYBYTES, (unsigned char *) & nonce, sizeof(nonce), hashValue);
-
-	for(register int32_t i = 0;
-		i < len;
-		memcpy(hashAsInput, hashValue, HASH_BLOCK_SIZE),
-		sm3_hmac(bufSharedKey, CRYPTO_NACL_KEYBYTES, hashAsInput, HASH_BLOCK_SIZE, hashValue))
+	if(len <= 0)
+		return;
+	//
+	struct
 	{
-		register int32_t k = min(HASH_BLOCK_SIZE, len);
+		uint64_t nonce;
+		octet bufSharedKey[CRYPTO_NACL_KEYBYTES];
+	} km;
+	octet hashValue[SHA256_DIGEST_SIZE];
+	//
+	CryptoNaClGetSharedSecret(km.bufSharedKey, peerPublicKey, bufPrivateKey);
+	sha256_hash(hashValue, (octet *) & km, sizeof(km));	
+	//
+	register int32_t i = 0, k;
+	do
+	{
+		k = min(SHA256_DIGEST_SIZE, len);		
 		for(register int32_t j = 0; j < k; j++)
 		{
 			buf[i] = input[i] ^ hashValue[j];
 			i++;
 		}
-	}
+		//
+		len -= k;
+		if(len <= 0)
+			break;
+		// assert(SHA256_DIGEST_SIZE <= CRYPTO_NACL_KEYBYTES);
+		memcpy(km.bufSharedKey, hashValue, SHA256_DIGEST_SIZE);
+		km.nonce ^= (uint64_t)i;
+		sha256_hash(hashValue, (octet *) & km, sizeof(km));	
+	} while(true);
 }
 
 #endif

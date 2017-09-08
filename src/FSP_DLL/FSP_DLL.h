@@ -111,9 +111,10 @@ class CSocketItemDl: public CSocketItem
 	friend struct	CommandToLLS;
 
 	friend FSPHANDLE FSPAPI ListenAt(const PFSP_IN6_ADDR, PFSP_Context);
+	friend FSPHANDLE FSPAPI Accept1(FSPHANDLE);
 	friend FSPHANDLE FSPAPI Connect2(const char *, PFSP_Context);
 	friend FSPHANDLE FSPAPI MultiplyAndWrite(FSPHANDLE, PFSP_Context, int8_t, NotifyOrReturn);
-	friend FSPHANDLE FSPAPI MultiplyAndGetSendBuffer(FSPHANDLE, PFSP_Context, int *, CallbackBufferReady);
+	friend FSPHANDLE FSPAPI MultiplyAndGetSendBuffer(FSPHANDLE, PFSP_Context, CallbackBufferReady);
 
 	static	CSocketDLLTLB socketsTLB;
 	static	DWORD	idThisProcess;
@@ -135,7 +136,7 @@ class CSocketItemDl: public CSocketItem
 	// for sake of incarnating new accepted connection
 	FSP_SocketParameter context;
 
-	char			isInCritical;	// prevent the second notice processed before the first one was finished
+	char			isInCritical;	// to emulate the situation of NMI that free the socket before previous notice processed
 	char			inUse;
 	char			newTransaction;	// it may simultaneously start a transmit transaction and flush/commit it
 	//
@@ -156,6 +157,8 @@ protected:
 	// to support superior RecvInline() over ReadFrom() make CallbackPeeked an independent function
 	CallbackPeeked	fpPeeked;
 	CallbackBufferReady fpSent;
+
+	LongRunCallback	longRunCallback;
 
 	// For network streaming *Buf is not NULL
 	BYTE *			pendingSendBuf;
@@ -188,7 +191,7 @@ protected:
 			, WaitOrTimeOutCallBack
 			, this
 			, INFINITE
-			, 0);
+			, WT_EXECUTELONGFUNCTION);
 	}
 
 	bool LOCALAPI AddOneShotTimer(uint32_t);
@@ -199,7 +202,9 @@ protected:
 	bool LockAndValidate();
 
 	// in Establish.cpp
-	void ProcessBacklog();
+	CSocketItemDl *ProcessOneBackLog(BackLogItem *);
+	void ProcessBacklogs();
+	CSocketItemDl *Accept1();
 
 	CSocketItemDl * PrepareToAccept(BackLogItem &, CommandNewSession &);
 	bool LOCALAPI ToWelcomeConnect(BackLogItem &);
@@ -216,8 +221,8 @@ protected:
 	int LOCALAPI BufferData(int);
 
 	// In Receive.cpp
-	void ProcessReceiveBuffer();
-	int FetchReceived();
+	void	ProcessReceiveBuffer();
+	int32_t FetchReceived();
 
 	// In IOControl.cpp
 	bool AllocStreamState();
@@ -229,16 +234,7 @@ protected:
 	void FreeStreamState() { if(pStreamState != NULL) { free(pStreamState); pStreamState = NULL; } }
 
 public:
-	void Disable()
-	{
-		register HANDLE h;
-		CancelTimer();
-		if((h = InterlockedExchangePointer((PVOID *) & theWaitObject, NULL)) != NULL)
-			UnregisterWaitEx(theWaitObject, NULL);
-		//^NULL: return immediately; INVALID_HANDLE_VALUE: waits for all callback functions to complete before returning
-		//
-		CSocketItem::Destroy();
-	}
+	void Disable();
 	void DisableAndFree()
 	{
 		FreeItem(this);
@@ -303,12 +299,12 @@ public:
 
 	int LOCALAPI InstallKey(BYTE *, int, int32_t);
 
-	int LOCALAPI AcquireSendBuf(int);
-	int LOCALAPI SendInplace(void *, int, bool);
+	int32_t LOCALAPI AcquireSendBuf();
+	int32_t LOCALAPI SendInplace(void *, int32_t, bool);
 
 	ControlBlock::PFSP_SocketBuf GetSendBuf() { return pControlBlock->GetSendBuf(); }
 
-	int LOCALAPI PrepareToSend(void *, int, bool);
+	int LOCALAPI PrepareToSend(void *, int32_t, bool);
 	int LOCALAPI SendStream(const void *, int, bool, bool);
 	bool TestSetSendReturn(PVOID fp1)
 	{
@@ -342,6 +338,7 @@ public:
 
 	void SetCallbackOnRequest(CallbackRequested fp1) { context.onAccepting = fp1; }
 	void SetCallbackOnAccept(CallbackConnected fp1) { context.onAccepted = fp1; }
+	void SetLongRunCallback(LongRunCallback fp1) { longRunCallback = fp1; }
 
 	void SetNewTransaction() { isFlushing = 0; newTransaction = 1; }
 	void SetEndTransaction() { isFlushing = 1; }

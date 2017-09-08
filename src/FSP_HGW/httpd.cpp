@@ -16,11 +16,10 @@
 
 #define SERVER_STRING	"Server: fspgated/0.1\r\n"
 #include "errstrs.hpp"
+#include "defs.h"
 
 #ifdef WIN32
 #include <WinSock2.h>
-#include "../FSP_API.h"
-#include "../Crypto/CryptoStub.h"
 #else
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -31,10 +30,6 @@
 #include <sys/wait.h>
 #define _strcmpi strcasecmp
 #endif
-
-#define DEFAULT_FILE	"index.html"
-#define	BUFFER_POOL_SIZE 65536
-#define DEFAULT_SOCKS_PORT 1080
 
 struct LineBuffer
 {
@@ -47,19 +42,20 @@ struct LineBuffer
 static unsigned char	bufPrivateKey[CRYPTO_NACL_KEYBYTES];
 static unsigned char *  bufPublicKey;
 
+static FSPHANDLE hListener; 
 static bool finished;
 static char DEFAULT_ROOT[MAX_PATH];
 
-
 void StartHTTPoverFSP();
 
-int	FSPAPI onAccepting(FSPHANDLE, PFSP_SINKINF, PFSP_IN6_ADDR);
-int	FSPAPI onAccepted(FSPHANDLE, PFSP_Context);
-void FSPAPI onNotice(FSPHANDLE h, FSP_ServiceCode code, int value);
-void FSPAPI onFinished(FSPHANDLE h, FSP_ServiceCode code, int value);
+static int	FSPAPI onAccepted(FSPHANDLE, PFSP_Context);
+static void FSPAPI onNotice(FSPHANDLE h, FSP_ServiceCode code, int value);
+static void FSPAPI onFinished(FSPHANDLE h, FSP_ServiceCode code, int value);
 
+static void FSPAPI onPublicKeyReceived(FSPHANDLE, FSP_ServiceCode, int);
+static void MasterService(FSPHANDLE);
 
-void FSPAPI onPublicKeyReceived(FSPHANDLE, FSP_ServiceCode, int);
+static void FSPAPI onFurtherTunnelRequest(FSPHANDLE, FSP_ServiceCode, int);
 
 void	Abort(const char *);
 
@@ -159,13 +155,13 @@ void StartHTTPoverFSP()
 	mLen += CRYPTO_NACL_KEYBYTES;
 
 	memset(&params, 0, sizeof(params));
-	params.onAccepting = onAccepting;
+	params.onAccepting = NULL;	// make it blocking
 	params.onAccepted = onAccepted;
 	params.onError = onNotice;
 	params.welcome = thisWelcome;
 	params.len = mLen;
-	params.sendSize = MAX_FSP_SHM_SIZE;
-	params.recvSize = 0;	// minimal receiving for download server
+	params.sendSize = BUFFER_POOL_SIZE;
+	params.recvSize = BUFFER_POOL_SIZE;	
 
 #ifdef _DEBUG
 	TranslateFSPoverIPv4(&atAddress, 0, 80);	//INADDR_ANY
@@ -175,33 +171,36 @@ void StartHTTPoverFSP()
 	atAddress.idALF = 0x01000000;		// 0x01 [well, it should be the well-known service number...] 
 #endif
 
-	FSPHANDLE hFspListen = ListenAt(&atAddress, &params);
+	hListener = ListenAt(&atAddress, &params);
 
-	while (!finished)
-		_sleep(50);
+	FSPHANDLE hService;
+	while((hService = Accept1(hListener)) != NULL)
+	{
+		FSPControl(hService, FSP_SET_CALLBACK_ON_REQUEST, (ulong_ptr)onMultiplying);
+	}
 
-	if (hFspListen != NULL)
-		Dispose(hFspListen);
-
+	if (hListener != NULL)
+		Dispose(hListener);
 }
 
 
 // The callback function to handle general notification of LLS. Parameters are self-describing.
-void FSPAPI onNotice(FSPHANDLE h, FSP_ServiceCode code, int value)
+static void FSPAPI onNotice(FSPHANDLE h, FSP_ServiceCode code, int value)
 {
 	printf_s("Notify: socket %p, service code = %d, return %d\n", h, code, value);
-	if(value < 0)
-	{
-		FreeExtent(h);
+	if(value >= 0)
+		return;	// waring is simply ignored
+	//
+	if(h == hListener)
 		finished = true;
-		return;
-	}
+	else
+		FreeExtent(h);
 }
 
 
 
 // The function called back when an FSP connection was released. Parameters are self-describing
-void FSPAPI onFinished(FSPHANDLE h, FSP_ServiceCode code, int value)
+static void FSPAPI onFinished(FSPHANDLE h, FSP_ServiceCode code, int value)
 {
 	printf_s("Socket %p, session was to shut down.\n", h);
 	if(code != FSP_NotifyRecycled)
@@ -210,29 +209,18 @@ void FSPAPI onFinished(FSPHANDLE h, FSP_ServiceCode code, int value)
 		return;
 	}
 	//
-	finished = true;
 	return;
 }
 
 
-
-// This function is for tracing purpose
-int	FSPAPI onAccepting(FSPHANDLE h, PFSP_SINKINF p, PFSP_IN6_ADDR remoteAddr)
+static int	FSPAPI onAccepted(FSPHANDLE client, PFSP_Context ctx)
 {
-	printf_s("\nTo accept handle of FSP session: %p\n", h);
-	printf_s("Interface#%d, fiber#%u\n", p->ipi6_ifindex, p->idALF);
-	// no be32toh() for local; note that for IPv6 network, little-endian CPU, the peer's remoteAddr->idALF wouldn't match it
-	printf_s("Remote address: 0x%llX::%X::%X\n", be64toh(remoteAddr->subnet), be32toh(remoteAddr->idHost), be32toh(remoteAddr->idALF));
-	return 0;	// no opposition
-}
+	printf_s("\noTiny http 1.0\nAccepted: handle of FSP session is %p\n", client);
 
-
-
-int	FSPAPI onAccepted(FSPHANDLE client, PFSP_Context ctx)
-{
 	void *bufPeerPublicKey = malloc(CRYPTO_NACL_KEYBYTES);
+	if(bufPeerPublicKey == NULL)
+		return -1;
 
-	printf_s("\noTiny http 1.0 nAccepted: handle of FSP session is %p\n", client);
 	// TODO: check connection context
 	FSPControl(client, FSP_SET_SIGNATURE, (ulong_ptr)bufPeerPublicKey);
 	ReadFrom(client, bufPeerPublicKey, CRYPTO_NACL_KEYBYTES, onPublicKeyReceived);
@@ -245,55 +233,69 @@ int	FSPAPI onAccepted(FSPHANDLE client, PFSP_Context ctx)
 //	FSPHANLDE	the handle of the connection to the client
 // Do
 //	Process the request
-void FSPAPI onPublicKeyReceived(FSPHANDLE client, FSP_ServiceCode c, int r)
+static void FSPAPI onPublicKeyReceived(FSPHANDLE client, FSP_ServiceCode c, int r)
 {
 	unsigned char bufSharedKey[CRYPTO_NACL_KEYBYTES];
 	octet *bufPeerPublicKey;
 
+	FSPControl(client, FSP_GET_SIGNATURE, (ulong_ptr) & bufPeerPublicKey);
+	FSPControl(client, FSP_SET_SIGNATURE, NULL);
+
+	if(r < 0)
+	{
+		free(bufPeerPublicKey);
+		Dispose(client);
+		return;
+	}
+
+#ifdef TRACE
+	printf_s("\tTo install the negotiated shared key...\n");
+#endif
+	CryptoNaClGetSharedSecret(bufSharedKey, bufPeerPublicKey, bufPrivateKey);
+	free(bufPeerPublicKey);
+
+	octet prfKey[32];
+	sha256_hash(prfKey, bufSharedKey, CRYPTO_NACL_KEYBYTES);
+	InstallSessionKey(client, bufSharedKey, CRYPTO_NACL_KEYBYTES, INT32_MAX);
+
+	MasterService(client);
+}
+
+
+
+void MasterService(FSPHANDLE client)
+{
 	char buf[1024];
-	int numchars;
 	char method[255];
 	char url[255];
 	char path[512];
 	size_t i, j;
 	struct stat st;
 	int fcgi = 0;	// whether to pass the content via fast-cgi
+	int tunnel = 0;
 	char *query_string = NULL;
 
-	FSPControl(client, FSP_GET_SIGNATURE, (ulong_ptr) & bufPeerPublicKey);
-
-	if(r < 0)
-	{
-		FSPControl(client, FSP_SET_SIGNATURE, 0);
-		free(bufPeerPublicKey);
-		//
-		Dispose(client);
-		return;
-	}
-
-	CryptoNaClGetSharedSecret(bufSharedKey, bufPeerPublicKey, bufPrivateKey);
-
-	printf_s("\tTo install the negotiated shared key...\n");
-	InstallSessionKey(client, bufSharedKey, CRYPTO_NACL_KEYBYTES, INT32_MAX);
-
-	//
-	free(bufPeerPublicKey);
-
-	numchars = ReadLine(client, buf, sizeof(buf));
+	int numchars = ReadLine(client, buf, sizeof(buf));
 	for(i = 0, j = 0; !isspace(buf[j]) && (i < sizeof(method) - 1); i++, j++)
 	{
 		method[i] = buf[j];
 	}
 	method[i] = '\0';
 
-	if (_strcmpi(method, "GET") && _strcmpi(method, "POST"))
+	if(_strcmpi(method, "TUNNEL") == 0)
+	{
+		tunnel = 1;
+	}
+	else if (_strcmpi(method, "POST") == 0)
+	{
+		fcgi = 1;
+	}
+	else if (_strcmpi(method, "GET") != 0)
 	{
 		WriteErrStr(client, ERRSTR_UNIMPLEMENTED);
 		return;
 	}
 
-	if (_strcmpi(method, "POST") == 0)
-		fcgi = 1;
 
 	i = 0;
 	while (isspace(buf[j]) && (j < sizeof(buf)))
@@ -303,6 +305,16 @@ void FSPAPI onPublicKeyReceived(FSPHANDLE client, FSP_ServiceCode c, int r)
 		url[i] = buf[j];
 	}
 	url[i] = '\0';
+
+	if(tunnel)
+	{
+		LineBuffer *lineBuf;
+		FSPControl(client, FSP_GET_SIGNATURE, (ulong_ptr) & lineBuf);
+		//
+		lineBuf->firstOffset = lineBuf->lastOffset = 0;
+		ReadFrom(client, lineBuf->buf, BUFFER_POOL_SIZE, onFurtherTunnelRequest);
+		return;
+	}
 
 	if (_strcmpi(method, "GET") == 0)
 	{
@@ -375,7 +387,7 @@ void Abort(const char *sc)
 // Returns: the number of bytes stored (excluding nul)
 int ReadLine(FSPHANDLE sock, char *buf, int size)
 {
-	struct LineBuffer *lineBuf;
+	LineBuffer *lineBuf;
 	int i = 0;
 	char c = '\0';
 	int n;
@@ -383,7 +395,7 @@ int ReadLine(FSPHANDLE sock, char *buf, int size)
 	FSPControl(sock, FSP_GET_SIGNATURE, (ulong_ptr) & lineBuf);
 	if(lineBuf == NULL)
 	{
-		lineBuf = (struct LineBuffer *)malloc(sizeof(struct LineBuffer));
+		lineBuf = (LineBuffer *)malloc(sizeof(LineBuffer));
 		if(lineBuf == NULL)
 		{
 			printf_s("No enough memory");
@@ -394,12 +406,15 @@ int ReadLine(FSPHANDLE sock, char *buf, int size)
 		lineBuf->firstOffset = lineBuf->lastOffset = 0;
 		FSPControl(sock, FSP_SET_SIGNATURE, (ulong_ptr)lineBuf);
 	}
-
+	// double buffering
 	while ((i < size - 1) && (c != '\n'))
 	{
 		if(lineBuf->firstOffset >= lineBuf->lastOffset)
 		{
-			n = ReadFrom(sock, lineBuf->buf, BUFFER_POOL_SIZE - lineBuf->firstOffset, NULL);
+			if(lineBuf->lastOffset >= BUFFER_POOL_SIZE)
+				lineBuf->firstOffset = lineBuf->lastOffset = 0;
+			//
+			n = ReadFrom(sock, lineBuf->buf, BUFFER_POOL_SIZE - lineBuf->lastOffset, NULL);
 			if(n == 0)
 				return i;
 			if(n < 0)
@@ -479,6 +494,17 @@ void SendRegFile(FSPHANDLE client, const char *filename)
 
 	_close(fd);
 }
+
+
+
+static void FSPAPI onFurtherTunnelRequest(FSPHANDLE client, FSP_ServiceCode code, int value)
+{
+	LineBuffer *lineBuf;
+	FSPControl(client, FSP_GET_SIGNATURE, (ulong_ptr) & lineBuf);
+	// TODO: parsing the line buffer, process further tunnel requests!
+	ReadFrom(client, lineBuf->buf, BUFFER_POOL_SIZE, onFurtherTunnelRequest);
+}
+
 
 
 /**
