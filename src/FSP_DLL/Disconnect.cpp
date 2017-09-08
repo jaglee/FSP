@@ -74,6 +74,27 @@ int CSocketItemDl::Recycle(bool reportError)
 
 
 
+// Make sure resource is kept until other threads leave critical section
+void CSocketItemDl::Disable()
+{
+	register HANDLE h;
+	CancelTimer();
+	if((h = InterlockedExchangePointer((PVOID *) & theWaitObject, NULL)) != NULL)
+		UnregisterWaitEx(theWaitObject, NULL);
+	//
+	if (_InterlockedCompareExchange8(&isInCritical, 1, 0) != 0)
+	{
+		inUse = 0;
+		return;
+	}
+	//
+	CSocketItem::Destroy();
+}
+
+
+
+
+
 // Try to commit current transmit transaction
 // Return 0 if no immediate error, or else the error number
 // The callback function might return code of delayed error
@@ -160,7 +181,6 @@ int LOCALAPI CSocketItemDl::Shutdown(NotifyOrReturn fp1)
 	while(fpCommitted != NULL)
 	{
 		SetMutexFree();
-		Sleep(50);
 		if(! WaitUseMutex())
 			return -EDEADLK;
 	}
@@ -283,7 +303,7 @@ int CSocketItemDl::Commit()
 		// Assume the caller has set time-out clock
 		do
 		{
-			Sleep(50);
+			Sleep(TIMER_SLICE_ms);
 		} while(!InState(CLOSABLE) && !InState(CLOSED)); 
 		//
 		return 0;

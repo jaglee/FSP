@@ -33,7 +33,7 @@ static int FSPAPI onAccepted(FSPHANDLE h, PFSP_Context ctx)
 	// TODO: check connection context
 
 	printf_s("\tTo send filename to the remote end...\n");
-	WriteTo(h, fileName, (int)strlen(fileName) + 1, EOF, onFileNameSent);
+	WriteTo(h, fileName, (int)strlen(fileName) + 1, TO_END_TRANSACTION, onFileNameSent);
 
 	return 0;
 }
@@ -55,7 +55,7 @@ static void FSPAPI onFileNameSent(FSPHANDLE h, FSP_ServiceCode c, int r)
 	printf("Filename has been sent to remote end,\n"
 		"to get send buffer for reading file and sending inline...\n");
 
-	r = GetSendBuffer(h, sizeof(bytesToSend), toSendNextBlock);
+	r = GetSendBuffer(h, toSendNextBlock);
 	if(r < 0)
 	{
 		printf_s("Cannot get send buffer onFileNameSent, error code: %d\n", r);
@@ -86,5 +86,5 @@ static int FSPAPI toSendNextBlock(FSPHANDLE h, void * batchBuffer, int32_t capac
 
 	offset += bytesRead;
 
-	return SendInline(h, batchBuffer, bytesRead, (int8_t)(offset >= sizeof(bytesToSend)));
+	return SendInline(h, batchBuffer, bytesRead, (offset >= sizeof(bytesToSend)));
 }

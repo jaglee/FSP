@@ -77,6 +77,60 @@ FSPHANDLE FSPAPI ListenAt(const PFSP_IN6_ADDR listenOn, PFSP_Context psp1)
 
 
 
+
+//[API: Accept]
+//	CHALLENGING-->COMMITTED/CLOSABLE
+// Given
+//	FSPHANDLE	the listening socket
+// Return
+//	One FSP socket that accepts remote connection request
+// Remark
+//	This function is blocking, called only
+//	when the function pointer onAccepting is NULL in the socket parameter of ListenAt.
+DllSpec
+FSPHANDLE FSPAPI Accept1(FSPHANDLE h)
+{
+	try
+	{
+		CSocketItemDl *pSocket = (CSocketItemDl *)h;
+		return pSocket->Accept1();
+	}
+	catch (...)
+	{
+		return NULL;
+	}
+}
+
+
+
+// Return
+//	The socket handle if there is one backlog item successfully processed.
+//	NULL if there is internal error
+// Remark
+//	This is function is blocking. It wait until success or internal error found
+CSocketItemDl *CSocketItemDl::Accept1()
+{
+	BackLogItem	*pLogItem;
+	while(LockAndValidate())
+	{
+		pLogItem = pControlBlock->backLog.Peek();
+		if (pLogItem != NULL)
+		{
+			CSocketItemDl *p = ProcessOneBackLog(pLogItem);
+			pControlBlock->backLog.Pop();
+			SetMutexFree();
+			return p;
+		}
+		//
+		SetMutexFree();
+		Sleep(TIMER_SLICE_ms);
+	}
+	//
+	return NULL;
+}
+
+
+
 //[API: Connect]
 //	NON_EXISTENT-->CONNECT_BOOTSTRAP
 // Given
@@ -127,45 +181,60 @@ FSPHANDLE FSPAPI Connect2(const char *peerName, PFSP_Context psp1)
 
 
 
-// Fetch each of the backlog item in the listening socket, create new socket, prepare the acknowledgement
-// and call LLS to send the acknowledgement to the connnection request or multiplication request
-void CSocketItemDl::ProcessBacklog()
+// Given
+//	BackLogItem *	the fetched backlog item of the listening socket
+// Do
+//	create new socket, prepare the acknowledgement
+//	and call LLS to send the acknowledgement to the connnection request or multiplication request
+// Return
+//	true if success
+//	false if failed.
+CSocketItemDl *CSocketItemDl::ProcessOneBackLog(BackLogItem	*pLogItem)
 {
 	// TODO: set the default interface to non-zero?
 	CommandNewSession objCommand;
-	BackLogItem		*pLogItem;
 	CSocketItemDl * socketItem;
-	// firstly, fetch the backlog item
-	for(; (pLogItem = pControlBlock->backLog.Peek()) != NULL; pControlBlock->backLog.Pop())
+	//
+	socketItem = PrepareToAccept(*pLogItem, objCommand);
+	if (socketItem == NULL)
 	{
-		socketItem = PrepareToAccept(*pLogItem, objCommand);
-		if(socketItem == NULL)
-		{
-			REPORT_ERRMSG_ON_TRACE("Process listening backlog: insufficient system resource?");
-			this->InitCommand<FSP_Reject>(objCommand);
-			this->Call(objCommand, sizeof(struct CommandToLLS));
-			pControlBlock->backLog.Pop();
-			return;
-		}
-		// lost some possibility of code reuse, gain flexibility (and reliability)
-		if(pLogItem->idParent == 0 && ! socketItem->ToWelcomeConnect(*pLogItem)
-		|| pLogItem->idParent != 0 && ! socketItem->ToWelcomeMultiply(*pLogItem))
-		{
-			this->InitCommand<FSP_Reject>(objCommand);
-			this->Call(objCommand, sizeof(objCommand));
-			socketsTLB.FreeItem(socketItem);
-			continue;
-		}
-		//
-		if(! socketItem->CallCreate(objCommand, FSP_Accept))
-		{
-			REPORT_ERRMSG_ON_TRACE("Process listening backlog: cannot synchronize - local IPC error");
-			socketsTLB.FreeItem(socketItem);
-		}
+		REPORT_ERRMSG_ON_TRACE("Process listening backlog: insufficient system resource?");
+		this->InitCommand<FSP_Reject>(objCommand);
+		this->Call(objCommand, sizeof(struct CommandToLLS));
+		return NULL;
 	}
-	// the backlog item would be kept even when InitCommand/InitCreate is called
+	// lost some possibility of code reuse, gain flexibility (and reliability)
+	if (pLogItem->idParent == 0 && !socketItem->ToWelcomeConnect(*pLogItem)
+	|| pLogItem->idParent != 0 && !socketItem->ToWelcomeMultiply(*pLogItem))
+	{
+		this->InitCommand<FSP_Reject>(objCommand);
+		this->Call(objCommand, sizeof(objCommand));
+		socketsTLB.FreeItem(socketItem);
+		return NULL;
+	}
+	//
+	if (!socketItem->CallCreate(objCommand, FSP_Accept))
+	{
+		REPORT_ERRMSG_ON_TRACE("Process listening backlog: cannot synchronize - local IPC error");
+		socketsTLB.FreeItem(socketItem);
+		return NULL;
+	}
+	//
+	return socketItem;
 }
 
+
+
+// Fetch each of the backlog item in the listening socket, create new socket, prepare the acknowledgement
+// and call LLS to send the acknowledgement to the connnection request or multiplication request
+void CSocketItemDl::ProcessBacklogs()
+{
+	BackLogItem		*pLogItem;
+	for (; (pLogItem = pControlBlock->backLog.Peek()) != NULL; pControlBlock->backLog.Pop())
+	{
+		ProcessOneBackLog(pLogItem);
+	}
+}
 
 
 // Given
@@ -226,13 +295,15 @@ CSocketItemDl * CSocketItemDl::PrepareToAccept(BackLogItem & backLog, CommandNew
 // Return
 //	true if to accept the connection
 //	false if to reject
+// Remark
+//	As the connection context is yet to be prepared further, context.onAccepting MAYNOT read or write anything
 bool LOCALAPI CSocketItemDl::ToWelcomeConnect(BackLogItem & backLog)
 {
 	PFSP_IN6_ADDR p = (PFSP_IN6_ADDR) & pControlBlock->peerAddr.ipFSP.allowedPrefixes[MAX_PHY_INTERFACES - 1];
 	//
 	SetNewTransaction();	// ACK_CONNECT_REQ is a singleton transmit transaction
 	SetState(CHALLENGING);
-	// Ask ULA whether to accept the connection. Note that context.onAccepting may not read or write
+	// Ask ULA whether to accept the connection
 	if(context.onAccepting != NULL && context.onAccepting(this, & backLog.acceptAddr, p) < 0)
 	{
 		// UNRESOLVED! report that the upper layer application reject it?

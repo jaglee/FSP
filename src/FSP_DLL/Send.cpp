@@ -40,7 +40,7 @@
 //	size of free send buffer available immediately, might be 0 which is not an error
 //	negative if exception has arisen
 DllExport
-int FSPAPI GetSendBuffer(FSPHANDLE hFSPSocket, int m, CallbackBufferReady fp1)
+int FSPAPI GetSendBuffer(FSPHANDLE hFSPSocket, CallbackBufferReady fp1)
 {
 	register CSocketItemDl * p = (CSocketItemDl *)hFSPSocket;
 	try
@@ -50,7 +50,7 @@ int FSPAPI GetSendBuffer(FSPHANDLE hFSPSocket, int m, CallbackBufferReady fp1)
 			return -EBADF;
 		if (!p->TestSetSendReturn(fp1))
 			return -EBUSY;
-		return p->AcquireSendBuf(m);
+		return p->AcquireSendBuf();
 	}
 	catch(...)
 	{
@@ -127,10 +127,8 @@ int FSPAPI WriteTo(FSPHANDLE hFSPSocket, const void * buffer, int len, int8_t fl
 
 // Return
 //	Size of currently available free send buffer
-int LOCALAPI CSocketItemDl::AcquireSendBuf(int n)
+int LOCALAPI CSocketItemDl::AcquireSendBuf()
 {
-	if (n <= 0)
-		return -EDOM;
 	if (! WaitUseMutex())
 		return -EDEADLK;
 
@@ -140,9 +138,7 @@ int LOCALAPI CSocketItemDl::AcquireSendBuf(int n)
 		return -EBUSY;
 	}
 
-	pendingSendSize = n;
-	n = 1;
-	void *buf = pControlBlock->InquireSendBuf(& n);
+	void *buf = pControlBlock->InquireSendBuf(& pendingSendSize);
 	SetMutexFree();
 	if(buf != NULL)
 	{
@@ -151,7 +147,7 @@ int LOCALAPI CSocketItemDl::AcquireSendBuf(int n)
 			return -EFAULT;
 	}
 
-	return n;
+	return pendingSendSize;
 }
 
 
@@ -366,17 +362,7 @@ void CSocketItemDl::ProcessPendingSend()
 			return;	// As there's no thread is waiting free send buffer
 		}
 		//
-		if(pendingSendSize <= 0)
-		{
-			SetMutexFree();
-#ifdef _DEBUG
-			printf_s("Waiting for a null buffer? It should not have happened!\n");
-#endif
-			fp2(this, NULL, 0);
-			return;
-		}
-		//
-		int m = 1;				// minimum block works perfect
+		int m;
 		void * p = pControlBlock->InquireSendBuf(& m);
 		SetMutexFree();
 		// If FSP_NotifyBufferReady caught but even a minimal buffer block is unavailable,
@@ -391,10 +377,8 @@ void CSocketItemDl::ProcessPendingSend()
 		}
 		// If ULA hinted that sending was not finished yet,
 		// continue to use the saved pointer of the callback function
-		bool r = (pendingSendSize - m > 0);
-		if (fp2(this, p, m) >= 0 || r)
+		if (fp2(this, p, m) >= 0)
 		{
-			pendingSendSize = (pendingSendSize - m > 0 ? pendingSendSize - m : 0);
 			TestSetSendReturn(fp2);
 			if(HasFreeSendBuffer())	// In case of round-robin
 				SelfNotify(FSP_NotifyBufferReady);
@@ -618,8 +602,8 @@ int LOCALAPI CSocketItemDl::PrepareToSend(void * buf, int len, bool eotFlag)
 		p->Unlock();
 	}
 
-	int m = len;
-	if(pControlBlock->InquireSendBuf(& m) != buf)	// 'm' is an in-out parameter
+	int m;
+	if(pControlBlock->InquireSendBuf(& m) != buf)
 		return -EFAULT;
 	if(m < len)
 		return -ENOMEM;

@@ -244,7 +244,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="..\Crypto\CryptoStub.c" />
-    <ClCompile Include="..\Crypto\sm3.c" />
+    <ClCompile Include="..\Crypto\sha256.c" />
     <ClCompile Include="..\Crypto\tweetnacl.c" />
     <ClCompile Include="FileSyncClient.cpp" />
     <ClCompile Include="FSP_CHAKA.cpp" />
@@ -254,7 +254,6 @@
   <ItemGroup>
     <ClInclude Include="..\Crypto\CHAKA.h" />
     <ClInclude Include="..\Crypto\CryptoStub.h" />
-    <ClInclude Include="..\Crypto\sm3.h" />
     <ClInclude Include="..\Crypto\tweetnacl.h" />
     <ClInclude Include="stdafx.h" />
   </ItemGroup>

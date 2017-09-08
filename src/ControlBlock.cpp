@@ -465,43 +465,33 @@ ControlBlock::PFSP_SocketBuf ControlBlock::GetSendBuf()
 
 
 // Given
-//	int &
-//		[_In_]  the minimum buffer size requested
-//		[_Out_] the size of the next free send buffer block, no less than what is requested
+//	int32_t *	[_Out_] placeholder of the size of the next free send buffer block
 // Return
-//	The start address of the next free send buffer block whose size might be less than requested
+//	The start address of the next free send buffer block
 // Remark
 //	It is assumed that the caller have gain exclusive access on the control block among providers
 //	However, LLS may change (sendWindowHeadPos, sendWindowFirstSN) simultaneously, non-atomically
 void * LOCALAPI ControlBlock::InquireSendBuf(int *p_m)
 {
-	int & m = *p_m;
-	if (m <= 0)
-	{
-		m = -EDOM;
-		return NULL;
-	}
-	if((m - 1) / MAX_BLOCK_SIZE + 1 > (sendBufferBlockN - CountSendBuffered()))
-	{
-		int r = CountSendBuffered();
-		BREAK_ON_DEBUG();
-		m = -ENOMEM;
-		return NULL;
-	}
-	// and no memory overwritten even it happens that sendBufferNextPos == sendWindowHeadPos
 	register int32_t i = sendBufferNextPos;
-	register int32_t k = _InterlockedCompareExchange((LONG *) & sendWindowHeadPos, 0, i);
-	if(i == k)
+	register int32_t k = sendWindowHeadPos;
+	if(i != k)	// the send queue is not fulfilled
 	{
-		sendWindowNextPos = sendBufferNextPos = 0;	// sendWindowHeadPos has been set to 0 
-		m = MAX_BLOCK_SIZE * sendBufferBlockN;
-		return (BYTE *)this + sendBuffer;
+		*p_m = ((i > k ? sendBufferBlockN : k) - i) * MAX_BLOCK_SIZE;
+		return (BYTE *)this + sendBuffer + i * MAX_BLOCK_SIZE;
 	}
 
-	m = ((i > k ? sendBufferBlockN : k) - i) * MAX_BLOCK_SIZE;
-	return (BYTE *)this + sendBuffer + i * MAX_BLOCK_SIZE;
-}
+	if(sendWindowFirstSN != sendBufferNextSN)
+	{
+		*p_m = 0;
+		return NULL;
+	}
 
+	// the send queue is thoroughly empty
+	sendWindowHeadPos = sendWindowNextPos = sendBufferNextPos = 0;
+	*p_m = MAX_BLOCK_SIZE * sendBufferBlockN;
+	return (BYTE *)this + sendBuffer;
+}
 
 
 // Given
@@ -590,8 +580,8 @@ ControlBlock::PFSP_SocketBuf LOCALAPI ControlBlock::AllocRecvBuf(seq_t seq1)
 
 
 // Given
-//	int & : [_Out_] place holder of the number of bytes [to be] peeked.
-//	bool &: [_Out_] place holder of the End of Transaction flag
+//	int32_t & : [_Out_] place holder of the number of bytes [to be] peeked.
+//	bool & :	[_Out_] place holder of the End of Transaction flag
 // Do
 //	Peek the receive buffer, figure out not only the start address but also the length of the next message
 //	till the end of receive buffer space, the last of the received packets, or the first buffer block
@@ -607,7 +597,7 @@ ControlBlock::PFSP_SocketBuf LOCALAPI ControlBlock::AllocRecvBuf(seq_t seq1)
 //				payload length of any packet should be no less than 0 and no greater than MAX_BLOCK_SIZE)
 //	-EAGAIN		some buffer block is double delivered, which breaks the protocol
 //	-EPERM		imconformant to the protocol, which is prohibitted
-void * LOCALAPI ControlBlock::InquireRecvBuf(int & nIO, bool & eotFlag)
+void * LOCALAPI ControlBlock::InquireRecvBuf(int32_t & nIO, bool & eotFlag)
 {
 	const int tail = recvWindowNextPos;
 	eotFlag = false;
@@ -680,7 +670,7 @@ void * LOCALAPI ControlBlock::InquireRecvBuf(int & nIO, bool & eotFlag)
 
 
 // Given
-//	int			the number of bytes be free, shall equal the value passed out by InquireRecvBuf
+//	int32_t		the number of bytes be free, shall equal the value passed out by InquireRecvBuf
 // Do
 //	Free the packet buffer blocks that cover at least the given number of bytes.
 // Return
@@ -693,7 +683,7 @@ void * LOCALAPI ControlBlock::InquireRecvBuf(int & nIO, bool & eotFlag)
 //	-EINTR		the receive queue has been messed up
 //	-EPERM		imconformant to the protocol, which is prohibitted
 //	-EDOM		parameter error
-int LOCALAPI ControlBlock::MarkReceivedFree(int nIO)
+int LOCALAPI ControlBlock::MarkReceivedFree(int32_t nIO)
 {
 	const int tail = recvWindowNextPos;
 	if (tail > recvBufferBlockN)

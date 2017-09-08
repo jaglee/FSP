@@ -68,7 +68,7 @@ static int	FSPAPI onConnected(FSPHANDLE, PFSP_Context);
 static void FSPAPI onServerResponseReceived(FSPHANDLE, FSP_ServiceCode, int);
 static int	FSPAPI onClientResponseSent(FSPHANDLE, void *, int32_t, BOOL);
 //
-static int	FSPAPI onReceiveNextBlock(FSPHANDLE, void *, int32_t, BOOL);
+static bool	FSPAPI onReceiveNextBlock(FSPHANDLE, void *, int32_t, bool);
 static void FSPAPI onAcknowledgeSent(FSPHANDLE, FSP_ServiceCode, int);
 
 // an internal function to parsing each memory segment received 'inline'
@@ -197,7 +197,7 @@ static void FSPAPI onServerResponseReceived(FSPHANDLE h, FSP_ServiceCode c, int 
 		return;
 	}
 
-	WriteTo(h, clientResponse, sizeof(clientResponse), EOF, NULL);
+	WriteTo(h, clientResponse, sizeof(clientResponse), TO_END_TRANSACTION, NULL);
 
 	printf_s("\tTo install the session key instantly...\n");
 	octet bufSessionKey[SESSION_KEY_SIZE];
@@ -214,13 +214,13 @@ static void FSPAPI onServerResponseReceived(FSPHANDLE h, FSP_ServiceCode c, int 
 // The iteration body that accept continuous segments of the directory list
 // The 'eot' (End of Transaction) flag is to indicate the end of the list
 // A reverse application layer acknowledgement message is written back to the remote end
-static int FSPAPI onReceiveNextBlock(FSPHANDLE h, void *buf, int32_t len, BOOL eot)
+static bool FSPAPI onReceiveNextBlock(FSPHANDLE h, void *buf, int32_t len, bool eot)
 {
 	if(buf == NULL)	
 	{
 		printf("FSP Internal panic? Receive nothing when calling the CallbackPeeked?\n");
 		Dispose(h);
-		return -1;
+		return false;
 	}
 
 	ParseBlock(buf, len);
@@ -228,11 +228,11 @@ static int FSPAPI onReceiveNextBlock(FSPHANDLE h, void *buf, int32_t len, BOOL e
 	if(eot)
 	{
 		printf_s("All data have been received, to acknowledge...\n");
-		// Respond with a code saying no error
-		return WriteTo(h, "0000", 4, EOF, onAcknowledgeSent);
+		WriteTo(h, "0000", 4, TO_END_TRANSACTION, onAcknowledgeSent);
+		return false;
 	}
 
-	return 1;
+	return true;
 }
 
 

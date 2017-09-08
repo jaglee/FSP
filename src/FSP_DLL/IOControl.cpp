@@ -75,6 +75,9 @@ int FSPAPI FSPControl(FSPHANDLE hFSPSocket, FSP_ControlCode controlCode, ULONG_P
 		case FSP_GET_PEER_COMMITTED:
 			*((int *)value) = pSocket->HasPeerCommitted() ? 1 : 0;
 			break;
+		case FSP_SET_LONGRUN_CALLBACK:
+			pSocket->SetLongRunCallback((LongRunCallback)value);
+			break;
 		default:
 			return -EDOM;
 		}

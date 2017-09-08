@@ -35,7 +35,7 @@ static bool finished;
 static int	FSPAPI onConnected(FSPHANDLE, PFSP_Context);
 static void FSPAPI onPublicKeySent(FSPHANDLE, FSP_ServiceCode, int);
 static void FSPAPI onReceiveFileNameReturn(FSPHANDLE, FSP_ServiceCode, int);
-static int	FSPAPI onReceiveNextBlock(FSPHANDLE, void *, int32_t, BOOL);
+static bool FSPAPI onReceiveNextBlock(FSPHANDLE, void *, int32_t, bool);
 static void FSPAPI onAcknowledgeSent(FSPHANDLE, FSP_ServiceCode, int);
 
 
@@ -155,7 +155,7 @@ static int	FSPAPI  onConnected(FSPHANDLE h, PFSP_Context ctx)
 
 	printf_s("\tTo install the shared key instantly...\n");
 	octet prfKey[32];
-	CryptoZhCnHash256(prfKey, bufSharedKey, CRYPTO_NACL_KEYBYTES);
+	sha256_hash(prfKey, bufSharedKey, CRYPTO_NACL_KEYBYTES);
 	InstallSessionKey(h, prfKey, 32, INT32_MAX);
 
 	return 0;
@@ -260,13 +260,13 @@ static void FSPAPI onReceiveFileNameReturn(FSPHANDLE h, FSP_ServiceCode resultCo
 // The iteration body that accept continuous segments of the file content one by one
 // The 'eot' (End of Transaction) flag is to indicate the end of the file
 // A reverse application layer acknowledgement message is written back to the remote end
-static int FSPAPI onReceiveNextBlock(FSPHANDLE h, void *buf, int32_t len, BOOL eot)
+static bool FSPAPI onReceiveNextBlock(FSPHANDLE h, void *buf, int32_t len, bool eot)
 {
 	if(buf == NULL)
 	{
 		printf("FSP Internal panic? Receive nothing when calling the CallbackPeeked?\n");
 		Dispose(h);
-		return -1;
+		return false;
 	}
 
 	printf_s("%d bytes read, to write the buffer directly...\n", len);
@@ -276,7 +276,7 @@ static int FSPAPI onReceiveNextBlock(FSPHANDLE h, void *buf, int32_t len, BOOL e
 	{
 		ReportLastError();
 		Dispose(h);
-		return -1;
+		return false;
 	}
 
 	printf_s("%d bytes written to local storage.\n", bytesWritten);
@@ -285,11 +285,11 @@ static int FSPAPI onReceiveNextBlock(FSPHANDLE h, void *buf, int32_t len, BOOL e
 	if(eot)
 	{
 		printf_s("All data have been received, to acknowledge...\n");
-		// Respond with a code saying no error
-		return WriteTo(h, "0000", 4, TO_END_TRANSACTION, onAcknowledgeSent);
+		WriteTo(h, "0000", 4, TO_END_TRANSACTION, onAcknowledgeSent);
+		return false;
 	}
 
-	return 1;
+	return true;
 }
 
 
