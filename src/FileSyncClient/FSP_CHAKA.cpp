@@ -72,7 +72,7 @@ static bool	FSPAPI onReceiveNextBlock(FSPHANDLE, void *, int32_t, bool);
 static void FSPAPI onAcknowledgeSent(FSPHANDLE, FSP_ServiceCode, int);
 
 // an internal function to parsing each memory segment received 'inline'
-static int ParseBlock(void *, int32_t);
+static int ParseBlock(octet *, int32_t);
 
 static bool finished;
 
@@ -146,7 +146,7 @@ static int	FSPAPI  onConnected(FSPHANDLE h, PFSP_Context ctx)
 
 	int mLen = strlen((const char *)ctx->welcome) + 1;
 	printf_s("\tWelcome message length: %d\n", ctx->len);
-	printf_s("%s\n", ctx->welcome);
+	printf_s("%s\n", (char *)ctx->welcome);
 
 	InitCHAKAClient(chakaPubInfo, bufPrivateKey);
 	memcpy(chakaPubInfo.peerPublicKey, (const char *)ctx->welcome + mLen, CRYPTO_NACL_KEYBYTES);
@@ -211,19 +211,68 @@ static void FSPAPI onServerResponseReceived(FSPHANDLE h, FSP_ServiceCode c, int 
 
 
 
+static char strStrings[1200];	// arbitrary size for test only
+static void FSPAPI onStringsRead(FSPHANDLE h, FSP_ServiceCode code, int len)
+{
+	if(len < 0)
+	{
+		printf_s("onStringsRead get call back parameter value %d\n", len);
+		Dispose(h);
+		return;
+	}
+
+	ParseBlock((octet *)strStrings, len);
+	
+	int r;
+	FSPControl(h, FSP_GET_PEER_COMMITTED, (ulong_ptr) & r);
+	if(! r)
+	{
+		ReadFrom(h, strStrings, (int)sizeof(strStrings), onStringsRead);
+		return;
+	}
+	//
+	printf_s("All data have been received, to acknowledge...\n");
+	WriteTo(h, "0000", 4, TO_END_TRANSACTION, onAcknowledgeSent);
+}
+
+
+static void SynchronousRead(FSPHANDLE h)
+{
+	int len;
+	do
+	{
+		len = ReadFrom(h, strStrings, (int)sizeof(strStrings), NULL);
+		if(len > 0)
+			ParseBlock((octet *)strStrings, len);	
+	} while (len > 0);
+	//
+	//FSPControl(h, FSP_GET_PEER_COMMITTED, (ulong_ptr) & len);
+	//assert(len != 0);
+	printf_s("All data have been received, to acknowledge...\n");
+	WriteTo(h, "0000", 4, TO_END_TRANSACTION, onAcknowledgeSent);
+}
+
+
 // The iteration body that accept continuous segments of the directory list
 // The 'eot' (End of Transaction) flag is to indicate the end of the list
 // A reverse application layer acknowledgement message is written back to the remote end
 static bool FSPAPI onReceiveNextBlock(FSPHANDLE h, void *buf, int32_t len, bool eot)
 {
+	if(len == -EPIPE)
+	{
+//		ReadFrom(h, strStrings, (int)sizeof(strStrings), onStringsRead);
+		SynchronousRead(h);
+		return false;
+	}
+
 	if(buf == NULL)	
 	{
-		printf("FSP Internal panic? Receive nothing when calling the CallbackPeeked?\n");
+		printf_s("FSP Internal panic? Receive nothing when calling the CallbackPeeked?\n");
 		Dispose(h);
 		return false;
 	}
 
-	ParseBlock(buf, len);
+	ParseBlock((octet *)buf, len);
 
 	if(eot)
 	{
@@ -237,33 +286,36 @@ static bool FSPAPI onReceiveNextBlock(FSPHANDLE h, void *buf, int32_t len, bool 
 
 
 
-static int ParseBlock(void *buf, int32_t len)
+static int ParseBlock(octet *utf8str, int32_t len)
 {
 	static char partialFileName[sizeof(TCHAR) * MAX_PATH + 4];	// buffered partial file name
 	static int lenPartial = 0;					// length of the partial name
-
 	TCHAR finalFileName[MAX_PATH];
-	char *utf8str = (char *)buf;
 	int lenCurrent = 0;
 	int nScanned = 0;
 
 	// Set the sentinel
 	char c = utf8str[len - 1];
 	utf8str[len - 1] = 0;
-	// the first block
+
+	// continue with previous cross-border string
 	if (lenPartial > 0)
 	{
-		while (utf8str[lenCurrent++] != 0)
+		while (utf8str[lenCurrent] != 0)
+		{
+			lenCurrent++;
 			nScanned++;
+		}
 		// There should be a NUL as the string terminator!
 		if (c != 0 && lenCurrent >= len)
 		{
 			printf_s("Attack encountered? File name too long!\n");
-			//clean up work here!
 			return -1;
 		}
 		//
-		memcpy(partialFileName + lenPartial, utf8str, lenCurrent);	// Make it null-terminated
+		lenCurrent++;	// Make it null-terminated
+		nScanned++;
+		memcpy(partialFileName + lenPartial, utf8str, lenCurrent);
 #ifdef _MBCS
 		UTF8ToLocalMBCS(finalFileName, MAX_PATH, partialFileName);
 		printf_s("%s\n", finalFileName);
@@ -273,7 +325,6 @@ static int ParseBlock(void *buf, int32_t len)
 #endif
 		// TODO: some further treatment on the final filename here.
 		utf8str += lenCurrent;
-		nScanned++;
 		lenCurrent = 0;
 		lenPartial = 0;
 	}
@@ -281,25 +332,30 @@ static int ParseBlock(void *buf, int32_t len)
 	do
 	{
 		while (utf8str[lenCurrent] != 0)
-			lenCurrent++, nScanned++;
-		//
-		if (++nScanned >= len && c != 0)
 		{
-			utf8str[lenCurrent] = c;
+			lenCurrent++;
+			nScanned++;
+		}
+		//
+		lenCurrent++;
+		nScanned++;
+		if (nScanned >= len && c != 0)
+		{
+			utf8str[lenCurrent - 1] = c;	// so that the sentinel character is copied
 			memcpy(partialFileName, utf8str, lenCurrent);
 			lenPartial = lenCurrent;
 			break;
 		}
 		//
 #ifdef _MBCS
-		UTF8ToLocalMBCS(finalFileName, MAX_PATH, utf8str);
+		UTF8ToLocalMBCS(finalFileName, MAX_PATH, (char *)utf8str);
 		printf_s("%s\n", finalFileName);
 #else
-		UTF8ToWideChars(finalFileName, MAX_PATH, utf8str, lenCurrent + 1);
+		UTF8ToWideChars(finalFileName, MAX_PATH, (char *)utf8str, lenCurrent);
 		wprintf_s(L"%s\n", finalFileName);
 #endif
 		// TODO: some further treatment on the final filename here.
-		utf8str += lenCurrent + 1;
+		utf8str += lenCurrent;
 		lenCurrent = 0;
 	} while (nScanned < len);
 	//

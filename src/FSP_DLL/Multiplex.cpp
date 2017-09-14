@@ -96,7 +96,7 @@ FSPHANDLE FSPAPI MultiplyAndGetSendBuffer(FSPHANDLE hFSP, PFSP_Context psp1, Cal
 		void *buf = p->pControlBlock->InquireSendBuf(& m);
 		if(buf == NULL)
 		{
-			CSocketItemDl::FreeItem(p);
+			p->FreeAndDisable();
 			return NULL;
 		}
 		//
@@ -142,11 +142,8 @@ CSocketItemDl * LOCALAPI CSocketItemDl::ToPrepareMultiply(CSocketItemDl *p, PFSP
 		// The MULTIPLY packet itself is sent in old key, while the packet next to MULTIPLY is send in derived key
 		socketItem->SetState(CLONING);
 		socketItem->SetNewTransaction();
-		socketItem->pControlBlock->peerAddr = p->pControlBlock->peerAddr;
-		// But nearEndName cannot be inheritted
-		socketItem->pControlBlock->nearEndInfo = p->pControlBlock->nearEndInfo;
 	}
-	catch(int)	// could we really catch run-time memory access exception?
+	catch(...)
 	{
 		socketsTLB.FreeItem(socketItem);
 		return NULL;
@@ -202,7 +199,7 @@ bool LOCALAPI CSocketItemDl::ToWelcomeMultiply(BackLogItem & backLog)
 	PFSP_IN6_ADDR remoteAddr = (PFSP_IN6_ADDR) & pControlBlock->peerAddr.ipFSP.allowedPrefixes[MAX_PHY_INTERFACES - 1];	
 	SetState(ESTABLISHED);
 	SetNewTransaction();
-	if (context.onAccepting != NULL	|| context.onAccepting(this, & backLog.acceptAddr, remoteAddr) < 0)
+	if (context.onAccepting != NULL	&& context.onAccepting(this, & backLog.acceptAddr, remoteAddr) < 0)
 	{
 		Recycle();
 		return false;

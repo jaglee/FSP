@@ -337,21 +337,42 @@ void LOCALAPI CLowerInterface::OnGetConnectRequest()
 	if(pSocket->pControlBlock->backLog.Has(& backlogItem))
 		goto l_return;
 
+	assert(sizeof(backlogItem.allowedPrefixes) == sizeof(q->params.subnets));
 	// secondly, fill in the backlog item if it is new
 	CtrlMsgHdr * const pHdr = (CtrlMsgHdr *)mesgInfo.Control.buf;
+	// Note that FSP over IPv6 does NOT support NAT automatically, by design
+	// However, participants of FSP MAY obtain the IPv6 network prefix
+	// obtained after NAT by uPnP and fill in the subnets field with the value after translation
+	backlogItem.acceptAddr.cmsg_level = pHdr->pktHdr.cmsg_level;
 	if (pHdr->IsIPv6())
 	{
 		memcpy(&backlogItem.acceptAddr, &pHdr->u, sizeof(FSP_SINKINF));
+		memcpy(backlogItem.allowedPrefixes, q->params.subnets, sizeof(uint64_t) * MAX_PHY_INTERFACES);
 	}
 	else
 	{	// FSP over UDP/IPv4
 		register PFSP_IN6_ADDR fspAddr = (PFSP_IN6_ADDR) & backlogItem.acceptAddr;
+		// For sake of NAT ignore the subnet prefixes reported by the initiator
 		fspAddr->_6to4.prefix = PREFIX_FSP_IP6to4;
+		//
+		fspAddr->_6to4.ipv4 = addrFrom.Ipv4.sin_addr.S_un.S_addr;
+		fspAddr->_6to4.port = addrFrom.Ipv4.sin_port;
+		backlogItem.allowedPrefixes[0] = fspAddr->subnet;
+#if defined(TRACE) && (TRACE & TRACE_ADDRESS)
+		printf_s("To accept connect request from address: ");
+		DumpNetworkUInt16((uint16_t *)& fspAddr->subnet, sizeof(fspAddr->subnet) / 2);
+#endif
 		fspAddr->_6to4.ipv4 = pHdr->u.ipi_addr;
 		fspAddr->_6to4.port = DEFAULT_FSP_UDPPORT;
 		fspAddr->idHost = 0;	// no for IPv4 no virtual host might be specified
 		fspAddr->idALF = fiberID;
+#if defined(TRACE) && (TRACE & TRACE_ADDRESS)
+		printf_s("To accept connect request at socket address: ");
+		DumpNetworkUInt16((uint16_t *)& fspAddr->subnet, sizeof(fspAddr->subnet) / 2);
+#endif
 		backlogItem.acceptAddr.ipi6_ifindex = pHdr->u.ipi_ifindex;
+		//
+		memset(& backlogItem.allowedPrefixes[1], 0, sizeof(uint64_t) * (MAX_PHY_INTERFACES - 1));
 	}
 	// Ephemeral key materials(together with salt):
 	backlogItem.initCheckCode = q->initCheckCode;
@@ -365,8 +386,6 @@ void LOCALAPI CLowerInterface::OnGetConnectRequest()
 	rand_w32(& backlogItem.initialSN, 1);
 	backlogItem.expectedSN = be32toh(q->initialSN);	// CONNECT_REQUEST does NOT consume a sequence number
 
-	assert(sizeof(backlogItem.allowedPrefixes) == sizeof(q->params.subnets));
-	memcpy(backlogItem.allowedPrefixes, q->params.subnets, sizeof(uint64_t) * MAX_PHY_INTERFACES);
 
 	// lastly, put it into the backlog
 	if (pSocket->pControlBlock->backLog.Put(&backlogItem) < 0)
@@ -1151,8 +1170,11 @@ void CSocketItemEx::OnGetMultiply()
 	FSP_NormalPacketHeader *pFH = (FSP_NormalPacketHeader *)headPacket->GetHeaderFSP();	// the fixed header
 	uint32_t remoteHostID = pControlBlock->connectParams.remoteHostID;
 	ALFID_T idSource = headPacket->fidPair.source;
+	uint32_t salt = pFH->expectedSN;
 	// The out-of-band serial number is stored in p1->expectedSN
-	if (!ValidateICC(pFH, headPacket->lenData, idSource, pFH->expectedSN))
+	// Recover the hidden expected SN exploited by the peer
+	pFH->expectedSN = htobe32(contextOfICC.snFirstSendWithCurrKey);
+	if (!ValidateICC(pFH, headPacket->lenData, idSource, salt))
 	{
 		BREAK_ON_DEBUG();	//TRACE_HERE("Invalid intergrity check code!?");
 		return;
@@ -1189,6 +1211,8 @@ l_bailout:
 	backlogItem.idParent = fidPair.source;
 	backlogItem.acceptAddr = pControlBlock->nearEndInfo;
 	backlogItem.acceptAddr.idALF = newItem->fidPair.source;
+	memcpy(backlogItem.allowedPrefixes, pControlBlock->peerAddr.ipFSP.allowedPrefixes, sizeof(uint64_t)* MAX_PHY_INTERFACES);
+	//^See also CSocketItemDl::PrepareToAccept()
 
 	// lastly, put it into the backlog
 	if (pControlBlock->backLog.Put(&backlogItem) < 0)
@@ -1205,10 +1229,11 @@ l_bailout:
 #endif
 
 	SOCKADDR_HOSTID(newItem->sockAddrTo) = remoteHostID;
+	// While the ALFID part which was assigned dynamically by AllocItem() is preserved
 	newItem->fidPair.peer = idSource;
 	newItem->idParent = fidPair.source;
 	newItem->nextOOBSN = this->nextOOBSN;
-	newItem->lastOOBSN = be32toh(pFH->expectedSN);
+	newItem->lastOOBSN = be32toh(salt);
 	//^As a salt it is of neutral byte-order, as an OOBSN it should be transformed to host byte order.
 	// place payload into the backlog, see also placepayload
 	newItem->CopyInPlainText((BYTE *)pFH + be16toh(pFH->hs.hsp), headPacket->lenData);
@@ -1216,10 +1241,12 @@ l_bailout:
 	ControlBlock::PFSP_SocketBuf skb = ((CMultiplyBacklogItem *)newItem)->TempSocketBuf();
 	skb->version = pFH->hs.major;
 	skb->opCode = pFH->hs.opCode;
+	skb->CopyInFlags(pFH);
 	skb->SetFlag<IS_FULFILLED>();
 	//^See also PlacePayload
 	// Be free to accept: we accept an imcomplete MULTIPLY
-	skb->SetFlag<TransactionEnded>(pFH->GetFlag<TransactionEnded>() || headPacket->lenData != MAX_BLOCK_SIZE);
+	if(headPacket->lenData != MAX_BLOCK_SIZE)
+		skb->SetFlag<TransactionEnded>();
 
 	// The first packet received is in the parent's session key while the very first responding packet shall be sent in the derived key!
 	newItem->contextOfICC.snFirstRecvWithCurrKey = headPacket->pktSeqNo + 1;
@@ -1266,7 +1293,7 @@ int CSocketItemEx::PlacePayload()
 			return -EFAULT;
 		//
 		memcpy(ubuf, (BYTE *)pHdr + be16toh(pHdr->hs.hsp), headPacket->lenData);
-		skb->SetFlag<TransactionEnded>((pHdr->GetFlag<TransactionEnded>() != 0));
+		skb->CopyInFlags(pHdr);
 	}
 	skb->version = pHdr->hs.major;
 	// Force the last packet descriptor of the transaction in the receive buffer to be _COMMIT.

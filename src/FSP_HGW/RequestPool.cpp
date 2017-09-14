@@ -28,7 +28,7 @@ PRequestPoolItem RequestPool::AllocItem(FSPHANDLE h)
 	{
 		if(items[i].hFSP == NULL)
 		{
-			FSPControl(h, FSP_SET_SIGNATURE, ulong_ptr(items + i));
+			FSPControl(h, FSP_SET_EXT_POINTER, ulong_ptr(items + i));
 			items[i].hFSP = h;
 			return (items + i);
 		}
@@ -57,8 +57,8 @@ PRequestPoolItem RequestPool::AllocItem()
 
 PRequestPoolItem RequestPool::FindItem(FSPHANDLE h)
 {
-	SRequestPoolItem *p;
-	FSPControl(h, FSP_GET_SIGNATURE, (ulong_ptr) & p);
+	PRequestPoolItem p;
+	FSPControl(h, FSP_GET_EXT_POINTER, (ulong_ptr) & p);
 	//
 	return (p == NULL || p->hFSP != h ? NULL : p);
 }
@@ -78,7 +78,7 @@ bool RequestPool::FreeItem(PRequestPoolItem p)
 		return false;
 
 	if(p->hFSP != (FSPHANDLE *)(-1))
-		FSPControl(p->hFSP, FSP_SET_SIGNATURE, NULL);
+		FSPControl(p->hFSP, FSP_SET_EXT_POINTER, NULL);
 	p->hFSP = NULL;
 	return true;
 }

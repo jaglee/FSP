@@ -14,6 +14,10 @@
 
 #include "../FSP_DLL/FSP_DLL.h"
 
+#define _CRT_RAND_S
+#include "../Crypto/CryptoStub.h"
+
+typedef uint32_t U32;
 
 class CSocketItemDbg: CSocketItemDl
 {
@@ -23,6 +27,7 @@ public:
 
 	friend void UnitTestPrepareToSend();
 	friend void UnitTestBufferData();
+	friend void LogicTestPackedSend();
 
 	friend void UnitTestFetchReceived();
 	friend void UnitTestCompressAndDecode();

@@ -388,10 +388,10 @@ void CSocketItemEx::UrgeCommit()
 	{
 		shouldAppendCommit = 1;
 		SendKeepAlive();
-		// See also EmitQ, DoResend
-		if (resendTimer == NULL)
-			AddResendTimer(tRoundTrip_us >> 8);
 	}
+	// See also EmitQ, DoResend
+	if (resendTimer == NULL)
+		AddResendTimer(tRoundTrip_us >> 8);
 }
 
 

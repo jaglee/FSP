@@ -27,7 +27,7 @@ static bool FSPAPI onSignatureReceived(FSPHANDLE hRev, void * buf, int32_t lengt
 	printf_s("%s\n", (CHAR *)buf);
 	// assert(eot);
 	Shutdown(hRev, onShutdown);
-	return 1;
+	return true;
 }
 
 

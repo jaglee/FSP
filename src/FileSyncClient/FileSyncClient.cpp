@@ -8,6 +8,7 @@
 // If compiled in Debug mode with the '_DEBUG' macro predefined by default, it tests FSP over UDP/IPv4
 // If compiled in Release mode, or anyway without the '_DEBUG' macro predefined, it tests FSP over IPv6
 #ifdef _DEBUG
+//# define REMOTE_APPLAYER_NAME "192.168.9.125:80"
 # define REMOTE_APPLAYER_NAME "localhost:80"
 // #define REMOTE_APPLAYER_NAME "lt-x61t:80"
 // #define REMOTE_APPLAYER_NAME "lt-at4:80"
@@ -130,7 +131,7 @@ static int	FSPAPI  onConnected(FSPHANDLE h, PFSP_Context ctx)
 
 	int mLen = strlen((const char *)ctx->welcome) + 1;
 	printf_s("\tWelcome message length: %d\n", ctx->len);
-	printf_s("%s\n", ctx->welcome);
+	printf_s("%s\n", (char *)ctx->welcome);
 	if(ctx->len <= 0 || mLen >= ctx->len)
 	{
 		printf_s("Security context is not fulfilled: the peer did not provide the public key.\n");
@@ -190,7 +191,7 @@ static void FSPAPI onReceiveFileNameReturn(FSPHANDLE h, FSP_ServiceCode resultCo
 {
 	if(resultCode != FSP_NotifyDataReady)
 	{
-		printf("\nUnknown result code %d returned by FSP LLS, returned = %\n", resultCode, resultValue);
+		printf_s("\nUnknown result code %d returned by FSP LLS, returned = %d\n", resultCode, resultValue);
 		Dispose(h);
 		return;
 	}
@@ -334,7 +335,7 @@ int ReportLastError()
 		0,
 		NULL )) 
 	{
-		printf("\tError: %s\n", lpMsgBuf);
+		printf_s("\tError: %s\n", (char *)lpMsgBuf);
 		LocalFree( lpMsgBuf );
 	}
 

@@ -46,6 +46,7 @@
 #pragma intrinsic(_InterlockedExchange, _InterlockedExchange16, _InterlockedExchange8)
 #pragma intrinsic(_InterlockedIncrement, _InterlockedOr, _InterlockedOr8)
 
+#define COOKIE_KEY_LEN			20	// salt include, as in RFC4543 5.4
 #define MULTIPLY_BACKLOG_SIZE	8
 
  // For testability
@@ -518,11 +519,13 @@ class CMultiplyBacklogItem: public CSocketItemEx
 {
 	friend	class CSocketSrvTLB;
 public:
-	//
-	void	CopyInPlainText(const uint8_t *buf, int n) { *((int32_t *)& tSessionBegin) = (int32_t)n; if(n > 0) memcpy(cipherText, buf, n); }
-	int		CopyOutPlainText(uint8_t *buf) { int n = *((int32_t *)& tSessionBegin); if(n > 0) memcpy(buf, cipherText, n); return n; }
-	// 'Convert' this to FSP_SocketBuf, and we knew FSP_SocketBuf start with a timestamp_t member
+	// Get the temporary FSP_SocketBuf descriptor,
 	ControlBlock::PFSP_SocketBuf TempSocketBuf() { return (ControlBlock::PFSP_SocketBuf)(& tSessionBegin - 1); }
+	// and we knew FSP_SocketBuf descriptor start with a timestamp_t member
+	void	CopyInPlainText(const uint8_t *buf, int32_t n) { TempSocketBuf()->len = n; if(n > 0) memcpy(cipherText, buf, n); }
+	int		CopyOutPlainText(uint8_t *buf) { int32_t n = TempSocketBuf()->len; if(n > 0) memcpy(buf, cipherText, n); return n; }
+	// copy out the flag, version and opcode fields. assume 32-bit alignment
+	void	CopyOutFVO(void *buf) { *(int32_t *)buf = *(int32_t *)& TempSocketBuf()->flags; }
 	//
 	void	ResponseToMultiply();
 };

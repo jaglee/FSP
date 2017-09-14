@@ -103,6 +103,7 @@ void GCM_AES_SetIV(GCM_AES_CTX *ctx, const uint8_t *IV)
 // Remark
 //	Salt is OPTIONAL. It is exploited as described in RFC4543
 //	bytesK must be 16, 24 or 32 without salt, or 20, 28, 40 with salt
+//	If the salt is not set here, it MUST have been set by the caller before Decrypt/Encrypt
 void GCM_AES_SetKey(GCM_AES_CTX *ctx, const uint8_t *K, int bytesK)
 {
 	// AES key schedule
@@ -115,10 +116,7 @@ void GCM_AES_SetKey(GCM_AES_CTX *ctx, const uint8_t *K, int bytesK)
 
 	if ((bytesK & 7))
 		*(uint32_t *)ctx->J = *(uint32_t *)(K + (bytesK & 0xF8));
-	else
-		*(uint32_t *)ctx->J = *(uint32_t *)ctx->H ^ *(uint32_t *)K;;
 }
-
 
 
 
@@ -127,6 +125,13 @@ uint32_t GCM_AES_XorSalt(GCM_AES_CTX *ctx, uint32_t salt)
 	register uint32_t u = *(uint32_t *)ctx->J;
 	*(uint32_t *)ctx->J = u ^ salt;
 	return u;
+}
+
+
+
+uint32_t GCM_AES_SetSalt(GCM_AES_CTX *ctx, uint32_t salt)
+{
+	return (uint32_t)_InterlockedExchange((long *)ctx->J, (long)salt);
 }
 
 

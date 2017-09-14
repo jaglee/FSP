@@ -19,7 +19,7 @@ void SendMemoryPattern()
 		* (uint32_t *) & bytesToSend[i * sizeof(uint32_t)] = htobe32(i);
 	}
 
-	WaitConnection(defaultWelcome, strlen(defaultWelcome) + 1, onAccepted);
+	WaitConnection(defaultWelcome, (uint16_t)strlen(defaultWelcome) + 1, onAccepted);
 }
 
 

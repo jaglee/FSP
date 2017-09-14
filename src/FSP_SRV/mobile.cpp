@@ -205,6 +205,7 @@ void CSocketItemEx::InstallEphemeralKey()
 	printf_s("Session key materials:\n");
 	DumpNetworkUInt16((uint16_t *)  & pControlBlock->connectParams, FSP_MAX_KEY_SIZE / 2);
 #endif
+	GCM_AES_SetSalt(&contextOfICC.curr.gcm_aes, pControlBlock->connectParams.salt);
 	contextOfICC.keyLife = 0;
 	contextOfICC.curr.precomputedICC[0] 
 		=  CalculateCRC64(* (uint64_t *) & fidPair, (uint8_t *) & pControlBlock->connectParams, FSP_MAX_KEY_SIZE);
@@ -284,10 +285,11 @@ void CSocketItemEx::InstallSessionKey(const CommandInstallKey & cmd)
 // Context - idInitiator, idResponder
 // Length -  An integer specifying the length (in bits) of the derived keying material K-output
 // Assume other fields of contextOfICC have been filled properly, especially contextOfICC.prev = contextOfICC.curr
+// A 4-octet (32-bit) salt generation is hard-coded. See also GCM_AES_SetKey
 void LOCALAPI CSocketItemEx::DeriveNextKey(ControlBlock::seq_t sn1, ControlBlock::seq_t ackSN, ALFID_T idInitiator, ALFID_T idResponder)
 {
 	register uint8_t *keyBuffer = (uint8_t *)& pControlBlock->connectParams;
-	register int L = pControlBlock->connectParams.keyLength;
+	register int L = pControlBlock->connectParams.keyLength + 4;
 	uint64_t nonce = htobe64(((uint64_t)sn1 << 32) + ackSN);
 	// hard coded, as specified by the protocol
 	ALIGN(8)
@@ -305,20 +307,16 @@ void LOCALAPI CSocketItemEx::DeriveNextKey(ControlBlock::seq_t sn1, ControlBlock
 		, nonce
 		, paddedData, sizeof(paddedData)
 		, keyBuffer, 16);
-	if(L <= 16)
-		goto l_return;
 	// the second 128-bits
+	// or the salt as specified in RFC4543
 	paddedData[0] = 2;
 	GCM_SecureHash(& contextOfICC.prev.gcm_aes
 		, nonce
 		, paddedData, sizeof(paddedData)
 		, keyBuffer + 16, 16);
-	// 384-bits AES does not exist. However, Blowfish, the default cipher algorithm exploited by OpenVPN,
-	// although suspectible to birthday attack in some senario, can utilise key length up to 448 bits
-	// https://sweet32.info/  mitigate the attack by forcing frequent rekeying with reneg-bytes 64000000. (64MB) 
 	if (L <= 32)
 		goto l_return;
-	// the third 128-bits
+	// for generation of salt if the length of the key is 256 bits
 	paddedData[0] = 3;
 	GCM_SecureHash(&contextOfICC.prev.gcm_aes
 		, nonce
@@ -327,7 +325,7 @@ void LOCALAPI CSocketItemEx::DeriveNextKey(ControlBlock::seq_t sn1, ControlBlock
 	//
 l_return:
 #ifndef NDEBUG
-	if (L != 16 && L != 32 && L != 48)
+	if (L != 20 && L != 36)
 		throw - EDOM;	// unsupported key length, there must be protocol incoherency
 #endif
 	GCM_AES_SetKey(& contextOfICC.curr.gcm_aes, keyBuffer, L);
@@ -674,8 +672,7 @@ int CSocketItemEx::EmitWithICC(ControlBlock::PFSP_SocketBuf skb, ControlBlock::s
 	register FSP_NormalPacketHeader *pHdr = & pControlBlock->tmpHeader;
 	// ICC, if required, is always set just before being sent
 	pControlBlock->SetSequenceFlags(pHdr, seq);
-	if (skb->GetFlag<TransactionEnded>())
-		pHdr->SetFlag<TransactionEnded>();
+	skb->CopyFlagsTo(pHdr);
 	pHdr->hs.Set(skb->opCode, sizeof(FSP_NormalPacketHeader));
 
 	// here we needn't check memory corruption as mishavior only harms himself

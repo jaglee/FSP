@@ -65,8 +65,7 @@ FSPHANDLE FSPAPI ListenAt(const PFSP_IN6_ADDR listenOn, PFSP_Context psp1)
 	if(! socketItem->AddOneShotTimer(TRANSIENT_STATE_TIMEOUT_ms))
 	{
 		REPORT_ERRMSG_ON_TRACE("Cannot set time-out clock for listen");
-		socketItem->Disable();
-		CSocketItemDl::FreeItem(socketItem);
+		socketItem->FreeAndDisable();
 		return NULL;
 	}
 
@@ -170,8 +169,7 @@ FSPHANDLE FSPAPI Connect2(const char *peerName, PFSP_Context psp1)
 	if(! socketItem->AddOneShotTimer(TRANSIENT_STATE_TIMEOUT_ms))
 	{
 		REPORT_ERRMSG_ON_TRACE("Cannot set time-out clock for connect");
-		socketItem->Disable();
-		CSocketItemDl::FreeItem(socketItem);
+		socketItem->FreeAndDisable();
 		return NULL;
 	}
 

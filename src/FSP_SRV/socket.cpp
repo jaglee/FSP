@@ -355,35 +355,32 @@ void CSocketItemEx::InitAssociation()
 
 	// See also CLowerInterface::EnumEffectiveAddresses
 	register PSOCKADDR_INET const pFarEnd = sockAddrTo;
-	if (!pControlBlock->nearEndInfo.IsIPv6())
+#ifdef OVER_UDP_IPv4
+	for(register int i = 0; i < MAX_PHY_INTERFACES; i++)
 	{
-		for(register int i = 0; i < MAX_PHY_INTERFACES; i++)
-		{
-			memset(&pFarEnd[i], 0, sizeof(pFarEnd[i]));
-			pFarEnd[i].Ipv4.sin_family = AF_INET;
-			pFarEnd[i].Ipv4.sin_addr.S_un.S_addr
-				= ((PFSP_IN4_ADDR_PREFIX) & pControlBlock->peerAddr.ipFSP.allowedPrefixes[i])->ipv4;
-			pFarEnd[i].Ipv4.sin_port = DEFAULT_FSP_UDPPORT;
-			((PFSP_IN6_ADDR) & (pFarEnd[i].Ipv6.sin6_addr))->idALF = fidPair.peer;
-		}
-		// namelen = sizeof(SOCKADDR_IN);
+		memset(&pFarEnd[i], 0, sizeof(pFarEnd[i]));
+		pFarEnd[i].Ipv4.sin_family = AF_INET;
+		pFarEnd[i].Ipv4.sin_addr.S_un.S_addr
+			= ((PFSP_IN4_ADDR_PREFIX) & pControlBlock->peerAddr.ipFSP.allowedPrefixes[i])->ipv4;
+		pFarEnd[i].Ipv4.sin_port = DEFAULT_FSP_UDPPORT;
+		((PFSP_IN6_ADDR) & (pFarEnd[i].Ipv6.sin6_addr))->idALF = fidPair.peer;
 	}
-	else
+	// namelen = sizeof(SOCKADDR_IN);
+#else
+	// local address is yet to be determined by the LLS
+	for(register int i = 0; i < MAX_PHY_INTERFACES; i++)
 	{
-		// local address is yet to be determined by the LLS
-		for(register int i = 0; i < MAX_PHY_INTERFACES; i++)
-		{
-			pFarEnd[i].Ipv6.sin6_family = AF_INET6;
-			pFarEnd[i].Ipv6.sin6_flowinfo = 0;
-			pFarEnd[i].Ipv6.sin6_port = 0;
-			pFarEnd[i].Ipv6.sin6_scope_id = 0;
-			((PFSP_IN6_ADDR) & (pFarEnd[i].Ipv6.sin6_addr))->subnet
-				= pControlBlock->peerAddr.ipFSP.allowedPrefixes[i];
-			((PFSP_IN6_ADDR) & (pFarEnd[i].Ipv6.sin6_addr))->idHost = idRemoteHost;
-			((PFSP_IN6_ADDR) & (pFarEnd[i].Ipv6.sin6_addr))->idALF = fidPair.peer;
-		}
-		// namelen = sizeof(SOCKADDR_IN6);
+		pFarEnd[i].Ipv6.sin6_family = AF_INET6;
+		pFarEnd[i].Ipv6.sin6_flowinfo = 0;
+		pFarEnd[i].Ipv6.sin6_port = 0;
+		pFarEnd[i].Ipv6.sin6_scope_id = 0;
+		((PFSP_IN6_ADDR) & (pFarEnd[i].Ipv6.sin6_addr))->subnet
+			= pControlBlock->peerAddr.ipFSP.allowedPrefixes[i];
+		((PFSP_IN6_ADDR) & (pFarEnd[i].Ipv6.sin6_addr))->idHost = idRemoteHost;
+		((PFSP_IN6_ADDR) & (pFarEnd[i].Ipv6.sin6_addr))->idALF = fidPair.peer;
 	}
+	// namelen = sizeof(SOCKADDR_IN6);
+#endif
 	//
 	SyncState();
 }
@@ -647,11 +644,15 @@ void CSocketItemEx::InitiateMultiply(CSocketItemEx *srcItem)
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend();
 	void * payload = GetSendPtr(skb);
 	FSP_NormalPacketHeader q;
-	nextOOBSN = ++ srcItem->nextOOBSN;
+	uint32_t salt = htobe32(nextOOBSN = ++srcItem->nextOOBSN);
 	lastOOBSN = 0;	// As the response from the peer, if any, is not an out-of-band packet
-	q.Set(MULTIPLY, sizeof(FSP_NormalPacketHeader), seq0, nextOOBSN, pControlBlock->recvBufferBlockN);
-
-	void * paidLoad = SetIntegrityCheckCode(& q, payload, skb->len, q.expectedSN);
+	q.Set(MULTIPLY
+		, sizeof(FSP_NormalPacketHeader)
+		, seq0
+		, srcItem->contextOfICC.snFirstRecvWithCurrKey
+		, pControlBlock->recvBufferBlockN);
+	void * paidLoad = SetIntegrityCheckCode(& q, payload, skb->len, salt);
+	q.expectedSN = salt;
 	if (paidLoad == NULL || skb->len > sizeof(this->cipherText))
 	{
 		BREAK_ON_DEBUG();	//TRACE_HERE("Cannot set ICC for the new MULTIPLY command");
@@ -770,12 +771,13 @@ void CMultiplyBacklogItem::ResponseToMultiply()
 // Remark
 //	Send the first packet in the send queuea only, for sake of congestion control
 //	ACK_CONNECT_REQUEST is resent on requested only.
+//	bind to the interface as soon as the control block mapped into server's memory space
 // See also
 //	CSocketItemEx::Start(), OnConnectRequestAck(); CSocketItemDl::ToWelcomeConnect(), ToWelcomeMultiply()
 void CSocketItemEx::Accept()
 {
-	// bind to the interface as soon as the control block mapped into server's memory space
 	InitAssociation();
+	//
 	if(lowState == CHALLENGING)
 	{
 		ReplaceTimer(TRANSIENT_STATE_TIMEOUT_ms);	// The socket slot might be a reused one
@@ -969,24 +971,4 @@ void LOCALAPI DumpNetworkUInt16(uint16_t * buf, int len)
 		printf("%04X ", be16toh(buf[i]));
 	}
 	printf("\n");
-}
-
-
-
-// An auxillary function handling the fixed header
-// Given
-//	FSPOperationCode
-//	uint16_t	The total length of all the headers
-//	uint32_t	The sequenceNo field in host byte order
-//	uint32_t	The expectedNo field in host byte order
-//	uint32_t	The advertised receive window size, in host byte order
-// Do
-//	Filled in the fixed header
-void LOCALAPI FSP_NormalPacketHeader::Set(FSPOperationCode code, uint16_t hsp, uint32_t seqThis, uint32_t seqExpected, int32_t advRecvWinSize)
-{
-	hs.Set(code, hsp);
-	expectedSN = htobe32(seqExpected);
-	sequenceNo = htobe32(seqThis);
-	ClearFlags();
-	SetRecvWS(advRecvWinSize);
 }

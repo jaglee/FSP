@@ -61,7 +61,7 @@ void StartToSendSignature(FSPHANDLE h)
 	//
 	FSP_SocketParameter parms;
 	memset(& parms, 0, sizeof(parms));
-	// parms.onAccepting = NULL;
+	parms.onAccepting = onAccepting;
 	parms.onAccepted = onMultiplied;
 	parms.onError = onError;
 	parms.recvSize = 0;	// the underlying service would give the minimum, however

@@ -186,7 +186,7 @@ void UnitTestGenerateSNACK()
 	// secondly, one gap only
 	ControlBlock::PFSP_SocketBuf skb1 = socket.AllocRecvBuf(FIRST_SN);
 	Assert::IsNotNull(skb1);
-	skb1->opCode = PURE_DATA;
+	skb1->opCode = PERSIST;	// start of the transmit transaction
 	skb1->SetFlag<IS_FULFILLED>();
 	skb1->SetFlag<TransactionEnded>();
 	Assert::IsTrue(pSCB->recvWindowNextSN == FIRST_SN + 1);
@@ -241,9 +241,8 @@ void UnitTestGenerateSNACK()
 
 	bool b;	// Used to be test for 'To be Continued', now for 'End of Transaction'
 	pSCB->InquireRecvBuf(r, b);
+	Assert::IsTrue(r == 0);
 	Assert::IsTrue(b);
-	Assert::IsTrue(pSCB->recvWindowHeadPos == 0 && pSCB->recvWindowFirstSN == FIRST_SN);
-	pSCB->MarkReceivedFree(r);
 	Assert::IsTrue(pSCB->recvWindowHeadPos == 1 && pSCB->recvWindowFirstSN == (FIRST_SN + 1));
 
 	skb1 = socket.AllocRecvBuf(FIRST_SN + 1);

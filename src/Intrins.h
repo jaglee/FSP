@@ -96,4 +96,35 @@ __inline uint64_t htobe64(uint64_t v)
 #endif
 
 
+
+#if (_MSC_VER >= 1600)
+#pragma intrinsic(_InterlockedCompareExchange8, _InterlockedExchange8)
+#else
+FORCEINLINE char _InterlockedCompareExchange8(volatile char *dest, char newval, char oldval)
+{
+    __asm
+    {
+        mov     al, oldval
+        mov     edx,dest
+        mov     cl,	newval
+        lock cmpxchg byte ptr [edx], cl
+    }
+}
+
+FORCEINLINE char _InterlockedExchange8(volatile char * a, char b)
+{
+	__asm mov	ecx, a;
+	__asm mov	AL, b;
+	__asm xchg	AL, byte ptr[ecx];
+}
+
+FORCEINLINE char _InterlockedExchange16(volatile short * a, short b)
+{
+	__asm mov	ecx, a;
+	__asm mov	AX, b;
+	__asm xchg	AX, word ptr[ecx];
+}
+#endif
+
+
 #endif

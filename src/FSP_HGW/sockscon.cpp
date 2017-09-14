@@ -49,7 +49,8 @@
 // If compiled in Debug mode with the '_DEBUG' macro predefined by default, it tests FSP over UDP/IPv4
 // If compiled in Release mode, or anyway without the '_DEBUG' macro predefined, it tests FSP over IPv6
 #ifdef _DEBUG
-# define REMOTE_APPLAYER_NAME "localhost:80"
+// #define REMOTE_APPLAYER_NAME "localhost:80"
+# define REMOTE_APPLAYER_NAME "192.168.9.125:80"
 // #define REMOTE_APPLAYER_NAME "lt-x61t:80"
 // #define REMOTE_APPLAYER_NAME "lt-at4:80"
 // #define REMOTE_APPLAYER_NAME "lt-ux31e:80"
@@ -132,8 +133,8 @@ void ToServeSOCKS(int port)
 	parms.onAccepting = NULL;
 	parms.onAccepted = onConnected;
 	parms.onError = onError;
-	parms.recvSize = MAX_FSP_SHM_SIZE;
-	parms.sendSize = MAX_FSP_SHM_SIZE;
+	parms.recvSize = MAX_FSP_SHM_SIZE/2;
+	parms.sendSize = MAX_FSP_SHM_SIZE/2;
 	hClientMaster = Connect2(REMOTE_APPLAYER_NAME, & parms);
 	if(hClientMaster == NULL)
 	{
@@ -526,7 +527,7 @@ void MakeInet4TunnelRequest(SOCKET client, PRequestResponse req)
 static void FSPAPI onMultiplyReturn(FSPHANDLE h, FSP_ServiceCode c, int value)
 {
 	PRequestPoolItem p;
-	FSPControl(h, FSP_GET_SIGNATURE, (ulong_ptr) & p);
+	FSPControl(h, FSP_GET_EXT_POINTER, (ulong_ptr) & p);
 	if(p == NULL)
 	{
 		Dispose(h);

@@ -136,7 +136,7 @@ class CSocketItemDl: public CSocketItem
 	// for sake of incarnating new accepted connection
 	FSP_SocketParameter context;
 
-	char			isInCritical;	// to emulate the situation of NMI that free the socket before previous notice processed
+	uint8_t			inCritical;		// to handle the situation of emulated NMI that free the socket before previous notice processed
 	char			inUse;
 	char			newTransaction;	// it may simultaneously start a transmit transaction and flush/commit it
 	//
@@ -157,8 +157,6 @@ protected:
 	// to support superior RecvInline() over ReadFrom() make CallbackPeeked an independent function
 	CallbackPeeked	fpPeeked;
 	CallbackBufferReady fpSent;
-
-	LongRunCallback	longRunCallback;
 
 	// For network streaming *Buf is not NULL
 	BYTE *			pendingSendBuf;
@@ -229,7 +227,7 @@ protected:
 	bool AllocDecodeState();
 	int	 Compress(void *, int &, const void *, int);
 	int	 Decompress(void *, int &, const void *, int);
-	bool HasPendingSend();
+	bool HasDataToCommit();
 	bool FlushDecodeState();
 	void FreeStreamState() { if(pStreamState != NULL) { free(pStreamState); pStreamState = NULL; } }
 
@@ -237,9 +235,14 @@ public:
 	void Disable();
 	void DisableAndFree()
 	{
-		FreeItem(this);
-		Disable();
 		SetMutexFree();
+		Disable();
+		socketsTLB.FreeItem(this);
+	}
+	void FreeAndDisable()
+	{
+		socketsTLB.FreeItem(this);
+		Disable();
 	}
 
 	int LOCALAPI Initialize(PFSP_Context, char[MAX_NAME_LENGTH]);
@@ -286,7 +289,13 @@ public:
 		objCommand.idProcess = idThisProcess;
 		objCommand.opCode = cmd;
 	}
+
+#ifndef _NO_LLS_CALLABLE
 	bool LOCALAPI Call(const CommandToLLS &, int);
+#else
+	bool Call(const CommandToLLS &, int) { return true; }
+#endif
+
 	// TODO: for heavy-load network application, polling is not only more efficient but more responsive as well
 	// Signal LLS that the send buffer is not null
 	template<FSP_ServiceCode c> bool Call()
@@ -322,7 +331,7 @@ public:
 		}
 		//
 		SetMutexFree();
-		return (Call<FSP_Send>() ? r : -EIO);
+		return (r == 0 ? r : (Call<FSP_Send>() ? r : -EIO));
 	}
 
 	int	LOCALAPI RecvInline(CallbackPeeked);
@@ -338,7 +347,6 @@ public:
 
 	void SetCallbackOnRequest(CallbackRequested fp1) { context.onAccepting = fp1; }
 	void SetCallbackOnAccept(CallbackConnected fp1) { context.onAccepted = fp1; }
-	void SetLongRunCallback(LongRunCallback fp1) { longRunCallback = fp1; }
 
 	void SetNewTransaction() { isFlushing = 0; newTransaction = 1; }
 	void SetEndTransaction() { isFlushing = 1; }
@@ -351,5 +359,4 @@ public:
 	static CSocketItemDl * LOCALAPI CreateControlBlock(const PFSP_IN6_ADDR, PFSP_Context, CommandNewSession &);
 	static DWORD GetProcessId() { return idThisProcess; }
 	static DWORD SaveProcessId() { return (idThisProcess = GetCurrentProcessId()); }
-	static void FreeItem(CSocketItemDl * p) { socketsTLB.FreeItem(p); }
 };

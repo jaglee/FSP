@@ -76,11 +76,11 @@ inline void WriteErrStr(FSPHANDLE client, const char *buf)
 inline void FreeExtent(FSPHANDLE h)
 {
 	void *p;
-	FSPControl(h, FSP_GET_SIGNATURE, (ulong_ptr) & p);
+	FSPControl(h, FSP_GET_EXT_POINTER, (ulong_ptr) & p);
 	if(p != NULL)
 	{
 		free(p);
-		FSPControl(h, FSP_SET_SIGNATURE, 0);
+		FSPControl(h, FSP_SET_EXT_POINTER, NULL);
 	}
 }
 
@@ -97,24 +97,32 @@ int main(int argc, char *argv[])
 {
 	if(argc <= 1)
 	{
+		printf_s("To serve SOCKS v4 request at port %d\n", DEFAULT_SOCKS_PORT);
 		ToServeSOCKS(DEFAULT_SOCKS_PORT);
 	}
-	else if (strcmp(argv[1], "-p"))
+	else if (strcmp(argv[1], "-p") == 0)
 	{
-		int port = atoi(argv[2]);
-		if (port == 0 || port > USHRT_MAX || argc > 3)
+		if (argc != 3)
 		{
-			printf_s("Usage[as a SOCKS server]: %s -p <port number>\n", argv[0]);
+			printf_s("Usage[as a SOCKS server]: %s [-p <port number>]\n", argv[0]);
 			return -1;
 		}
 
+		int port = atoi(argv[2]);
+		if (port == 0 || port > USHRT_MAX || argc > 3)
+		{
+			printf_s("Port number should be a value between 1 and %d\n", USHRT_MAX);
+			return -1;
+		}
+
+		printf_s("To serve SOCKS v4 request at port %d\n", port);
 		ToServeSOCKS(port);
 	}
-	else if (strcmp(argv[1], "-d"))
+	else if (strcmp(argv[1], "-d") == 0)
 	{
-		if (argc > 3)
+		if (argc != 3)
 		{
-			printf_s("Usage[as a SOCKS server]: %s -p <port number>\n", argv[0]);
+			printf_s("Usage[as a tunnel remote-end and httpf server]: %s -d <root directory>\n", argv[0]);
 			return -1;
 		}
 		//
@@ -128,11 +136,12 @@ int main(int argc, char *argv[])
 			return -2;
 		}
 		//
+		printf_s("To serve SOCKS tunneling request and Web Service over FSP at directory:\n%s\n\n", DEFAULT_ROOT);
 		StartHTTPoverFSP();
 	}
 	else
 	{
-		printf_s("Usage: %s [-p <port number> | -d <web root directory>]\n", argv[0]);
+		printf_s("Usage: %s [-p <port number>] | -d <web root directory>\n", argv[0]);
 		return -2;
 	}
 
@@ -222,7 +231,7 @@ static int	FSPAPI onAccepted(FSPHANDLE client, PFSP_Context ctx)
 		return -1;
 
 	// TODO: check connection context
-	FSPControl(client, FSP_SET_SIGNATURE, (ulong_ptr)bufPeerPublicKey);
+	FSPControl(client, FSP_SET_EXT_POINTER, (ulong_ptr)bufPeerPublicKey);
 	ReadFrom(client, bufPeerPublicKey, CRYPTO_NACL_KEYBYTES, onPublicKeyReceived);
 	return 0;
 }
@@ -238,8 +247,8 @@ static void FSPAPI onPublicKeyReceived(FSPHANDLE client, FSP_ServiceCode c, int 
 	unsigned char bufSharedKey[CRYPTO_NACL_KEYBYTES];
 	octet *bufPeerPublicKey;
 
-	FSPControl(client, FSP_GET_SIGNATURE, (ulong_ptr) & bufPeerPublicKey);
-	FSPControl(client, FSP_SET_SIGNATURE, NULL);
+	FSPControl(client, FSP_GET_EXT_POINTER, (ulong_ptr) & bufPeerPublicKey);
+	FSPControl(client, FSP_SET_EXT_POINTER, NULL);
 
 	if(r < 0)
 	{
@@ -309,7 +318,7 @@ void MasterService(FSPHANDLE client)
 	if(tunnel)
 	{
 		LineBuffer *lineBuf;
-		FSPControl(client, FSP_GET_SIGNATURE, (ulong_ptr) & lineBuf);
+		FSPControl(client, FSP_GET_EXT_POINTER, (ulong_ptr) & lineBuf);
 		//
 		lineBuf->firstOffset = lineBuf->lastOffset = 0;
 		ReadFrom(client, lineBuf->buf, BUFFER_POOL_SIZE, onFurtherTunnelRequest);
@@ -392,7 +401,7 @@ int ReadLine(FSPHANDLE sock, char *buf, int size)
 	char c = '\0';
 	int n;
 
-	FSPControl(sock, FSP_GET_SIGNATURE, (ulong_ptr) & lineBuf);
+	FSPControl(sock, FSP_GET_EXT_POINTER, (ulong_ptr) & lineBuf);
 	if(lineBuf == NULL)
 	{
 		lineBuf = (LineBuffer *)malloc(sizeof(LineBuffer));
@@ -404,7 +413,7 @@ int ReadLine(FSPHANDLE sock, char *buf, int size)
 		}
 		//
 		lineBuf->firstOffset = lineBuf->lastOffset = 0;
-		FSPControl(sock, FSP_SET_SIGNATURE, (ulong_ptr)lineBuf);
+		FSPControl(sock, FSP_SET_EXT_POINTER, (ulong_ptr)lineBuf);
 	}
 	// double buffering
 	while ((i < size - 1) && (c != '\n'))
@@ -500,7 +509,7 @@ void SendRegFile(FSPHANDLE client, const char *filename)
 static void FSPAPI onFurtherTunnelRequest(FSPHANDLE client, FSP_ServiceCode code, int value)
 {
 	LineBuffer *lineBuf;
-	FSPControl(client, FSP_GET_SIGNATURE, (ulong_ptr) & lineBuf);
+	FSPControl(client, FSP_GET_EXT_POINTER, (ulong_ptr) & lineBuf);
 	// TODO: parsing the line buffer, process further tunnel requests!
 	ReadFrom(client, lineBuf->buf, BUFFER_POOL_SIZE, onFurtherTunnelRequest);
 }

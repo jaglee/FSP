@@ -40,17 +40,20 @@
 typedef uint32_t ALFID_T;
 typedef ALFID_T	 ULTID_T;
 
+// To reuse DNS port number 53: 0x35; network byte order 0x3500 === 13568
+// ASCII code: 'F': 0x46 'S': 0x53; host byte order 0x4653 === 18003
 #if ARCH_BIG_ENDIAN
 // in network byte order on a big-endian host
 #define PORT2ALFID(port)	((ALFID_T)(unsigned short)(port))
 #define PREFIX_FSP_IP6to4	0x2002		// prefix of 6to4 overloaded
-#define DEFAULT_FSP_UDPPORT (((unsigned short)'F' << 8) + (unsigned short)'S')
+#define DEFAULT_FSP_UDPPORT	(((unsigned short)'F' << 8) + (unsigned short)'S')
 #else
 // __X86__
 // in network byte order on a little-endian host
 #define PORT2ALFID(port)	((ALFID_T)(port) << 16)
 #define PREFIX_FSP_IP6to4	0x0220		// prefix of 6to4 overloaded
-#define DEFAULT_FSP_UDPPORT ((unsigned short)'F' + ((unsigned short)'S' << 8))
+// #define DEFAULT_FSP_UDPPORT 13568
+#define DEFAULT_FSP_UDPPORT	((unsigned short)'F' + ((unsigned short)'S' << 8))
 #endif
 
 
@@ -61,6 +64,8 @@ typedef ALFID_T	 ULTID_T;
 #define FSP_MAX_KEY_SIZE	32	// in bytes
 #define FSP_MIN_KEY_SIZE	16	// in bytes
 #define FSP_TAG_SIZE		8	// in bytes
+
+#define MAX_PHY_INTERFACES	4	// maximum number of physical interfaces that might be multihomed
 
 /**
   error number may appear as REJECT packet 'reason code' where it is unsigned or near-end API return value where it is negative
@@ -197,7 +202,7 @@ typedef enum: char
 
 // the number of microsecond elapsed since Midnight January 1, 1970 UTC (unix epoch)
 typedef uint64_t timestamp_t;
-
+typedef uint8_t octet;
 
 
 /**
@@ -230,12 +235,14 @@ typedef struct FSP_IN4_ADDR_PREFIX
 	uint16_t	port;
 } *PFSP_IN4_ADDR_PREFIX;
 
+
+
 typedef struct FSP_IN6_ADDR
 {
 	union
 	{
 		FSP_IN4_ADDR_PREFIX _6to4;
-		uint64_t		subnet;	
+		uint64_t	subnet;	
 	};
 	uint32_t	idHost;
 	ALFID_T		idALF;
@@ -263,20 +270,201 @@ struct ALFIDPair
 
 
 
-typedef	struct FSP_HeaderSignature
+typedef	struct $FSP_HeaderSignature
 {
-	uint16_t			hsp;
+	uint16_t			hsp;	// header stack pointer
 	uint8_t				major;
 	FSPOperationCode	opCode;
+	//
+#ifdef __cplusplus
+	template<typename THdr, FSPOperationCode opCode1> void Set()
+	{
+		major = THIS_FSP_VERSION;
+		opCode = opCode1;
+		hsp = htobe16(sizeof(THdr));
+	}
+	void Set(FSPOperationCode opCode1, int len1)
+	{
+		major = THIS_FSP_VERSION;
+		opCode = opCode1;
+		hsp = htobe16(len1);
+	}
+#endif
 } *PFSP_HeaderSignature;
 
 
 
-// general place holder for the fixed part of the FSP header
-struct FSP_Header
+// position start from 7, the leftmost one
+enum FSP_FlagPosition : uint8_t
 {
-	unsigned char headerContent[20];
-	FSP_HeaderSignature hs;	// total length: 24 octets; default hsp = 0x18
+	TransactionEnded = 7,	// share with the buffer block descriptor
+	Compressed = 6,			// In this version of FSP, LZ4 is exploited
+	CongestionAlarm = 5,	// Accurate ECN/Scalable Congestion Control
+};
+
+
+
+// more detail implementation of FSP_NormalPacketHeader is defined later
+struct FSP_NormalPacketHeader
+{
+	uint32_t sequenceNo;
+	uint32_t expectedSN;
+	union
+	{
+		uint64_t	code;
+		ALFIDPair	id;
+	} integrity;
+	//
+	octet	flags_ws[4];
+	$FSP_HeaderSignature hs;
+
+#ifdef __cplusplus
+	void Set(FSPOperationCode code, uint16_t hsp, uint32_t seqThis, uint32_t seqExpected, int32_t advRecvWinSize)
+	{
+		hs.Set(code, hsp);
+		expectedSN = htobe32(seqExpected);
+		sequenceNo = htobe32(seqThis);
+		ClearFlags();
+		SetRecvWS(advRecvWinSize);
+	}
+	// A brute-force but safe method of set or retrieve receive window size, with byte order translation
+	int32_t GetRecvWS()	const { return ((int32_t)flags_ws[1] << 16) + ((unsigned)flags_ws[2] << 8) + flags_ws[3]; }
+	void SetRecvWS(int32_t v) { flags_ws[1] = (octet)(v >> 16); flags_ws[2] = (octet)(v >> 8); flags_ws[3] = (octet)v; }
+
+	void ClearFlags() { flags_ws[0] = 0; }
+	template<FSP_FlagPosition pos> void SetFlag() { flags_ws[0] |= (1 << pos); }
+	template<FSP_FlagPosition pos> void ClearFlag() { flags_ws[0] &= ~(1 << pos); }
+	template<FSP_FlagPosition pos> int GetFlag() const { return flags_ws[0] & (1 << pos); }
+
+	// Get the first extension header
+	PFSP_HeaderSignature PFirstExtHeader() const
+	{
+		return (PFSP_HeaderSignature)((uint8_t *)this + be16toh(hs.hsp) - sizeof($FSP_HeaderSignature));
+	}
+
+	// Get next extension header
+	// Given
+	//	The pointer to the current extension header
+	// Return
+	//	The pointer to the next optional header, NULL if it is illegal
+	// Remark
+	//	The caller should check that pStackPointer does not fall into dead-loop
+	template<typename THdr>	PFSP_HeaderSignature PHeaderNextTo(void *p0) const
+	{
+		uint16_t sp = be16toh(((THdr *)p0)->hs.hsp);
+		if (sp < sizeof(FSP_NormalPacketHeader) || sp >(uint8_t *)p0 - (uint8_t *)this)
+			return NULL;
+		return (PFSP_HeaderSignature)((uint8_t *)this + sp - sizeof($FSP_HeaderSignature));
+	}
+#endif
+};
+
+
+
+struct FSP_InitiateRequest
+{
+	timestamp_t timeStamp;
+	uint64_t	initCheckCode;
+	uint32_t	salt;
+	$FSP_HeaderSignature hs;
+};
+// Optional payload: domain name of the remote peer, less than 512 - sizeof(FSP_InitiateRequest) = 488 octets
+
+
+// acknowledgement to the connect bootstrap request, works as a challenge against the initiator
+// to be followed by the certificate optional header
+struct FSP_Challenge
+{
+	uint64_t	cookie;
+	uint64_t	initCheckCode;
+	int32_t		timeDelta;
+	$FSP_HeaderSignature hs;
+};
+// Optional payload: canonical name of the near end, less than 512 - sizeof(FSP_Challenge) = 488 octets
+
+
+// FSP_ConnectParam specifies the parent connection in a MULTIPLY or CONNECT_REQUEST packet
+// while alias as the mobile parameters
+// PEER_SUBNETS used to be CONNECT_PARAM and it is perfect OK to treat the latter as the canonical alias of the former
+struct FSP_ConnectParam
+{
+	uint64_t	subnets[MAX_PHY_INTERFACES];
+	ALFID_T		idListener;
+	ALFID_T		idHost;
+	//
+	octet		flags_ws[4];
+	$FSP_HeaderSignature hs;
+};	// Totally 6 QWORDs, 48 octets
+
+
+
+#ifdef __cplusplus
+struct FSP_ConnectRequest : FSP_InitiateRequest
+{
+#else
+struct FSP_ConnectRequest
+{
+	struct FSP_InitiateRequest _h;
+#endif
+	uint32_t	initialSN;		// initial sequence number, I->R, for this session segment
+	int32_t		timeDelta;
+	uint64_t	cookie;
+	//
+	FSP_ConnectParam params;
+};	// Totally 11 QWORDs, 88 octets
+// Optional payload: canonical name of the near end, less than 512 - sizeof(FSP_ConnectRequest) = 424 octets
+
+
+#ifdef __cplusplus
+struct FSP_AckConnectRequest : FSP_NormalPacketHeader
+{
+#else
+struct FSP_AckConnectRequest
+{
+	struct FSP_NormalPacketHeader _h;
+#endif
+	FSP_ConnectParam params;
+};
+
+
+
+// Mandatory additional header for KEEP_ALIVE
+// minimum constituent of a SNACK header
+struct FSP_SelectiveNACK
+{
+	struct GapDescriptor
+	{
+		uint32_t	gapWidth;	// in packets
+		uint32_t	dataLength;	// in packets
+	};
+	uint32_t		serialNo;
+	$FSP_HeaderSignature hs;
+};
+
+
+
+struct FSP_RejectConnect
+{
+	union
+	{
+		timestamp_t timeStamp;
+		struct
+		{
+			uint32_t initial;
+			uint32_t expected;
+		} sn;
+	};
+	//
+	union
+	{
+		uint64_t integrityCode;
+		uint64_t cookie;
+		uint64_t initCheckCode;
+		ALFIDPair fidPair;
+	};
+	//
+	uint32_t reasons;	// bit field(?)
+	$FSP_HeaderSignature hs;
 };
 
 

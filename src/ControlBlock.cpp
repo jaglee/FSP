@@ -494,21 +494,6 @@ void * LOCALAPI ControlBlock::InquireSendBuf(int32_t *p_m)
 }
 
 
-// Given
-//	FSP_NormalPacketHeader*	the place-holder of sequence number and flags
-//	ControlBlock::seq_t		the intent sequence number of the packet
-// Do
-//	Set the default sequence number, expected acknowledgment sequencenumber,
-//	flags and the advertised receive window size field of the FSP header 
-void LOCALAPI ControlBlock::SetSequenceFlags(FSP_NormalPacketHeader *pHdr, ControlBlock::seq_t seq1)
-{
-	pHdr->expectedSN = htobe32(recvWindowNextSN);
-	pHdr->sequenceNo = htobe32(seq1);
-	pHdr->ClearFlags();
-	pHdr->SetRecvWS(AdRecvWS(recvWindowNextSN));
-}
-
-
 
 // Given
 //	seq_t		the sequence number that is to be assigned to the new allocated packet buffer
@@ -589,9 +574,10 @@ ControlBlock::PFSP_SocketBuf LOCALAPI ControlBlock::AllocRecvBuf(seq_t seq1)
 // Return
 //	Start address of the received message
 // Remark
-//	No receive buffer block is released
+//	No receive buffer block is released, except the first block which is a payloadless PERSIST as well
 //	If the returned value is NULL, stored in int & [_Out_] is the error number
 //	-EACCES		the buffer space is corrupted and unaccessible
+//	-EPIPE		it is a compressed stream and ULA should receive in pipe mode
 //	-EFAULT		the descriptor is corrupted (illegal payload length:
 //				payload length of an intermediate packet of a message should be MAX_BLOCK_SIZE,
 //				payload length of any packet should be no less than 0 and no greater than MAX_BLOCK_SIZE)
@@ -608,8 +594,27 @@ void * LOCALAPI ControlBlock::InquireRecvBuf(int32_t & nIO, bool & eotFlag)
 	}
 
 	PFSP_SocketBuf p = GetFirstReceived();
+	if(p->GetFlag<Compressed>())
+	{
+		nIO = -EPIPE;	// -33
+		return NULL;
+	}
+
 	void *pMsg = GetRecvPtr(p);
 	nIO = 0;
+	if (p->opCode == PERSIST && p->len == 0)
+	{
+		p->opCode = (FSPOperationCode)0;
+		p->SetFlag<IS_FULFILLED>(false);
+		SlideRecvWindowByOne();
+		if (p->GetFlag<TransactionEnded>())
+		{
+			eotFlag = true;
+			return pMsg;
+		}
+		//
+		p = GetFirstReceived();
+	}
 	//
 	register int i, m;
 	if(tail > recvWindowHeadPos)
@@ -683,24 +688,32 @@ void * LOCALAPI ControlBlock::InquireRecvBuf(int32_t & nIO, bool & eotFlag)
 //	-EINTR		the receive queue has been messed up
 //	-EPERM		imconformant to the protocol, which is prohibitted
 //	-EDOM		parameter error
+// Remark
+//	It would mark the buffer block descriptors even if error encountered.
+//	Only the number of the last error would be preserved and reported.
 int LOCALAPI ControlBlock::MarkReceivedFree(int32_t nIO)
 {
+	if (nIO <= 0)
+		return 0;
+
 	const int tail = recvWindowNextPos;
 	if (tail > recvBufferBlockN)
 		return -EACCES;
 
-	PFSP_SocketBuf p = GetFirstReceived();
-	//
-	register int i, m;
-	m = nIO <= 0 ? 1 : (nIO - 1) / MAX_BLOCK_SIZE + 1;
-	//
+	register PFSP_SocketBuf p = GetFirstReceived();
+	register int i;
+	int m = (nIO - 1) / MAX_BLOCK_SIZE + 1;
+	int r = m;
 	for (i = 0; i < m && p->GetFlag<IS_FULFILLED>(); i++)
 	{
 		if (p->len > MAX_BLOCK_SIZE || p->len < 0)
-			return -EFAULT;
+			r = -EFAULT;
 		//
 		if (p->opCode != 0)
-			return -EINTR;
+		{
+			r = -EINTR;
+			break;
+		}
 		//
 		p->SetFlag<IS_FULFILLED>(false);	// release the buffer
 		nIO -= p->len;
@@ -712,20 +725,24 @@ int LOCALAPI ControlBlock::MarkReceivedFree(int32_t nIO)
 		}
 		//
 		if (p->len != MAX_BLOCK_SIZE)
-			return -EPERM;
+			r = -EPERM;
 		//
 		p++;
 	}
-	//
-	if (nIO != 0 || i != m)
-		return -EDOM;
+
+	if (r > 0 && (nIO != 0 || i != m))
+		r = -EDOM;
+
+	if (r < 0)
+		BREAK_ON_DEBUG();
+
 
 	recvWindowFirstSN += i;
 	recvWindowHeadPos += i;
 	if (recvWindowHeadPos - recvBufferBlockN >= 0)
 		recvWindowHeadPos -= recvBufferBlockN;
 
-	return i;
+	return r;
 }
 
 

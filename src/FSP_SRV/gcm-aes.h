@@ -58,6 +58,9 @@ void	GCM_AES_SetKey(GCM_AES_CTX *, const uint8_t *, int);
 //	The salt is the leftmost 32-bit of the 96-bit IV. The value is just a bit string of length 32
 uint32_t GCM_AES_XorSalt(GCM_AES_CTX *, uint32_t);
 
+// Alike GCM_AES_XorSalt, but set the salt part to new value and return the original value
+uint32_t GCM_AES_SetSalt(GCM_AES_CTX *, uint32_t);
+
 
 // Given
 //	GCM_AES_CTX *	pointer to the GCM context

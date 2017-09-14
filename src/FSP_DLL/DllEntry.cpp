@@ -355,9 +355,7 @@ bool CSocketItemDl::LockAndValidate()
 			, this
 			, stateNames[pControlBlock->state], pControlBlock->state);
 #endif
-		this->Recycle();
-		SetMutexFree();
-		NotifyError(FSP_NotifyReset, -EBADF);
+		this->Recycle();	// would notify ULA if reportError is set
 		return false;
 	}
 
@@ -369,7 +367,7 @@ bool CSocketItemDl::LockAndValidate()
 // The asynchronous, multi-thread friendly soft interrupt handler
 void CSocketItemDl::WaitEventToDispatch()
 {
-	_InterlockedExchange8(&isInCritical, 1);
+	_InterlockedExchange8((char *) & inCritical, inCritical + 1);
 	//
 	while(LockAndValidate())
 	{
@@ -451,6 +449,10 @@ void CSocketItemDl::WaitEventToDispatch()
 			ProcessReceiveBuffer();	// See FSP_NotifyDataReady, FSP_NotifyFlushed and CSocketItemDl::Shutdown()
 			if (!LockAndValidate())
 				goto l_return;
+			// Even if there's no callback function to accept data/flags (as in blocking receive mode)
+			// the peerCommitted flag can be set if no further data to deliver
+			if(! HasDataToDeliver())
+				peerCommitted = 1;
 			//
 			if(InState(CLOSABLE) && initiatingShutdown)
 				Call<FSP_Shutdown>();
@@ -499,8 +501,7 @@ void CSocketItemDl::WaitEventToDispatch()
 		case FSP_NotifyRecycled:
 			fp1 = isDisposing ? context.onError : NULL;
 			CancelTimer();	// If any; typically for Shutdown 
-			Recycle();
-			SetMutexFree();
+			Recycle();		// SetMutexFree();
 			if(fp1 != NULL)
 				fp1(this, notice, -EINTR);
 			goto l_return;
@@ -534,19 +535,10 @@ void CSocketItemDl::WaitEventToDispatch()
 	}
 	//
 l_return:
-	_InterlockedExchange8(&isInCritical, 0);
 	// There might be memory leak if it relies on longRunCallback to release dynamically allocated
 	// resource recorded by context.signuatureULA!
-	if(IsInUse())
-	{
-		LongRunCallback fp1 = (LongRunCallback)InterlockedExchangePointer(& longRunCallback, NULL);
-		if(fp1 != NULL)
-			fp1(this, context.signatureULA);
-	}
-	else
-	{
+	if(--inCritical == 0 && !IsInUse())
 		CSocketItem::Destroy();	// delayed destroy
-	}
 }
 
 
@@ -574,7 +566,7 @@ CSocketItemDl * LOCALAPI CSocketItemDl::CreateControlBlock(const PFSP_IN6_ADDR n
 	//
 	socketItem->fidPair.source = nearAddr->idALF;
 	//
-	FSP_PKTINFO_EX & nearEnd = socketItem->pControlBlock->nearEndInfo;
+	FSP_ADDRINFO_EX & nearEnd = socketItem->pControlBlock->nearEndInfo;
 	if(nearAddr->_6to4.prefix == PREFIX_FSP_IP6to4)
 	{
 		nearEnd.InitUDPoverIPv4(psp1->ifDefault);
@@ -592,7 +584,7 @@ CSocketItemDl * LOCALAPI CSocketItemDl::CreateControlBlock(const PFSP_IN6_ADDR n
 }
 
 
-
+#ifndef _NO_LLS_CALLABLE
 // Given
 //	CommandToLLS &		const, the command context to pass to LLS
 //	int					the size of the command context
@@ -604,7 +596,7 @@ bool LOCALAPI CSocketItemDl::Call(const CommandToLLS & cmd, int size)
 	DWORD		nBytesReadWrite;		// number of bytes read/write last time
 	return ::WriteFile(_mdService, & cmd, size, & nBytesReadWrite, NULL) != FALSE;
 }
-
+#endif
 
 
 // Given
@@ -748,7 +740,7 @@ CSocketItemDl * CSocketDLLTLB::AllocItem()
 	// so InitializeSRWLock(& item->rtSRWLock) or assign to SRWLOCK_INIT is unneccessary
 	//
 	pSockets[sizeOfWorkSet++] = item;
-	item->isInCritical = 0;
+	item->inCritical = 0;
 	_InterlockedExchange8(& item->inUse, 1);
 
 l_bailout:
@@ -941,7 +933,7 @@ static void GetServiceSA(PSECURITY_ATTRIBUTES pSA)
     }
  
     if (!InitializeSecurityDescriptor(& sd, SECURITY_DESCRIPTOR_REVISION)) 
-    {  
+    {
 #ifndef NDEBUG
         printf("InitializeSecurityDescriptor Error %u\n", GetLastError());
 #endif

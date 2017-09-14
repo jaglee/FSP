@@ -46,15 +46,22 @@ typedef unsigned char octet;	// keep sync with CrytoStub.h
 #pragma comment(lib, "crypt32.lib")
 
 #include <malloc.h>
-
+#include <stdio.h>
 
 DllSpec
 void randombytes(void *buf, size_t len)
 {
-	HCRYPTPROV   hCryptProv;
-	CryptAcquireContext(&hCryptProv, NULL, NULL, PROV_RSA_FULL, 0);
+	static HCRYPTPROV   hCryptProv;
+	if(! hCryptProv
+	&& ! CryptAcquireContext(&hCryptProv, NULL, NULL, PROV_RSA_AES, CRYPT_VERIFYCONTEXT + CRYPT_SILENT))
+	{
+#ifdef _DEBUG
+		printf_s("CryptAcquireContext() return %d\n", GetLastError());
+		DebugBreak();
+#endif
+		return;
+	}
 	CryptGenRandom(hCryptProv, (DWORD)len, (BYTE *)buf);
-	// Why PROV_RNG does not work? Elliptic Curve Nyberg-Rueppel Analog (ECNRA)?
 }
 
 

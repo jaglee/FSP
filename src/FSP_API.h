@@ -59,19 +59,16 @@
     typedef unsigned long ulong_ptr;
 #endif
 
-typedef unsigned char octet;
-
 typedef struct FSP_SocketParameter *PFSP_Context;
 
 typedef enum
 {
-	FSP_GET_SIGNATURE,			// pointer to the placeholder of the 64-bit signature
-	FSP_SET_SIGNATURE,			// pointer to the placeholder of the 64-bit signature
+	FSP_GET_EXT_POINTER,		// Placeholder to store the pointer meant to access the extent of the socket
+	FSP_SET_EXT_POINTER,		// Value of the pointer meant to access the the extent of the socket
 	FSP_SET_CALLBACK_ON_ERROR,	// NotifyOrReturn
 	FSP_SET_CALLBACK_ON_REQUEST,// CallbackRequested
 	FSP_SET_CALLBACK_ON_CONNECT,// CallbackConnected
 	FSP_GET_PEER_COMMITTED,
-	FSP_SET_LONGRUN_CALLBACK,
 } FSP_ControlCode;
 
 
@@ -290,14 +287,15 @@ int FSPAPI GetSendBuffer(FSPHANDLE, CallbackBufferReady);
 //	int32_t		the number of octets to send
 //	bool		whether terminate the transmit transaction
 // Return
-//	number of octets really scheduled to send
+//	positive if it is number of blocks scheduled to send
+//	negative if it is the error number
 // Remark
 //	The buffer MUST begin from what GetSendBuffer has returned and
 //	may not exceed the capacity that GetSendBuffer has returned
 //	if the buffer is to be continued, its size MUST be multiplier of MAX_BLOCK_SIZE
 //	SendInline could be chained in tandem with GetSendBuffer
 DllSpec
-int32_t FSPAPI SendInline(FSPHANDLE, void *, int32_t, bool);
+int FSPAPI SendInline(FSPHANDLE, void *, int32_t, bool);
 
 
 // Given
@@ -345,6 +343,8 @@ int FSPAPI RecvInline(FSPHANDLE, CallbackPeeked);
 //	Return value passed in NotifyOrReturn is number of octets really received
 //	If NotifyOrReturn is NULL the function is blocking, i.e.
 //	waiting until either the buffer is fulfilled or the peer's transmit transactin has been committed
+//	In the blocking mode DLL MAY report that the transmit transaction has been committed
+//	before all data has been fetched
 //	ULA should check whether the transmit transaction is committed by calling FSPControl. See also WriteTo
 DllSpec
 int FSPAPI ReadFrom(FSPHANDLE, void *, int, NotifyOrReturn);

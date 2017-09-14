@@ -65,14 +65,15 @@ int32_t FSPAPI GetSendBuffer(FSPHANDLE hFSPSocket, CallbackBufferReady fp1)
 //	int32_t		the number of octets to send
 //	bool		whether to terminate the transmit transaction
 // Return
-//	number of octets really scheduled to send
+//	positive if it is number of blocks scheduled to send
+//	negative if it is the error number
 // Remark
 //	SendInline is typically chained in tandem with GetSendBuffer
 //	The buffer MUST begin from what the callback function of GetSendBuffer has returned and
 //	may not exceed the capacity that the callback function of GetSendBuffer has returned
 //	if the buffer is to be continued, its size MUST be multiplier of MAX_BLOCK_SIZE
 DllExport
-int32_t FSPAPI SendInline(FSPHANDLE hFSPSocket, void * buffer, int32_t len, bool eotFlag)
+int FSPAPI SendInline(FSPHANDLE hFSPSocket, void * buffer, int32_t len, bool eotFlag)
 {
 	register CSocketItemDl * p = (CSocketItemDl *)hFSPSocket;
 	try
@@ -156,10 +157,10 @@ int32_t LOCALAPI CSocketItemDl::AcquireSendBuf()
 //	int32_t		the number of octets to send
 //	bool		whether to terminate the transmit transaction
 // Return
-//	number of octets really scheduled to send
+//	positive if it is number of blocks scheduled to send
+//	negative if it is the error number
 // Remark
 //	SendInplace works in tandem with AcquireSendBuf
-//	This is a prototype and thus simultaneous send and receive is not considered
 int LOCALAPI CSocketItemDl::SendInplace(void * buffer, int32_t len, bool eot)
 {
 #ifdef TRACE
@@ -226,14 +227,15 @@ int LOCALAPI CSocketItemDl::SendStream(const void * buffer, int len, bool eot, b
 	uint64_t t0 = GetTickCount64();
 	while ((r = BufferData(len)) >= 0)
 	{
-		if (!InState(CONNECT_AFFIRMING) && !InState(CHALLENGING) && !InState(CLONING)
+		if (r > 0
+		 && !InState(CONNECT_AFFIRMING) && !InState(CHALLENGING) && !InState(CLONING)
 		 && !Call<FSP_Send>())
 		{
 			r = -EIO;
 			break;
 		}
 		//
-		if (!HasPendingSend())
+		if (pendingSendSize <= 0)
 			break;
 		// Here wait LLS to free some send buffer block
 		do
@@ -351,64 +353,59 @@ void CSocketItemDl::ProcessPendingSend()
 	// Assume it has taken exclusive access of the socket
 	// Set fpSent to NULL BEFORE calling back so that chained send may set new value
 	CallbackBufferReady fp2 = (CallbackBufferReady)InterlockedExchangePointer((PVOID volatile *)& fpSent, NULL);
-
-	// pending GetSendBuffere()
-	if (pendingSendBuf == NULL)
+	void *p;
+	if(pendingSendBuf != NULL)
 	{
-		if(fp2 == NULL)
+		if (HasDataToCommit())
 		{
-			SetMutexFree();
-			return;	// As there's no thread is waiting free send buffer
+			int r = BufferData(pendingSendSize);
+			if(r > 0)
+				Call<FSP_Send>();
+			//
+			if(HasDataToCommit())
+			{
+				SetMutexFree();
+				return;
+			}
 		}
-		//
-		int32_t m;
-		void * p = pControlBlock->InquireSendBuf(& m);
+
+		p = InterlockedExchangePointer((PVOID *)& pendingSendBuf, NULL);
+		//^So that WriteTo chaining is possible, see also BufferData
 		SetMutexFree();
-		// If FSP_NotifyBufferReady caught but even a minimal buffer block is unavailable,
-		// it must be in chaotic memory situation. However, race condition does exist.
-		if(p == NULL)
-		{
-			TestSetSendReturn(fp2);
-			BREAK_ON_DEBUG();
-			if(HasFreeSendBuffer())
-				SelfNotify(FSP_NotifyBufferReady);
-			return;
-		}
-		// If ULA hinted that sending was not finished yet,
-		// continue to use the saved pointer of the callback function
-		if (fp2(this, p, m) >= 0)
-		{
-			TestSetSendReturn(fp2);
-			if(HasFreeSendBuffer())	// In case of round-robin
-				SelfNotify(FSP_NotifyBufferReady);
-		}
 		//
+		if(p != NULL && fp2 != NULL)
+			((NotifyOrReturn)fp2)(this, FSP_Send, bytesBuffered);
 		return;
 	}
 
-	// Now pendingSendBuf != NULL, pending WriteTo(), or pending Commit()
-	if (HasPendingSend())
+	// Or else it's pending GetSendBuffer()
+	if(fp2 == NULL)
 	{
-		BufferData(pendingSendSize);
-		Call<FSP_Send>();
-		if(HasPendingSend())
-		{
-			SetMutexFree();
-			return;
-		}
-		//
-#ifdef _DEBUG
-		if (fpSent == NULL)
-			printf_s("\nInternal panic! Lost way to report WriteTo result\n");
-#endif
+		SetMutexFree();
+		return;	// As there's no thread is waiting free send buffer
 	}
 
-	void *p = InterlockedExchangePointer((PVOID *)& pendingSendBuf, NULL);	// So that WriteTo() chaining is possible, see also BufferData()
+	int32_t m;
+	p = pControlBlock->InquireSendBuf(& m);
 	SetMutexFree();
-	//
-	if(p != NULL && fp2 != NULL)
-		((NotifyOrReturn)fp2)(this, FSP_Send, bytesBuffered);
-	// Or else SendInplace silently finished.
+	// If FSP_NotifyBufferReady caught but even a minimal buffer block is unavailable,
+	// it must be in chaotic memory situation. However, race condition does exist.
+	if(p == NULL)
+	{
+		TestSetSendReturn(fp2);
+		BREAK_ON_DEBUG();
+		if(HasFreeSendBuffer())
+			SelfNotify(FSP_NotifyBufferReady);
+		return;
+	}
+	// If ULA hinted that sending was not finished yet,
+	// continue to use the saved pointer of the callback function
+	if (fp2(this, p, m) >= 0)
+	{
+		TestSetSendReturn(fp2);
+		if(HasFreeSendBuffer())	// In case of round-robin
+			SelfNotify(FSP_NotifyBufferReady);
+	}
 }
 
 
@@ -432,6 +429,7 @@ int LOCALAPI CSocketItemDl::BufferData(int len)
 		return 0;
 
 	ControlBlock::PFSP_SocketBuf p = pControlBlock->LockLastBufferedSend();
+	len = 0;
 	if(p != NULL && !p->GetFlag<IS_COMPLETED>())
 	{
 		if (p->len < 0 || p->len >= MAX_BLOCK_SIZE)
@@ -446,6 +444,7 @@ int LOCALAPI CSocketItemDl::BufferData(int len)
 			m -= k;
 			p->len += k;
 			bytesBuffered += k;
+			len += k;
 			pendingSendBuf += k;
 		}
 		else
@@ -457,6 +456,7 @@ int LOCALAPI CSocketItemDl::BufferData(int len)
 			m -= m2;
 			p->len += k;
 			bytesBuffered += k;
+			len += k;
 			pendingSendBuf += m2;
 		}
 		//
@@ -489,6 +489,7 @@ int LOCALAPI CSocketItemDl::BufferData(int len)
 			memcpy(tgtBuf, pendingSendBuf, p->len);
 			m -= p->len;
 			bytesBuffered += p->len;
+			len += p->len;
 			pendingSendBuf += p->len;
 		}
 		else
@@ -500,6 +501,7 @@ int LOCALAPI CSocketItemDl::BufferData(int len)
 			m -= m2;
 			p->len = k;
 			bytesBuffered += k;
+			len += k;
 			pendingSendBuf += m2;
 			p->SetFlag<Compressed>();
 			// assert: if k == 0 then n == 0
@@ -529,12 +531,12 @@ l_finish:
 	pendingSendSize = m;
 	//
 	if(p == NULL)
-		return (len - m);
+		return len;
 	//
 	if(pendingSendSize != 0 || !isFlushing)
 	{
 		p->Unlock();
-		return (len - m);
+		return len;
 	}
 	// only after every field, including flag, has been set may it be unlocked
 	// otherwise WriteTo following may put further data into the last packet buffer
@@ -543,7 +545,7 @@ l_finish:
 		p->SetFlag<TransactionEnded>();
 		p->SetFlag<IS_COMPLETED>();
 		p->Unlock();
-		return (len - m);
+		return len;
 	}
 
 	int k = MAX_BLOCK_SIZE - p->len;	// To compress internally buffered: it may be that k == 0
@@ -551,12 +553,13 @@ l_finish:
 	p->len += k;
 	p->SetFlag<IS_COMPLETED>();
 	bytesBuffered += k;
+	len += k;
 	while(pendingStreamingSize > 0)
 	{
 		p->Unlock();	// only after every field, including flag, has been set may it be unlocked
 		p = GetSendBuf();
 		if(p == NULL)
-			return (len - m);	// Warning: not all data have been buffered
+			return len;	// Warning: not all data have been buffered
 		//
 		k = MAX_BLOCK_SIZE;			// To copy out internally compressed:
 		Compress(GetSendPtr(p), k, NULL, 0);
@@ -566,12 +569,13 @@ l_finish:
 		p->SetFlag<Compressed>();
 		p->SetFlag<IS_COMPLETED>();
 		bytesBuffered += k;
+		len += k;
 	}	// end if the internal buffer of on-the-wire compression is not empty
 	//
 	p->SetFlag<TransactionEnded>();
 	p->Unlock();
 	FreeStreamState();
-	return (len - m);
+	return len;
 }
 
 

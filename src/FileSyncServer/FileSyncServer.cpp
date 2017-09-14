@@ -174,6 +174,8 @@ l_return:
 
 
 
+// If the function pointer 'onAccepting' in a FSP_SocketParameter is not set
+// the listener MUST accept the connection request in blocking mode
 // This function is for tracing purpose
 int	FSPAPI onAccepting(FSPHANDLE h, PFSP_SINKINF p, PFSP_IN6_ADDR remoteAddr)
 {

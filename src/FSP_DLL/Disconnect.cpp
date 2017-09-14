@@ -65,8 +65,7 @@ int CSocketItemDl::Recycle(bool reportError)
 	}
 	//
 	NotifyOrReturn fp1 = context.onError;
-	CSocketItemDl::FreeItem(this);
-	Disable();
+	DisableAndFree();
 	if(reportError && fp1 != NULL)
 		fp1(this, FSP_Recycle, -EINTR);
 	return r;
@@ -82,11 +81,8 @@ void CSocketItemDl::Disable()
 	if((h = InterlockedExchangePointer((PVOID *) & theWaitObject, NULL)) != NULL)
 		UnregisterWaitEx(theWaitObject, NULL);
 	//
-	if (_InterlockedCompareExchange8(&isInCritical, 1, 0) != 0)
-	{
-		inUse = 0;
+	if (inCritical > 0)
 		return;
-	}
 	//
 	CSocketItem::Destroy();
 }
@@ -264,6 +260,9 @@ int LOCALAPI CSocketItemDl::Commit(NotifyOrReturn fp1)
 
 
 
+// Remark
+//	It is possible that a rogue ULA managed to call FSP_Send more frequently than fair share
+//	However the LLS would prevent abnormally frequent FSP_Commit from abusing
 int CSocketItemDl::Commit()
 {
 	SetEndTransaction();
@@ -288,27 +287,38 @@ int CSocketItemDl::Commit()
 		return EDOM;	// A warning say that the connection is aborted actually, for it is not in the proper state
 	}
 
-	bool yetSomeDataToBuffer = HasPendingSend();
+	// flush internal buffer for compression, if it is non-empty
+	bool yetSomeDataToBuffer = HasDataToCommit();
+	if (yetSomeDataToBuffer && pendingSendBuf == NULL)
+	{
+		pendingSendBuf = (BYTE *)(-1);
+		if (HasFreeSendBuffer())
+		{
+			BufferData(0);	// assert(pendingSendSize == 0);
+			Call<FSP_Send>();
+			yetSomeDataToBuffer = HasDataToCommit();
+		}
+	}
 	SetMutexFree();
 
-	if(fpCommitted == NULL)
-	{
-		if(! yetSomeDataToBuffer && !Call<FSP_Commit>())
-		{
-#ifdef TRACE
-			printf_s("Fatal error during Commit! Cannot call LLS\n");
-#endif
-			return -EIO;
-		}
-		// Assume the caller has set time-out clock
-		do
-		{
-			Sleep(TIMER_SLICE_ms);
-		} while(!InState(CLOSABLE) && !InState(CLOSED)); 
-		//
-		return 0;
-	}
-
 	// Case 1 is handled in DLL while case 2~5 are handled in LLS
-	return yetSomeDataToBuffer ? 0 : (Call<FSP_Commit>() ? 0 : -EIO);
+	if(fpCommitted != NULL)
+		return yetSomeDataToBuffer ? 0 : (Call<FSP_Commit>() ? 0 : -EIO);
+
+	// blocking mode:
+	if (!yetSomeDataToBuffer && !Call<FSP_Commit>())
+	{
+#ifdef TRACE
+		printf_s("Fatal error during Commit! Cannot call LLS\n");
+#endif
+		return -EIO;
+	}
+	// Assume the caller has set time-out clock
+#ifndef _NO_LLS_CALLABLE
+	do
+	{
+		Sleep(TIMER_SLICE_ms);
+	} while(!InState(CLOSABLE) && !InState(CLOSED)); 
+#endif
+	return 0;
 }

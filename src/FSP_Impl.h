@@ -50,40 +50,7 @@
 
 #include "Intrins.h"
 
-#if (_MSC_VER >= 1600)
-#pragma intrinsic(_InterlockedCompareExchange8, _InterlockedExchange8)
-#else
-FORCEINLINE char _InterlockedCompareExchange8(volatile char *dest, char newval, char oldval)
-{
-    __asm
-    {
-        mov     al, oldval
-        mov     edx,dest
-        mov     cl,	newval
-        lock cmpxchg byte ptr [edx], cl
-    }
-}
-
-FORCEINLINE char _InterlockedExchange8(volatile char * a, char b)
-{
-	__asm mov	ecx, a;
-	__asm mov	AL, b;
-	__asm xchg	AL, byte ptr[ecx];
-}
-
-FORCEINLINE char _InterlockedExchange16(volatile short * a, short b)
-{
-	__asm mov	ecx, a;
-	__asm mov	AX, b;
-	__asm xchg	AX, word ptr[ecx];
-}
-#endif
-
-
-
 #define	MAC_ALIGNMENT	16
-#define COOKIE_KEY_LEN	20	// salt include, as in RFC4543 5.4
-
 
 
 /**
@@ -153,13 +120,12 @@ void TraceLastError(char * fileName, int lineNo, char *funcName, char *s1);
 #ifndef OVER_UDP_IPv4
 // IPv6 requires that every link in the internet have an MTU of 1280 octets or greater. 
 # define MAX_BLOCK_SIZE		1024
-# define MAX_LLS_BLOCK_SIZE	(MAX_BLOCK_SIZE + sizeof(FSP_Header))		// 1048
+# define MAX_LLS_BLOCK_SIZE	(MAX_BLOCK_SIZE + sizeof(FSP_NormalPacketHeader))		// 1048
 #else
 # define MAX_BLOCK_SIZE		512
-# define MAX_LLS_BLOCK_SIZE	(MAX_BLOCK_SIZE + sizeof(FSP_Header) + 8)	// 544
+# define MAX_LLS_BLOCK_SIZE	(MAX_BLOCK_SIZE + sizeof(FSP_NormalPacketHeader) + sizeof(ALFIDPair))	// 544
 #endif
 
-#define MAX_PHY_INTERFACES	4	// maximum number of physical interfaces that might be multihomed
 #define MIN_QUEUED_INTR		2	// minimum number of queued (soft) interrupt, must be some power value of 2
 #define FSP_BACKLOG_SIZE	4	// shall be some power of 2
 #define FSP_MAX_NUM_NOTICE	15	// should be a reasonable value, shall be some multiple of 8 minus 1
@@ -218,185 +184,6 @@ extern CStringizeNotice noticeNames;
  */
 #include <pshpack1.h>
 
-struct $FSP_HeaderSignature: FSP_HeaderSignature
-{
-	template<typename THdr, FSPOperationCode opCode1> void Set()
-	{
-		major = THIS_FSP_VERSION;
-		opCode = opCode1;
-		hsp = htobe16(sizeof(THdr));
-	}
-	void Set(FSPOperationCode opCode1, int len1)
-	{
-		major = THIS_FSP_VERSION;
-		opCode = opCode1;
-		hsp = htobe16(len1);
-	}
-};
-
-
-
-// position start from 7, the leftmost one
-enum FSP_FlagPosition: uint8_t
-{
-	TransactionEnded = 7,	// share with the buffer block descriptor
-	Compressed = 6,			// In this version of FSP, LZ4 is exploited
-	CongestionAlarm = 5,	// Accurate ECN/Scalable Congestion Control
-	// 4: reserved for protocol use
-	// 3, 2, 1, 0: reserved for internal use
-};
-
-
-
-struct FSP_NormalPacketHeader
-{
-	uint32_t sequenceNo;
-	uint32_t expectedSN;
-	union
-	{
-		uint64_t	code;
-		ALFIDPair	id;
-	} integrity;
-	//
-	UINT8	flags_ws[4];
-	$FSP_HeaderSignature hs;
-
-	// Given the opCode, total length of all the headers, sequenceNo, expectedNo and receive window size
-	void LOCALAPI Set(FSPOperationCode, uint16_t, uint32_t, uint32_t, int32_t);
-
-	// A brute-force but safe method of set or retrieve receive window size, with byte order translation
-	int32_t GetRecvWS()	const { return ((int32_t)flags_ws[1] << 16) + ((unsigned)flags_ws[2] << 8) + flags_ws[3]; }
-	void SetRecvWS(int32_t v) { flags_ws[1] = (UINT8)(v >> 16); flags_ws[2] = (UINT8)(v >> 8); flags_ws[3] = (UINT8)v; }
-
-	void ClearFlags() { flags_ws[0] = 0; }
-	template<FSP_FlagPosition pos> void SetFlag() { flags_ws[0] |= (1 << pos); }
-	template<FSP_FlagPosition pos> void ClearFlag() { flags_ws[0] &= ~(1 << pos); }
-	template<FSP_FlagPosition pos> int GetFlag() const { return flags_ws[0] & (1 << pos); }
-
-	// Get the first extension header
-	PFSP_HeaderSignature PFirstExtHeader() const { return (PFSP_HeaderSignature)((uint8_t *)this + be16toh(hs.hsp) - sizeof(FSP_HeaderSignature)); }
-
-	// Get next extension header
-	// Given
-	//	The pointer to the current extension header
-	// Return
-	//	The pointer to the next optional header, NULL if it is illegal
-	// Remark
-	//	The caller should check that pStackPointer does not fall into dead-loop
-	template<typename THdr>	PFSP_HeaderSignature PHeaderNextTo(void *p0) const
-	{
-		uint16_t sp = be16toh(((THdr *)p0)->hs.hsp);
-		if(sp < sizeof(FSP_NormalPacketHeader) || sp > (uint8_t *)p0 - (uint8_t *)this)
-			return NULL;
-		return (PFSP_HeaderSignature)((uint8_t *)this + sp - sizeof(FSP_HeaderSignature));
-	}
-};
-
-
-
-struct FSP_InitiateRequest
-{
-	timestamp_t timeStamp;
-	uint64_t	initCheckCode;
-	uint32_t	salt;
-	$FSP_HeaderSignature hs;
-};
-
-
-
-// acknowledgement to the connect bootstrap request, works as a challenge against the initiator
-// to be followed by the certificate optional header
-struct FSP_Challenge
-{
-	uint64_t	cookie;
-	uint64_t	initCheckCode;
-	int32_t		timeDelta;
-	$FSP_HeaderSignature hs;
-};
-
-
-
-// FSP_ConnectParam specifies the parent connection in a MULTIPLY or CONNECT_REQUEST packet
-// while alias as the mobile parameters
-// PEER_SUBNETS used to be CONNECT_PARAM and it is perfect OK to treat the latter as the canonical alias of the former
-struct FSP_ConnectParam
-{
-	uint64_t	subnets[MAX_PHY_INTERFACES];
-	ALFID_T		idListener;
-	ALFID_T		idHost;
-	//
-	UINT8	flags_ws[4];
-	$FSP_HeaderSignature hs;
-
-	// Block size are counted in 512-byte sectors, actually
-	int GetBlockSize() const { return (int)flags_ws[0] << 9; }
-	void SetBlockSize(int n) { flags_ws[0] = (UINT8)(n >> 9); }
-
-	// A brute-force but safe method of set or retrieve receive window size, with byte order translation
-	int32_t GetRecvWS() const { return ((int32_t)flags_ws[1] << 16) + ((unsigned)flags_ws[2] << 8) + flags_ws[3]; }
-	void SetRecvWS(int32_t v) { flags_ws[1] = (UINT8)(v >> 16); flags_ws[2] = (UINT8)(v >> 8); flags_ws[3] = (UINT8)v; }
-};
-
-
-
-struct FSP_ConnectRequest: FSP_InitiateRequest
-{
-	uint32_t	initialSN;		// initial sequence number, I->R, for this session segment
-	int32_t		timeDelta;
-	uint64_t	cookie;
-	//
-	FSP_ConnectParam params;
-};
-
-
-
-struct FSP_AckConnectRequest: FSP_NormalPacketHeader
-{
-	FSP_ConnectParam params;
-};
-
-
-
-// Mandatory additional header for KEEP_ALIVE
-// minimum constituent of a SNACK header
-struct FSP_SelectiveNACK
-{
-	struct GapDescriptor
-	{
-		uint32_t	gapWidth;	// in packets
-		uint32_t	dataLength;	// in packets
-	};
-	uint32_t		serialNo;
-	$FSP_HeaderSignature hs;
-};
-
-
-
-struct FSP_RejectConnect
-{
-	union
-	{
-		timestamp_t timeStamp;
-		struct
-		{
-			uint32_t initial;
-			uint32_t expected;
-		} sn;
-	};
-	//
-	union
-	{
-		uint64_t integrityCode;
-		uint64_t cookie;
-		uint64_t initCheckCode;
-		ALFIDPair fidPair;
-	};
-	//
-	uint32_t reasons;	// bit field(?)
-	$FSP_HeaderSignature hs;
-};
-
-
 
 /**
  * Command to lower layer service
@@ -445,7 +232,7 @@ struct CommandCloneConnect : CommandNewSession
 
 
 
-struct FSP_PKTINFO_EX : FSP_SINKINF
+struct FSP_ADDRINFO_EX : FSP_SINKINF
 {
 	int32_t	cmsg_level;
 	//
@@ -462,8 +249,6 @@ struct FSP_PKTINFO_EX : FSP_SINKINF
 		ipi6_ifindex = if1;
 		cmsg_level = IPPROTO_IPV6;	/* originating protocol */
 	}
-	//
-	bool IsIPv6() const { return (cmsg_level == IPPROTO_IPV6); }
 };
 
 
@@ -496,7 +281,7 @@ struct SConnectParam	// MUST be aligned on 64-bit words!
 
 struct BackLogItem: SConnectParam
 {
-	FSP_SINKINF	acceptAddr;	// including the interface number AND the local fiber ID
+	FSP_ADDRINFO_EX	acceptAddr;		// including the local fiber ID
 	ALFID_T		idParent;
 	//^ 0 if it is the 'root' acceptor, otherwise the local fiber ID of the cloned connection
 	uint32_t	expectedSN;	// the expected sequence number of the packet to receive by order
@@ -561,18 +346,17 @@ public:
 
 
 
-/**
- * Session Control Block is meant to be shared by LLS and DLL. Shall be prefixed with 'volatile' if LLS is implemented in hardware
- */
+
+// Name of the flags for protocol use are in camel-case.
+// The flags for internal buffering are in upper case
+// 0~7 : reserved for protocol use. See also enum FSP_FlagPosition
 enum: uint8_t
 {
-	EXCLUSIVE_LOCK = 0,
-	IS_ACKNOWLEDGED = 1,
-	IS_COMPLETED = 2,
-	IS_SENT = 3,
+	EXCLUSIVE_LOCK = 8,
+	IS_ACKNOWLEDGED = 9,
+	IS_COMPLETED = 10,
+	IS_SENT = 11,
 	IS_FULFILLED = IS_COMPLETED,// mutual-mirroring flags for send and receive
-	// 4, 5, 6, 7 : reserved for protocol use. See also enum FSP_FlagPosition
-	// Name of the flags for protocol use are in camel-case. The flags for internal buffering are in upper case
 };
 
 
@@ -580,6 +364,10 @@ enum: uint8_t
 class CSocketItem;	// forward declaration for sake of declaring ControlBlock
 
 
+/**
+ * Session Control Block is meant to be shared by LLS and DLL.
+ * Shall be prefixed with 'volatile' if LLS is implemented in hardware
+ */
 
 // It heavily depends on Address Space Layout Randomization and user-space memory segment isolation
 // or similar measures to pretect sensive information, integrity and privacy, of user process
@@ -601,7 +389,7 @@ struct ControlBlock
 	// Used to be the matched list of local and remote addresses.
 	// for security reason the remote addresses were moved to LLS
 	char			nearEndName[INET6_ADDRSTRLEN + 7];	// 72 bytes, in UTF-8
-	FSP_PKTINFO_EX	nearEndInfo;
+	FSP_ADDRINFO_EX	nearEndInfo;
 	struct
 	{
 		char		name[INET6_ADDRSTRLEN + 7];	// 72 bytes
@@ -698,6 +486,8 @@ struct ControlBlock
 		void Unlock() { SetFlag<EXCLUSIVE_LOCK>(false); }
 		//
 		void InitFlags() { _InterlockedExchange16((SHORT *) & flags, 1 << EXCLUSIVE_LOCK); }
+		void CopyFlagsTo(FSP_NormalPacketHeader *p) { p->flags_ws[0]  = (uint8_t)flags; }
+		void CopyInFlags(const FSP_NormalPacketHeader *p) { _InterlockedExchange8((char *) & flags, p->flags_ws[0]); }
 	} *PFSP_SocketBuf;
 	//
 	// END REGION: buffer descriptors
@@ -791,7 +581,19 @@ struct ControlBlock
 
 	int32_t CountReceived() const { return int32_t(recvWindowNextSN - recvWindowFirstSN); }	// gaps included, however
 
-	void LOCALAPI SetSequenceFlags(FSP_NormalPacketHeader *, ControlBlock::seq_t);
+	// Given
+	//	FSP_NormalPacketHeader*	the place-holder of sequence number and flags
+	//	ControlBlock::seq_t		the intent sequence number of the packet
+	// Do
+	//	Set the default sequence number, expected acknowledgment sequencenumber,
+	//	flags and the advertised receive window size field of the FSP header 
+	void LOCALAPI SetSequenceFlags(FSP_NormalPacketHeader *pHdr, ControlBlock::seq_t seq1)
+	{
+		pHdr->expectedSN = htobe32(recvWindowNextSN);
+		pHdr->sequenceNo = htobe32(seq1);
+		pHdr->ClearFlags();
+		pHdr->SetRecvWS(AdRecvWS(recvWindowNextSN));
+	}
 
 	void * LOCALAPI InquireSendBuf(int32_t *);
 

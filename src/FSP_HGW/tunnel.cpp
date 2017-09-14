@@ -162,7 +162,12 @@ static bool FSPAPI onRequestArrived(FSPHANDLE h, void *buf, int32_t len, bool eo
 	remoteEnd.sin_family = AF_INET;
 	remoteEnd.sin_port = req->nboPort;
 
-	printf_s("Try to connect to %s:%d\n", inet_ntoa(remoteEnd.sin_addr), ntohs(remoteEnd.sin_port));
+	printf_s("Try to connect to %d.%d.%d.%d:%d\n"
+		, remoteEnd.sin_addr.S_un.S_un_b.s_b1
+		, remoteEnd.sin_addr.S_un.S_un_b.s_b2
+		, remoteEnd.sin_addr.S_un.S_un_b.s_b3
+		, remoteEnd.sin_addr.S_un.S_un_b.s_b4
+		, ntohs(remoteEnd.sin_port));
 
 	int r = connect(toServer, (PSOCKADDR) & remoteEnd, sizeof(remoteEnd)); 
 	if(r != 0)

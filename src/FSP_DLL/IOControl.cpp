@@ -57,11 +57,11 @@ int FSPAPI FSPControl(FSPHANDLE hFSPSocket, FSP_ControlCode controlCode, ULONG_P
 		CSocketItemDl *pSocket = (CSocketItemDl *)hFSPSocket;
 		switch(controlCode)
 		{
-		case FSP_GET_SIGNATURE:
-			*(uint64_t *)value = pSocket->GetULASignature();
+		case FSP_GET_EXT_POINTER:
+			*(ULONG_PTR *)value = (ULONG_PTR)pSocket->GetULASignature();
 			break;
-		case FSP_SET_SIGNATURE:
-			pSocket->SetULASignature(*(uint64_t *)value);
+		case FSP_SET_EXT_POINTER:
+			pSocket->SetULASignature(value);
 			break;
 		case FSP_SET_CALLBACK_ON_ERROR:
 			pSocket->SetCallbackOnError((NotifyOrReturn)value);
@@ -74,9 +74,6 @@ int FSPAPI FSPControl(FSPHANDLE hFSPSocket, FSP_ControlCode controlCode, ULONG_P
 			break;
 		case FSP_GET_PEER_COMMITTED:
 			*((int *)value) = pSocket->HasPeerCommitted() ? 1 : 0;
-			break;
-		case FSP_SET_LONGRUN_CALLBACK:
-			pSocket->SetLongRunCallback((LongRunCallback)value);
 			break;
 		default:
 			return -EDOM;
@@ -350,6 +347,8 @@ bool CSocketItemDl::AllocDecodeState()
 //	int &			[_InOut_] In: the capacity of the target buffer, Out: number of bytes occupied
 //	const void *	Source buffer
 //	int				length of the source octet string
+// Return
+//	Number of octets consumed from the source
 // Remark
 //	The source octet string is automatically segmented
 //	If the given length of the source octet string is zero,
@@ -393,7 +392,7 @@ int	CSocketItemDl::Compress(void *pOut, int &tgtSize, const void *pIn, int srcLe
 
 
 // Return whether internal buffer for compression is empty
-bool CSocketItemDl::HasPendingSend()
+bool CSocketItemDl::HasDataToCommit()
 {
 	return (pendingSendSize > 0 || pStreamState != NULL && (pendingStreamingSize > 0 || pStreamState->rNext > 0));
 }

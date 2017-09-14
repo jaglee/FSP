@@ -30,18 +30,7 @@
 #include "FSP_DLL.h"
 
 
-// Given
-//	FSPHandle		the socket handle
-//	CallbackPeeked	the pointer of the function called back when some data is available
-// Do
-//	Register the call back function. Trigger a software interrupt
-//	to call back the given function if there are data available immediately.
-//  Return immediately if there is no data available.
-// Return
-//	0 if no error, negative if error detected on calling the function
-// Remark
-//	The the start pointer and the available data size in the receive buffer
-//	are returned by passing as the parameters of the callback function
+/// Commented in FSP_API.h
 DllExport
 int FSPAPI RecvInline(FSPHANDLE hFSPSocket, CallbackPeeked fp1)
 {
@@ -60,26 +49,7 @@ int FSPAPI RecvInline(FSPHANDLE hFSPSocket, CallbackPeeked fp1)
 
 
 
-// Given
-//	FSPHANDLE		the FSP socket handle
-//	void *			the start pointer of the receive buffer
-//	int				the capacity in byte of the receive buffer
-//	NotifyOrReturn	the function called back when either EoT reached,
-//					connection terminated or receive buffer fulfilled
-// Return
-//	positive if it is the length of the available data
-//	0 if no immediate error
-//	-EFAULT if some ridiculous exception has arised
-//	-EBUSY if previous asynchronous Read operation has not completed
-//	-EDEADLK if cannot obtain the mutual exclusive lock
-//	-EADDRINUSE if previous ReadFrom has not completed
-// Remark
-//	NotifyOrReturn is called when receive buffer is full OR end of transaction encountered
-//	NotifyOrReturn might report error later even if ReadFrom itself return no error
-//	Return value passed in NotifyOrReturn is number of octets really received
-//	If NotifyOrReturn is NULL the function is blocking, i.e.
-//	waiting until either the buffer is fulfilled or the peer's transmit transactin has been committed
-//	ULA should check whether the transmit transaction is committed by calling FSPControl. See also WriteTo
+/// Commented in FSP_API.h
 DllExport
 int FSPAPI ReadFrom(FSPHANDLE hFSPSocket, void *buf, int capacity, NotifyOrReturn fp1)
 {
@@ -96,7 +66,16 @@ int FSPAPI ReadFrom(FSPHANDLE hFSPSocket, void *buf, int capacity, NotifyOrRetur
 
 
 
-// See ::RecvInline()
+
+// Given
+//	CallbackPeeked	the pointer of the function called back when some data is available
+// Do
+//	Register the call back function. Trigger a software interrupt
+//	to call back the given function if there are data available immediately.
+// Return
+//	0 if no error, negative if error detected on calling the function
+// Remark
+//  Return immediately if there is no data available yet.
 int CSocketItemDl::RecvInline(CallbackPeeked fp1)
 {
 	if (!WaitUseMutex())
@@ -218,13 +197,14 @@ l_postloop:
 //	-ENOMEM (-12)	if it is to decompress, but there is no enough memory for internal buffer
 //	non-negative: number of octets fetched. might be zero
 // Remark
-//	Left border of the receive window is slided if RecvInline has been called but the inquired receive buffer has not been unlocked
+//	Left border of the receive window is slided if RecvInline has been called
+//	but the inquired receive buffer has not been unlocked
+//	Skip payload-less PERSIST meant to be in-band acknowledgment that starts a new transmit transaction
 inline
 int32_t CSocketItemDl::FetchReceived()
 {
 	ControlBlock::PFSP_SocketBuf p;
 	int n, sum = 0;
-	// Skip payload-less PERSIST meant to be in-band acknowledgment that starts a new transmit transaction
 	while(HasDataToDeliver())
 	{
 		p = pControlBlock->GetFirstReceived();
@@ -232,12 +212,21 @@ int32_t CSocketItemDl::FetchReceived()
 		{
 			if(p->len > 0)
 				goto l_continue;
+			//
+			p->opCode = (FSPOperationCode)0;
 		}
 		else if(p->opCode != 0)
 		{
 			goto l_continue;
 		}
+		//
 		pControlBlock->SlideRecvWindowByOne();
+		p->SetFlag<IS_FULFILLED>(false);
+		if (p->GetFlag<TransactionEnded>())
+		{
+			peerCommitted = 1;
+			return 0;
+		}
 	}
 	return 0;
 	//
@@ -317,10 +306,10 @@ void CSocketItemDl::ProcessReceiveBuffer()
 	printf_s("Fiber#%u process receive buffer in %s\n", fidPair.source, stateNames[pControlBlock->state]);
 #endif
 	//
-	CallbackPeeked fp1 = fpPeeked;
+	CallbackPeeked fp1;
 	int32_t n;
 	// RecvInline takes precedence
-	if(fp1 != NULL)
+	if((fp1 = (CallbackPeeked)InterlockedExchangePointer((PVOID *) & fpPeeked, NULL)) != NULL)
 	{
 #ifdef TRACE
 		printf_s("RecvInline...\n");
@@ -337,26 +326,40 @@ void CSocketItemDl::ProcessReceiveBuffer()
 			printf_s("Transmit transaction terminated\n");
 #endif
 			peerCommitted = 1;
-			fpPeeked = NULL;
 		}
 		else if(n == 0) // when the last message is a payload-less PERSIST without the EoT flag set
 		{
 			Call<FSP_AdRecvWindow>();
+			fpPeeked = fp1;
 			SetMutexFree();
 			return;
 		}
 		//
 		SetMutexFree();
 
-		bool b = fp1(this, p, (int32_t)n, eot);
-		if (!b)
-			fpPeeked = NULL;
+		// Manage to recover from possible error, hope that lower-precedence ReadFrom is ready
+		bool b = fp1(this, p, n, eot);
 		if(n < 0)
+		{
+			SelfNotify(FSP_NotifyDataReady);
 			return;
+		}
 
 		WaitUseMutex();
+		if(b)
+			fpPeeked = fp1;
+
 		// Assume the call-back function did not mess up the receive queue
-		MarkReceiveFinished(n);
+		int r = MarkReceiveFinished(n);
+		if(r < 0)
+		{
+#ifdef TRACE
+			printf_s("Protocol implementation failure? MarkReceiveFinished() returned %d\n", r);
+#endif
+			BREAK_ON_DEBUG();
+			// UNRESOLVED! error recovery?
+		}
+
 		if (HasDataToDeliver())
 		{
 			SetMutexFree();

@@ -275,36 +275,48 @@ inline void CLowerInterface::MakeALFIDsPool()
 
 
 
-// TODO: fill in the allowed prefixes with properly multihome support (utilize concept of 'zone')
-// multihome/mobility/resilence support (see also CInterface::EnumEffectiveAddresses):
-// MAX_PHY_INTERFACES is hard-coded to 4
+// multihome/mobility/resilence(multipath) support is provided for non-NAT IPv6 network only
 // sockAddrTo[0] is the most preferred address (care of address)
 // sockAddrTo[3] is the home-address
 // while sockAddr[1], sockAddr[2] are backup-up/load-balance address (might be zero)
+// we assume that at the very beginning the home address equals the care-of address
 int LOCALAPI CLowerInterface::EnumEffectiveAddresses(uint64_t *prefixes)
 {
+	memset(prefixes, 0, sizeof(uint64_t) * MAX_PHY_INTERFACES);
 	// UNRESOLVED! could we make sure u is 64-bit aligned?
-	if (nearInfo.IsIPv6())
+	if (! nearInfo.IsIPv6())
+		return 0;
+
+	// The address that has accepted the acknowledgement is the current care-of-address
+	// no matter whether it is global routable:
+	prefixes[0] = *(uint64_t *)& nearInfo.u;
+
+	int n = sdSet.fd_count;
+	int k = 1;
+	uint64_t prefix;
+	for (register int i = 0; i < n; i++)
 	{
-		prefixes[0] = *(uint64_t *) & nearInfo.u;
-		prefixes[1] = 0;	// IN6_ADDR_ANY; no compatible multicast prefix
+		// binary prefix 000 MUST have its interface ID set to EUID, which is NOT compatible with FSP
+		// neithor the "IPv4-Compatible	IPv6 address" nor the "IPv4 - mapped IPv6 address"
+		// is compatible with FSP
+		if ((addresses[i].sin6_addr.u.Byte[0] & 0xE0) == 0)
+			continue;
+		// RFC4193 unique local address might be NATed, which is NOT compatible with FSP
+		if ((addresses[i].sin6_addr.u.Byte[0] & 0xFE) == 0xFC)
+			continue;
+		// RFC4291 link-local address may not be utilized in resilence support, unless configured specially
+		if (*(uint64_t *)& addresses[i].sin6_addr.u == *(uint64_t *)& in6addr_linklocalprefix.u)
+			continue;
+		// other global routable address are supposed to be not-NATed, compatible with FSP
+		prefix = *(uint64_t *)& addresses[i].sin6_addr;
+		if (prefix == prefixes[0])
+			continue;
+		prefixes[k] = prefix;
+		if (++k >= 4)
+			break;
 	}
-	else
-	{
-		((PFSP_IN4_ADDR_PREFIX) & prefixes[0])->prefix = PREFIX_FSP_IP6to4;
-		((PFSP_IN4_ADDR_PREFIX) & prefixes[0])->ipv4 = (nearInfo.u.ipi_addr == 0)
-			? INADDR_LOOPBACK	// in ws2def.h
-			: nearInfo.u.ipi_addr;
-		((PFSP_IN4_ADDR_PREFIX) & prefixes[0])->port = DEFAULT_FSP_UDPPORT;
-		//
-		((PFSP_IN4_ADDR_PREFIX) & prefixes[1])->prefix = PREFIX_FSP_IP6to4;
-		((PFSP_IN4_ADDR_PREFIX)& prefixes[1])->ipv4 = INADDR_BROADCAST;
-		((PFSP_IN4_ADDR_PREFIX) & prefixes[1])->port = DEFAULT_FSP_UDPPORT;
-	}
-	// we assume that at the very beginning the home address equals the care-of address
-	prefixes[3] = prefixes[0];
-	prefixes[2] = prefixes[1];
-	return 4;
+	//
+	return k;
 }
 
 
@@ -575,13 +587,7 @@ inline int CLowerInterface::SetInterfaceOptions(SOCKET sd)
 	DWORD enablePktInfo = TRUE;
 
 	// enable return of packet information by WSARecvMsg, so that make difference between IPv4 and IPv6
-	if (setsockopt(sd, IPPROTO_IP, IP_PKTINFO, (char *)& enablePktInfo, sizeof(enablePktInfo)) != 0)
-	{
-		REPORT_WSAERROR_TRACE("Cannot set socket option to fetch the source IP address");
-		return -1;
-	}
-
-	return 0;
+	return setsockopt(sd, IPPROTO_IP, IP_PKTINFO, (char *)& enablePktInfo, sizeof(enablePktInfo));
 }
 
 
@@ -602,16 +608,19 @@ int CLowerInterface::BindSendRecv(const SOCKADDR_IN *pAddrListen, int k)
 		, pAddrListen->sin_addr.S_un.S_un_b.s_b4
 		, be16toh(pAddrListen->sin_port));
 #endif
-	memcpy(&addresses[k], pAddrListen, sizeof(SOCKADDR_IN));
-	interfaces[k] = 0;
-
 	if (::bind(sdSend, (const struct sockaddr *)pAddrListen, sizeof(SOCKADDR_IN)) != 0)
 	{
 		REPORT_WSAERROR_TRACE("Cannot bind to the selected address");
 		return -1;
 	}
+	if (SetInterfaceOptions(sdSend) != 0)
+	{
+		REPORT_WSAERROR_TRACE("Cannot set socket option to fetch the source IP address");
+		return -1;
+	}
 
-	SetInterfaceOptions(sdSend);
+	memcpy(&addresses[k], pAddrListen, sizeof(SOCKADDR_IN));
+	interfaces[k] = 0;
 	FD_SET(sdSend, &sdSet);
 	return 0;
 }
@@ -654,18 +663,16 @@ inline bool CLowerInterface::LearnAddresses()
 			return false;
 		}
 		//
+		// When BindSemdRecv, k++; as k is the alias of sdSet.fd_count
 		if (k >= SD_SETSIZE)
 		{
-			REPORT_ERRMSG_ON_TRACE("out of memory");
-			return false;
+			REPORT_ERRMSG_ON_TRACE("run out of socket set space");
+			break;		//^Only a warning
 		}
 		//
 		p->sin_port = DEFAULT_FSP_UDPPORT;
 		if(BindSendRecv(p, k) != 0)
-		{
-			REPORT_WSAERROR_TRACE("Bind failure");
-			return false;
-		}
+			closesocket(sdSend);		// instead of return false;
 
 		sdSend = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 		if (sdSend == INVALID_SOCKET)
@@ -673,12 +680,6 @@ inline bool CLowerInterface::LearnAddresses()
 			REPORT_ERRMSG_ON_TRACE("run out of handle space?!");
 			return false;
 		}
-		// On BindInterface, k++; as k is the alias of sdSet.fd_count
-	}
-	if (k >= SD_SETSIZE)
-	{
-		REPORT_ERRMSG_ON_TRACE("run out of socket set space");
-		return false;
 	}
 
 	// Set the loopback address as the last resort of receiving
@@ -948,6 +949,10 @@ int LOCALAPI CLowerInterface::SendBack(char * buf, int len)
 	pktBuf->fidPair.peer = _InterlockedExchange((LONG *) & pktBuf->fidPair.source, pktBuf->fidPair.peer);
 	wsaData[0].buf = (char *) & pktBuf->fidPair;
 	wsaData[0].len = sizeof(pktBuf->fidPair);
+#if defined(TRACE) && (TRACE & TRACE_ADDRESS)
+	printf_s("\nSend back to peer socket address:\n");
+	DumpNetworkUInt16((uint16_t *)& addrFrom, sizeof(SOCKADDR_IN6) / 2);
+#endif
 	int r = WSASendTo(sdSend
 		, wsaData, 2, &n
 		, 0
@@ -1398,66 +1403,63 @@ DWORD WINAPI HandleConnect(LPVOID p)
 //	ScatteredSendBuffers
 // Return
 //	number of bytes sent, or 0 if error
+// 'Prefer productivity over cleverness' - if there is some 'cleverness'
 int CSocketItemEx::SendPacket(register ULONG n1, ScatteredSendBuffers s)
 {
 	DWORD n = 0;
 	int r;
 
-	// 'Prefer productivity over cleverness - if there is some cleverness'
-	if (pControlBlock->nearEndInfo.IsIPv6())
+#ifndef OVER_UDP_IPv4
+	CtrlMsgHdr nearInfo;
+	WSAMSG wsaMsg;
+	//
+	wsaMsg.Control.buf = (CHAR *)& nearInfo;
+	wsaMsg.Control.len = sizeof(nearInfo);
+	nearInfo.pktHdr = CLowerInterface::Singleton.nearInfo.pktHdr;
+	if(! CLowerInterface::Singleton.SelectPath
+		(& nearInfo.u, fidPair.source, pControlBlock->nearEndInfo.ipi6_ifindex, sockAddrTo))
 	{
-		CtrlMsgHdr nearInfo;
-		WSAMSG wsaMsg;
-		//
-		wsaMsg.Control.buf = (CHAR *)& nearInfo;
-		wsaMsg.Control.len = sizeof(nearInfo);
-		nearInfo.pktHdr = CLowerInterface::Singleton.nearInfo.pktHdr;
-		if(! CLowerInterface::Singleton.SelectPath
-			(& nearInfo.u, fidPair.source, pControlBlock->nearEndInfo.ipi6_ifindex, sockAddrTo))
-		{
-			return 0;	// no selectable path
-		}
-		wsaMsg.dwBufferCount = n1;
-		wsaMsg.lpBuffers = & s.scattered[1];
-		wsaMsg.name = (LPSOCKADDR)sockAddrTo;
-		wsaMsg.namelen = sizeof(sockAddrTo->Ipv6);
-#ifndef NDEBUG
-		s.scattered[0].buf = NULL;
-		s.scattered[0].len = 0;
-		if(nearInfo.u.idALF != fidPair.source)
-			BREAK_ON_DEBUG();
-#endif
-#if defined(TRACE) && (TRACE & TRACE_ADDRESS)
-		printf_s("Near end's address info:\n");
-		// Level: [0 for IPv4, 41 for IPv6]]
-		printf("Len = %d, level = %d, type = %d, local interface address:\n"
-			, (int)nearInfo.pktHdr.cmsg_len
-			, nearInfo.pktHdr.cmsg_level
-			, nearInfo.pktHdr.cmsg_type);
-		DumpHexical(& nearInfo.u, sizeof(nearInfo.u));
-		printf_s("Target address:\n\t");
-		DumpNetworkUInt16((uint16_t *)wsaMsg.name, wsaMsg.namelen / 2);
-#endif
-		r = WSASendMsg(CLowerInterface::Singleton.sdSend, & wsaMsg, 0, &n, NULL, NULL);
+		return 0;	// no selectable path
 	}
-	else
-	{
-		s.scattered[0].buf = (CHAR *)& fidPair;
-		s.scattered[0].len = sizeof(fidPair);
-		n1++;
+	wsaMsg.dwBufferCount = n1;
+	wsaMsg.lpBuffers = & s.scattered[1];
+	wsaMsg.name = (LPSOCKADDR)sockAddrTo;
+	wsaMsg.namelen = sizeof(sockAddrTo->Ipv6);
+# ifndef NDEBUG
+	s.scattered[0].buf = NULL;
+	s.scattered[0].len = 0;
+	if(nearInfo.u.idALF != fidPair.source)
+		BREAK_ON_DEBUG();
+# endif
+# if defined(TRACE) && (TRACE & TRACE_ADDRESS)
+	printf_s("Near end's address info:\n");
+	// Level: [0 for IPv4, 41 for IPv6]]
+	printf("Len = %d, level = %d, type = %d, local interface address:\n"
+		, (int)nearInfo.pktHdr.cmsg_len
+		, nearInfo.pktHdr.cmsg_level
+		, nearInfo.pktHdr.cmsg_type);
+	DumpHexical(& nearInfo.u, sizeof(nearInfo.u));
+	printf_s("Target address:\n\t");
+	DumpNetworkUInt16((uint16_t *)wsaMsg.name, wsaMsg.namelen / 2);
+# endif
+	r = WSASendMsg(CLowerInterface::Singleton.sdSend, & wsaMsg, 0, &n, NULL, NULL);
+#else
+	s.scattered[0].buf = (CHAR *)& fidPair;
+	s.scattered[0].len = sizeof(fidPair);
+	n1++;
 #if defined(TRACE) && (TRACE & TRACE_ADDRESS)
-		printf_s("\nPeer socket address:\n");
-		DumpNetworkUInt16((uint16_t *)sockAddrTo, sizeof(SOCKADDR_IN6) / 2);
+	printf_s("\nPeer socket address:\n");
+	DumpNetworkUInt16((uint16_t *)sockAddrTo, sizeof(SOCKADDR_IN6) / 2);
 #endif
-		r = WSASendTo(CLowerInterface::Singleton.sdSend
-			, s.scattered, n1
-			, &n
-			, 0
-			, (const struct sockaddr *)sockAddrTo
-			, sizeof(sockAddrTo->Ipv4)
-			, NULL
-			, NULL);
-	}
+	r = WSASendTo(CLowerInterface::Singleton.sdSend
+		, s.scattered, n1
+		, &n
+		, 0
+		, (const struct sockaddr *)sockAddrTo
+		, sizeof(sockAddrTo->Ipv4)
+		, NULL
+		, NULL);
+#endif
 
 	tRecentSend = NowUTC();
 	if (r != 0)
@@ -1573,11 +1575,16 @@ static int CreateFWRules()
 	INetFwPolicy2 *pNetFwPolicy2 = NULL;
 	INetFwRules *pFwRuleSet = NULL;
 	INetFwRule *pFwRule = NULL;
-
 	BSTR bstrRuleName = SysAllocString(L"Flexible Session Protocol");
 	BSTR bstrRuleDescription = SysAllocString(L"Allow network traffic from/to FSP over IPv6");
+	BSTR bstrRuleDescription2 = SysAllocString(L"Allow network traffic from/to FSP over UDP/IPv4");
 	BSTR bstrRuleGroup = SysAllocString(L"FSP/IPv6");	//  and optionally FSP over UDP/IPv4
-	BSTR bstrRulePorts = SysAllocString(L"18003");	// 0x4653, i.e. ASCII Code of 'F' 'S'
+	BSTR bstrRuleGroup2 = SysAllocString(L"FSP/UDP");	//  and optionally FSP over IPv6
+	//
+	OLECHAR strUDPport[6];
+	_itow_s(be16toh(DEFAULT_FSP_UDPPORT), strUDPport, 6, 10);
+	BSTR bstrRulePorts = SysAllocString(strUDPport);
+	//
 	BSTR bstrRuleService = SysAllocString(L"*");
 	BSTR bstrRuleApplication = NULL;
 	WCHAR	strBuf[MAX_PATH];	// shall not be too deep
@@ -1731,12 +1738,13 @@ static int CreateFWRules()
 		goto l_bailout;
 	}
 	pFwRule->put_Name(bstrRuleName);
-	pFwRule->put_Description(bstrRuleDescription);
+	pFwRule->put_Description(bstrRuleDescription2);
 	pFwRule->put_Protocol(NET_FW_IP_PROTOCOL_UDP);	// NET_FW_IP_VERSION_V4
 	pFwRule->put_LocalPorts(bstrRulePorts);
-	pFwRule->put_RemotePorts(bstrRulePorts);
+	// For sake of NAT the REMOTE port is NOT particularly specified
+	// pFwRule->put_RemotePorts(bstrRulePorts);
 	pFwRule->put_Direction(NET_FW_RULE_DIR_OUT);
-	pFwRule->put_Grouping(bstrRuleGroup);
+	pFwRule->put_Grouping(bstrRuleGroup2);
 	pFwRule->put_Profiles(NET_FW_PROFILE2_ALL);
 	pFwRule->put_Action(NET_FW_ACTION_ALLOW);
 	pFwRule->put_Enabled(VARIANT_TRUE);
@@ -1765,16 +1773,22 @@ static int CreateFWRules()
 		goto l_bailout;
 	}
 	pFwRule->put_Name(bstrRuleName);
-	pFwRule->put_Description(bstrRuleDescription);
+	pFwRule->put_Description(bstrRuleDescription2);
 	pFwRule->put_ApplicationName(bstrRuleApplication);
 	// pFwRule->put_ServiceName(bstrRuleService);
 	pFwRule->put_Protocol(NET_FW_IP_PROTOCOL_UDP);	// NET_FW_IP_VERSION_V4
 	pFwRule->put_LocalPorts(bstrRulePorts);
-	pFwRule->put_RemotePorts(bstrRulePorts);
+	// For sake of NAT the REMOTE port is NOT particularly specified
+	// pFwRule->put_RemotePorts(bstrRulePorts);
 	pFwRule->put_Direction(NET_FW_RULE_DIR_IN);		// By default the direcion is in
-	pFwRule->put_Grouping(bstrRuleGroup);
+	pFwRule->put_Grouping(bstrRuleGroup2);
 	pFwRule->put_Profiles(NET_FW_PROFILE2_ALL);
 	pFwRule->put_Action(NET_FW_ACTION_ALLOW);
+	// Allow applications to receive unsolicited traffic directly
+	// from the Internet through a NAT edge device
+	// Note that edge traversal is allowed for UDP traffic only.
+	// For IPv6 it is assumed that no NAT except simple network prefix substitution is involved.
+	pFwRule->put_EdgeTraversal(VARIANT_TRUE);
 	pFwRule->put_Enabled(VARIANT_TRUE);
 	// LocalAddresses, RemoteAddresses, Interfaces and InterfaceTypes are all ignored
 	// Add the Firewall Rule
@@ -1790,7 +1804,9 @@ l_bailout:
 	// Free BSTR's
 	SysFreeString(bstrRuleName);
 	SysFreeString(bstrRuleDescription);
+	SysFreeString(bstrRuleDescription2);
 	SysFreeString(bstrRuleGroup);
+	SysFreeString(bstrRuleGroup2);
 	SysFreeString(bstrRulePorts);
 	SysFreeString(bstrRuleService);
 	if (bstrRuleApplication != NULL)
