@@ -438,14 +438,14 @@ uint32_t * FSPAPI TranslateFSPoverIPv4(PFSP_IN6_ADDR p, uint32_t dwIPv4, uint32_
 //	0 if no error
 //	negative: the error number
 DllSpec
-int FSPAPI InstallSessionKey(FSPHANDLE h, octet * key, int keySize, int32_t keyLife)
+int FSPAPI InstallMasterKey(FSPHANDLE h, octet * key, int32_t keyBits, uint64_t keyLife)
 {
-	if(keySize < FSP_MIN_KEY_SIZE || keySize > FSP_MAX_KEY_SIZE || keySize % sizeof(uint64_t) != 0 || keyLife <= 0)
+	if(keyBits < FSP_MIN_KEY_SIZE * 8 || keyBits > FSP_MAX_KEY_SIZE * 8 || keyBits % 64 != 0)
 		return -EDOM;
 	try
 	{
 		CSocketItemDl *pSocket = (CSocketItemDl *)h;
-		return pSocket->InstallKey(key, keySize, keyLife);
+		return pSocket->InstallRawKey(key, keyBits, keyLife);
 	}
 	catch(...)
 	{
@@ -456,9 +456,9 @@ int FSPAPI InstallSessionKey(FSPHANDLE h, octet * key, int keySize, int32_t keyL
 
 
 // Given
-//	BYTE *		byte stream of the key
-//	int			length of the key, should be multiplication of 8
-//	int32_t		life of the key, maximum number of packets that may utilize the key
+//	octet *		octet stream of the key
+//	int32_t		length of the key in bits, should be multiplication of 64
+//	uint64_t	life of the key, maximum number of packets that may utilize the key
 // Return
 //	-EINTR	if cannot obtain the right lock
 //	-EIO	if cannot trigger LLS to do the installation work through I/O
@@ -471,15 +471,15 @@ int FSPAPI InstallSessionKey(FSPHANDLE h, octet * key, int keySize, int32_t keyL
 //	Take the snapshot of sendBufferNextSN and pass the snapshot as the parameter
 //	because it is perfectly possible that installation of new session key is followed by
 //	sending new data so tight that LLS has not yet excute FSP_InstallKey before the send queue changed.
-int LOCALAPI CSocketItemDl::InstallKey(BYTE *key, int keySize, int32_t keyLife)
+int LOCALAPI CSocketItemDl::InstallRawKey(octet *key, int32_t keyBits, uint64_t keyLife)
 {
 	if(! WaitUseMutex())
 		return -EDEADLK;
 
 	CommandInstallKey objCommand(pControlBlock->sendBufferNextSN, keyLife);
 	this->InitCommand<FSP_InstallKey>(objCommand);
-	memcpy(& pControlBlock->connectParams, key, keySize);
-	pControlBlock->connectParams.keyLength = keySize;
+	memcpy(& pControlBlock->connectParams, key, keyBits/8);
+	pControlBlock->connectParams.keyBits = keyBits;
 
 	SetMutexFree();
 	return Call(objCommand, sizeof(objCommand)) ? 0 : -EIO;

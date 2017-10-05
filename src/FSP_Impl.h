@@ -193,8 +193,8 @@ extern CStringizeNotice noticeNames;
  */
 struct CommandToLLS
 {
-	DWORD			idProcess;
 	ALIGN(8)
+	DWORD			idProcess;
 	ALFID_T			fiberID;
 	FSP_ServiceCode	opCode;	// operation code
 
@@ -218,8 +218,8 @@ struct CommandNewSession: CommandToLLS
 struct CommandInstallKey : CommandToLLS
 {
 	uint32_t	nextSendSN;	// ControlBlock::seq_t
-	int32_t		keyLife;
-	CommandInstallKey(uint32_t seq1, int32_t v) { nextSendSN = seq1;  keyLife = v; }
+	uint64_t	keyLife;
+	CommandInstallKey(uint32_t seq1, uint64_t v) { nextSendSN = seq1; keyLife = v; }
 };
 
 
@@ -263,8 +263,8 @@ struct SConnectParam	// MUST be aligned on 64-bit words!
 	timestamp_t nboTimeStamp;
 	//^ Timestamp in network byte order, together with the first four fields, totally 256 bits could be overlaid
 	//
-	int8_t		padding[8];	// allow maximum key length of 384-bit, padding the structure to 64 bytes/512bits
-	int32_t		keyLength;	// by default 16 bytes
+	octet		padding[8];	// allow maximum key length of 384-bit, padding the structure to 64 bytes/512bits
+	int32_t		keyBits;	// by default 128
 	union
 	{
 		uint32_t	initialSN;

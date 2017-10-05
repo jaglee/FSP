@@ -27,6 +27,7 @@ typedef unsigned long long uint64_t;
 #define UINT64_C(v) v ## ULL
 #endif
 
+typedef uint8_t octet;
 
 #if __GNUC__
 #define ALIGN(n)      __attribute__ ((aligned(n))) 

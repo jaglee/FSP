@@ -137,12 +137,12 @@ uint32_t GCM_AES_SetSalt(GCM_AES_CTX *ctx, uint32_t salt)
 
 
 int	GCM_AES_AuthenticatedEncrypt(GCM_AES_CTX *ctx, uint64_t IV
-								, const uint8_t *P, uint32_t bytesP
+								, const octet *P, uint32_t bytesP
 								, const uint64_t *aad, uint32_t bytesA
 								, uint64_t *bufCipherText	// capacity of ciphertext buffer MUST be no less than bytesP
-								, uint8_t *T, int bytesT)
+								, octet *T, int bytesT)
 {
-	uint8_t	keystream[GCM_BLOCK_LEN];
+	uint8_t		keystream[GCM_BLOCK_LEN];
 	uint64_t	blk[2] = { 0, 0 };
 	int	plen;
 	int nMinus1;
@@ -229,14 +229,14 @@ int	GCM_AES_AuthenticatedEncrypt(GCM_AES_CTX *ctx, uint64_t IV
 
 
 int	GCM_AES_AuthenticateAndDecrypt(GCM_AES_CTX *ctx, uint64_t IV
-									, const uint8_t *C, uint32_t bytesC
+									, const octet *C, uint32_t bytesC
 									, const uint64_t *aad, uint32_t bytesA
-									, const uint8_t *T, int bytesT
+									, const octet *T, int bytesT
 									, uint64_t *bufPlainText	// capacity of plaintext buffer MUST be no less than bytesC
 									)
 {
-	uint64_t blk[2] = { 0, 0 };
-	uint8_t	keystream[GCM_BLOCK_LEN];
+	uint8_t		keystream[GCM_BLOCK_LEN];
+	uint64_t	blk[2] = { 0, 0 };
 	int	plen;
 	int nMinus1;
 	uint64_t *x;
@@ -336,11 +336,4 @@ int	GCM_AES_AuthenticateAndDecrypt(GCM_AES_CTX *ctx, uint64_t IV
 	bzero(keystream, sizeof(keystream));	// for security reason
 
 	return 0;	// no error
-}
-
-
-
-int GCM_SecureHash(GCM_AES_CTX *ctx, uint64_t nonce, const uint8_t *A, uint32_t bytesA, uint8_t *T, int bytesT)
-{
-	return GCM_AES_AuthenticatedEncrypt(ctx, nonce, NULL, 0, (const uint64_t *)A, bytesA, NULL, T, bytesT);
 }

@@ -174,9 +174,9 @@ static void FSPAPI onClientResponseReceived(FSPHANDLE h, FSP_ServiceCode c, int 
 	}
 	//
 	printf_s("\tTo install the session key instantly...\n");
-	octet bufSharedKey[SESSION_KEY_SIZE];
-	ChakaDeriveKey(bufSharedKey, passwordHash, chakaPubInfo, bufPrivateKey);
-	InstallSessionKey(h, bufSharedKey, SESSION_KEY_SIZE, INT32_MAX);
+	octet bufSharedKey[CRYPTO_NACL_KEYBYTES];
+	CryptoNaClGetSharedSecret(bufSharedKey, chakaPubInfo.peerPublicKey, bufPrivateKey);
+	InstallMasterKey(h, bufSharedKey, SESSION_KEY_SIZE * 8, INT32_MAX);
 
 	// To list files remotely
 	WIN32_FIND_DATA findFileData;

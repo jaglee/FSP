@@ -20,6 +20,9 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CSharpAPI", "src\CSharpAPI\
 	EndProjectSection
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "FSP_HGW", "src\FSP_HGW\fspgate.vcxproj", "{A897E4E3-B25F-40E8-8F9A-049643FA4246}"
+	ProjectSection(ProjectDependencies) = postProject
+		{DC63E2B4-BA8D-4540-936A-63106FFCB999} = {DC63E2B4-BA8D-4540-936A-63106FFCB999}
+	EndProjectSection
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution

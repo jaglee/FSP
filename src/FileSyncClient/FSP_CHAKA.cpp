@@ -201,8 +201,8 @@ static void FSPAPI onServerResponseReceived(FSPHANDLE h, FSP_ServiceCode c, int 
 
 	printf_s("\tTo install the session key instantly...\n");
 	octet bufSessionKey[SESSION_KEY_SIZE];
-	ChakaDeriveKey(bufSessionKey, clientInputHash, chakaPubInfo, bufPrivateKey);
-	InstallSessionKey(h, bufSessionKey, SESSION_KEY_SIZE, INT32_MAX);
+	CryptoNaClGetSharedSecret(bufSessionKey, chakaPubInfo.peerPublicKey, bufPrivateKey);
+	InstallMasterKey(h, bufSessionKey, SESSION_KEY_SIZE * 8, INT32_MAX);
 
 	// The server side write with the stream mode, while the client side read with block buffer mode
 	printf_s("\nTo read file list...\n");

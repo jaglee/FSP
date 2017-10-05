@@ -155,9 +155,7 @@ static int	FSPAPI  onConnected(FSPHANDLE h, PFSP_Context ctx)
 	CryptoNaClGetSharedSecret(bufSharedKey, bufPeersKey, bufPrivateKey);
 
 	printf_s("\tTo install the shared key instantly...\n");
-	octet prfKey[32];
-	sha256_hash(prfKey, bufSharedKey, CRYPTO_NACL_KEYBYTES);
-	InstallSessionKey(h, prfKey, 32, INT32_MAX);
+	InstallMasterKey(h, bufSharedKey, CRYPTO_NACL_KEYBYTES * 8, INT32_MAX);
 
 	return 0;
 }

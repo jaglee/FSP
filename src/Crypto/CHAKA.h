@@ -207,22 +207,6 @@ bool CHAKAValidateByServer(SCHAKAPublicInfo &chakaPubInfo, const octet passwordH
 }
 
 
-
-// It takes use of trivally more memory but lets length of the key
-// agreed de-coupled with length of the key HMACed.
-// assert(SHA256_DIGEST_SIZE == SESSION_KEY_SIZE);
-SINLINE
-void ChakaDeriveKey(octet sessionKey[SESSION_KEY_SIZE]
-	, const octet saltedPassword[CRYPTO_NACL_HASHBYTES]
-	, const SCHAKAPublicInfo &chakaPubInfo
-	, const octet bufPrivateKey[CRYPTO_NACL_KEYBYTES])
-{
-	octet bufSharedKey[CRYPTO_NACL_KEYBYTES];
-	CryptoNaClGetSharedSecret(bufSharedKey, chakaPubInfo.peerPublicKey, bufPrivateKey);
-	hmac_sha256_key512(sessionKey, saltedPassword, bufSharedKey, sizeof(bufSharedKey));
-}
-
-
 // A very simple stream encryption/decryption meant to protect privacy of a short message such as a user's name/client's id
 SINLINE
 void ChakaStreamcrypt(octet *buf

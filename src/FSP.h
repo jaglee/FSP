@@ -202,7 +202,6 @@ typedef enum: char
 
 // the number of microsecond elapsed since Midnight January 1, 1970 UTC (unix epoch)
 typedef uint64_t timestamp_t;
-typedef uint8_t octet;
 
 
 /**

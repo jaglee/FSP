@@ -632,8 +632,8 @@ void CSocketItemEx::InitiateMultiply(CSocketItemEx *srcItem)
 	InitAssociation();
 	assert(fidPair.peer == srcItem->fidPair.peer);	// Set in InitAssociation
 
-	contextOfICC.keyLife = (srcItem->contextOfICC.keyLife == 0 ? 0 : INT32_MAX - 1);
-	contextOfICC.savedCRC = (srcItem->contextOfICC.keyLife == 0);
+	contextOfICC.keyLifeRemain = srcItem->contextOfICC.keyLifeRemain;
+	contextOfICC.savedCRC = (contextOfICC.keyLifeRemain == 0);
 	contextOfICC.prev = srcItem->contextOfICC.curr;
 	//
 	ControlBlock::seq_t seq0 = pControlBlock->sendWindowNextSN;	// See also @DLL::ToPrepareMultiply
@@ -689,15 +689,11 @@ bool CSocketItemEx::FinalizeMultiply()
 		, contextOfICC.snFirstSendWithCurrKey, contextOfICC.snFirstRecvWithCurrKey
 		, fidPair.source, idPeerParent);
 #endif
-	if (contextOfICC.keyLife != 0)
-	{
-		DeriveNextKey(contextOfICC.snFirstSendWithCurrKey, contextOfICC.snFirstRecvWithCurrKey, fidPair.source, idPeerParent);
-	}
-	else
-	{
-		assert(contextOfICC.savedCRC);
+	if (contextOfICC.savedCRC)
 		contextOfICC.curr = contextOfICC.prev;
-	}
+	else
+		DeriveNextKey(contextOfICC.snFirstSendWithCurrKey, contextOfICC.snFirstRecvWithCurrKey, fidPair.source, idPeerParent);
+
 	if (!ValidateICC())
 	{
 		BREAK_ON_DEBUG();	//TRACE_HERE("Invalid intergrity check code of PERSIST to MULTIPLY!?");
@@ -753,15 +749,10 @@ void CMultiplyBacklogItem::ResponseToMultiply()
 		, fidPair.peer, idParent);
 #endif
 	// note that the responder's key material mirrors the initiator's
-	if (contextOfICC.keyLife != 0)
-	{
-		DeriveNextKey(contextOfICC.snFirstRecvWithCurrKey, contextOfICC.snFirstSendWithCurrKey, fidPair.peer, idParent);
-	}
-	else
-	{
-		assert(contextOfICC.savedCRC);
+	if (contextOfICC.savedCRC)
 		contextOfICC.curr = contextOfICC.prev;
-	}
+	else
+		DeriveNextKey(contextOfICC.snFirstRecvWithCurrKey, contextOfICC.snFirstSendWithCurrKey, fidPair.peer, idParent);
 }
 
 

@@ -262,10 +262,7 @@ static void FSPAPI onPublicKeyReceived(FSPHANDLE client, FSP_ServiceCode c, int 
 #endif
 	CryptoNaClGetSharedSecret(bufSharedKey, bufPeerPublicKey, bufPrivateKey);
 	free(bufPeerPublicKey);
-
-	octet prfKey[32];
-	sha256_hash(prfKey, bufSharedKey, CRYPTO_NACL_KEYBYTES);
-	InstallSessionKey(client, bufSharedKey, CRYPTO_NACL_KEYBYTES, INT32_MAX);
+	InstallMasterKey(client, bufSharedKey, CRYPTO_NACL_KEYBYTES * 8, INT32_MAX);
 
 	MasterService(client);
 }

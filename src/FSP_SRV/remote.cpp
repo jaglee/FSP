@@ -1253,8 +1253,8 @@ l_bailout:
 	newItem->contextOfICC.snFirstSendWithCurrKey = backlogItem.initialSN;
 	newItem->contextOfICC.prev = contextOfICC.curr;
 	// See also ::InitiateMultiply
-	newItem->contextOfICC.keyLife = (contextOfICC.keyLife > 0 ? INT32_MAX - 1 : 0);
-	newItem->contextOfICC.savedCRC = (contextOfICC.keyLife == 0);
+	newItem->contextOfICC.keyLifeRemain = contextOfICC.keyLifeRemain;
+	newItem->contextOfICC.savedCRC = (contextOfICC.keyLifeRemain == 0);
 	// Derivation of the new session key is delayed until ULA accepted the multiplication, however.
 
 	newItem->tLastRecv = tLastRecv;	// inherit the time when the MULTIPLY packet was received

@@ -172,18 +172,26 @@ uint64_t LOCALAPI CalculateCookie(const void *header, int sizeHdr, timestamp_t t
 		GCM_AES_SetKey(& cookieContext.ctx, st, COOKIE_KEY_LEN);
 	}
 
-	BYTE tag[sizeof(uint64_t)];
+	GCM_AES_CTX *ctx;
+	uint64_t tag;
+	uint64_t nonce;
 	if((long long)(t0 - cookieContext.timeStamp) < INT_MAX)
 	{
-		cookieContext.timeSign = t0;
-		GCM_SecureHash(& cookieContext.ctx, cookieContext.timeStamp, m, sizeof(m), tag, sizeof(tag));
+		nonce = cookieContext.timeSign = t0;
+		ctx = &cookieContext.ctx;
 	}
 	else
 	{
-		prevCookieContext.timeSign = t0;
-		GCM_SecureHash(& prevCookieContext.ctx, prevCookieContext.timeStamp, m, sizeof(m), tag, sizeof(tag));
+		nonce = prevCookieContext.timeSign = t0;
+		ctx = &prevCookieContext.ctx;
 	}
-	return *(uint64_t *)tag;
+	GCM_AES_AuthenticatedEncrypt(ctx, nonce
+		, NULL, 0,
+		(const uint64_t *)m, sizeof(m)
+		, NULL
+		, (octet *)& tag, sizeof(tag));
+
+	return tag;
 }
 
 
@@ -206,7 +214,7 @@ void CSocketItemEx::InstallEphemeralKey()
 	DumpNetworkUInt16((uint16_t *)  & pControlBlock->connectParams, FSP_MAX_KEY_SIZE / 2);
 #endif
 	GCM_AES_SetSalt(&contextOfICC.curr.gcm_aes, pControlBlock->connectParams.salt);
-	contextOfICC.keyLife = 0;
+	contextOfICC.keyLifeRemain = 0;
 	contextOfICC.curr.precomputedICC[0] 
 		=  CalculateCRC64(* (uint64_t *) & fidPair, (uint8_t *) & pControlBlock->connectParams, FSP_MAX_KEY_SIZE);
 
@@ -233,7 +241,7 @@ void CSocketItemEx::InstallEphemeralKey()
 //	The key length and the first sequence number exploiting the new session key at the receive side next
 //	are designated in the control block while the key life and the first sequence number exploiting
 //	the new session key at the send side are given in the parameter
-// See @DLL::InstallKey
+// See @DLL::InstallRawKey
 void CSocketItemEx::InstallSessionKey(const CommandInstallKey & cmd)
 {
 #if defined(TRACE) && (TRACE & (TRACE_SLIDEWIN | TRACE_ULACALL))
@@ -243,8 +251,8 @@ void CSocketItemEx::InstallSessionKey(const CommandInstallKey & cmd)
 		, pControlBlock->sendWindowNextSN
 		, pControlBlock->sendBufferNextSN, pControlBlock->recvWindowNextSN
 		, cmd.nextSendSN, pControlBlock->connectParams.nextKey$initialSN);
-	printf("Key length: %d bytes\t", pControlBlock->connectParams.keyLength);
-	DumpHexical(& pControlBlock->connectParams, pControlBlock->connectParams.keyLength);
+	printf("Key length: %d bits\t", pControlBlock->connectParams.keyBits);
+	DumpHexical(& pControlBlock->connectParams, pControlBlock->connectParams.keyBits / 8);
 #endif
 #ifndef NDEBUG
 	contextOfICC._mac_ctx_protect_prolog[0]
@@ -253,20 +261,29 @@ void CSocketItemEx::InstallSessionKey(const CommandInstallKey & cmd)
 		= contextOfICC._mac_ctx_protect_epilog[1]
 		= MAC_CTX_PROTECT_SIGN;
 #endif
-	contextOfICC.savedCRC = (contextOfICC.keyLife == 0);
+	contextOfICC.savedCRC = (contextOfICC.keyLifeRemain == 0);
 	contextOfICC.prev = contextOfICC.curr;
 	contextOfICC.noEncrypt = (pControlBlock->noEncrypt != 0);
+
+	int n = pControlBlock->connectParams.keyBits / 8;
 	if (contextOfICC.noEncrypt)
 	{
-		contextOfICC.curr.keyLength = pControlBlock->connectParams.keyLength;
-		memcpy(contextOfICC.curr.rawKey, & pControlBlock->connectParams, contextOfICC.curr.keyLength);
+		if (n > sizeof(contextOfICC.curr.rawKey))
+			n = sizeof(contextOfICC.curr.rawKey);
+		contextOfICC.curr.keyLength = n;
+		memcpy(contextOfICC.curr.rawKey, &pControlBlock->connectParams, n);
 	}
 	else
 	{
-		GCM_AES_SetKey(&contextOfICC.curr.gcm_aes, (uint8_t *)& pControlBlock->connectParams, pControlBlock->connectParams.keyLength);
+		int k = (n > FSP_MIN_KEY_SIZE ? FSP_MAX_KEY_SIZE : FSP_MIN_KEY_SIZE);
+		octet extractedKey[FSP_MAX_KEY_SIZE];
+		if (n > sizeof(SConnectParam))
+			n = sizeof(SConnectParam);
+		blake2b(extractedKey, k, NULL, 0, &pControlBlock->connectParams, n);
+		GCM_AES_SetKey(&contextOfICC.curr.gcm_aes, extractedKey, k);
 	}
 
-	contextOfICC.keyLife = cmd.keyLife;
+	contextOfICC.keyLifeRemain = cmd.keyLife;
 	contextOfICC.snFirstSendWithCurrKey = cmd.nextSendSN;
 	contextOfICC.snFirstRecvWithCurrKey	= pControlBlock->connectParams.nextKey$initialSN;
 }
@@ -278,57 +295,60 @@ void CSocketItemEx::InstallSessionKey(const CommandInstallKey & cmd)
 //	ControlBlock::seq_t ackSN		The sequence number of the responder's PERSIST packet
 //	ALFID_T idInitiator				The initiator's NEW ALFID
 //	ALFID_T idResponder				The responder's original ALFID (the parent ALFID)
-// Set the session key for the packet next sent and the next received. KDF counter mode
-// As the NIST SP800-108 recommended, K(i) = PRF(K, [i] || Label || 0x00 || Context || L)
-// Psuedo-Random-Function is GCM_SecureHash, with the nonce set to sn1 concated with ackSN (sn1 || ackSN)
-// Label  ¨C A string that identifies the purpose for the derived keying material, here we set to "Multiply an FSP connection"
-// Context - idInitiator, idResponder
-// Length -  An integer specifying the length (in bits) of the derived keying material K-output
-// Assume other fields of contextOfICC have been filled properly, especially contextOfICC.prev = contextOfICC.curr
-// A 4-octet (32-bit) salt generation is hard-coded. See also GCM_AES_SetKey
+// Do
+//  Set the session key for the packet next sent and the next received. 
+//	K[i] = PRF(K, [i] || Label || 0x00 || Context || L)
+//	[i]		- Index. It is the KDF counter mode as the NIST SP800-108 (not the feedback mode in RFC5869)
+//	Label	¨C A string that identifies the purpose for the derived keying material,
+//	          here we set to "Multiply an FSP connection"
+//	Context	- ackSN, sn1, idInitiator, idResponder
+//	Length	- An integer specifying the length (in bits) of the derived keying material K-output
+// Remark
+//	Assume other fields of contextOfICC have been filled properly,
+//	especially contextOfICC.prev = contextOfICC.curr
+//  Assume internal of SConnectParam is properly padded so that 
+//	It is a bad idea to access internal round key of AES (to utilize blake2b)!
 void LOCALAPI CSocketItemEx::DeriveNextKey(ControlBlock::seq_t sn1, ControlBlock::seq_t ackSN, ALFID_T idInitiator, ALFID_T idResponder)
 {
-	register uint8_t *keyBuffer = (uint8_t *)& pControlBlock->connectParams;
-	register int L = pControlBlock->connectParams.keyLength + 4;
-	uint64_t nonce = htobe64(((uint64_t)sn1 << 32) + ackSN);
+	octet *keyBuffer = (octet *)& pControlBlock->connectParams;
+	int L = pControlBlock->connectParams.keyBits;
 	// hard coded, as specified by the protocol
+	const int PLEN = 48;
 	ALIGN(8)
-	uint8_t paddedData[40];
+	octet paddedData[48];
+	paddedData[0] = 1;
 	memcpy(paddedData + 1, "Multiply an FSP connection", 26); // works in multi-byte character set/ASCII encoding source only
 	paddedData[27] = 0;
+	*(uint32_t *)(paddedData + 28) = (uint32_t)ackSN;
+	*(uint32_t *)(paddedData + 32) = (uint32_t)sn1;
 	// ALFIDs were transmitted in neutral byte order, actually
-	*(uint32_t *)(paddedData + 28) = idInitiator;
-	*(uint32_t *)(paddedData + 32) = idResponder;
-	*(uint32_t *)(paddedData + 36) = htobe32(L * 8);
-
-	// The first 128 bits
-	paddedData[0] = 1;
-	GCM_SecureHash(& contextOfICC.prev.gcm_aes
-		, nonce
-		, paddedData, sizeof(paddedData)
-		, keyBuffer, 16);
-	// the second 128-bits
-	// or the salt as specified in RFC4543
-	paddedData[0] = 2;
-	GCM_SecureHash(& contextOfICC.prev.gcm_aes
-		, nonce
-		, paddedData, sizeof(paddedData)
-		, keyBuffer + 16, 16);
-	if (L <= 32)
-		goto l_return;
-	// for generation of salt if the length of the key is 256 bits
-	paddedData[0] = 3;
-	GCM_SecureHash(&contextOfICC.prev.gcm_aes
-		, nonce
-		, paddedData, sizeof(paddedData)
-		, keyBuffer + 32, 16);
+	*(uint32_t *)(paddedData + 36) = idInitiator;
+	*(uint32_t *)(paddedData + 40) = idResponder;
+	*(uint32_t *)(paddedData + 44) = htobe32(L);
 	//
-l_return:
+	if (contextOfICC.noEncrypt)
+	{
 #ifndef NDEBUG
-	if (L != 20 && L != 36)
+		if (L % 8 != 0)
+			throw - EDOM;	// unsupported key length, there must be protocol incoherency
+#endif
+		blake2b(keyBuffer, L / 8, contextOfICC.prev.rawKey, contextOfICC.prev.keyLength, paddedData, PLEN);
+		return;
+	}
+#ifndef NDEBUG
+	if (L != 128 && L != 256)
 		throw - EDOM;	// unsupported key length, there must be protocol incoherency
 #endif
-	GCM_AES_SetKey(& contextOfICC.curr.gcm_aes, keyBuffer, L);
+	blake2b(keyBuffer, 16, &contextOfICC.prev.gcm_aes.H, 16, paddedData, PLEN);
+	paddedData[0] = 2;
+	//	A 4-octet (32-bit) salt generation is hard-coded. See also GCM_AES_SetKey
+	blake2b(keyBuffer + 4, 4, &contextOfICC.prev.gcm_aes.H, 16, paddedData, PLEN);
+	if (L == 256)
+	{
+		paddedData[0] = 3;
+		blake2b(keyBuffer + 20, 16, &contextOfICC.prev.gcm_aes.H, 16, paddedData, PLEN);
+	}
+	GCM_AES_SetKey(&contextOfICC.curr.gcm_aes, keyBuffer, L / 8 + 4);
 }
 
 
@@ -406,7 +426,7 @@ void * LOCALAPI CSocketItemEx::SetIntegrityCheckCode(FSP_NormalPacketHeader *p1,
 
 	void * buf = content;
 	// CRC64
-	if(contextOfICC.keyLife == 0)
+	if(contextOfICC.keyLifeRemain == 0)
 	{
 		p1->integrity.code = contextOfICC.curr.precomputedICC[0];
 		p1->integrity.code = CalculateCRC64(0, (uint8_t *)p1, byteA);
@@ -485,7 +505,7 @@ bool LOCALAPI CSocketItemEx::ValidateICC(FSP_NormalPacketHeader *p1, int32_t ctL
 	uint32_t seqNo = be32toh(p1->sequenceNo);
 	register bool r;
 	// CRC64
-	if(contextOfICC.keyLife == 0)
+	if(contextOfICC.keyLifeRemain == 0)
 	{
 		// CRC64 is the initial integrity check algorithm
 		p1->integrity.code = contextOfICC.curr.precomputedICC[1];
@@ -649,17 +669,20 @@ int CSocketItemEx::EmitWithICC(ControlBlock::PFSP_SocketBuf skb, ControlBlock::s
 		return -EDOM;
 	}
 #endif
-	if(contextOfICC.keyLife == 1)
-	{
-#ifdef TRACE
-		printf_s("\nSession#%u key run out of life\n", fidPair.source);
-#endif
-		return -EACCES;
+	if(contextOfICC.keyLifeRemain > 0)
+	{ 
+		int m = sizeof(FSP_NormalPacketHeader) + skb->len;
+		if(contextOfICC.keyLifeRemain < m)
+		{
+	#ifdef TRACE
+			printf_s("\nSession#%u key run out of life\n", fidPair.source);
+	#endif
+			return -EACCES;
+		}
+		contextOfICC.keyLifeRemain -= m;
+		if (contextOfICC.keyLifeRemain == 0)
+			contextOfICC.keyLifeRemain = 1;	// As a sentinel
 	}
-
-	// UNRESOLVED! retransmission consume key life? of course?
-	if(contextOfICC.keyLife > 0)
-		contextOfICC.keyLife--;
 
 	void  *payload = (FSP_NormalPacketHeader *)this->GetSendPtr(skb);
 	if(payload == NULL)

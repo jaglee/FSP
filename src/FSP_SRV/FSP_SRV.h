@@ -247,8 +247,7 @@ struct ICC_Context
 #ifndef NDEBUG
 	uint64_t	_mac_ctx_protect_epilog[2];
 #endif
-	// Only life of current ICC key is cared about 
-	int32_t		keyLife;
+	uint64_t	keyLifeRemain;	// in terms of number of octets that could be encrypted
 	// Previous key is applied for CRC only
 	bool		savedCRC;
 	bool		noEncrypt;

@@ -306,7 +306,7 @@ public:
 	}
 	CSocketItemDl * LOCALAPI CallCreate(CommandNewSession &, FSP_ServiceCode);
 
-	int LOCALAPI InstallKey(BYTE *, int, int32_t);
+	int LOCALAPI InstallRawKey(octet *, int32_t, uint64_t);
 
 	int32_t LOCALAPI AcquireSendBuf();
 	int32_t LOCALAPI SendInplace(void *, int32_t, bool);
