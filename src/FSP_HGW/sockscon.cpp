@@ -1,18 +1,45 @@
-/**
-  FSP http accelerator, SOCKS gateway and tunnel server
+/*
+ * Implement the SOCKSv4 interface of FSP http accelerator, SOCKS gateway and tunnel server
+ *
+    Copyright (c) 2017, Jason Gao
+    All rights reserved.
 
-	Client to SOCKS server:
+    Redistribution and use in source and binary forms, with or without modification,
+    are permitted provided that the following conditions are met:
 
+    - Redistributions of source code must retain the above copyright notice,
+      this list of conditions and the following disclaimer.
+
+    - Redistributions in binary form must reproduce the above copyright notice,
+      this list of conditions and the following disclaimer in the documentation
+	  and/or other materials provided with the distribution.
+
+    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+    AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+    IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+    ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+    LIABLE FOR ANY DIRECT, INDIRECT,INCIDENTAL, SPECIAL, EXEMPLARY, OR
+    CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+    SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+    INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+    CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+    ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+    POSSIBILITY OF SUCH DAMAGE.
+ */
+
+ /*
+  * SOCKS4 protocol, Client to SOCKS server:
+  *
 	field 1: SOCKS version number, 1 byte, must be 0x04 for this version
 	field 2: command code, 1 byte:
-	0x01 = establish a TCP/IP stream connection
-	0x02 = establish a TCP/IP port binding
+		0x01 = establish a TCP/IP stream connection
+		0x02 = establish a TCP/IP port binding
 	field 3: port number, 2 bytes
 	field 4: IPv4 address, 4 bytes
 	field 5: the user ID string, variable length, terminated with a null (0x00)
-
-	Server to SOCKS client:
-
+ *
+ *	Server to SOCKS client:
+ *
 	field 1: null byte
 	field 2: status, 1 byte:
 		0x5A = request granted
@@ -22,18 +49,23 @@
 	field 3: 2 bytes (should better be zero)
 	field 4: 4 bytes (should better be zero)
 
-  Process
-	### IPv4: check ruleset
-	   white-list: direct FSP/IPv6 access (TCP/IPv4->FSP/IPv6, transmit via SOCKS)
-	   {TODO: download the whitelist}
-	   { /// UNRESOLVED! As a transit method:
-	   if not in white-list, try search PTR, [DnsQuery], if get the _FSP exception-list: direct connect
-	   }
-	   not in the white-list: FSP-relay
+ */
 
-  Further streaming:
-    transparent HTTP acceleration!
-  */
+/*
+ *
+ *	TODO: download the whitelist
+ *
+	Process
+	### IPv4: check ruleset
+	white - list : direct FSP / IPv6 access(TCP / IPv4->FSP / IPv6, transmit via SOCKS)
+	not in the white - list: FSP - relay
+	{ /// UNRESOLVED! As a transit method:
+	if not in white - list, try search PTR, [DnsQuery], if get the _FSP exception - list: direct connect
+	}
+	Further streaming :
+	transparent HTTP acceleration!
+ */
+
 #include <stdio.h>
 #include <ctype.h>
 #include <string.h>
@@ -46,20 +78,19 @@
 
 #include "defs.h"
 
-// If compiled in Debug mode with the '_DEBUG' macro predefined by default, it tests FSP over UDP/IPv4
-// If compiled in Release mode, or anyway without the '_DEBUG' macro predefined, it tests FSP over IPv6
-#ifdef _DEBUG
-#define REMOTE_APPLAYER_NAME "localhost:80"
-// #define REMOTE_APPLAYER_NAME "192.168.9.125:80"
-// #define REMOTE_APPLAYER_NAME "lt-x61t:80"
-// #define REMOTE_APPLAYER_NAME "lt-at4:80"
-// #define REMOTE_APPLAYER_NAME "lt-ux31e:80"
-#else
-# define REMOTE_APPLAYER_NAME "E000:AAAA::1"
-#endif
 
+// Storage of private key SHOULD be allocated with random address layout
 static unsigned char bufPrivateKey[CRYPTO_NACL_KEYBYTES];
+
+// Request string towards the remote tunnel server
+static char tunnelRequest[80];
+
+// FSP handle of the master connection that the client side, which accept the SOCKS4 service request,
+// made towards the tunnel server. It is the client in the sense that it made tunnel service request
 static FSPHANDLE hClientMaster;
+
+// TCP socket to listen for SOCKSv4 service request
+static SOCKET hListener;
 
 // shared by master connection and child connection
 static void FSPAPI onError(FSPHANDLE, FSP_ServiceCode, int);
@@ -67,10 +98,11 @@ static void FSPAPI onError(FSPHANDLE, FSP_ServiceCode, int);
 // for master connection
 static int	FSPAPI onConnected(FSPHANDLE, PFSP_Context);
 static void FSPAPI onPublicKeySent(FSPHANDLE, FSP_ServiceCode, int);
+static void FSPAPI onRequestSent(FSPHANDLE, FSP_ServiceCode, int);
 static bool	FSPAPI onResponseReceived(FSPHANDLE, void *, int32_t, bool);
 
 // for child connection
-static void FSPAPI onMultiplyReturn(FSPHANDLE, FSP_ServiceCode, int);
+static void FSPAPI onSubrequestSent(FSPHANDLE, FSP_ServiceCode, int);
 
 
 //
@@ -126,8 +158,20 @@ VOID CALLBACK TpWorkCallBack(PTP_CALLBACK_INSTANCE, PVOID, PTP_WORK Work);
 
 
 
-void ToServeSOCKS(int port)
+// Given
+//	char *	Remote FSP application name such as 192.168.9.125:80 or www.lt-x61t.home.net
+//	int		The TCP port number on which the socket is listening for SOCKSv4 service request
+// Do
+//	Create a thread pool to service SOCKS request in a multi-threaded parallel fashion
+void ToServeSOCKS(char *nameAppLayer, int port)
 {
+	int len = sprintf_s(tunnelRequest, sizeof(tunnelRequest), "TUNNEL %s HTTP/1.0\r\n", nameAppLayer);
+	if(len < 0)
+	{
+		printf_s("Invalid name of remote tunnel server end-poine: %s\n", nameAppLayer);
+		return;
+	}
+
 	FSP_SocketParameter parms;
 	memset(& parms, 0, sizeof(parms));
 	parms.onAccepting = NULL;
@@ -135,16 +179,18 @@ void ToServeSOCKS(int port)
 	parms.onError = onError;
 	parms.recvSize = MAX_FSP_SHM_SIZE/2;
 	parms.sendSize = MAX_FSP_SHM_SIZE/2;
-	hClientMaster = Connect2(REMOTE_APPLAYER_NAME, & parms);
+	hClientMaster = Connect2(nameAppLayer, & parms);
 	if(hClientMaster == NULL)
 	{
-		printf_s("Failed to initialize the connection in the very beginning\n");
+		printf_s("Failed to initialize the FSP connection towards the tunnel server\n");
 		return;
 	}
 	//
-
 	if(! requestPool.Init(MAX_WORKING_THREADS))
-		return;
+	{
+		printf_s("Failed to allocate tunnel service request pool\n");
+		goto l_bailout;
+	}
 
     PTP_POOL pool = NULL;
     TP_CALLBACK_ENVIRON envCallBack;
@@ -159,7 +205,7 @@ void ToServeSOCKS(int port)
 	if (pool == NULL)
 	{
 		printf_s("CreateThreadpool failed. LastError: %u\n", GetLastError());
-		return;
+		goto l_bailout;
 	}
 
     SetThreadpoolThreadMaximum(pool, MAX_WORKING_THREADS);
@@ -202,7 +248,7 @@ void ToServeSOCKS(int port)
 		goto l_bailout4;
 	}
 
-	SOCKET hListener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	hListener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 	if(hListener == SOCKET_ERROR)
 	{
         printf_s("socket() failed with error: %d\n", WSAGetLastError() );
@@ -229,6 +275,7 @@ void ToServeSOCKS(int port)
 		goto l_bailout6;
     }
 
+	printf_s("Ready to serve SOCKSv4 request at %s:%d\n", inet_ntoa(localEnd.sin_addr), be16toh(localEnd.sin_port));
 	do
 	{
 		int iClientSize = sizeof(sockaddr_in);
@@ -268,6 +315,8 @@ l_bailout4:
 	CloseThreadpoolCleanupGroup(cleanupgroup);
 l_bailout1:
     CloseThreadpool(pool);
+l_bailout:
+	Dispose(hClientMaster);
 }
 
 
@@ -314,6 +363,14 @@ TpWorkCallBack(PTP_CALLBACK_INSTANCE Instance, PVOID parameter, PTP_WORK Work)
 		return;
 	}
 
+#ifndef NDEBUG
+	printf_s("Version %d, command code %d, target at %s:%d\n"
+		, req.version
+		, req.cmd
+		, inet_ntoa(req.inet4Addr)
+		, be16toh(req.nboPort));
+#endif
+
 	printf_s("Skipped user Id: ");
 	char c;
 	do
@@ -345,8 +402,8 @@ TpWorkCallBack(PTP_CALLBACK_INSTANCE Instance, PVOID parameter, PTP_WORK Work)
 	parms.welcome = &p->req;
 	parms.len = (unsigned short)sizeof(p->req);
 	parms.signatureULA = (ulong_ptr)p;
-
-	FSPHANDLE h = MultiplyAndWrite(hClientMaster, & parms, TO_END_TRANSACTION, onMultiplyReturn);
+	//^For 
+	FSPHANDLE h = MultiplyAndWrite(hClientMaster, & parms, TO_END_TRANSACTION, onSubrequestSent);
 	if(h == NULL)
 	{
 		requestPool.FreeItem(p);
@@ -376,6 +433,12 @@ void ReportErrorToClient(SOCKET client, ERepCode code)
 
 
 
+// Given
+//	SOCKET	the handle of the TCP socket that connected to the SOCKS client
+//	bool	forceful
+//			true if to force shutdown without waiting for receive buffer emptied
+// Do
+//	Shutdown the connection to the SOCKS client gracefully if forceful is false
 void CloseClient(SOCKET client, bool forceful)
 {
 	int r = forceful ? 1 : 0;
@@ -407,8 +470,9 @@ static void FSPAPI onError(FSPHANDLE h, FSP_ServiceCode code, int value)
 #endif
 	if(h == hClientMaster)
 	{
+		printf_s("Fatal IPC %d, error %d encountered in the session with the tunnel server.\n", code, value);
 		Dispose(h);
-		hClientMaster = NULL;
+		closesocket(hListener);
 	}
 	return;
 }
@@ -450,7 +514,7 @@ static int	FSPAPI  onConnected(FSPHANDLE h, PFSP_Context ctx)
 	printf_s("\tTo install the shared key instantly...\n");
 #endif
 	CryptoNaClGetSharedSecret(bufSharedKey, bufPeersKey, bufPrivateKey);
-	InstallMasterKey(h, bufSharedKey, CRYPTO_NACL_KEYBYTES * 8, INT32_MAX);
+	InstallMasterKey(h, bufSharedKey, CRYPTO_NACL_KEYBYTES);
 
 	return 0;
 }
@@ -468,7 +532,16 @@ static void FSPAPI onPublicKeySent(FSPHANDLE h, FSP_ServiceCode c, int r)
 		return;
 	}
 
-	// TODO: client's side authentication & authorization
+	printf_s("To send tunnel request towards the tunnel server (the remote tunnel end):\n");
+	puts(tunnelRequest);
+	WriteTo(h, tunnelRequest, strlen(tunnelRequest), TO_END_TRANSACTION, onRequestSent);
+}
+
+
+
+// TODO: client's side authentication & authorization
+static void FSPAPI onRequestSent(FSPHANDLE h, FSP_ServiceCode c, int r)
+{
 	if(RecvInline(h, onResponseReceived) < 0)
 	{
 		Dispose(h);
@@ -498,31 +571,7 @@ static bool FSPAPI onResponseReceived(FSPHANDLE h, void * buf, int32_t len, bool
 
 
 
-void MakeInet4TunnelRequest(SOCKET client, PRequestResponse req)
-{
-	PRequestPoolItem p = requestPool.AllocItem();
-	p->hSocket = client;
-	memcpy(&p->req, req, sizeof(req));
-
-	FSP_SocketParameter parms;
-	memset(& parms, 0, sizeof(parms));
-	parms.onAccepting = NULL;
-	parms.onAccepted = NULL;
-	parms.onError = onError;
-	parms.recvSize = 0;	// the underlying service would give the minimum, however
-	parms.sendSize = MAX_FSP_SHM_SIZE;	// 4MB
-	parms.welcome = &p->req;
-	parms.len = (unsigned short)sizeof(p->req);
-	parms.signatureULA = (ulong_ptr)p;
-
-	FSPHANDLE h = MultiplyAndWrite(hClientMaster, & parms, TO_END_TRANSACTION, onMultiplyReturn);
-	if(h == NULL)
-		ReportErrorToClient(client, REP_REJECTED);
-}
-
-
-
-static void FSPAPI onMultiplyReturn(FSPHANDLE h, FSP_ServiceCode c, int value)
+static void FSPAPI onSubrequestSent(FSPHANDLE h, FSP_ServiceCode c, int value)
 {
 	PRequestPoolItem p;
 	FSPControl(h, FSP_GET_EXT_POINTER, (ulong_ptr) & p);

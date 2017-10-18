@@ -259,8 +259,7 @@ FSPHANDLE FSPAPI MultiplyAndGetSendBuffer(FSPHANDLE, PFSP_Context, CallbackBuffe
 // given
 //	the handle of the FSP socket to install the master key
 //	the buffer of the key
-//	the length of the key in bits
-//	the life of the key in terms of number of octets allowed to send or resend
+//	the length of the key in bytes
 // return
 //	0 if no error
 //	-EDOM	if parameter domain error
@@ -268,7 +267,7 @@ FSPHANDLE FSPAPI MultiplyAndGetSendBuffer(FSPHANDLE, PFSP_Context, CallbackBuffe
 //	-EINTR	if cannot obtain the right lock
 //	-EIO	if cannot trigger LLS to do the installation work through I/O
 DllSpec
-int FSPAPI InstallMasterKey(FSPHANDLE, octet *, int32_t, uint64_t);
+int FSPAPI InstallMasterKey(FSPHANDLE, octet *, int32_t);
 
 
 

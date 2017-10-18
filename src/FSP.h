@@ -67,6 +67,17 @@ typedef ALFID_T	 ULTID_T;
 
 #define MAX_PHY_INTERFACES	4	// maximum number of physical interfaces that might be multihomed
 
+//	As recommmended in NIST SP800-38d, if maximum combined length of the ciphertext and AAD in a single packet
+//	is 2^15 octets, maximum invocations of authenticated decryption function shall be limited to 2^32
+//	if a single packet size limit is 2^17, invocations shall be limited to 2^29 for 64 bit tags
+//	As an FSP packet may not exceed 2^16 octets, and because out-of-band packet consume invocation space as well
+//	we infer that maximum sequence number consumed on either direction shall be limit to 2^29
+#ifndef NDEBUG
+#define FSP_REKEY_THRESHOLD	3
+#else
+#define FSP_REKEY_THRESHOLD	0x20000000U
+#endif
+
 /**
   error number may appear as REJECT packet 'reason code' where it is unsigned or near-end API return value where it is negative
   standard C	FSP error meaning

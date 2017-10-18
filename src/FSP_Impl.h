@@ -219,6 +219,7 @@ struct CommandInstallKey : CommandToLLS
 {
 	uint32_t	nextSendSN;	// ControlBlock::seq_t
 	uint64_t	keyLife;
+	octet		ikm[400];	// it is hard-coded to 400 bytes, i.e. 2400 bits
 	CommandInstallKey(uint32_t seq1, uint64_t v) { nextSendSN = seq1; keyLife = v; }
 };
 

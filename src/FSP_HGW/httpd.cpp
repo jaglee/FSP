@@ -1,6 +1,30 @@
 /*
- * Simple HTTP 1.0 server over FSP version 0
- * Migrated by Jason Gao <jagao@outlook.com>
+ * Simple HTTP 1.0 server over FSP version 0. SOCKS gateway and tunnel server as well
+ *
+    Copyright (c) 2017, Jason Gao
+    All rights reserved.
+
+    Redistribution and use in source and binary forms, with or without modification,
+    are permitted provided that the following conditions are met:
+
+    - Redistributions of source code must retain the above copyright notice,
+      this list of conditions and the following disclaimer.
+
+    - Redistributions in binary form must reproduce the above copyright notice,
+      this list of conditions and the following disclaimer in the documentation
+	  and/or other materials provided with the distribution.
+
+    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+    AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+    IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+    ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+    LIABLE FOR ANY DIRECT, INDIRECT,INCIDENTAL, SPECIAL, EXEMPLARY, OR
+    CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+    SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+    INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+    CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+    ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+    POSSIBILITY OF SUCH DAMAGE.
  */
 
 #include <stdio.h>
@@ -42,28 +66,60 @@ struct LineBuffer
 static unsigned char	bufPrivateKey[CRYPTO_NACL_KEYBYTES];
 static unsigned char *  bufPublicKey;
 
+// The FSP handle that listens for tunnel service request
 static FSPHANDLE hListener; 
 static bool finished;
 static char DEFAULT_ROOT[MAX_PATH];
 
-void StartHTTPoverFSP();
-
 static int	FSPAPI onAccepted(FSPHANDLE, PFSP_Context);
-static void FSPAPI onNotice(FSPHANDLE h, FSP_ServiceCode code, int value);
-static void FSPAPI onFinished(FSPHANDLE h, FSP_ServiceCode code, int value);
+static void FSPAPI onNotice(FSPHANDLE, FSP_ServiceCode, int);
+static void FSPAPI onFinished(FSPHANDLE, FSP_ServiceCode, int);
 
 static void FSPAPI onPublicKeyReceived(FSPHANDLE, FSP_ServiceCode, int);
-static void MasterService(FSPHANDLE);
-
+static void FSPAPI onFirstLineRead(FSPHANDLE, FSP_ServiceCode, int);
 static void FSPAPI onFurtherTunnelRequest(FSPHANDLE, FSP_ServiceCode, int);
 
+// Forward declaration of the default toplevel function of the
+// HTTP server 1.0 over FSP version 0 AND tunnel server
+void	StartHTTPoverFSP();
+
+// Forward declaration of the toplevel function that implements service interface for SOCKS gateway
+void	ToServeSOCKS(char *, int);
+
+// Given
+//	const *		the error message meant to be put on system console (and should be logged)
+// Do
+//	Exit the program abruptly for some fatal reason
 void	Abort(const char *);
 
-void	ToServeSOCKS(int);
-
+// Given
+//	FSPHANDLE		The handle of the FSP connection that was made towards the browser
+//					that supports HTTP over FSP, or the tunnel service client
+//	const char *	path of the executable
+//	const char *	invoke HTTP method of the executable. 'GET' or 'POST' only for this version
+//	const char *	the query string in the original URL that was meant to pass to the executable
+// Do
+//	Execute the CGI executable that subjected to *FCGI* management
 void	execute_cgi(FSPHANDLE, const char *, const char *, const char *);
 
+// Given
+//	FSPHANDLE	The handle of the FSP connection that was made towards the browser
+//	char *		The buffer to hold the request line
+//	int			The capacity of the buffer which should be more than 80, less than 32767
+// Return
+//	Non-negative:	number of octets read,
+//	Negative:		the error number
+// Remark
+//	Request byte stream is further buffered internally
 int		ReadLine(FSPHANDLE, char *, int);
+
+// Given
+//	FSPHANDLE		The handle of the FSP connection that was made towards the browser
+//	const char *	the name of the file whose content is meant to be sent to the browser
+// Do
+//	Read the content of file and send the binary stream to the remote end
+// Remark
+//	For this version assume only the html content type is supported
 void	SendRegFile(FSPHANDLE, const char *);
 
 
@@ -91,32 +147,31 @@ inline void FreeExtent(FSPHANDLE h)
 // The port number could be configured on the command line only.
 // If the command line specifies the port number, it could only be a local SOCKS4a server
 // If the command line specifies the local web root, it is the remote end point of the tunnel
-// The DNS server list is built in
-
 int main(int argc, char *argv[])
 {
 	if(argc <= 1)
 	{
 		printf_s("To serve SOCKS v4 request at port %d\n", DEFAULT_SOCKS_PORT);
-		ToServeSOCKS(DEFAULT_SOCKS_PORT);
+		ToServeSOCKS("localhost:80", DEFAULT_SOCKS_PORT);
 	}
 	else if (strcmp(argv[1], "-p") == 0)
 	{
-		if (argc != 3)
+		if(argc != 3 && argc != 4)
 		{
-			printf_s("Usage[as a SOCKS server]: %s [-p <port number>]\n", argv[0]);
-			return -1;
+			printf_s("Usage: %s -p <port number> [remote fsp app-name, e.g. 192.168.9.125:80]", argv[0]);
+			return -2;
 		}
 
 		int port = atoi(argv[2]);
-		if (port == 0 || port > USHRT_MAX || argc > 3)
+		if (port == 0 || port > USHRT_MAX)
 		{
 			printf_s("Port number should be a value between 1 and %d\n", USHRT_MAX);
 			return -1;
 		}
 
+		char *nameAppLayer = (argc == 4 ? argv[3] : "localhost:80");
 		printf_s("To serve SOCKS v4 request at port %d\n", port);
-		ToServeSOCKS(port);
+		ToServeSOCKS(nameAppLayer, port);
 	}
 	else if (strcmp(argv[1], "-d") == 0)
 	{
@@ -141,7 +196,7 @@ int main(int argc, char *argv[])
 	}
 	else
 	{
-		printf_s("Usage: %s [-p <port number>] | -d <web root directory>\n", argv[0]);
+		printf_s("Usage: %s [-p <port number> [remote fsp url]] | -d <web root directory>\n", argv[0]);
 		return -2;
 	}
 
@@ -152,6 +207,7 @@ int main(int argc, char *argv[])
 
 
 
+// HTTP 1.0 over FSP version 0 with 'TUNNEL' extension
 void StartHTTPoverFSP()
 {
 	FSP_SocketParameter params;
@@ -222,9 +278,10 @@ static void FSPAPI onFinished(FSPHANDLE h, FSP_ServiceCode code, int value)
 }
 
 
+
 static int	FSPAPI onAccepted(FSPHANDLE client, PFSP_Context ctx)
 {
-	printf_s("\noTiny http 1.0\nAccepted: handle of FSP session is %p\n", client);
+	printf_s("\nAccepted: handle of FSP session is %p\n", client);
 
 	void *bufPeerPublicKey = malloc(CRYPTO_NACL_KEYBYTES);
 	if(bufPeerPublicKey == NULL)
@@ -238,10 +295,6 @@ static int	FSPAPI onAccepted(FSPHANDLE client, PFSP_Context ctx)
 
 
 
-// Given
-//	FSPHANLDE	the handle of the connection to the client
-// Do
-//	Process the request
 static void FSPAPI onPublicKeyReceived(FSPHANDLE client, FSP_ServiceCode c, int r)
 {
 	unsigned char bufSharedKey[CRYPTO_NACL_KEYBYTES];
@@ -262,15 +315,33 @@ static void FSPAPI onPublicKeyReceived(FSPHANDLE client, FSP_ServiceCode c, int 
 #endif
 	CryptoNaClGetSharedSecret(bufSharedKey, bufPeerPublicKey, bufPrivateKey);
 	free(bufPeerPublicKey);
-	InstallMasterKey(client, bufSharedKey, CRYPTO_NACL_KEYBYTES * 8, INT32_MAX);
+	InstallMasterKey(client, bufSharedKey, CRYPTO_NACL_KEYBYTES);
 
-	MasterService(client);
+	LineBuffer *lineBuf = (LineBuffer *)malloc(sizeof(LineBuffer));
+	if(lineBuf == NULL)
+	{
+		printf_s("No enough memory");
+		Dispose(client);
+		return;
+	}
+
+	lineBuf->firstOffset = lineBuf->lastOffset = 0;
+	FSPControl(client, FSP_SET_EXT_POINTER, (ulong_ptr)lineBuf);
+
+	ReadFrom(client, lineBuf->buf, BUFFER_POOL_SIZE, onFirstLineRead); 
 }
 
 
 
-void MasterService(FSPHANDLE client)
+// Service the HTTP request, after authentication and get first request line.
+// Given
+//	FSPHANLDE	the handle of the connection to the client
+// Do
+//	Process the request
+static void FSPAPI onFirstLineRead(FSPHANDLE client, FSP_ServiceCode c, int r)
 {
+	printf_s("First request line ready for %p\n", client);
+
 	char buf[1024];
 	char method[255];
 	char url[255];
@@ -282,6 +353,11 @@ void MasterService(FSPHANDLE client)
 	char *query_string = NULL;
 
 	int numchars = ReadLine(client, buf, sizeof(buf));
+	if (numchars < 0)
+	{
+		printf_s("Cannot ReadLine in MasterService(), error number: %d\n", numchars);
+		return;
+	}
 	for(i = 0, j = 0; !isspace(buf[j]) && (i < sizeof(method) - 1); i++, j++)
 	{
 		method[i] = buf[j];
@@ -314,6 +390,8 @@ void MasterService(FSPHANDLE client)
 
 	if(tunnel)
 	{
+		printf_s("To serve tunnel request target at %s\n", url);
+		//
 		LineBuffer *lineBuf;
 		FSPControl(client, FSP_GET_EXT_POINTER, (ulong_ptr) & lineBuf);
 		//
@@ -379,39 +457,18 @@ void Abort(const char *sc)
 
 
 
-/**********************************************************************/
-/* Get a line from a socket, whether the line ends in a newline,
- * carriage return, or a CRLF combination.  Terminates the string read
- * with a null character.  If no newline indicator is found before the
- * end of the buffer, the string is terminated with a null.  If any of
- * the above three line terminators is read, the last character of the
- * string will be a linefeed and the string will be terminated with a
- * null character.
-/**********************************************************************/
-// 
-// 
-// Returns: the number of bytes stored (excluding nul)
-int ReadLine(FSPHANDLE sock, char *buf, int size)
+// Returns the number of bytes stored, excluding terminating zero
+int ReadLine(FSPHANDLE h, char *buf, int size)
 {
 	LineBuffer *lineBuf;
 	int i = 0;
 	char c = '\0';
 	int n;
 
-	FSPControl(sock, FSP_GET_EXT_POINTER, (ulong_ptr) & lineBuf);
+	FSPControl(h, FSP_GET_EXT_POINTER, (ulong_ptr) & lineBuf);
 	if(lineBuf == NULL)
-	{
-		lineBuf = (LineBuffer *)malloc(sizeof(LineBuffer));
-		if(lineBuf == NULL)
-		{
-			printf_s("No enough memory");
-			Dispose(sock);
-			return -1;
-		}
-		//
-		lineBuf->firstOffset = lineBuf->lastOffset = 0;
-		FSPControl(sock, FSP_SET_EXT_POINTER, (ulong_ptr)lineBuf);
-	}
+		return - EFAULT;
+
 	// double buffering
 	while ((i < size - 1) && (c != '\n'))
 	{
@@ -420,7 +477,7 @@ int ReadLine(FSPHANDLE sock, char *buf, int size)
 			if(lineBuf->lastOffset >= BUFFER_POOL_SIZE)
 				lineBuf->firstOffset = lineBuf->lastOffset = 0;
 			//
-			n = ReadFrom(sock, lineBuf->buf, BUFFER_POOL_SIZE - lineBuf->lastOffset, NULL);
+			n = ReadFrom(h, lineBuf->buf, BUFFER_POOL_SIZE - lineBuf->lastOffset, NULL);
 			if(n == 0)
 				return i;
 			if(n < 0)
@@ -507,6 +564,9 @@ static void FSPAPI onFurtherTunnelRequest(FSPHANDLE client, FSP_ServiceCode code
 {
 	LineBuffer *lineBuf;
 	FSPControl(client, FSP_GET_EXT_POINTER, (ulong_ptr) & lineBuf);
+
+	printf_s("To further server tunnel request target at %s\n", lineBuf->buf);
+
 	// TODO: parsing the line buffer, process further tunnel requests!
 	ReadFrom(client, lineBuf->buf, BUFFER_POOL_SIZE, onFurtherTunnelRequest);
 }
@@ -514,15 +574,18 @@ static void FSPAPI onFurtherTunnelRequest(FSPHANDLE client, FSP_ServiceCode code
 
 
 /**
-Future extensions:
-1.Cache and automatically compression (using lz4HC; automatically transport)
-  Use of program names for the identification of
-  encoding formats is not desirable and should be discouraged
-  for future encodings.Their use here is representative of
-  historical practice, not good design.
-2.Automatically utilizing content delivery network (alternate URL)
-  But
-3.Content transfer: application layer SHA256, or precomputed BLAKE2b checksum ?
-  For streamed content
-*/
+  Future extensions:
+	1.Cache and automatically compression (using lz4HC; automatically transport)
+	  Use of program names for the identification of
+	  encoding formats is not desirable and should be discouraged
+	  for future encodings.Their use here is representative of
+	  historical practice, not good design.
+	2.Automatically utilizing content delivery network (alternate URL)
+	  But
+	3.Content transfer: application layer SHA256, or precomputed BLAKE2b checksum ?
+	  For streamed content
+
+  The DNS server list is built in
+
+  */
  

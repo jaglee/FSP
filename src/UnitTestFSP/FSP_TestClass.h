@@ -63,9 +63,9 @@ public:
 	void InstallSessionKey(BYTE key[FSP_MIN_KEY_SIZE])
 	{
 		CommandInstallKey cmd(pControlBlock->sendBufferNextSN, INT32_MAX);
-		memcpy(& pControlBlock->connectParams, key, FSP_MIN_KEY_SIZE);
-		pControlBlock->connectParams.keyLength = FSP_MIN_KEY_SIZE;
-		pControlBlock->connectParams.nextKey$initialSN = pControlBlock->recvWindowNextSN;
+		memcpy(cmd.ikm, key, FSP_MIN_KEY_SIZE);
+		pControlBlock->connectParams.keyBits = FSP_MIN_KEY_SIZE * 8;
+		pControlBlock->SnapshotReceiveWindowRightEdge();
 		CSocketItemEx::InstallSessionKey(cmd);
 	}
 	void SetPairOfFiberID(ALFID_T src, ALFID_T dst) { fidPair.source = src; fidPair.peer = dst; }

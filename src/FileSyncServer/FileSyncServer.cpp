@@ -211,7 +211,7 @@ static void FSPAPI onPublicKeyReceived(FSPHANDLE h, FSP_ServiceCode c, int r)
 	CryptoNaClGetSharedSecret(bufSharedKey, bufPeerPublicKey, bufPrivateKey);
 
 	printf_s("\tTo install the negotiated shared key...\n");
-	InstallMasterKey(h, bufSharedKey, CRYPTO_NACL_KEYBYTES * 8, INT32_MAX);
+	InstallMasterKey(h, bufSharedKey, CRYPTO_NACL_KEYBYTES);
 
 	printf_s("\tTo send filename to the remote end...\n");
 #ifdef _MBCS

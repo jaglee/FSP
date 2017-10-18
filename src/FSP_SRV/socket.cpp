@@ -632,13 +632,8 @@ void CSocketItemEx::InitiateMultiply(CSocketItemEx *srcItem)
 	InitAssociation();
 	assert(fidPair.peer == srcItem->fidPair.peer);	// Set in InitAssociation
 
-	contextOfICC.keyLifeRemain = srcItem->contextOfICC.keyLifeRemain;
-	contextOfICC.savedCRC = (contextOfICC.keyLifeRemain == 0);
-	contextOfICC.prev = srcItem->contextOfICC.curr;
-	//
 	ControlBlock::seq_t seq0 = pControlBlock->sendWindowNextSN;	// See also @DLL::ToPrepareMultiply
-	contextOfICC.snFirstSendWithCurrKey = seq0 + 1;
-	// But the snFirstRecvWithCurrKey is unset until the first response packet is accepted.
+	contextOfICC.InheritS0(srcItem->contextOfICC, seq0);
 
 	// MULTIPLY can only be the very first packet
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend();
@@ -680,6 +675,7 @@ bool CSocketItemEx::FinalizeMultiply()
 {
 	ALFID_T idPeerParent = _InterlockedExchange((long *)&pControlBlock->peerAddr.ipFSP.fiberID, headPacket->fidPair.source);
 	contextOfICC.snFirstRecvWithCurrKey = headPacket->pktSeqNo;
+	//^See also ResponseToMultiply()
 	InitAssociation();	// reinitialize with new peer's ALFID
 	assert(fidPair.peer == headPacket->fidPair.source);
 #if defined(TRACE) && (TRACE & TRACE_PACKET)
@@ -689,7 +685,7 @@ bool CSocketItemEx::FinalizeMultiply()
 		, contextOfICC.snFirstSendWithCurrKey, contextOfICC.snFirstRecvWithCurrKey
 		, fidPair.source, idPeerParent);
 #endif
-	if (contextOfICC.savedCRC)
+	if (contextOfICC.keyLifeRemain == 0)
 		contextOfICC.curr = contextOfICC.prev;
 	else
 		DeriveNextKey(contextOfICC.snFirstSendWithCurrKey, contextOfICC.snFirstRecvWithCurrKey, fidPair.source, idPeerParent);
@@ -739,8 +735,8 @@ void CMultiplyBacklogItem::ResponseToMultiply()
 	pControlBlock->recvWindowNextPos++;
 	// The receive buffer is eventually ready
 
-	ALFID_T & idParent = pControlBlock->idParent;
 	// assume contextOfICC, including snFirstRecvWithCurrKey and snFirstSendWithCurrKey has been set properly
+	ALFID_T & idParent = pControlBlock->idParent;
 #if defined(TRACE) && (TRACE & TRACE_PACKET)
 	printf_s("\nTo acknowledge MULTIPLY/send a PERSIST in LLS, ICC context:\n"
 		"\trecv start SN = %09u, send start sn = %09u\n"
@@ -749,7 +745,7 @@ void CMultiplyBacklogItem::ResponseToMultiply()
 		, fidPair.peer, idParent);
 #endif
 	// note that the responder's key material mirrors the initiator's
-	if (contextOfICC.savedCRC)
+	if (contextOfICC.keyLifeRemain == 0)
 		contextOfICC.curr = contextOfICC.prev;
 	else
 		DeriveNextKey(contextOfICC.snFirstRecvWithCurrKey, contextOfICC.snFirstSendWithCurrKey, fidPair.peer, idParent);

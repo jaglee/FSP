@@ -386,9 +386,8 @@ void FlowTestRecvWinRoundRobin()
 	printf_s("Should return the first two blocks:\n"
 		"InquireRecvBuf#1, buf = %p, size = %d, eot = %d\n", buf, m, eot);
 
-	buf = pSCB->InquireRecvBuf(m, eot);
-	printf_s("Encounter a gap, should return the gap address, but size is 0:\n"
-		"InquireRecvBuf#2, buf = %p, size = %d, eot = %d\n", buf, m, eot);
+	if (m > 0)
+		pSCB->MarkReceivedFree(m);
 
 	skb = pSCB->AllocRecvBuf(FIRST_SN + 2);	// used to be free
 	assert(skb != NULL);
@@ -413,6 +412,9 @@ void FlowTestRecvWinRoundRobin()
 	printf_s("Should return the last two blocks:\n"
 		"InquireRecvBuf#3, buf = %p, size = %d, eot = %d\n", buf, m, eot);
 
+	if (m > 0)
+		pSCB->MarkReceivedFree(m);
+
 	skb = pSCB->AllocRecvBuf(FIRST_SN + 6);
 	skb->opCode = PURE_DATA;
 	skb->len = MAX_BLOCK_SIZE;
@@ -430,5 +432,7 @@ void FlowTestRecvWinRoundRobin()
 	printf_s("Should round-robin to the start, return the whole buffer space:\n"
 		"InquireRecvBuf, #4, buf = %p, size = %d, eot = %d\n", buf, m, eot);
 
+	if (m > 0)
+		pSCB->MarkReceivedFree(m);
 	//TODO: more test, now EOT should be taken into care of
 }

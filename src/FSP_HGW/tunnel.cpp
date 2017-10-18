@@ -1,7 +1,30 @@
-/**
+/*
+ * Implement the tunnel server role in FSP http accelerator, SOCKS gateway and tunnel server
+ *
+    Copyright (c) 2017, Jason Gao
+    All rights reserved.
 
-  FSP http accelerator, SOCKS gateway and tunnel server
+    Redistribution and use in source and binary forms, with or without modification,
+    are permitted provided that the following conditions are met:
 
+    - Redistributions of source code must retain the above copyright notice,
+      this list of conditions and the following disclaimer.
+
+    - Redistributions in binary form must reproduce the above copyright notice,
+      this list of conditions and the following disclaimer in the documentation
+	  and/or other materials provided with the distribution.
+
+    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+    AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+    IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+    ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+    LIABLE FOR ANY DIRECT, INDIRECT,INCIDENTAL, SPECIAL, EXEMPLARY, OR
+    CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+    SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+    INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+    CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+    ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+    POSSIBILITY OF SUCH DAMAGE.
  */
 
 #include <stdio.h>
@@ -19,11 +42,7 @@
 /**
   How does it work:
   Each tunnel client makes one master connection with the tunnel end-server
-	CONNECT server.example.com:80 HTTP/1.1
-	Host: server.example.com:80
-	Proxy-Authorization: basic aGVsbG86d29ybGQ=
--->
-	TUNNEL registered.fsp.tunnel.end.point:80 FSP/0\r\n
+	TUNNEL registered.fsp.tunnel.end.point:80 HTTP/1.0\r\n
 	[Authorization User Id\r\n]
 	\r\n
 
@@ -31,18 +50,11 @@
   But it MAY be chaining tunnel endpoint
 
   FSP tunnel request is directly passes via a clone connection
+  The response is sent back via the clone connection of course.
+
   The master connection is utilised to
   1.shutdown the clone connection gracefully
-  2.re-keying
-  3.accounting/report statistics
-
-  Inet4 tunnel request or domain name tunnel request is transported via the master connection
-  if failed to do domain name resolution,
-  failure reason is returned in the reverse stream of the master connection
-  if succeeded, domain name/target address: real network address, requested port number, 
-  together with bind address, bind port number is returned through a reverse multiplied connection
-
-  Tunnel requests might be sent in a batch transmit transaction (further optimization yet to implement).
+  2.accounting/report statistics
 
  */
 
@@ -157,17 +169,18 @@ static bool FSPAPI onRequestArrived(FSPHANDLE h, void *buf, int32_t len, bool eo
 	}
 
 	sockaddr_in remoteEnd;
-	SRequestResponse *req = (SRequestResponse *)buf;
-	remoteEnd.sin_addr = req->inet4Addr;
+	SRequestResponse *q = (SRequestResponse *)buf;
+	remoteEnd.sin_addr = q->inet4Addr;
 	remoteEnd.sin_family = AF_INET;
-	remoteEnd.sin_port = req->nboPort;
+	remoteEnd.sin_port = q->nboPort;
 
-	printf_s("Try to connect to %d.%d.%d.%d:%d\n"
-		, remoteEnd.sin_addr.S_un.S_un_b.s_b1
-		, remoteEnd.sin_addr.S_un.S_un_b.s_b2
-		, remoteEnd.sin_addr.S_un.S_un_b.s_b3
-		, remoteEnd.sin_addr.S_un.S_un_b.s_b4
-		, ntohs(remoteEnd.sin_port));
+#ifndef NDEBUG
+	printf_s("Version %d, command code %d, try to connect to %s:%d\n"
+		, q->version
+		, q->cmd
+		, inet_ntoa(q->inet4Addr)
+		, be16toh(q->nboPort));
+#endif
 
 	int r = connect(toServer, (PSOCKADDR) & remoteEnd, sizeof(remoteEnd)); 
 	if(r != 0)

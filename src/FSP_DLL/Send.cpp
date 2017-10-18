@@ -194,7 +194,8 @@ int LOCALAPI CSocketItemDl::SendInplace(void * buffer, int32_t len, bool eot)
 int LOCALAPI CSocketItemDl::SendStream(const void * buffer, int len, bool eot, bool toCompress)
 {
 #ifdef TRACE
-	printf_s("SendStream in state %s[%d]\n", stateNames[GetState()], GetState());
+	printf_s("SendStream in state %s[%d], toCompress is %d\n"
+		, stateNames[GetState()], GetState(), toCompress);
 #endif
 	if(! WaitUseMutex())
 		return -EDEADLK;
@@ -353,8 +354,7 @@ void CSocketItemDl::ProcessPendingSend()
 	// Assume it has taken exclusive access of the socket
 	// Set fpSent to NULL BEFORE calling back so that chained send may set new value
 	CallbackBufferReady fp2 = (CallbackBufferReady)InterlockedExchangePointer((PVOID volatile *)& fpSent, NULL);
-	void *p;
-	if(pendingSendBuf != NULL)
+	if(pendingSendBuf != NULL || pStreamState != NULL)
 	{
 		if (HasDataToCommit())
 		{
@@ -369,11 +369,10 @@ void CSocketItemDl::ProcessPendingSend()
 			}
 		}
 
-		p = InterlockedExchangePointer((PVOID *)& pendingSendBuf, NULL);
-		//^So that WriteTo chaining is possible, see also BufferData
+		pendingSendBuf = NULL;
 		SetMutexFree();
 		//
-		if(p != NULL && fp2 != NULL)
+		if(fp2 != NULL)
 			((NotifyOrReturn)fp2)(this, FSP_Send, bytesBuffered);
 		return;
 	}
@@ -386,7 +385,7 @@ void CSocketItemDl::ProcessPendingSend()
 	}
 
 	int32_t m;
-	p = pControlBlock->InquireSendBuf(& m);
+	void *p = pControlBlock->InquireSendBuf(& m);
 	SetMutexFree();
 	// If FSP_NotifyBufferReady caught but even a minimal buffer block is unavailable,
 	// it must be in chaotic memory situation. However, race condition does exist.

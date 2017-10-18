@@ -575,13 +575,13 @@ ControlBlock::PFSP_SocketBuf LOCALAPI ControlBlock::AllocRecvBuf(seq_t seq1)
 //	Start address of the received message
 // Remark
 //	No receive buffer block is released, except the first block which is a payloadless PERSIST as well
+//	As it meant to be idempotent
 //	If the returned value is NULL, stored in int & [_Out_] is the error number
 //	-EACCES		the buffer space is corrupted and unaccessible
 //	-EPIPE		it is a compressed stream and ULA should receive in pipe mode
 //	-EFAULT		the descriptor is corrupted (illegal payload length:
 //				payload length of an intermediate packet of a message should be MAX_BLOCK_SIZE,
 //				payload length of any packet should be no less than 0 and no greater than MAX_BLOCK_SIZE)
-//	-EAGAIN		some buffer block is double delivered, which breaks the protocol
 //	-EPERM		imconformant to the protocol, which is prohibitted
 void * LOCALAPI ControlBlock::InquireRecvBuf(int32_t & nIO, bool & eotFlag)
 {
@@ -645,12 +645,6 @@ void * LOCALAPI ControlBlock::InquireRecvBuf(int32_t & nIO, bool & eotFlag)
 			return NULL;
 		}
 		//
-		if (_InterlockedExchange8((char *) & p->opCode, 0) == 0)
-		{
-			BREAK_ON_DEBUG();	// TRACE_HERE("To double deliver a packet?");
-			nIO = -EAGAIN;
-			return NULL;
-		}
 		nIO += p->len;
 		//
 		if(p->GetFlag<TransactionEnded>())
@@ -709,13 +703,8 @@ int LOCALAPI ControlBlock::MarkReceivedFree(int32_t nIO)
 		if (p->len > MAX_BLOCK_SIZE || p->len < 0)
 			r = -EFAULT;
 		//
-		if (p->opCode != 0)
-		{
-			r = -EINTR;
-			break;
-		}
-		//
 		p->SetFlag<IS_FULFILLED>(false);	// release the buffer
+		p->opCode = (FSPOperationCode)0;
 		nIO -= p->len;
 		//
 		if (p->GetFlag<TransactionEnded>())

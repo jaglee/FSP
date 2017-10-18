@@ -74,12 +74,14 @@ int CSocketItemDl::Recycle(bool reportError)
 
 
 // Make sure resource is kept until other threads leave critical section
+// Does NOT waits for all callback functions to complete before returning
+// in case of deadlock when the function itself is called in some call-back function
 void CSocketItemDl::Disable()
 {
 	register HANDLE h;
 	CancelTimer();
 	if((h = InterlockedExchangePointer((PVOID *) & theWaitObject, NULL)) != NULL)
-		UnregisterWaitEx(theWaitObject, NULL);
+		UnregisterWaitEx(h, NULL);
 	//
 	if (inCritical > 0)
 		return;
@@ -289,15 +291,12 @@ int CSocketItemDl::Commit()
 
 	// flush internal buffer for compression, if it is non-empty
 	bool yetSomeDataToBuffer = HasDataToCommit();
-	if (yetSomeDataToBuffer && pendingSendBuf == NULL)
+	if (yetSomeDataToBuffer && HasFreeSendBuffer())
 	{
-		pendingSendBuf = (BYTE *)(-1);
-		if (HasFreeSendBuffer())
-		{
-			BufferData(0);	// assert(pendingSendSize == 0);
-			Call<FSP_Send>();
-			yetSomeDataToBuffer = HasDataToCommit();
-		}
+		BufferData(pendingSendSize);
+		yetSomeDataToBuffer = HasDataToCommit();
+		if(yetSomeDataToBuffer)
+			Call<FSP_Send>();	// Or else FSP_Commit would trigger sending the queue
 	}
 	SetMutexFree();
 
@@ -318,7 +317,7 @@ int CSocketItemDl::Commit()
 	do
 	{
 		Sleep(TIMER_SLICE_ms);
-	} while(!InState(CLOSABLE) && !InState(CLOSED)); 
+	} while(!InState(COMMITTED) && !InState(CLOSABLE) && !InState(CLOSED) && !InState(NON_EXISTENT));
 #endif
 	return 0;
 }

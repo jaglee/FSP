@@ -8,8 +8,8 @@
 // If compiled in Debug mode with the '_DEBUG' macro predefined by default, it tests FSP over UDP/IPv4
 // If compiled in Release mode, or anyway without the '_DEBUG' macro predefined, it tests FSP over IPv6
 #ifdef _DEBUG
-//# define REMOTE_APPLAYER_NAME "192.168.9.125:80"
-# define REMOTE_APPLAYER_NAME "localhost:80"
+# define REMOTE_APPLAYER_NAME "192.168.9.125:80"
+//# define REMOTE_APPLAYER_NAME "localhost:80"
 // #define REMOTE_APPLAYER_NAME "lt-x61t:80"
 // #define REMOTE_APPLAYER_NAME "lt-at4:80"
 // #define REMOTE_APPLAYER_NAME "lt-ux31e:80"
@@ -155,7 +155,7 @@ static int	FSPAPI  onConnected(FSPHANDLE h, PFSP_Context ctx)
 	CryptoNaClGetSharedSecret(bufSharedKey, bufPeersKey, bufPrivateKey);
 
 	printf_s("\tTo install the shared key instantly...\n");
-	InstallMasterKey(h, bufSharedKey, CRYPTO_NACL_KEYBYTES * 8, INT32_MAX);
+	InstallMasterKey(h, bufSharedKey, CRYPTO_NACL_KEYBYTES);
 
 	return 0;
 }

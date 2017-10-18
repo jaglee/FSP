@@ -1248,13 +1248,11 @@ l_bailout:
 	if(headPacket->lenData != MAX_BLOCK_SIZE)
 		skb->SetFlag<TransactionEnded>();
 
-	// The first packet received is in the parent's session key while the very first responding packet shall be sent in the derived key!
+	// The first packet received is in the parent's session key while
+	// the first responding packet shall be sent in the derived key
+	newItem->contextOfICC.InheritR1(contextOfICC, backlogItem.initialSN);
 	newItem->contextOfICC.snFirstRecvWithCurrKey = headPacket->pktSeqNo + 1;
-	newItem->contextOfICC.snFirstSendWithCurrKey = backlogItem.initialSN;
-	newItem->contextOfICC.prev = contextOfICC.curr;
-	// See also ::InitiateMultiply
-	newItem->contextOfICC.keyLifeRemain = contextOfICC.keyLifeRemain;
-	newItem->contextOfICC.savedCRC = (contextOfICC.keyLifeRemain == 0);
+	//^See also FinalizeMultiply()
 	// Derivation of the new session key is delayed until ULA accepted the multiplication, however.
 
 	newItem->tLastRecv = tLastRecv;	// inherit the time when the MULTIPLY packet was received

@@ -176,7 +176,7 @@ static void FSPAPI onClientResponseReceived(FSPHANDLE h, FSP_ServiceCode c, int 
 	printf_s("\tTo install the session key instantly...\n");
 	octet bufSharedKey[CRYPTO_NACL_KEYBYTES];
 	CryptoNaClGetSharedSecret(bufSharedKey, chakaPubInfo.peerPublicKey, bufPrivateKey);
-	InstallMasterKey(h, bufSharedKey, SESSION_KEY_SIZE * 8, INT32_MAX);
+	InstallMasterKey(h, bufSharedKey, SESSION_KEY_SIZE);
 
 	// To list files remotely
 	WIN32_FIND_DATA findFileData;
