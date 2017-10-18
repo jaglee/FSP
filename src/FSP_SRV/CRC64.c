@@ -76,10 +76,10 @@ const uint64_t TableCRC64[256] = {
 
 
 
-uint64_t CalculateCRC64(register uint64_t nAccum, register const uint8_t *buf, size_t len)
+uint64_t CalculateCRC64(register uint64_t nAccum, register const void *p1, size_t len)
 {
+	register uint8_t *buf = (uint8_t *)p1;
 	register size_t i;
-
 	for (i = 0; i < len; i++ )
 	{
 		nAccum = (nAccum << 8) ^ TableCRC64[(nAccum >> 56) ^ *(buf++)];

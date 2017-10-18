@@ -28,6 +28,9 @@
 #define GCM_BLOCK_LEN_POWER 4	// 2^^4 == 16
 #define GMAC_SALT_LEN		4	// As of RFC4543
 
+#ifndef bzero
+#define bzero(p, size) memset((p), 0, (size))
+#endif
 
 typedef struct _GCM_AES_CTX {
 	uint32_t	K[4*(RIJNDAEL_MAXNR + 1)];
@@ -57,9 +60,6 @@ void	GCM_AES_SetKey(GCM_AES_CTX *, const octet *, int);
 // Remark
 //	The salt is the leftmost 32-bit of the 96-bit IV. The value is just a bit string of length 32
 uint32_t GCM_AES_XorSalt(GCM_AES_CTX *, uint32_t);
-
-// Alike GCM_AES_XorSalt, but set the salt part to new value and return the original value
-uint32_t GCM_AES_SetSalt(GCM_AES_CTX *, uint32_t);
 
 
 // Given

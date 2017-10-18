@@ -313,9 +313,9 @@ bool LOCALAPI CSocketItemDl::ToWelcomeConnect(BackLogItem & backLog)
 	//
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend();
 	FSP_ConnectParam *params = (FSP_ConnectParam *)GetSendPtr(skb);
-	//
-	memcpy(& pControlBlock->connectParams, & backLog, FSP_MAX_KEY_SIZE);
 
+	memcpy(&pControlBlock->connectParams, &backLog, FSP_MAX_KEY_SIZE);
+	//^following fields are filled later
 	params->idListener = pControlBlock->idParent;
 	params->hs.Set(PEER_SUBNETS, sizeof(FSP_NormalPacketHeader));
 	//
@@ -437,10 +437,11 @@ uint32_t * FSPAPI TranslateFSPoverIPv4(PFSP_IN6_ADDR p, uint32_t dwIPv4, uint32_
 // Return
 //	0 if no error
 //	negative: the error number
+//	(e.g. -EDOM if parameter error)
 DllSpec
 int FSPAPI InstallMasterKey(FSPHANDLE h, octet * key, int32_t keyBits, uint64_t keyLife)
 {
-	if(keyBits < FSP_MIN_KEY_SIZE * 8 || keyBits > FSP_MAX_KEY_SIZE * 8 || keyBits % 64 != 0)
+	if (keyBits % 8 != 0 || keyBits <= 0 || keyLife < MAX_BLOCK_SIZE * 2)
 		return -EDOM;
 	try
 	{
@@ -460,7 +461,7 @@ int FSPAPI InstallMasterKey(FSPHANDLE h, octet * key, int32_t keyBits, uint64_t 
 //	int32_t		length of the key in bits, should be multiplication of 64
 //	uint64_t	life of the key, maximum number of packets that may utilize the key
 // Return
-//	-EINTR	if cannot obtain the right lock
+//	-EDEADLK	if cannot obtain the right lock
 //	-EIO	if cannot trigger LLS to do the installation work through I/O
 //	0		if no failure
 // Remark
@@ -471,6 +472,7 @@ int FSPAPI InstallMasterKey(FSPHANDLE h, octet * key, int32_t keyBits, uint64_t 
 //	Take the snapshot of sendBufferNextSN and pass the snapshot as the parameter
 //	because it is perfectly possible that installation of new session key is followed by
 //	sending new data so tight that LLS has not yet excute FSP_InstallKey before the send queue changed.
+//	the input key material would be truncated if it exceeds the internal command buffer capacity
 int LOCALAPI CSocketItemDl::InstallRawKey(octet *key, int32_t keyBits, uint64_t keyLife)
 {
 	if(! WaitUseMutex())
@@ -478,7 +480,9 @@ int LOCALAPI CSocketItemDl::InstallRawKey(octet *key, int32_t keyBits, uint64_t 
 
 	CommandInstallKey objCommand(pControlBlock->sendBufferNextSN, keyLife);
 	this->InitCommand<FSP_InstallKey>(objCommand);
-	memcpy(& pControlBlock->connectParams, key, keyBits/8);
+	if (keyBits > sizeof(objCommand.ikm) * 8)
+		keyBits = sizeof(objCommand.ikm) * 8;
+	memcpy(objCommand.ikm, key, keyBits/8);
 	pControlBlock->connectParams.keyBits = keyBits;
 
 	SetMutexFree();

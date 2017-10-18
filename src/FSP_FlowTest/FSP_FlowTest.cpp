@@ -21,14 +21,17 @@ void UnitTestCRC()
 		((uint8_t *) & pCB->connectParams)[i] = i;
 		((uint8_t *) & pCB2->connectParams)[i] = i;
 	}
-
+	for (register int i = 0; i < sizeof(storage.payload); i++)
+	{
+		storage.payload[i] = (BYTE)i;
+	}
 	socket.InstallEphemeralKey();
 	socketR2.InstallEphemeralKey();
 
 	//
 	socket.SetPairOfFiberID(nearFID, htobe32(LAST_WELL_KNOWN_ALFID));
 	socketR2.SetPairOfFiberID(htobe32(LAST_WELL_KNOWN_ALFID), nearFID);
-
+	storage.hdr.hs.hsp = htobe16(sizeof(FSP_NormalPacketHeader));
 	socket.SetIntegrityCheckCode(& storage.hdr);
 
 	storage2 = storage;
@@ -38,7 +41,7 @@ void UnitTestCRC()
 
 	storage2.payload[0] ^= 1;
 	checked = socketR2.ValidateICC(& storage2.hdr, 0, nearFID, 0);
-	assert(checked);	// Because in CRC mode we doesn't care about the payload
+	assert(checked);	// Because payload length is set to zero in the parameter
 
 	* ((uint8_t *) & storage2.hdr) ^= 1;
 	checked = socketR2.ValidateICC(& storage2.hdr, 0, nearFID, 0);
@@ -47,6 +50,17 @@ void UnitTestCRC()
 	* ((uint8_t *) & storage2.hdr) ^= 1;
 	checked = socketR2.ValidateICC(& storage2.hdr, 0, nearFID, 0);
 	assert(checked);
+
+	// Assume the payload is of 3 octets
+	socket.SetIntegrityCheckCode(&storage.hdr, storage.payload, 3);
+	storage2 = storage;
+
+	checked = socketR2.ValidateICC(&storage2.hdr, 3, nearFID, 0);
+	assert(checked);
+
+	storage2.payload[0] ^= 1;
+	checked = socketR2.ValidateICC(&storage2.hdr, 3, nearFID, 0);
+	assert(! checked);
 }
 
 
@@ -77,7 +91,8 @@ void UnitTestICC()
 	memcpy(& pCBR->connectParams, & pSCB->connectParams, FSP_MAX_KEY_SIZE);	// 256 bits
 	//^when install session key the original connection parameter is destroyed
 	// so it must be copied beforehand
-	DumpNetworkUInt16((uint16_t *)  & pCBR->connectParams, FSP_MAX_KEY_SIZE / 2);
+	printf_s("\nEphemeral master key generated: \n");
+	DumpNetworkUInt16((uint16_t *) & pCBR->connectParams, FSP_MAX_KEY_SIZE / 2);
 
 	pSCB->SetSendWindow(FIRST_SN);
 	socket.SetPairOfFiberID(nearFID, htobe32(LAST_WELL_KNOWN_ALFID));
@@ -87,7 +102,6 @@ void UnitTestICC()
 	pCBR->SetRecvWindow(FIRST_SN);
 	socketR2.SetPairOfFiberID(htobe32(LAST_WELL_KNOWN_ALFID), nearFID);
 	socketR2.InstallEphemeralKey();	// initializtion
-	pCBR->recvWindowNextSN++;		// == FIRST_SN + 1
 	socketR2.InstallSessionKey(samplekey);
 
 	// So, the packet with FIRST_SN shall be calculated with CRC64
@@ -96,23 +110,37 @@ void UnitTestICC()
 	FSP_NormalPacketHeader &request = storage.hdr;
 	request.hs.Set<FSP_NormalPacketHeader, PURE_DATA>();
 
-	request.sequenceNo = FIRST_SN;
+	request.sequenceNo = htobe32(FIRST_SN);
 	socket.SetIntegrityCheckCode(& request);
 	//
 	bool checked = socketR2.ValidateICC(& request, 0, nearFID, 0);
 	assert(checked);
 
-	request.sequenceNo = FIRST_SN - 1;
+	request.sequenceNo = htobe32(FIRST_SN - 1);
 	socket.SetIntegrityCheckCode(& request);
 	//
 	checked = socketR2.ValidateICC(& request, 0, nearFID, 0);
 	assert(checked);
 
 	// should apply AES-GCM
-	request.sequenceNo = FIRST_SN + 1;
+	request.sequenceNo = htobe32(FIRST_SN + 1);
 	socket.SetIntegrityCheckCode(& request);
 	//
 	checked = socketR2.ValidateICC(& request, 0, nearFID, 0);
+	assert(checked);
+
+	// The sender should not rekey, but the receiver should prepare:
+	request.sequenceNo = htobe32(FIRST_SN + FSP_REKEY_THRESHOLD - 1);
+	socket.SetIntegrityCheckCode(&request);
+	//
+	checked = socketR2.ValidateICC(&request, 0, nearFID, 0);
+	assert(checked);
+
+	// The sender should rekey while the receiver has prepared:
+	request.sequenceNo = htobe32(FIRST_SN + FSP_REKEY_THRESHOLD);
+	socket.SetIntegrityCheckCode(&request);
+	//
+	checked = socketR2.ValidateICC(&request, 0, nearFID, 0);
 	assert(checked);
 
 	// partially scattered I/O
@@ -151,6 +179,7 @@ void UnitTestICC()
 	// It's most complicated in the sense that 
 	ControlBlock::PFSP_SocketBuf skb1 = socketR2.AllocRecvBuf(FIRST_SN + 1);
 	skb1->SetFlag<IS_FULFILLED>();
+	pCBR->recvWindowNextSN++;		// == FIRST_SN + 1
 
 	// See also: timer.cpp::KeepAlive
 	ControlBlock::seq_t seq0;
@@ -164,15 +193,16 @@ void UnitTestICC()
 	printf_s("Size of the SNACK header = %d, expected SN = %u, salt=0x%X\n", sizeSNACK, seq0, salt);
 
 	mp.hdr.hs.Set(KEEP_ALIVE, sizeof(FSP_NormalPacketHeader) + sizeSNACK);
-	pSCB->SetSequenceFlags(& mp.hdr, pSCB->sendWindowNextSN);
+	// pSCB->SetSequenceFlags(& mp.hdr, FIRST_SN + FSP_REKEY_THRESHOLD);
+	pSCB->SetSequenceFlags(& mp.hdr, FIRST_SN + 1);
 	mp.hdr.expectedSN = htobe32(seq0);
 	//
-	socketR2.SetIntegrityCheckCode(& mp.hdr, NULL, 0, salt);
+	socket.SetIntegrityCheckCode(& mp.hdr, NULL, 0, salt);
 
-	checked = socket.ValidateICC(& mp.hdr, 0, socketR2.fidPair.source, salt);
+	checked = socketR2.ValidateICC(& mp.hdr, 0, socket.fidPair.source, salt);
 	assert(checked);
 
-	checked = socket.ValidateICC(& mp.hdr, 0, socket.fidPair.peer, salt);
+	checked = socketR2.ValidateICC(& mp.hdr, 0, socketR2.fidPair.peer, salt);
 	assert(checked);
 }
 
@@ -206,8 +236,6 @@ void UnitTestHMAC()
 	// emulate negotiation of sequence number and the session key
 	rand_w32((uint32_t *)& pSCB->connectParams, FSP_MAX_KEY_SIZE / 4);		// 256 bits
 	memcpy(&pCBR->connectParams, &pSCB->connectParams, FSP_MAX_KEY_SIZE);	// 256 bits
-	//^when install session key the original connection parameter is destroyed
-	// so it must be copied beforehand
 	DumpNetworkUInt16((uint16_t *)& pCBR->connectParams, FSP_MAX_KEY_SIZE / 2);
 
 	pSCB->SetSendWindow(FIRST_SN);
@@ -380,7 +408,7 @@ struct FSP_FixedHeader
 
 void UnitTestByteOrderDefinitin()
 {
-	FSP_HeaderSignature fhs;
+	$FSP_HeaderSignature fhs;
 	uint32_t & rFHS = *(uint32_t *)& fhs;
 
 	fhs.opCode = _FSP_Operation_Code(1);
@@ -412,14 +440,14 @@ int _tmain(int argc, _TCHAR* argv[])
 	//FlowTestRetransmission();
 	//FlowTestRecvWinRoundRobin();
 
-	//UnitTestCRC();
+	UnitTestCRC();
 	UnitTestICC();
 	UnitTestHMAC();
 
 	//TrySRP6();
 	//UnitTestTweetNacl();
 	//TryCHAKA();
-	TryWideChar();
+	//TryWideChar();
 	//UnitTestByteOrderDefinitin();
 	//
 	// TODO: UnitTest of SendInplace, SendStream

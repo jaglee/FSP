@@ -135,7 +135,7 @@ CSocketItemDl * LOCALAPI CSocketItemDl::ToPrepareMultiply(CSocketItemDl *p, PFSP
 
 	try
 	{
-		memcpy(& socketItem->pControlBlock->connectParams, & p->pControlBlock->connectParams, FSP_MAX_KEY_SIZE);
+		socketItem->pControlBlock->connectParams = p->pControlBlock->connectParams;
 		socketItem->pControlBlock->idParent = p->fidPair.source;
 		socketItem->pControlBlock->SetSendWindow(p->pControlBlock->sendWindowNextSN - 1);
 		//^The receive window would be initialized in LLS

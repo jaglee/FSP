@@ -232,29 +232,107 @@ struct ICC_Context
 	ALIGN(MAC_ALIGNMENT)
 	uint64_t	_mac_ctx_protect_prolog[2];
 #endif
+	// precomputed CRCs are placed in such a way that send and receive direction are managed separately
 	union
 	{
+		uint64_t	precomputedCRCR1;			// precomputed CRC value for Receiver role/Input side
+		//^CRC64 with ephemeral key
 		struct
 		{
-			char	rawKey[FSP_MAX_KEY_SIZE];
-			uint8_t	keyLength;
+			octet	rawKey[sizeof(GCM_AES_CTX)];
+			int32_t	keyLength;
 		};
-		uint64_t	precomputedICC[2];	// [0] is for output/send, [1] is for input/receive
-		ALIGN(MAC_ALIGNMENT)
-		GCM_AES_CTX	gcm_aes;
+		//^raw key meant for secure hash mode
+		struct
+		{
+			GCM_AES_CTX	gcm_aes;
+			union
+			{
+				uint64_t precomputedCRCS0;		// precomputed CRC value for Sender role/Output side
+				struct
+				{
+					octet	key[FSP_MAX_KEY_SIZE + GMAC_SALT_LEN];
+					uint8_t	H[GCM_BLOCK_LEN];	/* hash subkey, save one block encryption */
+				} send;
+			};
+		};
 	} curr, prev;
 
 #ifndef NDEBUG
 	uint64_t	_mac_ctx_protect_epilog[2];
 #endif
 	uint64_t	keyLifeRemain;	// in terms of number of octets that could be encrypted
-	// Previous key is applied for CRC only
-	bool		savedCRC;
+	octet		masterKey[FSP_MAX_KEY_SIZE];
+	uint32_t	iBatchRecv;
+	uint32_t	iBatchSend;
+	uint8_t		originalKeyLength;
 	bool		noEncrypt;
+	bool		sendCRConly;
+	bool		recvCRConly;
 	// only when there is no packet left applied with previous key may current key changed  
 	// the sequence number of the first packet to be sent or received with current key, respectively
 	ControlBlock::seq_t	snFirstSendWithCurrKey;
 	ControlBlock::seq_t	snFirstRecvWithCurrKey;
+	// Given
+	//	const void *	the input key material, shall be less than 512 bits for this FSP version
+	//	int				the length of the key material in octets, shall be no greater than 64
+	// Do
+	//	Extract and install internal key for the first batch
+	// Remark
+	//	Each batch consists of FSP_REKEY_THRESHOLD packets
+	void InitiateExternalKey(const void *, int);
+	// Given 0 for output (0 appears like o, send), 1 for input(1 appears like i, receive)
+	void ForcefulRekey(int);
+	// Given the sequence number, check wether it should rekey before send
+	// The caller should make sure that rekeying is not too frequent to 
+	// keep unacknowledged packets to be resent correctly
+	void CheckToRekeyBeforeSend(ControlBlock::seq_t seqNo)
+	{
+#if (TRACE & TRACE_PACKET)
+		printf_s("CheckToRekeyBeforeSend: seq#%u\n"
+			"\tsnFirstSendWithCurrKey = %u\n"
+			, seqNo
+			, snFirstSendWithCurrKey);
+#endif
+		// From snFirstSendWithCurrKey + FSP_REKEY_THRESHOLD, inclusively, apply new key
+		if (int32_t(seqNo - snFirstSendWithCurrKey) >= FSP_REKEY_THRESHOLD)
+			ForcefulRekey(0);
+	}
+	// Before accepting packet, check wether it needs rekeying to validate it. If it does need, do rekey
+	// Assume every packet in the receive window is either encyrpted in the new re-keyed key
+	void CheckToRekeyAnteAccept(ControlBlock::seq_t seqNo)
+	{
+#if (TRACE & TRACE_PACKET)
+		printf_s("CheckToRekeyAnteAccept: seq#%u\n"
+			"\tsnFirstSendWithCurrKey = %u\n"
+			, seqNo
+			, snFirstRecvWithCurrKey);
+#endif
+		if (int32_t(seqNo - snFirstRecvWithCurrKey) < FSP_REKEY_THRESHOLD
+		 || int32_t(seqNo - snFirstRecvWithCurrKey) >= FSP_REKEY_THRESHOLD * 2)
+		{
+			return;
+		}
+		ForcefulRekey(1);
+	}
+	// Given
+	//	GCM_AES_CTX &	[out]	Preserved storage of the GCM_AES context
+	//	ControlBlock::seq_t		The sequence number of the packet to send	
+	// Return
+	//	The GCM_AES context selected for send, might be prepared on the fly
+	GCM_AES_CTX * GetGCMContextForSend(GCM_AES_CTX &, ControlBlock::seq_t);
+	// Given
+	//	const ICC_Context &		The ICC context of the parent connection
+	//	ControlBlock::seq_t		The sequence number of the first packet to send by the child connection
+	// Do
+	//	Copy the core parameter of security context of the parent connection
+	// Remark
+	//	InheritS0 is for send/output/initiative/zero-start direction
+	//  InheritR1 is for recv/input/responder/first-ready direction
+	void InheritS0(const ICC_Context &, ControlBlock::seq_t);
+	void InheritR1(const ICC_Context &, ControlBlock::seq_t);
+	//
+	void Derive(const octet *, int);
 };
 
 
@@ -701,7 +779,7 @@ void LOCALAPI DumpNetworkUInt16(uint16_t *, int);
 uint64_t LOCALAPI CalculateCookie(const void *, int, timestamp_t);
 
 // defined in CRC64.c
-extern "C" uint64_t CalculateCRC64(register uint64_t, register const uint8_t *, size_t);
+extern "C" uint64_t CalculateCRC64(register uint64_t, register const void *, size_t);
 
 // power(3, a) 	// less stringent than pow(3, a) ?
 inline double CubicPower(double a) { return a * a * a; }

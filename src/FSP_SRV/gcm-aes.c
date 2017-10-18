@@ -25,10 +25,6 @@
 #define bcopy(src, tgt, size) memcpy((tgt), (src), (size))
 #endif
 
-#ifndef bzero
-#define bzero(p, size) memset((p), 0, (size))
-#endif
-
 #define gfadd(X, Y, S)	(\
 	((uint64_t *)(S))[0] = ((uint64_t *)(X))[0] ^ ((uint64_t *)(Y))[0], \
 	((uint64_t *)(S))[1] = ((uint64_t *)(X))[1] ^ ((uint64_t *)(Y))[1]	\
@@ -96,7 +92,7 @@ void GCM_AES_SetIV(GCM_AES_CTX *ctx, const uint8_t *IV)
 
 // Given
 //	GCM_AES_CTX *	pointer to the security context to set
-//	const uint8_t * pointer to the key input buffer
+//	const octet *	pointer to the key input buffer
 //	int				number of octets the key occupied in the input buffer
 // Do
 //	Initialize the security context with the given key
@@ -104,7 +100,7 @@ void GCM_AES_SetIV(GCM_AES_CTX *ctx, const uint8_t *IV)
 //	Salt is OPTIONAL. It is exploited as described in RFC4543
 //	bytesK must be 16, 24 or 32 without salt, or 20, 28, 40 with salt
 //	If the salt is not set here, it MUST have been set by the caller before Decrypt/Encrypt
-void GCM_AES_SetKey(GCM_AES_CTX *ctx, const uint8_t *K, int bytesK)
+void GCM_AES_SetKey(GCM_AES_CTX *ctx, const octet *K, int bytesK)
 {
 	// AES key schedule
 	ctx->rounds = rijndaelKeySetupEnc(ctx->K, K, (bytesK & 0xF8) * 8);
@@ -125,13 +121,6 @@ uint32_t GCM_AES_XorSalt(GCM_AES_CTX *ctx, uint32_t salt)
 	register uint32_t u = *(uint32_t *)ctx->J;
 	*(uint32_t *)ctx->J = u ^ salt;
 	return u;
-}
-
-
-
-uint32_t GCM_AES_SetSalt(GCM_AES_CTX *ctx, uint32_t salt)
-{
-	return (uint32_t)_InterlockedExchange((long *)ctx->J, (long)salt);
 }
 
 
