@@ -205,10 +205,9 @@ struct CommandToLLS
 
 struct CommandNewSession: CommandToLLS
 {
-	HANDLE			hMemoryMap;		// pass to LLS by ULA, should be duplicated by the server
-	ALIGN(8)
-	DWORD			dwMemorySize;	// size of the shared memory, in the mapped view
 	char			szEventName[MAX_NAME_LENGTH];	// name of the callback event
+	DWORD			dwMemorySize;	// size of the shared memory, in the mapped view
+	uint64_t		hMemoryMap;		// pass to LLS by ULA, should be duplicated by the server
 
 	CommandNewSession() { memset(this, 0, sizeof(CommandNewSession)); }
 };
@@ -339,7 +338,8 @@ class LLSBackLog: public CLightMutex
 	int	InitSize(int);
 
 public:
-	bool LOCALAPI Has(const BackLogItem *p);
+	BackLogItem * LOCALAPI FindByRemoteId(ALFID_T, uint32_t);
+	bool Has(const BackLogItem *p) { return FindByRemoteId(p->idRemote, p->salt) != NULL; }
 	BackLogItem * Peek() { return count <= 0 ? NULL : q  + headQ; }
 	int Pop();
 	int LOCALAPI Put(const BackLogItem *p);
@@ -428,8 +428,9 @@ struct ControlBlock
 	seq_t		sendBufferNextSN;
 	int32_t		sendBufferNextPos;	// the index number of the block with sendBufferNextSN
 	//
-	int32_t		sendWindowLimitSN;	// the right edge of the send window
-	int32_t		sendCongestWindow;	// UNRESOLVED! Reserved yet.
+	seq_t		sendWindowLimitSN;	// the right edge of the send window
+	//
+	seq_t		lastRecvCacheSN;	// the SN of the packet that stored in the receive cache. not used yet
 
 	// (head position, receive window first sn) (next position, receive buffer maximum sn)
 	// are managed independently for maximum parallism in DLL and LLS
@@ -527,17 +528,18 @@ struct ControlBlock
 	//
 	int32_t CountSendBuffered()
 	{
-		register int32_t a, b;
-		a = _InterlockedOr((volatile LONG *)&sendBufferNextSN, 0);
-		b = _InterlockedOr((volatile LONG *)&sendWindowFirstSN, 0);
-		return a - b;
+		register int32_t a = _InterlockedOr((volatile LONG *)&sendBufferNextSN, 0);
+		return int32_t(a - sendWindowFirstSN);
 	}
 	int32_t CountSentInFlight()
 	{
-		register int32_t a, b;
-		a = _InterlockedOr((volatile LONG *)&sendWindowNextSN, 0);
-		b = _InterlockedOr((volatile LONG *)&sendWindowFirstSN, 0);
-		return a - b;
+		register int32_t a = _InterlockedOr((volatile LONG *)&sendWindowNextSN, 0);
+		return int32_t(a - sendWindowFirstSN);
+	}
+	int32_t CountDeliverable()
+	{
+		register int32_t a = _InterlockedOr((volatile LONG *)&recvWindowExpectedSN, 0);
+		return int32_t(a - recvWindowFirstSN);
 	}
 #if defined(TRACE) && !defined(NDEBUG)
 	int DumpSendRecvWindowInfo() const;
@@ -579,8 +581,6 @@ struct ControlBlock
 
 	void RoundSendBufferNextPos() { int32_t m = sendBufferNextPos - sendBufferBlockN; if(m >= 0) sendBufferNextPos = m; }
 	void RoundSendWindowNextPos() { int32_t m = sendWindowNextPos - sendBufferBlockN; if(m >= 0) sendWindowNextPos = m; }
-
-	int32_t CountReceived() const { return int32_t(recvWindowNextSN - recvWindowFirstSN); }	// gaps included, however
 
 	// Given
 	//	FSP_NormalPacketHeader*	the place-holder of sequence number and flags
@@ -703,15 +703,12 @@ protected:
 	{
 		register HANDLE h;
 		//
+		if ((h = InterlockedExchangePointer((PVOID *)& pControlBlock, NULL)) != NULL)
+			::UnmapViewOfFile(h);
+		if ((h = InterlockedExchangePointer((PVOID *)& hMemoryMap, NULL)) != NULL)
+			::CloseHandle(h);
 		if((h = InterlockedExchangePointer((PVOID *) & hEvent, NULL)) != NULL)
 			::CloseHandle(h);
-		//
-		if((h = InterlockedExchangePointer((PVOID *) & hMemoryMap, NULL)) != NULL)
-		{
-			::UnmapViewOfFile(pControlBlock);
-			::CloseHandle(h);
-			pControlBlock = NULL;
-		}
 	}
 };
 

@@ -176,7 +176,7 @@ void PrepareFlowTestResend(CSocketItemExDbg & dbgSocket, PControlBlock & pSCB)
 	dbgSocket.pControlBlock = pSCB;
 
 	pSCB->Init(s1, s2);
-	pSCB->recvWindowFirstSN = pSCB->recvWindowNextSN = FIRST_SN;
+	pSCB->SetRecvWindow(FIRST_SN);
 
 	pSCB->SetSendWindow(FIRST_SN);
 	ControlBlock::PFSP_SocketBuf skb = pSCB->GetSendBuf();
@@ -362,7 +362,7 @@ void FlowTestRecvWinRoundRobin()
 
 	int32_t m;
 	void * buf = pSCB->InquireSendBuf(& m);
-	// should be NULL, -ENOMEM
+	// should be NULL, 0
 	printf_s("InquireSendBuf: buf = %p, size = %d\n", buf, m);
 
 	ControlBlock::PFSP_SocketBuf skb = pSCB->HeadRecv();

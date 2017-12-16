@@ -494,7 +494,7 @@ bool LOCALAPI CSocketItemEx::ValidateSNACK(ControlBlock::seq_t & ackSeqNo, FSP_S
 	int32_t offset = IsOutOfWindow(headPacket->pktSeqNo);
 	if (offset > 0 || offset < -1)
 	{
-#ifdef TRACE
+#if defined(TRACE) && (TRACE & TRACE_OUTBAND)
 		printf_s("%s has encountered attack? sequence number: %u\n\tshould in: [%u %u]\n"
 			, opCodeStrings[p1->hs.opCode]
 			, headPacket->pktSeqNo
@@ -578,7 +578,9 @@ bool LOCALAPI CSocketItemEx::ValidateSNACK(ControlBlock::seq_t & ackSeqNo, FSP_S
 //	Check the validity of the ackowledgement to the CONNECT_REQUEST command and establish the ephemeral session key
 // Remark
 //	CONNECT_AFFIRMING-->/ACK_CONNECT_REQ/-->[API{callback}]
-//		|-->{Return Accept}-->PEER_COMMIT-->[Send PERSIST]{start keep-alive}
+//		|-->{Return Accept}
+//			{to piggyback data}|-->PEER_COMMIT-->[Send PERSIST] {start keep-alive}
+//			{payloadless}|-->COMMITTING2-->[Send ACK_START] {start keep-alive}
 //		|-->{Return Reject}-->NON_EXISTENT-->[Send RESET]
 // See also {FSP_DLL}CSocketItemDl::ToConcludeConnect()
 void CSocketItemEx::OnConnectRequestAck(PktBufferBlock *pktBuf, int lenData)
@@ -676,6 +678,114 @@ l_return:
 
 
 
+// ACK_START is the acknowledgement to ACK_CONNECT_REQ or MULTIPLY, and/or start a new transmit transaction
+//	CHALLENGING-->/ACK_START/-->CLOSABLE-->[Send ACK_FLUSH]-->[Notify]
+//	PEER_COMMIT-->/ACK_START/-->[Send ACK_FLUSH]
+//	CLOSABLE-->/ACK_START/-->{keep state}[Send ACK_FLUSH]
+//  CLONING-->/ACK_START/
+//		|-->{Not ULA-flushing}-->PEER_COMMIT
+//		|-->{ULA-flushing}-->CLOSABLE
+//	-->{stop keep-alive}[Send ACK_FLUSH]-->[Notify]
+void CSocketItemEx::OnGetAckStart()
+{
+	TRACE_SOCKET();
+	if (!InStates(4, CHALLENGING, PEER_COMMIT, CLOSABLE, CLONING))
+		return;
+
+	bool isInitiativeState = InState(CHALLENGING) || InState(CLONING);
+	bool isMultiplying = InState(CLONING);
+
+	if (headPacket->lenData != 0)
+	{
+#ifdef TRACE
+		printf_s("ACK_START should be payloadless, but payload length received is %d\n", headPacket->lenData);
+#endif
+		return;
+	}
+
+	FSP_NormalPacketHeader *p1 = headPacket->GetHeaderFSP();
+	if (!isMultiplying)	// the normality
+	{
+		int32_t d = IsOutOfWindow(headPacket->pktSeqNo);
+		if (d > 0)
+		{
+#if defined(TRACE) && (TRACE & TRACE_SLIDEWIN)
+			printf_s("@%s: invalid sequence number: %u, distance to the receive window: %d\n"
+				, __FUNCTION__, headPacket->pktSeqNo, d);
+#endif
+			return;		// DoS attack OR a premature start of new transmit transaction
+		}
+		if (d < 0)
+		{
+			AddLazyAckTimer();	// It costs much less than to ValidateICC() or Notify()
+			return;
+		}
+		if (!ValidateICC())
+		{
+#if defined(TRACE) && (TRACE & TRACE_SLIDEWIN)
+			printf_s("@%s: invalid ICC received\n", __FUNCTION__);
+			pControlBlock->DumpSendRecvWindowInfo();
+#endif
+			return;
+		}
+	}
+	else if (!FinalizeMultiply())	// if (lowState == CLONING)
+	{
+		return;
+	}
+
+	ControlBlock::seq_t ackSeqNo = be32toh(p1->expectedSN);
+	if (!ResizeSendWindow(ackSeqNo, p1->GetRecvWS()))
+	{
+#ifdef TRACE
+		printf_s("Cannot resize send window. Acknowledged sequence number: %u\n", ackSeqNo);
+		pControlBlock->DumpSendRecvWindowInfo();
+#endif
+		return;
+	}
+
+	// Just make it consume the sequence space slot in the receive queue
+	if (pControlBlock->AllocRecvBuf(headPacket->pktSeqNo) == NULL)
+	{
+		AddLazyAckTimer();
+		return;
+	}
+	// ACK_START has nothing to deliver to ULA
+	pControlBlock->SlideRecvWindowByOne();
+
+	if (!isInitiativeState)
+	{
+		BREAK_ON_DEBUG();
+		return;	// and it MUST have been notified already
+	}
+
+	if (isMultiplying)
+	{
+		StopKeepAlive();
+		SetState(_InterlockedExchange8(&shouldAppendCommit, 0) ? CLOSABLE : PEER_COMMIT);
+	}
+	else // if (lowState == CHALLENGING)
+	{	
+		SetState(CLOSABLE);
+	}
+	SendAckFlush();
+
+	// ACK_START is always the accumulative acknowledgement to ACK_CONNECT_REQ or MULTIPLY
+	pControlBlock->SlideSendWindowByOne();	// See also RespondToSNACK
+	tLastRecv = NowUTC();
+	tRoundTrip_us = (uint32_t)min(UINT32_MAX, tLastRecv - tRecentSend);
+#ifdef TRACE
+	printf_s("\nACK_START received, acknowledged SN = %u\n\tThe responder calculate RTT: %uus\n", ackSeqNo, tRoundTrip_us);
+#endif
+
+	if (isMultiplying)
+		SignalFirstEvent(FSP_NotifyMultiplied);
+	else
+		SignalFirstEvent(FSP_NotifyAccepted);
+}
+
+
+
 //PERSIST is the acknowledgement to ACK_CONNECT_REQ or MULTIPLY, and/or start a new transmit transaction
 //	CHALLENGING-->/PERSIST/
 //		--{EOT}-->CLOSABLE-->[Send ACK_FLUSH]-->[Notify]
@@ -730,11 +840,25 @@ void CSocketItemEx::OnGetPersist()
 
 	FSP_NormalPacketHeader *p1 = headPacket->GetHeaderFSP();
 	if (! isMultiplying)	// the normality
-	{		
-		if(! ICCSeqValid())
+	{
+		int32_t d = IsOutOfWindow(headPacket->pktSeqNo);
+		if (d > 0)
 		{
-#ifdef TRACE
-			printf_s("@%s: Invalid sequence number: %u or invalid ICC\n", __FUNCTION__, headPacket->pktSeqNo);
+#if defined(TRACE) && (TRACE & TRACE_SLIDEWIN)
+			printf_s("@%s: invalid sequence number: %u, distance to the receive window: %d\n"
+				, __FUNCTION__, headPacket->pktSeqNo, d);
+#endif
+			return;		// DoS attack OR a premature start of new transmit transaction
+		}
+		if (d < 0)
+		{
+			AddLazyAckTimer();	// It costs much less than to ValidateICC() or Notify()
+			return;
+		}
+		if (!ValidateICC())
+		{
+#if defined(TRACE) && (TRACE & TRACE_SLIDEWIN)
+			printf_s("@%s: invalid ICC received\n", __FUNCTION__);
 			pControlBlock->DumpSendRecvWindowInfo();
 #endif
 			return;
@@ -765,7 +889,7 @@ void CSocketItemEx::OnGetPersist()
 	// Make acknowledgement, in case previous acknowledgement is lost
 	if (countPlaced == -ENOENT || countPlaced == -EEXIST)
 	{
-		SendKeepAlive();	// AddLazyAckTimer();	// PERSIST needs an instant response to enhance efficiency
+		AddLazyAckTimer();
 		return;
 	}
 
@@ -818,13 +942,15 @@ void CSocketItemEx::OnGetPersist()
 
 	// PERSIST is always the accumulative acknowledgement to ACK_CONNECT_REQ or MULTIPLY
 	// ULA slide the receive window, no matter whether the packet has payload
+	// The timer was already started for transient state management when Accept(), Multiply() or sending MULTIPLY
 	if (isInitiativeState)
 	{
-#ifdef TRACE
-		printf_s("\nPERSIST received. \tAcknowledged SN = %u\n\tThe responder calculate RTT\t", ackSeqNo);
-#endif
 		pControlBlock->SlideSendWindowByOne();	// See also RespondToSNACK
-		CalibrateRTT();
+		tLastRecv = NowUTC();
+		tRoundTrip_us = (uint32_t)min(UINT32_MAX, tLastRecv - tRecentSend);
+#ifdef TRACE
+		printf_s("\nPERSIST received, acknowledged SN = %u\n\tThe responder calculate RTT: %uus\n", ackSeqNo, tRoundTrip_us);
+#endif
 	}
 
 #if defined(TRACE) && (TRACE & TRACE_PACKET)
@@ -907,10 +1033,25 @@ void CSocketItemEx::OnGetPureData()
 		return;
 	}
 
-	if(! ICCSeqValid())
+	int32_t d = IsOutOfWindow(headPacket->pktSeqNo);
+	if (d > 0)
 	{
-#ifdef TRACE
-		printf_s("@%s: Invalid sequence number: %u or invald ICC\n", __FUNCTION__, headPacket->pktSeqNo);
+#if defined(TRACE) && (TRACE & TRACE_SLIDEWIN)
+		printf_s("@%s: invalid sequence number: %u, distance to the receive window: %d\n"
+			, __FUNCTION__, headPacket->pktSeqNo, d);
+#endif
+		return;		// DoS attack OR a premature start of new transmit transaction
+	}
+	if (d < 0)
+	{
+		AddLazyAckTimer();	// It costs much less than to ValidateICC() or Notify()
+		return;
+	}
+	if (!ValidateICC())
+	{
+#if defined(TRACE) && (TRACE & TRACE_SLIDEWIN)
+		printf_s("@%s: invalid ICC received\n", __FUNCTION__);
+		pControlBlock->DumpSendRecvWindowInfo();
 #endif
 		return;
 	}
@@ -919,8 +1060,8 @@ void CSocketItemEx::OnGetPureData()
 	ControlBlock::seq_t ackSeqNo = be32toh(p1->expectedSN);	
 	if (!ResizeSendWindow(ackSeqNo, p1->GetRecvWS()))
 	{
-#ifdef TRACE
-		printf_s("An out of order acknowledgement? seq#%u\n",ackSeqNo);
+#if defined(TRACE) && (TRACE & TRACE_SLIDEWIN)
+		printf_s("An out of order acknowledgement? seq#%u\n", ackSeqNo);
 #endif
 		return;
 	}
@@ -1008,7 +1149,6 @@ void CSocketItemEx::OnGetEOT()
 	TransitOnPeerCommit();
 	Notify(FSP_NotifyToCommit);
 }
-
 
 
 
@@ -1176,31 +1316,45 @@ void CSocketItemEx::OnGetMultiply()
 	pFH->expectedSN = htobe32(contextOfICC.snFirstSendWithCurrKey);
 	if (!ValidateICC(pFH, headPacket->lenData, idSource, salt))
 	{
-		BREAK_ON_DEBUG();	//TRACE_HERE("Invalid intergrity check code!?");
+#if defined(TRACE) && (TRACE & TRACE_OUTBAND)
+		printf_s("Invalid intergrity check code of MULTIPLY"
+				 ", might be in the race condition that MULTIPLY received before ULA installed new key\n");
+#endif
 		return;
 	}
 
-	// Check whether the request is already put into the multiplication backlog
-	// Check whether it is a collision!?
-	CMultiplyBacklogItem *newItem  = CLowerInterface::Singleton.FindByRemoteId(remoteHostID, idSource, fidPair.source);
-	// Unlike ACK_CONNECT_REQ, response to MULTIPLY is retranmitted on timed-out, not on demand
-	if (newItem != NULL)
-		return;
-
+	// Check whether it is a collision: a retransmitted MULTIPLY MAY refresh the ICC context
 	// See also CLowerInterface::OnGetInitConnect
-	newItem = (CMultiplyBacklogItem *)CLowerInterface::Singleton.AllocItem();
-	if(newItem == NULL)
+	CMultiplyBacklogItem *newItem  = CLowerInterface::Singleton.FindByRemoteId(remoteHostID, idSource, fidPair.source);
+	if (newItem != NULL)
 	{
-		REPORT_ERRMSG_ON_TRACE("Cannot allocate new socket slot for multiplication");
-		return;		// for security reason silently the exception
+		if( newItem->contextOfICC.snFirstRecvWithCurrKey == headPacket->pktSeqNo + 1
+		&&  newItem->contextOfICC.noEncrypt == this->contextOfICC.noEncrypt
+		&& (newItem->contextOfICC.keyLifeRemain != 0) == (this->contextOfICC.keyLifeRemain != 0) )
+		{
+#if defined(TRACE) && (TRACE & TRACE_OUTBAND)
+			printf_s("Duplicate MULTIPLY received, context established already.\n");
+#endif
+			return;
+		}
+	}
+	else
+	{
+		newItem = (CMultiplyBacklogItem *)CLowerInterface::Singleton.AllocItem();
+		if (newItem == NULL)
+		{
+			REPORT_ERRMSG_ON_TRACE("Cannot allocate new socket slot for multiplication");
+			return;		// for security reason silently ignore the exception
+		}
 	}
 
 	BackLogItem backlogItem(pControlBlock->connectParams);
 	backlogItem.idRemote = idSource;
 	if (pControlBlock->backLog.Has(&backlogItem))
 	{
-		BREAK_ON_DEBUG();	//TRACE_HERE("Duplicate MULTIPLY backlogged already");
-l_bailout:
+#if defined(TRACE) && (TRACE & TRACE_OUTBAND)
+		printf_s("Duplicate MULTIPLY received, backlogged already.\n");
+#endif
 		CLowerInterface::Singleton.FreeItem(newItem);
 		return;
 	}
@@ -1213,20 +1367,6 @@ l_bailout:
 	backlogItem.acceptAddr.idALF = newItem->fidPair.source;
 	memcpy(backlogItem.allowedPrefixes, pControlBlock->peerAddr.ipFSP.allowedPrefixes, sizeof(uint64_t)* MAX_PHY_INTERFACES);
 	//^See also CSocketItemDl::PrepareToAccept()
-
-	// lastly, put it into the backlog
-	if (pControlBlock->backLog.Put(&backlogItem) < 0)
-	{
-#if defined(TRACE) && (TRACE & TRACE_OUTBAND)
-		printf_s("Cannot put the multiplying connection request into the SCB backlog.\n");
-#endif
-		goto l_bailout;
-	}
-
-#if defined(TRACE) && (TRACE & TRACE_OUTBAND)
-	printf_s("Multiply request put into the backlog\n"
-		"\tParent's fid = 0x%X, allocated fid = 0x%X, peer's fid = 0x%X\n", fidPair.source, newItem->fidPair.source, idSource);
-#endif
 
 	SOCKADDR_HOSTID(newItem->sockAddrTo) = remoteHostID;
 	// While the ALFID part which was assigned dynamically by AllocItem() is preserved
@@ -1250,16 +1390,39 @@ l_bailout:
 
 	// The first packet received is in the parent's session key while
 	// the first responding packet shall be sent in the derived key
+	newItem->contextOfICC.snFirstRecvWithCurrKey = backlogItem.expectedSN + 1;
 	newItem->contextOfICC.InheritR1(contextOfICC, backlogItem.initialSN);
-	newItem->contextOfICC.snFirstRecvWithCurrKey = headPacket->pktSeqNo + 1;
 	//^See also FinalizeMultiply()
-	// Derivation of the new session key is delayed until ULA accepted the multiplication, however.
+	// Assume DoS attacks or replay attacks have been filtered out
+#if defined(TRACE) && (TRACE & TRACE_OUTBAND)
+	printf_s("\nTo acknowledge MULTIPLY/send a PERSIST in LLS, ICC context:\n"
+		"\trecv start SN = %09u, send start sn = %09u\n"
+		"\tALFID of peer's parent = %u, ALFID of near end's parent = %u\n"
+		, newItem->contextOfICC.snFirstRecvWithCurrKey, newItem->contextOfICC.snFirstSendWithCurrKey
+		, this->fidPair.peer, newItem->idParent);
+#endif
+	// note that the responder's key material mirrors the initiator's
+	if (newItem->contextOfICC.keyLifeRemain != 0)
+	{
+		newItem->DeriveKey(newItem->contextOfICC.snFirstRecvWithCurrKey
+			, newItem->contextOfICC.snFirstSendWithCurrKey
+			, this->fidPair.peer
+			, newItem->idParent);
+	}
 
 	newItem->tLastRecv = tLastRecv;	// inherit the time when the MULTIPLY packet was received
 	newItem->tRoundTrip_us = tRoundTrip_us;	// inherit the value of the parent as the initial
 	newItem->tKeepAlive_ms = TRANSIENT_STATE_TIMEOUT_ms;
 	newItem->lowState = NON_EXISTENT;	// so that when timeout it is scavenged
 	newItem->AddTimer();
+
+	// Lastly, put it into the backlog. Put it too early may cause race condition
+	if (pControlBlock->backLog.Put(&backlogItem) < 0)
+	{
+		REPORT_ERRMSG_ON_TRACE("Cannot put the multiplying connection request into the SCB backlog");
+		CLowerInterface::Singleton.FreeItem(newItem);
+		return;
+	}
 
 	Notify(FSP_NotifyAccepting);	// Not necessarily the first one in the queue
 }

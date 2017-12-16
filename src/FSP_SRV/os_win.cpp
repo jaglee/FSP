@@ -600,14 +600,13 @@ inline int CLowerInterface::SetInterfaceOptions(SOCKET sd)
 //	negative, as the error number
 int CLowerInterface::BindSendRecv(const SOCKADDR_IN *pAddrListen, int k)
 {
-#if defined(TRACE) && (TRACE & TRACE_ADDRESS)
 	printf_s("Bind to listen at UDP socket address: %d.%d.%d.%d:%d\n"
 		, pAddrListen->sin_addr.S_un.S_un_b.s_b1
 		, pAddrListen->sin_addr.S_un.S_un_b.s_b2
 		, pAddrListen->sin_addr.S_un.S_un_b.s_b3
 		, pAddrListen->sin_addr.S_un.S_un_b.s_b4
 		, be16toh(pAddrListen->sin_port));
-#endif
+	//
 	if (::bind(sdSend, (const struct sockaddr *)pAddrListen, sizeof(SOCKADDR_IN)) != 0)
 	{
 		REPORT_WSAERROR_TRACE("Cannot bind to the selected address");
@@ -893,8 +892,9 @@ int CLowerInterface::AcceptAndProcess(SOCKET sdRecv)
 		pSocket->OnGetReset(*FSP_OperationHeader<FSP_RejectConnect>());
 		break;
 		// TODO: get hint of explicit congest notification
-	case PERSIST:
+	case ACK_START:
 	case PURE_DATA:
+	case PERSIST:
 	case ACK_FLUSH:
 	case RELEASE:
 	case MULTIPLY:
@@ -1273,8 +1273,7 @@ void CSocketItemEx::HandleFullICC(PktBufferBlock *pktBuf, FSPOperationCode opCod
 	// In the CLONING state only PERSIST is the legitimate acknowledgement to MULTIPLY,
 	// while the acknowledgement itself shall typically originate from some new ALFID.
 	if (fidPair.peer != pktBuf->fidPair.source	// it should be rare
-		&& opCode != MULTIPLY && (lowState != CLONING || opCode != PERSIST)
-		)
+		&& opCode != MULTIPLY && (lowState != CLONING || opCode != ACK_START && opCode != PERSIST) )
 	{
 #ifdef TRACE
 		printf_s("Source fiber ID #%u the packet does not matched context\n", pktBuf->fidPair.source);
@@ -1288,11 +1287,14 @@ void CSocketItemEx::HandleFullICC(PktBufferBlock *pktBuf, FSPOperationCode opCod
 	headPacket = pktBuf;
 	switch (opCode)
 	{
-	case PERSIST:
-		OnGetPersist();
+	case ACK_START:
+		OnGetAckStart();
 		break;
 	case PURE_DATA:
 		OnGetPureData();
+		break;
+	case PERSIST:
+		OnGetPersist();
 		break;
 	case ACK_FLUSH:
 		OnAckFlush();
@@ -1350,7 +1352,7 @@ CommandNewSessionSrv::CommandNewSessionSrv(const CommandToLLS *p1)
 {
 	CommandNewSession *pCmd = (CommandNewSession *)p1;
 	memcpy(this, pCmd, sizeof(CommandToLLS));
-	hMemoryMap = pCmd->hMemoryMap;
+	hMemoryMap = (HANDLE)pCmd->hMemoryMap;
 	dwMemorySize = pCmd->dwMemorySize;
 	hEvent = OpenEventA(EVENT_MODIFY_STATE, FALSE, (LPCSTR)pCmd->szEventName);
 }

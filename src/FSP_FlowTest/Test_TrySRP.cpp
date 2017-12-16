@@ -29,7 +29,7 @@ void TrySRP6()
 	mpz_t p;
 	mpz_t g;
 	mpz_t t;
-
+	DebugBreak();	// And to single-step, watch without printf_s
 	mpz_init_set_str(p, "FFFFFFFF FFFFFFFF C90FDAA2 2168C234 C4C6628B 80DC1CD1"
 		"29024E08 8A67CC74 020BBEA6 3B139B22 514A0879 8E3404DD"
 		"EF9519B3 CD3A431B 302B0A6D F25F1437 4FE1356D 6D51C245"
@@ -57,7 +57,7 @@ void TrySRP6()
 	CryptoNaClHash(h, input, strlen(S) + strlen(U) + strlen(password));
 	mpz_import(x.get_mpz_t(), strlen(S) + strlen(U) + strlen(password), 1, 1, 0, 0, h);
 	// x %= mpz_class(p);	// the value of the 512 bit hash result is clearly less than p
-	mpz_powm_sec(v.get_mpz_t(), g, x.get_mpz_t(), p);
+	mpz_powm(v.get_mpz_t(), g, x.get_mpz_t(), p);
 
 	mpz_class a, b;
 	// prepare the random generator
@@ -73,8 +73,8 @@ void TrySRP6()
 	mpz_class S1;	// S of server
 	mpz_class S_c;	// S of client
 
-	mpz_powm_sec(A.get_mpz_t(), g, a.get_mpz_t(), p);
-	mpz_powm_sec(B.get_mpz_t(), g, b.get_mpz_t(), p);
+	mpz_powm(A.get_mpz_t(), g, a.get_mpz_t(), p);
+	mpz_powm(B.get_mpz_t(), g, b.get_mpz_t(), p);
 	B += 3*v;
 
 	size_t n, m;
@@ -86,17 +86,17 @@ void TrySRP6()
 	// u = H(A, B)		<-(B)
 	// S = (B - 3g^x)^(a + ux)		// (g^b)^(a+ux) = g^b^a * g^b^(ux) = g^a * g^(ux))^b = (g^a*(g^x)^u)^b
 	mpz_class tmp = a + u * x;
-	mpz_powm_sec(t, g, x.get_mpz_t(), p);
+	mpz_powm(t, g, x.get_mpz_t(), p);
 	S_c = B - 3 * mpz_class(t);
-	mpz_powm_sec(t, S_c.get_mpz_t(), tmp.get_mpz_t(), p);
+	mpz_powm(t, S_c.get_mpz_t(), tmp.get_mpz_t(), p);
 	S_c = mpz_class(t);
 	//
 	//	M1 = H(A, B, S)	-> (if M1 was lost, no need to calculate u, S and verify M1)
 	//					u = H(A, B)
 	//					S = (Av^u)^b
-	mpz_powm_sec(S1.get_mpz_t(), v.get_mpz_t(), u.get_mpz_t(), p);
+	mpz_powm(S1.get_mpz_t(), v.get_mpz_t(), u.get_mpz_t(), p);
 	mpz_mul(t, A.get_mpz_t(), S1.get_mpz_t());
-	mpz_powm_sec(S1.get_mpz_t(), t, b.get_mpz_t(), p);
+	mpz_powm(S1.get_mpz_t(), t, b.get_mpz_t(), p);
 
 	assert(S_c == S1);	// if they are equal, M1, M2 would certainly be equal
 	//					verify M1
@@ -105,4 +105,3 @@ void TrySRP6()
 
 	mpz_clears(p, g, t, NULL);
 }
-

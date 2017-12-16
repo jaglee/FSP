@@ -57,6 +57,7 @@ const char *password = "Passw0rd";
 ALIGN(8)
 static uint8_t passwordHash[CRYPTO_NACL_HASHBYTES];
 
+static octet bufSharedKey[CRYPTO_NACL_KEYBYTES];
 static SCHAKAPublicInfo chakaPubInfo;
 static char sessionClientIdString[_MAX_PATH];
 
@@ -121,13 +122,10 @@ static void FSPAPI onPublicKeyReceived(FSPHANDLE h, FSP_ServiceCode c, int r)
 	octet buf[sizeof(sessionClientIdString)];
 	int nBytes = ReadFrom(h, buf, sizeof(buf), NULL);
 	// assert(nBytes <= sizeof(sessionClientIdString));
-	ChakaStreamcrypt((octet *)sessionClientIdString
-		, chakaPubInfo.clientNonce
-		, buf, nBytes
-		, chakaPubInfo.peerPublicKey, bufPrivateKey);
+	CryptoNaClGetSharedSecret(bufSharedKey, chakaPubInfo.peerPublicKey, bufPrivateKey);
+	ChakaStreamcrypt((octet *)sessionClientIdString, buf, nBytes, chakaPubInfo.clientNonce, bufSharedKey);
 
-	FSPControl(h, FSP_GET_PEER_COMMITTED, (ULONG_PTR) & r);
-	if(r == 0)
+	if (!HasReadEoT(h))
 	{
 		printf_s("Protocol is broken: length of client's id should not exceed MAX_PATH\n");
 		Dispose(h);
@@ -174,9 +172,9 @@ static void FSPAPI onClientResponseReceived(FSPHANDLE h, FSP_ServiceCode c, int 
 	}
 	//
 	printf_s("\tTo install the session key instantly...\n");
-	octet bufSharedKey[CRYPTO_NACL_KEYBYTES];
-	CryptoNaClGetSharedSecret(bufSharedKey, chakaPubInfo.peerPublicKey, bufPrivateKey);
 	InstallMasterKey(h, bufSharedKey, SESSION_KEY_SIZE);
+	memset(bufSharedKey, 0, SESSION_KEY_SIZE);
+	memset(bufPrivateKey, 0, CRYPTO_NACL_KEYBYTES);
 
 	// To list files remotely
 	WIN32_FIND_DATA findFileData;

@@ -32,7 +32,6 @@ void FSPAPI onNotice(FSPHANDLE h, FSP_ServiceCode code, int value)
 		r2Finish = finished = true;
 		return;
 	}
-	//
 }
 
 

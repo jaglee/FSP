@@ -143,7 +143,7 @@ bool CLightMutex::WaitSetMutex()
 			return false;
 		}
 		//
-		Sleep(50);
+		Sleep(TIMER_SLICE_ms);
 	}
 	return true;
 }
@@ -155,6 +155,8 @@ bool CLightMutex::WaitSetMutex()
 // Return
 //	true if obtained the mutual-exclusive lock
 //	false if timed out
+// Remark
+//	if there is some thread that has exclusive access on the lock, wait patiently
 bool CSocketItemDl::WaitUseMutex()
 {
 	uint64_t t0 = GetTickCount64();
@@ -166,7 +168,7 @@ bool CSocketItemDl::WaitUseMutex()
 		if(!IsInUse())
 			return false;
 		//
-		Sleep(50);	// if there is some thread that has exclusive access on the lock, wait patiently
+		Sleep(TIMER_SLICE_ms);
 	}
 	//
 	return IsInUse();
@@ -191,7 +193,7 @@ int CSocketItemDl::SelfNotify(FSP_ServiceCode c)
 			BREAK_ON_DEBUG();	// To trace the call stack, there may be deadlock on waiting for free notice slot
 			return -EINTR;
 		}
-		Sleep(50);
+		Sleep(TIMER_SLICE_ms);
 	}
 #ifdef TRACE
 	printf_s("Self notice %s[%d] in local fiber#%u(_%X_), state %s\t\n", noticeNames[c], c
@@ -314,7 +316,7 @@ CSocketItemDl * LOCALAPI CSocketItemDl::CallCreate(CommandNewSession & objComman
 	objCommand.fiberID = fidPair.source;
 	objCommand.idProcess = idThisProcess;
 	objCommand.opCode = cmdCode;
-	objCommand.hMemoryMap = hMemoryMap;
+	objCommand.hMemoryMap = (uint64_t)hMemoryMap;
 	objCommand.dwMemorySize = dwMemorySize;
 	//
 	if(! Call(objCommand, sizeof(objCommand)))
@@ -367,7 +369,7 @@ bool CSocketItemDl::LockAndValidate()
 // The asynchronous, multi-thread friendly soft interrupt handler
 void CSocketItemDl::WaitEventToDispatch()
 {
-	_InterlockedExchange8((char *) & inCritical, inCritical + 1);
+	++inCritical;	// Memory barrier in LockAndValidate() make this statement executed first
 	//
 	while(LockAndValidate())
 	{
@@ -392,9 +394,8 @@ void CSocketItemDl::WaitEventToDispatch()
 #ifndef NDEBUG
 			printf_s(
 				"\nEvent to be processed, but the socket has been recycled!?\n"
-				"\tdescriptor=0x%X, state: %s[%d]\n"
-				, (int32_t)(CSocketItem *)this
-				, stateNames[pControlBlock->state], pControlBlock->state);
+				"\tdescriptor=%p, state: %s[%d]\n"
+				, this, stateNames[pControlBlock->state], pControlBlock->state);
 #endif
 			DisableAndFree();
 			NotifyError(FSP_NotifyReset, -EBADF);
@@ -451,7 +452,7 @@ void CSocketItemDl::WaitEventToDispatch()
 				goto l_return;
 			// Even if there's no callback function to accept data/flags (as in blocking receive mode)
 			// the peerCommitted flag can be set if no further data to deliver
-			if(! HasDataToDeliver())
+			if (!HasDataToDeliver())
 				peerCommitted = 1;
 			//
 			if(InState(CLOSABLE) && initiatingShutdown)

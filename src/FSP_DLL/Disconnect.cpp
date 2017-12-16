@@ -91,8 +91,6 @@ void CSocketItemDl::Disable()
 
 
 
-
-
 // Try to commit current transmit transaction
 // Return 0 if no immediate error, or else the error number
 // The callback function might return code of delayed error
@@ -134,13 +132,18 @@ int FSPAPI Shutdown(FSPHANDLE hFSPSocket, NotifyOrReturn fp1)
 
 
 
-
 // [API:Shutdown]
 //	CLOSABLE-->PRE_CLOSED-->[Send RELEASE]
 //	PRE_CLOSED<-->{keep state}
 //	{ESTABLISHED, COMMITTING, PEER_COMMIT, COMMITTED, COMMITTING2}{try to commit first, chain async-shutdown}
 //	{otherwise: connection not ever established yet}-->{Treat 'Shutdown' command as 'Abort'}
 //	ALWAYS assume that only after it has finished receiving is shutdown called
+// Remark
+//	Shutdown is always somewhat blocking. It is deliberate blocking if fp1 == NULL,
+//	undeliberate if it internally waits for previous Commit to finish.
+//	And it always assume that the caller does not accept further data
+//	In deliberate blocking mode, it sends RELEASE immediately
+//	after data has been committed but does not wait for acknowledgement
 int LOCALAPI CSocketItemDl::Shutdown(NotifyOrReturn fp1)
 {
 	if(! WaitUseMutex())
@@ -205,22 +208,34 @@ int LOCALAPI CSocketItemDl::Shutdown(NotifyOrReturn fp1)
 		return (Call<FSP_Shutdown>() ? 0 : -EIO);
 	}
 
-	return Commit();
+	int r = InState(COMMITTED) ? 0 : Commit();
+	if(fpCommitted != NULL || r < 0)
+		return r;
+
+#ifndef _NO_LLS_CALLABLE
+	while(InState(COMMITTED))
+	{
+		Sleep(TIMER_SLICE_ms);
+	}
+	//^pure blocking mode: wait it to transit to CLOSABLE, CLOSED or NON_EXISTENT state
+	if (InState(CLOSABLE))
+	{
+		SetState(PRE_CLOSED);
+		SetMutexFree();
+		return (Call<FSP_Shutdown>() ? 0 : -EIO);
+	}
+#endif
+
+	return r;
 }
 
 
 
-// Internal API for committing/flushing a transmit transaction
-// Assume that it has obtained the mutex lock
-// It is somewhat a little tricky to commit a transmit tranaction:
-// Case 1, it is in sending a stream or obtaining send buffer, and there are yet some data to be buffered
-// Case 2, the send queue is empty at all
-// Case 3, there is set some block to be sent in the send queue
-// Case 4, all blocks have been sent and the tail of the send queue has already been marked EOT
-// Case 5, all blocks have been sent and the tail of the send queue could not set with EOT flag
 // [API:Commit]
 //	{COMMITTED, CLOSABLE, PRE_CLOSED, CLOSED}-->{keep state}
-//	{ESTABLISHED, COMMITTING, PEER_COMMIT, COMMITTED, COMMITTING2}{try to commit first, chain async-shutdown}
+//	ESTABLISHED-->COMMITTING
+//	PEER_COMMIT-->COMMITTING2
+//	{COMMITTING, COMMITTING2}-->{keep state}
 //	{otherwise: failed}
 int LOCALAPI CSocketItemDl::Commit(NotifyOrReturn fp1)
 {
@@ -262,6 +277,14 @@ int LOCALAPI CSocketItemDl::Commit(NotifyOrReturn fp1)
 
 
 
+// Internal API for committing/flushing a transmit transaction
+// Assume that it has obtained the mutex lock
+// It is somewhat a little tricky to commit a transmit tranaction:
+// Case 1, it is in sending a stream or obtaining send buffer, and there are yet some data to be buffered
+// Case 2, the send queue is empty at all
+// Case 3, there is set some block to be sent in the send queue
+// Case 4, all blocks have been sent and the tail of the send queue has already been marked EOT
+// Case 5, all blocks have been sent and the tail of the send queue could not set with EOT flag
 // Remark
 //	It is possible that a rogue ULA managed to call FSP_Send more frequently than fair share
 //	However the LLS would prevent abnormally frequent FSP_Commit from abusing
@@ -270,12 +293,6 @@ int CSocketItemDl::Commit()
 	SetEndTransaction();
 
 	// The last resort: flush sending stream if it has not yet been committed
-	if (InState(COMMITTED))
-	{
-		SetMutexFree();
-		return 0;
-	}
-
 	if (InState(COMMITTING) || InState(COMMITTING2))
 	{
 		SetMutexFree();
@@ -304,7 +321,8 @@ int CSocketItemDl::Commit()
 	if(fpCommitted != NULL)
 		return yetSomeDataToBuffer ? 0 : (Call<FSP_Commit>() ? 0 : -EIO);
 
-	// blocking mode:
+	// Or else it is in blocking mode:
+#ifndef _NO_LLS_CALLABLE
 	if (!yetSomeDataToBuffer && !Call<FSP_Commit>())
 	{
 #ifdef TRACE
@@ -313,7 +331,6 @@ int CSocketItemDl::Commit()
 		return -EIO;
 	}
 	// Assume the caller has set time-out clock
-#ifndef _NO_LLS_CALLABLE
 	do
 	{
 		Sleep(TIMER_SLICE_ms);

@@ -77,10 +77,16 @@
 #include <sys/stat.h>
 
 #include "defs.h"
+#include "../Crypto/CHAKA.h"
 
 
 // Storage of private key SHOULD be allocated with random address layout
-static unsigned char bufPrivateKey[CRYPTO_NACL_KEYBYTES];
+static octet bufPrivateKey[CRYPTO_NACL_KEYBYTES];
+static octet bufSharedKey[CRYPTO_NACL_KEYBYTES];
+ALIGN(8)
+static SCHAKAPublicInfo chakaPubInfo;
+static char inputPassword[80];
+static void SetStdinEcho(bool enable = true);
 
 // Request string towards the remote tunnel server
 static char tunnelRequest[80];
@@ -97,8 +103,8 @@ static void FSPAPI onError(FSPHANDLE, FSP_ServiceCode, int);
 
 // for master connection
 static int	FSPAPI onConnected(FSPHANDLE, PFSP_Context);
-static void FSPAPI onPublicKeySent(FSPHANDLE, FSP_ServiceCode, int);
-static void FSPAPI onRequestSent(FSPHANDLE, FSP_ServiceCode, int);
+static void FSPAPI onServerResponseReceived(FSPHANDLE, FSP_ServiceCode, int);
+static int	FSPAPI onClientResponseSent(FSPHANDLE, void *, int32_t, BOOL);
 static bool	FSPAPI onResponseReceived(FSPHANDLE, void *, int32_t, bool);
 
 // for child connection
@@ -401,8 +407,8 @@ TpWorkCallBack(PTP_CALLBACK_INSTANCE Instance, PVOID parameter, PTP_WORK Work)
 	parms.sendSize = BUFFER_POOL_SIZE;
 	parms.welcome = &p->req;
 	parms.len = (unsigned short)sizeof(p->req);
-	parms.signatureULA = (ulong_ptr)p;
-	//^For 
+	parms.extentI64ULA = (ulong_ptr)p;
+	//
 	FSPHANDLE h = MultiplyAndWrite(hClientMaster, & parms, TO_END_TRANSACTION, onSubrequestSent);
 	if(h == NULL)
 	{
@@ -484,12 +490,7 @@ static void FSPAPI onError(FSPHANDLE h, FSP_ServiceCode code, int value)
 // buffer block available and the public key fits in one buffer block 
 static int	FSPAPI  onConnected(FSPHANDLE h, PFSP_Context ctx)
 {
-	unsigned char bufPublicKey[CRYPTO_NACL_KEYBYTES];
-	unsigned char bufPeersKey[CRYPTO_NACL_KEYBYTES];
-	unsigned char bufSharedKey[CRYPTO_NACL_KEYBYTES];
-#ifdef TRACE
-	printf_s("\nHandle of FSP session: %p", h);
-#endif
+	printf_s("\nConnecting to remote FSP SOCKS tunnel server... Handle of FSP session: %p\n", h);
 	if(h == NULL)
 	{
 		printf_s("\n\tConnection failed.\n");
@@ -497,56 +498,73 @@ static int	FSPAPI  onConnected(FSPHANDLE h, PFSP_Context ctx)
 	}
 
 	int mLen = strlen((const char *)ctx->welcome) + 1;
-#ifdef TRACE
-	printf_s("\tWelcome message length: %d\n", ctx->len);
-	printf_s("%s\n", ctx->welcome);
-#endif
-	memcpy(bufPeersKey, (const char *)ctx->welcome + mLen, CRYPTO_NACL_KEYBYTES);
+	printf_s("Welcome message received: %s\n", (const char *)ctx->welcome);
 
-	CryptoNaClKeyPair(bufPublicKey, bufPrivateKey);
+	InitCHAKAClient(chakaPubInfo, bufPrivateKey);
+	memcpy(chakaPubInfo.peerPublicKey, (const char *)ctx->welcome + mLen, CRYPTO_NACL_KEYBYTES);
 
-#ifdef TRACE
-	printf_s("\nTo send the key material for shared key agreement...\n");
-#endif
-	WriteTo(h, bufPublicKey, CRYPTO_NACL_KEYBYTES, TO_END_TRANSACTION, onPublicKeySent);
+	WriteTo(h, chakaPubInfo.selfPublicKey, sizeof(chakaPubInfo.selfPublicKey), 0, NULL);
+	WriteTo(h, & chakaPubInfo.clientNonce, sizeof(chakaPubInfo.clientNonce), 0, NULL);
+	// And suffixed with the client's identity
 
-#ifdef TRACE
-	printf_s("\tTo install the shared key instantly...\n");
-#endif
-	CryptoNaClGetSharedSecret(bufSharedKey, bufPeersKey, bufPrivateKey);
-	InstallMasterKey(h, bufSharedKey, CRYPTO_NACL_KEYBYTES);
+	char userName[80];
+	printf_s("Please input the username: ");
+	scanf_s("%s", userName, _countof(userName));
+	printf_s("Please input the password: ");
+	scanf_s("%s", inputPassword, _countof(inputPassword));
+	fgetc(stdin);	// Skip Carriage Return
+	// this is just a demonstration, so don't hide the input
+
+	int nBytes = (int)strlen(userName) + 1;
+	octet buf[MAX_PATH];
+	// assert(strlen(theUserId) + 1 <= sizeof(buf));
+	CryptoNaClGetSharedSecret(bufSharedKey, chakaPubInfo.peerPublicKey, bufPrivateKey);
+	ChakaStreamcrypt(buf, (octet *)userName, nBytes, chakaPubInfo.clientNonce, bufSharedKey);
+	WriteTo(h, buf, nBytes, TO_END_TRANSACTION, NULL);
+
+	ReadFrom(h, chakaPubInfo.salt, sizeof(chakaPubInfo.salt), onServerResponseReceived);
 
 	return 0;
 }
 
 
 
-static void FSPAPI onPublicKeySent(FSPHANDLE h, FSP_ServiceCode c, int r)
+// second round C->S
+static void FSPAPI onServerResponseReceived(FSPHANDLE h, FSP_ServiceCode c, int r)
 {
-#ifdef TRACE
-	printf_s("Result of sending public key: %d\n", r);
-#endif
-	if(r < 0)
+	ReadFrom(h, & chakaPubInfo.serverNonce, sizeof(chakaPubInfo.serverNonce) + sizeof(chakaPubInfo.serverRandom), NULL);
+	ReadFrom(h, chakaPubInfo.peerResponse, sizeof(chakaPubInfo.peerResponse), NULL);
+	// The peer should have commit the transmit transaction. Integrity is assured
+	if (!HasReadEoT(h))
+	{
+		printf_s("Protocol is broken: length of client's id should not exceed MAX_PATH\n");
+		Dispose(h);
+		return;
+	}
+
+	octet clientInputHash[CRYPTO_NACL_HASHBYTES];
+	MakeSaltedPassword(clientInputHash, chakaPubInfo.salt, inputPassword);
+
+	octet clientResponse[CRYPTO_NACL_HASHBYTES];
+	if(! CHAKAResponseByClient(chakaPubInfo, clientInputHash, clientResponse))
 	{
 		Dispose(h);
 		return;
 	}
+
+	WriteTo(h, clientResponse, sizeof(clientResponse), TO_END_TRANSACTION, NULL);
+
+	InstallMasterKey(h, bufSharedKey, SESSION_KEY_SIZE);
+	memset(bufSharedKey, 0, SESSION_KEY_SIZE);
+	memset(bufPrivateKey, 0, CRYPTO_NACL_KEYBYTES);
+	printf_s("\nThe session key to be authenticated has been pre-installed.\n");
 
 	printf_s("To send tunnel request towards the tunnel server (the remote tunnel end):\n");
 	puts(tunnelRequest);
-	WriteTo(h, tunnelRequest, strlen(tunnelRequest), TO_END_TRANSACTION, onRequestSent);
-}
+	WriteTo(h, tunnelRequest, strlen(tunnelRequest), TO_END_TRANSACTION, NULL);
 
-
-
-// TODO: client's side authentication & authorization
-static void FSPAPI onRequestSent(FSPHANDLE h, FSP_ServiceCode c, int r)
-{
 	if(RecvInline(h, onResponseReceived) < 0)
-	{
 		Dispose(h);
-		return;
-	}
 }
 
 
@@ -558,23 +576,25 @@ static bool FSPAPI onResponseReceived(FSPHANDLE h, void * buf, int32_t len, bool
 	if(buf == NULL || len <= 0 || h != hClientMaster)
 	{
 		Dispose(h);
-		return FALSE;
+		return false;
 	}
 	//
 	// TODO: process the buffer!
 	//
 	if(eot && RecvInline(h, onResponseReceived) < 0)
+	{
 		Dispose(h);
+		return false;
+	}
 
-	return TRUE;
+	return true;
 }
 
 
 
 static void FSPAPI onSubrequestSent(FSPHANDLE h, FSP_ServiceCode c, int value)
 {
-	PRequestPoolItem p;
-	FSPControl(h, FSP_GET_EXT_POINTER, (ulong_ptr) & p);
+	PRequestPoolItem p = (PRequestPoolItem)GetExtPointer(h);
 	if(p == NULL)
 	{
 		Dispose(h);
@@ -597,4 +617,32 @@ static void FSPAPI onSubrequestSent(FSPHANDLE h, FSP_ServiceCode c, int value)
 	p->hFSP = h;
 	RecvInline(h, onFSPDataAvailable);
 	GetSendBuffer(h, toReadTCPData);
+}
+
+
+
+static void SetStdinEcho(bool enable)
+{
+#ifdef WIN32
+    HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE); 
+    DWORD mode;
+    GetConsoleMode(hStdin, &mode);
+
+    if( !enable )
+        mode &= ~ENABLE_ECHO_INPUT;
+    else
+        mode |= ENABLE_ECHO_INPUT;
+
+    SetConsoleMode(hStdin, mode );
+
+#else
+    struct termios tty;
+    tcgetattr(STDIN_FILENO, &tty);
+    if( !enable )
+        tty.c_lflag &= ~ECHO;
+    else
+        tty.c_lflag |= ECHO;
+
+    (void) tcsetattr(STDIN_FILENO, TCSANOW, &tty);
+#endif
 }

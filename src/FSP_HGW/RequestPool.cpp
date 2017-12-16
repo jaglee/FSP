@@ -86,8 +86,7 @@ PRequestPoolItem RequestPool::AllocItem()
 
 PRequestPoolItem RequestPool::FindItem(FSPHANDLE h)
 {
-	PRequestPoolItem p;
-	FSPControl(h, FSP_GET_EXT_POINTER, (ulong_ptr) & p);
+	PRequestPoolItem p = (PRequestPoolItem)GetExtPointer(h);
 	//
 	return (p == NULL || p->hFSP != h ? NULL : p);
 }

@@ -58,7 +58,7 @@ static void FSPAPI onPublicKeyReceived(FSPHANDLE h, FSP_ServiceCode c, int r)
 
 	printf_s("\tTo send filename to the remote end...\n");
 	// multi-byte character set only:
-	WriteTo(h, fileName, strlen(fileName) + 1, TO_END_TRANSACTION, onFileNameSent);
+	WriteTo(h, fileName, (int)strlen(fileName) + 1, TO_END_TRANSACTION, onFileNameSent);
 }
 
 
@@ -102,7 +102,7 @@ static int FSPAPI toSendNextBlock(FSPHANDLE h, void * batchBuffer, int32_t capac
 		return -ENOMEM;
 	}
 
-	int bytesRead = __min(sizeOfBuffer - offset, (size_t)capacity);
+	int bytesRead = __min((int32_t)sizeOfBuffer - offset, capacity);
 	memcpy(batchBuffer, bytesToSend + offset, bytesRead);
 	printf_s("To send %d bytes to the remote end. %d bytes have been sent before.\n", bytesRead, offset);
 

@@ -68,8 +68,12 @@ CSocketItemEx * CSocketSrvTLB::AllocItem()
 		headFreeSID = p->next;
 		if (headFreeSID == NULL)
 			tailFreeSID = NULL;
+#ifdef NDEBUG
+		p->TestSetInUse();
+#else
 		if (!p->TestSetInUse())
-			BREAK_ON_DEBUG();
+			DebugBreak();	// BREAK_ON_DEBUG();
+#endif
 		p->next = NULL;
 	}
 	else
@@ -224,6 +228,10 @@ void CSocketSrvTLB::FreeItemDonotCareLock(CSocketItemEx *p)
 		tailFreeSID = p;
 		p->next = NULL;	// in case it is not
 	}
+
+	bzero(&p->contextOfICC, sizeof(ICC_Context));
+	//^For sake of security enforcement.
+	// It might be unfriendly for connection resurrection. However, here security takes precedence.
 }
 
 
@@ -615,11 +623,6 @@ void CSocketItemEx::AffirmConnect(const SConnectParam & initState, ALFID_T idLis
 // See InitiateConnect and @DLL ULA FSPAPI ConnectMU
 // Given
 //	CSocketItemEx *		Pointer to the source socket slot. The nextOOBSN field would be updated
-// Remark
-//	On get the peer's PERSIST the socket would be put into the remote id's translate look-aside buffer
-//	In some extreme situation the peer's PERSIST to MULTIPLY could be received before tSessionBegin was set
-//	and such an acknowledgement is effectively lost
-//	however, it is not a fault but is a feature in sake of proper state management
 // See also
 //	OnConnectRequestAck; CSocketItemDl::ToWelcomeConnect; CSocketItemDl::ToWelcomeMultiply
 void CSocketItemEx::InitiateMultiply(CSocketItemEx *srcItem)
@@ -630,6 +633,8 @@ void CSocketItemEx::InitiateMultiply(CSocketItemEx *srcItem)
 	pControlBlock->nearEndInfo.idALF = fidPair.source;	// and pass back to DLL/ULA
 	pControlBlock->connectParams = srcItem->pControlBlock->connectParams;
 	InitAssociation();
+	// pControlBlock->idParent was set in @DLL::ToPrepareMultiply()
+	assert(idParent == pControlBlock->idParent);	// Set in InitAssocation
 	assert(fidPair.peer == srcItem->fidPair.peer);	// Set in InitAssociation
 
 	ControlBlock::seq_t seq0 = pControlBlock->sendWindowNextSN;	// See also @DLL::ToPrepareMultiply
@@ -671,6 +676,11 @@ void CSocketItemEx::InitiateMultiply(CSocketItemEx *srcItem)
 
 // On getting the peer's response to MULTIPLY, fill in the proper field of contextOfICC
 // so that the derived new session key is put into effect
+// Remark
+//	On get the peer's ACK_START/PERSIST the socket would be put into the remote id's translate look-aside buffer
+//	In some extreme situation the peer's ACK_START/PERSIST to MULTIPLY could be received before tSessionBegin was set
+//	and such an acknowledgement is effectively lost
+//	however, it is not a fault but is a feature in sake of proper state management
 bool CSocketItemEx::FinalizeMultiply()
 {
 	ALFID_T idPeerParent = _InterlockedExchange((long *)&pControlBlock->peerAddr.ipFSP.fiberID, headPacket->fidPair.source);
@@ -678,29 +688,32 @@ bool CSocketItemEx::FinalizeMultiply()
 	//^See also ResponseToMultiply()
 	InitAssociation();	// reinitialize with new peer's ALFID
 	assert(fidPair.peer == headPacket->fidPair.source);
-#if defined(TRACE) && (TRACE & TRACE_PACKET)
-	printf_s("\nGet the acknowledgement PERSIST to MULTIPLY in LLS, ICC context:\n"
+#if defined(TRACE) && (TRACE & TRACE_OUTBAND)
+	printf_s("\nGet the acknowledgement ACK_START/PERSIST to MULTIPLY in LLS, ICC context:\n"
 		"\tsend start SN = %09u, recv start sn = %09u\n"
-		"\tnear end's ALFID  = %u, ALFID of peer's parent = %u\n"
+		"\tALFID of near end's parent = %u, ALFID of peer's parent = %u\n"
 		, contextOfICC.snFirstSendWithCurrKey, contextOfICC.snFirstRecvWithCurrKey
-		, fidPair.source, idPeerParent);
+		, idParent, idPeerParent);
 #endif
-	if (contextOfICC.keyLifeRemain == 0)
-		contextOfICC.curr = contextOfICC.prev;
-	else
-		DeriveNextKey(contextOfICC.snFirstSendWithCurrKey, contextOfICC.snFirstRecvWithCurrKey, fidPair.source, idPeerParent);
+	if (contextOfICC.keyLifeRemain != 0)
+	{
+		DeriveKey(contextOfICC.snFirstSendWithCurrKey
+			, contextOfICC.snFirstRecvWithCurrKey
+			, idParent
+			, idPeerParent);
+	}
 
 	if (!ValidateICC())
 	{
-		BREAK_ON_DEBUG();	//TRACE_HERE("Invalid intergrity check code of PERSIST to MULTIPLY!?");
+		BREAK_ON_DEBUG();	//TRACE_HERE("Invalid intergrity check code of ACK_START/PERSIST to MULTIPLY!?");
 		return false;
 	}
 
 #if defined(TRACE) && (TRACE & TRACE_OUTBAND)
-	printf_s("Response of MULTIPLY was received in LLS, recvBufferBlockN = %d\n"
-		"\tParent's fiber#%u, allocated fiber#%u, peer's fiber#%u\n"
+	printf_s("Response of MULTIPLY was accepted, recvBufferBlockN = %d\n"
+		"\tAllocated fiber#%u, peer's fiber#%u\n"
 		, pControlBlock->recvBufferBlockN
-		, idParent, fidPair.source, fidPair.peer);
+		, fidPair.source, fidPair.peer);
 #endif
 	RestartKeepAlive();
 	// And continue to accept the payload in the caller
@@ -726,29 +739,20 @@ void CMultiplyBacklogItem::ResponseToMultiply()
 
 	*(& skb->len + 1) = *(& TempSocketBuf()->len + 1);
 	skb->len = CopyOutPlainText(ubuf);
-	if (skb->GetFlag<TransactionEnded>())
-		SetState(pControlBlock->state == COMMITTING ? COMMITTING2 : PEER_COMMIT);
-	else
-		SyncState();
-	//^See also OnGetMultiply, ControlBlock::FSP_SocketBuf 
-	pControlBlock->recvWindowNextSN++;
-	pControlBlock->recvWindowNextPos++;
+	pControlBlock->recvWindowExpectedSN = ++pControlBlock->recvWindowNextSN;
+	_InterlockedIncrement((LONG *)&pControlBlock->recvWindowNextPos);
 	// The receive buffer is eventually ready
 
-	// assume contextOfICC, including snFirstRecvWithCurrKey and snFirstSendWithCurrKey has been set properly
-	ALFID_T & idParent = pControlBlock->idParent;
-#if defined(TRACE) && (TRACE & TRACE_PACKET)
-	printf_s("\nTo acknowledge MULTIPLY/send a PERSIST in LLS, ICC context:\n"
-		"\trecv start SN = %09u, send start sn = %09u\n"
-		"\tpeer's ALFID  = %u, near end's parent ALFID  = %u\n"
-		, contextOfICC.snFirstRecvWithCurrKey, contextOfICC.snFirstSendWithCurrKey
-		, fidPair.peer, idParent);
-#endif
-	// note that the responder's key material mirrors the initiator's
-	if (contextOfICC.keyLifeRemain == 0)
-		contextOfICC.curr = contextOfICC.prev;
+	if (skb->GetFlag<TransactionEnded>())
+	{
+		SetState(pControlBlock->state == COMMITTING ? COMMITTING2 : PEER_COMMIT);
+		SignalFirstEvent(FSP_NotifyToCommit);					// And deliver data instantly if it is to commit
+	}
 	else
-		DeriveNextKey(contextOfICC.snFirstRecvWithCurrKey, contextOfICC.snFirstSendWithCurrKey, fidPair.peer, idParent);
+	{
+		SyncState();
+		pControlBlock->notices.SetHead(FSP_NotifyDataReady);	// But do not signal until next packet is received
+	}
 }
 
 
@@ -771,13 +775,12 @@ void CSocketItemEx::Accept()
 		InstallEphemeralKey();
 		//^ ephemeral session key material was ready when CSocketItemDl::PrepareToAccept
 		pControlBlock->notices.SetHead(NullCommand);
-		//^ The success or failure signal is delayed until PERSIST or RESET received
+		//^ The success or failure signal is delayed until ACK_START, PERSIST or RESET received
 	}
 	else
 	{
 		// Timer has been set when the socket slot was prepared on getting MULTIPLY
 		((CMultiplyBacklogItem *)this)->ResponseToMultiply();
-		SignalFirstEvent(FSP_NotifyDataReady);
 		// UNRESOLVED!? Implement lazy notification to wait further data?
 		AddResendTimer(tRoundTrip_us >> 8);	// tRoundTrip_us was set OnGetMultiply
 	}
@@ -786,19 +789,6 @@ void CSocketItemEx::Accept()
 	pControlBlock->SetFirstSendWindowRightEdge();
 	//
 	tSessionBegin = tRecentSend;
-}
-
-
-
-// With replay-attack suppression. It could be true while still be out of window
-// TODO! anti-replay attack by manage a replay-attack cache!?
-bool CSocketItemEx::ICCSeqValid()
-{
-	int32_t d = IsOutOfWindow(headPacket->pktSeqNo);
-	if (d > 0 || d <= -MAX_BUFFER_BLOCKS)
-		return false;
-	//
-	return ValidateICC();
 }
 
 

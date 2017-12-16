@@ -76,6 +76,7 @@ int FSPAPI ReadFrom(FSPHANDLE hFSPSocket, void *buf, int capacity, NotifyOrRetur
 //	0 if no error, negative if error detected on calling the function
 // Remark
 //  Return immediately if there is no data available yet.
+//	Each calling of RecvInline() should accept one and only one transmit transaction from the peer
 int CSocketItemDl::RecvInline(CallbackPeeked fp1)
 {
 	if (!WaitUseMutex())
@@ -87,6 +88,12 @@ int CSocketItemDl::RecvInline(CallbackPeeked fp1)
 		return -EADDRINUSE;
 	}
 
+	if (peerCommitPending)
+	{
+		SetMutexFree();
+		return -EDOM;	// May not call RecvInline if previous ReadFrom with decompression unfinished
+	}
+
 	if (InterlockedExchangePointer((PVOID *)& fpPeeked, fp1) != NULL)
 	{
 #ifdef TRACE
@@ -94,7 +101,7 @@ int CSocketItemDl::RecvInline(CallbackPeeked fp1)
 #endif
 	}
 	//
-	peerCommitPending = peerCommitted = 0;	// See also ProcessReceiveBuffer()
+	peerCommitted = 0;	// peerCommitted is actually a per-transaction flag
 	if (HasDataToDeliver())
 	{
 		SetMutexFree();
@@ -122,7 +129,7 @@ int CSocketItemDl::RecvInline(CallbackPeeked fp1)
 int LOCALAPI CSocketItemDl::ReadFrom(void * buffer, int capacity, NotifyOrReturn fp1)
 {
 #ifdef TRACE
-	printf_s("ReadFrom the FSP pipe to 0x%08X: byte[%d]\n", (LONG)buffer, capacity);
+	printf_s("ReadFrom the FSP pipe to %p: byte[%d]\n", buffer, capacity);
 #endif
 	if (!WaitUseMutex())
 		return -EDEADLK;
@@ -140,7 +147,6 @@ int LOCALAPI CSocketItemDl::ReadFrom(void * buffer, int capacity, NotifyOrReturn
 		return -EADDRINUSE;
 	}
 
-	peerCommitPending = peerCommitted = 0;	// See also FetchReceived()
 	bytesReceived = 0;
 	waitingRecvSize = capacity;
 
@@ -161,26 +167,25 @@ int LOCALAPI CSocketItemDl::ReadFrom(void * buffer, int capacity, NotifyOrReturn
 
 	// If it is blocking, wait until every slot in the receive buffer has been filled
 	// or the peer has committed the transmit transaction
-	uint64_t t0 = GetTickCount64();
+	peerCommitted = 0;	// See also ProcessReceiveBuffer, ReadInline
 	int32_t r;
-	while ((r = FetchReceived()) >= 0 && bytesReceived < capacity)
+	while ((r = FetchReceived()) >= 0 && _InterlockedOr((LONG *)&bytesReceived, 0) < capacity)
 	{
+		uint64_t t0 = GetTickCount64();
 		do
 		{
 			if (peerCommitted)
 				goto l_postloop;
 			SetMutexFree();
-			Sleep(50);
+			Sleep(TIMER_SLICE_ms);
 			if (GetTickCount64() - t0 > MAX_LOCK_WAIT_ms)
 				return -EDEADLK;
 			if (!WaitUseMutex())
 				return -EDEADLK;
 		} while (!HasDataToDeliver());
 	}
+	// Assert: if(peerCommitted) the decode buffer MUST have been flushed. See also FlushDecodeBuffer()
 l_postloop:
-	if(peerCommitted)
-		FlushDecodeState();
-	//
 	waitingRecvBuf = NULL;
 	SetMutexFree();
 	//
@@ -192,49 +197,35 @@ l_postloop:
 
 
 // Return
-//	-EDOM	(-33)	if the packet size does not comform to the protocol
+//	-EDOM	(-33)	if the PERSIST packet of the size of some packet does not comform to the protocol
 //	-EFAULT (-14)	if the packet buffer was broken
 //	-ENOMEM (-12)	if it is to decompress, but there is no enough memory for internal buffer
 //	non-negative: number of octets fetched. might be zero
 // Remark
 //	Left border of the receive window is slided if RecvInline has been called
 //	but the inquired receive buffer has not been unlocked
-//	Skip payload-less PERSIST meant to be in-band acknowledgment that starts a new transmit transaction
-inline
+//	A payload-less PERSIST with EndOfTransaction flag set would make it return instantly
+//	Automatically decompress, but the return value is the size of the raw data, not the decompression result
 int32_t CSocketItemDl::FetchReceived()
 {
-	ControlBlock::PFSP_SocketBuf p;
-	int n, sum = 0;
-	while(HasDataToDeliver())
+	// Data that remain in the internal decompression buffer must be fetched firstly
+	if (HasInternalBufferedToDeliver())
 	{
-		p = pControlBlock->GetFirstReceived();
-		if(p->opCode == PERSIST)
-		{
-			if(p->len > 0)
-				goto l_continue;
-			//
-			p->opCode = (FSPOperationCode)0;
-		}
-		else if(p->opCode != 0)
-		{
-			goto l_continue;
-		}
-		//
-		pControlBlock->SlideRecvWindowByOne();
-		p->SetFlag<IS_FULFILLED>(false);
-		if (p->GetFlag<TransactionEnded>())
-		{
-			peerCommitted = 1;
+		FlushDecodeBuffer();
+		if (peerCommitted)
 			return 0;
-		}
 	}
-	return 0;
+	if (pControlBlock->CountDeliverable() <= 0)
+		return 0;
+
+	ControlBlock::PFSP_SocketBuf p = pControlBlock->GetFirstReceived();
+	int sum = 0;
+	int n;
 	//
-l_continue:
 	if(p->GetFlag<Compressed>() && pDecodeState == NULL && !AllocDecodeState())
 		return -ENOMEM;
 	//
-	for(; p->GetFlag<IS_FULFILLED>(); p = pControlBlock->GetFirstReceived())
+	for (; p->GetFlag<IS_FULFILLED>(); p = pControlBlock->GetFirstReceived())
 	{
 		if(p->len > MAX_BLOCK_SIZE || p->len < 0)
 			return -EFAULT;
@@ -281,8 +272,9 @@ l_continue:
 		//
 		if(p->GetFlag<TransactionEnded>())
 		{
-			peerCommitted = 1; // might be copied to peerCommitPending and then cleared by FlushDecodeState
-			FlushDecodeState();
+			peerCommitted = 1;	// might be copied to peerCommitPending and then cleared by FlushDecodeBuffer
+			if(pDecodeState != NULL)
+				FlushDecodeBuffer();
 			break;
 		}
 		//
@@ -308,26 +300,23 @@ void CSocketItemDl::ProcessReceiveBuffer()
 	//
 	CallbackPeeked fp1;
 	int32_t n;
+	//^in case that the flag set by previous RecvInline or FetchReceived disturbs current process
 	// RecvInline takes precedence
-	if((fp1 = (CallbackPeeked)InterlockedExchangePointer((PVOID *) & fpPeeked, NULL)) != NULL)
+	if ((fp1 = (CallbackPeeked)InterlockedExchangePointer((PVOID *)& fpPeeked, NULL)) != NULL)
 	{
-#ifdef TRACE
-		printf_s("RecvInline...\n");
-#endif
 		bool eot;
 		void *p = pControlBlock->InquireRecvBuf(n, eot);
 #ifdef TRACE
-		printf_s("Data to deliver@%p, length = %d, eot = %d\n", p, n, (int)eot);
+		printf_s("RecvInline, data to deliver@%p, length = %d, eot = %d\n", p, n, (int)eot);
 #endif
-		// If end-of-transaction encountered reset fpPeeked so that RecvInline() may work
-		if(eot)
+		if (eot)
 		{
 #ifdef TRACE
 			printf_s("Transmit transaction terminated\n");
 #endif
 			peerCommitted = 1;
 		}
-		else if(n == 0) // when the last message is a payload-less PERSIST without the EoT flag set
+		else if (n == 0) // when the last message is a payload-less PERSIST without the EoT flag set
 		{
 			Call<FSP_AdRecvWindow>();
 			fpPeeked = fp1;
@@ -338,27 +327,19 @@ void CSocketItemDl::ProcessReceiveBuffer()
 		SetMutexFree();
 
 		// Manage to recover from possible error, hope that lower-precedence ReadFrom is ready
+		// UNRESOLVED! Is error recovery possible?
 		bool b = fp1(this, p, n, eot);
-		if(n < 0)
+		if (n < 0)
 		{
 			SelfNotify(FSP_NotifyDataReady);
 			return;
 		}
 
 		WaitUseMutex();
-		if(b)
+		if (b)
 			fpPeeked = fp1;
-
 		// Assume the call-back function did not mess up the receive queue
-		int r = MarkReceiveFinished(n);
-		if(r < 0)
-		{
-#ifdef TRACE
-			printf_s("Protocol implementation failure? MarkReceiveFinished() returned %d\n", r);
-#endif
-			BREAK_ON_DEBUG();
-			// UNRESOLVED! error recovery?
-		}
+		n = pControlBlock->MarkReceivedFree(n);
 
 		if (HasDataToDeliver())
 		{
@@ -375,20 +356,21 @@ void CSocketItemDl::ProcessReceiveBuffer()
 	}
 
 	// it is possible that data is buffered and waiting to be delivered to ULA
-	if(waitingRecvBuf == NULL || waitingRecvSize <= 0 || fpReceived == NULL)
+	if (waitingRecvBuf == NULL || waitingRecvSize <= 0 || fpReceived == NULL || !HasDataToDeliver())
 	{
 		SetMutexFree();
 		return;
 	}
 
+	peerCommitted = 0;	// Safely suppose there's some data to deliver
 	n = FetchReceived();
-	if(n < 0)
+	if (n < 0)
 	{
 		SetMutexFree();
 #ifdef TRACE
 		printf_s("FetchReceived() return %d when ProcessReceiveBuffer\n", n);
 #endif		
-		if(fpReceived != NULL)
+		if (fpReceived != NULL)
 			fpReceived(this, FSP_NotifyDataReady, n);
 		else
 			NotifyError(FSP_NotifyDataReady, n);
@@ -397,13 +379,13 @@ void CSocketItemDl::ProcessReceiveBuffer()
 
 	Call<FSP_AdRecvWindow>();
 
-	if(peerCommitted || waitingRecvSize <= 0)
+	if (peerCommitted || waitingRecvSize <= 0)
 	{
-		NotifyOrReturn fp1 = (NotifyOrReturn)InterlockedExchangePointer((PVOID *) & fpReceived, NULL);
+		NotifyOrReturn fp1 = (NotifyOrReturn)InterlockedExchangePointer((PVOID *)& fpReceived, NULL);
 		waitingRecvBuf = NULL;
 		SetMutexFree();
 		// due to multi-task nature it could be already reset in the caller although fpReceived has been checked here
-		if(fp1 != NULL)
+		if (fp1 != NULL)
 			fp1(this, FSP_NotifyDataReady, bytesReceived);
 	}
 	else

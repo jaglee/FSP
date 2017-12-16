@@ -8,8 +8,8 @@
 // If compiled in Debug mode with the '_DEBUG' macro predefined by default, it tests FSP over UDP/IPv4
 // If compiled in Release mode, or anyway without the '_DEBUG' macro predefined, it tests FSP over IPv6
 #ifdef _DEBUG
-# define REMOTE_APPLAYER_NAME "192.168.9.125:80"
-//# define REMOTE_APPLAYER_NAME "localhost:80"
+// # define REMOTE_APPLAYER_NAME "192.168.9.125:80"
+# define REMOTE_APPLAYER_NAME "localhost:80"
 // #define REMOTE_APPLAYER_NAME "lt-x61t:80"
 // #define REMOTE_APPLAYER_NAME "lt-at4:80"
 // #define REMOTE_APPLAYER_NAME "lt-ux31e:80"
@@ -19,6 +19,7 @@
 
 // the reverse socket, count to finish
 extern int32_t ticksToWait;
+extern bool r2finish;
 
 // Branch controllers
 extern int	CompareMemoryPattern(TCHAR *fileName);
@@ -44,7 +45,7 @@ static void FSPAPI onAcknowledgeSent(FSPHANDLE, FSP_ServiceCode, int);
 static void FSPAPI onError(FSPHANDLE h, FSP_ServiceCode code, int value)
 {
 	printf_s("Notify: socket %p, service code = %d, return %d\n", h, code, value);
-	finished = true;
+	r2finish = finished = true;
 	return;
 }
 
@@ -53,7 +54,7 @@ static void FSPAPI onError(FSPHANDLE h, FSP_ServiceCode code, int value)
 static void FSPAPI onError2(FSPHANDLE h, FSP_ServiceCode code, int value)
 {
 	printf_s("Notify2: socket %p, service code = %d, return %d\n", h, code, value);
-	finished = true;
+	r2finish = finished = true;
 	return;
 }
 
@@ -95,7 +96,7 @@ int _tmain(int argc, TCHAR *argv[])
 		goto l_bailout;
 	}
 
-	while(ticksToWait-- > 0 && !finished)
+	while(ticksToWait-- > 0 && !(finished && r2finish))
 		Sleep(50);	// yield CPU out for about 1/20 second
 
 	if(hFile != NULL && hFile != INVALID_HANDLE_VALUE)
@@ -125,11 +126,11 @@ static int	FSPAPI  onConnected(FSPHANDLE h, PFSP_Context ctx)
 	if(h == NULL)
 	{
 		printf_s("\n\tConnection failed.\n");
-		finished = true;
+		r2finish = finished = true;
 		return -1;
 	}
 
-	int mLen = strlen((const char *)ctx->welcome) + 1;
+	int mLen = (int)strlen((const char *)ctx->welcome) + 1;
 	printf_s("\tWelcome message length: %d\n", ctx->len);
 	printf_s("%s\n", (char *)ctx->welcome);
 	if(ctx->len <= 0 || mLen >= ctx->len)
@@ -138,7 +139,7 @@ static int	FSPAPI  onConnected(FSPHANDLE h, PFSP_Context ctx)
 		printf_s("To read the filename directly...\t");
 		if(ReadFrom(h, fileName, sizeof(fileName), onReceiveFileNameReturn) < 0)
 		{
-			finished = true;
+			r2finish = finished = true;
 			return -1;
 		}
 		return 0;
@@ -279,8 +280,6 @@ static bool FSPAPI onReceiveNextBlock(FSPHANDLE h, void *buf, int32_t len, bool 
 	}
 
 	printf_s("%d bytes written to local storage.\n", bytesWritten);
-	// needn't UnlockPeeked as Shutdown would forcefully close the receive window
-	// and return a non-zero would let the occupied receive buffer free
 	if(eot)
 	{
 		printf_s("All data have been received, to acknowledge...\n");

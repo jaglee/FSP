@@ -50,9 +50,9 @@ const char * CStringizeOpCode::names[LARGEST_OP_CODE + 1] =
 	"CONNECT_REQUEST",
 	"ACK_CONNECT_REQ",
 	"RESET",
-	"PERSIST",		// Alias: DATA_WITH_ACK
+	"ACK_START",
 	"PURE_DATA",	// Without any optional header
-	"_COMMIT",
+	"PERSIST",		// Alias: DATA_WITH_ACK
 	"ACK_FLUSH",
 	"RELEASE",
 	"MULTIPLY",		// To clone connection, may piggyback payload
@@ -82,7 +82,7 @@ const char * CStringizeState::names[LARGEST_FSP_STATE + 1] =
 	// timeout to retry or NON_EXISTENT:
 	"CONNECT_BOOTSTRAP",
 	// after getting legal CONNECT_REQUEST and sending back ACK_CONNECT_REQ
-	// before getting first PERSIST. timeout to NON_EXISTENT:
+	// before getting ACK_START or first PERSIST. timeout to NON_EXISTENT:
 	"CHALLENGING",
 	// after getting responder's cookie and sending formal CONNECT_REQUEST
 	// before getting ACK_CONNECT_REQ, timeout to retry or NON_EXISTENT
@@ -286,7 +286,7 @@ int LLSBackLog::Pop()
 // Return
 //	true if the given backlog item is matched with some item in the queue
 //	false if no match found
-bool LOCALAPI LLSBackLog::Has(const BackLogItem *p)
+BackLogItem * LLSBackLog::FindByRemoteId(ALFID_T idRemote, uint32_t salt)
 {
 	if (!WaitSetMutex())
 		throw - EINTR;
@@ -294,7 +294,7 @@ bool LOCALAPI LLSBackLog::Has(const BackLogItem *p)
 	if(count <= 0)
 	{
 		SetMutexFree();
-		return false;	// empty queue
+		return NULL;	// empty queue
 	}
 
 	// it is possible that phantom read occurred
@@ -302,16 +302,16 @@ bool LOCALAPI LLSBackLog::Has(const BackLogItem *p)
 	register int k = tailQ;
 	do
 	{
-		if(q[i].idRemote == p->idRemote && q[i].salt == p->salt)
+		if(q[i].idRemote == idRemote && q[i].salt == salt)
 		{
 			SetMutexFree();
-			return true;
+			return &q[i];
 		}
 		i = (i + 1) & (capacity - 1);
 	} while(i != k);
 	//
 	SetMutexFree();
-	return false;
+	return NULL;
 }
 
 
@@ -570,12 +570,13 @@ ControlBlock::PFSP_SocketBuf LOCALAPI ControlBlock::AllocRecvBuf(seq_t seq1)
 // Do
 //	Peek the receive buffer, figure out not only the start address but also the length of the next message
 //	till the end of receive buffer space, the last of the received packets, or the first buffer block
-//	with the End of Transaction flag set, inclusively, whichever meets first.
+//	with the End of Transaction flag set, inclusively, whichever met first.
 // Return
 //	Start address of the received message
 // Remark
 //	No receive buffer block is released, except the first block which is a payloadless PERSIST as well
-//	As it meant to be idempotent
+//	However, it is not meant to be thoroughly idempotent in the sense that
+//	receive buffers that have been inquired may not be delivered by ReadFrom
 //	If the returned value is NULL, stored in int & [_Out_] is the error number
 //	-EACCES		the buffer space is corrupted and unaccessible
 //	-EPIPE		it is a compressed stream and ULA should receive in pipe mode
@@ -593,6 +594,10 @@ void * LOCALAPI ControlBlock::InquireRecvBuf(int32_t & nIO, bool & eotFlag)
 		return NULL;
 	}
 
+	nIO = 0;
+	if(CountDeliverable() <= 0)
+		return NULL;
+
 	PFSP_SocketBuf p = GetFirstReceived();
 	if(p->GetFlag<Compressed>())
 	{
@@ -601,21 +606,6 @@ void * LOCALAPI ControlBlock::InquireRecvBuf(int32_t & nIO, bool & eotFlag)
 	}
 
 	void *pMsg = GetRecvPtr(p);
-	nIO = 0;
-	if (p->opCode == PERSIST && p->len == 0)
-	{
-		p->opCode = (FSPOperationCode)0;
-		p->SetFlag<IS_FULFILLED>(false);
-		SlideRecvWindowByOne();
-		if (p->GetFlag<TransactionEnded>())
-		{
-			eotFlag = true;
-			return pMsg;
-		}
-		//
-		p = GetFirstReceived();
-	}
-	//
 	register int i, m;
 	if(tail > recvWindowHeadPos)
 		m = tail - recvWindowHeadPos;
@@ -645,6 +635,7 @@ void * LOCALAPI ControlBlock::InquireRecvBuf(int32_t & nIO, bool & eotFlag)
 			return NULL;
 		}
 		//
+		p->opCode = (FSPOperationCode)0;
 		nIO += p->len;
 		//
 		if(p->GetFlag<TransactionEnded>())
@@ -704,7 +695,6 @@ int LOCALAPI ControlBlock::MarkReceivedFree(int32_t nIO)
 			r = -EFAULT;
 		//
 		p->SetFlag<IS_FULFILLED>(false);	// release the buffer
-		p->opCode = (FSPOperationCode)0;
 		nIO -= p->len;
 		//
 		if (p->GetFlag<TransactionEnded>())
@@ -721,10 +711,6 @@ int LOCALAPI ControlBlock::MarkReceivedFree(int32_t nIO)
 
 	if (r > 0 && (nIO != 0 || i != m))
 		r = -EDOM;
-
-	if (r < 0)
-		BREAK_ON_DEBUG();
-
 
 	recvWindowFirstSN += i;
 	recvWindowHeadPos += i;
@@ -758,14 +744,14 @@ int LOCALAPI ControlBlock::GetSelectiveNACK(seq_t & snExpect, FSP_SelectiveNACK:
 	if(n <= 0)
 		return -EDOM;
 	//
-	int nRcv = CountReceived();	// gaps included, however
+	int32_t nRcv = int32_t(recvWindowNextSN - recvWindowFirstSN);	// gaps included, however
 	if(nRcv <= 0)
 	{
 		snExpect = recvWindowNextSN;
 		return 0;
 	}
 	//
-	register int iHead = recvWindowNextPos - nRcv;
+	register int32_t iHead = recvWindowNextPos - nRcv;
 	if(iHead < 0)
 		iHead += recvBufferBlockN;
 	PFSP_SocketBuf p = HeadRecv() + iHead;
@@ -923,7 +909,7 @@ int LOCALAPI ControlBlock::DealWithSNACK(seq_t expectedSN, FSP_SelectiveNACK::Ga
 //	false if there is no _COMMIT packet in the queue, or there is some gap before or after the _COMMIT packet
 bool ControlBlock::HasBeenCommitted() const
 {
-	register int d = int(recvWindowExpectedSN - recvWindowNextSN);
+	register int32_t d = int32_t(recvWindowExpectedSN - recvWindowNextSN); 	// there should be no gap
 	if (d != 0)
 		return false;
 
@@ -939,7 +925,7 @@ bool ControlBlock::HasBeenCommitted() const
 	// Now scan the receive queue to found the gap. See also GetSelectiveNACK
 	// Normally recvWindowExpectedSN == recvWindowNextSN if no gap, but...
 #ifndef NDEBUG
-	d = CountReceived();	// gaps included, however
+	d = int32_t(recvWindowNextSN - recvWindowFirstSN);
 	if (d <= 0)
 		return true;
 	//

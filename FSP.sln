@@ -1,5 +1,7 @@
 Microsoft Visual Studio Solution File, Format Version 12.00
-# Visual Studio 2012
+# Visual Studio 15
+VisualStudioVersion = 15.0.26730.16
+MinimumVisualStudioVersion = 10.0.40219.1
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "FSP_SRV", "src\FSP_SRV\FSP_SRV.vcxproj", "{EB22DAD8-523E-4FED-88F3-F0647110BE7F}"
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "FSP_DLL", "src\FSP_DLL\FSP_DLL.vcxproj", "{DC63E2B4-BA8D-4540-936A-63106FFCB999}"
@@ -20,12 +22,15 @@ Global
 		{EB22DAD8-523E-4FED-88F3-F0647110BE7F}.Release|Win32.Build.0 = Release|Win32
 		{EB22DAD8-523E-4FED-88F3-F0647110BE7F}.Release|x64.ActiveCfg = Release|x64
 		{EB22DAD8-523E-4FED-88F3-F0647110BE7F}.Release|x64.Build.0 = Release|x64
-		{DC63E2B4-BA8D-4540-936A-63106FFCB999}.Debug|Win32.ActiveCfg = Release|x64
+		{DC63E2B4-BA8D-4540-936A-63106FFCB999}.Debug|Win32.ActiveCfg = Debug|Win32
 		{DC63E2B4-BA8D-4540-936A-63106FFCB999}.Debug|x64.ActiveCfg = Debug|x64
-		{DC63E2B4-BA8D-4540-936A-63106FFCB999}.Release|Win32.ActiveCfg = Release|x64
+		{DC63E2B4-BA8D-4540-936A-63106FFCB999}.Release|Win32.ActiveCfg = Release|Win32
 		{DC63E2B4-BA8D-4540-936A-63106FFCB999}.Release|x64.ActiveCfg = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {3FC4295E-B847-4405-877E-9510F837C3E0}
 	EndGlobalSection
 EndGlobal

@@ -59,6 +59,7 @@ const char *	theUserId = "FSP_Sciter";
  * The key agreement block
  */
 // TODO: should associated it with the session!
+static octet bufSharedKey[CRYPTO_NACL_KEYBYTES];
 ALIGN(8)
 static SCHAKAPublicInfo chakaPubInfo;
 static unsigned char bufPrivateKey[CRYPTO_NACL_KEYBYTES];
@@ -66,7 +67,6 @@ static unsigned char bufPrivateKey[CRYPTO_NACL_KEYBYTES];
 // Forward declarations
 static int	FSPAPI onConnected(FSPHANDLE, PFSP_Context);
 static void FSPAPI onServerResponseReceived(FSPHANDLE, FSP_ServiceCode, int);
-static int	FSPAPI onClientResponseSent(FSPHANDLE, void *, int32_t, BOOL);
 //
 static bool	FSPAPI onReceiveNextBlock(FSPHANDLE, void *, int32_t, bool);
 static void FSPAPI onAcknowledgeSent(FSPHANDLE, FSP_ServiceCode, int);
@@ -144,7 +144,7 @@ static int	FSPAPI  onConnected(FSPHANDLE h, PFSP_Context ctx)
 		return -1;
 	}
 
-	int mLen = strlen((const char *)ctx->welcome) + 1;
+	int mLen = (int)strlen((const char *)ctx->welcome) + 1;
 	printf_s("\tWelcome message length: %d\n", ctx->len);
 	printf_s("%s\n", (char *)ctx->welcome);
 
@@ -155,13 +155,13 @@ static int	FSPAPI  onConnected(FSPHANDLE h, PFSP_Context ctx)
 	WriteTo(h, & chakaPubInfo.clientNonce, sizeof(chakaPubInfo.clientNonce), 0, NULL);
 	// And suffixed with the client's identity
 
-	int nBytes = strlen(theUserId) + 1;
+	int nBytes = (int)strlen(theUserId) + 1;
 	octet buf[MAX_PATH];
+
+	CryptoNaClGetSharedSecret(bufSharedKey, chakaPubInfo.peerPublicKey, bufPrivateKey);
+
 	// assert(strlen(theUserId) + 1 <= sizeof(buf));
-	ChakaStreamcrypt(buf
-		, chakaPubInfo.clientNonce
-		, (octet *)theUserId, nBytes
-		, chakaPubInfo.peerPublicKey, bufPrivateKey);
+	ChakaStreamcrypt(buf, (octet *)theUserId, nBytes, chakaPubInfo.clientNonce, bufSharedKey);
 	WriteTo(h, buf, nBytes, TO_END_TRANSACTION, NULL);
 
 	ReadFrom(h, chakaPubInfo.salt, sizeof(chakaPubInfo.salt), onServerResponseReceived);
@@ -176,8 +176,7 @@ static void FSPAPI onServerResponseReceived(FSPHANDLE h, FSP_ServiceCode c, int 
 	ReadFrom(h, & chakaPubInfo.serverNonce, sizeof(chakaPubInfo.serverNonce) + sizeof(chakaPubInfo.serverRandom), NULL);
 	ReadFrom(h, chakaPubInfo.peerResponse, sizeof(chakaPubInfo.peerResponse), NULL);
 	// The peer should have commit the transmit transaction. Integrity is assured
-	FSPControl(h, FSP_GET_PEER_COMMITTED, (ulong_ptr) & r);
-	if(r == 0)
+	if (!HasReadEoT(h))
 	{
 		printf_s("Protocol is broken: length of client's id should not exceed MAX_PATH\n");
 		Dispose(h);
@@ -200,9 +199,9 @@ static void FSPAPI onServerResponseReceived(FSPHANDLE h, FSP_ServiceCode c, int 
 	WriteTo(h, clientResponse, sizeof(clientResponse), TO_END_TRANSACTION, NULL);
 
 	printf_s("\tTo install the session key instantly...\n");
-	octet bufSessionKey[SESSION_KEY_SIZE];
-	CryptoNaClGetSharedSecret(bufSessionKey, chakaPubInfo.peerPublicKey, bufPrivateKey);
-	InstallMasterKey(h, bufSessionKey, SESSION_KEY_SIZE);
+	InstallMasterKey(h, bufSharedKey, SESSION_KEY_SIZE);
+	memset(bufSharedKey, 0, SESSION_KEY_SIZE);
+	memset(bufPrivateKey, 0, CRYPTO_NACL_KEYBYTES);
 
 	// The server side write with the stream mode, while the client side read with block buffer mode
 	printf_s("\nTo read file list...\n");
@@ -223,9 +222,7 @@ static void FSPAPI onStringsRead(FSPHANDLE h, FSP_ServiceCode code, int len)
 
 	ParseBlock((octet *)strStrings, len);
 	
-	int r;
-	FSPControl(h, FSP_GET_PEER_COMMITTED, (ulong_ptr) & r);
-	if(! r)
+	if (!HasReadEoT(h))
 	{
 		ReadFrom(h, strStrings, (int)sizeof(strStrings), onStringsRead);
 		return;
@@ -242,9 +239,11 @@ static void SynchronousRead(FSPHANDLE h)
 	do
 	{
 		len = ReadFrom(h, strStrings, (int)sizeof(strStrings), NULL);
-		if(len > 0)
-			ParseBlock((octet *)strStrings, len);	
-	} while (len > 0);
+		if (len > 0)
+			ParseBlock((octet *)strStrings, len);
+		else if (len < 0)
+			printf_s("In SynchronousRead, ReadFrom() return %d\n", len);
+	} while (len > 0 && !HasReadEoT(h));
 	//
 	//FSPControl(h, FSP_GET_PEER_COMMITTED, (ulong_ptr) & len);
 	//assert(len != 0);
@@ -260,7 +259,7 @@ static bool FSPAPI onReceiveNextBlock(FSPHANDLE h, void *buf, int32_t len, bool 
 {
 	if(len == -EPIPE)
 	{
-//		ReadFrom(h, strStrings, (int)sizeof(strStrings), onStringsRead);
+		printf_s("It cannot be asynchronous read inlined. Change to blocking-mode stream read.\n");
 		SynchronousRead(h);
 		return false;
 	}

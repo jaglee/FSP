@@ -371,9 +371,9 @@ void CSocketItemDl::ToConcludeConnect()
 		Recycle();
 		return;
 	}
-	SetHeadPacketIfEmpty(PERSIST);
-	SetState(isFlushing ? COMMITTING2 : PEER_COMMIT);
-	// See also ToWelcomeMultiply, differs in state migration
+	skb = SetHeadPacketIfEmpty(ACK_START);
+	// ACK_START implies to Commit. See also ToWelcomeMultiply:
+	SetState((skb == NULL || isFlushing) ? COMMITTING2 : PEER_COMMIT);
 
 	Call<FSP_Start>();
 }

@@ -52,6 +52,13 @@ FSPHANDLE FSPAPI MultiplyAndWrite(FSPHANDLE hFSP, PFSP_Context psp1, int8_t flag
 	if(p == NULL)
 		return p;
 
+	if (!p->AddOneShotTimer(TRANSIENT_STATE_TIMEOUT_ms))
+	{
+		REPORT_ERRMSG_ON_TRACE("Cannot set time-out clock for MultiplyAndWrite");
+		p->FreeAndDisable();
+		return NULL;
+	}
+
 	p->TestSetSendReturn(fp1);
 	if(psp1->welcome != NULL)
 	{
@@ -89,6 +96,13 @@ FSPHANDLE FSPAPI MultiplyAndGetSendBuffer(FSPHANDLE hFSP, PFSP_Context psp1, Cal
 	CSocketItemDl *p = CSocketItemDl::ToPrepareMultiply((CSocketItemDl *)hFSP, psp1, objCommand);
 	if(p == NULL)
 		return p;
+
+	if (!p->AddOneShotTimer(TRANSIENT_STATE_TIMEOUT_ms))
+	{
+		REPORT_ERRMSG_ON_TRACE("Cannot set time-out clock for MultiplyAndGetSendBuffer");
+		p->FreeAndDisable();
+		return NULL;
+	}
 
 	if(onBufferReady != NULL)
 	{
@@ -169,7 +183,7 @@ FSPHANDLE CSocketItemDl::CompleteMultiply(CommandCloneConnect & cmd)
 	// See also InitCommand, CallCreate
 	cmd.fiberID = pControlBlock->idParent;
 	cmd.idProcess = idThisProcess;
-	cmd.hMemoryMap = hMemoryMap;
+	cmd.hMemoryMap = (uint64_t)hMemoryMap;
 	cmd.dwMemorySize = dwMemorySize;
 	//
 	cmd.isFlushing = this->isFlushing;
@@ -187,8 +201,9 @@ FSPHANDLE CSocketItemDl::CompleteMultiply(CommandCloneConnect & cmd)
 
 //{ESTABLISHED, COMMITTING, PEER_COMMIT, COMMITTING2, COMMITTED, CLOSABLE}
 //	|-->/MULTIPLY/-->[API{Callback}]
-//		|-->[{Return Accept}]-->{new context}ESTABLISHED/COMMITTING
-//			-->[Send PERSIST]{start keep-alive}
+//		|-->[{Return Accept}]-->{new context}
+//			{to piggyback payload}|-->[Send PERSIST]{start keep-alive}-->ESTABLISHED
+//			{without payload}|-->[Send ACK_START]{start keep-alive}-->COMMITTING
 //		|-->[{Return}:Reject]-->[Send RESET] {abort creating new context}
 // Remark
 //	Unlike in ToWelcomeConnect, context.onAccepting MAY read or write here as multiplication is of 0-RTT
@@ -204,8 +219,8 @@ bool LOCALAPI CSocketItemDl::ToWelcomeMultiply(BackLogItem & backLog)
 		Recycle();
 		return false;
 	}
-	SetHeadPacketIfEmpty(PERSIST);
-	if(isFlushing)
+	ControlBlock::PFSP_SocketBuf skb = SetHeadPacketIfEmpty(ACK_START);
+	if (skb == NULL || isFlushing)	// ACK_START implies to Commit
 		SetState(COMMITTING);
 
 	return true;

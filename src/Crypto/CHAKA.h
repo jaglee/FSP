@@ -69,7 +69,7 @@ struct SCHAKAPublicInfo
 SINLINE
 int MakeSaltedPassword(octet clientInputHash[CRYPTO_NACL_HASHBYTES], const octet salt[CRYPTO_SALT_LENGTH], const char * inputPassword)
 {
-	const int len = strlen(inputPassword);
+	const int len = (int)strlen(inputPassword);
 	octet *clientPasswordHashMaterial = (octet *)_alloca(CRYPTO_SALT_LENGTH + len);
 	if(clientPasswordHashMaterial == NULL)
 	{
@@ -124,7 +124,7 @@ void InitCHAKAServer(SCHAKAPublicInfo &chakaPubInfo, const octet bufPublicKey[CR
 
 
 SINLINE
-void InitCHAKAClient(SCHAKAPublicInfo &chakaPubInfo, octet bufPrivateKey[CRYPTO_NACL_KEYBYTES])
+void InitCHAKAClient(SCHAKAPublicInfo &chakaPubInfo, octet *bufPrivateKey)
 {
 	CryptoNaClKeyPair(chakaPubInfo.selfPublicKey, bufPrivateKey);
 	chakaPubInfo.clientNonce = htobe64(NowUTC()); 
@@ -136,9 +136,8 @@ void InitCHAKAClient(SCHAKAPublicInfo &chakaPubInfo, octet bufPrivateKey[CRYPTO_
 // Remark
 //	The server both answers the client's initial challenge and pushes back its own challenge
 SINLINE
-bool CHAKAChallengeByServer(SCHAKAPublicInfo &chakaPubInfo,
-							octet serverResponse[CRYPTO_NACL_HASHBYTES],
-							const octet passwordHash[CRYPTO_NACL_HASHBYTES])
+bool CHAKAChallengeByServer(SCHAKAPublicInfo &chakaPubInfo
+	, octet *serverResponse, const octet passwordHash[CRYPTO_NACL_HASHBYTES])
 {
 	// The server precheck validity of nonce. If clock 'difference is too high'(?), reject the request
 	int64_t d = be64toh(chakaPubInfo.serverNonce) - be64toh(chakaPubInfo.clientNonce);
@@ -160,9 +159,7 @@ bool CHAKAChallengeByServer(SCHAKAPublicInfo &chakaPubInfo,
 
 // Suppose the client get the salt
 SINLINE
-bool CHAKAResponseByClient(SCHAKAPublicInfo &chakaPubInfo
-	, octet clientInputHash[CRYPTO_NACL_HASHBYTES]
-	, octet cResponse[CRYPTO_NACL_HASHBYTES])
+bool CHAKAResponseByClient(SCHAKAPublicInfo &chakaPubInfo, octet * clientInputHash, octet *cResponse)
 {
 	// The client prechecks the validity of nonce. If clock 'difference is too high'(?), reject the request
 	int64_t d = be64toh(chakaPubInfo.serverNonce) - be64toh(chakaPubInfo.clientNonce);
@@ -208,43 +205,37 @@ bool CHAKAValidateByServer(SCHAKAPublicInfo &chakaPubInfo, const octet passwordH
 
 
 // A very simple stream encryption/decryption meant to protect privacy of a short message such as a user's name/client's id
+// Remark
+//	May overwrite content point by bufSharedKey given in the structured parameter
 SINLINE
 void ChakaStreamcrypt(octet *buf
-	, uint64_t nonce
 	, const octet *input, int32_t len
-	, const octet peerPublicKey[CRYPTO_NACL_KEYBYTES], const octet bufPrivateKey[CRYPTO_NACL_KEYBYTES])
+	, uint64_t nonce, const octet bufSharedKey[CRYPTO_NACL_KEYBYTES])
 {
-	if(len <= 0)
-		return;
-	//
 	struct
 	{
 		uint64_t nonce;
 		octet bufSharedKey[CRYPTO_NACL_KEYBYTES];
 	} km;
+	km.nonce = nonce;
+	memcpy(km.bufSharedKey, bufSharedKey, CRYPTO_NACL_KEYBYTES);
+	//^Let's the compiler optimize off additional copy
 	octet hashValue[SHA256_DIGEST_SIZE];
-	//
-	CryptoNaClGetSharedSecret(km.bufSharedKey, peerPublicKey, bufPrivateKey);
-	sha256_hash(hashValue, (octet *) & km, sizeof(km));	
-	//
-	register int32_t i = 0, k;
-	do
+	register int32_t k;
+	for (register int32_t i = 0; len > 0; len -= k)
 	{
-		k = min(SHA256_DIGEST_SIZE, len);		
+		km.nonce ^= htobe64((uint64_t)i + 1);
+		sha256_hash(hashValue, (octet *)& km, sizeof(km));
+		//
+		k = min(SHA256_DIGEST_SIZE, len);
 		for(register int32_t j = 0; j < k; j++)
 		{
 			buf[i] = input[i] ^ hashValue[j];
 			i++;
 		}
 		//
-		len -= k;
-		if(len <= 0)
-			break;
-		// assert(SHA256_DIGEST_SIZE <= CRYPTO_NACL_KEYBYTES);
 		memcpy(km.bufSharedKey, hashValue, SHA256_DIGEST_SIZE);
-		km.nonce ^= (uint64_t)i;
-		sha256_hash(hashValue, (octet *) & km, sizeof(km));	
-	} while(true);
+	}
 }
 
 #endif

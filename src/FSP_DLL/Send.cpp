@@ -225,7 +225,6 @@ int LOCALAPI CSocketItemDl::SendStream(const void * buffer, int len, bool eot, b
 		return FinalizeSend(BufferData(len));	// pendingSendSize = len;
 
 	// If it is blocking, wait until every byte has been put into the queue
-	uint64_t t0 = GetTickCount64();
 	while ((r = BufferData(len)) >= 0)
 	{
 		if (r > 0
@@ -239,10 +238,11 @@ int LOCALAPI CSocketItemDl::SendStream(const void * buffer, int len, bool eot, b
 		if (pendingSendSize <= 0)
 			break;
 		// Here wait LLS to free some send buffer block
+		uint64_t t0 = GetTickCount64();
 		do
 		{
 			SetMutexFree();
-			Sleep(50);
+			Sleep(TIMER_SLICE_ms);
 			if (GetTickCount64() - t0 > MAX_LOCK_WAIT_ms)
 				return -EDEADLK;
 			if (!WaitUseMutex())
@@ -256,7 +256,7 @@ int LOCALAPI CSocketItemDl::SendStream(const void * buffer, int len, bool eot, b
 	//
 	if (r < 0)
 		return r;
-	//
+
 	return bytesBuffered;
 }
 
@@ -412,117 +412,109 @@ void CSocketItemDl::ProcessPendingSend()
 // Given
 //	int		number of octets in pendingSendBuf to put into the send queue
 // Return
-//	number of bytes buffered in the send queue
+//	number of packets that have been completed
+//	negative return value is the error number
 // Remark
 //	If len == 0, it meant to flush the compression buffer, if any
 //	Side-effect:
 //	set the value of pendingSendSize to number of octets yet to be buffered
 //	set the value of pendingStreamingSize to number of compression result octets yet to be queued
 // Compression on the wire is co-routing
-int LOCALAPI CSocketItemDl::BufferData(int len)
+int LOCALAPI CSocketItemDl::BufferData(int m)
 {
-	int m = len;
 	if (m < 0)
 		return -EDOM;
-	if (m == 0 && pStreamState == NULL)
+	if (m == 0 && !HasInternalBufferedToSend())
 		return 0;
 
 	ControlBlock::PFSP_SocketBuf p = pControlBlock->LockLastBufferedSend();
-	len = 0;
-	if(p != NULL && !p->GetFlag<IS_COMPLETED>())
+	int count = 0;
+	octet *tgtBuf;
+	register int k;
+	if (p != NULL && !p->GetFlag<IS_COMPLETED>())
 	{
 		if (p->len < 0 || p->len >= MAX_BLOCK_SIZE)
 			return -EFAULT;
 		//
-		octet *tgtBuf = GetSendPtr(p) + p->len;
+		tgtBuf = GetSendPtr(p) + p->len;
+	}
+	else
+	{
+		if (p != NULL)	// && p->GetFlag<IS_COMPLETED>()
+			p->Unlock();
 		//
-		if(pStreamState == NULL)
+		p = GetSendBuf();
+		if (p == NULL)
+			return 0;
+		//
+		p->version = THIS_FSP_VERSION;
+		p->opCode = PURE_DATA;
+		p->len = 0;
+		tgtBuf = GetSendPtr(p);
+	}
+	// p->buf was set when the send buffer control structure itself was initialized
+	// flags are already initialized when GetSendBuf
+	// only after every field, including flag, has been set may it be unlocked
+	// otherwise WriteTo following may put further data into the last packet buffer
+	// unlike next loop, this loop does not force compression
+	do
+	{
+		if (pStreamState == NULL)
 		{
-			int k = min(m, MAX_BLOCK_SIZE - p->len);
+			k = min(m, MAX_BLOCK_SIZE - p->len);
 			memcpy(tgtBuf, pendingSendBuf, k);
-			m -= k;
 			p->len += k;
 			bytesBuffered += k;
-			len += k;
+			//
+			m -= k;
 			pendingSendBuf += k;
 		}
 		else
 		{
-			int k = MAX_BLOCK_SIZE - p->len;
+			k = MAX_BLOCK_SIZE - p->len;
 			int m2 = Compress(tgtBuf, k, pendingSendBuf, m);
-			if(m2 < 0)
+			if (m2 < 0)
 				return m2;
-			m -= m2;
 			p->len += k;
 			bytesBuffered += k;
-			len += k;
-			pendingSendBuf += m2;
-		}
-		//
-		if(p->len >= MAX_BLOCK_SIZE)
-			p->SetFlag<IS_COMPLETED>();
-		else
-			goto l_finish;	// assert: m == 0
-		//
-		if (m == 0)
-			goto l_finish;	// it is full, and it happens to be the last packet in this batch
-		//
-		p->Unlock();
-	}
-	else if(p != NULL)	// && p->GetFlag<IS_COMPLETED>()
-	{
-		p->Unlock();
-	}
-
-	p = GetSendBuf();
-	// p->buf was set when the send buffer control structure itself was initialized
-	// flags are already initialized when GetSendBuf
-	while(p != NULL)
-	{
-		octet *tgtBuf = GetSendPtr(p);
-		p->version = THIS_FSP_VERSION;
-		p->opCode = PURE_DATA;
-		if(pStreamState == NULL)
-		{
-			p->len = min(m, MAX_BLOCK_SIZE);
-			memcpy(tgtBuf, pendingSendBuf, p->len);
-			m -= p->len;
-			bytesBuffered += p->len;
-			len += p->len;
-			pendingSendBuf += p->len;
-		}
-		else
-		{
-			int k = MAX_BLOCK_SIZE;
-			int m2 = Compress(tgtBuf, k, pendingSendBuf, m);
-			if(m2 < 0)
-				return m2;
+			//
 			m -= m2;
-			p->len = k;
-			bytesBuffered += k;
-			len += k;
 			pendingSendBuf += m2;
 			p->SetFlag<Compressed>();
-			// assert: if k == 0 then n == 0
 		}
-		if(p->len >= MAX_BLOCK_SIZE)
-			p->SetFlag<IS_COMPLETED>();
 		//
-		if (m <= 0)
+		if (p->len >= MAX_BLOCK_SIZE)
+		{
+			p->SetFlag<IS_COMPLETED>();
+			count++;
+		}
+		//
+		if (m == 0)
 			break;
 		//
+#ifndef NDEBUG
+		if (p->GetFlag<IS_COMPLETED>())
+			printf_s("Erroneous implementation!? More data to append, but the last packet is imcompleted\n");
+#endif
 		p->Unlock();
-		p = GetSendBuf();
-	}
 
-l_finish:
+		p = GetSendBuf();
+		if (p == NULL)
+			break;
+		//
+		p->version = THIS_FSP_VERSION;
+		p->opCode = PURE_DATA;
+		p->len = 0;
+		tgtBuf = GetSendPtr(p);
+	} while (true);
+
 	// It somewhat overlaps with checking isFlushing, i.e. there is some redundancy, but it keeps code simple
 	if(_InterlockedCompareExchange8(& newTransaction, 0, 1) != 0)
 	{
 		ControlBlock::PFSP_SocketBuf skb0 = pControlBlock->HeadSend() + pControlBlock->sendWindowNextPos;
-#ifdef TRACE
+#ifndef NDEBUG
 		if(skb0->GetFlag<IS_SENT>())
-			printf_s("Erroneous implementation!? May not start a new transaction");
+			printf_s("Erroneous implementation!? May not start a new transaction\n");
 #endif
 		skb0->opCode = PERSIST;
 	}
@@ -530,36 +522,42 @@ l_finish:
 	pendingSendSize = m;
 	//
 	if(p == NULL)
-		return len;
+		return count;
 	//
 	if(pendingSendSize != 0 || !isFlushing)
 	{
 		p->Unlock();
-		return len;
-	}
-	// only after every field, including flag, has been set may it be unlocked
-	// otherwise WriteTo following may put further data into the last packet buffer
-	if(pStreamState == NULL)
-	{
-		p->SetFlag<TransactionEnded>();
-		p->SetFlag<IS_COMPLETED>();
-		p->Unlock();
-		return len;
+		return count;
 	}
 
-	int k = MAX_BLOCK_SIZE - p->len;	// To compress internally buffered: it may be that k == 0
-	Compress(GetSendPtr(p) + p->len, k, NULL, 0);
-	p->len += k;
-	p->SetFlag<IS_COMPLETED>();
-	bytesBuffered += k;
-	len += k;
-	while(pendingStreamingSize > 0)
+	if (pStreamState == NULL)
+	{
+		p->SetFlag<TransactionEnded>();
+		if(!p->GetFlag<IS_COMPLETED>())
+		{
+			p->SetFlag<IS_COMPLETED>();
+			count++;
+		}
+		p->Unlock();
+		return count;
+	}
+
+	k = MAX_BLOCK_SIZE - p->len;	// To compress internally buffered: it may be that k == 0
+	if (k > 0)
+	{
+		Compress(GetSendPtr(p) + p->len, k, NULL, 0);
+		p->len += k;
+		p->SetFlag<IS_COMPLETED>();
+		count++;
+		bytesBuffered += k;
+	}
+	while (HasInternalBufferedToSend())
 	{
 		p->Unlock();	// only after every field, including flag, has been set may it be unlocked
 		p = GetSendBuf();
-		if(p == NULL)
-			return len;	// Warning: not all data have been buffered
-		//
+		if (p == NULL)
+			return count;	// Warning: not all data have been buffered
+						//
 		k = MAX_BLOCK_SIZE;			// To copy out internally compressed:
 		Compress(GetSendPtr(p), k, NULL, 0);
 		p->version = THIS_FSP_VERSION;
@@ -567,14 +565,14 @@ l_finish:
 		p->len = k;
 		p->SetFlag<Compressed>();
 		p->SetFlag<IS_COMPLETED>();
+		count++;
 		bytesBuffered += k;
-		len += k;
 	}	// end if the internal buffer of on-the-wire compression is not empty
-	//
+
 	p->SetFlag<TransactionEnded>();
 	p->Unlock();
 	FreeStreamState();
-	return len;
+	return count;
 }
 
 

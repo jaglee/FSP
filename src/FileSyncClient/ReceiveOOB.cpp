@@ -5,16 +5,17 @@
 
 
 // A shared global parameter to configure the time to wait the connection multiplication request is sent and acknowledged:
-int32_t ticksToWait = 6000;	// by default there is no reverse socket and wait for about 300 seconds to wait one. see also main()
-
+// by default there is no reverse socket and wait for about 30 seconds to wait one. see also main()
+int32_t ticksToWait = 600;
+bool	r2finish = true;
 
 // The call back function to be executed when the clone connection is closed
 static void FSPAPI onShutdown(FSPHANDLE hRev, FSP_ServiceCode code, int value)
 {
-	printf_s("Socket %p, the clone connection has been shutdown.\n", hRev);
+	printf_s("Clone session, socket %p has been shutdown.\n", hRev);
 	if(code != FSP_NotifyRecycled)
 		printf_s("Should got ON_RECYCLED, but service code = %d, return %d\n", code, value);
-
+	r2finish = true;
 	return;
 }
 
@@ -23,11 +24,11 @@ static void FSPAPI onShutdown(FSPHANDLE hRev, FSP_ServiceCode code, int value)
 // The call back function to be executed when data expected in the clone connection has been received.
 static bool FSPAPI onSignatureReceived(FSPHANDLE hRev, void * buf, int32_t length, bool eot)
 {
-	printf_s("Socket %p, %d bytes received, message:\n", hRev, length);
+	printf_s("Cloned session, socket %p, %d bytes received, message:\n", hRev, length);
 	printf_s("%s\n", (CHAR *)buf);
 	// assert(eot);
 	Shutdown(hRev, onShutdown);
-	return true;
+	return false;
 }
 
 
@@ -36,8 +37,9 @@ static bool FSPAPI onSignatureReceived(FSPHANDLE hRev, void * buf, int32_t lengt
 int	FSPAPI onMultiplying(FSPHANDLE hRev, PFSP_SINKINF p, PFSP_IN6_ADDR remoteAddr)
 {
 	ticksToWait = INT32_MAX;	// wait shutdown almost forever
+	r2finish = false;
 	//
-	printf_s("\nTo accept multiplied handle of FSP session: %p\n", hRev);
+	printf_s("\nTo accept FSP session multiplication, socket handle: %p\n", hRev);
 	printf_s("Interface#%d, fiber#%u\n", p->ipi6_ifindex, p->idALF);
 	// no be32toh() for local; note that for IPv6 network, little-endian CPU, the peer's remoteAddr->idALF wouldn't match it
 	printf_s("Remote address: 0x%llX::%X::%X\n", be64toh(remoteAddr->subnet), be32toh(remoteAddr->idHost), be32toh(remoteAddr->idALF));

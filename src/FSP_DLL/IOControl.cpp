@@ -58,10 +58,10 @@ int FSPAPI FSPControl(FSPHANDLE hFSPSocket, FSP_ControlCode controlCode, ULONG_P
 		switch(controlCode)
 		{
 		case FSP_GET_EXT_POINTER:
-			*(ULONG_PTR *)value = (ULONG_PTR)pSocket->GetULASignature();
+			*(ULONG_PTR *)value = (ULONG_PTR)pSocket->GetExtentOfULA();
 			break;
 		case FSP_SET_EXT_POINTER:
-			pSocket->SetULASignature(value);
+			pSocket->SetExtentOfULA(value);
 			break;
 		case FSP_SET_CALLBACK_ON_ERROR:
 			pSocket->SetCallbackOnError((NotifyOrReturn)value);
@@ -87,17 +87,54 @@ int FSPAPI FSPControl(FSPHANDLE hFSPSocket, FSP_ControlCode controlCode, ULONG_P
 }
 
 
+
+// Return whether previous ReadFrom or ReadInline has reach an end-of-transaction mark.
+// A shortcut for FSPControl(FSPHANDLE, FSP_GET_PEER_COMMITTED, ...);
+DllSpec
+void * FSPAPI GetExtPointer(FSPHANDLE hFSPSocket)
+{
+	try
+	{
+		CSocketItemDl *pSocket = (CSocketItemDl *)hFSPSocket;
+		return (void *)pSocket->GetExtentOfULA();
+	}
+	catch (...)
+	{
+		return NULL;
+	}
+}
+
+
+
+// Return the extent pointer set by ULA, either stored directly in FSP_SocketParameter.extentI64ULA
+// or set by calling FSPControl(FSPHANDLE, FSP_SET_EXT_POINTER, ...);
+// A shortcut for FSPControl(FSPHANDLE, FSP_GET_EXT_POINTER, ...);
+DllSpec
+bool FSPAPI HasReadEoT(FSPHANDLE hFSPSocket)
+{
+	try
+	{
+		CSocketItemDl *pSocket = (CSocketItemDl *)hFSPSocket;
+		return pSocket->HasPeerCommitted();
+	}
+	catch (...)
+	{
+		return false;
+	}
+}
+
+
+
+
 /*
  * FSP LZ4 frame format
  * Start of the first frame MUST be aligned with start of the transmit transaction
- * Magic Number AND version identifier: 4 octet, FSLZ
  * each block depends on previous ones (up to LZ4 window size, which is 64KB)
  * it's necessary to decode all blocks in sequence
  * block max size is fixed in each version
  * no header checksum
- * Little endian, 3 octet
+ * Little endian
  * Data blocks: block size [4 bytes], data
- * The algorithm:
  */
 
 #define FSP_MAX_SEGMENT_SIZE (1 << 17)	// 128KB
@@ -391,10 +428,10 @@ int	CSocketItemDl::Compress(void *pOut, int &tgtSize, const void *pIn, int srcLe
 }
 
 
-// Return whether internal buffer for compression is empty
-bool CSocketItemDl::HasDataToCommit()
+// Return whether internal buffer for compression contains data
+bool CSocketItemDl::HasInternalBufferedToSend()
 {
-	return (pendingSendSize > 0 || pStreamState != NULL && (pendingStreamingSize > 0 || pStreamState->rNext > 0));
+	return (pStreamState != NULL && (pendingStreamingSize > 0 || pStreamState->rNext > 0));
 }
 
 
@@ -459,18 +496,18 @@ int	CSocketItemDl::Decompress(void *pOut, int &tgtSize, const void *pIn, int src
 
 
 // Return true if the internal buffer is empty, false if it is not.
-bool CSocketItemDl::FlushDecodeState()
+// Temporily unset peerCommitted in case premature report of
+// commitment of peer's transmit transaction. See also ReadFrom()
+bool CSocketItemDl::FlushDecodeBuffer()
 {
-	if(pDecodeState == NULL)
-		return true;
-
 	for(int k = waitingRecvSize; k > 0; k = waitingRecvSize)
 	{
 		Decompress(waitingRecvBuf, k, NULL, 0);
 		if(k < 0)
 			return false;
-		if(k == 0)
+		if (k == 0)
 			break;
+		bytesReceived += k;
 		waitingRecvBuf += k;
 		waitingRecvSize -= k;
 	}
@@ -483,7 +520,20 @@ bool CSocketItemDl::FlushDecodeState()
 	}
 
 	peerCommitted |= peerCommitPending;
-	free(pDecodeState);
-	pDecodeState = NULL;
+	peerCommitPending = 0;
+	if(peerCommitted)
+	{
+		free(pDecodeState);
+		pDecodeState = NULL;
+	}
 	return true;
+}
+
+
+
+// Return whether internal buffer for decompression contains data
+bool CSocketItemDl::HasInternalBufferedToDeliver()
+{
+	return (pDecodeState != NULL
+		&& (pDecodeState->dNext > 0 || pDecodeState->dstNext - pDecodeState->srcDstNext > 0));
 }

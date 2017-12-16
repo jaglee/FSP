@@ -221,15 +221,19 @@ protected:
 	// In Receive.cpp
 	void	ProcessReceiveBuffer();
 	int32_t FetchReceived();
+	bool	HasFreeSendBuffer() { return (pControlBlock->CountSendBuffered() - pControlBlock->sendBufferBlockN < 0); }
 
 	// In IOControl.cpp
 	bool AllocStreamState();
 	bool AllocDecodeState();
 	int	 Compress(void *, int &, const void *, int);
 	int	 Decompress(void *, int &, const void *, int);
-	bool HasDataToCommit();
-	bool FlushDecodeState();
+	bool HasInternalBufferedToSend();
+	bool HasDataToCommit() { return (pendingSendSize > 0 || HasInternalBufferedToSend()); }
+	bool FlushDecodeBuffer();
 	void FreeStreamState() { if(pStreamState != NULL) { free(pStreamState); pStreamState = NULL; } }
+	bool HasInternalBufferedToDeliver();
+	bool HasDataToDeliver() { return (pControlBlock->CountDeliverable() > 0 || HasInternalBufferedToDeliver()); }
 
 public:
 	void Disable();
@@ -267,8 +271,8 @@ public:
 	}
 	bool InIllegalState() const { return pControlBlock->state <= 0 || pControlBlock->state > LARGEST_FSP_STATE; }
 
-	uint64_t GetULASignature() const { return context.signatureULA; }
-	void SetULASignature(uint64_t value) { context.signatureULA = value; }
+	uint64_t GetExtentOfULA() const { return context.extentI64ULA; }
+	void SetExtentOfULA(uint64_t value) { context.extentI64ULA = value; }
 
 	bool HasPeerCommitted() const { return peerCommitted != 0; }
 
@@ -336,10 +340,6 @@ public:
 
 	int	LOCALAPI RecvInline(CallbackPeeked);
 	int LOCALAPI ReadFrom(void *, int, NotifyOrReturn);
-	int LOCALAPI MarkReceiveFinished(int n) { return pControlBlock->MarkReceivedFree(n); }
-
-	bool HasDataToDeliver()  { return int32_t(pControlBlock->recvWindowExpectedSN - pControlBlock->recvWindowFirstSN) > 0; }
-	bool HasFreeSendBuffer() { return (pControlBlock->CountSendBuffered() - pControlBlock->sendBufferBlockN < 0); }
 
 	int LOCALAPI Shutdown(NotifyOrReturn);
 	int LOCALAPI Commit(NotifyOrReturn);

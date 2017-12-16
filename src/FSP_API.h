@@ -118,8 +118,8 @@ typedef int (FSPAPI *CallbackConnected)(FSPHANDLE, PFSP_Context);
 //	int32_t			the length of the available (partial) message in bytes
 //	bool			whether the peer has committed the tansmit transaction
 // Return
-//	true if processing is successful and the buffer should be release
-//	false if processing has not finished and the receive buffer should be held
+//	true if to continue applying this callback function to accept further data
+//	false if to discontinue
 // Remark
 //	the caller shall make the callback function thread-safe
 typedef bool (FSPAPI *CallbackPeeked)(FSPHANDLE, void *, int32_t, bool);
@@ -156,6 +156,7 @@ typedef void (FSPAPI *LongRunCallback)(FSPHANDLE, ulong_ptr);
 #endif
 
 
+
 struct FSP_SocketParameter
 {
 	CallbackRequested	onAccepting;	// NULL if synchronously accepting, non-NULL if asynchronous
@@ -181,7 +182,7 @@ struct FSP_SocketParameter
 	int32_t		recvSize;	// [_In_] default size of the receive window [_Out] size of the allocated receive buffer segment
 	int32_t		sendSize;	// [_In_] default size of the send window	 [_Out] size of the allocated send buffer segment
 	//
-	uint64_t	signatureULA;
+	uint64_t	extentI64ULA;
 };
 
 
@@ -241,7 +242,6 @@ DllSpec
 FSPHANDLE FSPAPI MultiplyAndWrite(FSPHANDLE, PFSP_Context, int8_t, NotifyOrReturn);
 
 
-
 // given
 //	the handle of the FSP socket whose connection is to be duplicated,
 //	the pointer to the socket parameter
@@ -268,7 +268,6 @@ FSPHANDLE FSPAPI MultiplyAndGetSendBuffer(FSPHANDLE, PFSP_Context, CallbackBuffe
 //	-EIO	if cannot trigger LLS to do the installation work through I/O
 DllSpec
 int FSPAPI InstallMasterKey(FSPHANDLE, octet *, int32_t);
-
 
 
 // given
@@ -309,7 +308,7 @@ int FSPAPI SendInline(FSPHANDLE, void *, int32_t, bool);
 // Remark
 //	Only all data have been buffered may be NotifyOrReturn called.
 //	If NotifyOrReturn is NULL the function is blocking, i.e.
-//	waiting until every octet in the given buffer has been passed to LLS. See also ReadFrom
+//	waiting until every octet in the given buffer has been passed to LLS.
 DllSpec
 int FSPAPI WriteTo(FSPHANDLE, const void *, int, int8_t, NotifyOrReturn);
 
@@ -322,6 +321,7 @@ int FSPAPI WriteTo(FSPHANDLE, const void *, int, int8_t, NotifyOrReturn);
 //	if it failed, when CallbackPeeked is called the first parameter is passed with NULL
 //	while the second parameter is passed with the error number
 //	currently the implementation limit the maximum message size of each peek to 2GB
+//	each calling of the function should accept one and only one transmit transaction from the peer
 DllSpec
 int FSPAPI RecvInline(FSPHANDLE, CallbackPeeked);
 
@@ -349,6 +349,11 @@ DllSpec
 int FSPAPI ReadFrom(FSPHANDLE, void *, int, NotifyOrReturn);
 
 
+// Return whether previous ReadFrom or ReadInline has reach an end-of-transaction mark.
+// A shortcut for FSPControl(FSPHANDLE, FSP_GET_PEER_COMMITTED, ...);
+DllSpec
+bool FSPAPI HasReadEoT(FSPHANDLE);
+
 
 // Given
 //	FSPHANDLE		the FSP socket
@@ -363,7 +368,6 @@ int FSPAPI ReadFrom(FSPHANDLE, void *, int, NotifyOrReturn);
 //	-EIO if the packet piggyback EoT flag cannot be sent
 DllSpec
 int FSPAPI Commit(FSPHANDLE, NotifyOrReturn);
-
 
 
 // Given
@@ -408,6 +412,12 @@ uint32_t * FSPAPI TranslateFSPoverIPv4(PFSP_IN6_ADDR, uint32_t, ULTID_T);
 DllSpec
 int FSPAPI FSPControl(FSPHANDLE, FSP_ControlCode, ulong_ptr);
 
+
+// Return the extent pointer set by ULA, either stored directly in FSP_SocketParameter.extentI64ULA
+// or set by calling FSPControl(FSPHANDLE, FSP_SET_EXT_POINTER, ...);
+// A shortcut for FSPControl(FSPHANDLE, FSP_GET_EXT_POINTER, ...);
+DllSpec
+void * FSPAPI GetExtPointer(FSPHANDLE);
 
 // Exported by the DLL
 DllSpec

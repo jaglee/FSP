@@ -6,7 +6,7 @@
 const ControlBlock::seq_t FIRST_SN = 12;
 
 // See also CSocketItemDl::Connect2
-CSocketItemDbg *GetPreparedSocket()
+CSocketItemDbg *GetPreparedSocket(int32_t minSendBufSize = 0)
 {
 	static CommandNewSession objCommand;
 	static FSP_SocketParameter parms;
@@ -14,8 +14,8 @@ CSocketItemDbg *GetPreparedSocket()
 	parms.onAccepting = NULL;
 	parms.onAccepted = NULL;
 	parms.onError = NULL;
-	parms.recvSize = MAX_FSP_SHM_SIZE;	// 4MB
-	parms.sendSize = 0;	// the underlying service would give the minimum, however
+	parms.recvSize = MAX_FSP_SHM_SIZE - minSendBufSize;		// 4MB
+	parms.sendSize = minSendBufSize;	// the underlying service would give the minimum, however
 	parms.passive = 0;	// override what is provided by ULA
 	parms.welcome = NULL;	// an active connection request shall have no welcome message
 	parms.len = 0;			// or else memory access exception may occur
@@ -192,7 +192,7 @@ void UnitTestBufferData()
 	// now, there was no enough buffer and the data were partly buffered
 	pSocketItem->pendingSendBuf = preparedTestData;
 	r = pSocketItem->BufferData(MIN_RESERVED_BUF - 2);
-	printf_s("%d bytes sent, %d octets remained\n", r, pSocketItem->pendingSendSize);
+	printf_s("%d packets completed, %d octets remains\n", r, pSocketItem->pendingSendSize);
 	printf_s("Buffer next SN = %u\n", pSCB->sendBufferNextSN);
 	assert(pSCB->sendBufferNextSN == FIRST_SN + MIN_RESERVED_BUF / MAX_BLOCK_SIZE);
 	//
@@ -248,7 +248,7 @@ void UnitTestBufferData()
 	pSocketItem->bytesBuffered = 0;
 	r = pSocketItem->BufferData(MIN_RESERVED_BUF - 2);
 	// assert: pSocketItem->pStreamState == NULL;
-	printf_s("%d octets queued, %d octets remained, %d internally buffered\n"
+	printf_s("%d packets completed, %d octets remains, %d internally buffered\n"
 		, r, pSocketItem->pendingSendSize, pSocketItem->pendingStreamingSize);
 	printf_s("Buffer next SN = %u\n", pSCB->sendBufferNextSN);
 
@@ -284,7 +284,7 @@ void UnitTestBufferData()
 	pSocketItem->SetEndTransaction();
 	pSocketItem->bytesBuffered = 0;
 	r = pSocketItem->BufferData(MIN_RESERVED_BUF - 2);
-	printf_s("%d octets queued, %d octets remained, %d internally buffered\n"
+	printf_s("%d packets completed, %d octets remains, %d internally buffered\n"
 		, r, pSocketItem->pendingSendSize, pSocketItem->pendingStreamingSize);
 	printf_s("Buffer next SN = %u\n", pSCB->sendBufferNextSN);
 
@@ -311,7 +311,8 @@ static int ParseBlock(octet *utf8str, int32_t len)
 {
 	static char partialFileName[sizeof(TCHAR) * MAX_PATH + 4];	// buffered partial file name
 	static int lenPartial = 0;					// length of the partial name
-	TCHAR finalFileName[MAX_PATH];
+	//TCHAR finalFileName[MAX_PATH];
+	char finalFileName[MAX_PATH];				// Well, the console is of MBCS
 	int lenCurrent = 0;
 	int nScanned = 0;
 
@@ -337,13 +338,13 @@ static int ParseBlock(octet *utf8str, int32_t len)
 		lenCurrent++;	// Make it null-terminated
 		nScanned++;
 		memcpy(partialFileName + lenPartial, utf8str, lenCurrent);
-#ifdef _MBCS
+//#ifdef _MBCS
 		UTF8ToLocalMBCS(finalFileName, MAX_PATH, partialFileName);
 		printf_s("%s\n", finalFileName);
-#else
-		UTF8ToWideChars(finalFileName, MAX_PATH, partialFileName, lenPartial + lenCurrent);
-		wprintf_s(L"%s\n", finalFileName);
-#endif
+//#else
+//		UTF8ToWideChars(finalFileName, MAX_PATH, partialFileName, lenPartial + lenCurrent);
+//		wprintf_s(L"%s\n", finalFileName);
+//#endif
 		utf8str += lenCurrent;
 		lenCurrent = 0;
 		lenPartial = 0;
@@ -367,13 +368,13 @@ static int ParseBlock(octet *utf8str, int32_t len)
 			break;
 		}
 		//
-#ifdef _MBCS
+//#ifdef _MBCS
 		UTF8ToLocalMBCS(finalFileName, MAX_PATH, (char *)utf8str);
 		printf_s("%s\n", finalFileName);
-#else
-		UTF8ToWideChars(finalFileName, MAX_PATH, (char *)utf8str, lenCurrent);
-		wprintf_s(L"%s\n", finalFileName);
-#endif
+//#else
+//		UTF8ToWideChars(finalFileName, MAX_PATH, (char *)utf8str, lenCurrent);
+//		wprintf_s(L"%s\n", finalFileName);
+//#endif
 		utf8str += lenCurrent;
 		lenCurrent = 0;
 	} while (nScanned < len);
@@ -386,10 +387,11 @@ static int ParseBlock(octet *utf8str, int32_t len)
 // Show the file/sub-directory name of a directory with moderate number of entries
 void LogicTestPackedSend()
 {
-	CSocketItemDbg *pSocketItem = GetPreparedSocket();
+	CSocketItemDbg *pSocketItem = GetPreparedSocket(MAX_FSP_SHM_SIZE / 2);
 	ControlBlock *pSCB = pSocketItem->GetControlBlock();
 	const TCHAR *pattern = _T("d:\\temp\\*.*");
 	octet lineBuf[80];
+	char localBuf[80];
 
 	// Emulate that a connection is established
 	pSocketItem->SetNewTransaction();
@@ -411,12 +413,15 @@ void LogicTestPackedSend()
 	// Assume it the program was compiled in unicode mode
 	do
 	{
-		wprintf_s(L"File or directory: %s\n", findFileData.cFileName);
+		// wprintf_s(L"File or directory: %s\n", findFileData.cFileName);
 		int nBytes = WideStringToUTF8(lineBuf, sizeof(lineBuf), findFileData.cFileName);
 		if (nBytes <= 0)
 			continue;
 		//
 		WriteTo(pSocketItem, lineBuf, nBytes, TO_COMPRESS_STREAM, NULL);
+		//
+		UTF8ToLocalMBCS(localBuf, sizeof(localBuf), (char *)lineBuf);
+		printf_s("File or directory: %s\n", localBuf);
 	} while (FindNextFile(hFind, &findFileData));
 	//
 	FindClose(hFind);
@@ -424,7 +429,7 @@ void LogicTestPackedSend()
 	Commit(pSocketItem, NULL);
 	//
 	// Pretend that all the data packet have been received:
-	memcpy(pSCB->GetRecvPtr(pSCB->HeadRecv()), pSCB->GetSendPtr(pSCB->HeadSend()), MIN_RESERVED_BUF - 2);
+	memcpy(pSCB->GetRecvPtr(pSCB->HeadRecv()), pSCB->GetSendPtr(pSCB->HeadSend()), pSocketItem->bytesBuffered);
 	while (int(pSCB->recvWindowNextSN - pSCB->sendBufferNextSN) < 0)
 	{
 		ControlBlock::PFSP_SocketBuf skb1 = pSCB->HeadSend() + (pSCB->recvWindowNextSN - FIRST_SN);
@@ -434,9 +439,23 @@ void LogicTestPackedSend()
 	//
 	// Emulate receive (with decompression)
 	//
-	octet *buf = (BYTE *)_alloca(MIN_RESERVED_BUF);
-	int n = ReadFrom(pSocketItem, buf, MIN_RESERVED_BUF, NULL);
-	ParseBlock(buf, n);
+	octet *buf = (octet *)_alloca(MAX_BLOCK_SIZE);
+	if (buf == NULL)
+		return;
+	int n;
+	while ((n = ReadFrom(pSocketItem, buf, MAX_BLOCK_SIZE, NULL)) > 0)
+	{
+		ParseBlock(buf, n);
+	}
+	//// Receive by calling ReadFrom only once
+	//octet *buf = (octet *)malloc(MAX_FSP_SHM_SIZE / 2);
+	//if (buf == NULL)
+	//	return;
+	//int n = ReadFrom(pSocketItem, buf, MAX_FSP_SHM_SIZE / 2, NULL);
+	//if (n > 0)
+	//	ParseBlock(buf, n);
+	////
+	//free(buf);
 }
 
 
@@ -825,18 +844,18 @@ void UnitTestCompressAndDecode()
 
 int _tmain(int argc, _TCHAR* argv[])
 {
-	FUZ_unitTests();
+	//FUZ_unitTests();
 	UnitTestCompressAndDecode();
 
-	UnitTestCheckedRevertCommit();
+	//UnitTestCheckedRevertCommit();
 
-	UnitTestBufferData();
+	//UnitTestBufferData();
 
 	LogicTestPackedSend();
 
-	UnitTestPrepareToSend();
+	//UnitTestPrepareToSend();
 
-	UnitTestFetchReceived();
+	//UnitTestFetchReceived();
 
 	return 0;
 }

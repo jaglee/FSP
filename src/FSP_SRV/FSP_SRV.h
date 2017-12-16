@@ -235,8 +235,8 @@ struct ICC_Context
 	// precomputed CRCs are placed in such a way that send and receive direction are managed separately
 	union
 	{
-		uint64_t	precomputedCRCR1;			// precomputed CRC value for Receiver role/Input side
-		//^CRC64 with ephemeral key
+		// CRC64 with ephemeral key is applied when keyLifeRemain == 0, respective
+		// precomputed values are stored in precomputedCRCS0 and precomputedCRCR1
 		struct
 		{
 			octet	rawKey[sizeof(GCM_AES_CTX)];
@@ -245,10 +245,14 @@ struct ICC_Context
 		//^raw key meant for secure hash mode
 		struct
 		{
-			GCM_AES_CTX	gcm_aes;
 			union
 			{
-				uint64_t precomputedCRCS0;		// precomputed CRC value for Sender role/Output side
+				uint64_t	precomputedCRCR1;	// precomputed CRC value for Receiver role/Input side
+				GCM_AES_CTX	gcm_aes;
+			};
+			union
+			{
+				uint64_t	precomputedCRCS0;	// precomputed CRC value for Sender role/Output side
 				struct
 				{
 					octet	key[FSP_MAX_KEY_SIZE + GMAC_SALT_LEN];
@@ -267,8 +271,8 @@ struct ICC_Context
 	uint32_t	iBatchSend;
 	uint8_t		originalKeyLength;
 	bool		noEncrypt;
-	bool		sendCRConly;
-	bool		recvCRConly;
+	bool		isPrevSendCRC;
+	bool		isPrevRecvCRC;
 	// only when there is no packet left applied with previous key may current key changed  
 	// the sequence number of the first packet to be sent or received with current key, respectively
 	ControlBlock::seq_t	snFirstSendWithCurrKey;
@@ -295,7 +299,7 @@ struct ICC_Context
 			, snFirstSendWithCurrKey);
 #endif
 		// From snFirstSendWithCurrKey + FSP_REKEY_THRESHOLD, inclusively, apply new key
-		if (int32_t(seqNo - snFirstSendWithCurrKey) >= FSP_REKEY_THRESHOLD)
+		if (int32_t(seqNo - snFirstSendWithCurrKey - FSP_REKEY_THRESHOLD) >= 0)
 			ForcefulRekey(0);
 	}
 	// Before accepting packet, check wether it needs rekeying to validate it. If it does need, do rekey
@@ -308,8 +312,8 @@ struct ICC_Context
 			, seqNo
 			, snFirstRecvWithCurrKey);
 #endif
-		if (int32_t(seqNo - snFirstRecvWithCurrKey) < FSP_REKEY_THRESHOLD
-		 || int32_t(seqNo - snFirstRecvWithCurrKey) >= FSP_REKEY_THRESHOLD * 2)
+		if (int32_t(seqNo - snFirstRecvWithCurrKey - FSP_REKEY_THRESHOLD) < 0
+		 || int32_t(seqNo - snFirstRecvWithCurrKey - FSP_REKEY_THRESHOLD - FSP_REKEY_THRESHOLD) >= 0)
 		{
 			return;
 		}
@@ -404,23 +408,6 @@ protected:
 
 	void RestartKeepAlive() { ReplaceTimer(KEEP_ALIVE_TIMEOUT_ms); }
 	void StopKeepAlive() { ReplaceTimer(SCAVENGE_THRESHOLD_ms); }
-	void CalibrateRTT()
-	{ 
-		tLastRecv = NowUTC();
-		// The timer was already started for transient state management when Accept(), Multiply() or sending MULTIPLY
-		tRoundTrip_us = (uint32_t)min(UINT32_MAX, tLastRecv - tRecentSend);
-	}
-	// Note that the raw round trip time includes the lazy-acknowledgement delay
-	// We hard-coded the lazy-acknowledgement delay as one RTT
-	void RecalibrateRTT(uint64_t rtt64_us)
-	{
-		if(rtt64_us > LAZY_ACK_DELAY_MIN_ms * 2000)
-			tRoundTrip_us = uint32_t((min(rtt64_us >> 1, UINT32_MAX) + tRoundTrip_us + 1) >> 1);
-		else if(rtt64_us > LAZY_ACK_DELAY_MIN_ms * 1000)
-			tRoundTrip_us = uint32_t((rtt64_us + tRoundTrip_us + 1) >> 1);
-		else
-			tRoundTrip_us = uint32_t((LAZY_ACK_DELAY_MIN_ms * 1000 + tRoundTrip_us + 1) >> 1);
-	}
 
 	bool InState(FSP_Session_State s) { return lowState == s; }
 	bool InStates(int n, ...);
@@ -470,7 +457,7 @@ public:
 
 	void InstallEphemeralKey();
 	void InstallSessionKey(const CommandInstallKey &);
-	void LOCALAPI DeriveNextKey(ControlBlock::seq_t, ControlBlock::seq_t, ALFID_T, ALFID_T);
+	void LOCALAPI DeriveKey(ControlBlock::seq_t, ControlBlock::seq_t, ALFID_T, ALFID_T);
 
 	bool CheckMemoryBorder(ControlBlock::PFSP_SocketBuf p)
 	{
@@ -525,13 +512,11 @@ public:
 	// Return 0 if it falls in the window (not out of window),
 	// or the offset if it is out of window, negative if on the left, positive if on the right
 	// somewhat 'be free to accept' as we didnot enforce 'announced receive window size'
-	int32_t IsOutOfWindow(ControlBlock::seq_t seq1) const
+	int32_t IsOutOfWindow(ControlBlock::seq_t seq1)
 	{
-		register int32_t d = int32_t(seq1 - pControlBlock->recvWindowFirstSN);
+		register int32_t d = int32_t(seq1) - InterlockedOr((LONG *)& pControlBlock->recvWindowFirstSN, 0);
 		return ((0 <= d) && (d < pControlBlock->recvBufferBlockN)) ? 0 : d;
 	}
-	// With replay-attack suppression. It could be true while still be out of window
-	bool ICCSeqValid();
 
 	// Given
 	//	ControlBlock::seq_t	The sequence number of the packet that mostly expected by the remote end
@@ -571,7 +556,8 @@ public:
 
 	// Event triggered by the remote peer
 	void OnConnectRequestAck(PktBufferBlock *, int);
-	void OnGetPersist();	// PERSIST packet might be apparently out-of-band as it might be payloadless
+	void OnGetAckStart();
+	void OnGetPersist();
 	void OnGetPureData();	// PURE_DATA
 	void OnGetEOT();		// Used to be a standalone COMMIT packet, now the EoT flag
 	void OnAckFlush();		// ACK_FLUSH is always out-of-band

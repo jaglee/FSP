@@ -201,9 +201,7 @@ void UnitTestICC()
 
 	checked = socketR2.ValidateICC(& mp.hdr, 0, socket.fidPair.source, salt);
 	assert(checked);
-
-	checked = socketR2.ValidateICC(& mp.hdr, 0, socketR2.fidPair.peer, salt);
-	assert(checked);
+	// assert(socket.fidPair.source == socketR2.fidPair.peer);
 }
 
 
@@ -436,19 +434,19 @@ void UnitTestByteOrderDefinitin()
  */
 int _tmain(int argc, _TCHAR* argv[])
 {
-	//FlowTestAcknowledge();
-	//FlowTestRetransmission();
-	//FlowTestRecvWinRoundRobin();
+	FlowTestAcknowledge();
+	FlowTestRetransmission();
+	FlowTestRecvWinRoundRobin();
 
 	UnitTestCRC();
 	UnitTestICC();
 	UnitTestHMAC();
 
-	//TrySRP6();
-	//UnitTestTweetNacl();
-	//TryCHAKA();
-	//TryWideChar();
-	//UnitTestByteOrderDefinitin();
+	TrySRP6();
+	UnitTestTweetNacl();
+	TryCHAKA();
+	TryWideChar();
+	UnitTestByteOrderDefinitin();
 	//
 	// TODO: UnitTest of SendInplace, SendStream
 

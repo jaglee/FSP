@@ -511,8 +511,18 @@ int LOCALAPI CSocketItemEx::RespondToSNACK(ControlBlock::seq_t expectedSN, FSP_S
 		return nAck;
 	}
 
+	// Note that the raw round trip time includes the lazy-acknowledgement delay
+	// We hard-coded the lazy-acknowledgement delay as one RTT
 	if(nAck > 0)
-		RecalibrateRTT(rtt64_us);
+	{
+		if (rtt64_us > LAZY_ACK_DELAY_MIN_ms * 2000)
+			tRoundTrip_us = uint32_t((min(rtt64_us >> 1, UINT32_MAX) + tRoundTrip_us + 1) >> 1);
+		else if (rtt64_us > LAZY_ACK_DELAY_MIN_ms * 1000)
+			tRoundTrip_us = uint32_t((rtt64_us + tRoundTrip_us + 1) >> 1);
+		else
+			tRoundTrip_us = uint32_t((LAZY_ACK_DELAY_MIN_ms * 1000 + tRoundTrip_us + 1) >> 1);
+	}
+
 	// ONLY when the first packet in the send window is acknowledged may round-trip time re-calibrated
 	// We assume that after sliding send window the number of unacknowledged was reduced
 	if(pControlBlock->GetSendQueueHead()->GetFlag<IS_ACKNOWLEDGED>())

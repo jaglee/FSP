@@ -252,7 +252,7 @@ void CSocketItemEx::InstallSessionKey(const CommandInstallKey & cmd)
 	printf("Key length: %d bits\t", pControlBlock->connectParams.keyBits);
 	DumpHexical(cmd.ikm, pControlBlock->connectParams.keyBits / 8);
 #endif
-	contextOfICC.sendCRConly = contextOfICC.recvCRConly
+	contextOfICC.isPrevSendCRC = contextOfICC.isPrevRecvCRC
 		= (InterlockedExchange64((LONGLONG *)&contextOfICC.keyLifeRemain, cmd.keyLife) == 0);
 	contextOfICC.noEncrypt = (pControlBlock->noEncrypt != 0);
 	contextOfICC.snFirstSendWithCurrKey = cmd.nextSendSN;
@@ -349,12 +349,14 @@ void ICC_Context::ForcefulRekey(int ioFlag)
 	{
 		snFirstSendWithCurrKey += FSP_REKEY_THRESHOLD;
 		++iBatchSend;
+		isPrevSendCRC = false;
 		u = htobe32(iBatchSend);
 	}
 	else
 	{
 		snFirstRecvWithCurrKey += FSP_REKEY_THRESHOLD;
 		++iBatchRecv;
+		isPrevRecvCRC = false;
 		u = htobe32(iBatchRecv);
 	}
 	info[26] = ((octet *)&u)[0];
@@ -379,13 +381,11 @@ void ICC_Context::ForcefulRekey(int ioFlag)
 	if (ioFlag == 0)
 	{
 		memcpy(& prev.send, & curr.send, sizeof(prev.send));
-		sendCRConly = false;
 		blake2b_update(&ctx, prev.send.H, 16);
 	}
 	else
 	{
 		memcpy(& prev.gcm_aes, & curr.gcm_aes, sizeof(GCM_AES_CTX));
-		recvCRConly = false;
 		blake2b_update(&ctx, prev.gcm_aes.H, 16);
 	}
 	blake2b_update(&ctx, info, 30);
@@ -413,7 +413,7 @@ void ICC_Context::ForcefulRekey(int ioFlag)
 	printf_s("AES-hash key: ");
 	DumpHexical(curr.gcm_aes.H, GCM_BLOCK_LEN);
 	printf_s("Saved send-hash key: ");
-	DumpHexical(curr.gcm_aes.saveH, GCM_BLOCK_LEN);
+	DumpHexical(curr.send.H, GCM_BLOCK_LEN);
 #endif
 
 	bzero(&ctx, sizeof(ctx));
@@ -452,7 +452,14 @@ GCM_AES_CTX * ICC_Context::GetGCMContextForSend(GCM_AES_CTX & ctx, ControlBlock:
 //	The snFirstRecvWithCurrKey is unset until the first response packet is accepted.
 void ICC_Context::InheritS0(const ICC_Context &src, ControlBlock::seq_t seq0)
 {
-	sendCRConly = recvCRConly = ((keyLifeRemain = src.keyLifeRemain) == 0);
+	if ((keyLifeRemain = src.keyLifeRemain) == 0)
+	{
+		curr.precomputedCRCS0 = src.curr.precomputedCRCS0;
+		curr.precomputedCRCR1 = src.curr.precomputedCRCR1;
+		return;
+	}
+
+	isPrevSendCRC = isPrevRecvCRC = false;
 	noEncrypt = src.noEncrypt;
 	snFirstSendWithCurrKey = seq0 + 1;
 
@@ -467,11 +474,11 @@ void ICC_Context::InheritS0(const ICC_Context &src, ControlBlock::seq_t seq0)
 
 	if (src.iBatchRecv == src.iBatchSend)
 	{
-		memcpy(&prev, &src.curr, sizeof(GCM_AES_CTX));
+		prev.gcm_aes = src.curr.gcm_aes;
 	}
 	else if (src.iBatchRecv - src.iBatchSend == 1)
 	{
-		memcpy(&prev, &src.prev, sizeof(GCM_AES_CTX));
+		prev.gcm_aes = src.prev.gcm_aes;
 	}
 	else
 	{
@@ -489,9 +496,20 @@ void ICC_Context::InheritS0(const ICC_Context &src, ControlBlock::seq_t seq0)
 // Remark
 //	And initiate that of the child for accepting the very first packet
 //	The snFirstRecvWithCurrKey is set by the caller directly
+//	Unlike InheritS0, it does not necessarily applying the most recent key of the original connection
+//	because MULTIPLY is out-of-band and it might be in the race condition
+//	that MULTIPLY is received before the ULA installs new key
+//	Assume this ICC_Context has been zeroed
 void ICC_Context::InheritR1(const ICC_Context &src, ControlBlock::seq_t seq0)
 {
-	sendCRConly = recvCRConly = ((keyLifeRemain = src.keyLifeRemain) == 0);
+	if ((keyLifeRemain = src.keyLifeRemain) == 0)
+	{
+		curr.precomputedCRCS0 = src.curr.precomputedCRCS0;
+		curr.precomputedCRCR1 = src.curr.precomputedCRCR1;
+		return;
+	}
+
+	isPrevSendCRC = isPrevRecvCRC = false;
 	noEncrypt = src.noEncrypt;
 	snFirstSendWithCurrKey = seq0;
 
@@ -505,7 +523,11 @@ void ICC_Context::InheritR1(const ICC_Context &src, ControlBlock::seq_t seq0)
 	originalKeyLength = src.originalKeyLength;
 
 	iBatchRecv = iBatchSend = 1;
-	memcpy(&prev, &src.curr, sizeof(GCM_AES_CTX));
+	prev.gcm_aes = src.curr.gcm_aes;
+	// MULTIPLY may race with ULA installing session key
+	prev.gcm_aes = int32_t(snFirstRecvWithCurrKey - src.snFirstRecvWithCurrKey) < 0
+		? src.prev.gcm_aes
+		: src.curr.gcm_aes;
 }
 
 
@@ -544,8 +566,8 @@ void ICC_Context::Derive(const octet *info, int LEN)
 
 // Given
 //	ControlBlock::seq_t sn1			The sequence number of the initiator's MULTIPLY packet
-//	ControlBlock::seq_t ackSN		The sequence number of the responder's PERSIST packet
-//	ALFID_T idInitiator				The initiator's NEW ALFID
+//	ControlBlock::seq_t ackSN		The sequence number of the responder's first packet
+//	ALFID_T idInitiator				The initiator's original ALFID (the parent ALFID)
 //	ALFID_T idResponder				The responder's original ALFID (the parent ALFID)
 // Do
 //  Set the session key for the packet next sent and the next received. 
@@ -561,12 +583,8 @@ void ICC_Context::Derive(const octet *info, int LEN)
 //  Assume internal of SConnectParam is properly padded
 //	It is a bad idea to access internal round key of AES (to utilize blake2b)!
 //	Deliberately hard-coded. Depth of key derivation is always 1 for this version of FSP
-void LOCALAPI CSocketItemEx::DeriveNextKey(ControlBlock::seq_t sn1, ControlBlock::seq_t ackSN, ALFID_T idInitiator, ALFID_T idResponder)
+void LOCALAPI CSocketItemEx::DeriveKey(ControlBlock::seq_t sn1, ControlBlock::seq_t ackSN, ALFID_T idInitiator, ALFID_T idResponder)
 {
-	int L = pControlBlock->connectParams.keyBits;
-	if (L % 8 != 0)
-		throw - EDOM;
-
 	ALIGN(8)
 	octet paddedData[48];
 	paddedData[0] = 1;
@@ -577,7 +595,7 @@ void LOCALAPI CSocketItemEx::DeriveNextKey(ControlBlock::seq_t sn1, ControlBlock
 	// ALFIDs were transmitted in neutral byte order, actually
 	*(uint32_t *)(paddedData + 36) = idInitiator;
 	*(uint32_t *)(paddedData + 40) = idResponder;
-	*(uint32_t *)(paddedData + 44) = htobe32(L);
+	*(uint32_t *)(paddedData + 44) = htobe32(contextOfICC.originalKeyLength * 8);
 	//
 	contextOfICC.Derive(paddedData, 48);
 }
@@ -643,6 +661,7 @@ inline void CSocketItemEx::ChangeRemoteValidatedIP()
 //	AAD = (source fiber ID, destination fiber ID, flags, receive window free pages
 //		 , version, OpCode, header stack pointer, optional headers)
 //	This function is NOT multi-thread safe
+//	Retransmission DOES consume the key life of authenticated encryption
 void * LOCALAPI CSocketItemEx::SetIntegrityCheckCode(FSP_NormalPacketHeader *p1, void *content, int32_t ptLen, uint32_t salt)
 {
 	uint32_t byteA = be16toh(p1->hs.hsp);	// number of octets that 'additional data' in Galois Counter Mode
@@ -662,7 +681,7 @@ void * LOCALAPI CSocketItemEx::SetIntegrityCheckCode(FSP_NormalPacketHeader *p1,
 		p1->integrity.code = contextOfICC.curr.precomputedCRCS0;
 		p1->integrity.code = CalculateCRC64(CalculateCRC64(0, p1, byteA), content, ptLen);
 	}
-	else if(int32_t(seqNo - contextOfICC.snFirstSendWithCurrKey) < 0 && contextOfICC.sendCRConly)
+	else if(int32_t(seqNo - contextOfICC.snFirstSendWithCurrKey) < 0 && contextOfICC.isPrevSendCRC)
 	{
 		p1->integrity.code = contextOfICC.prev.precomputedCRCS0;
 		p1->integrity.code = CalculateCRC64(CalculateCRC64(0, p1, byteA), content, ptLen);
@@ -680,6 +699,19 @@ void * LOCALAPI CSocketItemEx::SetIntegrityCheckCode(FSP_NormalPacketHeader *p1,
 	}
 	else
 	{
+		// assert contextOfICC.keyLifeRemain > 0
+		uint32_t m = byteA + ptLen;
+		if (contextOfICC.keyLifeRemain < m)
+		{
+#ifdef TRACE
+			printf_s("\nSession#%u key run out of life\n", fidPair.source);
+#endif
+			return NULL;
+		}
+		contextOfICC.keyLifeRemain -= m;
+		if (contextOfICC.keyLifeRemain == 0)
+			contextOfICC.keyLifeRemain = 1;	// As a sentinel
+
 		// assert(pControlBlock->sendBufferBlockN <= FSP_REKEY_THRESHOLD);
 		contextOfICC.CheckToRekeyBeforeSend(seqNo);
 		GCM_AES_CTX ctx;
@@ -742,7 +774,7 @@ bool LOCALAPI CSocketItemEx::ValidateICC(FSP_NormalPacketHeader *p1, int32_t ctL
 		p1->integrity.code = contextOfICC.curr.precomputedCRCR1;
 		r = (tag[0] == CalculateCRC64(0, p1, byteA + ctLen));
 	}
-	else if(int32_t(seqNo - contextOfICC.snFirstRecvWithCurrKey) < 0 && contextOfICC.recvCRConly)
+	else if(int32_t(seqNo - contextOfICC.snFirstRecvWithCurrKey) < 0 && contextOfICC.isPrevRecvCRC)
 	{
 		p1->integrity.code = contextOfICC.prev.precomputedCRCR1;
 		r = (tag[0] == CalculateCRC64(0, p1, byteA + ctLen));
@@ -805,8 +837,11 @@ bool LOCALAPI CSocketItemEx::ValidateICC(FSP_NormalPacketHeader *p1, int32_t ctL
 	CONNECT_REQUEST		payload buffer	/ temporary: initiator may retransmit it actively/stateless for responder
 	ACK_CONNECT_REQ		separate payload/ temporary: responder may retransmit it passively/transient for initiator
 	RESET				temporary		/ temporary: one-shot only
-	PERSIST				separate payload/ separate payload: fixed header regenerated on retransmission
+	ACK_START			payload buffer	/ payload buffer
+							Initiator of CONNECT REQUEST may retransmit it actively
+							Responder of MULTIPY may retransmit it on demand
 	PURE_DATA			separate payload/ separate payload: fixed header regenerated on retransmission
+	PERSIST				separate payload/ separate payload: fixed header regenerated on retransmission
 	KEEP_ALIVE			temporary		/ temporary: KEEP_ALIVE is always generate on fly
 	ACK_FLUSH			temporary		/ temporary: ACK_FLUSH is always generate on fly
 	RELEASE				temporary		/ temporary: one-shot only
@@ -844,11 +879,15 @@ bool CSocketItemEx::EmitStart()
 		//
 		result = SendPacket(2, ScatteredSendBuffers(pHdr, sizeof(FSP_NormalPacketHeader), payload, skb->len));
 		break;
-	case PERSIST:	// PERSIST is an in-band control packet with optional payload that confirms a connection
+	case PERSIST:	// PERSIST is an in-band control packet with payload that start a transmit transaction
 		result = EmitWithICC(skb, pControlBlock->sendWindowFirstSN);
 		skb->SetFlag<IS_SENT>();
 		break;
-	// Only possible for retransmission
+	case ACK_START:	// ACK_START is an in-band payloadless control packet that confirms a connection
+		result = EmitWithICC(skb, pControlBlock->sendWindowFirstSN);
+		skb->SetFlag<IS_SENT>();
+		break;
+		// Only possible for retransmission
 	case MULTIPLY:	// The MULTIPLY command head is stored in the queue while the encrypted payload is buffered in cipherText
 		result = SendPacket(2, ScatteredSendBuffers(payload, sizeof(FSP_NormalPacketHeader), this->cipherText, skb->len));
 		break;
@@ -902,21 +941,6 @@ int CSocketItemEx::EmitWithICC(ControlBlock::PFSP_SocketBuf skb, ControlBlock::s
 		return -EDOM;
 	}
 #endif
-	if(contextOfICC.keyLifeRemain > 0)
-	{ 
-		int m = sizeof(FSP_NormalPacketHeader) + skb->len;
-		if(contextOfICC.keyLifeRemain < m)
-		{
-	#ifdef TRACE
-			printf_s("\nSession#%u key run out of life\n", fidPair.source);
-	#endif
-			return -EACCES;
-		}
-		contextOfICC.keyLifeRemain -= m;
-		if (contextOfICC.keyLifeRemain == 0)
-			contextOfICC.keyLifeRemain = 1;	// As a sentinel
-	}
-
 	void  *payload = (FSP_NormalPacketHeader *)this->GetSendPtr(skb);
 	if(payload == NULL)
 	{

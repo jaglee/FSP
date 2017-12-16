@@ -72,10 +72,13 @@ typedef ALFID_T	 ULTID_T;
 //	if a single packet size limit is 2^17, invocations shall be limited to 2^29 for 64 bit tags
 //	As an FSP packet may not exceed 2^16 octets, and because out-of-band packet consume invocation space as well
 //	we infer that maximum sequence number consumed on either direction shall be limit to 2^29
-#ifndef NDEBUG
-#define FSP_REKEY_THRESHOLD	3
-#else
-#define FSP_REKEY_THRESHOLD	0x20000000U
+//	If rekeying occurs more frequently than the length of the send queue
+//	earliest packet that shall be retransmitted may always be rejected
+//	because this implementation only store one historical key
+//	while the earliest packet require ealiear key than stored
+//	The macro might be defined on command line for purpose of boundary test
+#ifndef  FSP_REKEY_THRESHOLD
+# define FSP_REKEY_THRESHOLD	0x20000000
 #endif
 
 /**
@@ -113,13 +116,13 @@ typedef enum _FSP_Session_State: char
 	// timeout to retry or NON_EXISTENT:
 	CONNECT_BOOTSTRAP,
 	// after getting legal CONNECT_REQUEST and sending back ACK_CONNECT_REQ
-	// before getting first PERSIST. timeout to NON_EXISTENT:
+	// before getting ACK_START or first PERSIST. timeout to NON_EXISTENT:
 	CHALLENGING,
 	// after getting responder's cookie and sending formal CONNECT_REQUEST
 	// before getting ACK_CONNECT_REQ, timeout to retry or NON_EXISTENT
 	CONNECT_AFFIRMING,
 	// initiator: after getting ACK_CONNECT_REQ 
-	// responder: after getting the first PERSIST
+	// responder: after getting ACK_START or the first PERSIST
 	// no default timeout. however, implementation could arbitrarily limit a session life
 	ESTABLISHED,
 	// after sending EoT flag, before getting all packet-in-flight acknowledged.
@@ -144,16 +147,17 @@ typedef enum _FSP_Session_State: char
 
 
 // operation code
-typedef enum _FSP_Operation_Code: char
+typedef enum _FSP_Operation_Code : char
 {
-	INIT_CONNECT	= 1,
+	INIT_CONNECT = 1,
 	ACK_INIT_CONNECT,
 	CONNECT_REQUEST,
 	ACK_CONNECT_REQ,	// may piggyback payload
 	RESET,
-	PERSIST,	// Start a new transmit transaction, while EoT flag make it transactional
+	ACK_START,	// Payloadless acknowledgement to CLONE or ACK_CONNECT_REQUEST. Used to be payloadless PERSIST
+	_COMMIT = ACK_START,	// Overloaded as a sentinel to terminatate a transmit transaction in the receive queue
 	PURE_DATA,	// Without any optional header
-	_COMMIT,	// Not literally sent anyway, just as a mark in the receive buffer
+	PERSIST,	// Start a new transmit transaction, while EoT flag make it transactional
 	ACK_FLUSH,
 	RELEASE,
 	MULTIPLY,	// To clone connection, may piggyback payload

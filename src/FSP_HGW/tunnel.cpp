@@ -80,6 +80,7 @@ bool FSPAPI onFSPDataAvailable(FSPHANDLE h, void * buf, int32_t len, bool eot)
 		shutdown(pReq->hSocket, SD_BOTH);
 		closesocket(pReq->hSocket);
 		Dispose(h);
+		return false;
 	}
 	//
 	return true;
@@ -187,12 +188,12 @@ static bool FSPAPI onRequestArrived(FSPHANDLE h, void *buf, int32_t len, bool eo
 	{
         printf_s("connect() failed with error: %d\n", WSAGetLastError());
 		ReportToRemoteClient(p, REP_REJECTED);
-		return TRUE;
+		return false;
 	}
 	
 	ReportToRemoteClient(p, REP_SUCCEEDED);
 	RecvInline(h, onFSPDataAvailable);
 	GetSendBuffer(h, toReadTCPData);
 
-	return true;
+	return false;	// do not chain the previous call-back function
 }
