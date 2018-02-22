@@ -48,7 +48,7 @@
 #include <errno.h>
 #include <stdio.h>
 
-#include "Intrins.h"
+#include "FSP.h"
 
 #define	MAC_ALIGNMENT	16
 
@@ -146,8 +146,6 @@ public:
 	const char * operator[](int);
 };
 
-
-
 // Reflexing string representation of FSP_Session_State and FSP_ServiceCode, for debug purpose
 class CStringizeState
 {
@@ -156,7 +154,7 @@ public:
 	const char * operator[](int);
 };
 
-// Reflexing string 
+// Reflexing string representation of software vector interrupt (notice), for debug purpose
 class CStringizeNotice
 {
 	static const char * names[LARGEST_FSP_NOTICE + 1];
@@ -197,8 +195,6 @@ struct CommandToLLS
 	DWORD			idProcess;
 	ALFID_T			fiberID;
 	FSP_ServiceCode	opCode;	// operation code
-
-	CommandToLLS() { memset(this, 0, sizeof(CommandToLLS)); }
 };
 
 
@@ -214,11 +210,20 @@ struct CommandNewSession: CommandToLLS
 
 
 
+struct CommandRejectRequest : CommandToLLS
+{
+	uint32_t		reasonCode;	
+
+	CommandRejectRequest(ALFID_T id1, uint32_t rc)	{ fiberID = id1; opCode = FSP_Reject; reasonCode = rc; }
+};
+
+
+
 struct CommandInstallKey : CommandToLLS
 {
 	uint32_t	nextSendSN;	// ControlBlock::seq_t
 	uint64_t	keyLife;
-	octet		ikm[400];	// it is hard-coded to 400 bytes, i.e. 2400 bits
+	octet		ikm[400];	// it is hard-coded to 400 bytes, i.e. 3200 bits
 	CommandInstallKey(uint32_t seq1, uint64_t v) { nextSendSN = seq1; keyLife = v; }
 };
 
@@ -227,7 +232,7 @@ struct CommandInstallKey : CommandToLLS
 struct CommandCloneConnect : CommandNewSession
 {
 	ALIGN(4)
-	char		isFlushing;
+	char		committing;
 };
 
 
@@ -274,7 +279,7 @@ struct SConnectParam	// MUST be aligned on 64-bit words!
 	ALFID_T		idRemote;	// ID of the listener or the new forked, depending on context
 	uint32_t	remoteHostID;
 	//
-	uint64_t	allowedPrefixes[MAX_PHY_INTERFACES];
+	TSubnets	allowedPrefixes;
 };	// totally 64 bytes, 512 bits
 
 
@@ -347,7 +352,6 @@ public:
 
 
 
-
 // Name of the flags for protocol use are in camel-case.
 // The flags for internal buffering are in upper case
 // 0~7 : reserved for protocol use. See also enum FSP_FlagPosition
@@ -396,7 +400,7 @@ struct ControlBlock
 		char		name[INET6_ADDRSTRLEN + 7];	// 72 bytes
 		struct
 		{
-			uint64_t	allowedPrefixes[MAX_PHY_INTERFACES];
+			TSubnets	allowedPrefixes;
 			uint32_t	hostID;
 			ALFID_T		fiberID;
 		} ipFSP;
@@ -553,20 +557,6 @@ struct ControlBlock
 	// Return the head packet even if the send queue is empty
 	PFSP_SocketBuf GetSendQueueHead() const { return HeadSend() + sendWindowHeadPos; }
 
-	// Return the descriptor of the last buffered packet in the send buffer, NULL if the send queue is empty or cannot obtain the lock
-	// The imcomplete last buffered packet, if any, is implictly locked
-	// but a complete packet MUST be explicitly locked at first here to make the send queue stable enough
-	PFSP_SocketBuf LockLastBufferedSend()
-	{
-		register int i = _InterlockedOr((volatile LONG *)&sendBufferNextPos, 0);
-		i--;
-		register PFSP_SocketBuf p = HeadSend() + (i < 0 ? sendBufferBlockN - 1 : i);
-		if(! p->Lock())
-			return NULL;
-		// An invalid packet buffer might be locked
-		return CountSendBuffered() <= 0 ? NULL : p;
-	}
-
 	// Return
 	//	0 if used to be no packet at all
 	//	1 if there existed a sent packet at the tail which has ready marked EOT 
@@ -586,7 +576,7 @@ struct ControlBlock
 	//	FSP_NormalPacketHeader*	the place-holder of sequence number and flags
 	//	ControlBlock::seq_t		the intent sequence number of the packet
 	// Do
-	//	Set the default sequence number, expected acknowledgment sequencenumber,
+	//	Set the sequence number, expected sequence number for accumulative acknowledgement,
 	//	flags and the advertised receive window size field of the FSP header 
 	void LOCALAPI SetSequenceFlags(FSP_NormalPacketHeader *pHdr, ControlBlock::seq_t seq1)
 	{
@@ -649,11 +639,11 @@ struct ControlBlock
 	void SlideSendWindow();
 
 	// Slide the send window to skip the head slot, supposing that it has been acknowledged
-	void ControlBlock::SlideSendWindowByOne()
+	void SlideSendWindowByOne()
 	{
 		register int32_t a = _InterlockedIncrement((LONG *)& sendWindowHeadPos) - sendBufferBlockN;
 		if (a >= 0)
-			_InterlockedExchange((LONG *)& sendWindowHeadPos, a);
+			sendWindowHeadPos = a;
 		//
 		_InterlockedIncrement((LONG *)& sendWindowFirstSN);
 	}

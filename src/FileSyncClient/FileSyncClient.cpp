@@ -1,6 +1,6 @@
 /**
-  Usage 1, passively accept a file transfered the FileSyncServer <FileSyncClient> 
-  Usage 2, check memory pattern of a file transfered and saved <FileSyncClient> $memory.^ 
+  Usage 1, passively accept a file transfered by the FileSyncServer <FileSyncClient> [remote_fsp_url]
+  Usage 2, passively accept a file list sent by the FileSyncServer <FileSyncClient> <remote_fsp_url> .
  **/
 #include "stdafx.h"
 #include "tchar.h"
@@ -8,11 +8,7 @@
 // If compiled in Debug mode with the '_DEBUG' macro predefined by default, it tests FSP over UDP/IPv4
 // If compiled in Release mode, or anyway without the '_DEBUG' macro predefined, it tests FSP over IPv6
 #ifdef _DEBUG
-// # define REMOTE_APPLAYER_NAME "192.168.9.125:80"
 # define REMOTE_APPLAYER_NAME "localhost:80"
-// #define REMOTE_APPLAYER_NAME "lt-x61t:80"
-// #define REMOTE_APPLAYER_NAME "lt-at4:80"
-// #define REMOTE_APPLAYER_NAME "lt-ux31e:80"
 #else
 # define REMOTE_APPLAYER_NAME "E000:AAAA::1"
 #endif
@@ -65,21 +61,26 @@ static void FSPAPI onError2(FSPHANDLE h, FSP_ServiceCode code, int value)
 int _tmain(int argc, TCHAR *argv[])
 {
 	int result = -1;
-	if(argc > 2)
+	if(argc > 3 || argc == 3 && (argv[2][0] != _T('.') || _tcslen(argv[2]) > 1))
 	{
-		_tprintf_s(_T("Usage: %s [. | <filename>]\n"), argv[0]);
-		goto l_bailout;
-	}
-	if(argc == 2 && (argv[1][0] != _T('.') || _tcslen(argv[1]) > 1))
-	{
-		result = CompareMemoryPattern(argv[1]);
+		_tprintf_s(_T("Usage: %s [<remote_fsp_url> [. ]]\n"), argv[0]);
 		goto l_bailout;
 	}
 
-	Sleep(2000);	// wait the server up when debug simultaneously
-	if(argc == 2)	//  && argv[1][0] isString "."
+#ifdef _MBCS
+	char *urlRemote = argc > 1 ? argv[1] : REMOTE_APPLAYER_NAME;
+#else
+	if(argc > 1)
 	{
-		result = ToAcceptPushedDirectory(REMOTE_APPLAYER_NAME);
+		_tprintf_s(_T("Presently this program does not accept wide-char parameter.\n");
+		goto l_bailout;
+	}
+	char *urlRemote = REMOTE_APPLAYER_NAME;
+#endif
+	Sleep(2000);	// wait the server up when debug simultaneously
+	if(argc == 3)	//  && argv[2] isString "."
+	{
+		result = ToAcceptPushedDirectory(urlRemote);
 		goto l_bailout;
 	}
 
@@ -88,9 +89,11 @@ int _tmain(int argc, TCHAR *argv[])
 	parms.onAccepting = onMultiplying;
 	parms.onAccepted = onConnected;
 	parms.onError = onError;
+	//parms.onFinish == NULL; // On this client side, we test blocking mode
+	//while on server side we test asynchronous mode
 	parms.recvSize = MAX_FSP_SHM_SIZE;	// 4MB
 	parms.sendSize = 0;	// the underlying service would give the minimum, however
-	if(Connect2(REMOTE_APPLAYER_NAME, & parms) == NULL)
+	if(Connect2(urlRemote, & parms) == NULL)
 	{
 		printf("Failed to initialize the connection in the very beginning\n");
 		goto l_bailout;
@@ -262,9 +265,10 @@ static void FSPAPI onReceiveFileNameReturn(FSPHANDLE h, FSP_ServiceCode resultCo
 // A reverse application layer acknowledgement message is written back to the remote end
 static bool FSPAPI onReceiveNextBlock(FSPHANDLE h, void *buf, int32_t len, bool eot)
 {
+	static DWORD totalWritten;
 	if(buf == NULL)
 	{
-		printf("FSP Internal panic? Receive nothing when calling the CallbackPeeked?\n");
+		printf("FSP Internal panic? Receive nothing when calling the CallbackPeeked? Error code = %d\n", len);
 		Dispose(h);
 		return false;
 	}
@@ -279,7 +283,8 @@ static bool FSPAPI onReceiveNextBlock(FSPHANDLE h, void *buf, int32_t len, bool 
 		return false;
 	}
 
-	printf_s("%d bytes written to local storage.\n", bytesWritten);
+	totalWritten += bytesWritten;
+	printf_s("%d bytes written to local storage, totally %d bytes.\n", bytesWritten, totalWritten);
 	if(eot)
 	{
 		printf_s("All data have been received, to acknowledge...\n");
@@ -303,7 +308,7 @@ static void FSPAPI onAcknowledgeSent(FSPHANDLE h, FSP_ServiceCode c, int r)
 	}
 
 	// On server side we test asynchronous mode
-	if(Shutdown(h, NULL) < 0)
+	if(Shutdown(h) < 0)
 	{
 		printf_s("Cannot shutdown gracefully in the final stage.\n");
 		Dispose(h);

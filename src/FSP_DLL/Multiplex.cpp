@@ -48,7 +48,7 @@ DllExport
 FSPHANDLE FSPAPI MultiplyAndWrite(FSPHANDLE hFSP, PFSP_Context psp1, int8_t flag, NotifyOrReturn fp1)
 {
 	CommandCloneConnect objCommand;
-	CSocketItemDl *p = CSocketItemDl::ToPrepareMultiply((CSocketItemDl *)hFSP, psp1, objCommand);
+	CSocketItemDl *p = CSocketItemDl::ToPrepareMultiply(hFSP, psp1, objCommand);
 	if(p == NULL)
 		return p;
 
@@ -59,19 +59,13 @@ FSPHANDLE FSPAPI MultiplyAndWrite(FSPHANDLE hFSP, PFSP_Context psp1, int8_t flag
 		return NULL;
 	}
 
-	p->TestSetSendReturn(fp1);
-	if(psp1->welcome != NULL)
+	FSPHANDLE h = p->WriteOnMultiplied(objCommand, psp1, flag, fp1);
+	if (h == NULL)
 	{
-		p->pendingSendBuf = (BYTE *)psp1->welcome;
-		p->bytesBuffered = 0;
-		p->CheckTransmitaction((flag & TO_END_TRANSACTION) != 0);
-		if((flag & TO_COMPRESS_STREAM) && !p->AllocStreamState())
-			return NULL;
-		// pendingSendSize set in BufferData
-		p->BufferData(psp1->len);
+		p->FreeAndDisable();
+		return NULL;
 	}
-
-	return p->CompleteMultiply(objCommand);
+	return h;
 }
 
 
@@ -93,7 +87,7 @@ DllExport
 FSPHANDLE FSPAPI MultiplyAndGetSendBuffer(FSPHANDLE hFSP, PFSP_Context psp1, CallbackBufferReady onBufferReady)
 {
 	CommandCloneConnect objCommand;
-	CSocketItemDl *p = CSocketItemDl::ToPrepareMultiply((CSocketItemDl *)hFSP, psp1, objCommand);
+	CSocketItemDl *p = CSocketItemDl::ToPrepareMultiply(hFSP, psp1, objCommand);
 	if(p == NULL)
 		return p;
 
@@ -130,8 +124,9 @@ FSPHANDLE FSPAPI MultiplyAndGetSendBuffer(FSPHANDLE hFSP, PFSP_Context psp1, Cal
 //	The new socket item
 // Remark
 //	Requirement of a command structure is rendered by CreateControlBlock
-CSocketItemDl * LOCALAPI CSocketItemDl::ToPrepareMultiply(CSocketItemDl *p, PFSP_Context psp1, CommandCloneConnect & objCommand)
+CSocketItemDl * LOCALAPI CSocketItemDl::ToPrepareMultiply(FSPHANDLE h, PFSP_Context psp1, CommandCloneConnect & objCommand)
 {
+	CSocketItemDl *p = CSocketDLLTLB::HandleToRegisteredSocket(h);
 	if(p == NULL)
 	{
 		psp1->flags = -EBADF;
@@ -168,6 +163,28 @@ CSocketItemDl * LOCALAPI CSocketItemDl::ToPrepareMultiply(CSocketItemDl *p, PFSP
 
 
 
+inline
+FSPHANDLE LOCALAPI CSocketItemDl::WriteOnMultiplied(CommandCloneConnect &objCommand, PFSP_Context psp1, int8_t flag, NotifyOrReturn fp1)
+{
+	TestSetSendReturn(fp1);
+	if (psp1->welcome != NULL)
+	{
+		if ((flag & TO_COMPRESS_STREAM) && !AllocStreamState())
+			return NULL;
+		pendingSendBuf = (BYTE *)psp1->welcome;
+		bytesBuffered = 0;
+		committing = char((flag & TO_END_TRANSACTION) != 0);
+		// pendingSendSize set in BufferData
+		if (!WaitUseMutex())
+			return NULL;
+		BufferData(psp1->len);
+		SetMutexFree();
+	}
+	return CompleteMultiply(objCommand);
+}
+
+
+
 // Given
 //	CommandCloneConnect & [_InOut_]	The command context whose shared memory and event handlers have been prepared
 // Do
@@ -186,8 +203,9 @@ FSPHANDLE CSocketItemDl::CompleteMultiply(CommandCloneConnect & cmd)
 	cmd.hMemoryMap = (uint64_t)hMemoryMap;
 	cmd.dwMemorySize = dwMemorySize;
 	//
-	cmd.isFlushing = this->isFlushing;
+	cmd.committing = this->committing;
 	cmd.opCode = FSP_Multiply;
+	SetState(CLONING);
 	if(! Call(cmd, sizeof(cmd)))
 	{
 		socketsTLB.FreeItem(this);
@@ -211,7 +229,7 @@ FSPHANDLE CSocketItemDl::CompleteMultiply(CommandCloneConnect & cmd)
 //	ToConcludeConnect()
 bool LOCALAPI CSocketItemDl::ToWelcomeMultiply(BackLogItem & backLog)
 {
-	PFSP_IN6_ADDR remoteAddr = (PFSP_IN6_ADDR) & pControlBlock->peerAddr.ipFSP.allowedPrefixes[MAX_PHY_INTERFACES - 1];	
+	PFSP_IN6_ADDR remoteAddr = (PFSP_IN6_ADDR) & pControlBlock->peerAddr.ipFSP.allowedPrefixes[MAX_PHY_INTERFACES - 1];
 	SetState(ESTABLISHED);
 	SetNewTransaction();
 	if (context.onAccepting != NULL	&& context.onAccepting(this, & backLog.acceptAddr, remoteAddr) < 0)
@@ -220,7 +238,7 @@ bool LOCALAPI CSocketItemDl::ToWelcomeMultiply(BackLogItem & backLog)
 		return false;
 	}
 	ControlBlock::PFSP_SocketBuf skb = SetHeadPacketIfEmpty(ACK_START);
-	if (skb == NULL || isFlushing)	// ACK_START implies to Commit
+	if (skb == NULL || committing)	// ACK_START implies to Commit
 		SetState(COMMITTING);
 
 	return true;

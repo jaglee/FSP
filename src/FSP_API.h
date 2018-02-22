@@ -69,6 +69,7 @@ typedef enum
 	FSP_SET_CALLBACK_ON_REQUEST,// CallbackRequested
 	FSP_SET_CALLBACK_ON_CONNECT,// CallbackConnected
 	FSP_GET_PEER_COMMITTED,
+	FSP_SET_CALLBACK_ON_FINISH,	// NotifyOrReturn
 } FSP_ControlCode;
 
 
@@ -135,6 +136,7 @@ typedef bool (FSPAPI *CallbackPeeked)(FSPHANDLE, void *, int32_t, bool);
 //	negative if to be discontinued
 // Remark
 //	the caller shall make the callback function thread-safe
+//	the callback function should consume at least one buffer block to avoid possible dead-loop
 typedef int (FSPAPI *CallbackBufferReady)(FSPHANDLE, void *, int32_t);
 
 
@@ -159,9 +161,10 @@ typedef void (FSPAPI *LongRunCallback)(FSPHANDLE, ulong_ptr);
 
 struct FSP_SocketParameter
 {
-	CallbackRequested	onAccepting;	// NULL if synchronously accepting, non-NULL if asynchronous
+	CallbackRequested	onAccepting;	// NULL if synchronous accepting, non-NULL if asynchronous
 	CallbackConnected	onAccepted;		// SHOULD be non-NULL for sake of piggybacking payload
 	NotifyOrReturn		onError;		// SHOULD be non-NULL
+	NotifyOrReturn		onFinish;		// NULL if synchronous shutdown, non-NULL if asynchronous 
 	//
 	const void *	welcome;		// default welcome message, may be NULL
 	unsigned short	len;			// length of the default welcome message
@@ -299,18 +302,18 @@ int FSPAPI SendInline(FSPHANDLE, void *, int32_t, bool);
 // Given
 //	FSPHANDLE	the socket handle
 //	const void *the buffer pointer
-//	int			the number of octets to send
-//	int8_t		the send options (TO_END_TRANSACTION, TO_COMPRESS_STREAM)
+//	int32_t		the number of octets to send
+//	unsigned	the send options (TO_END_TRANSACTION, TO_COMPRESS_STREAM)
 //	NotifyOrReturn	the callback function pointer
 // Return
-//	non-negative if it is the number of octets put into the queue immediately. might be 0 of course.
+//	non-negative if it is the number of octets put into the queue immediately. might be 0.
 //	negative if it failed
 // Remark
 //	Only all data have been buffered may be NotifyOrReturn called.
 //	If NotifyOrReturn is NULL the function is blocking, i.e.
 //	waiting until every octet in the given buffer has been passed to LLS.
 DllSpec
-int FSPAPI WriteTo(FSPHANDLE, const void *, int, int8_t, NotifyOrReturn);
+int32_t FSPAPI WriteTo(FSPHANDLE, const void *, int32_t, unsigned, NotifyOrReturn);
 
 
 // given
@@ -359,37 +362,47 @@ bool FSPAPI HasReadEoT(FSPHANDLE);
 //	FSPHANDLE		the FSP socket
 //	NotifyOrReturn	the function pointer for call back
 // Return
-//	EBUSY warning if it is COMMITTING
 //	0 if no error
-//	-EDEADLK if no mutual-exclusive lock available
-//	-EBADF if the socket is in abnormal state
 //	-EAGAIN if commit more than once, which may render dead-lock
-//	-EFAULT if internal resource error encountered, typical time-out clock unavailable
+//	-EDEADLK if no mutual-exclusive lock available
+//	-EDOM if the connection is aborted
+//	-EFAULT	if internal resource error encountered
 //	-EIO if the packet piggyback EoT flag cannot be sent
+// Remark
+//	Would block until the connetion is CLOSABLE, closed or reset if the function pointer is NULL
 DllSpec
 int FSPAPI Commit(FSPHANDLE, NotifyOrReturn);
 
 
 // Given
 //	FSPHANDLE		the FSP socket
-//	NotifyOrReturn	the function pointer for call back
+// Return
+//	0 if no error
+//	-EDEADLK if no mutual-exclusive lock available
+//	-EFAULT if internal resource error encountered
+//	-EIO if LLS is not available
+// Remark
+//	Unlike Commit, the last packet is not necessarily marked EoT
+//	For compatibility with TCP byte-stream transmission
+DllSpec
+int FSPAPI Flush(FSPHANDLE);
+
+
+// Given
+//	FSPHANDLE		the FSP socket
 // Return
 //	EDOM warning if the connection is to shutdown prematurely, i.e. it is a RESET actually
 //	EBUSY warning if it is COMMITTING
 //	EAGAIN warning if the connection is already in the progress of shutdown
 //	0 if no error
 //	-EDEADLK if no mutual-exclusive lock available
-//	-EBADF if the socket is in abnormal state
 //	-EFAULT if internal resource error encountered, typical time-out clock unavailable
 //	-EIO if the shutdown packet cannot be sent
 // Remark
-//	It is assumed that when Shutdown was called ULA did not expect further data from the remote end
-//	The caller should make sure Shutdown is not carelessly called more than once
-//	in a multi-thread continual communication context or else connection reuse(resurrection) may be broken
-// If the pointer of the callback function is null, 
-// blocks until it reaches the state that the transmit transaction has been comitted
+//	If the pointer of the callback function 'onFinish' is null,
+//	it would block the caller until the connection is closed or reset
 DllSpec
-int FSPAPI Shutdown(FSPHANDLE, NotifyOrReturn);
+int FSPAPI Shutdown(FSPHANDLE);
 
 
 // return 0 if no zero, negative if error, positive if warning
@@ -422,6 +435,13 @@ void * FSPAPI GetExtPointer(FSPHANDLE);
 // Exported by the DLL
 DllSpec
 timestamp_t NowUTC();
+
+// For sake of unit test:
+DllSpec
+FSPHANDLE FSPAPI CreateFSPHandle();
+
+DllSpec
+void FSPAPI FreeFSPHandle(FSPHANDLE);
 
 #ifdef __cplusplus
 	}

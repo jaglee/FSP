@@ -37,15 +37,14 @@ void FSPAPI onNotice(FSPHANDLE h, FSP_ServiceCode code, int value)
 
 
 // The function called back when an FSP connection was released. Parameters are self-describing
-void FSPAPI onFinished(FSPHANDLE h, FSP_ServiceCode code, int value)
+void FSPAPI onFinish(FSPHANDLE h, FSP_ServiceCode code, int)
 {
-	printf_s("Socket %p, session was to shut down.\n", h);
-	if(code != FSP_NotifyRecycled)
+	printf_s("Socket %p, session was to shut down, service code = %d.\n", h, code);
+	if(code == FSP_NotifyToFinish)
 	{
-		printf_s("Should got ON_RECYCLED, but service code = %d, return %d\n", code, value);
-		return;
+		FSPControl(h, FSP_SET_CALLBACK_ON_FINISH, NULL);
+		Shutdown(h);
 	}
-
 	finished = true;
 	return;
 }
@@ -65,6 +64,7 @@ void FSPAPI WaitConnection(const char *thisWelcome, unsigned short mLen, Callbac
 	params.onAccepting = onAccepting;
 	params.onAccepted = onAccepted;
 	params.onError = onNotice;
+	params.onFinish = onFinish;
 	params.welcome = thisWelcome;
 	params.len = mLen;
 	params.sendSize = MAX_FSP_SHM_SIZE;
@@ -303,7 +303,7 @@ l_bailout:
 	}
 
 	printf_s("Response received: %s. To shutdown.\n", linebuf);
-	if(Shutdown(h, onFinished) < 0)
+	if(Shutdown(h) < 0)
 	{
 		printf_s("What? Cannot shutdown gracefully!\n");
 		goto l_bailout;

@@ -282,8 +282,7 @@ inline void CLowerInterface::MakeALFIDsPool()
 // we assume that at the very beginning the home address equals the care-of address
 int LOCALAPI CLowerInterface::EnumEffectiveAddresses(uint64_t *prefixes)
 {
-	memset(prefixes, 0, sizeof(uint64_t) * MAX_PHY_INTERFACES);
-	// UNRESOLVED! could we make sure u is 64-bit aligned?
+	memset(prefixes, 0, sizeof(TSubnets));
 	if (! nearInfo.IsIPv6())
 		return 0;
 
@@ -1125,23 +1124,6 @@ bool CSocketItemEx::IsProcessAlive()
 
 
 
-// Return
-//	true if the timer was set, false if it failed.
-bool CSocketItemEx::AddTimer()
-{
-	return (
-		::CreateTimerQueueTimer(& timer, TimerWheel::Singleton()
-			, KeepAlive	// WAITORTIMERCALLBACK
-			, this		// LPParameter
-			, tKeepAlive_ms
-			, tKeepAlive_ms
-			, WT_EXECUTEINTIMERTHREAD
-			) != FALSE
-		);
-}
-
-
-
 // Given
 //	uint32_t		number of millisecond delayed to trigger the timer
 // Return
@@ -1205,6 +1187,7 @@ bool CSocketItemEx::AddResendTimer(uint32_t tPeriod_ms)
 // Assume a mutex has been obtained
 void CSocketItemEx::RemoveTimers()
 {
+	ClearInUse();
 	HANDLE h;
 	if((h = (HANDLE)InterlockedExchangePointer(& timer, NULL)) != NULL)
 		::DeleteTimerQueueTimer(TimerWheel::Singleton(), h, NULL);
@@ -1245,29 +1228,12 @@ void CSocketItemEx::ScheduleConnect(CommandNewSessionSrv *pCmd)
 inline 
 void CSocketItemEx::HandleFullICC(PktBufferBlock *pktBuf, FSPOperationCode opCode)
 {
-	if (!WaitUseMutex())
+	if (!LockWithActiveULA())
 		return;
+
 	// Because some service call may recycle the FSP socket in a concurrent way
 	if (lowState <= 0 || lowState > LARGEST_FSP_STATE)
-	{
-#ifdef TRACE
-		printf_s("Socket#%p for local fiber#%u(_%X_) not in use or not in workable state: %s[%d]\n"
-			, this, fidPair.source, be32toh(fidPair.source)
-			, stateNames[lowState], lowState);
-#endif
 		goto l_return;
-	}
-	// We assume that it costs neglectible time to test whether the ULA process is alive
-	if (!IsProcessAlive())
-	{
-#ifdef TRACE
-		printf_s("Socket#%p for local fiber#%u(_%X_), ULA not alive. State: %s[%d]\n"
-			, this, fidPair.source, be32toh(fidPair.source)
-			, stateNames[lowState], lowState);
-#endif
-		AbortLLS();
-		goto l_return;
-	}
 
 	// MULTIPLY is semi-out-of-band COMMAND starting from a fresh new ALFID. Note that pktBuf is the received
 	// In the CLONING state only PERSIST is the legitimate acknowledgement to MULTIPLY,
@@ -1364,20 +1330,17 @@ CommandNewSessionSrv::CommandNewSessionSrv(const CommandToLLS *p1)
  */
 
 // For ScheduleEmitQ
-DWORD WINAPI HandleSendQ(LPVOID p)
+DWORD WINAPI HandleSendQ(LPVOID p0)
 {
-	try
+	CSocketItemEx *p = (CSocketItemEx *)p0;
+	if (!p->WaitUseMutex())
 	{
-		CSocketItemEx *p0 = (CSocketItemEx *)p;
-		p0->WaitUseMutex();
-		p0->EmitQ();
-		p0->SetMutexFree();
-		return 1;
-	}
-	catch(...)
-	{
+		BREAK_ON_DEBUG();
 		return 0;
 	}
+	p->EmitQ();
+	p->SetMutexFree();
+	return 1;
 }
 
 

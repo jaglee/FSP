@@ -35,7 +35,6 @@
 #include "CryptoStub.h"
 
 #define CRYPTO_SALT_LENGTH	16	// 128 bits
-#define SESSION_KEY_SIZE	32	// 256 bits
 
 struct SCHAKAPublicInfo
 {
@@ -141,10 +140,10 @@ bool CHAKAChallengeByServer(SCHAKAPublicInfo &chakaPubInfo
 {
 	// The server precheck validity of nonce. If clock 'difference is too high'(?), reject the request
 	int64_t d = be64toh(chakaPubInfo.serverNonce) - be64toh(chakaPubInfo.clientNonce);
-	if(d < -60000000 || d > 60000000)	// i.e. 60 seconds
+	if(d < -300000000 || d > 300000000)	// i.e. 300 seconds
 	{
-#ifdef TRACE
-		printf_s("Protocol is broken: timer difference exceeds 1 minute.\n");
+#ifndef NDEBUG
+		printf_s("Protocol is broken: timer difference exceeds 5 minute.\n");
 #endif
 		return false;
 	}
@@ -163,12 +162,10 @@ bool CHAKAResponseByClient(SCHAKAPublicInfo &chakaPubInfo, octet * clientInputHa
 {
 	// The client prechecks the validity of nonce. If clock 'difference is too high'(?), reject the request
 	int64_t d = be64toh(chakaPubInfo.serverNonce) - be64toh(chakaPubInfo.clientNonce);
-	//
-	//
-	if(d < -60000000 || d > 60000000)
+	if(d < -300000000 || d > 300000000)	// i.e. 300 seconds
 	{
-#ifdef TRACE
-		printf_s("Protocol is broken: timer difference exceeds 1 minute.\n");
+#ifndef NDEBUG
+		printf_s("Protocol is broken: timer difference exceeds 5 minute.\n");
 #endif
 		return false;
 	}

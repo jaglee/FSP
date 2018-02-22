@@ -1,5 +1,6 @@
 /**
- * A short module in FileSyncClient, which meant to check the memory pattern saved in the designated file is right
+ * Used to be a short module in FileSyncClient, now in FSP_FlowTest
+ * which meant to check that the memory pattern saved in the designated file is right
  */
 #include "stdafx.h"
 #include "tchar.h"

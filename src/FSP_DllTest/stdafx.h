@@ -23,7 +23,7 @@ class CSocketItemDbg: CSocketItemDl
 {
 public:
 	ControlBlock * GetControlBlock() const { return pControlBlock; }
-	friend void UnitTestCheckedRevertCommit();
+	void SetEndTransaction() { committing = 1; }
 
 	friend void UnitTestPrepareToSend();
 	friend void UnitTestBufferData();

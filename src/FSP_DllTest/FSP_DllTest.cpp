@@ -29,123 +29,6 @@ CSocketItemDbg *GetPreparedSocket(int32_t minSendBufSize = 0)
 static void FUZ_fillCompressibleNoiseBuffer(void* buffer, size_t bufferSize, double proba, U32 * seed);
 
 
-void UnitTestCheckedRevertCommit()
-{
-	CSocketItemDbg *pSocketItem = GetPreparedSocket();
-	ControlBlock *pSCB = pSocketItem->GetControlBlock();
-	bool flag = false;
-
-	pSCB->state = NON_EXISTENT;
-	int r = pSocketItem->CheckTransmitaction(flag);
-	assert(r < 0);
-
-	pSCB->state = CONNECT_BOOTSTRAP;
-	r = pSocketItem->CheckTransmitaction(flag);
-	assert(r < 0);
-
-	pSCB->state = PRE_CLOSED;
-	r = pSocketItem->CheckTransmitaction(flag);
-	assert(r < 0);
-
-	pSCB->state = CLOSED;
-	r = pSocketItem->CheckTransmitaction(flag);
-	assert(r < 0);
-	//
-
-	pSCB->state = COMMITTING;
-	r = pSocketItem->CheckTransmitaction(flag);
-	assert(r == -EBUSY);
-
-	pSCB->state = COMMITTING2;
-	r = pSocketItem->CheckTransmitaction(flag);
-	assert(r == -EBUSY);
-
-	pSCB->state = COMMITTED;
-	r = pSocketItem->CheckTransmitaction(flag);
-	assert(r == 1 && pSCB->state == ESTABLISHED);
-
-	pSCB->state = CLOSABLE;
-	r = pSocketItem->CheckTransmitaction(flag);
-	assert(r == 1 && pSCB->state == PEER_COMMIT);
-
-	//
-	pSCB->state = CONNECT_AFFIRMING;
-	r = pSocketItem->CheckTransmitaction(flag);
-	assert(r == 0);
-
-	pSCB->state = ESTABLISHED;
-	r = pSocketItem->CheckTransmitaction(flag);
-	assert(r == 0);
-
-	pSCB->state = PEER_COMMIT;
-	r = pSocketItem->CheckTransmitaction(flag);
-	assert(r == 0);
-
-	pSCB->state = CLONING;
-	r = pSocketItem->CheckTransmitaction(flag);
-	assert(r == 0);
-
-	//
-	// LISTENING state is just ignored
-	//
-	pSCB->state = NON_EXISTENT;
-
-	//
-	//
-	//
-	pSCB->state = NON_EXISTENT;
-	flag = true;
-	r = pSocketItem->CheckTransmitaction(flag);
-	assert(r < 0);
-
-	pSCB->state = CONNECT_BOOTSTRAP;
-	r = pSocketItem->CheckTransmitaction(flag);
-	assert(r < 0);
-
-	pSCB->state = PRE_CLOSED;
-	r = pSocketItem->CheckTransmitaction(flag);
-	assert(r < 0);
-
-	pSCB->state = CLOSED;
-	r = pSocketItem->CheckTransmitaction(flag);
-	assert(r < 0);
-	//
-
-	pSCB->state = COMMITTING;
-	r = pSocketItem->CheckTransmitaction(flag);
-	assert(r == -EBUSY);
-
-	pSCB->state = COMMITTING2;
-	r = pSocketItem->CheckTransmitaction(flag);
-	assert(r == -EBUSY);
-
-	pSCB->state = COMMITTED;
-	r = pSocketItem->CheckTransmitaction(flag);
-	assert(r == 1 && pSCB->state == COMMITTING);
-
-	pSCB->state = CLOSABLE;
-	r = pSocketItem->CheckTransmitaction(flag);
-	assert(r == 1 && pSCB->state == COMMITTING2);
-
-	//
-	pSCB->state = CONNECT_AFFIRMING;
-	r = pSocketItem->CheckTransmitaction(flag);
-	assert(r == 0);
-
-	pSCB->state = ESTABLISHED;
-	r = pSocketItem->CheckTransmitaction(flag);
-	assert(r == 0);
-
-	pSCB->state = PEER_COMMIT;
-	r = pSocketItem->CheckTransmitaction(flag);
-	assert(r == 0);
-
-	pSCB->state = CLONING;
-	r = pSocketItem->CheckTransmitaction(flag);
-	assert(r == 0);
-}
-
-
 
 // Test logic of SendStream and SendInplace
 void UnitTestBufferData()
@@ -446,6 +329,8 @@ void LogicTestPackedSend()
 	while ((n = ReadFrom(pSocketItem, buf, MAX_BLOCK_SIZE, NULL)) > 0)
 	{
 		ParseBlock(buf, n);
+		if (HasReadEoT(pSocketItem))
+			break;
 	}
 	//// Receive by calling ReadFrom only once
 	//octet *buf = (octet *)malloc(MAX_FSP_SHM_SIZE / 2);
@@ -483,7 +368,8 @@ void UnitTestPrepareToSend()
 	// One packet
 	pSocketItem->SetState(ESTABLISHED);
 	pSocketItem->SetNewTransaction();
-	pSocketItem->PrepareToSend(buf, MAX_BLOCK_SIZE - 2, true);
+	pSocketItem->SetEndTransaction();
+	pSocketItem->PrepareToSend(buf, MAX_BLOCK_SIZE - 2);
 	assert(pSCB->sendBufferNextSN == FIRST_SN + 1);
 	printf_s("Buffer next SN = %u; start packet operation is %s, state is %s\n"
 		, pSCB->sendBufferNextSN
@@ -493,8 +379,9 @@ void UnitTestPrepareToSend()
 	// Reset, two packets
 	pSocketItem->SetState(ESTABLISHED);
 	pSocketItem->SetNewTransaction();
+	pSocketItem->SetEndTransaction();
 	pSCB->SetSendWindow(FIRST_SN);
-	pSocketItem->PrepareToSend(buf, MIN_RESERVED_BUF - 2, true);
+	pSocketItem->PrepareToSend(buf, MIN_RESERVED_BUF - 2);
 	printf_s("Buffer next SN = %u; start packet operation is %s, state is %s\n\n"
 		, pSCB->sendBufferNextSN
 		, opCodeStrings[skb->opCode]
@@ -859,4 +746,3 @@ int _tmain(int argc, _TCHAR* argv[])
 
 	return 0;
 }
-

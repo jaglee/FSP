@@ -89,6 +89,7 @@
   <ItemGroup>
     <ClInclude Include="defs.h" />
     <ClInclude Include="errstrs.hpp" />
+    <ClInclude Include="fsp_http.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

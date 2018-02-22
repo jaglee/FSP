@@ -2,6 +2,8 @@
 // or project specific include files that are used frequently, but
 // are changed infrequently
 //
+// Jason Gao, Jan.6, 2018: Formally apply Multiple Precision Integers and Rationals lib
+//
 
 #pragma once
 
@@ -40,3 +42,5 @@ void TrySRP6();
 void TryCHAKA();
 
 void TryWideChar();
+
+int CompareMemoryPattern(TCHAR *);

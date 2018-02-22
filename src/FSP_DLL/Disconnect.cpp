@@ -33,22 +33,19 @@
 DllExport
 int FSPAPI Dispose(FSPHANDLE hFSPSocket)
 {
-	register CSocketItemDl *p = (CSocketItemDl *)hFSPSocket;
-	try
-	{
-		return p->Recycle(true);
-	}
-	catch(...)
-	{
+	CSocketItemDl *p = CSocketDLLTLB::HandleToRegisteredSocket(hFSPSocket);
+	if(p == NULL)
 		return -EFAULT;
-	}
+	if(! p->WaitUseMutex())
+		return (p->IsInUse() ? -EDEADLK : 0);
+	return p->Recycle();
 }
 
 
 
 // return 0 if no error, positive if some warning
 // an ill-behaviored ULA could be punished by dead-lock
-int CSocketItemDl::Recycle(bool reportError)
+int CSocketItemDl::Recycle()
 {
 	if(! IsInUse())
 		return EAGAIN;	// warning: already disposed
@@ -56,7 +53,6 @@ int CSocketItemDl::Recycle(bool reportError)
 	register int r = 0;
 	if (! lowerLayerRecycled)
 	{
-		isDisposing = reportError ? 1 : 0;
 		bool b = Call<FSP_Recycle>();
 		if(b)
 			return r;	// Free the socket item when FSP_Recycle called back
@@ -64,10 +60,8 @@ int CSocketItemDl::Recycle(bool reportError)
 		r = EIO;		// LLS would eventually timed-out
 	}
 	//
-	NotifyOrReturn fp1 = context.onError;
-	DisableAndFree();
-	if(reportError && fp1 != NULL)
-		fp1(this, FSP_Recycle, -EINTR);
+	FreeAndDisable();
+	SetMutexFree();
 	return r;
 }
 
@@ -79,7 +73,8 @@ int CSocketItemDl::Recycle(bool reportError)
 void CSocketItemDl::Disable()
 {
 	register HANDLE h;
-	CancelTimer();
+	CancelPolling();
+	CancelTimeout();
 	if((h = InterlockedExchangePointer((PVOID *) & theWaitObject, NULL)) != NULL)
 		UnregisterWaitEx(h, NULL);
 	//
@@ -91,43 +86,16 @@ void CSocketItemDl::Disable()
 
 
 
-// Try to commit current transmit transaction
-// Return 0 if no immediate error, or else the error number
-// The callback function might return code of delayed error
-// If the pointer of the callback function is null, 
-// blocks until it reaches the state that the transmit transaction has been comitted
-DllSpec
-int FSPAPI Commit(FSPHANDLE hFSPSocket, NotifyOrReturn fp1)
-{
-	register CSocketItemDl * p = (CSocketItemDl *)hFSPSocket;
-	try
-	{
-		return p->Commit(fp1);
-	}
-	catch(...)
-	{
-		return -EFAULT;
-	}
-}
-
-
-
 // Try to terminate the session gracefully, automatically commit if not yet 
 // Return 0 if no immediate error, or else the error number
-// The callback function might return code of delayed error
-// If the pointer of the callback function is null, blocks until the socket is closed
+// The callback function 'onFinish' might return code of delayed error
 DllSpec
-int FSPAPI Shutdown(FSPHANDLE hFSPSocket, NotifyOrReturn fp1)
+int FSPAPI Shutdown(FSPHANDLE hFSPSocket)
 {
-	register CSocketItemDl * p = (CSocketItemDl *)hFSPSocket;
-	try
-	{
-		return p->Shutdown(fp1);
-	}
-	catch(...)
-	{
+	CSocketItemDl *p = CSocketDLLTLB::HandleToRegisteredSocket(hFSPSocket);
+	if(p == NULL)
 		return -EFAULT;
-	}
+	return p->Shutdown();
 }
 
 
@@ -139,38 +107,34 @@ int FSPAPI Shutdown(FSPHANDLE hFSPSocket, NotifyOrReturn fp1)
 //	{otherwise: connection not ever established yet}-->{Treat 'Shutdown' command as 'Abort'}
 //	ALWAYS assume that only after it has finished receiving is shutdown called
 // Remark
-//	Shutdown is always somewhat blocking. It is deliberate blocking if fp1 == NULL,
+//	Shutdown is always somewhat blocking. It is deliberate blocking
+//	if 'onFinish' function pointer in the connection context is NULL,
 //	undeliberate if it internally waits for previous Commit to finish.
 //	And it always assume that the caller does not accept further data
 //	In deliberate blocking mode, it sends RELEASE immediately
 //	after data has been committed but does not wait for acknowledgement
-int LOCALAPI CSocketItemDl::Shutdown(NotifyOrReturn fp1)
+int CSocketItemDl::Shutdown()
 {
 	if(! WaitUseMutex())
-		return -EDEADLK;
-
-	if(pControlBlock == NULL || InIllegalState())
-	{
-		SetMutexFree();
-		return -EBADF;
-	}
+		return (IsInUse() ? -EDEADLK : 0);
 
 	if(initiatingShutdown)
 	{
 		SetMutexFree();
 		return EAGAIN;	// A warning saying that the socket is already in graceful shutdown process
 	}
-
-	if (InState(PRE_CLOSED))
-	{
-		SetMutexFree();
-		return -EBADF;	// If it is in PRE_CLOSED state it MUST be initiatingShutdown!
-	}
-
 	initiatingShutdown = 1;
 
+	if (lowerLayerRecycled || InState(CLOSED))
+	{
+		SetMutexFree(); // So that SelfNotify may call back instantly
+		if (context.onFinish != NULL)
+			SelfNotify(FSP_NotifyToFinish);
+		//^because initiatingShutdown is set FSP_NotifyRecycled is reported to ULA instead
+		return 0;
+	}
+
 	// Send RELEASE and wait echoed RELEASE. LLS to signal FSP_NotifyRecycled, NotifyReset or NotifyTimeout
-	CancelTimer();	// If any; typically because of previous Commit. Shutdown could override Commit
 	if(! AddOneShotTimer(TRANSIENT_STATE_TIMEOUT_ms))
 	{
 		REPORT_ERRMSG_ON_TRACE("Cannot set time-out clock for shutdown");
@@ -178,163 +142,42 @@ int LOCALAPI CSocketItemDl::Shutdown(NotifyOrReturn fp1)
 		return -EFAULT;
 	}
 
-	// If it is committing, wait until it finishes.
-	while(fpCommitted != NULL)
+	if (fpCommitted != NULL && context.onFinish != NULL)
 	{
 		SetMutexFree();
-		if(! WaitUseMutex())
-			return -EDEADLK;
+		return 0;	// Full-fledged asynchronous mode
 	}
-	fpCommitted = fp1;
-
-	if(InState(CLOSED))
-	{
-		SetMutexFree(); // So that SelfNotify may call back instantly
-		SelfNotify(FSP_NotifyToFinish);
-		return 0;
-	}
-
-	if(lowerLayerRecycled)
-	{
-		SetMutexFree();	// So that SelfNotify may call back instantly
-		SelfNotify(FSP_NotifyToFinish);
-		return 0;
-	}
-
-	if (InState(CLOSABLE))
-	{
-		SetState(PRE_CLOSED);
-		SetMutexFree();
-		return (Call<FSP_Shutdown>() ? 0 : -EIO);
-	}
-
-	int r = InState(COMMITTED) ? 0 : Commit();
-	if(fpCommitted != NULL || r < 0)
-		return r;
 
 #ifndef _NO_LLS_CALLABLE
-	while(InState(COMMITTED))
-	{
-		Sleep(TIMER_SLICE_ms);
-	}
-	//^pure blocking mode: wait it to transit to CLOSABLE, CLOSED or NON_EXISTENT state
-	if (InState(CLOSABLE))
-	{
-		SetState(PRE_CLOSED);
-		SetMutexFree();
-		return (Call<FSP_Shutdown>() ? 0 : -EIO);
-	}
-#endif
-
-	return r;
-}
-
-
-
-// [API:Commit]
-//	{COMMITTED, CLOSABLE, PRE_CLOSED, CLOSED}-->{keep state}
-//	ESTABLISHED-->COMMITTING
-//	PEER_COMMIT-->COMMITTING2
-//	{COMMITTING, COMMITTING2}-->{keep state}
-//	{otherwise: failed}
-int LOCALAPI CSocketItemDl::Commit(NotifyOrReturn fp1)
-{
-	if(! WaitUseMutex())
-		return -EDEADLK;
-
-	if(pControlBlock == NULL || InIllegalState())
-	{
-		SetMutexFree();
-		return -EBADF;
-	}
-
-	if(InterlockedExchangePointer((PVOID *)& fpCommitted, fp1) != NULL)
-	{
-#if defined(TRACE) && !defined(NDEBUG)
-		printf_s("Commit: the socket is already in commit or graceful shutdown process.\n");
-#endif
-		SetMutexFree();
-		return -EAGAIN;	
-	}
-
-	if (InState(COMMITTED) || InState(CLOSABLE) || InState(PRE_CLOSED) || InState(CLOSED))
-	{
-		SetMutexFree();	// So that SelfNotify may call back instantly
-		SelfNotify(FSP_NotifyFlushed);
-		return 0;	// It is already in a state that the near end's last transmit transactio has been committed
-	}
-
-	// Send RELEASE and wait echoed RELEASE. LLS to signal FSP_NotifyRecycled, NotifyReset or NotifyTimeout
-	if(! AddOneShotTimer(TRANSIENT_STATE_TIMEOUT_ms))
-	{
-		REPORT_ERRMSG_ON_TRACE("Cannot set time-out clock for Commit");
-		SetMutexFree();
-		return -EFAULT;
-	}
-
-	return Commit();
-}
-
-
-
-// Internal API for committing/flushing a transmit transaction
-// Assume that it has obtained the mutex lock
-// It is somewhat a little tricky to commit a transmit tranaction:
-// Case 1, it is in sending a stream or obtaining send buffer, and there are yet some data to be buffered
-// Case 2, the send queue is empty at all
-// Case 3, there is set some block to be sent in the send queue
-// Case 4, all blocks have been sent and the tail of the send queue has already been marked EOT
-// Case 5, all blocks have been sent and the tail of the send queue could not set with EOT flag
-// Remark
-//	It is possible that a rogue ULA managed to call FSP_Send more frequently than fair share
-//	However the LLS would prevent abnormally frequent FSP_Commit from abusing
-int CSocketItemDl::Commit()
-{
-	SetEndTransaction();
-
-	// The last resort: flush sending stream if it has not yet been committed
-	if (InState(COMMITTING) || InState(COMMITTING2))
-	{
-		SetMutexFree();
-		return EBUSY;	// a warning saying that it is COMMITTING
-	}
-
-	if (!TestSetState(ESTABLISHED, COMMITTING) && !TestSetState(PEER_COMMIT, COMMITTING2))
-	{
-		SetMutexFree();
-		Recycle();
-		return EDOM;	// A warning say that the connection is aborted actually, for it is not in the proper state
-	}
-
-	// flush internal buffer for compression, if it is non-empty
-	bool yetSomeDataToBuffer = HasDataToCommit();
-	if (yetSomeDataToBuffer && HasFreeSendBuffer())
-	{
-		BufferData(pendingSendSize);
-		yetSomeDataToBuffer = HasDataToCommit();
-		if(yetSomeDataToBuffer)
-			Call<FSP_Send>();	// Or else FSP_Commit would trigger sending the queue
-	}
-	SetMutexFree();
-
-	// Case 1 is handled in DLL while case 2~5 are handled in LLS
-	if(fpCommitted != NULL)
-		return yetSomeDataToBuffer ? 0 : (Call<FSP_Commit>() ? 0 : -EIO);
-
-	// Or else it is in blocking mode:
-#ifndef _NO_LLS_CALLABLE
-	if (!yetSomeDataToBuffer && !Call<FSP_Commit>())
-	{
-#ifdef TRACE
-		printf_s("Fatal error during Commit! Cannot call LLS\n");
-#endif
-		return -EIO;
-	}
-	// Assume the caller has set time-out clock
 	do
 	{
+		if (!InState(COMMITTED) && !InState(CLOSABLE) && !InState(PRE_CLOSED))
+		{
+			int r = Commit();
+			if (r < 0)
+				return r;
+			if (!WaitUseMutex())
+				return (IsInUse() ? -EDEADLK : 0);
+		}
+		//
+		if (InState(CLOSABLE))
+		{
+			SetState(PRE_CLOSED);
+			bool b = Call<FSP_Shutdown>();
+			if (context.onFinish != NULL || !b)
+			{
+				SetMutexFree();
+				return (b ? 0 : -EIO);
+			}
+		}
+		//
+		bool b = InState(CLOSED) || InState(NON_EXISTENT);
+		SetMutexFree();
+		if (b)
+			return 0;
+		//
 		Sleep(TIMER_SLICE_ms);
-	} while(!InState(COMMITTED) && !InState(CLOSABLE) && !InState(CLOSED) && !InState(NON_EXISTENT));
+	} while (WaitUseMutex());
+	return (IsInUse() ? -EDEADLK : 0);
 #endif
-	return 0;
 }

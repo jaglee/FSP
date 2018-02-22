@@ -71,7 +71,14 @@ FSPHANDLE FSPAPI ListenAt(const PFSP_IN6_ADDR listenOn, PFSP_Context psp1)
 
 	socketItem->SetState(LISTENING);
 	// MUST set the state before calling LLS so that event-driven state transition may work properly
-	return socketItem->CallCreate(objCommand, FSP_Listen);
+
+	CSocketItemDl *p = socketItem->CallCreate(objCommand, FSP_Listen);
+	if (p == NULL)
+	{
+		REPORT_ERRMSG_ON_TRACE("Cannot create the LLS socket to listen");
+		socketItem->FreeAndDisable();
+	}
+	return p;
 }
 
 
@@ -174,7 +181,15 @@ FSPHANDLE FSPAPI Connect2(const char *peerName, PFSP_Context psp1)
 	}
 
 	socketItem->SetPeerName(peerName, strlen(peerName));
-	return socketItem->CallCreate(objCommand, InitConnection);
+	socketItem->SetState(CONNECT_BOOTSTRAP);
+
+	CSocketItemDl *p = socketItem->CallCreate(objCommand, InitConnection);
+	if (p == NULL)
+	{
+		REPORT_ERRMSG_ON_TRACE("Cannot create the LLS socket to request connection establishment");
+		socketItem->FreeAndDisable();
+	}
+	return p;
 }
 
 
@@ -197,16 +212,14 @@ CSocketItemDl *CSocketItemDl::ProcessOneBackLog(BackLogItem	*pLogItem)
 	if (socketItem == NULL)
 	{
 		REPORT_ERRMSG_ON_TRACE("Process listening backlog: insufficient system resource?");
-		this->InitCommand<FSP_Reject>(objCommand);
-		this->Call(objCommand, sizeof(struct CommandToLLS));
+		RejectRequest(pLogItem->acceptAddr.idALF, ENOSPC);
 		return NULL;
 	}
 	// lost some possibility of code reuse, gain flexibility (and reliability)
 	if (pLogItem->idParent == 0 && !socketItem->ToWelcomeConnect(*pLogItem)
 	|| pLogItem->idParent != 0 && !socketItem->ToWelcomeMultiply(*pLogItem))
 	{
-		this->InitCommand<FSP_Reject>(objCommand);
-		this->Call(objCommand, sizeof(objCommand));
+		RejectRequest(pLogItem->acceptAddr.idALF, EPERM);
 		socketsTLB.FreeItem(socketItem);
 		return NULL;
 	}
@@ -307,26 +320,29 @@ bool LOCALAPI CSocketItemDl::ToWelcomeConnect(BackLogItem & backLog)
 		// UNRESOLVED! report that the upper layer application reject it?
 		return false;
 	}
+	if(pendingSendBuf != NULL && pendingSendSize + sizeof(FSP_AckConnectRequest) > MAX_BLOCK_SIZE)
+	{
+		// UNRESOLVED! report that ULA should not piggyback too large payload on ACK_CONNECT_REQ?
+		return false;
+	}
 
 	pControlBlock->sendBufferNextSN = pControlBlock->sendWindowFirstSN + 1;
 	pControlBlock->sendBufferNextPos = 1;	// reserve the head packet
 	//
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend();
-	FSP_ConnectParam *params = (FSP_ConnectParam *)GetSendPtr(skb);
+	BYTE *pSubnets = GetSendPtr(skb);
 
 	memcpy(&pControlBlock->connectParams, &backLog, FSP_MAX_KEY_SIZE);
 	//^following fields are filled later
-	params->idListener = pControlBlock->idParent;
-	params->hs.Set(PEER_SUBNETS, sizeof(FSP_NormalPacketHeader));
 	//
 	skb->version = THIS_FSP_VERSION;
 	skb->opCode = ACK_CONNECT_REQ;
-	skb->len = sizeof(*params);	// the fixed header is generated on the fly
+	skb->len = sizeof(TSubnets);	// And the fixed header part is generated on the fly
 	skb->InitFlags();
 	//
-	if(pendingSendBuf != NULL && pendingSendSize + skb->len <= MAX_BLOCK_SIZE)
+	if(pendingSendBuf != NULL)
 	{
-		memcpy((BYTE *)params + skb->len, pendingSendBuf, pendingSendSize);
+		memcpy(pSubnets + skb->len, pendingSendBuf, pendingSendSize);
 		skb->len += pendingSendSize;
 		//
 		pendingSendBuf = NULL;
@@ -373,7 +389,7 @@ void CSocketItemDl::ToConcludeConnect()
 	}
 	skb = SetHeadPacketIfEmpty(ACK_START);
 	// ACK_START implies to Commit. See also ToWelcomeMultiply:
-	SetState((skb == NULL || isFlushing) ? COMMITTING2 : PEER_COMMIT);
+	SetState((skb == NULL || committing) ? COMMITTING2 : PEER_COMMIT);
 
 	Call<FSP_Start>();
 }

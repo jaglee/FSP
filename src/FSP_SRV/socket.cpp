@@ -63,17 +63,11 @@ CSocketItemEx * CSocketSrvTLB::AllocItem()
 	AcquireMutex();
 
 	CSocketItemEx *p = headFreeSID;
-	if(p != NULL)
+	if(p != NULL && p->TestSetInUse())
 	{
 		headFreeSID = p->next;
 		if (headFreeSID == NULL)
 			tailFreeSID = NULL;
-#ifdef NDEBUG
-		p->TestSetInUse();
-#else
-		if (!p->TestSetInUse())
-			DebugBreak();	// BREAK_ON_DEBUG();
-#endif
 		p->next = NULL;
 	}
 	else
@@ -89,6 +83,7 @@ CSocketItemEx * CSocketSrvTLB::AllocItem()
 				break;
 			}
 		}
+		p = NULL;
 	}
 
 	ReleaseMutex();
@@ -187,7 +182,6 @@ void CSocketSrvTLB::PutToListenTLB(CSocketItemEx * p, int k)
 //	Assume having obtained the lock of TLB. Will free the lock in the end.
 void CSocketSrvTLB::FreeItemDonotCareLock(CSocketItemEx *p)
 {
-	p->ClearInUse();	// might be redundant, but it does little harm
 	// if it is allocated by AllocItem(ALFID_T idListener):
 	if(p->IsPassive())
 	{
@@ -226,8 +220,8 @@ void CSocketSrvTLB::FreeItemDonotCareLock(CSocketItemEx *p)
 	{
 		tailFreeSID->next = p;
 		tailFreeSID = p;
-		p->next = NULL;	// in case it is not
 	}
+	p->next = NULL;	// in case it is not
 
 	bzero(&p->contextOfICC, sizeof(ICC_Context));
 	//^For sake of security enforcement.
@@ -437,7 +431,7 @@ bool CSocketItemEx::MapControlBlock(const CommandNewSessionSrv &cmd)
 		REPORT_ERROR_ON_TRACE();
 		return false;
 	}
-#ifdef TRACE
+#if (TRACE & TRACE_ULACALL)
 	printf_s("Handle of the source process is %I64X, handle of the shared memory in the source process is %I64X\n"
 		, (long long)hThatProcess
 		, (long long)cmd.hMemoryMap);
@@ -456,7 +450,7 @@ bool CSocketItemEx::MapControlBlock(const CommandNewSessionSrv &cmd)
 		goto l_bailout;
 	}
 
-#ifdef TRACE
+#if (TRACE & TRACE_ULACALL)
 	printf_s("Handle of the mapped memory in current process is %I64X\n", (long long)hMemoryMap);
 #endif
 
@@ -469,7 +463,7 @@ bool CSocketItemEx::MapControlBlock(const CommandNewSessionSrv &cmd)
 		REPORT_ERROR_ON_TRACE();
 		goto l_bailout1;
 	}
-#ifdef TRACE
+#if (TRACE & TRACE_ULACALL)
 	printf_s("Successfully take use of the shared memory object.\r\n");
 #endif
 
@@ -510,7 +504,7 @@ int32_t LOCALAPI CSocketItemEx::GenerateSNACK(FSP_PreparedKEEP_ALIVE &buf, Contr
 #endif
 		return n;
 	}
-#ifdef TRACE
+#if (TRACE & TRACE_HEARTBEAT)
 	if(n > 0)
 		printf_s("GetSelectiveNACK reported there were %d gap blocks.\n", n);
 #endif
@@ -567,13 +561,12 @@ void CSocketItemEx::InitiateConnect()
 
 	q->timeStamp = initState.nboTimeStamp;
 	skb->SetFlag<IS_COMPLETED>();	// for resend
-	skb->timeSent = NowUTC();		// SetEarliestSendTime();
 	// it neednot be unlocked
 	SendPacket(1, ScatteredSendBuffers(q, sizeof(FSP_InitiateRequest)));
+	skb->timeSent = tRecentSend;
 
-	tKeepAlive_ms = INIT_RETRANSMIT_TIMEOUT_ms;
-	AddTimer();
-	SetState(CONNECT_BOOTSTRAP);
+	SyncState();
+	ReplaceTimer(INIT_RETRANSMIT_TIMEOUT_ms);
 }
 
 
@@ -598,7 +591,14 @@ void CSocketItemEx::AffirmConnect(const SConnectParam & initState, ALFID_T idLis
 		BREAK_ON_DEBUG();	//TRACE_HERE("memory corruption");
 		return;
 	}
-	tRoundTrip_us = uint32_t(min(UINT32_MAX, NowUTC() - skb->timeSent));
+
+	int64_t tDiff = int64_t(NowUTC() - skb->timeSent);
+	if (tDiff <= 0)
+		tRoundTrip_us = 1;	// The minimum round-trip time allowable depends on timer resolution
+	else if (tDiff > UINT32_MAX)
+		tRoundTrip_us = UINT32_MAX;
+	else
+		tRoundTrip_us = (uint32_t)tDiff;
 
 	pkt->initialSN = htobe32(initState.initialSN);
 	pkt->timeDelta = htobe32(initState.timeDelta);
@@ -638,13 +638,22 @@ void CSocketItemEx::InitiateMultiply(CSocketItemEx *srcItem)
 	assert(fidPair.peer == srcItem->fidPair.peer);	// Set in InitAssociation
 
 	ControlBlock::seq_t seq0 = pControlBlock->sendWindowNextSN;	// See also @DLL::ToPrepareMultiply
+	uint32_t salt = htobe32(nextOOBSN = ++srcItem->nextOOBSN);
 	contextOfICC.InheritS0(srcItem->contextOfICC, seq0);
+#if defined(TRACE) && (TRACE & TRACE_OUTBAND)
+	printf_s("\nTo send MULTIPLY in LLS, ICC context:\n"
+		"\tSN of MULTIPLY to send = %09u, salt = %09u\n"
+		"\tALFID of near end's parent = %u, ALFID of peer's parent = %u\n"
+		, seq0, salt
+		, idParent, fidPair.peer);
+#endif
+	if (contextOfICC.keyLifeRemain != 0)
+		DeriveKey(seq0, salt, idParent, fidPair.peer);
 
 	// MULTIPLY can only be the very first packet
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend();
 	void * payload = GetSendPtr(skb);
 	FSP_NormalPacketHeader q;
-	uint32_t salt = htobe32(nextOOBSN = ++srcItem->nextOOBSN);
 	lastOOBSN = 0;	// As the response from the peer, if any, is not an out-of-band packet
 	q.Set(MULTIPLY
 		, sizeof(FSP_NormalPacketHeader)
@@ -666,8 +675,8 @@ void CSocketItemEx::InitiateMultiply(CSocketItemEx *srcItem)
 	SendPacket(2, ScatteredSendBuffers(payload, sizeof(FSP_NormalPacketHeader), this->cipherText, skb->len));
 	pControlBlock->SetFirstSendWindowRightEdge();
 	//
-	tSessionBegin = skb->timeSent = NowUTC();	// UNRESOLVED!? But if SendPacket failed?
-	SetState(CLONING);
+	tSessionBegin = skb->timeSent = tRecentSend;	// UNRESOLVED!? But if SendPacket failed?
+	SyncState();
 	// tRoundTrip_us would be calculated when PERSIST is got, when tLastRecv is set as well
 	ReplaceTimer(INIT_RETRANSMIT_TIMEOUT_ms);
 }
@@ -683,31 +692,17 @@ void CSocketItemEx::InitiateMultiply(CSocketItemEx *srcItem)
 //	however, it is not a fault but is a feature in sake of proper state management
 bool CSocketItemEx::FinalizeMultiply()
 {
-	ALFID_T idPeerParent = _InterlockedExchange((long *)&pControlBlock->peerAddr.ipFSP.fiberID, headPacket->fidPair.source);
+	pControlBlock->peerAddr.ipFSP.fiberID = headPacket->fidPair.source;
 	contextOfICC.snFirstRecvWithCurrKey = headPacket->pktSeqNo;
 	//^See also ResponseToMultiply()
 	InitAssociation();	// reinitialize with new peer's ALFID
 	assert(fidPair.peer == headPacket->fidPair.source);
-#if defined(TRACE) && (TRACE & TRACE_OUTBAND)
-	printf_s("\nGet the acknowledgement ACK_START/PERSIST to MULTIPLY in LLS, ICC context:\n"
-		"\tsend start SN = %09u, recv start sn = %09u\n"
-		"\tALFID of near end's parent = %u, ALFID of peer's parent = %u\n"
-		, contextOfICC.snFirstSendWithCurrKey, contextOfICC.snFirstRecvWithCurrKey
-		, idParent, idPeerParent);
-#endif
-	if (contextOfICC.keyLifeRemain != 0)
-	{
-		DeriveKey(contextOfICC.snFirstSendWithCurrKey
-			, contextOfICC.snFirstRecvWithCurrKey
-			, idParent
-			, idPeerParent);
-	}
 
+#if defined(TRACE) && (TRACE & TRACE_OUTBAND)
+	printf_s("\nGet the acknowledgement ACK_START/PERSIST of MULTIPLY\n");
+#endif
 	if (!ValidateICC())
-	{
-		BREAK_ON_DEBUG();	//TRACE_HERE("Invalid intergrity check code of ACK_START/PERSIST to MULTIPLY!?");
 		return false;
-	}
 
 #if defined(TRACE) && (TRACE & TRACE_OUTBAND)
 	printf_s("Response of MULTIPLY was accepted, recvBufferBlockN = %d\n"
@@ -840,7 +835,6 @@ void CSocketItemEx::Destroy()
 #endif
 		lowState = NON_EXISTENT;	// Donot [SetState(NON_EXISTENT);] as the ULA might do further cleanup
 		RemoveTimers();
-		ClearInUse();
 		CSocketItem::Destroy();
 		//
 		CLowerInterface::Singleton.FreeItem(this);
@@ -888,19 +882,15 @@ void CSocketItemEx::Recycle()
 	if(!IsInUse())
 		return;
 	//
-	if (lowState != CLOSED && lowState != LISTENING)
-	{
-#ifdef TRACE
-		printf_s("Recycle called in %s(%d) state\n", stateNames[lowState], lowState);
+#if (TRACE & TRACE_ULACALL)
+	printf_s("Recycle called in %s(%d) state\n", stateNames[lowState], lowState);
 #endif
-		// It is legitimate to recycle in PRE_CLOSED state unilaterally to support timeout in the upper layer
-		// UNRESOLVED!?!
-		if (lowState != PRE_CLOSED)
-		{
-			RejectOrReset();
-			return;
-		}
-	}
+	// It is legitimate to recycle in PRE_CLOSED state unilaterally to support timeout in the upper layer
+	if (lowState == CHALLENGING || lowState == CONNECT_AFFIRMING)
+		CLowerInterface::Singleton.SendPrematureReset(EINTR, this);
+	else if (lowState != CLOSED && lowState != LISTENING && lowState != PRE_CLOSED)
+		SendReset();
+
 	// Donot [pControlBlock->state = NON_EXISTENT;] as the ULA might do further cleanup
 	// See also RejectOrReset, Destroy and @DLL::RespondToRecycle
 	SignalFirstEvent(FSP_NotifyRecycled);
@@ -909,15 +899,12 @@ void CSocketItemEx::Recycle()
 
 
 
-// Send RESET to the remote peer in the certain states (not guaranteed to be received)
+// Send RESET to the remote peer to reject some request in pre-active state.
+// The RESET packet is not guaranteed to be received.
 // See also DisposeOnReset, Recycle
-void CSocketItemEx::RejectOrReset()
+void CSocketItemEx::Reject(uint32_t reasonCode)
 {
-	if(lowState == CHALLENGING || lowState == CONNECT_AFFIRMING)
-		CLowerInterface::Singleton.SendPrematureReset(EINTR, this);
-	else if(InStates(6, ESTABLISHED, COMMITTING, PEER_COMMIT, COMMITTING2, COMMITTED, CLOSABLE))
-		SendReset();
-	// Do not [pControlBlock->state = NON_EXISTENT;] as the ULA might do further cleanup
+	CLowerInterface::Singleton.SendPrematureReset(reasonCode, this);
 	SignalFirstEvent(FSP_NotifyRecycled);
 	Destroy();	// MUST signal event before Destroy
 }

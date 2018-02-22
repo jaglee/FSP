@@ -51,13 +51,16 @@
 #define DEFAULT_FILE	"index.html"
 #define	BUFFER_POOL_SIZE 65536
 #define DEFAULT_SOCKS_PORT 1080
+#define HTTP_SUCCESS_HEADER  "HTTP/1.0 200 OK\r\n"
 
 // Edge and Chrome on Windows by default use IE settings
 // Firefox support both SOCKS4 and SOCKS5
 // All of them does not support SOCKS4a
 #define SOCKS_VERSION		4
 #define SOCKS_CMD_CONNECT	1	// only support CONNECT
-#define MAX_WORKING_THREADS	40
+#ifndef MAX_WORKING_THREADS
+# define MAX_WORKING_THREADS	40
+#endif
 // fine tuning this value to half number of workable hyper-thread of the platform
 #define RECV_TIME_OUT		30	// half a miniute
 
@@ -98,11 +101,9 @@ typedef struct SRequestPoolItem
 {
 	SOCKET			hSocket;
 	FSPHANDLE		hFSP;
-	union
-	{
-		SRequestResponse req;
-		void * $data_req;
-	};
+	SRequestResponse req;
+	int64_t			countTCPreceived;
+	int64_t			countFSPreceived;
 } *PRequestPoolItem;
 
 
@@ -126,14 +127,7 @@ public:
 
 extern RequestPool requestPool;
 
-// Client-to SOCKS4 service interface
-void ReportErrorToClient(SOCKET, ERepCode);
-void CloseClient(SOCKET, bool);
-
-// Server side forward declarations
-int	FSPAPI onMultiplying(FSPHANDLE, PFSP_SINKINF, PFSP_IN6_ADDR);
-void ReportToRemoteClient(PRequestPoolItem, ERepCode);
-
 // Shared, symmetric routines
+void CloseGracefully(SOCKET);
 bool FSPAPI onFSPDataAvailable(FSPHANDLE, void *, int32_t, bool);
 int	 FSPAPI toReadTCPData(FSPHANDLE, void *, int32_t);

@@ -40,8 +40,7 @@
 
 #define SERVER_STRING	"Server: fspgated/0.1\r\n"
 #include "errstrs.hpp"
-#include "defs.h"
-#include "../Crypto/CHAKA.h"
+#include "fsp_http.h"
 
 #ifdef WIN32
 #include <WinSock2.h>
@@ -56,28 +55,13 @@
 #define _strcmpi strcasecmp
 #endif
 
-struct LineBuffer
-{
-	int		firstOffset;
-	int		lastOffset;
-	char	buf[BUFFER_POOL_SIZE];
-};
-
 /**
  * The key agreement block
  */
-// TODO: should associated salt, password and passwordHash with the session!
-const octet salt[CRYPTO_SALT_LENGTH] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
-const char *password = "Passw0rd";
-ALIGN(8)
-static uint8_t passwordHash[CRYPTO_NACL_HASHBYTES];
 
 // assume that address space layout randomization keep the secret hard to find
 static octet longTermPublicKey[CRYPTO_NACL_KEYBYTES];
-static octet bufPrivateKey[CRYPTO_NACL_KEYBYTES];
-static octet bufSharedKey[CRYPTO_NACL_KEYBYTES];
-static SCHAKAPublicInfo chakaPubInfo;
-static char sessionClientIdString[_MAX_PATH];
+static octet bufASLRPrivateKey[CRYPTO_NACL_KEYBYTES];
 
 static void FSPAPI onPublicKeyReceived(FSPHANDLE, FSP_ServiceCode, int);
 static void FSPAPI onServerResponseSent(FSPHANDLE h, FSP_ServiceCode c, int r);
@@ -90,7 +74,7 @@ static char DEFAULT_ROOT[MAX_PATH];
 
 static int	FSPAPI onAccepted(FSPHANDLE, PFSP_Context);
 static void FSPAPI onNotice(FSPHANDLE, FSP_ServiceCode, int);
-static void FSPAPI onFinished(FSPHANDLE, FSP_ServiceCode, int);
+static void FSPAPI onFinish(FSPHANDLE, FSP_ServiceCode, int);
 
 static void FSPAPI onFirstLineRead(FSPHANDLE, FSP_ServiceCode, int);
 static void FSPAPI onFurtherTunnelRequest(FSPHANDLE, FSP_ServiceCode, int);
@@ -145,7 +129,7 @@ inline void WriteErrStr(FSPHANDLE client, const char *buf)
 }
 
 
-inline void FreeExtent(FSPHANDLE h)
+inline void FreeExtent(FSPHANDLE h, bool disposing = false)
 {
 	void *p = GetExtPointer(h);
 	if(p != NULL)
@@ -153,6 +137,9 @@ inline void FreeExtent(FSPHANDLE h)
 		free(p);
 		FSPControl(h, FSP_SET_EXT_POINTER, NULL);
 	}
+	//
+	if(disposing)
+		Dispose(h);
 }
 
 
@@ -164,36 +151,47 @@ inline void FreeExtent(FSPHANDLE h)
 // If the command line specifies the local web root, it is the remote end point of the tunnel
 int main(int argc, char *argv[])
 {
+	WSADATA wsaData;
+	int r = -1;
+	//
+	if (WSAStartup(0x202, &wsaData) < 0)
+	{
+		printf_s("Cannot start up Windows socket service provider.\n");
+		return r;
+	}
+
 	if(argc <= 1)
 	{
 		printf_s("To serve SOCKS v4 request at port %d\n", DEFAULT_SOCKS_PORT);
 		ToServeSOCKS("localhost:80", DEFAULT_SOCKS_PORT);
+		r = 0;
 	}
 	else if (strcmp(argv[1], "-p") == 0)
 	{
 		if(argc != 3 && argc != 4)
 		{
 			printf_s("Usage: %s -p <port number> [remote fsp app-name, e.g. 192.168.9.125:80]", argv[0]);
-			return -2;
+			goto l_return;
 		}
 
 		int port = atoi(argv[2]);
 		if (port == 0 || port > USHRT_MAX)
 		{
 			printf_s("Port number should be a value between 1 and %d\n", USHRT_MAX);
-			return -1;
+			goto l_return;
 		}
 
 		char *nameAppLayer = (argc == 4 ? argv[3] : "localhost:80");
 		printf_s("To serve SOCKS v4 request at port %d\n", port);
 		ToServeSOCKS(nameAppLayer, port);
+		r = 0;
 	}
 	else if (strcmp(argv[1], "-d") == 0)
 	{
-		if (argc != 3)
+		if (argc != 3 && argc != 4)
 		{
-			printf_s("Usage[as a tunnel remote-end and httpf server]: %s -d <root directory>\n", argv[0]);
-			return -1;
+			printf_s("Usage[as a tunnel remote-end and httpf server]: %s -d <root directory> [max-requests]\n", argv[0]);
+			goto l_return;
 		}
 		//
 		strcpy_s(DEFAULT_ROOT, sizeof(DEFAULT_ROOT), argv[2]);
@@ -203,21 +201,32 @@ int main(int argc, char *argv[])
 		if (stat(DEFAULT_ROOT, &st) == -1 || (st.st_mode & S_IFMT) != S_IFDIR)
 		{
 			printf_s("Either the path is too long or the directory does not exist:\n\t%s\n", argv[2]);
-			return -2;
+			goto l_return;
+		}
+		//
+		int n = argc > 3 ? atoi(argv[3]) : MAX_WORKING_THREADS;
+		if (n <= 0 || !requestPool.Init(n))
+		{
+			printf_s("No enough resource to accept up to %d requests. Check configuration.\n", n);
+			goto l_return;
 		}
 		//
 		printf_s("To serve SOCKS tunneling request and Web Service over FSP at directory:\n%s\n\n", DEFAULT_ROOT);
 		StartHTTPoverFSP();
+		r = 0;
 	}
 	else
 	{
 		printf_s("Usage: %s [-p <port number> [remote fsp url]] | -d <web root directory>\n", argv[0]);
-		return -2;
+		goto l_return;
 	}
 
 	printf("\n\nPress Enter to exit...");
 	getchar();
-	return(0);
+
+l_return:
+	WSACleanup();
+	exit(r);
 }
 
 
@@ -230,7 +239,7 @@ void StartHTTPoverFSP()
 
 	unsigned short mLen = (unsigned short)strlen(SERVER_STRING) + 1;
 	char *thisWelcome = (char *)_alloca(mLen + CRYPTO_NACL_KEYBYTES);
-	CryptoNaClKeyPair(longTermPublicKey, bufPrivateKey);
+	CryptoNaClKeyPair(longTermPublicKey, bufASLRPrivateKey);
 	memcpy(thisWelcome, SERVER_STRING, mLen);
 	memcpy(thisWelcome + mLen, longTermPublicKey, CRYPTO_NACL_KEYBYTES);
 	mLen += CRYPTO_NACL_KEYBYTES;
@@ -239,6 +248,7 @@ void StartHTTPoverFSP()
 	params.onAccepting = NULL;	// make it blocking
 	params.onAccepted = onAccepted;
 	params.onError = onNotice;
+	params.onFinish = onFinish;
 	params.welcome = thisWelcome;
 	params.len = mLen;
 	params.sendSize = BUFFER_POOL_SIZE;
@@ -281,15 +291,14 @@ static void FSPAPI onNotice(FSPHANDLE h, FSP_ServiceCode code, int value)
 
 
 // The function called back when an FSP connection was released. Parameters are self-describing
-static void FSPAPI onFinished(FSPHANDLE h, FSP_ServiceCode code, int value)
+static void FSPAPI onFinish(FSPHANDLE h, FSP_ServiceCode code, int)
 {
-	printf_s("Socket %p, session was to shut down.\n", h);
-	if(code != FSP_NotifyRecycled)
+	printf_s("Socket %p, session was to shut down, service code = %d.\n", h, code);
+	if(code == FSP_NotifyToFinish)
 	{
-		printf_s("Should got ON_RECYCLED, but service code = %d, return %d\n", code, value);
-		return;
+		FSPControl(h, FSP_SET_CALLBACK_ON_FINISH, NULL);
+		Shutdown(h);
 	}
-	//
 	return;
 }
 
@@ -299,8 +308,17 @@ static int	FSPAPI onAccepted(FSPHANDLE client, PFSP_Context ctx)
 {
 	printf_s("\nAccepted: handle of FSP session is %p\n", client);
 
-	InitCHAKAServer(chakaPubInfo, longTermPublicKey);
-	ReadFrom(client, chakaPubInfo.peerPublicKey, sizeof(chakaPubInfo.peerPublicKey), onPublicKeyReceived);
+	PFSAData pdFSA = (PFSAData)malloc(sizeof(AssociatedData));
+	if(pdFSA == NULL)
+	{
+		printf_s("Fatal! No enough memory.\n");
+		return -1;
+	}
+	FSPControl(client, FSP_SET_EXT_POINTER, (ulong_ptr)pdFSA);
+
+	pdFSA->firstOffset = pdFSA->lastOffset = 0;
+	InitCHAKAServer(pdFSA->chakaPubInfo, longTermPublicKey);
+	ReadFrom(client, pdFSA->chakaPubInfo.peerPublicKey, CRYPTO_NACL_KEYBYTES, onPublicKeyReceived);
 	return 0;
 }
 
@@ -311,69 +329,64 @@ static void FSPAPI onPublicKeyReceived(FSPHANDLE h, FSP_ServiceCode c, int r)
 	if(r < 0)
 	{
 		printf_s("Previous ReadFrom@ServiceSAWS_onAccepted asynchronously return %d.\n", r);
-		Dispose(h);
+		FreeExtent(h, true);
 		return;
 	}
 
-	ReadFrom(h, & chakaPubInfo.clientNonce, sizeof(chakaPubInfo.clientNonce), NULL);
-	octet buf[sizeof(sessionClientIdString)];
+	PFSAData pdFSA = (PFSAData)GetExtPointer(h);
+	ReadFrom(h, & pdFSA->chakaPubInfo.clientNonce, sizeof(timestamp_t), NULL);
+	octet buf[_MAX_PATH];
 	int nBytes = ReadFrom(h, buf, sizeof(buf), NULL);
 
 	// assert(nBytes <= sizeof(sessionClientIdString));
-	CryptoNaClGetSharedSecret(bufSharedKey, chakaPubInfo.peerPublicKey, bufPrivateKey);
-	ChakaStreamcrypt((octet *)sessionClientIdString, buf, nBytes, chakaPubInfo.clientNonce, bufSharedKey);
+	CryptoNaClGetSharedSecret(pdFSA->bufSharedKey, pdFSA->chakaPubInfo.peerPublicKey, bufASLRPrivateKey);
+	ChakaStreamcrypt(pdFSA->sessionClientIdString, buf, nBytes, pdFSA->chakaPubInfo.clientNonce, pdFSA->bufSharedKey);
 
 	// TODO: check connection context further
 	if (!HasReadEoT(h))
 	{
 		printf_s("Protocol is broken: length of client's id should not exceed MAX_PATH\n");
-		Dispose(h);
+		FreeExtent(h, true);
 		return;
 	}
 
 	// TODO: map the client's id to its salt and password hash value
-	MakeSaltedPassword(passwordHash, salt, password);
-	memcpy(chakaPubInfo.salt, salt, sizeof(salt));
+	MakeSaltedPassword(pdFSA->passwordHash, sampleSalt, samplePassword);
+	memcpy(pdFSA->chakaPubInfo.salt, sampleSalt, sizeof(sampleSalt));
 
 	octet serverResponse[CRYPTO_NACL_HASHBYTES];
-	if(! CHAKAChallengeByServer(chakaPubInfo, serverResponse, passwordHash))
+	if(! CHAKAChallengeByServer(pdFSA->chakaPubInfo, serverResponse, pdFSA->passwordHash))
 	{
-		Dispose(h);
+		FreeExtent(h, true);
 		return;
 	}
 
-	int n = sizeof(chakaPubInfo.salt) + sizeof(chakaPubInfo.serverNonce) + sizeof(chakaPubInfo.serverRandom);
-	WriteTo(h, chakaPubInfo.salt, n, 0, NULL);
+	int n = sizeof(pdFSA->chakaPubInfo.salt)
+		+ sizeof(pdFSA->chakaPubInfo.serverNonce) + sizeof(pdFSA->chakaPubInfo.serverRandom);
+	WriteTo(h, pdFSA->chakaPubInfo.salt, n, 0, NULL);
 	WriteTo(h, serverResponse, sizeof(serverResponse), TO_END_TRANSACTION, onServerResponseSent);
 }
 
 
 
+
 static void FSPAPI onServerResponseSent(FSPHANDLE h, FSP_ServiceCode c, int r)
 {
-	ReadFrom(h, chakaPubInfo.peerResponse, sizeof(chakaPubInfo.peerResponse), NULL);
-	if(! CHAKAValidateByServer(chakaPubInfo, passwordHash))
+	PFSAData pdFSA = (PFSAData)GetExtPointer(h);
+	ReadFrom(h, pdFSA->chakaPubInfo.peerResponse, CRYPTO_NACL_HASHBYTES, NULL);
+	if(! CHAKAValidateByServer(pdFSA->chakaPubInfo, pdFSA->passwordHash))
 	{
-		Dispose(h);
+		FreeExtent(h, true);
 		return;
 	}
-	memset(passwordHash, 0, sizeof(passwordHash));	// clear memory trace for better security assurance
+	memset(pdFSA->passwordHash, 0, CRYPTO_NACL_HASHBYTES);	// clear memory trace for better security assurance
 
-	InstallMasterKey(h, bufSharedKey, SESSION_KEY_SIZE);
-	memset(bufSharedKey, 0, SESSION_KEY_SIZE);
-	memset(bufPrivateKey, 0, CRYPTO_NACL_KEYBYTES);
+	InstallMasterKey(h, pdFSA->bufSharedKey, CRYPTO_NACL_KEYBYTES);
+	memset(pdFSA->bufSharedKey, 0, CRYPTO_NACL_KEYBYTES);
+	// Unlike the client side, private key of the server side is semi-static for sake of performance
 	printf_s("Remote tunnel client authorized. The negotiated shared key installed.\n");
 
-	LineBuffer *lineBuf = (LineBuffer *)malloc(sizeof(LineBuffer));
-	if(lineBuf == NULL)
-	{
-		printf_s("\nFatal! No enough memory\n");
-		Dispose(h);
-		return;
-	}
-	lineBuf->firstOffset = lineBuf->lastOffset = 0;
-	FSPControl(h, FSP_SET_EXT_POINTER, (ulong_ptr)lineBuf);
-	ReadFrom(h, lineBuf->buf, BUFFER_POOL_SIZE, onFirstLineRead);
+	ReadFrom(h, pdFSA->buf, BUFFER_POOL_SIZE, onFirstLineRead);
 }
 
 
@@ -387,7 +400,7 @@ static void FSPAPI onFirstLineRead(FSPHANDLE client, FSP_ServiceCode c, int r)
 {
 	if (r < 0)
 	{
-		Dispose(client);
+		FreeExtent(client, true);
 		return;
 	}
 	printf_s("First request line ready for %p\n", client);
@@ -405,7 +418,7 @@ static void FSPAPI onFirstLineRead(FSPHANDLE client, FSP_ServiceCode c, int r)
 	int tunnel = 0;
 	char *query_string = NULL;
 
-	int numchars = ReadLine(client, buf, sizeof(buf));
+	int numchars = ReadLine(client, buf, sizeof(buf) - 1);
 	if (numchars < 0)
 	{
 		printf_s("Cannot ReadLine in MasterService(), error number: %d\n", numchars);
@@ -416,6 +429,8 @@ static void FSPAPI onFirstLineRead(FSPHANDLE client, FSP_ServiceCode c, int r)
 		method[i] = buf[j];
 	}
 	method[i] = '\0';
+	buf[numchars] = '\0';
+	printf_s("Remote request:\n%s\n", buf);
 
 	if(_strcmpi(method, "TUNNEL") == 0)
 	{
@@ -493,7 +508,7 @@ static void FSPAPI onFirstLineRead(FSPHANDLE client, FSP_ServiceCode c, int r)
 	}
 
 	FreeExtent(client);
-	Shutdown(client, onFinished);
+	Shutdown(client);
 }
 
 

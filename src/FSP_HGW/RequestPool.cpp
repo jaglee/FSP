@@ -36,14 +36,12 @@ bool RequestPool::Init(int n)
 	if(n <= 0)
 		return false;
 	//
-	items = (SRequestPoolItem *)malloc(sizeof(SRequestPoolItem) * n);
+	size_t requestedSize = sizeof(SRequestPoolItem) * n;
+	items = (SRequestPoolItem *)malloc(requestedSize);
 	if(items == NULL)
 		return false;
 
-	for(register int i = 0; i < n; i++)
-	{
-		items[i].hFSP = NULL;
-	}
+	memset(items, 0, requestedSize);
 
 	capacity = n;
 	return true;
@@ -86,17 +84,20 @@ PRequestPoolItem RequestPool::AllocItem()
 
 PRequestPoolItem RequestPool::FindItem(FSPHANDLE h)
 {
-	PRequestPoolItem p = (PRequestPoolItem)GetExtPointer(h);
-	//
-	return (p == NULL || p->hFSP != h ? NULL : p);
+	for(register int i = 0; i < capacity; i++)
+	{
+		if(items[i].hFSP == h)
+			return (items + i);
+	}
+	return NULL;
 }
+
 
 
 // See also AllocItem
 bool RequestPool::FreeItem(PRequestPoolItem p)
 {
-	int offset = p - this->items;
-	
+	int offset = (octet *)p - (octet *)this->items;
 	if(offset % sizeof(SRequestPoolItem) != 0)
 		return false;
 
@@ -105,8 +106,6 @@ bool RequestPool::FreeItem(PRequestPoolItem p)
 	if(offset < 0 || offset >= capacity)
 		return false;
 
-	if(p->hFSP != (FSPHANDLE *)(-1))
-		FSPControl(p->hFSP, FSP_SET_EXT_POINTER, NULL);
-	p->hFSP = NULL;
+	memset(p, 0, sizeof(SRequestPoolItem));
 	return true;
 }

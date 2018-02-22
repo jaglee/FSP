@@ -63,7 +63,6 @@ UnregisterWaitEx(
     );
 #endif
 
-#include "../FSP.h"
 #include "../FSP_Impl.h"
 
 // prepare pre-defined macros before including FSP_API.h
@@ -101,6 +100,8 @@ public:
 	CSocketItemDl * operator [] (int i) { return pSockets[i]; }
 
 	CSocketDLLTLB();
+	// Return the registered socket pointer mapped to the FSP handle
+	static CSocketItemDl * HandleToRegisteredSocket(FSPHANDLE);
 };
 
 
@@ -136,27 +137,33 @@ class CSocketItemDl: public CSocketItem
 	// for sake of incarnating new accepted connection
 	FSP_SocketParameter context;
 
+	// for sake of buffered, streamed I/O
+	ControlBlock::PFSP_SocketBuf skbImcompleteToSend;
+
 	uint8_t			inCritical;		// to handle the situation of emulated NMI that free the socket before previous notice processed
 	char			inUse;
+
+protected:
 	char			newTransaction;	// it may simultaneously start a transmit transaction and flush/commit it
-	//
+
 	char			initiatingShutdown : 1;
-	char			isDisposing : 1;
-	char			isFlushing : 1;
+	char			committing : 1;
 	char			lowerLayerRecycled : 1;
 	char			peerCommitPending : 1;
 	char			peerCommitted : 1;
-protected:
-	//
+	char			chainingReceive : 1;
+	char			chainingSend : 1;
+	char			toIgnoreNextPoll : 1;
+
+	HANDLE			pollingTimer;
 	ALIGN(8)		HANDLE theWaitObject;
 
-	// On ACK_FLUSH Callback for FSPAPI COMMIT, and overloaded for SHUT_DOWN
-	NotifyOrReturn	fpCommitted;
 	// to support full-duplex send and receive does not share the same call back function
 	NotifyOrReturn	fpReceived;
 	// to support superior RecvInline() over ReadFrom() make CallbackPeeked an independent function
 	CallbackPeeked	fpPeeked;
 	CallbackBufferReady fpSent;
+	NotifyOrReturn	fpCommitted;
 
 	// For network streaming *Buf is not NULL
 	BYTE *			pendingSendBuf;
@@ -175,12 +182,12 @@ protected:
 	static VOID NTAPI WaitOrTimeOutCallBack(PVOID param, BOOLEAN isTimeout)
 	{
 		if(isTimeout)
-		{
 			((CSocketItemDl *)param)->TimeOut();
-			return;
-		}
-		((CSocketItemDl *)param)->WaitEventToDispatch();
+		else
+			((CSocketItemDl *)param)->WaitEventToDispatch();
 	}
+
+	static VOID NTAPI PollingTimedoutCallBack(PVOID param, BOOLEAN) { ((CSocketItemDl *)param)->PollingTimedout();}
 
 	BOOL RegisterDrivingEvent()
 	{
@@ -193,8 +200,11 @@ protected:
 	}
 
 	bool LOCALAPI AddOneShotTimer(uint32_t);
-	bool CancelTimer();
+	bool LOCALAPI AddPollingTimer(uint32_t);
+	bool CancelPolling();
+	bool CancelTimeout();
 	void TimeOut();
+	void PollingTimedout();
 
 	void WaitEventToDispatch();
 	bool LockAndValidate();
@@ -210,7 +220,8 @@ protected:
 	ControlBlock::PFSP_SocketBuf LOCALAPI SetHeadPacketIfEmpty(FSPOperationCode c);
 
 	// In Multiplex.cpp
-	static CSocketItemDl * LOCALAPI CSocketItemDl::ToPrepareMultiply(CSocketItemDl *, PFSP_Context, CommandCloneConnect &);
+	static CSocketItemDl * LOCALAPI CSocketItemDl::ToPrepareMultiply(FSPHANDLE, PFSP_Context, CommandCloneConnect &);
+	FSPHANDLE LOCALAPI WriteOnMultiplied(CommandCloneConnect &, PFSP_Context, int8_t, NotifyOrReturn);
 	FSPHANDLE CompleteMultiply(CommandCloneConnect &);
 	bool LOCALAPI ToWelcomeMultiply(BackLogItem &);
 
@@ -218,10 +229,11 @@ protected:
 	void ProcessPendingSend();
 	int LOCALAPI BufferData(int);
 
+	bool HasFreeSendBuffer() { return (pControlBlock->CountSendBuffered() - pControlBlock->sendBufferBlockN < 0); }
+
 	// In Receive.cpp
 	void	ProcessReceiveBuffer();
 	int32_t FetchReceived();
-	bool	HasFreeSendBuffer() { return (pControlBlock->CountSendBuffered() - pControlBlock->sendBufferBlockN < 0); }
 
 	// In IOControl.cpp
 	bool AllocStreamState();
@@ -237,12 +249,16 @@ protected:
 
 public:
 	void Disable();
-	void DisableAndFree()
+	void DisableAndNotify(FSP_ServiceCode c, int v)
 	{
-		SetMutexFree();
+		NotifyOrReturn fp1 = context.onError;
 		Disable();
+		SetMutexFree();
 		socketsTLB.FreeItem(this);
+		if(fp1 != NULL)
+			fp1(this, c, -v);
 	}
+	//^The error handler need not and should not do further clean-up work
 	void FreeAndDisable()
 	{
 		socketsTLB.FreeItem(this);
@@ -250,7 +266,7 @@ public:
 	}
 
 	int LOCALAPI Initialize(PFSP_Context, char[MAX_NAME_LENGTH]);
-	int Recycle(bool reportError = false);
+	int Recycle();
 
 	// Convert the relative address in the control block to the address in process space, unchecked
 	BYTE * GetSendPtr(const ControlBlock::PFSP_SocketBuf skb) const
@@ -309,6 +325,12 @@ public:
 		return Call(cmd, sizeof(cmd));
 	}
 	CSocketItemDl * LOCALAPI CallCreate(CommandNewSession &, FSP_ServiceCode);
+	void LOCALAPI RejectRequest(ALFID_T id1, uint32_t rc)
+	{
+		CommandRejectRequest objCommand(id1, rc);
+		objCommand.idProcess = idThisProcess;
+		Call(objCommand, sizeof(objCommand));
+	}
 
 	int LOCALAPI InstallRawKey(octet *, int32_t, uint64_t);
 
@@ -317,13 +339,14 @@ public:
 
 	ControlBlock::PFSP_SocketBuf GetSendBuf() { return pControlBlock->GetSendBuf(); }
 
-	int LOCALAPI PrepareToSend(void *, int32_t, bool);
-	int LOCALAPI SendStream(const void *, int, bool, bool);
+	int32_t LOCALAPI PrepareToSend(void *, int32_t);
+	int32_t LOCALAPI SendStream(const void *, int32_t, bool, bool);
+	int Flush();
+
 	bool TestSetSendReturn(PVOID fp1)
 	{
 		return InterlockedCompareExchangePointer((PVOID *) & fpSent, fp1, NULL) == NULL; 
 	}
-	int LOCALAPI CheckTransmitaction(bool);
 	//
 	int LOCALAPI FinalizeSend(int r)
 	{
@@ -337,19 +360,32 @@ public:
 		SetMutexFree();
 		return (r == 0 ? r : (Call<FSP_Send>() ? r : -EIO));
 	}
+	//
+	int Commit();
+	int LockAndCommit(NotifyOrReturn);
 
 	int	LOCALAPI RecvInline(CallbackPeeked);
 	int LOCALAPI ReadFrom(void *, int, NotifyOrReturn);
 
-	int LOCALAPI Shutdown(NotifyOrReturn);
-	int LOCALAPI Commit(NotifyOrReturn);
-	int Commit();
+	int Shutdown();
 
 	void SetCallbackOnRequest(CallbackRequested fp1) { context.onAccepting = fp1; }
 	void SetCallbackOnAccept(CallbackConnected fp1) { context.onAccepted = fp1; }
+	void SetCallbackOnFinish(NotifyOrReturn fp1) { context.onFinish = fp1; }
 
-	void SetNewTransaction() { isFlushing = 0; newTransaction = 1; }
-	void SetEndTransaction() { isFlushing = 1; }
+	void SetNewTransaction() { committing = 0; newTransaction = 1; }
+	// Given
+	//	bool	whether to terminate the transmit transaction
+	// Do
+	//	Set committing and newTransaction conditionally, respectively
+	void CheckTransmitaction(bool eotFlag)
+	{
+		if(eotFlag)
+			committing = 1;
+		if (InState(COMMITTED) || InState(CLOSABLE))
+			newTransaction = 1;
+	}
+	void MigrateToNewStateOnSend();
 
 	int SelfNotify(FSP_ServiceCode c);
 	void SetCallbackOnError(NotifyOrReturn fp1) { context.onError = fp1; }

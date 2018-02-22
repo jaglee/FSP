@@ -22,19 +22,6 @@ static int FSPAPI onMultiplied(FSPHANDLE hRev, PFSP_Context ctx)
 
 
 
-// The function called back when the FSP clone connection was released. Parameters are self-describing
-static void FSPAPI onShutdown(FSPHANDLE hRev, FSP_ServiceCode code, int value)
-{
-	printf_s("Clone session, socket %p has been shutdown.\n", hRev);
-	if(code != FSP_NotifyRecycled)
-		printf_s("Should got ON_RECYCLED, but service code = %d, return %d\n", code, value);
-
-	r2Finish = true;
-	return;
-}
-
-
-
 static void FSPAPI onError(FSPHANDLE hRev, FSP_ServiceCode code, int value)
 {
 	printf_s("Clone session, socket %p has been reset (%d, %d).\n", hRev, code, value);
@@ -48,7 +35,8 @@ static void FSPAPI onError(FSPHANDLE hRev, FSP_ServiceCode code, int value)
 static void FSPAPI onSignatureSent(FSPHANDLE hRev, FSP_ServiceCode c, int r)
 {
 	printf_s("Clone session, socket %p, result of sending the signature: %d\n", hRev, r);
-	Shutdown(hRev, onShutdown);
+	Shutdown(hRev);
+	r2Finish = true;
 	return;
 }
 

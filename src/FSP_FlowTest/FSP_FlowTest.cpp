@@ -447,8 +447,8 @@ int _tmain(int argc, _TCHAR* argv[])
 	TryCHAKA();
 	TryWideChar();
 	UnitTestByteOrderDefinitin();
-	//
-	// TODO: UnitTest of SendInplace, SendStream
+
+	CompareMemoryPattern("$memory.^");
 
 	return 0;
 }

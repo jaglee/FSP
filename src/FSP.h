@@ -218,6 +218,8 @@ typedef enum: char
 // the number of microsecond elapsed since Midnight January 1, 1970 UTC (unix epoch)
 typedef uint64_t timestamp_t;
 
+// the typeof the subnets field of some structures
+typedef uint64_t			TSubnets[MAX_PHY_INTERFACES];
 
 /**
  * Protocol defined timeouts
@@ -402,7 +404,7 @@ struct FSP_Challenge
 // PEER_SUBNETS used to be CONNECT_PARAM and it is perfect OK to treat the latter as the canonical alias of the former
 struct FSP_ConnectParam
 {
-	uint64_t	subnets[MAX_PHY_INTERFACES];
+	TSubnets	subnets;
 	ALFID_T		idListener;
 	ALFID_T		idHost;
 	//
@@ -437,8 +439,9 @@ struct FSP_AckConnectRequest
 {
 	struct FSP_NormalPacketHeader _h;
 #endif
-	FSP_ConnectParam params;
+	TSubnets	subnets;
 };
+// Attention Please! the optional payload of ACK_CONNECT_REQ is prefixed with the array of reachable subnets
 
 
 

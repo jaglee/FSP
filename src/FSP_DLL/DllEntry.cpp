@@ -126,7 +126,6 @@ timestamp_t NowUTC()
 
 
 
-
 // Return
 //	true if obtained the mutual-exclusive lock
 //	false if timed out
@@ -191,7 +190,7 @@ int CSocketItemDl::SelfNotify(FSP_ServiceCode c)
 		if(GetTickCount64() - t0 > MAX_LOCK_WAIT_ms)
 		{
 			BREAK_ON_DEBUG();	// To trace the call stack, there may be deadlock on waiting for free notice slot
-			return -EINTR;
+			return -EDEADLK;
 		}
 		Sleep(TIMER_SLICE_ms);
 	}
@@ -319,12 +318,7 @@ CSocketItemDl * LOCALAPI CSocketItemDl::CallCreate(CommandNewSession & objComman
 	objCommand.hMemoryMap = (uint64_t)hMemoryMap;
 	objCommand.dwMemorySize = dwMemorySize;
 	//
-	if(! Call(objCommand, sizeof(objCommand)))
-	{
-		socketsTLB.FreeItem(this);
-		return NULL;
-	}
-	return this;
+	return Call(objCommand, sizeof(objCommand)) ? this : NULL;
 }
 
 
@@ -344,8 +338,7 @@ bool CSocketItemDl::LockAndValidate()
 #ifndef NDEBUG
 		printf_s("\nDescriptor#%p: event to be processed, but the Control Block is missing!\n", this);
 #endif
-		DisableAndFree();
-		NotifyError(FSP_NotifyReset, -EBADF);
+		DisableAndNotify(FSP_NotifyReset, EBADF);
 		return false;
 	}
 
@@ -357,7 +350,7 @@ bool CSocketItemDl::LockAndValidate()
 			, this
 			, stateNames[pControlBlock->state], pControlBlock->state);
 #endif
-		this->Recycle();	// would notify ULA if reportError is set
+		Recycle();
 		return false;
 	}
 
@@ -397,16 +390,16 @@ void CSocketItemDl::WaitEventToDispatch()
 				"\tdescriptor=%p, state: %s[%d]\n"
 				, this, stateNames[pControlBlock->state], pControlBlock->state);
 #endif
-			DisableAndFree();
-			NotifyError(FSP_NotifyReset, -EBADF);
+			DisableAndNotify(FSP_NotifyReset, EBADF);
 			break;
 		}
 		//
+		FSP_Session_State s0;
 		NotifyOrReturn fp1;
 		switch(notice)
 		{
 		case FSP_NotifyListening:
-			CancelTimer();			// See also ::ListenAt
+			CancelTimeout();		// See also ::ListenAt
 			SetMutexFree();
 			break;
 		case FSP_NotifyAccepting:	// overloaded callback for either CONNECT_REQUEST or MULTIPLY
@@ -415,7 +408,7 @@ void CSocketItemDl::WaitEventToDispatch()
 			SetMutexFree();
 			break;
 		case FSP_NotifyAccepted:
-			CancelTimer();			// If any
+			CancelTimeout();		// If any
 			// Asychronous return of Connect2, where the initiator may cancel data transmission
 			if(InState(CONNECT_AFFIRMING))
 			{
@@ -425,14 +418,17 @@ void CSocketItemDl::WaitEventToDispatch()
 			if(context.onAccepted != NULL)
 			{
 				SetMutexFree();
-				context.onAccepted(this, &context);
-				if (!LockAndValidate())
+				int r = context.onAccepted(this, &context);
+				if (!LockAndValidate() || r < 0)
+				{
+					Recycle();		// SetMutexFree();
 					goto l_return;
+				}
 			}
 			ProcessReceiveBuffer();	// SetMutexFree();
 			break;
 		case FSP_NotifyMultiplied:	// See also @LLS::Connect()
-			CancelTimer();			// If any
+			CancelTimeout();		// If any
 			fidPair.source = pControlBlock->nearEndInfo.idALF;
 			ProcessReceiveBuffer();
 			if (!LockAndValidate())
@@ -460,7 +456,7 @@ void CSocketItemDl::WaitEventToDispatch()
 			SetMutexFree();
 			break;
 		case FSP_NotifyFlushed:
-			isFlushing = 0;			// Must clear the flag firstly or else transmit transactions is splitted unproperly
+			committing = 0;			// Must clear the flag firstly or else transmit transactions is splitted unproperly
 			ProcessPendingSend();	// SetMutexFree();
 			if (!LockAndValidate())
 				goto l_return;
@@ -470,66 +466,53 @@ void CSocketItemDl::WaitEventToDispatch()
 				SetMutexFree();
 				Call<FSP_Shutdown>();
 			}
-			else if(!initiatingShutdown	// See also Commit(NotifyOrReturn):
-				&& (InState(COMMITTED) || InState(CLOSABLE) || InState(PRE_CLOSED) || InState(CLOSED)))
+			else
 			{
-				NotifyOrReturn fp1 = (NotifyOrReturn)InterlockedExchangePointer((PVOID *)& fpCommitted, NULL);
-				CancelTimer();		// If any
+				fp1 = NULL;
+				if (InState(COMMITTED) || InState(CLOSABLE) || InState(PRE_CLOSED) || InState(CLOSED))
+					fp1 = (NotifyOrReturn)InterlockedExchangePointer((PVOID *)& fpCommitted, fp1);
+				CancelTimeout();// If any
 				SetMutexFree();
 				if (fp1 != NULL)
 					fp1(this, FSP_NotifyFlushed, 0);
 			}
-			else
-			{
-				SetMutexFree();
-			}
 			break;
 		case FSP_NotifyToFinish:
+			fp1 = context.onFinish;	// For security reason recycle MAY reset context
 			if(initiatingShutdown)
 			{
-				NotifyOrReturn fp1 = (NotifyOrReturn)InterlockedExchangePointer((PVOID *)& fpCommitted, NULL);
-				SetMutexFree();
+				Recycle();	// CancelTimer(); SetMutexFree();
 				if (fp1 != NULL)
 					fp1(this, FSP_NotifyRecycled, 0);
-				//
-				Recycle();
 			}
 			else
 			{
 				SetMutexFree();
+				if (fp1 != NULL)
+					fp1(this, FSP_NotifyToFinish, 0);
 			}
 			break;
 		case FSP_NotifyRecycled:
-			fp1 = isDisposing ? context.onError : NULL;
-			CancelTimer();	// If any; typically for Shutdown 
-			Recycle();		// SetMutexFree();
-			if(fp1 != NULL)
-				fp1(this, notice, -EINTR);
+			Recycle();		// CancelTimer(); SetMutexFree();
 			goto l_return;
 		case FSP_IPC_CannotReturn:
-			if (pControlBlock->state == LISTENING)
-			{
-				SetMutexFree();
-				NotifyError(FSP_Listen, -EFAULT);
-			}
-			else if (pControlBlock->state == CONNECT_BOOTSTRAP || pControlBlock->state == CONNECT_AFFIRMING)
-			{
-				CancelTimer();	// If any
-				SetMutexFree();
-				context.onAccepted(NULL, &context);		// general error
-			}
-			else
-			{
-				SetMutexFree();
-			}
+			s0 = pControlBlock->state;
+			fp1 = context.onError;
+			Recycle();		// CancelTimer(); SetMutexFree();
+			if(fp1 == NULL)
+				goto l_return;
+			if (s0 == LISTENING)
+				fp1(this, FSP_Listen, -EIO);
+			else if (s0 != CHALLENGING)
+				fp1(this, (s0 == CLONING ? FSP_Multiply : InitConnection), -EIO);
+			//
 			goto l_return;
 		case FSP_MemoryCorruption:
 		case FSP_NotifyOverflow:
 		case FSP_NotifyTimeout:
 		case FSP_NotifyNameResolutionFailed:
 		case FSP_NotifyReset:
-			DisableAndFree();	// The error handler needn't do further clean-up work
-			NotifyError(notice, -EINTR);
+			DisableAndNotify(notice, EINTR);
 			goto l_return;
 			// UNRESOLVED!? There could be some remedy if name resolution failed?
 		}
@@ -585,6 +568,7 @@ CSocketItemDl * LOCALAPI CSocketItemDl::CreateControlBlock(const PFSP_IN6_ADDR n
 }
 
 
+
 #ifndef _NO_LLS_CALLABLE
 // Given
 //	CommandToLLS &		const, the command context to pass to LLS
@@ -600,6 +584,7 @@ bool LOCALAPI CSocketItemDl::Call(const CommandToLLS & cmd, int size)
 #endif
 
 
+
 // Given
 //	uint32_t		number of milli-seconds to wait till the timer shoot
 // Return
@@ -607,15 +592,48 @@ bool LOCALAPI CSocketItemDl::Call(const CommandToLLS & cmd, int size)
 //	false if it failed
 bool LOCALAPI CSocketItemDl::AddOneShotTimer(uint32_t dueTime)
 {
-	return (timer == NULL
-		&&::CreateTimerQueueTimer(& timer, ::timerQueue
+	return (timer == NULL && ::CreateTimerQueueTimer(& timer, ::timerQueue
 			, WaitOrTimeOutCallBack
 			, this		// LPParameter
 			, dueTime
 			, 0
 			, WT_EXECUTEINTIMERTHREAD
 			) != FALSE
+		|| timer != NULL && ::ChangeTimerQueueTimer(::timerQueue, timer, dueTime, 0) != FALSE
 		);
+}
+
+
+
+// Given
+//	uint32_t		number of milli-seconds of the interval
+// Return
+//	true if the repeative timer is registered successfully
+//	false if it failed
+bool LOCALAPI CSocketItemDl::AddPollingTimer(uint32_t interval)
+{
+	return (pollingTimer == NULL
+		&&::CreateTimerQueueTimer(& pollingTimer, ::timerQueue
+			, PollingTimedoutCallBack
+			, this		// LPParameter
+			, interval
+			, interval
+			, WT_EXECUTEINTIMERTHREAD
+			) != FALSE
+		);
+}
+
+
+
+// Do
+//	Try to cancel the registered polling timer
+// Return
+//	true if the polling timer is successfully canceled
+//	false if it failed
+bool CSocketItemDl::CancelPolling()
+{
+	HANDLE h = (HANDLE)InterlockedExchangePointer((PVOID *)& pollingTimer, NULL);
+	return (h == NULL || ::DeleteTimerQueueTimer(::timerQueue, h, NULL) != FALSE);
 }
 
 
@@ -625,16 +643,10 @@ bool LOCALAPI CSocketItemDl::AddOneShotTimer(uint32_t dueTime)
 // Return
 //	true if the one-shot timer is successfully canceled
 //	false if it failed
-bool CSocketItemDl::CancelTimer()
+bool CSocketItemDl::CancelTimeout()
 {
-	if(timer == NULL)
-		return true;
-
-	if(::DeleteTimerQueueTimer(::timerQueue, timer, NULL) == FALSE)
-		return false;
-
-	timer = NULL;
-	return true;
+	HANDLE h = (HANDLE)InterlockedExchangePointer((PVOID *)& timer, NULL);
+	return (h == NULL || ::DeleteTimerQueueTimer(::timerQueue, h, NULL) != FALSE);
 }
 
 
@@ -643,27 +655,52 @@ bool CSocketItemDl::CancelTimer()
 // See also Recycle
 void CSocketItemDl::TimeOut()
 {
-	WaitUseMutex();
-
-#ifdef TRACE
-	printf_s("\nDescriptor#%p: timed-out ", this);
-	if(pControlBlock == NULL)
-		printf_s("event to be processed, the Control Block has been released.\n");
-	else
-		printf_s("in state %s[%d]\n", stateNames[pControlBlock->state], pControlBlock->state);
-#endif
-	if(! IsInUse())
-	{
-		SetMutexFree();
+	if(! LockAndValidate())
 		return;
-	}
 
 	if (! lowerLayerRecycled)
 		Call<FSP_Recycle>();
 
-	DisableAndFree();
-	BREAK_ON_DEBUG();
-	NotifyError(FSP_NotifyTimeout, -ETIMEDOUT);
+	DisableAndNotify(FSP_NotifyTimeout, ETIMEDOUT);
+}
+
+
+
+void CSocketItemDl::PollingTimedout()
+{
+	if(! LockAndValidate())
+		return;
+
+	if(toIgnoreNextPoll)
+	{
+		toIgnoreNextPoll = 0;
+		SetMutexFree();
+		return;
+	}
+
+	// To make it less stressing, process either receive or send, but not both
+	// and receive takes precedence because receiving is to free resource
+	if( (fpReceived != NULL || fpPeeked != NULL) && !chainingReceive && HasDataToDeliver())
+		SelfNotify(FSP_NotifyDataReady);
+	else if(fpSent != NULL && !chainingSend && HasFreeSendBuffer())
+		SelfNotify(FSP_NotifyBufferReady);
+
+	SetMutexFree();
+}
+
+
+
+// For a prototype it does not worth the trouble to exploit hash table 
+CSocketItemDl *	CSocketDLLTLB::HandleToRegisteredSocket(FSPHANDLE h)
+{
+	register CSocketItemDl *p = (CSocketItemDl *)h;
+	for(register int i = 0; i < MAX_CONNECTION_NUM; i++)
+	{
+		if (CSocketItemDl::socketsTLB.pSockets[i] == p)
+			return ((p->pControlBlock == NULL || p->InIllegalState()) ? NULL : p);
+	}
+	//
+	return NULL;
 }
 
 
@@ -729,19 +766,15 @@ CSocketItemDl * CSocketDLLTLB::AllocItem()
 			head->prev = NULL;
 		else
 			tail = NULL;
-		// Product system: should clear the buffer space as well for sake of system security
-		memset(item->pControlBlock, 0, (BYTE *) & item->pControlBlock->sendBufferBlockN - (BYTE *)item->pControlBlock);
 	}
 
 	memset((BYTE *)item + sizeof(CSocketItem)
 		, 0
 		, sizeof(CSocketItemDl) - sizeof(CSocketItem));
-	// item->prev = item->next = NULL;	// so does other connection state pointers and flags
 	// We are confident that RTL_SRWLOCK_INIT is all zero
 	// so InitializeSRWLock(& item->rtSRWLock) or assign to SRWLOCK_INIT is unneccessary
 	//
 	pSockets[sizeOfWorkSet++] = item;
-	item->inCritical = 0;
 	_InterlockedExchange8(& item->inUse, 1);
 
 l_bailout:

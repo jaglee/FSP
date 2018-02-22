@@ -110,6 +110,7 @@ void LOCALAPI Connect(CommandNewSessionSrv &cmd)
 	return;
 
 l_bailout3:
+	socketItem->ClearInUse();
 	CLowerInterface::Singleton.FreeItem(socketItem);
 l_bailout2:
 	connectRequests.Remove(cmd.index);
@@ -203,7 +204,7 @@ void Multiply(CommandCloneSessionSrv &cmd)
 		return;
 	}
 
-	newItem->shouldAppendCommit = cmd.isFlushing;
+	newItem->shouldAppendCommit = cmd.committing;
 	newItem->InitiateMultiply(srcItem);
 l_return:
 	// Only on exception would it signal event to DLL
@@ -239,7 +240,7 @@ void CSocketItemEx::ProcessCommand(CommandToLLS *pCmd)
 	switch(pCmd->opCode)
 	{
 	case FSP_Reject:
-		RejectOrReset();
+		Reject(((CommandRejectRequest *)pCmd)->reasonCode);
 		break;
 	case FSP_Recycle:
 		Recycle();
@@ -296,7 +297,7 @@ void CSocketItemEx::Listen()
 //	Make initiative connect context and initiate session establishment
 void CSocketItemEx::Connect()
 {
-#ifdef TRACE
+#if (TRACE & TRACE_ULACALL)
 	printf_s("Try to make connection to %s (@local fiber#%u(_%X_)\n", PeerName(), fidPair.source, be32toh(fidPair.source));
 #endif
 	char nodeName[INET6_ADDRSTRLEN];
@@ -349,7 +350,7 @@ void CSocketItemEx::Connect()
 //	DLL::FinalizeSend, DLL::ToConcludeConnect
 void CSocketItemEx::Start()
 {
-#ifdef TRACE
+#if (TRACE & TRACE_ULACALL)
 	printf_s("To send first packet %s\n\tin %s[%d] => %s[%d] state\n\tfirstSN = %u, nextSN = %u\n"
 		, opCodeStrings[(pControlBlock->HeadSend() + pControlBlock->sendWindowHeadPos)->opCode]
 		, stateNames[lowState], lowState
@@ -384,14 +385,17 @@ void CSocketItemEx::UrgeCommit()
 	}
 	//
 	int r = pControlBlock->MarkSendQueueEOT();
+	if (r == 2)
+	{
+		EmitQ();
+		return;
+	}
 	if (r <= 0)
 	{
 		shouldAppendCommit = 1;
 		SendKeepAlive();
 	}
-	// See also EmitQ, DoResend
-	if (resendTimer == NULL)
-		AddResendTimer(tRoundTrip_us >> 8);
+	AddResendTimer(tRoundTrip_us >> 8);
 }
 
 

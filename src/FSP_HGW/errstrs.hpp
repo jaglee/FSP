@@ -15,7 +15,6 @@
 	| "502"   ; Bad Gateway
 	| "503"   ; Service Unavailable
 */
-#define HTTP_SUCCESS_HEADER  "HTTP/1.0 200 OK\r\n"
 
 const char * ERRSTR_BAD_REQUEST =
 	"HTTP/1.0 400 BAD REQUEST\r\n"

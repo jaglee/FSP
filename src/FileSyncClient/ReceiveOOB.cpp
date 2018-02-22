@@ -27,7 +27,7 @@ static bool FSPAPI onSignatureReceived(FSPHANDLE hRev, void * buf, int32_t lengt
 	printf_s("Cloned session, socket %p, %d bytes received, message:\n", hRev, length);
 	printf_s("%s\n", (CHAR *)buf);
 	// assert(eot);
-	Shutdown(hRev, onShutdown);
+	Shutdown(hRev);
 	return false;
 }
 
@@ -44,6 +44,7 @@ int	FSPAPI onMultiplying(FSPHANDLE hRev, PFSP_SINKINF p, PFSP_IN6_ADDR remoteAdd
 	// no be32toh() for local; note that for IPv6 network, little-endian CPU, the peer's remoteAddr->idALF wouldn't match it
 	printf_s("Remote address: 0x%llX::%X::%X\n", be64toh(remoteAddr->subnet), be32toh(remoteAddr->idHost), be32toh(remoteAddr->idALF));
 
+	FSPControl(hRev, FSP_SET_CALLBACK_ON_FINISH, (ulong_ptr)onShutdown);
 	RecvInline(hRev, onSignatureReceived);
 	return 0;	// no opposition
 }

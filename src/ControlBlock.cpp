@@ -35,7 +35,6 @@
 
 #include <stdlib.h>
 
-#include "FSP.h"
 #include "FSP_Impl.h"
 
 //
@@ -231,7 +230,7 @@ int LLSBackLog::InitSize(int n)
 int LOCALAPI LLSBackLog::Put(const BackLogItem *p)
 {
 	if (!WaitSetMutex())
-		return -EINTR;
+		return -EDEADLK;
 
 	if(count >= capacity)
 	{
@@ -253,15 +252,15 @@ int LOCALAPI LLSBackLog::Put(const BackLogItem *p)
 // Do
 //	Remove the head log item in the queue
 // Return
-//	-EINTR	if internal panic arise
-//	-ENOENT if the queue is empty
+//	-EDEADLK if cannot obtain the lock
+//	-ENOENT	if the queue is empty
 //	non-negative on success
 // Remark
 //	capacity must be some power of 2
 int LLSBackLog::Pop()
 {
 	if (!WaitSetMutex())
-		return -EINTR;
+		return -EDEADLK;
 
 	register int i = headQ;
 	if(count == 0)
@@ -327,7 +326,7 @@ BackLogItem * LLSBackLog::FindByRemoteId(ALFID_T idRemote, uint32_t salt)
 int LOCALAPI LLSNotice::Put(FSP_ServiceCode c)
 {
 	if (!WaitSetMutex())
-		return -EINTR;
+		return -EDEADLK;
 	//
 	register char *p = (char *) & q[FSP_MAX_NUM_NOTICE - 1];
 	if(*p != NullCommand)
@@ -470,27 +469,19 @@ ControlBlock::PFSP_SocketBuf ControlBlock::GetSendBuf()
 //	The start address of the next free send buffer block
 // Remark
 //	It is assumed that the caller have gain exclusive access on the control block among providers
-//	However, LLS may change (sendWindowHeadPos, sendWindowFirstSN) simultaneously, non-atomically
 void * LOCALAPI ControlBlock::InquireSendBuf(int32_t *p_m)
 {
 	register int32_t i = sendBufferNextPos;
 	register int32_t k = sendWindowHeadPos;
-	if(i != k)	// the send queue is not fulfilled
-	{
-		*p_m = ((i > k ? sendBufferBlockN : k) - i) * MAX_BLOCK_SIZE;
-		return (BYTE *)this + sendBuffer + i * MAX_BLOCK_SIZE;
-	}
 
-	if(sendWindowFirstSN != sendBufferNextSN)
+	if(i == k && CountSendBuffered() != 0)
 	{
 		*p_m = 0;
 		return NULL;
 	}
 
-	// the send queue is thoroughly empty
-	sendWindowHeadPos = sendWindowNextPos = sendBufferNextPos = 0;
-	*p_m = MAX_BLOCK_SIZE * sendBufferBlockN;
-	return (BYTE *)this + sendBuffer;
+	*p_m = ((i >= k ? sendBufferBlockN : k) - i) * MAX_BLOCK_SIZE;
+	return (BYTE *)this + sendBuffer + i * MAX_BLOCK_SIZE;
 }
 
 
@@ -617,10 +608,10 @@ void * LOCALAPI ControlBlock::InquireRecvBuf(int32_t & nIO, bool & eotFlag)
 	if(m == 0) 
 	{
 #ifdef TRACE
-		printf_s("\nOnly when both recvWindowHeadPos and recvWindowNextPos run to the right edge!\n");
-#endif
+		printf_s("\nShould not occur! When InquireRecvBuf recvWindowHeadPos has run to the right edge?\n");
 		BREAK_ON_DEBUG();
-		recvWindowHeadPos = recvWindowNextPos = 0;
+#endif
+		recvWindowHeadPos = 0;
 		m = recvBufferBlockN;
 		p = HeadRecv();
 		pMsg = GetRecvPtr(p);
@@ -644,7 +635,7 @@ void * LOCALAPI ControlBlock::InquireRecvBuf(int32_t & nIO, bool & eotFlag)
 			i++;
 			break;
 		}
-		if(p->len != MAX_BLOCK_SIZE)
+		if (p->len != MAX_BLOCK_SIZE)
 		{
 			BREAK_ON_DEBUG();	//TRACE_HERE("Unrecoverable error! Not conform to the protocol");
 			nIO = -EPERM;
@@ -670,7 +661,6 @@ void * LOCALAPI ControlBlock::InquireRecvBuf(int32_t & nIO, bool & eotFlag)
 //	-EFAULT		the descriptor is corrupted (illegal payload length:
 //				payload length of an intermediate packet of a message should be MAX_BLOCK_SIZE,
 //				payload length of any packet should be no less than 0 and no greater than MAX_BLOCK_SIZE)
-//	-EINTR		the receive queue has been messed up
 //	-EPERM		imconformant to the protocol, which is prohibitted
 //	-EDOM		parameter error
 // Remark
@@ -796,7 +786,7 @@ int LOCALAPI ControlBlock::GetSelectiveNACK(seq_t & snExpect, FSP_SelectiveNACK:
 		}
 		//
 		if(m <= 0)
-			snExpect = seq0 - gapWidth;	// the accumulative acknowledgment
+			snExpect = seq0 - gapWidth;	// the accumulative acknowledgement
 		else
 			buf[m - 1].dataLength = dataLength;
 		//
@@ -825,7 +815,7 @@ void ControlBlock::SlideSendWindow()
 		if(++sendWindowHeadPos - sendBufferBlockN >= 0)
 			sendWindowHeadPos -= sendBufferBlockN;
 		//
-		sendWindowFirstSN++;
+		_InterlockedIncrement((LONG *)& sendWindowFirstSN);
 	}
 }
 
@@ -866,10 +856,15 @@ int LOCALAPI ControlBlock::DealWithSNACK(seq_t expectedSN, FSP_SelectiveNACK::Ga
 			if(! p->GetFlag<IS_ACKNOWLEDGED>())
 			{
 				p->SetFlag<IS_ACKNOWLEDGED>();
-				// round-trip time: 
-				if(countAck++ == 0)
-					rtt64_us = rttNow - p->timeSent;
-				rtt64_us = (rtt64_us + (rttNow - p->timeSent)) >> 1;
+				countAck++;
+				// sum of round-trip time
+				int64_t tDiff = rttNow - p->timeSent;
+				if (tDiff <= 0)
+					rtt64_us++;	// RTT should not be zero
+				else if (tDiff >= UINT32_MAX)
+					rtt64_us += UINT32_MAX;
+				else
+					rtt64_us += tDiff;
 			}
 			//
 			if(++iHead - capacity >= 0)
@@ -897,7 +892,7 @@ int LOCALAPI ControlBlock::DealWithSNACK(seq_t expectedSN, FSP_SelectiveNACK::Ga
 	}
 
 	if(countAck > 0)
-		rttNow = rtt64_us;
+		rttNow = rtt64_us / countAck;
 
 	return countAck;
 }
@@ -961,7 +956,7 @@ bool ControlBlock::HasBeenCommitted() const
 
 // Return
 //	0 if used to be no packet at all
-//	1 if there existed a sent packet at the tail which has ready marked EOT 
+//	1 if there existed a sent packet at the tail which has already marked EOT 
 //	2 if there existed an unsent packet at the tail and it is marked EOT
 //  -1 if there existed a sent packet at the tail which could not be marked EOT
 // See also @LLS::EmitQ()
@@ -1007,7 +1002,7 @@ bool LOCALAPI ControlBlock::ResizeSendWindow(seq_t seq1, unsigned int adRecvWin)
 }
 
 
-#if defined(TRACE) && !defined(NDEDUG)
+#if defined(TRACE) && !defined(NDEBUG)
 int ControlBlock::DumpSendRecvWindowInfo() const
 {
 	return printf_s("\tSend[head, tail] = [%d, %d], packets on flight = %d\n"

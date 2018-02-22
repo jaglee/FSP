@@ -58,36 +58,109 @@
 
  */
 
-// It is either client-to-tunnel SOCKS-interface side, or tunnel-to-server transparent TCP-interface side
-// But not both
 RequestPool	requestPool;
 
-
 static bool FSPAPI onRequestArrived(FSPHANDLE, void *, int32_t, bool);
+
+
+
+// Given
+//	SOCKET	the handle of the TCP socket that connected to the SOCKS client
+// Do
+//	Shutdown the connection to the SOCKS client gracefully
+void CloseGracefully(SOCKET client)
+{
+	struct timeval timeout;
+	timeout.tv_sec = RECV_TIME_OUT;
+	timeout.tv_usec = 0;
+	setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, sizeof(timeout));
+	//
+	shutdown(client, SD_SEND);
+	int r;
+	do
+	{
+		char c;
+		r = recv(client, &c, 1, 0);
+	} while (r > 0);
+	// until either nothing may be received or the peer has closed the connection
+	closesocket(client);
+}
+
+
+
+static void FreeRequestItem(PRequestPoolItem p, bool graceful = false)
+{
+	if(p->hSocket != SOCKET_ERROR && ! graceful)
+	{
+		shutdown(p->hSocket, SD_BOTH);
+		closesocket(p->hSocket);
+	}
+	else if (p->hSocket != SOCKET_ERROR)
+	{
+		CloseGracefully(p->hSocket);
+	}
+	//
+	if(p->hFSP != NULL)
+	{
+		if(graceful)
+			Shutdown(p->hFSP);
+		else
+			Dispose(p->hFSP);
+	}
+	//
+	requestPool.FreeItem(p);
+}
+
 
 
 // This is an I/O routine which rely on the full-duplex mode
 bool FSPAPI onFSPDataAvailable(FSPHANDLE h, void * buf, int32_t len, bool eot)
 {
 	SRequestPoolItem *pReq = requestPool.FindItem(h);
-	if(pReq == NULL)
-		return false;	// but it may cause dead-locke!?
-	//
-	send(pReq->hSocket, (char *)buf, len, 0);
-	// but if send error?
-	if(eot && RecvInline(h, onFSPDataAvailable) < 0)
+	if (pReq == NULL)
 	{
-		shutdown(pReq->hSocket, SD_BOTH);
-		closesocket(pReq->hSocket);
-		Dispose(h);
+		printf_s("Broken protocol pipe! Cannot get the request state related to the FSP socket.\n");
+		FreeRequestItem(pReq);
 		return false;
 	}
-	//
+	if (len < 0)
+	{
+		printf_s("Broken protocol pipe! Callback function get error code %d\n", len);
+		FreeRequestItem(pReq);
+		return false;
+	}
+	if (len == 0 && !eot)
+	{
+		printf_s("Broken protocol pipe! Payloadless block without EoT flag set is delivered?");
+		FreeRequestItem(pReq);
+		return false;
+	}
+
+#ifndef NDEBUG
+	printf_s("%d bytes received from the remote FSP peer\n", len);
+#endif
+	if (len == 0 && eot)
+		return true;
+#ifndef NDEBUG
+	if (pReq->countFSPreceived == 0)
+		printf_s("%.60s\n", (char *)buf);
+#endif
+	pReq->countFSPreceived += len;
+
+	int r = send(pReq->hSocket, (char *)buf, len, 0);
+	if (r < 0)
+	{
+		printf_s("Proxy transfer request failed with error number: %d\n", WSAGetLastError());
+		FreeRequestItem(pReq);
+		return false;
+	}
+
 	return true;
 }
 
 
 
+// Only when the server side close the TCP socket would the tunnel be closed gracefully.
 // This is a long-run I/O routine which rely on the full-duplex mode heavily
 int FSPAPI toReadTCPData(FSPHANDLE h, void *buf, int32_t capacity)
 {
@@ -96,34 +169,79 @@ int FSPAPI toReadTCPData(FSPHANDLE h, void *buf, int32_t capacity)
 		return 0;
 
 	int n = recv(pReq->hSocket, (char *)buf, capacity, 0);
+	int r = WSAGetLastError();
 	if(n <= 0)
 	{
-		shutdown(pReq->hSocket, SD_BOTH);
-		closesocket(pReq->hSocket);
-		Dispose(h);
-		return -1;
+#ifndef NDEBUG
+		printf_s("Proxy TCP recv() returned %d\n", r);
+#endif
+		Shutdown(h);
+		FreeRequestItem(pReq, (n == 0));
+		return 0;
 	}
 
-	SendInline(h, buf, n, true);
+#ifndef NDEBUG
+	printf_s("%d bytes read from the TCP end\n", n);
+	if(pReq->countTCPreceived == 0)
+		printf_s("%.60s\n", (char *)buf);
+#endif
+	pReq->countTCPreceived += n;
+
+	do
+	{
+		r = SendInline(h, buf, n, true);
+		if (r >= 0)
+			break;
+		Sleep(1);	// yield CPU out for at least 1ms/one time slice
+	} while (r == -EBUSY);
+	if(r < 0)
+	{
+#ifndef NDEBUG
+		printf_s("SendInline() in toReadTCPData failed!? Error code: %d\n", r);
+#endif
+		FreeRequestItem(pReq);
+	}
+
 	return 0;
 }
 
 
 
+// The version of the reply code should be zero while DSTPORT and DSTIP are ignored
 // Side-effect: cleanup if the 'error' code is not REP_SUCCEEDED
+void ReportSuccessViaFSP(PRequestPoolItem p)
+{
+	SRequestResponse rep;
+	SOCKADDR_IN boundAddr;
+	int namelen = sizeof(boundAddr);
+
+	int r = getsockname(p->hSocket, (SOCKADDR *)& boundAddr, &namelen);
+	if (r < 0)
+	{
+		FreeRequestItem(p);
+		return;
+	}
+	rep.inet4Addr = boundAddr.sin_addr;
+	rep.nboPort = boundAddr.sin_port;
+	rep.rep = REP_SUCCEEDED;
+	rep._reserved = 0;
+
+	r = WriteTo(p->hFSP, &rep, sizeof(rep), TO_END_TRANSACTION, NULL);
+	if(r <= 0)
+		FreeRequestItem(p);
+}
+
+
+
 void ReportToRemoteClient(PRequestPoolItem p, ERepCode code)
 {
 	SRequestResponse rep;
 	memset(& rep, 0, sizeof(rep));
 	rep.rep = code;
 
-	int r = WriteTo(p->hFSP, & rep, sizeof(rep), TO_END_TRANSACTION, NULL);
-	if(code == REP_SUCCEEDED)
-		return;
-	//
-	shutdown(p->hSocket, SD_BOTH);
-	closesocket(p->hSocket);
-	Shutdown(p->hFSP, NULL);
+	WriteTo(p->hFSP, & rep, sizeof(rep), TO_END_TRANSACTION, NULL);
+
+	FreeRequestItem(p, true);
 }
 
 
@@ -141,10 +259,7 @@ int	FSPAPI onMultiplying(FSPHANDLE hSrv, PFSP_SINKINF p, PFSP_IN6_ADDR remoteAdd
 		, be32toh(remoteAddr->idALF));
 #endif
 	if(requestPool.AllocItem(hSrv) == NULL)
-	{
-		Dispose(hSrv);
 		return -1;	// no more resource!
-	}
 
 	RecvInline(hSrv, onRequestArrived);
 	return 0;	// no opposition
@@ -161,8 +276,8 @@ static bool FSPAPI onRequestArrived(FSPHANDLE h, void *buf, int32_t len, bool eo
 		return false;	// to report break of protocol!
 
 	// following code should be put in the remote end point
-	SOCKET toServer = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-	if(toServer == SOCKET_ERROR)
+	p->hSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	if(p->hSocket == SOCKET_ERROR)
 	{
         printf_s("remote socket() failed with error: %d\n", WSAGetLastError());
 		ReportToRemoteClient(p, REP_REJECTED);
@@ -183,15 +298,15 @@ static bool FSPAPI onRequestArrived(FSPHANDLE h, void *buf, int32_t len, bool eo
 		, be16toh(q->nboPort));
 #endif
 
-	int r = connect(toServer, (PSOCKADDR) & remoteEnd, sizeof(remoteEnd)); 
+	int r = connect(p->hSocket, (PSOCKADDR) & remoteEnd, sizeof(remoteEnd));
 	if(r != 0)
 	{
         printf_s("connect() failed with error: %d\n", WSAGetLastError());
 		ReportToRemoteClient(p, REP_REJECTED);
 		return false;
 	}
-	
-	ReportToRemoteClient(p, REP_SUCCEEDED);
+	ReportSuccessViaFSP(p);
+
 	RecvInline(h, onFSPDataAvailable);
 	GetSendBuffer(h, toReadTCPData);
 

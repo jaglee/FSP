@@ -559,6 +559,31 @@ void UnitTestConnectQueue()
 }
 
 
+void UnitTestAllocSocket()
+{
+	static CSocketSrvTLB tlb;
+	CSocketItemEx *p;
+	for (register int i = 0; i < MAX_CONNECTION_NUM; i++)
+	{
+		p = tlb.AllocItem();
+		Assert::IsNotNull(p);
+	}
+	CSocketItemEx *p0 = p;
+
+	Logger::WriteMessage("All slots allocated.");
+	p = tlb.AllocItem();
+	Assert::IsNull(p);
+
+	tlb.FreeItem(p0);
+	Logger::WriteMessage("One slot is free");
+
+	p = tlb.AllocItem();
+	Assert::IsNotNull(p);
+
+	p = tlb.AllocItem();
+	Assert::IsNull(p);
+}
+
 
 void UnitTestOCB_MAC()
 {
@@ -769,6 +794,12 @@ namespace UnitTestFSP
 		TEST_METHOD(TestConnectQueue)
 		{
 			UnitTestConnectQueue();
+		}
+
+
+		TEST_METHOD(TestAllocSocket)
+		{
+			UnitTestAllocSocket();
 		}
 
 

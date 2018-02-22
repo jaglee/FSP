@@ -29,13 +29,32 @@
  */
 #include "FSP_DLL.h"
 
+// These two functions are created in sake of unit test
+DllExport
+FSPHANDLE FSPAPI CreateFSPHandle()
+{
+	IN6_ADDR addrAny = IN6ADDR_ANY_INIT;
+	CommandNewSession objCommand;
+	FSP_SocketParameter stubParameter;
+	PFSP_Context psp1 = &stubParameter;
+	memset(psp1, 0, sizeof(FSP_SocketParameter));
+	return (CSocketItemDl::CreateControlBlock((PFSP_IN6_ADDR) & addrAny, psp1, objCommand));
+}
+
+
+
+DllExport
+void FSPAPI FreeFSPHandle(FSPHANDLE h)
+{
+	((CSocketItemDl *)h)->FreeAndDisable();
+}
+
 
 // When use FSPControl to enumerate interfaces,
 // 'value' is the pointer to the first element of an array of IN6_PKTINFO structure
 // and the 'ipi6_ifindex' field of the first element should store the size of the array
 // return number of available interfaces with configured IPv4/IPv6 address
 // which might be zero. negative if error.
-
 
 
 
@@ -74,6 +93,9 @@ int FSPAPI FSPControl(FSPHANDLE hFSPSocket, FSP_ControlCode controlCode, ULONG_P
 			break;
 		case FSP_GET_PEER_COMMITTED:
 			*((int *)value) = pSocket->HasPeerCommitted() ? 1 : 0;
+			break;
+		case FSP_SET_CALLBACK_ON_FINISH:
+			pSocket->SetCallbackOnFinish((NotifyOrReturn)value);
 			break;
 		default:
 			return -EDOM;
@@ -446,13 +468,11 @@ bool CSocketItemDl::HasInternalBufferedToSend()
 int	CSocketItemDl::Decompress(void *pOut, int &tgtSize, const void *pIn, int srcLen)
 {
 	register CSocketItemDl::SDecodeState *pCtx = pDecodeState;
-	if(tgtSize <= 0)
-		return 0;
-
 	// Firstly, check whether the buffered decompressed data has more data to deliver. If it does, return the data
 	if (pCtx->dstNext - pCtx->srcDstNext > 0)
 	{
-		tgtSize = pCtx->CopyOut(pOut, tgtSize);
+		if (tgtSize > 0)
+			tgtSize = pCtx->CopyOut(pOut, tgtSize);
 		return 0;	// the uncompressed data is not consumed.
 	}
 
@@ -489,7 +509,8 @@ int	CSocketItemDl::Decompress(void *pOut, int &tgtSize, const void *pIn, int src
 	if(k < 0)
 		return k;
 
-	tgtSize = pCtx->CopyOut(pOut, tgtSize);
+	if(tgtSize > 0)
+		tgtSize = pCtx->CopyOut(pOut, tgtSize);
 	return n + overhead;
 }
 

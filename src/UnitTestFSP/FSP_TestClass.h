@@ -1,13 +1,6 @@
 #include "../FSP_SRV/fsp_srv.h"
 #include "../Crypto/CryptoStub.h"
 
-#ifdef MAX_CONNECTION_NUM
-#undef MAX_CONNECTION_NUM
-#endif
-#define MAX_CONNECTION_NUM	256
-
-#define MAX_PHY_INTERFACES	4
-
 typedef ControlBlock * PControlBlock;
 
 class CSocketItemExDbg: public CSocketItemEx

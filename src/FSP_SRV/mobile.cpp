@@ -575,23 +575,24 @@ void ICC_Context::Derive(const octet *info, int LEN)
 //	[d]		- Depth. It is alike the KDF counter mode as the NIST SP800-108 (not the feedback mode)
 //	Label	¨C A string that identifies the purpose for the derived keying material,
 //	          here we set to "Multiply an FSP connection"
-//	Context	- ackSN, sn1, idInitiator, idResponder
+//	Context	- SN of MULTIPLY (host byte order), Salt, idInitiator, idResponder
 //	Length	- An integer specifying the length (in bits) of the derived keying material K-output
 // Remark
+//	The Salt is actually the out-of-band serial number (OOBSN) field in the MULTIPLY packet
 //	Assume other fields of contextOfICC have been filled properly,
 //	especially contextOfICC.prev = contextOfICC.curr
 //  Assume internal of SConnectParam is properly padded
 //	It is a bad idea to access internal round key of AES (to utilize blake2b)!
 //	Deliberately hard-coded. Depth of key derivation is always 1 for this version of FSP
-void LOCALAPI CSocketItemEx::DeriveKey(ControlBlock::seq_t sn1, ControlBlock::seq_t ackSN, ALFID_T idInitiator, ALFID_T idResponder)
+void LOCALAPI CSocketItemEx::DeriveKey(ControlBlock::seq_t sn1, uint32_t salt, ALFID_T idInitiator, ALFID_T idResponder)
 {
 	ALIGN(8)
 	octet paddedData[48];
 	paddedData[0] = 1;
 	memcpy(paddedData + 1, "Multiply an FSP connection", 26); // works in multi-byte character set/ASCII encoding source only
 	paddedData[27] = 0;
-	*(uint32_t *)(paddedData + 28) = (uint32_t)ackSN;
-	*(uint32_t *)(paddedData + 32) = (uint32_t)sn1;
+	*(uint32_t *)(paddedData + 28) = htobe32((uint32_t)sn1);
+	*(uint32_t *)(paddedData + 32) = (uint32_t)salt;
 	// ALFIDs were transmitted in neutral byte order, actually
 	*(uint32_t *)(paddedData + 36) = idInitiator;
 	*(uint32_t *)(paddedData + 40) = idResponder;
@@ -855,7 +856,7 @@ bool LOCALAPI CSocketItemEx::ValidateICC(FSP_NormalPacketHeader *p1, int32_t ctL
 bool CSocketItemEx::EmitStart()
 {
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->GetSendQueueHead();
-	void  *payload = (FSP_NormalPacketHeader *)this->GetSendPtr(skb);
+	void  *payload = this->GetSendPtr(skb);
 	if(payload == NULL)
 	{
 		REPORT_ERRMSG_ON_TRACE("TODO: debug log memory corruption error");
@@ -873,7 +874,7 @@ bool CSocketItemEx::EmitStart()
 		pHdr->integrity.code = htobe64(skb->timeSent);
 
 		CLowerInterface::Singleton.EnumEffectiveAddresses(pControlBlock->connectParams.allowedPrefixes);
-		memcpy((BYTE *)payload, pControlBlock->connectParams.allowedPrefixes, sizeof(uint64_t) * MAX_PHY_INTERFACES);
+		memcpy((BYTE *)payload, pControlBlock->connectParams.allowedPrefixes, sizeof(TSubnets));
 
 		pHdr->hs.Set<FSP_AckConnectRequest, ACK_CONNECT_REQ>();
 		//
@@ -960,10 +961,11 @@ int CSocketItemEx::EmitWithICC(ControlBlock::PFSP_SocketBuf skb, ControlBlock::s
 	if(paidLoad == NULL)
 		return -EPERM;
 	//
-	if (skb->len > 0)
-		return SendPacket(2, ScatteredSendBuffers(pHdr, sizeof(FSP_NormalPacketHeader), paidLoad, skb->len));
-	else
-		return SendPacket(1, ScatteredSendBuffers(pHdr, sizeof(FSP_NormalPacketHeader)));
+	int r = skb->len > 0
+		? SendPacket(2, ScatteredSendBuffers(pHdr, sizeof(FSP_NormalPacketHeader), paidLoad, skb->len))
+		: SendPacket(1, ScatteredSendBuffers(pHdr, sizeof(FSP_NormalPacketHeader)));
+	skb->timeSent = InterlockedOr((ULONGLONG *)& tRecentSend, 0);
+	return r;
 }
 
 
@@ -1067,7 +1069,6 @@ void CSocketItemEx::EmitQ()
 			break;
 		}
 		skb->SetFlag<IS_SENT>();
-		skb->timeSent = NowUTC();	// not necessarily tRecentSend
 
 		register int32_t a = _InterlockedIncrement(pNextPos) - maxPos;
 		if (a >= 0)

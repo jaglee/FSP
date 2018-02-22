@@ -41,20 +41,12 @@
 DllExport
 int32_t FSPAPI GetSendBuffer(FSPHANDLE hFSPSocket, CallbackBufferReady fp1)
 {
-	register CSocketItemDl * p = (CSocketItemDl *)hFSPSocket;
-	try
-	{
-		// Invalid FSP handle: for sake of pre-buffering only in a limited number of states sending is prohibited
-		if (p->InIllegalState() || p->InState(LISTENING) || p->InState(PRE_CLOSED) || p->InState(CLOSED))
-			return -EBADF;
-		if (!p->TestSetSendReturn(fp1))
-			return -EBUSY;
-		return p->AcquireSendBuf();
-	}
-	catch(...)
-	{
+	CSocketItemDl *p = CSocketDLLTLB::HandleToRegisteredSocket(hFSPSocket);
+	if(p == NULL)
 		return -EFAULT;
-	}
+	if (!p->TestSetSendReturn(fp1))
+		return -EBUSY;
+	return p->AcquireSendBuf();
 }
 
 
@@ -75,15 +67,10 @@ int32_t FSPAPI GetSendBuffer(FSPHANDLE hFSPSocket, CallbackBufferReady fp1)
 DllExport
 int FSPAPI SendInline(FSPHANDLE hFSPSocket, void * buffer, int32_t len, bool eotFlag)
 {
-	register CSocketItemDl * p = (CSocketItemDl *)hFSPSocket;
-	try
-	{
-		return p->SendInplace(buffer, len, eotFlag);
-	}
-	catch(...)
-	{
+	CSocketItemDl *p = CSocketDLLTLB::HandleToRegisteredSocket(hFSPSocket);
+	if(p == NULL)
 		return -EFAULT;
-	}
+	return p->SendInplace(buffer, len, eotFlag);
 }
 
 
@@ -91,15 +78,14 @@ int FSPAPI SendInline(FSPHANDLE hFSPSocket, void * buffer, int32_t len, bool eot
 // Given
 //	FSPHANDLE	the socket handle
 //	const void *the buffer pointer
-//	int			the number of octets to send
-//	int8_t		the send options
+//	int32_t		the number of octets to send
+//	unsigned	the send options
 //	NotifyOrReturn	the callback function pointer
 // Return
-//	non-negative if it is the number of octets put into the queue immediately. might be 0 of course.
+//	non-negative if it is the number of octets put into the queue immediately
 //	-EBUSY if previous asynchronous Write operation has not completed
 //	-EFAULT if some ridiculous exception has arised
 //	-EDEADLK if it cannot obtain mutual exclusive lock
-//	-EBADF if the socket is in unknown state
 //	-EADDRINUSE if previous blocking Write operation has not completed
 //	-EIO if immediate sending operation failed
 // Remark
@@ -107,20 +93,51 @@ int FSPAPI SendInline(FSPHANDLE hFSPSocket, void * buffer, int32_t len, bool eot
 //	If NotifyOrReturn is NULL the function is blocking, i.e.
 //	waiting until every octet in the given buffer has been passed to LLS. See also ReadFrom
 DllExport
-int FSPAPI WriteTo(FSPHANDLE hFSPSocket, const void * buffer, int len, int8_t flags, NotifyOrReturn fp1)
+int32_t FSPAPI WriteTo(FSPHANDLE hFSPSocket, const void * buffer, int32_t len, unsigned flags, NotifyOrReturn fp1)
 {
-	register CSocketItemDl * p = (CSocketItemDl *)hFSPSocket;
-	try
-	{
-		if(!p->TestSetSendReturn(fp1))
-			return -EBUSY;
-		//
-		return p->SendStream(buffer, len, (flags & TO_END_TRANSACTION) != 0, (flags & TO_COMPRESS_STREAM) != 0);
-	}
-	catch(...)
-	{
+	CSocketItemDl *p = CSocketDLLTLB::HandleToRegisteredSocket(hFSPSocket);
+	if(p == NULL)
 		return -EFAULT;
-	}
+	if(!p->TestSetSendReturn(fp1))
+		return -EBUSY;
+	return p->SendStream(buffer, len, (flags & TO_END_TRANSACTION) != 0, (flags & TO_COMPRESS_STREAM) != 0);
+}
+
+
+
+// Given
+//	FSPHANDLE		the FSP socket
+// Return
+//	0 if no error
+//	-EDEADLK if no mutual-exclusive lock available
+//	-EIO if LLS is not available
+// Remark
+//	Unlike Commit, the last packet is not necessarily marked EoT
+//	For compatibility with TCP byte-stream transmission
+DllExport
+int FSPAPI Flush(FSPHANDLE hFSPSocket)
+{
+	CSocketItemDl *p = CSocketDLLTLB::HandleToRegisteredSocket(hFSPSocket);
+	if(p == NULL)
+		return -EFAULT;
+	return p->Flush();
+}
+
+
+
+// [API:Commit]
+//	{COMMITTED, CLOSABLE, PRE_CLOSED, CLOSED}-->{keep state}
+//	ESTABLISHED-->COMMITTING
+//	PEER_COMMIT-->COMMITTING2
+//	{COMMITTING, COMMITTING2}-->{keep state}
+//	{otherwise: failed}
+DllSpec
+int FSPAPI Commit(FSPHANDLE hFSPSocket, NotifyOrReturn fp1)
+{
+	CSocketItemDl *p = CSocketDLLTLB::HandleToRegisteredSocket(hFSPSocket);
+	if(p == NULL)
+		return -EFAULT;
+	return p->LockAndCommit(fp1);
 }
 
 
@@ -139,15 +156,9 @@ int32_t LOCALAPI CSocketItemDl::AcquireSendBuf()
 	}
 
 	void *buf = pControlBlock->InquireSendBuf(& pendingSendSize);
+	bool b = (chainingSend || buf == NULL);
 	SetMutexFree();
-	if(buf != NULL)
-	{
-		int r = SelfNotify(FSP_NotifyBufferReady);
-		if(r < 0)
-			return -EFAULT;
-	}
-
-	return pendingSendSize;
+	return ((b || SelfNotify(FSP_NotifyBufferReady) >= 0) ? pendingSendSize : -EFAULT);
 }
 
 
@@ -166,18 +177,19 @@ int LOCALAPI CSocketItemDl::SendInplace(void * buffer, int32_t len, bool eot)
 #ifdef TRACE
 	printf_s("SendInplace in state %s[%d]\n", stateNames[GetState()], GetState());
 #endif
+	if(len <= 0)
+		return -EDOM;
+
+	if(eot && (InState(COMMITTING) || InState(COMMITTING2)))
+		return -EBUSY;
+
 	if(! WaitUseMutex())
 		return -EDEADLK;
-	//
-	int r = CheckTransmitaction(eot);
-	if (r < 0)
-	{
-		SetMutexFree();
-		return -EBADF;
-	}
-	//
+
+	AddPollingTimer(TIMER_SLICE_ms);
+	CheckTransmitaction(eot);
 	bytesBuffered = 0;
-	return FinalizeSend(PrepareToSend(buffer, len, eot));
+	return FinalizeSend(PrepareToSend(buffer, len));
 }
 
 
@@ -190,22 +202,29 @@ int LOCALAPI CSocketItemDl::SendInplace(void * buffer, int32_t len, bool eot)
 //	Number of bytes put on the send queue
 //	negative on error
 // Remark
-//	This is a prototype and thus simultaneous send and receive is not considered
-int LOCALAPI CSocketItemDl::SendStream(const void * buffer, int len, bool eot, bool toCompress)
+//	It is blocking if to commit the data but previous transaction commitment has not been acknowledged
+int32_t LOCALAPI CSocketItemDl::SendStream(const void * buffer, int32_t len, bool eot, bool toCompress)
 {
 #ifdef TRACE
 	printf_s("SendStream in state %s[%d], toCompress is %d\n"
 		, stateNames[GetState()], GetState(), toCompress);
 #endif
+	int r;
+	if(eot && (InState(COMMITTING) || InState(COMMITTING2)))
+	{
+		uint64_t t0 = GetTickCount64();
+		do
+		{
+			Sleep(TIMER_SLICE_ms);
+			if (GetTickCount64() - t0 > MAX_LOCK_WAIT_ms)
+				return -EBUSY;
+		} while(InState(COMMITTING) || InState(COMMITTING2));
+	}
+
 	if(! WaitUseMutex())
 		return -EDEADLK;
 
-	int r = CheckTransmitaction(eot);
-	if (r < 0)
-	{
-		SetMutexFree();
-		return -EBADF;
-	}
+	CheckTransmitaction(eot);
 
 	if(InterlockedCompareExchangePointer((PVOID *) & pendingSendBuf, (PVOID)buffer, NULL) != NULL)
 	{
@@ -222,7 +241,10 @@ int LOCALAPI CSocketItemDl::SendStream(const void * buffer, int len, bool eot, b
 
 	// By default it should be asynchronous:
 	if (fpSent != NULL)
+	{
+		AddPollingTimer(TIMER_SLICE_ms);
 		return FinalizeSend(BufferData(len));	// pendingSendSize = len;
+	}
 
 	// If it is blocking, wait until every byte has been put into the queue
 	while ((r = BufferData(len)) >= 0)
@@ -262,81 +284,42 @@ int LOCALAPI CSocketItemDl::SendStream(const void * buffer, int len, bool eot, b
 
 
 
-/**
-	An ACK_CONNECT_REQ packet itself make a singular transmit transaction.
-	A PERSIST or MULTIPLY packet always starts a transmit transaction.
-	A PERSIST or MULTIPLY packet with 'To Be Continued' flag cleared terminates the transmit transaction as well.
- */
-// Return
-//	1 if revert to ACTIVE or PEER_COMMIT state
-//	0 if no state reversion
-//	-EBADF if the operation is prohibited because the control block is in irreversible state
-//	-EBUSY if the control block is busy in committing a message
-// Remark
-//	You may not send further packet when a transmit transaction commitment is pending
-//	It MIGHT change state in the ESTABLISHED state
-//	It may change indication 'isFlushing' as well
-//	See also FinalizeSend()
-int LOCALAPI CSocketItemDl::CheckTransmitaction(bool eotFlag)
+// Internal API for committing/flushing a transmit transaction
+// Try to commit current transmit transaction
+int CSocketItemDl::LockAndCommit(NotifyOrReturn fp1)
 {
-	if(InState(COMMITTING) || InState(COMMITTING2))
-		return -EBUSY;
-
-	if(eotFlag)
-		SetEndTransaction();
-
-	if(InState(CLONING) || InState(CONNECT_AFFIRMING) || InState(CHALLENGING))
-		return 0;	// Just prebuffer, data could be sent without state migration
-
-	if(InState(ESTABLISHED))
+	if (InterlockedCompareExchangePointer((PVOID *)& fpCommitted, fp1, NULL) != NULL)
 	{
-		if(isFlushing)
-			SetState(COMMITTING);
-		return 0;
-	}
-
-	if(InState(PEER_COMMIT))
-	{
-		if(isFlushing)
-			SetState(COMMITTING2);
-		return 0;
-	}
-
-	if (InState(COMMITTED))
-	{
-#ifdef TRACE
-		printf_s("Data requested to be sent in %s state. Migrated\n", stateNames[GetState()]);
+#if defined(TRACE) && !defined(NDEBUG)
+		printf_s("Commit: the socket is already in commit or graceful shutdown process.\n");
 #endif
-		if(isFlushing)
-		{
-			SetState(COMMITTING);
-		}
-		else
-		{
-			SetState(ESTABLISHED);
-			newTransaction = 1;	// isFlushing = 0; // SetNewTransaction();
-		}
-		return 1;
+		SetMutexFree();
+		return -EAGAIN;
 	}
 
-	if (InState(CLOSABLE))
+	if (!WaitUseMutex())
+		return -EDEADLK;
+
+	if (HasDataToCommit())
+		MigrateToNewStateOnSend();
+	//^In case returning prematurely in COMMITTED or CLOSABLE state
+
+	if (InState(COMMITTED) || InState(CLOSABLE) || InState(PRE_CLOSED) || InState(CLOSED))
 	{
-#ifdef TRACE
-		printf_s("\nData requested to be sent in %s state. Migrated\n", stateNames[GetState()]);
-#endif
-		if(isFlushing)
-		{
-			SetState(COMMITTING2);
-		}
-		else
-		{
-			SetState(PEER_COMMIT);
-			newTransaction = 1;	// isFlushing = 0; // SetNewTransaction();
-		}
-		return 1;
+		SetMutexFree();	// So that SelfNotify may call back instantly
+		SelfNotify(FSP_NotifyFlushed);
+		return 0;	// It is already in a state that the near end's last transmit transactio has been committed
 	}
 
-	return -EBADF;
+	// Send RELEASE and wait echoed RELEASE. LLS to signal FSP_NotifyRecycled, NotifyReset or NotifyTimeout
+	if (!AddOneShotTimer(TRANSIENT_STATE_TIMEOUT_ms))
+	{
+		REPORT_ERRMSG_ON_TRACE("Cannot set time-out clock for Commit");
+		SetMutexFree();
+		return -EFAULT;
+	}
+
+	return Commit();
 }
 
 
@@ -346,12 +329,15 @@ int LOCALAPI CSocketItemDl::CheckTransmitaction(bool eotFlag)
 //	may call back fpSent and clear the function pointer
 //	Here we have assumed that the underlying binary system does not change
 //	execution order of accessing volatile variables
+// When FSP_NotifyFlushed was triggered the sender queue MUST be empty,
+// When FSP_NotifyBufferReady was triggered the header packet of the sender queue SHALL be acknowledged
 void CSocketItemDl::ProcessPendingSend()
 {
 #ifdef TRACE
 	printf_s("Fiber#%u process pending send in %s\n", fidPair.source, stateNames[pControlBlock->state]);
 #endif
 	// Assume it has taken exclusive access of the socket
+	toIgnoreNextPoll = 1;
 	// Set fpSent to NULL BEFORE calling back so that chained send may set new value
 	CallbackBufferReady fp2 = (CallbackBufferReady)InterlockedExchangePointer((PVOID volatile *)& fpSent, NULL);
 	if(pendingSendBuf != NULL || pStreamState != NULL)
@@ -384,27 +370,31 @@ void CSocketItemDl::ProcessPendingSend()
 		return;	// As there's no thread is waiting free send buffer
 	}
 
+	int32_t k = pControlBlock->CountSendBuffered();
 	int32_t m;
 	void *p = pControlBlock->InquireSendBuf(& m);
-	SetMutexFree();
-	// If FSP_NotifyBufferReady caught but even a minimal buffer block is unavailable,
-	// it must be in chaotic memory situation. However, race condition does exist.
 	if(p == NULL)
 	{
 		TestSetSendReturn(fp2);
-		BREAK_ON_DEBUG();
-		if(HasFreeSendBuffer())
-			SelfNotify(FSP_NotifyBufferReady);
+		SetMutexFree();
+		// BREAK_ON_DEBUG(); // race condition does exist, but shall be very rare!
 		return;
 	}
-	// If ULA hinted that sending was not finished yet,
-	// continue to use the saved pointer of the callback function
-	if (fp2(this, p, m) >= 0)
-	{
+	chainingSend = 1;
+	SetMutexFree();
+	// If ULA hinted that sending was not finished yet, continue to use the saved pointer
+	// of the callback function. However, if it happens to be updated, prefer the new one
+	bool b = (fp2(this, p, m) >= 0);
+	if(! WaitUseMutex())
+		return;	// It could be disposed in the callback function.
+	if (b)
 		TestSetSendReturn(fp2);
-		if(HasFreeSendBuffer())	// In case of round-robin
-			SelfNotify(FSP_NotifyBufferReady);
-	}
+	chainingSend = 0;
+	// The callback function should consume at least one buffer block to avoid dead-loop
+	b = b && (pControlBlock->CountSendBuffered() > k) && HasFreeSendBuffer();
+	SetMutexFree();
+	if(b)
+		SelfNotify(FSP_NotifyBufferReady);
 }
 
 
@@ -426,12 +416,11 @@ int LOCALAPI CSocketItemDl::BufferData(int m)
 		return -EDOM;
 	if (m == 0 && !HasInternalBufferedToSend())
 		return 0;
-
-	ControlBlock::PFSP_SocketBuf p = pControlBlock->LockLastBufferedSend();
+	ControlBlock::PFSP_SocketBuf p = skbImcompleteToSend;
 	int count = 0;
 	octet *tgtBuf;
 	register int k;
-	if (p != NULL && !p->GetFlag<IS_COMPLETED>())
+	if (p != NULL)
 	{
 		if (p->len < 0 || p->len >= MAX_BLOCK_SIZE)
 			return -EFAULT;
@@ -440,9 +429,6 @@ int LOCALAPI CSocketItemDl::BufferData(int m)
 	}
 	else
 	{
-		if (p != NULL)	// && p->GetFlag<IS_COMPLETED>()
-			p->Unlock();
-		//
 		p = GetSendBuf();
 		if (p == NULL)
 			return 0;
@@ -456,7 +442,7 @@ int LOCALAPI CSocketItemDl::BufferData(int m)
 	// flags are already initialized when GetSendBuf
 	// only after every field, including flag, has been set may it be unlocked
 	// otherwise WriteTo following may put further data into the last packet buffer
-	// unlike next loop, this loop does not force compression
+	ControlBlock::PFSP_SocketBuf skb0 = p;
 	do
 	{
 		if (pStreamState == NULL)
@@ -484,20 +470,14 @@ int LOCALAPI CSocketItemDl::BufferData(int m)
 		}
 		//
 		if (p->len >= MAX_BLOCK_SIZE)
-		{
-			p->SetFlag<IS_COMPLETED>();
 			count++;
-		}
 		//
 		if (m == 0)
+		{
+			tgtBuf += k;
 			break;
+		}
 		//
-#ifndef NDEBUG
-		if (p->GetFlag<IS_COMPLETED>())
-			printf_s("Erroneous implementation!? More data to append, but the last packet is imcompleted\n");
-#endif
-		p->Unlock();
-
 		p = GetSendBuf();
 		if (p == NULL)
 			break;
@@ -508,70 +488,96 @@ int LOCALAPI CSocketItemDl::BufferData(int m)
 		tgtBuf = GetSendPtr(p);
 	} while (true);
 
-	// It somewhat overlaps with checking isFlushing, i.e. there is some redundancy, but it keeps code simple
-	if(_InterlockedCompareExchange8(& newTransaction, 0, 1) != 0)
-	{
-		ControlBlock::PFSP_SocketBuf skb0 = pControlBlock->HeadSend() + pControlBlock->sendWindowNextPos;
-#ifndef NDEBUG
-		if(skb0->GetFlag<IS_SENT>())
-			printf_s("Erroneous implementation!? May not start a new transaction\n");
-#endif
-		skb0->opCode = PERSIST;
-	}
-
 	pendingSendSize = m;
 	//
 	if(p == NULL)
-		return count;
-	//
-	if(pendingSendSize != 0 || !isFlushing)
 	{
-		p->Unlock();
-		return count;
+		skbImcompleteToSend = NULL;
+		if(count > 0)
+			goto l_finalize;
+		skb0->Unlock();
+		return 0;
 	}
-
+	//
+	k = MAX_BLOCK_SIZE - p->len;	// To compress internally buffered: it may be that k == 0
+	if(pendingSendSize != 0 || !committing)
+	{
+		skbImcompleteToSend = (k > 0 ? p : NULL);
+		if(count > 0)
+			goto l_finalize;
+		// assert(p == skb0);
+		p->Unlock();
+		return 0;
+	}
+	// pendingSendSize == 0 && committing:
+	skbImcompleteToSend = NULL;
 	if (pStreamState == NULL)
 	{
 		p->SetFlag<TransactionEnded>();
-		if(!p->GetFlag<IS_COMPLETED>())
-		{
-			p->SetFlag<IS_COMPLETED>();
+		if(k > 0)
 			count++;
-		}
-		p->Unlock();
-		return count;
+		goto l_finalize;
 	}
-
-	k = MAX_BLOCK_SIZE - p->len;	// To compress internally buffered: it may be that k == 0
+	// pStreamState != NULL, ie. To compress internal buffered
 	if (k > 0)
 	{
-		Compress(GetSendPtr(p) + p->len, k, NULL, 0);
+		Compress(tgtBuf, k, NULL, 0);
 		p->len += k;
-		p->SetFlag<IS_COMPLETED>();
 		count++;
 		bytesBuffered += k;
 	}
+#ifndef NDEBUG
+	if(count <= 0)
+		printf_s("Erroneous implementation!? On-the-wire compression shall consume at least one block\n");
+#endif
 	while (HasInternalBufferedToSend())
 	{
-		p->Unlock();	// only after every field, including flag, has been set may it be unlocked
 		p = GetSendBuf();
 		if (p == NULL)
-			return count;	// Warning: not all data have been buffered
-						//
-		k = MAX_BLOCK_SIZE;			// To copy out internally compressed:
+			goto l_finalize;	// Warning: not all data have been buffered		
+		// To copy out internally compressed:
+		k = MAX_BLOCK_SIZE;
 		Compress(GetSendPtr(p), k, NULL, 0);
 		p->version = THIS_FSP_VERSION;
 		p->opCode = PURE_DATA;
 		p->len = k;
 		p->SetFlag<Compressed>();
-		p->SetFlag<IS_COMPLETED>();
 		count++;
 		bytesBuffered += k;
 	}	// end if the internal buffer of on-the-wire compression is not empty
-
 	p->SetFlag<TransactionEnded>();
-	p->Unlock();
 	FreeStreamState();
+	//
+l_finalize:
+	if (_InterlockedCompareExchange8(&newTransaction, 0, 1) != 0)
+	{
+		p = pControlBlock->HeadSend() + pControlBlock->sendWindowNextPos;
+#ifndef NDEBUG
+		if (p != skb0)
+			printf_s("Erroneous implementation!? May not start a new transaction\n");
+		if (p->GetFlag<IS_SENT>())
+			printf_s("Erroneous implementation!? Packet to start a new transaction locked but sent?\n");
+#endif
+		p->opCode = PERSIST;
+		p->SetFlag<IS_COMPLETED>();	// Might be redundant, but it doesn't matter!
+	}
+	//
+	MigrateToNewStateOnSend();
+	//
+	k = count;
+	p = skb0;
+	do
+	{
+		p->SetFlag<IS_COMPLETED>();
+		p->Unlock();
+#ifndef NDEBUG
+		if (p->len < MAX_BLOCK_SIZE && !p->GetFlag<TransactionEnded>())
+			printf_s("Erroneous implementation!? Length of a non-terminating packet is %d\n", p->len);
+#endif
+		if((++p - pControlBlock->HeadSend()) >= pControlBlock->sendBufferBlockN)
+			p = pControlBlock->HeadSend();
+	} while (--k > 0);
+	//
 	return count;
 }
 
@@ -580,7 +586,6 @@ int LOCALAPI CSocketItemDl::BufferData(int m)
 // Given
 //	void *	the pointer to the in-place buffer to be marked in the send queue
 //	int32_t	the size of the buffer in bytes
-//	bool	whether to terminate the transmit transaction
 // Return
 //	number of blocks split
 //	-EFAULT if the first parameter is illegal
@@ -588,27 +593,32 @@ int LOCALAPI CSocketItemDl::BufferData(int m)
 //	-EDOM if the second or third parameter is illegal
 // Remark
 //	Would automatically mark the previous last packet as completed
-int LOCALAPI CSocketItemDl::PrepareToSend(void * buf, int32_t len, bool eotFlag)
+int32_t LOCALAPI CSocketItemDl::PrepareToSend(void * buf, int32_t len)
 {
-	if(len <= 0 || len % MAX_BLOCK_SIZE != 0 && ! eotFlag)
+	if(len <= 0 || len % MAX_BLOCK_SIZE != 0 && !committing)
 		return -EDOM;
 
 	// Automatically mark the last unsent packet as completed. See also BufferData()
-	register ControlBlock::PFSP_SocketBuf p = pControlBlock->LockLastBufferedSend();
-	if(p != NULL)
+	if(skbImcompleteToSend != NULL)
 	{
-		p->SetFlag<IS_COMPLETED>();
-		//^it might be redundant, but do little harm
-		p->Unlock();
+		skbImcompleteToSend->SetFlag<IS_COMPLETED>();
+		skbImcompleteToSend->Unlock();
+		skbImcompleteToSend = NULL;
 	}
 
 	int32_t m;
-	if(pControlBlock->InquireSendBuf(& m) != buf)
-		return -EFAULT;
-	if(m < len)
+#ifndef NDEBUG
+	void *bufToCheck = pControlBlock->InquireSendBuf(&m);
+	if (bufToCheck != buf)
+	{
+		printf_s("The caller should not mess up the reserved the buffer space!\n");
+		bufToCheck = pControlBlock->InquireSendBuf(&m);
+	}
+	if (m < len)
 		return -ENOMEM;
+#endif
 
-	p = pControlBlock->HeadSend() + pControlBlock->sendBufferNextPos;
+	register ControlBlock::PFSP_SocketBuf p = pControlBlock->HeadSend() + pControlBlock->sendBufferNextPos;
 	// p now is the descriptor of the first available buffer block
 	m = (len - 1) / MAX_BLOCK_SIZE;
 
@@ -628,20 +638,154 @@ int LOCALAPI CSocketItemDl::PrepareToSend(void * buf, int32_t len, bool eotFlag)
 	p->len = len - MAX_BLOCK_SIZE * m;
 	p->opCode = PURE_DATA;
 	p->SetFlag<IS_COMPLETED>();
-	p->SetFlag<TransactionEnded>(eotFlag);
+	p->SetFlag<TransactionEnded>(committing != 0);
 	//
-	pControlBlock->sendBufferNextPos += m + 1;
+	m++;
+	pControlBlock->sendBufferNextPos += m;
 	pControlBlock->RoundSendBufferNextPos();
-	pControlBlock->sendBufferNextSN += m + 1;
+	pControlBlock->sendBufferNextSN += m;
+
+	MigrateToNewStateOnSend();
 
 	if(_InterlockedCompareExchange8(& newTransaction, 0, 1) != 0)
 		p0->opCode = PERSIST;
 	// unlock them in a batch
 	p = p0;
-	for(register int j = 0; j <= m; j++)
+	for(register int j = 0; j < m; j++)
 	{
 		(p++)->Unlock();
 	}
 
-	return (m + 1);
+	return m;
+}
+
+
+
+// Remark
+//	if(InState(CLONING) || InState(CONNECT_AFFIRMING) || InState(CHALLENGING))
+//		return (NO_ERROR);	// Just prebuffer, data could be sent without state migration
+//	// otherwise silently ignore
+//	Because there may be race condition between LLS and DLL
+//	we have to defer state transition until all packet has been put into the send queue
+void CSocketItemDl::MigrateToNewStateOnSend()
+{
+	if(InState(ESTABLISHED))
+	{
+		if(committing)
+		{
+#ifdef TRACE
+			printf_s("\nData requested to be sent in %s state. Migrated\n", stateNames[GetState()]);
+#endif
+			SetState(COMMITTING);
+		}
+	}
+	else if(InState(PEER_COMMIT))
+	{
+		if(committing)
+		{
+#ifdef TRACE
+			printf_s("\nData requested to be sent in %s state. Migrated\n", stateNames[GetState()]);
+#endif
+			SetState(COMMITTING2);
+		}
+	}
+	else if (InState(COMMITTED))
+	{
+#ifdef TRACE
+		printf_s("\nData requested to be sent in %s state. Migrated\n", stateNames[GetState()]);
+#endif
+		SetState(committing ? COMMITTING : ESTABLISHED);
+	}
+	else if (InState(CLOSABLE))
+	{
+#ifdef TRACE
+		printf_s("\nData requested to be sent in %s state. Migrated\n", stateNames[GetState()]);
+#endif
+		SetState(committing ? COMMITTING2 : PEER_COMMIT);
+	}
+}
+
+
+
+// Assume that it has obtained the mutex lock
+// It is somewhat a little tricky to commit a transmit tranaction:
+// Case 1, it is in sending a stream or obtaining send buffer, and there are yet some data to be buffered
+// Case 2, the send queue is empty at all
+// Case 3, there is set some block to be sent in the send queue
+// Case 4, all blocks have been sent and the tail of the send queue has already been marked EOT
+// Case 5, all blocks have been sent and the tail of the send queue could not set with EOT flag
+// Remark
+//	It is possible that a rogue ULA managed to call FSP_Send more frequently than fair share
+//	However the LLS would prevent abnormally frequent FSP_Commit from abusing
+int CSocketItemDl::Commit()
+{
+	committing = 1;
+
+	// The last resort: flush sending stream if it has not yet been committed
+	// Assume the caller has set time-out clock
+	while (InState(COMMITTING) || InState(COMMITTING2))
+	{
+		Sleep(TIMER_SLICE_ms);
+	}
+
+	if (!TestSetState(ESTABLISHED, COMMITTING) && !TestSetState(PEER_COMMIT, COMMITTING2))
+	{
+		SetMutexFree();
+		Recycle();
+		return -EDOM;
+	}
+
+	// flush internal buffer for compression, if it is non-empty
+	bool yetSomeDataToBuffer = HasDataToCommit();
+	if (yetSomeDataToBuffer && HasFreeSendBuffer())
+	{
+		BufferData(pendingSendSize);
+		yetSomeDataToBuffer = HasDataToCommit();
+		if (yetSomeDataToBuffer)
+			Call<FSP_Send>();	// Or else FSP_Commit would trigger sending the queue
+	}
+	if (!yetSomeDataToBuffer && skbImcompleteToSend != NULL)
+	{
+		skbImcompleteToSend->SetFlag<TransactionEnded>();
+		skbImcompleteToSend->Unlock();	// further processing is done on FSP_Commit
+		skbImcompleteToSend = NULL;
+	}
+	SetMutexFree();
+
+#ifndef _NO_LLS_CALLABLE
+	// Case 1 is handled in DLL while case 2~5 are handled in LLS
+	if (fpCommitted != NULL)
+		return yetSomeDataToBuffer ? 0 : (Call<FSP_Commit>() ? 0 : -EIO);
+	// Or else it is in blocking mode:
+	// Assume the caller has set time-out clock
+	do
+	{
+		Sleep(TIMER_SLICE_ms);
+	} while (!InState(COMMITTED) && !InState(CLOSABLE) && !InState(CLOSED) && !InState(NON_EXISTENT));
+#endif
+	return 0;
+}
+
+
+
+// Urge LLS to send, even if the last packet is not fullly loaded.
+int CSocketItemDl::Flush()
+{
+	if (!WaitUseMutex())
+		return -EDEADLK;
+
+	register ControlBlock::PFSP_SocketBuf p = skbImcompleteToSend;
+
+	if (p == NULL)
+	{
+		SetMutexFree();
+		return 0;
+	}
+
+	p->SetFlag<IS_COMPLETED>();
+	skbImcompleteToSend = NULL;
+
+	int r = Call<FSP_Send>() ? 0 : -EIO;
+	SetMutexFree();
+	return r;
 }

@@ -34,17 +34,12 @@
 DllExport
 int FSPAPI RecvInline(FSPHANDLE hFSPSocket, CallbackPeeked fp1)
 {
-	register CSocketItemDl * p = (CSocketItemDl *)hFSPSocket;
-	try
-	{
-		if(fp1 == NULL)
-			return -EDOM;
-		return p->RecvInline(fp1);
-	}
-	catch(...)
-	{
+	CSocketItemDl *p = CSocketDLLTLB::HandleToRegisteredSocket(hFSPSocket);
+	if(p == NULL)
 		return -EFAULT;
-	}
+	if(fp1 == NULL)
+		return -EDOM;
+	return p->RecvInline(fp1);
 }
 
 
@@ -53,15 +48,10 @@ int FSPAPI RecvInline(FSPHANDLE hFSPSocket, CallbackPeeked fp1)
 DllExport
 int FSPAPI ReadFrom(FSPHANDLE hFSPSocket, void *buf, int capacity, NotifyOrReturn fp1)
 {
-	register CSocketItemDl *p = (CSocketItemDl *)hFSPSocket;
-	try
-	{
-		return p->ReadFrom(buf, capacity, fp1);
-	}
-	catch (...)
-	{
+	CSocketItemDl *p = CSocketDLLTLB::HandleToRegisteredSocket(hFSPSocket);
+	if(p == NULL)
 		return -EFAULT;
-	}
+	return p->ReadFrom(buf, capacity, fp1);
 }
 
 
@@ -101,8 +91,9 @@ int CSocketItemDl::RecvInline(CallbackPeeked fp1)
 #endif
 	}
 	//
+	AddPollingTimer(TIMER_SLICE_ms);
 	peerCommitted = 0;	// peerCommitted is actually a per-transaction flag
-	if (HasDataToDeliver())
+	if (!chainingReceive && HasDataToDeliver())
 	{
 		SetMutexFree();
 		return SelfNotify(FSP_NotifyDataReady);
@@ -161,6 +152,7 @@ int LOCALAPI CSocketItemDl::ReadFrom(void * buffer, int capacity, NotifyOrReturn
 	if (fpReceived != NULL)
 	{
 		bool b = HasDataToDeliver();
+		AddPollingTimer(TIMER_SLICE_ms);
 		SetMutexFree();
 		return b ? SelfNotify(FSP_NotifyDataReady) : 0;
 	}
@@ -240,7 +232,9 @@ int32_t CSocketItemDl::FetchReceived()
 				bytesReceived += n;
 				waitingRecvSize -= n;
 			}
-			else if(waitingRecvSize > 0)
+			// Decompress would gobble data into internal buffer as much as possible
+			// even if there's no free space in the external waitingRecvBuf
+			else
 			{
 				int m = waitingRecvSize;
 				n = Decompress(waitingRecvBuf, m, srcBuf, p->len - offsetInLastRecvBlock);
@@ -249,12 +243,6 @@ int32_t CSocketItemDl::FetchReceived()
 				waitingRecvBuf += m;
 				bytesReceived += m;
 				waitingRecvSize -= m;
-			}
-			else
-			{
-				// Decompress would gobble data into internal buffer as much as possible
-				// even if there's no free space in the external waitingRecvBuf
-				n = 0;
 			}
 			//
 			sum += n;
@@ -266,6 +254,7 @@ int32_t CSocketItemDl::FetchReceived()
 		//
 		_InterlockedExchange8((char *)& p->opCode, 0);
 		p->SetFlag<IS_FULFILLED>(false);	// release the buffer
+
 		// Slide the left border of the receive window before possibly set the flag 'end of received message'
 		pControlBlock->SlideRecvWindowByOne();
 		offsetInLastRecvBlock = 0;
@@ -277,9 +266,17 @@ int32_t CSocketItemDl::FetchReceived()
 				FlushDecodeBuffer();
 			break;
 		}
-		//
-		if(p->len != MAX_BLOCK_SIZE)
-			return -EDOM;
+
+		if (p->len != MAX_BLOCK_SIZE)
+		{
+#ifndef NDEBUG
+			printf_s("%p: this segment of stream is terminated for TCP compatibility.\n"
+					 "Payload length of last packet is %d\n", this, p->len);
+#endif
+			if (pDecodeState != NULL)
+				FlushDecodeBuffer();
+			break;
+		}
 	}
 	//
 	return sum;
@@ -297,9 +294,9 @@ void CSocketItemDl::ProcessReceiveBuffer()
 #ifdef TRACE
 	printf_s("Fiber#%u process receive buffer in %s\n", fidPair.source, stateNames[pControlBlock->state]);
 #endif
-	//
 	CallbackPeeked fp1;
 	int32_t n;
+	toIgnoreNextPoll = 1;
 	//^in case that the flag set by previous RecvInline or FetchReceived disturbs current process
 	// RecvInline takes precedence
 	if ((fp1 = (CallbackPeeked)InterlockedExchangePointer((PVOID *)& fpPeeked, NULL)) != NULL)
@@ -323,23 +320,29 @@ void CSocketItemDl::ProcessReceiveBuffer()
 			SetMutexFree();
 			return;
 		}
-		//
+		chainingReceive = 1;
 		SetMutexFree();
 
-		// Manage to recover from possible error, hope that lower-precedence ReadFrom is ready
-		// UNRESOLVED! Is error recovery possible?
+		// It is possible that no meaningful payload is received but an EoT flag is got.
+		// The callback function should work in such senario
+		// It is also possible that p == NULL while n is the error code. The callback function MUST handle such scenario
 		bool b = fp1(this, p, n, eot);
+		if(!WaitUseMutex())
+			return;	// it could be disposed in the callback function
+		chainingReceive = 0;
 		if (n < 0)
 		{
 			SelfNotify(FSP_NotifyDataReady);
+			SetMutexFree();
 			return;
 		}
 
-		WaitUseMutex();
+		// If the callback function happens to be updated, prefer the new one
 		if (b)
-			fpPeeked = fp1;
+			InterlockedCompareExchangePointer((PVOID *)&fpPeeked, fp1, NULL);
 		// Assume the call-back function did not mess up the receive queue
-		n = pControlBlock->MarkReceivedFree(n);
+		pControlBlock->MarkReceivedFree(n);
+		Call<FSP_AdRecvWindow>();
 
 		if (HasDataToDeliver())
 		{
@@ -351,7 +354,6 @@ void CSocketItemDl::ProcessReceiveBuffer()
 			SetMutexFree();
 		}
 		//
-		Call<FSP_AdRecvWindow>();
 		return;
 	}
 

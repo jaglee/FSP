@@ -37,7 +37,6 @@
 #include <stdio.h>
 #include <time.h>
 
-#include "../FSP.h"
 #include "../FSP_Impl.h"
 
 #include "gcm-aes.h"
@@ -127,8 +126,11 @@ inline uint64_t ntohll(uint64_t h)
 #define SOCKADDR_HOSTID(s)  (((PFSP_IN6_ADDR) & ((PSOCKADDR_IN6)(s))->sin6_addr)->idHost)
 
 
+
 // per-host connection mumber and listener limit defined in LLS:
-#define MAX_CONNECTION_NUM	16	// 256	// must be some power value of 2
+#ifndef MAX_CONNECTION_NUM	// must be some power value of 2
+# define MAX_CONNECTION_NUM	256
+#endif
 #define MAX_LISTENER_NUM	4
 #define MAX_RETRANSMISSION	8
 
@@ -165,11 +167,11 @@ class CommandCloneSessionSrv: CommandNewSessionSrv
 {
 	friend void Multiply(CommandCloneSessionSrv &);
 	ALIGN(4)
-	char	isFlushing;
+	char	committing;
 public:
 	CommandCloneSessionSrv(const CommandToLLS *p): CommandNewSessionSrv(p)
 	{
-		isFlushing = ((CommandCloneConnect *)p)->isFlushing;
+		committing = ((CommandCloneConnect *)p)->committing;
 	}
 };
 
@@ -355,6 +357,8 @@ class CSocketItemEx: public CSocketItem
 	bool IsPassive() const { return lowState == LISTENING; }
 	void SetPassive() { lowState = LISTENING; }
 	//
+	bool IsProcessAlive();
+	//
 protected:
 	PktBufferBlock * headPacket;	// But UNRESOLVED! There used to be an independent packet queue for each SCB for sake of fairness
 	ICC_Context	contextOfICC;
@@ -396,13 +400,11 @@ protected:
 	uint32_t	nextOOBSN;	// host byte order for near end. if it overflow the session MUST be terminated
 	uint32_t	lastOOBSN;	// host byte order, the serial number of peer's last out-of-band packet
 
-	int8_t		lazyAckTimeoutRetryCount;
-	//
 	void AbortLLS(bool haveTLBLocked = false);
 
 	bool AddLazyAckTimer();
 	bool AddResendTimer(uint32_t);
-	bool AddTimer();
+	// Side-effect: clear the isInUse flag
 	void RemoveTimers();
 	bool LOCALAPI ReplaceTimer(uint32_t);
 
@@ -444,11 +446,10 @@ protected:
 	static VOID NTAPI LazilySendSNACK(PVOID c, BOOLEAN) { ((CSocketItemEx *)c)->LazilySendSNACK(); }
 	//
 public:
-	bool IsProcessAlive();
-	//
 	bool MapControlBlock(const CommandNewSessionSrv &);
 	void InitAssociation();
-
+	bool LockWithActiveULA();
+	//
 	bool WaitUseMutex();
 	void SetMutexFree();
 	bool IsInUse() { return (_InterlockedOr8(& inUse, 0) != 0); }
@@ -457,7 +458,7 @@ public:
 
 	void InstallEphemeralKey();
 	void InstallSessionKey(const CommandInstallKey &);
-	void LOCALAPI DeriveKey(ControlBlock::seq_t, ControlBlock::seq_t, ALFID_T, ALFID_T);
+	void LOCALAPI DeriveKey(ControlBlock::seq_t, uint32_t, ALFID_T, ALFID_T);
 
 	bool CheckMemoryBorder(ControlBlock::PFSP_SocketBuf p)
 	{
@@ -500,9 +501,9 @@ public:
 	int32_t LOCALAPI GenerateSNACK(FSP_PreparedKEEP_ALIVE &, ControlBlock::seq_t &, int);
 	//
 	void InitiateConnect();
-	void RejectOrReset();
 	void DisposeOnReset();
 	void Recycle();
+	void Reject(uint32_t);
 	void InitiateMultiply(CSocketItemEx *);
 	bool FinalizeMultiply();
 
@@ -514,7 +515,7 @@ public:
 	// somewhat 'be free to accept' as we didnot enforce 'announced receive window size'
 	int32_t IsOutOfWindow(ControlBlock::seq_t seq1)
 	{
-		register int32_t d = int32_t(seq1) - InterlockedOr((LONG *)& pControlBlock->recvWindowFirstSN, 0);
+		register int32_t d = int32_t(seq1) - _InterlockedOr((LONG *)& pControlBlock->recvWindowFirstSN, 0);
 		return ((0 <= d) && (d < pControlBlock->recvBufferBlockN)) ? 0 : d;
 	}
 
@@ -613,9 +614,9 @@ protected:
 	// The free list
 	CSocketItemEx *headFreeSID, *tailFreeSID;
 
+	void InitMutex() { InitializeSRWLock(&rtSRWLock); }
 public:
 	CSocketSrvTLB();
-	void InitMutex() { InitializeSRWLock(& rtSRWLock); } 
 #ifdef NDEBUG
 	void AcquireMutex() { AcquireSRWLockExclusive(& rtSRWLock); }
 #else

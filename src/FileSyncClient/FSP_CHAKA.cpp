@@ -84,6 +84,7 @@ static void finalize()
 }
 
 
+
 // The call back function on exception notified. Just report error and simply abort the program.
 static void FSPAPI onError(FSPHANDLE h, FSP_ServiceCode code, int value)
 {
@@ -95,12 +96,14 @@ static void FSPAPI onError(FSPHANDLE h, FSP_ServiceCode code, int value)
 
 
 // Forward definition of the callback function that handles the event of Connection Released (Shutdown)
-static void FSPAPI onFinished(FSPHANDLE h, FSP_ServiceCode code, int value)
+static void FSPAPI onFinish(FSPHANDLE h, FSP_ServiceCode code, int)
 {
-	printf_s("Socket %p, session was to shut down.\n", h);
-	if(code != FSP_NotifyRecycled)
-		printf_s("Should got ON_RECYCLED, but service code = %d, return %d\n", code, value);
-
+	printf_s("Socket %p, session was to shut down, service code = %d.\n", h, code);
+	if(code == FSP_NotifyToFinish)
+	{
+		FSPControl(h, FSP_SET_CALLBACK_ON_FINISH, NULL);
+		Shutdown(h);
+	}
 	finalize();
 	return;
 }
@@ -116,6 +119,7 @@ int ToAcceptPushedDirectory(char *remoteAppURL)
 	parms.onAccepting = NULL;
 	parms.onAccepted = onConnected;
 	parms.onError = onError;
+	parms.onFinish = onFinish;
 	parms.recvSize = MAX_FSP_SHM_SIZE;	// 4MB
 	parms.sendSize = 0;	// the underlying service would give the minimum, however
 	if(Connect2(remoteAppURL, & parms) == NULL)
@@ -129,7 +133,6 @@ int ToAcceptPushedDirectory(char *remoteAppURL)
 
 	return 0;
 }
-
 
 
 
@@ -199,8 +202,8 @@ static void FSPAPI onServerResponseReceived(FSPHANDLE h, FSP_ServiceCode c, int 
 	WriteTo(h, clientResponse, sizeof(clientResponse), TO_END_TRANSACTION, NULL);
 
 	printf_s("\tTo install the session key instantly...\n");
-	InstallMasterKey(h, bufSharedKey, SESSION_KEY_SIZE);
-	memset(bufSharedKey, 0, SESSION_KEY_SIZE);
+	InstallMasterKey(h, bufSharedKey, CRYPTO_NACL_KEYBYTES);
+	memset(bufSharedKey, 0, CRYPTO_NACL_KEYBYTES);
 	memset(bufPrivateKey, 0, CRYPTO_NACL_KEYBYTES);
 
 	// The server side write with the stream mode, while the client side read with block buffer mode
@@ -266,7 +269,7 @@ static bool FSPAPI onReceiveNextBlock(FSPHANDLE h, void *buf, int32_t len, bool 
 
 	if(buf == NULL)	
 	{
-		printf_s("FSP Internal panic? Receive nothing when calling the CallbackPeeked?\n");
+		printf_s("FSP Internal panic? Receive nothing when calling the CallbackPeeked? Error code = %d\n", len);
 		Dispose(h);
 		return false;
 	}
@@ -345,7 +348,9 @@ static int ParseBlock(octet *utf8str, int32_t len)
 			lenPartial = lenCurrent;
 			break;
 		}
-		//
+		// The string of strings itself is terminated with an empty string
+		if(utf8str[0] == 0)
+			break;
 #ifdef _MBCS
 		UTF8ToLocalMBCS(finalFileName, MAX_PATH, (char *)utf8str);
 		printf_s("%s\n", finalFileName);
@@ -373,7 +378,7 @@ static void FSPAPI onAcknowledgeSent(FSPHANDLE h, FSP_ServiceCode c, int r)
 		return;
 	}
 
-	if(Shutdown(h, onFinished) < 0)
+	if(Shutdown(h) < 0)
 	{
 		printf_s("Cannot shutdown gracefully in the final stage.\n");
 		Dispose(h);

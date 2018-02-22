@@ -172,8 +172,8 @@ static void FSPAPI onClientResponseReceived(FSPHANDLE h, FSP_ServiceCode c, int 
 	}
 	//
 	printf_s("\tTo install the session key instantly...\n");
-	InstallMasterKey(h, bufSharedKey, SESSION_KEY_SIZE);
-	memset(bufSharedKey, 0, SESSION_KEY_SIZE);
+	InstallMasterKey(h, bufSharedKey, CRYPTO_NACL_KEYBYTES);
+	memset(bufSharedKey, 0, CRYPTO_NACL_KEYBYTES);
 	memset(bufPrivateKey, 0, CRYPTO_NACL_KEYBYTES);
 
 	// To list files remotely
@@ -197,12 +197,15 @@ static void FSPAPI onClientResponseReceived(FSPHANDLE h, FSP_ServiceCode c, int 
 #else
 		int nBytes = WideStringToUTF8(buffer, sizeof(buffer), fName);
 #endif
+//		WriteTo(h, buffer, nBytes, 0, NULL);
 		WriteTo(h, buffer, nBytes, TO_COMPRESS_STREAM, NULL);
-	} while (FindNextFile(hFind, &findFileData));
+	}  while (FindNextFile(hFind, &findFileData));
 	//
 	FindClose(hFind);
-
-	Commit(h, onFileListSent);
+	//Commit(h, onFileListSent);
+	//if the file list happen to be empty, it should be OK
+	buffer[0] = 0;
+	WriteTo(h, buffer, 1, TO_COMPRESS_STREAM + TO_END_TRANSACTION, onFileListSent);
 }
 
 

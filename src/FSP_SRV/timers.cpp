@@ -33,12 +33,6 @@
 #include <time.h>
 
 
-//
-// TODO: garbage collector, those whose parent process is inactive should be collected!
-// Non-empty notice queue
-// IsProcessAlive
-//
-
 // let calling of Destroy() in the NON_EXISTENT state to do cleanup 
 #define TIMED_OUT() \
 		ReplaceTimer(DEINIT_WAIT_TIMEOUT_ms);	\
@@ -46,6 +40,21 @@
 		lowState = NON_EXISTENT;	\
 		SetMutexFree();	\
 		return
+
+
+// Lock the session context if the process of upper layer application is still active
+// Abort the FSP session if ULA is not active
+// Return true if the session context is locked, false if not
+bool CSocketItemEx::LockWithActiveULA()
+{
+	char c = _InterlockedCompareExchange8(& locked, 1, 0);
+	if(IsProcessAlive())
+		return (c == 0 || WaitUseMutex());
+	//
+	AbortLLS();
+	locked = 0;
+	return false;
+}
 
 
 // Main purpose is to send the mandatory low-frequence KEEP_ALIVE
@@ -66,24 +75,20 @@
  */
 void CSocketItemEx::KeepAlive()
 {
-	if(! WaitUseMutex())
+	if(! LockWithActiveULA())
 	{
-#ifdef TRACE
-		printf_s("\nFiber#%u's KeepAlive not executed due to lack of locks in state %s. InUse: %d\n"
-			, fidPair.source, stateNames[lowState], IsInUse());
-#endif
-		if (lowState == NON_EXISTENT)
+		if (lowState == NON_EXISTENT && pControlBlock != NULL)
 		{
 			REPORT_ERRMSG_ON_TRACE("Lazy garbage collection found possible dead-lock");
 			Destroy();
 		}
-		return;
-	}
-
-	if (!IsProcessAlive())
-	{
-		AbortLLS();		// shall pair with free-lock in one function!?
-		SetMutexFree();
+#if defined(TRACE) && (TRACE & TRACE_HEARTBEAT)
+		else if(pControlBlock != NULL)
+		{
+			printf_s("\nFiber#%u's KeepAlive not executed due to lack of locks in state %s[%d]\n"
+				, fidPair.source, stateNames[lowState], pControlBlock->state);
+		}
+#endif
 		return;
 	}
 
@@ -192,10 +197,8 @@ void CSocketItemEx::DoResend()
 		return;
 	}
 
-	// In some risky situation DoResend may be triggered even after the resendTimer handle is set to NULL
-	if (resendTimer == NULL)
-		goto l_return;
-	// assertion: if resendTimer != NULL then pControlBlock != NULL
+	// Because RemoveTimers() clear the isInUse flag before reset the handle resendTimer
+	// we assert that resendTimer != NULL and pControlBlock != NULL
 	// if the assertion failed, memory access exception might be raised.
 
 	const int32_t		capacity = pControlBlock->sendBufferBlockN;
@@ -221,9 +224,6 @@ void CSocketItemEx::DoResend()
 		if (!WaitUseMutex())
 			break;
 
-		if (resendTimer == NULL)
-			goto l_return;
-
 		// As a simultaneous ackowledgement may have slided the send window already, check the send window every time
 		seqHead = _InterlockedOr((long *)&pControlBlock->sendWindowFirstSN, 0);
 		if (int(seqHead - seq1) > 0)
@@ -238,7 +238,7 @@ void CSocketItemEx::DoResend()
 		}
 
 		// retransmission time-out is hard coded to 4RTT
-		if ((tNow - p->timeSent) < (tRoundTrip_us << 2))
+		if ((tNow - p->timeSent) < ((uint64_t)tRoundTrip_us << 2))
 		{
 			SetMutexFree();
 			break;
@@ -291,9 +291,6 @@ void CSocketItemEx::DoResend()
 	if (!WaitUseMutex())
 		return;
 
-	if (resendTimer == NULL)
-		goto l_return;
-
 	if(pControlBlock->CountSendBuffered() <= 0)
 	{
 		HANDLE h = (HANDLE)InterlockedExchangePointer(& resendTimer, NULL);
@@ -304,7 +301,6 @@ void CSocketItemEx::DoResend()
 		EmitQ();	// retry to send those pending on the queue
 	}
 
-l_return:
 	SetMutexFree();
 }
 
@@ -316,18 +312,10 @@ void CSocketItemEx::LazilySendSNACK()
 	lazyAckTimer = NULL;
 	if(! WaitUseMutex())
 	{
-#ifdef TRACE
-		printf_s("\n#0x%X's LazilySendSNACK not executed due to lack of locks in state %s. InUse: %d\n"
-			, fidPair.source, stateNames[lowState], IsInUse());
-#endif
-		if(IsInUse() && lazyAckTimeoutRetryCount < TIMEOUT_RETRY_MAX_COUNT)
-		{
-			lazyAckTimeoutRetryCount++;
+		if(IsInUse())
 			AddLazyAckTimer();
-		}
 		return;
 	}
-	lazyAckTimeoutRetryCount = 0;
 
 #ifdef TRACE
 	if(!InState(ESTABLISHED) && !InState(COMMITTING) && !InState(COMMITTED))
@@ -500,7 +488,7 @@ int LOCALAPI CSocketItemEx::RespondToSNACK(ControlBlock::seq_t expectedSN, FSP_S
 
 	uint64_t	rtt64_us = NowUTC();
 	const int	nAck = pControlBlock->DealWithSNACK(expectedSN, gaps, n, rtt64_us);
-#if defined(TRACE) && (TRACE & (TRACE_HEARTBEAT | TRACE_PACKET | TRACE_SLIDEWIN))
+#if (TRACE & (TRACE_HEARTBEAT | TRACE_PACKET | TRACE_SLIDEWIN))
 	printf_s("Accumulatively acknowledged SN = %u, %d packet(s) acknowledged.\n", expectedSN, nAck);
 #endif
 	if (nAck < 0)
@@ -513,20 +501,21 @@ int LOCALAPI CSocketItemEx::RespondToSNACK(ControlBlock::seq_t expectedSN, FSP_S
 
 	// Note that the raw round trip time includes the lazy-acknowledgement delay
 	// We hard-coded the lazy-acknowledgement delay as one RTT
+#if (TRACE & TRACE_HEARTBEAT)
+	printf_s("Round trip time to calibrate = %u, packet(s) acknowledged = %d\n", tRoundTrip_us, nAck);
+	// new = ((current + old) / 2 + old) / 2 = current/4 + old * 3/4
+	// new = ((current + old - timer-slice/2) / 2
+	// here we have to fight against RTT creeping because of lazy acknowledgement
+#endif
 	if(nAck > 0)
 	{
-		if (rtt64_us > LAZY_ACK_DELAY_MIN_ms * 2000)
-			tRoundTrip_us = uint32_t((min(rtt64_us >> 1, UINT32_MAX) + tRoundTrip_us + 1) >> 1);
-		else if (rtt64_us > LAZY_ACK_DELAY_MIN_ms * 1000)
-			tRoundTrip_us = uint32_t((rtt64_us + tRoundTrip_us + 1) >> 1);
+		if (rtt64_us > TIMER_SLICE_ms * 1000 / 2)
+			tRoundTrip_us = uint32_t(min((rtt64_us - TIMER_SLICE_ms * 1000 / 2  + 1) >> 1, UINT32_MAX));
 		else
-			tRoundTrip_us = uint32_t((LAZY_ACK_DELAY_MIN_ms * 1000 + tRoundTrip_us + 1) >> 1);
-	}
-
-	// ONLY when the first packet in the send window is acknowledged may round-trip time re-calibrated
-	// We assume that after sliding send window the number of unacknowledged was reduced
-	if(pControlBlock->GetSendQueueHead()->GetFlag<IS_ACKNOWLEDGED>())
+			tRoundTrip_us = uint32_t(((rtt64_us + 1) >> 1) + tRoundTrip_us) >> 1;
+		//
 		pControlBlock->SlideSendWindow();
+	}
 
 	return nAck;
 }
