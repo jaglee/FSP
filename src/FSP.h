@@ -190,7 +190,6 @@ typedef enum: char
 	FSP_Shutdown,		// close the connection
 	FSP_InstallKey,		// install the authenticated encryption key
 	FSP_Multiply,		// clone the connection, make SCB of LLS synchronized with DLL
-	FSP_AdRecvWindow,	// force to advertise the receive window ONCE by send a SNACK/ACK_FLUSH
 	// 16~23: LLS to DLL in the backlog
 	FSP_NotifyListening = FSP_Listen,		// a reverse command to signal success execution of FSP_Listen
 	FSP_NotifyAccepting = FSP_Accept,		// a reverse command to make context ready
@@ -235,6 +234,7 @@ typedef uint64_t			TSubnets[MAX_PHY_INTERFACES];
 # define TRANSIENT_STATE_TIMEOUT_ms		60000	// 1 minute
 #endif
 
+#define LAZY_ACK_DELAY_MIN_us			1024	// 1 millisecond (after shifted 10 bits right)
 #define KEEP_ALIVE_TIMEOUT_ms			600000	// 10 minutes
 #define MAXIMUM_SESSION_LIFE_ms			43200000// 12 hours
 
@@ -454,6 +454,7 @@ struct FSP_SelectiveNACK
 		uint32_t	gapWidth;	// in packets
 		uint32_t	dataLength;	// in packets
 	};
+	uint64_t		tLazyAck;	// delay time of the lazy acknowledgement, in microseconds
 	uint32_t		serialNo;
 	$FSP_HeaderSignature hs;
 };

@@ -261,7 +261,11 @@ void LOCALAPI CLowerInterface::OnGetConnectRequest()
 		&& pSocket->fidPair.peer == this->GetRemoteFiberID()
 		&& pSocket->pControlBlock->connectParams.cookie == q->cookie)
 		{
+			if(! pSocket->WaitUseMutex())
+				return;
 			pSocket->EmitStart();	// hitted
+			pSocket->SetMutexFree();
+
 		}
 		// Or else it is a collision and is silently discard in case an out-of-order RESET reset a legitimate connection
 		return;
@@ -411,9 +415,9 @@ void LOCALAPI CSocketItemEx::OnGetReset(FSP_RejectConnect & reject)
 	}
 	else if(! InState(LISTENING) && ! InState(CLOSED))
 	{
-		int32_t offset = IsOutOfWindow(be32toh(reject.sn.initial));
-		if ( (offset == 0 || offset == -1)	// RESET is out-of-band
-		&& ValidateICC((FSP_NormalPacketHeader *) & reject, 0, fidPair.peer, 0))
+		int32_t offset = OffsetToRecvWinLeftEdge(be32toh(reject.sn.initial));
+		if(-1 <= offset && offset < pControlBlock->recvBufferBlockN
+		&& ValidateICC((FSP_NormalPacketHeader *)& reject, 0, fidPair.peer, 0))
 		{
 			DisposeOnReset();
 		}
@@ -451,30 +455,31 @@ bool LOCALAPI CSocketItemEx::ValidateSNACK(ControlBlock::seq_t & ackSeqNo, FSP_S
 		return false;
 	}
 
-	int32_t offset = IsOutOfWindow(headPacket->pktSeqNo);
-	if (offset > 0 || offset < -1)
+	int32_t offset = OffsetToRecvWinLeftEdge(headPacket->pktSeqNo);
+	if (offset >= pControlBlock->recvBufferBlockN || offset < -1)
 	{
-#if (TRACE & TRACE_OUTBAND) && (TRACE & TRACE_SLIDEWIN) 
+#if (TRACE & (TRACE_HEARTBEAT | TRACE_OUTBAND | TRACE_SLIDEWIN))
 		printf_s("%s has encountered attack? sequence number: %u\n\tshould in: [%u %u]\n"
 			, opCodeStrings[p1->hs.opCode]
 			, headPacket->pktSeqNo
 			, pControlBlock->recvWindowFirstSN
-			, pControlBlock->recvWindowFirstSN +  pControlBlock->recvBufferBlockN
+			, pControlBlock->recvWindowFirstSN + pControlBlock->recvBufferBlockN
 			);
 #endif
 		return false;
 	}
-	
+
 	offset = be16toh(p1->hs.hsp);	// For the KEEP_ALIVE/ACK_FLUSH it is the packet length as well
 	//^now it is the offset of payload against the start of the FSP header
 	FSP_SelectiveNACK *pSNACK = (FSP_SelectiveNACK *)((uint8_t *)p1 + offset - sizeof(FSP_SelectiveNACK));
 	uint32_t salt = pSNACK->serialNo;
 	uint32_t sn = be32toh(salt);
 
-	if(int(sn - lastOOBSN) <= 0)
+	if(int32_t(sn - lastOOBSN) <= 0)
 	{
 #ifdef TRACE
-		printf_s("%s has encountered replay attack? sequence number: %u\t%u\n", opCodeStrings[p1->hs.opCode], headPacket->pktSeqNo, sn);
+		printf_s("%s has encountered replay attack? Sequence number:\n\tinband %u, oob %u - %u\n"
+			, opCodeStrings[p1->hs.opCode], headPacket->pktSeqNo, sn, lastOOBSN);
 #endif
 		return false;
 	}
@@ -499,13 +504,7 @@ bool LOCALAPI CSocketItemEx::ValidateSNACK(ControlBlock::seq_t & ackSeqNo, FSP_S
 
 	ackSeqNo = be32toh(p1->expectedSN);
 	if (!ResizeSendWindow(ackSeqNo, p1->GetRecvWS()))
-	{
-#ifdef TRACE
-		printf_s("Cannot adjust the send window on %s!? Acknowledged sequence number: %u\n", opCodeStrings[p1->hs.opCode], ackSeqNo);
-		pControlBlock->DumpSendRecvWindowInfo();
-#endif
 		return false;
-	}
 
 	if(p1->GetFlag<TransactionEnded>())
 		OnGetEOT();
@@ -655,18 +654,19 @@ void CSocketItemEx::OnGetAckStart()
 	FSP_NormalPacketHeader *p1 = headPacket->GetHeaderFSP();
 	if (!isMultiplying)	// the normality
 	{
-		int32_t d = IsOutOfWindow(headPacket->pktSeqNo);
-		if (d > 0)
+		// Although it lets ill-behaviored peer take advantage by sending ill-formed ACK_START
+		// it costs much less than to ValidateICC() or Notify()
+		if (OffsetToRecvWinLeftEdge(headPacket->pktSeqNo) < 0 || !isInitiativeState)
 		{
-#if defined(TRACE) && (TRACE & TRACE_SLIDEWIN)
-			printf_s("@%s: invalid sequence number: %u, distance to the receive window: %d\n"
-				, __FUNCTION__, headPacket->pktSeqNo, d);
-#endif
-			return;		// DoS attack OR a premature start of new transmit transaction
+			AddLazyAckTimer();
+			return;
 		}
-		if (d < 0)
+		if (headPacket->pktSeqNo != pControlBlock->recvWindowExpectedSN)
 		{
-			AddLazyAckTimer();	// It costs much less than to ValidateICC() or Notify()
+#if (TRACE & TRACE_SLIDEWIN)
+			printf_s("ACK_START should have the very sequence number awaited to receive.\n");
+#endif
+			BREAK_ON_DEBUG();
 			return;
 		}
 		if (!ValidateICC())
@@ -685,52 +685,32 @@ void CSocketItemEx::OnGetAckStart()
 
 	ControlBlock::seq_t ackSeqNo = be32toh(p1->expectedSN);
 	if (!ResizeSendWindow(ackSeqNo, p1->GetRecvWS()))
-	{
-#ifdef TRACE
-		printf_s("Cannot resize send window. Acknowledged sequence number: %u\n", ackSeqNo);
-		pControlBlock->DumpSendRecvWindowInfo();
-#endif
 		return;
-	}
 
 	// Just make it consume the sequence space slot in the receive queue
-	if (pControlBlock->AllocRecvBuf(headPacket->pktSeqNo) == NULL)
-	{
-		AddLazyAckTimer();
-		return;
-	}
 	// ACK_START has nothing to deliver to ULA
-	pControlBlock->SlideRecvWindowByOne();
-
-	if (!isInitiativeState)
-	{
-		BREAK_ON_DEBUG();
-		return;	// and it MUST have been notified already
-	}
-
-	if (isMultiplying)
-	{
-		StopKeepAlive();
-		SetState(_InterlockedExchange8(&shouldAppendCommit, 0) ? CLOSABLE : PEER_COMMIT);
-	}
-	else // if (lowState == CHALLENGING)
-	{	
-		SetState(CLOSABLE);
-	}
-	SendAckFlush();
+	pControlBlock->SlideRecvSlotNextTo(headPacket->pktSeqNo);
 
 	// ACK_START is always the accumulative acknowledgement to ACK_CONNECT_REQ or MULTIPLY
 	pControlBlock->SlideSendWindowByOne();	// See also RespondToSNACK
 	tLastRecv = NowUTC();
 	tRoundTrip_us = (uint32_t)min(UINT32_MAX, tLastRecv - tRecentSend);
-#if (TRACE & TRACE_SLIDEWIN)
+#if (TRACE & (TRACE_SLIDEWIN | TRACE_HEARTBEAT))
 	printf_s("\nACK_START received, acknowledged SN = %u\n\tThe responder calculate RTT: %uus\n", ackSeqNo, tRoundTrip_us);
 #endif
 
 	if (isMultiplying)
+	{
+		StopKeepAlive();
+		SetState(_InterlockedExchange8(&shouldAppendCommit, 0) ? CLOSABLE : PEER_COMMIT);
 		SignalFirstEvent(FSP_NotifyMultiplied);
-	else
+	}
+	else // if (lowState == CHALLENGING)
+	{	
+		SetState(CLOSABLE);
 		SignalFirstEvent(FSP_NotifyAccepted);
+	}
+	SendAckFlush();
 }
 
 
@@ -790,10 +770,10 @@ void CSocketItemEx::OnGetPersist()
 	FSP_NormalPacketHeader *p1 = headPacket->GetHeaderFSP();
 	if (! isMultiplying)	// the normality
 	{
-		int32_t d = IsOutOfWindow(headPacket->pktSeqNo);
-		if (d > 0)
+		int32_t d = OffsetToRecvWinLeftEdge(headPacket->pktSeqNo);
+		if (d >= pControlBlock->recvBufferBlockN)
 		{
-#if defined(TRACE) && (TRACE & TRACE_SLIDEWIN)
+#if (TRACE & (TRACE_HEARTBEAT | TRACE_SLIDEWIN))
 			printf_s("@%s: invalid sequence number: %u, distance to the receive window: %d\n"
 				, __FUNCTION__, headPacket->pktSeqNo, d);
 #endif
@@ -820,13 +800,7 @@ void CSocketItemEx::OnGetPersist()
 
 	ControlBlock::seq_t ackSeqNo = be32toh(p1->expectedSN);
 	if (!ResizeSendWindow(ackSeqNo, p1->GetRecvWS()))
-	{
-#ifdef TRACE
-		printf_s("Cannot resize send window. Acknowledged sequence number: %u\n", ackSeqNo);
-		pControlBlock->DumpSendRecvWindowInfo();
-#endif
 		return;
-	}
 
 	int countPlaced = PlacePayload();
 	if (countPlaced == -EFAULT)
@@ -860,22 +834,20 @@ void CSocketItemEx::OnGetPersist()
 	}
 	else
 	{
+		RestartKeepAlive();
 		switch(lowState)
 		{
 		case CHALLENGING:
 			SetState(COMMITTED);
-			RestartKeepAlive();
 			break;
 		case PEER_COMMIT:
 			SetState(ESTABLISHED);
-			RestartKeepAlive();
 			break;
 		case COMMITTING2:
 			SetState(COMMITTING);
 			break;
 		case CLOSABLE:
 			SetState(COMMITTED);
-			RestartKeepAlive();
 			break;
 		case CLONING:
 			SetState(_InterlockedExchange8(&shouldAppendCommit, 0) ? COMMITTED : ESTABLISHED);
@@ -897,7 +869,7 @@ void CSocketItemEx::OnGetPersist()
 		pControlBlock->SlideSendWindowByOne();	// See also RespondToSNACK
 		tLastRecv = NowUTC();
 		tRoundTrip_us = (uint32_t)min(UINT32_MAX, tLastRecv - tRecentSend);
-#if (TRACE & TRACE_SLIDEWIN)
+#if (TRACE & (TRACE_SLIDEWIN | TRACE_HEARTBEAT))
 		printf_s("\nPERSIST received, acknowledged SN = %u\n\tThe responder calculate RTT: %uus\n", ackSeqNo, tRoundTrip_us);
 #endif
 	}
@@ -942,14 +914,14 @@ void CSocketItemEx::OnGetKeepAlive()
 	ControlBlock::seq_t ackSeqNo;
 	if(!ValidateSNACK(ackSeqNo, gaps, n))
 		return;
-#if defined(TRACE) && (TRACE & (TRACE_HEARTBEAT | TRACE_PACKET | TRACE_SLIDEWIN))
+#if (TRACE & (TRACE_HEARTBEAT | TRACE_PACKET | TRACE_SLIDEWIN))
 	printf_s("Fiber#%u: SNACK packet with %d gap(s) advertised received\n", fidPair.source, n);
 #endif
 	if (acknowledgible)
 	{
-		ControlBlock::seq_t seq0 = _InterlockedOr((LONG *)& pControlBlock->sendWindowFirstSN, 0);
+		ControlBlock::seq_t seq0 = pControlBlock->sendWindowFirstSN;
 		int r = RespondToSNACK(ackSeqNo, gaps, n);
-		if(r > 0 && pControlBlock->sendWindowFirstSN != seq0)
+		if (r > 0 && pControlBlock->sendWindowFirstSN != seq0)
 			Notify(FSP_NotifyBufferReady);
 #ifdef TRACE
 		else if (r < 0)
@@ -991,10 +963,10 @@ void CSocketItemEx::OnGetPureData()
 		return;
 	}
 
-	int32_t d = IsOutOfWindow(headPacket->pktSeqNo);
-	if (d > 0)
+	int32_t d = OffsetToRecvWinLeftEdge(headPacket->pktSeqNo);
+	if (d > pControlBlock->recvBufferBlockN)
 	{
-#if defined(TRACE) && (TRACE & TRACE_SLIDEWIN)
+#if (TRACE & (TRACE_HEARTBEAT | TRACE_SLIDEWIN))
 		printf_s("@%s: invalid sequence number: %u, distance to the receive window: %d\n"
 			, __FUNCTION__, headPacket->pktSeqNo, d);
 #endif
@@ -1017,12 +989,7 @@ void CSocketItemEx::OnGetPureData()
 	FSP_NormalPacketHeader *p1 = headPacket->GetHeaderFSP();
 	ControlBlock::seq_t ackSeqNo = be32toh(p1->expectedSN);	
 	if (!ResizeSendWindow(ackSeqNo, p1->GetRecvWS()))
-	{
-#if defined(TRACE) && (TRACE & TRACE_SLIDEWIN)
-		printf_s("An out of order acknowledgement? seq#%u\n", ackSeqNo);
-#endif
 		return;
-	}
 
 	int r = PlacePayload();
 	if(r == -EFAULT)
@@ -1063,8 +1030,11 @@ void CSocketItemEx::OnGetPureData()
 	// PURE_DATA cannot start a transmit transaction, so in state like CLONING just prebuffer
 	else if(! InStates(4, CLONING, PEER_COMMIT, COMMITTING2, CLOSABLE))
 	{
+		_InterlockedExchange((LONG *)&savedCountDeliverable, pControlBlock->CountDeliverable());
+		if (savedCountDeliverable > 0)
+			Notify(FSP_NotifyDataReady);
+		//
 		AddLazyAckTimer();
-		Notify(FSP_NotifyDataReady);
 	}
 	// See also OnGetPersist()
 }
@@ -1120,6 +1090,7 @@ void CSocketItemEx::OnGetEOT()
 // Side-effect: send ACK_FLUSH immediately
 void CSocketItemEx::TransitOnPeerCommit()
 {
+	_InterlockedExchange(&tLazyAck_us, 0);	// Cancel lazy acknowledgement, if any
 	switch (lowState)
 	{
 	case CHALLENGING:
@@ -1183,8 +1154,7 @@ void CSocketItemEx::OnAckFlush()
 		SetState(COMMITTED);
 	}
 
-	// For ACK_FLUSH just accumulatively positively acknowledge
-	RespondToSNACK(ackSeqNo, NULL, 0);
+	RespondToSNACK(ackSeqNo, gaps, 0);
 	Notify(FSP_NotifyFlushed);
 }
 
@@ -1258,8 +1228,8 @@ void CSocketItemEx::OnGetMultiply()
 	if (!InStates(6, ESTABLISHED, COMMITTING, PEER_COMMIT, COMMITTING2, COMMITTED, CLOSABLE))
 		return;
 
-	int32_t d = IsOutOfWindow(headPacket->pktSeqNo);
-	if (d > 0 || d <= -MAX_BUFFER_BLOCKS)
+	int32_t d = OffsetToRecvWinLeftEdge(headPacket->pktSeqNo);
+	if (d > pControlBlock->recvBufferBlockN || d <= -MAX_BUFFER_BLOCKS)
 	{
 		BREAK_ON_DEBUG();
 		return;	// stale packets are silently discarded
@@ -1340,11 +1310,11 @@ void CSocketItemEx::OnGetMultiply()
 	skb->version = pFH->hs.major;
 	skb->opCode = pFH->hs.opCode;
 	skb->CopyInFlags(pFH);
-	skb->SetFlag<IS_FULFILLED>();
-	//^See also PlacePayload
 	// Be free to accept: we accept an imcomplete MULTIPLY
 	if(headPacket->lenData != MAX_BLOCK_SIZE)
 		skb->SetFlag<TransactionEnded>();
+	skb->SetFlag<IS_FULFILLED>();
+	//^See also PlacePayload
 
 	// The first packet received is in the parent's session key while
 	// the first responding packet shall be sent in the derived key
@@ -1365,7 +1335,7 @@ void CSocketItemEx::OnGetMultiply()
 
 	newItem->tLastRecv = tLastRecv;	// inherit the time when the MULTIPLY packet was received
 	newItem->tRoundTrip_us = tRoundTrip_us;	// inherit the value of the parent as the initial
-	newItem->lowState = NON_EXISTENT;	// so that when timeout it is scavenged
+	newItem->lowState = NON_EXISTENT;		// so that when timeout it is scavenged
 	newItem->ReplaceTimer(TRANSIENT_STATE_TIMEOUT_ms);
 
 	// Lastly, put it into the backlog. Put it too early may cause race condition
@@ -1395,7 +1365,7 @@ int CSocketItemEx::PlacePayload()
 	if (!CheckMemoryBorder(skb))
 		return -EFAULT;
 
-	if(skb->GetFlag<IS_FULFILLED>())
+	if (skb->GetFlag<IS_FULFILLED>())
 		return -EEXIST;
 
 	FSP_NormalPacketHeader *pHdr = headPacket->GetHeaderFSP();
@@ -1413,7 +1383,11 @@ int CSocketItemEx::PlacePayload()
 	// See also Check HasBeenCommitted()
 	skb->opCode = skb->GetFlag<TransactionEnded>() ? _COMMIT : pHdr->hs.opCode;
 	skb->len = headPacket->lenData;
+	skb->timeRecv = NowUTC();
 	skb->SetFlag<IS_FULFILLED>();
+
+	// This is a fresh packet that filling the gap, so it can be suppressed active KEEP_ALIVE to adverise receive window
+	savedCountDeliverable = pControlBlock->CountDeliverable();
 
 	return headPacket->lenData;	// Might be zero for PERSIST or MULTIPLY packet
 }

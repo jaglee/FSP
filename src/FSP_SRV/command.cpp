@@ -255,20 +255,10 @@ void CSocketItemEx::ProcessCommand(CommandToLLS *pCmd)
 		UrgeCommit();
 		break;
 	case FSP_Shutdown:
-		SendRelease();
+		Release();
 		break;
 	case FSP_InstallKey:
 		InstallSessionKey((CommandInstallKey &)*pCmd);
-		break;
-	case FSP_AdRecvWindow:
-		if (InState(PEER_COMMIT) || InState(COMMITTING2) || InState(CLOSABLE))
-			SendAckFlush();
-		else if (InState(ESTABLISHED) || InState(COMMITTING) || InState(COMMITTED))
-			SendKeepAlive();
-#ifndef NDEUBG
-		else
-			printf_s("Implementation error: maynot advertise receive window size in state %s(%d)\n", stateNames[lowState], lowState);
-#endif
 		break;
 	default:
 #ifndef NDEUBG

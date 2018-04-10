@@ -91,7 +91,7 @@ int _tmain(int argc, TCHAR *argv[])
 	parms.onError = onError;
 	//parms.onFinish == NULL; // On this client side, we test blocking mode
 	//while on server side we test asynchronous mode
-	parms.recvSize = MAX_FSP_SHM_SIZE;	// 4MB
+	parms.recvSize = MAX_FSP_SHM_SIZE;
 	parms.sendSize = 0;	// the underlying service would give the minimum, however
 	if(Connect2(urlRemote, & parms) == NULL)
 	{
@@ -108,7 +108,7 @@ int _tmain(int argc, TCHAR *argv[])
 	result = 0;
 	//
 l_bailout:
-	printf("\n\nPress Enter to exit...");
+	printf("\n\nTicksToWait = %d, press Enter to exit...", ticksToWait);
 	getchar();
 	// Sleep(3000);	// so that the other thread may send RESET successfully
 	exit(result);

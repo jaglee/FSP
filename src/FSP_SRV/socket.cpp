@@ -57,36 +57,96 @@ CSocketSrvTLB::CSocketSrvTLB()
 
 
 
+bool CSocketSrvTLB::PutToScavengeCache(CSocketItemEx *pSocket, timestamp_t tNow)
+{
+	int32_t n;
+	if ((n = InterlockedIncrement(&topOfSC)) >= MAX_CONNECTION_NUM)
+	{
+		InterlockedDecrement(&topOfSC);
+		return false;
+	}
+
+	scavengeCache[n].pSocket = pSocket;
+	scavengeCache[n].timeRecycled = tNow;
+	return true;
+}
+
+
 // allocate from the free list
 CSocketItemEx * CSocketSrvTLB::AllocItem()
 {
+	CSocketItemEx *p;
+	register int i;
+
 	AcquireMutex();
 
-	CSocketItemEx *p = headFreeSID;
-	if(p != NULL && p->TestSetInUse())
+	if (headFreeSID != NULL && headFreeSID->TestSetInUse())
+		goto l_success;
+
+	// For a heavy duty server it might be beneficial to throttle the request by waiting for free socket
+	// as this is a prototype is not bothered to exploit hash table
+	// recycle all of the orphan sockets
+	for (i = 0, p = itemStorage; i < MAX_CONNECTION_NUM; i++, p++)
 	{
-		headFreeSID = p->next;
-		if (headFreeSID == NULL)
-			tailFreeSID = NULL;
-		p->next = NULL;
+		if (!p->IsProcessAlive())
+			p->AbortLLS(true);
+	}
+	if (headFreeSID != NULL)
+		goto l_success;
+
+	timestamp_t tNow = NowUTC();
+	CSocketItemEx *p1 = NULL;
+	uint64_t tDiff0;
+	// Reserved: a 'CLOSED' socket might be resurrected,
+	// provides it is the original ULA process that is to reuse the socket
+	if (topOfSC == 0)
+	{
+		for (i = 0, p = itemStorage; i < MAX_CONNECTION_NUM; i++, p++)
+		{
+			if (p->lowState == CLOSED)
+				PutToScavengeCache(p, tNow);
+		}
+	}
+	//
+	if (topOfSC == 0)
+	{
+		// Found the least recent used socket
+		for (i = 0, p = itemStorage; i < MAX_CONNECTION_NUM; i++, p++)
+		{
+			uint64_t tDiff = min(tNow - p->tLastRecv, tNow - p->tRecentSend);
+			if ( (tDiff > KEEP_ALIVE_TIMEOUT_ms) && (p1 == NULL || tDiff > tDiff0))
+				p1 = p, tDiff0 = tDiff;
+		}
+		//
+		if (p1 == NULL)
+		{
+			ReleaseMutex();
+			return NULL;
+		}
 	}
 	else
 	{
-		register int i;
-		// forceful garbage collection: it might be better to tune the time-out?
-		for (i = 0, p = itemStorage; i < MAX_CONNECTION_NUM; i++, p++)
+		p1 = scavengeCache[0].pSocket;
+		topOfSC--;
+		for (i = 0; i < topOfSC; i++)
 		{
-			if (!p->IsProcessAlive())
-			{
-				p->AbortLLS(true);
-				p->TestSetInUse();
-				break;
-			}
+			scavengeCache[i] = scavengeCache[i++];
 		}
-		p = NULL;
 	}
 
+	p1->WaitUseMutex();		// it is throttling!
+	p1->AbortLLS(true);
+	assert(headFreeSID != NULL);
+
+l_success:
+	p = headFreeSID;
+	headFreeSID = p->next;
+	if (headFreeSID == NULL)
+		tailFreeSID = NULL;
 	ReleaseMutex();
+	//
+	p->next = NULL;
+	p->TestSetInUse();
 	return p;
 }
 
@@ -504,14 +564,27 @@ int32_t LOCALAPI CSocketItemEx::GenerateSNACK(FSP_PreparedKEEP_ALIVE &buf, Contr
 #endif
 		return n;
 	}
-#if (TRACE & TRACE_HEARTBEAT)
-	if(n > 0)
-		printf_s("GetSelectiveNACK reported there were %d gap blocks.\n", n);
-#endif
 	// Suffix the effective gap descriptors block with the FSP_SelectiveNACK struct
 	// built-in rule: an optional header MUST be 64-bit aligned
-	// I don't know why, but set buf.n sometime cause memory around some stack variable corruptted!?
 	register FSP_SelectiveNACK *pSNACK = (FSP_SelectiveNACK *)(pGaps + n);
+	if (n > 0)
+	{
+		int32_t k = int32_t(seq0 - pControlBlock->recvWindowFirstSN) + pControlBlock->recvWindowHeadPos;
+		if (k >= pControlBlock->recvBufferBlockN)
+			k -= pControlBlock->recvBufferBlockN;
+		if (k < 0 || k >= pControlBlock->recvBufferBlockN)
+			return -EACCES;	// memory access error!
+		ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadRecv() + k;
+		pSNACK->tLazyAck = htobe64(NowUTC() - skb->timeRecv);
+#if (TRACE & TRACE_HEARTBEAT)
+		printf_s("GetSelectiveNACK reported there were %d gap blocks.\n"
+			"\tLazy acknowledgement delay = %lluus\n", n, be64toh(pSNACK->tLazyAck));
+#endif
+	}
+	else
+	{
+		pSNACK->tLazyAck = 0;
+	}
 	buf.n = n;
 	while(--n >= 0)
 	{
@@ -519,7 +592,7 @@ int32_t LOCALAPI CSocketItemEx::GenerateSNACK(FSP_PreparedKEEP_ALIVE &buf, Contr
 		pGaps[n].gapWidth = htobe32(pGaps[n].gapWidth);
 	}
 
-	++nextOOBSN;	// Because lastOOBSN start from zero as well. See ValidateSNACK
+	InterlockedIncrement(& nextOOBSN);	// Because lastOOBSN start from zero as well. See ValidateSNACK
 	pSNACK->serialNo = htobe32(nextOOBSN);
 	pSNACK->hs.Set(SELECTIVE_NACK, nPrefix);
 	return int32_t((uint8_t *)pSNACK + sizeof(FSP_SelectiveNACK) - (uint8_t *)pGaps) + nPrefix;
@@ -762,6 +835,9 @@ void CMultiplyBacklogItem::ResponseToMultiply()
 //	CSocketItemEx::Start(), OnConnectRequestAck(); CSocketItemDl::ToWelcomeConnect(), ToWelcomeMultiply()
 void CSocketItemEx::Accept()
 {
+	if (!WaitUseMutex())
+		return;	// but how on earth could it happen? race condition does exist!
+
 	InitAssociation();
 	//
 	if(lowState == CHALLENGING)
@@ -784,6 +860,7 @@ void CSocketItemEx::Accept()
 	pControlBlock->SetFirstSendWindowRightEdge();
 	//
 	tSessionBegin = tRecentSend;
+	SetMutexFree();
 }
 
 
@@ -828,6 +905,9 @@ void CSocketItemEx::DisposeOnReset()
 // See also ~::KeepAlive case NON_EXISTENT
 void CSocketItemEx::Destroy()
 {
+	if (InterlockedExchange(&idSrcProcess, 0) == 0)
+		return;
+	//
 	try
 	{
 #ifdef TRACE
@@ -872,6 +952,7 @@ void CSocketItemEx::AbortLLS(bool haveTLBLocked)
 		CSocketItem::Destroy();
 		CLowerInterface::Singleton.FreeItemDonotCareLock(this);
 	}
+	
 }
 
 
@@ -909,6 +990,19 @@ void CSocketItemEx::Reject(uint32_t reasonCode)
 	Destroy();	// MUST signal event before Destroy
 }
 
+
+
+// Set to PRE_CLOSED state and send RELEASE to the remote end.
+// The RELEASE packet is not guaranteed to be received
+// so that PRE_CLOSED is alike TCP TIME-WAIT state.
+void CSocketItemEx::Release()
+{
+	if (lowState == PRE_CLOSED)
+		return;			// Refuse to send redundant RELEASE packet
+	ReplaceTimer(TRANSIENT_STATE_TIMEOUT_ms);
+	SetState(PRE_CLOSED);
+	SendRelease();
+}
 
 
 // Given

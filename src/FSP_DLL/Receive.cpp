@@ -173,7 +173,7 @@ int LOCALAPI CSocketItemDl::ReadFrom(void * buffer, int capacity, NotifyOrReturn
 			if (GetTickCount64() - t0 > MAX_LOCK_WAIT_ms)
 				return -EDEADLK;
 			if (!WaitUseMutex())
-				return -EDEADLK;
+				return (IsInUse() ? -EDEADLK : -EINTR);
 		} while (!HasDataToDeliver());
 	}
 	// Assert: if(peerCommitted) the decode buffer MUST have been flushed. See also FlushDecodeBuffer()
@@ -217,7 +217,7 @@ int32_t CSocketItemDl::FetchReceived()
 	if(p->GetFlag<Compressed>() && pDecodeState == NULL && !AllocDecodeState())
 		return -ENOMEM;
 	//
-	for (; p->GetFlag<IS_FULFILLED>(); p = pControlBlock->GetFirstReceived())
+	for (; p->TestAndClearBusy(); p = pControlBlock->GetFirstReceived())
 	{
 		if(p->len > MAX_BLOCK_SIZE || p->len < 0)
 			return -EFAULT;
@@ -253,7 +253,6 @@ int32_t CSocketItemDl::FetchReceived()
 			break;
 		//
 		_InterlockedExchange8((char *)& p->opCode, 0);
-		p->SetFlag<IS_FULFILLED>(false);	// release the buffer
 
 		// Slide the left border of the receive window before possibly set the flag 'end of received message'
 		pControlBlock->SlideRecvWindowByOne();
@@ -287,13 +286,16 @@ int32_t CSocketItemDl::FetchReceived()
 // Remark
 //	It is meant to be called by the soft interrupt handling entry function where the mutex lock has been obtained
 //	and it sets the mutex lock free on leave.
-//	LLS FSP_AdRecvWindow may be called before DLL SetMutexFree.
-//	Advertise the receive window size to the peer unless error encountered, even if nothing is delivered.
 void CSocketItemDl::ProcessReceiveBuffer()
 {
 #ifdef TRACE
 	printf_s("Fiber#%u process receive buffer in %s\n", fidPair.source, stateNames[pControlBlock->state]);
 #endif
+	if (pControlBlock->state >= PRE_CLOSED)
+	{
+		SetMutexFree();
+		return;
+	}
 	CallbackPeeked fp1;
 	int32_t n;
 	toIgnoreNextPoll = 1;
@@ -315,7 +317,6 @@ void CSocketItemDl::ProcessReceiveBuffer()
 		}
 		else if (n == 0) // when the last message is a payload-less PERSIST without the EoT flag set
 		{
-			Call<FSP_AdRecvWindow>();
 			fpPeeked = fp1;
 			SetMutexFree();
 			return;
@@ -342,7 +343,6 @@ void CSocketItemDl::ProcessReceiveBuffer()
 			InterlockedCompareExchangePointer((PVOID *)&fpPeeked, fp1, NULL);
 		// Assume the call-back function did not mess up the receive queue
 		pControlBlock->MarkReceivedFree(n);
-		Call<FSP_AdRecvWindow>();
 
 		if (HasDataToDeliver())
 		{
@@ -378,8 +378,6 @@ void CSocketItemDl::ProcessReceiveBuffer()
 			NotifyError(FSP_NotifyDataReady, n);
 		return;
 	}
-
-	Call<FSP_AdRecvWindow>();
 
 	if (peerCommitted || waitingRecvSize <= 0)
 	{

@@ -361,9 +361,13 @@ class CSocketItemEx: public CSocketItem
 	//
 protected:
 	PktBufferBlock * headPacket;	// But UNRESOLVED! There used to be an independent packet queue for each SCB for sake of fairness
+	TSubnets	savedPathsToNearEnd;
+	int32_t		savedCountDeliverable;
+	char		mobileNoticeInFlight;
+	//
 	ICC_Context	contextOfICC;
 	ALIGN(MAC_ALIGNMENT)
-	uint8_t	cipherText[MAX_BLOCK_SIZE];
+	octet		cipherText[MAX_BLOCK_SIZE];
 
 	// multihome/mobility/resilence support (see also CInterface::EnumEffectiveAddresses):
 	// MAX_PHY_INTERFACES is hard-coded to 4
@@ -372,6 +376,7 @@ protected:
 	// while sockAddr[1], sockAddr[2] are backup-up/load-balance address
 	// the extra one is for saving temporary souce address
 	SOCKADDR_INET	sockAddrTo[MAX_PHY_INTERFACES + 1];
+	FSP_ADDRINFO_EX	tempAddrAccept;
 
 	char	locked;	// emulate spinlock linux-kernel
 	char	inUse;
@@ -389,9 +394,9 @@ protected:
 
 	uint32_t	tRoundTrip_us;	// round trip time evaluated in microsecond
 	uint32_t	tKeepAlive_ms;	// keep-alive time-out limit in millisecond
+	uint32_t	tLazyAck_us;	// lazy-acknowledgement evaluated in microsecond
 	HANDLE		timer;			// the repeating timer
 	HANDLE		resendTimer;	// retransmission timer
-	HANDLE		lazyAckTimer;	// an one-shot timer, typically for sending snack lazily
 	timestamp_t	tSessionBegin;
 	timestamp_t	tLastRecv;
 	timestamp_t tRecentSend;
@@ -402,19 +407,20 @@ protected:
 
 	void AbortLLS(bool haveTLBLocked = false);
 
-	bool AddLazyAckTimer();
+	void AddLazyAckTimer();
 	bool AddResendTimer(uint32_t);
 	// Side-effect: clear the isInUse flag
 	void RemoveTimers();
 	bool LOCALAPI ReplaceTimer(uint32_t);
 
-	void RestartKeepAlive() { ReplaceTimer(KEEP_ALIVE_TIMEOUT_ms); }
-	void StopKeepAlive() { ReplaceTimer(SCAVENGE_THRESHOLD_ms); }
+	// KeepAlive interval in established mode is hard-coded to ~16RTT
+	void RestartKeepAlive() { ReplaceTimer(max(TIMER_SLICE_ms, uint32_t(tRoundTrip_us >> 6))); }
+	void StopKeepAlive() { ReplaceTimer(RECYCLABLE_TIMEOUT_ms); }
 
 	bool InState(FSP_Session_State s) { return lowState == s; }
 	bool InStates(int n, ...);
 	// synchronize the state in the 'cache' and the real state in the session control block
-	void SyncState() { lowState = pControlBlock->state; tMigrate = NowUTC(); }
+	void SyncState() { _InterlockedExchange8((char *)& lowState, pControlBlock->state); tMigrate = NowUTC(); }
 	void SetState(FSP_Session_State s) { _InterlockedExchange8((char *)& pControlBlock->state, s); SyncState(); }
 	bool HasBeenCommitted()
 	{
@@ -435,15 +441,15 @@ protected:
 	bool SendKeepAlive();
 	bool SendRelease();
 	void SendReset();
+
+	bool IsNearEndMoved();
 	int	 EmitWithICC(ControlBlock::PFSP_SocketBuf, ControlBlock::seq_t);
 
 	void DoResend();
 	void KeepAlive();
-	void LazilySendSNACK();
 
 	static VOID NTAPI DoResend(PVOID c, BOOLEAN) { ((CSocketItemEx *)c)->DoResend(); }
 	static VOID NTAPI KeepAlive(PVOID c, BOOLEAN) { ((CSocketItemEx *)c)->KeepAlive(); }
-	static VOID NTAPI LazilySendSNACK(PVOID c, BOOLEAN) { ((CSocketItemEx *)c)->LazilySendSNACK(); }
 	//
 public:
 	bool MapControlBlock(const CommandNewSessionSrv &);
@@ -504,19 +510,16 @@ public:
 	void DisposeOnReset();
 	void Recycle();
 	void Reject(uint32_t);
+	void Release();
 	void InitiateMultiply(CSocketItemEx *);
 	bool FinalizeMultiply();
 
 	void AffirmConnect(const SConnectParam &, ALFID_T);
 
-	// Compare the given sequence with the left and right edge of the receive window
-	// Return 0 if it falls in the window (not out of window),
-	// or the offset if it is out of window, negative if on the left, positive if on the right
-	// somewhat 'be free to accept' as we didnot enforce 'announced receive window size'
-	int32_t IsOutOfWindow(ControlBlock::seq_t seq1)
+	// Calculte offset of the given sequence number to the left edge of the receive window
+	int32_t OffsetToRecvWinLeftEdge(ControlBlock::seq_t seq1)
 	{
-		register int32_t d = int32_t(seq1) - _InterlockedOr((LONG *)& pControlBlock->recvWindowFirstSN, 0);
-		return ((0 <= d) && (d < pControlBlock->recvBufferBlockN)) ? 0 : d;
+		return int32_t(seq1 - _InterlockedOr((LONG *)& pControlBlock->recvWindowFirstSN, 0));
 	}
 
 	// Given
@@ -540,9 +543,20 @@ public:
 	bool LOCALAPI ValidateSNACK(ControlBlock::seq_t &, FSP_SelectiveNACK::GapDescriptor * &, int &);
 	// On near end's IPv6 address changed automatically send an out-of-sync KEEP_ALIVE
 	void OnLocalAddressChanged();
-	// On got valid ICC automatically register source IP address as the favorite returning IP address
+	// Register source IPv6 address of a validated received packet as the favorite returning IP address
 	inline void ChangeRemoteValidatedIP();
+	// Check whether previous KEEP_ALIVE is implicitly acknowledged on gettting a validated packet
+	inline void CheckAckToKeepAlive();
 
+	int	EmitNextToSend();
+	// Normally those pended on the queue would be eventually sent if the send window size is greater than 0
+	// retry to probe the advertised receive window size of the peer to adjust the send window size.
+	void EmitProbe()
+	{
+		if (int(pControlBlock->sendWindowLimitSN - pControlBlock->sendWindowFirstSN) <= 0)
+			EmitNextToSend();
+		AddResendTimer(tRoundTrip_us >> 8);
+	}
 	void EmitQ();
 	void ScheduleEmitQ();
 	void ScheduleConnect(CommandNewSessionSrv *);
@@ -613,6 +627,15 @@ protected:
 
 	// The free list
 	CSocketItemEx *headFreeSID, *tailFreeSID;
+
+	// The scanvenge cache; it does waste some space, but saves much time
+	struct
+	{
+		CSocketItemEx	*pSocket;
+		timestamp_t		timeRecycled;
+	}		scavengeCache[MAX_CONNECTION_NUM];
+	LONG	topOfSC;
+	bool	PutToScavengeCache(CSocketItemEx *, timestamp_t);
 
 	void InitMutex() { InitializeSRWLock(&rtSRWLock); }
 public:

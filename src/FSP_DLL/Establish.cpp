@@ -349,8 +349,8 @@ bool LOCALAPI CSocketItemDl::ToWelcomeConnect(BackLogItem & backLog)
 		pendingSendSize = 0;
 	}
 	// else let ProcessPendingSend eventually transmit the welcome message, if any
-	skb->SetFlag<IS_COMPLETED>();
 	skb->SetFlag<TransactionEnded>();
+	skb->SetFlag<IS_COMPLETED>();
 	// the packet is still locked
 
 	return true;
@@ -384,7 +384,8 @@ void CSocketItemDl::ToConcludeConnect()
 	SetMutexFree();
 	if(context.onAccepted != NULL && context.onAccepted(this, &context) < 0)
 	{
-		Recycle();
+		if(WaitUseMutex())	// in case of memory access error
+			RecycLocked();
 		return;
 	}
 	skb = SetHeadPacketIfEmpty(ACK_START);

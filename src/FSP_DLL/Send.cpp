@@ -147,7 +147,7 @@ int FSPAPI Commit(FSPHANDLE hFSPSocket, NotifyOrReturn fp1)
 int32_t LOCALAPI CSocketItemDl::AcquireSendBuf()
 {
 	if (! WaitUseMutex())
-		return -EDEADLK;
+		return (IsInUse() ? -EDEADLK : -EINTR);
 
 	if(pendingSendBuf != NULL)
 	{
@@ -180,11 +180,11 @@ int LOCALAPI CSocketItemDl::SendInplace(void * buffer, int32_t len, bool eot)
 	if(len <= 0)
 		return -EDOM;
 
-	if(eot && (InState(COMMITTING) || InState(COMMITTING2)))
-		return -EBUSY;
-
 	if(! WaitUseMutex())
-		return -EDEADLK;
+		return (IsInUse() ? -EDEADLK : -EINTR);
+
+	if (eot && (InState(COMMITTING) || InState(COMMITTING2)))
+		return -EBUSY;
 
 	AddPollingTimer(TIMER_SLICE_ms);
 	CheckTransmitaction(eot);
@@ -210,19 +210,23 @@ int32_t LOCALAPI CSocketItemDl::SendStream(const void * buffer, int32_t len, boo
 		, stateNames[GetState()], GetState(), toCompress);
 #endif
 	int r;
-	if(eot && (InState(COMMITTING) || InState(COMMITTING2)))
+
+	if(! WaitUseMutex())
+		return (IsInUse() ? -EDEADLK : -EINTR);
+
+	if (eot && (InState(COMMITTING) || InState(COMMITTING2)))
 	{
 		uint64_t t0 = GetTickCount64();
 		do
 		{
+			SetMutexFree();
 			Sleep(TIMER_SLICE_ms);
 			if (GetTickCount64() - t0 > MAX_LOCK_WAIT_ms)
 				return -EBUSY;
-		} while(InState(COMMITTING) || InState(COMMITTING2));
+			if (!WaitUseMutex())
+				return (IsInUse() ? -EDEADLK : -EINTR);
+		} while (InState(COMMITTING) || InState(COMMITTING2));
 	}
-
-	if(! WaitUseMutex())
-		return -EDEADLK;
 
 	CheckTransmitaction(eot);
 
@@ -266,9 +270,9 @@ int32_t LOCALAPI CSocketItemDl::SendStream(const void * buffer, int32_t len, boo
 			SetMutexFree();
 			Sleep(TIMER_SLICE_ms);
 			if (GetTickCount64() - t0 > MAX_LOCK_WAIT_ms)
-				return -EDEADLK;
+				return -EBUSY;
 			if (!WaitUseMutex())
-				return -EDEADLK;
+				return (IsInUse() ? -EDEADLK : -EINTR);
 		} while (!HasFreeSendBuffer());
 		//
 		len = pendingSendSize;
@@ -298,7 +302,7 @@ int CSocketItemDl::LockAndCommit(NotifyOrReturn fp1)
 	}
 
 	if (!WaitUseMutex())
-		return -EDEADLK;
+		return (IsInUse() ? -EDEADLK : -EINTR);
 
 	if (HasDataToCommit())
 		MigrateToNewStateOnSend();
@@ -329,6 +333,7 @@ int CSocketItemDl::LockAndCommit(NotifyOrReturn fp1)
 //	may call back fpSent and clear the function pointer
 //	Here we have assumed that the underlying binary system does not change
 //	execution order of accessing volatile variables
+// Assume it has taken exclusive access of the socket
 // When FSP_NotifyFlushed was triggered the sender queue MUST be empty,
 // When FSP_NotifyBufferReady was triggered the header packet of the sender queue SHALL be acknowledged
 void CSocketItemDl::ProcessPendingSend()
@@ -336,7 +341,6 @@ void CSocketItemDl::ProcessPendingSend()
 #ifdef TRACE
 	printf_s("Fiber#%u process pending send in %s\n", fidPair.source, stateNames[pControlBlock->state]);
 #endif
-	// Assume it has taken exclusive access of the socket
 	toIgnoreNextPoll = 1;
 	// Set fpSent to NULL BEFORE calling back so that chained send may set new value
 	CallbackBufferReady fp2 = (CallbackBufferReady)InterlockedExchangePointer((PVOID volatile *)& fpSent, NULL);
@@ -637,8 +641,8 @@ int32_t LOCALAPI CSocketItemDl::PrepareToSend(void * buf, int32_t len)
 	p->version = THIS_FSP_VERSION;
 	p->len = len - MAX_BLOCK_SIZE * m;
 	p->opCode = PURE_DATA;
-	p->SetFlag<IS_COMPLETED>();
 	p->SetFlag<TransactionEnded>(committing != 0);
+	p->SetFlag<IS_COMPLETED>();
 	//
 	m++;
 	pControlBlock->sendBufferNextPos += m;
@@ -725,13 +729,15 @@ int CSocketItemDl::Commit()
 	// Assume the caller has set time-out clock
 	while (InState(COMMITTING) || InState(COMMITTING2))
 	{
+		SetMutexFree();
 		Sleep(TIMER_SLICE_ms);
+		if (!WaitUseMutex())
+			return (IsInUse() ? -EDEADLK : 0);
 	}
 
 	if (!TestSetState(ESTABLISHED, COMMITTING) && !TestSetState(PEER_COMMIT, COMMITTING2))
 	{
-		SetMutexFree();
-		Recycle();
+		RecycLocked();
 		return -EDOM;
 	}
 
@@ -750,17 +756,24 @@ int CSocketItemDl::Commit()
 		skbImcompleteToSend->Unlock();	// further processing is done on FSP_Commit
 		skbImcompleteToSend = NULL;
 	}
-	SetMutexFree();
 
 #ifndef _NO_LLS_CALLABLE
 	// Case 1 is handled in DLL while case 2~5 are handled in LLS
 	if (fpCommitted != NULL)
-		return yetSomeDataToBuffer ? 0 : (Call<FSP_Commit>() ? 0 : -EIO);
+	{
+		int r = yetSomeDataToBuffer ? 0 : (Call<FSP_Commit>() ? 0 : -EIO);
+		SetMutexFree();
+		return r;
+	}
+
 	// Or else it is in blocking mode:
 	// Assume the caller has set time-out clock
 	do
 	{
+		SetMutexFree();
 		Sleep(TIMER_SLICE_ms);
+		if (!WaitUseMutex())
+			return (IsInUse() ? -EDEADLK : 0);
 	} while (!InState(COMMITTED) && !InState(CLOSABLE) && !InState(CLOSED) && !InState(NON_EXISTENT));
 #endif
 	return 0;
@@ -772,7 +785,7 @@ int CSocketItemDl::Commit()
 int CSocketItemDl::Flush()
 {
 	if (!WaitUseMutex())
-		return -EDEADLK;
+		return (IsInUse() ? -EDEADLK : -EINTR);
 
 	register ControlBlock::PFSP_SocketBuf p = skbImcompleteToSend;
 

@@ -124,8 +124,8 @@ const char * CStringizeNotice::names[LARGEST_FSP_NOTICE + 1] =
 	"FSP_Shutdown",		// close the connection
 	"FSP_InstallKey",	// install the authenticated encryption key
 	"FSP_Multiply",		// clone the connection, make SCB of LLS synchronized with DLL
-	"FSP_AdRecvWindow",	// force to advertise the receive window ONCE by send a SNACK/ACK_FLUSH
-	// 13-15, 3 reserved
+	// 12-15, 4 reserved
+	"Reserved12",
 	"Reserved13",
 	"Reserved14",
 	"Reserved15",
@@ -504,7 +504,7 @@ ControlBlock::PFSP_SocketBuf LOCALAPI ControlBlock::AllocRecvBuf(seq_t seq1)
 	if(int(seq1 - recvWindowFirstSN - recvBufferBlockN) >= 0)
 		return NULL;	// a packet right to the right edge of the receive window may not be accepted
 
-	int d = int(seq1 - recvWindowNextSN);
+	register int32_t d = int32_t(seq1 - recvWindowNextSN);
 	PFSP_SocketBuf p;
 	if(d == 0)
 	{
@@ -535,22 +535,63 @@ ControlBlock::PFSP_SocketBuf LOCALAPI ControlBlock::AllocRecvBuf(seq_t seq1)
 	}
 	//
 	p->InitFlags();	// and locked
-	//
-	d = int(recvWindowExpectedSN - recvWindowNextSN);
-	PFSP_SocketBuf p2;
+	if (seq1 != recvWindowExpectedSN)
+		return p;
+
+	// distance of the right edge of the receive window to the probable left edge of the first gap
+	d = recvWindowNextSN - ++recvWindowExpectedSN;
+	if (d <= 0)	// <? but it is safe
+		return p;
+
+	register int32_t i = recvWindowNextPos - d;
+	if (i < 0)
+		i += recvBufferBlockN;
+	int n1 = recvBufferBlockN - recvWindowNextPos;
+	int n2 = d - n1;
+	if (n2 < 0)
+		n1 = d;
+	register PFSP_SocketBuf q = HeadRecv() + i;
+	i = 0;
 	do
 	{
-		d += recvWindowNextPos;
-		if (d - recvBufferBlockN >= 0)
-			d -= recvBufferBlockN;
-		else if (d < 0)
-			d += recvBufferBlockN;
-		p2 = HeadRecv() + d;
-		if(seq1 != recvWindowExpectedSN && ! p2->GetFlag<IS_FULFILLED>())
-			break;
-	} while ((d = int(++recvWindowExpectedSN - recvWindowNextSN)) < 0);
+		if (!q->GetFlag<IS_FULFILLED>())
+			return p;
+		q++;
+		recvWindowExpectedSN++;
+	} while (++i < n1);
+	//
+	if (n2 <= 0)
+		return p;
+	//
+	q = HeadRecv();
+	i = 0;
+	do
+	{
+		if (!q->GetFlag<IS_FULFILLED>())
+			return p;
+		q++;
+		recvWindowExpectedSN++;
+	} while (++i < n2);
 	//
 	return p;
+}
+
+
+
+
+// Given
+//	seq_t		the sequence number of the receive buffer slot to slide
+// Do
+//	Make it consume the sequence space slot in the receive queue
+void ControlBlock::SlideRecvSlotNextTo(seq_t seq1)
+{
+	if (++recvWindowNextPos - recvBufferBlockN >= 0)
+		recvWindowNextPos -= recvBufferBlockN;
+	_InterlockedIncrement((LONG *)& recvWindowNextSN);
+	//
+	if (++recvWindowHeadPos - recvBufferBlockN >= 0)
+		recvWindowHeadPos -= recvBufferBlockN;
+	InterlockedIncrement((LONG *)& recvWindowFirstSN);
 }
 
 
@@ -625,8 +666,13 @@ void * LOCALAPI ControlBlock::InquireRecvBuf(int32_t & nIO, bool & eotFlag)
 			nIO = -EFAULT;
 			return NULL;
 		}
-		//
-		p->opCode = (FSPOperationCode)0;
+		if (p->opCode == 0)
+		{
+			BREAK_ON_DEBUG();	//Should not happen if properly locked!
+			p++;
+			pMsg = GetRecvPtr(p);
+			continue;
+		}
 		nIO += p->len;
 		//
 		if(p->GetFlag<TransactionEnded>())
@@ -679,12 +725,12 @@ int LOCALAPI ControlBlock::MarkReceivedFree(int32_t nIO)
 	register int i;
 	int m = (nIO - 1) / MAX_BLOCK_SIZE + 1;
 	int r = m;
-	for (i = 0; i < m && p->GetFlag<IS_FULFILLED>(); i++)
+	for (i = 0; i < m && p->TestAndClearBusy(); i++)
 	{
+		_InterlockedExchange8((char *)& p->opCode, 0);
 		if (p->len > MAX_BLOCK_SIZE || p->len < 0)
 			r = -EFAULT;
 		//
-		p->SetFlag<IS_FULFILLED>(false);	// release the buffer
 		nIO -= p->len;
 		//
 		if (p->GetFlag<TransactionEnded>())
@@ -825,7 +871,6 @@ void ControlBlock::SlideSendWindow()
 //	ControlBlock::seq_t		the sequence number that was accumulatively acknowledged
 //	const GapDescriptor *	array of the gap descriptors
 //	int						number of gap descriptors
-//	timestamp_t & [In, Out]	In: the timestamp of Now. Out: average round-robin time in microseconds, if some packet is acknowledged
 // Do
 //	Make acknowledgement, maybe accumulatively if number of gap descriptors is 0
 // Return
@@ -834,7 +879,7 @@ void ControlBlock::SlideSendWindow()
 //	As the receiver has nothing to know about the tail packets the sender MUST append a gap.
 //	It's destructive! Endian conversion is also destructive.
 //	UNRESOLVED!? For big endian architecture it is unnecessary to transform the descriptor: let's the compiler/optimizer handle it
-int LOCALAPI ControlBlock::DealWithSNACK(seq_t expectedSN, FSP_SelectiveNACK::GapDescriptor *gaps, int n, timestamp_t & rttNow)
+int LOCALAPI ControlBlock::DealWithSNACK(seq_t expectedSN, FSP_SelectiveNACK::GapDescriptor *gaps, int n)
 {
 	// Check validity of the control block descriptors to prevent memory corruption propagation
 	const int32_t & capacity = sendBufferBlockN;
@@ -846,7 +891,6 @@ int LOCALAPI ControlBlock::DealWithSNACK(seq_t expectedSN, FSP_SelectiveNACK::Ga
 	int	countAck = 0;
 
 	register int nAck = int(expectedSN - seq0);
-	uint64_t rtt64_us = 0;
 	for(int	k = 0; ; k++)
 	{
 		seq0 += nAck;
@@ -857,14 +901,6 @@ int LOCALAPI ControlBlock::DealWithSNACK(seq_t expectedSN, FSP_SelectiveNACK::Ga
 			{
 				p->SetFlag<IS_ACKNOWLEDGED>();
 				countAck++;
-				// sum of round-trip time
-				int64_t tDiff = rttNow - p->timeSent;
-				if (tDiff <= 0)
-					rtt64_us++;	// RTT should not be zero
-				else if (tDiff >= UINT32_MAX)
-					rtt64_us += UINT32_MAX;
-				else
-					rtt64_us += tDiff;
 			}
 			//
 			if(++iHead - capacity >= 0)
@@ -890,9 +926,6 @@ int LOCALAPI ControlBlock::DealWithSNACK(seq_t expectedSN, FSP_SelectiveNACK::Ga
 		//
 		nAck = gaps[k].dataLength = be32toh(gaps[k].dataLength);
 	}
-
-	if(countAck > 0)
-		rttNow = rtt64_us / countAck;
 
 	return countAck;
 }
@@ -989,15 +1022,31 @@ int ControlBlock::MarkSendQueueEOT()
 //	advertisement of an out-of order packet about the receive window size is simply ignored
 bool LOCALAPI ControlBlock::ResizeSendWindow(seq_t seq1, unsigned int adRecvWin)
 {
-	int32_t d = int(seq1 - sendWindowFirstSN);
-	if (d < 0 || d > CountSentInFlight() || (uint64_t)CountSentInFlight() + adRecvWin >= INT32_MAX)
-		return false;	// you cannot acknowledge a packet not sent yet
-	
-	if(int32_t(seq1 - welcomedNextSNtoSend) <= 0)
+	int32_t d = int32_t(seq1 - sendWindowFirstSN);
+	if (d < 0 || d > CountSentInFlight())
+		return false;
+	//^Out of order packet received | You cannot acknowledge a packet not sent yet
+#if (TRACE & TRACE_SLIDEWIN)
+	if ((uint64_t)adRecvWin + CountSentInFlight() >= UINT32_MAX)
+	{
+		printf_s("Broken protocol implementation? Advertised window size too large!\n");
+		return false;
+	}
+#endif
+
+	d = int32_t(seq1 - welcomedNextSNtoSend);
+	if (d < 0)
 		return true;
 
-	sendWindowLimitSN = seq1 + adRecvWin;
-	welcomedNextSNtoSend = seq1;
+	if (d > 0)
+	{
+		sendWindowLimitSN = seq1 + adRecvWin;
+		welcomedNextSNtoSend = seq1;
+	}
+	else if (int32_t(seq1 + adRecvWin - sendWindowLimitSN) > 0)
+	{
+		sendWindowLimitSN = seq1 + adRecvWin;
+	}
 	return true;
 }
 

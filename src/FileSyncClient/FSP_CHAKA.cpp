@@ -120,7 +120,7 @@ int ToAcceptPushedDirectory(char *remoteAppURL)
 	parms.onAccepted = onConnected;
 	parms.onError = onError;
 	parms.onFinish = onFinish;
-	parms.recvSize = MAX_FSP_SHM_SIZE;	// 4MB
+	parms.recvSize = MAX_FSP_SHM_SIZE;
 	parms.sendSize = 0;	// the underlying service would give the minimum, however
 	if(Connect2(remoteAppURL, & parms) == NULL)
 	{

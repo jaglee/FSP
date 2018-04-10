@@ -92,12 +92,10 @@ void TraceLastError(char * fileName, int lineNo, char *funcName, char *s1);
 #ifdef _DEBUG
 # define DEINIT_WAIT_TIMEOUT_ms		15000	// 15 seconds
 # define SCAVENGE_THRESHOLD_ms		180000	// 3 minutes
-# define LAZY_ACK_DELAY_MIN_ms		100		// 100 millisecond, minimum delay for lazy acknowledgement
 # define BREAK_ON_DEBUG()			DebugBreak()
 #else
 # define DEINIT_WAIT_TIMEOUT_ms		5000	// 5 seconds
 # define SCAVENGE_THRESHOLD_ms		1800000	// 30 minutes
-# define LAZY_ACK_DELAY_MIN_ms		1		// 1 millisecond, minimum delay for lazy acknowledgement
 # define BREAK_ON_DEBUG()
 #endif
 
@@ -458,7 +456,11 @@ struct ControlBlock
 	// Total size of FSP_SocketBuf (descriptor): 8 bytes (a 64-bit word)
 	typedef struct FSP_SocketBuf
 	{
+		union
+		{
 		timestamp_t	timeSent;
+		timestamp_t timeRecv;
+		};
 		int32_t		len;
 		uint16_t	flags;
 		uint8_t		version;	// should be the same as in the FSP fixed header
@@ -490,6 +492,7 @@ struct ControlBlock
 #endif
 		bool Lock()	{ return ! SetFlag<EXCLUSIVE_LOCK>(); }
 		void Unlock() { SetFlag<EXCLUSIVE_LOCK>(false); }
+		bool TestAndClearBusy() { return SetFlag<IS_FULFILLED>(false);  }
 		//
 		void InitFlags() { _InterlockedExchange16((SHORT *) & flags, 1 << EXCLUSIVE_LOCK); }
 		void CopyFlagsTo(FSP_NormalPacketHeader *p) { p->flags_ws[0]  = (uint8_t)flags; }
@@ -570,7 +573,12 @@ struct ControlBlock
 	PFSP_SocketBuf	GetSendBuf();
 
 	void RoundSendBufferNextPos() { int32_t m = sendBufferNextPos - sendBufferBlockN; if(m >= 0) sendBufferNextPos = m; }
-	void RoundSendWindowNextPos() { int32_t m = sendWindowNextPos - sendBufferBlockN; if(m >= 0) sendWindowNextPos = m; }
+	void RoundIncrementSendWinNextPos()
+	{
+		register int32_t a = _InterlockedIncrement((LONG *)& sendWindowNextPos) - sendBufferBlockN;
+		if (a >= 0)
+			_InterlockedExchange((LONG *)& sendWindowNextPos, a);
+	}
 
 	// Given
 	//	FSP_NormalPacketHeader*	the place-holder of sequence number and flags
@@ -595,7 +603,7 @@ struct ControlBlock
 	}
 
 	int LOCALAPI GetSelectiveNACK(seq_t &, FSP_SelectiveNACK::GapDescriptor *, int) const;
-	int LOCALAPI DealWithSNACK(seq_t, FSP_SelectiveNACK::GapDescriptor *, int, timestamp_t &);
+	int LOCALAPI DealWithSNACK(seq_t, FSP_SelectiveNACK::GapDescriptor *, int);
 
 	// Return the locked descriptor of the receive buffer block with the given sequence number
 	PFSP_SocketBuf LOCALAPI AllocRecvBuf(seq_t);
@@ -607,6 +615,8 @@ struct ControlBlock
 			recvWindowHeadPos -= recvBufferBlockN;
 		InterlockedIncrement((LONG *) & recvWindowFirstSN);
 	}
+
+	void SlideRecvSlotNextTo(seq_t);
 
 	// Given
 	//	int & : [_Out_] place holder of the number of bytes [to be] peeked.
@@ -652,13 +662,9 @@ struct ControlBlock
 	void SetFirstSendWindowRightEdge()
 	{
 		seq_t k = sendWindowFirstSN;
-		if(_InterlockedCompareExchange((LONG *) & sendWindowNextSN, k + 1, k) == k)
-		{
-			++sendWindowNextPos;
-			RoundSendWindowNextPos();
-		}
+		if (_InterlockedCompareExchange((LONG *)& sendWindowNextSN, k + 1, k) == k)
+			RoundIncrementSendWinNextPos();
 	}
-
 	//
 	bool LOCALAPI ResizeSendWindow(seq_t, unsigned int);
 

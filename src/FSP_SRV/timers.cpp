@@ -57,6 +57,7 @@ bool CSocketItemEx::LockWithActiveULA()
 }
 
 
+
 // Main purpose is to send the mandatory low-frequence KEEP_ALIVE
 /**
   [Idle Timeout]
@@ -70,46 +71,79 @@ bool CSocketItemEx::LockWithActiveULA()
 
   But the transaction commit time-out is handled in DLL, i.e. in ULA's work set.
 	{COMMITTING, COMMITTING2}-->NON_EXISTENT
-  So does the shutdown time-out:
-	PRE_CLOSED-->NON_EXISTENT
  */
 void CSocketItemEx::KeepAlive()
 {
-	if(! LockWithActiveULA())
+	// Unlike LockWithActiveULA(), here is lock without wait
+	char c = _InterlockedCompareExchange8(&locked, 1, 0);
+	if (!IsProcessAlive())	// assume it takes little time to detect process life
 	{
-		if (lowState == NON_EXISTENT && pControlBlock != NULL)
+		if (c == 0)
 		{
-			REPORT_ERRMSG_ON_TRACE("Lazy garbage collection found possible dead-lock");
-			Destroy();
+			// If the time-out handler took the lock, it may abort the session safely
+			AbortLLS();
 		}
-#if defined(TRACE) && (TRACE & TRACE_HEARTBEAT)
-		else if(pControlBlock != NULL)
+		else if(IsInUse())
 		{
+			inUse = 0;		// So that any WaitUseMutex() would be forcefully aborted
+			ReplaceTimer(TIMER_SLICE_ms);
+			// Assume there is no dead loop, eventually the socket would be unlocked
+			// and the time-out handler would safely abort the session
+		}
+		// Or else it MUST be already in clean-up phase
+		return;
+	}
+
+	// Whether it has been released elsewhere
+	if (!IsInUse() || pControlBlock == NULL)
+	{
+		if (c == 0)
+			SetMutexFree();
+		return;
+	}
+
+	// If the lock could not be obtained this time, fire the timer a short while later
+	if (c != 0)
+	{
+		if (timer != NULL)
+			::ChangeTimerQueueTimer(TimerWheel::Singleton(), timer, TIMER_SLICE_ms, tKeepAlive_ms);
+#if (TRACE & TRACE_HEARTBEAT)
+		else
+			REPORT_ERRMSG_ON_TRACE("It could have found orphan timer handler for lazy garbage collection");
+		//
+		if (pControlBlock != NULL)
 			printf_s("\nFiber#%u's KeepAlive not executed due to lack of locks in state %s[%d]\n"
 				, fidPair.source, stateNames[lowState], pControlBlock->state);
-		}
 #endif
 		return;
+	}
+
+	if (lowState == NON_EXISTENT)
+	{
+#if (TRACE & TRACE_HEARTBEAT)
+		printf_s("\nFiber#%u's session control block is released in a delayed timer handler.\n", fidPair.source);
+#endif
+		Destroy();
+		SetMutexFree();
+		return;
+	}
+
+	// To suppress unnecessary KEEP_ALIVE
+	bool keepAliveNeeded = _InterlockedExchange(&tLazyAck_us, 0) != 0;
+	keepAliveNeeded = IsNearEndMoved() || keepAliveNeeded;
+	if (keepAliveNeeded)
+	{
+		SendKeepAlive();	// No matter which state it is in
+		keepAliveNeeded = false;
+	}
+	else if(mobileNoticeInFlight != 0 || pControlBlock->CountDeliverable() != savedCountDeliverable)
+	{
+		keepAliveNeeded = true;
 	}
 
 	timestamp_t t1 = NowUTC();
 	switch(lowState)
 	{
-	case NON_EXISTENT:
-#ifdef TRACE
-		printf_s("\nFiber#%u, SCB to be completely disposed\n", fidPair.source);
-#endif
-		if(pControlBlock != NULL)
-		{
-#ifdef TRACE
-			printf_s("\tState of SCB used to be %s[%d]\n"
-				, stateNames[pControlBlock->state], pControlBlock->state);
-#endif
-			pControlBlock->state = NON_EXISTENT;
-		}
-		Destroy();
-		break;
-	//
 	case CONNECT_BOOTSTRAP:
 	case CONNECT_AFFIRMING:
 	case CHALLENGING:
@@ -139,10 +173,17 @@ void CSocketItemEx::KeepAlive()
 		}
 		// If the peer has committed an ACK_FLUSH has accumulatively acknowledged it.
 		// The near end needn't send periodical KEEP_ALIVE anymore
-		if (lowState != PEER_COMMIT)
+		if (lowState != PEER_COMMIT && keepAliveNeeded)
 			SendKeepAlive();
 		break;
-	//
+	// assert: TRANSIENT_STATE_TIMEOUT_ms < RECYCLABLE_TIMEOUT_ms && RECYCLABLE_TIMEOUT_ms < MAXIMUM_SESSION_LIFE_ms
+	case PRE_CLOSED:
+		if (t1 - tMigrate > (TRANSIENT_STATE_TIMEOUT_ms << 10))
+		{
+			// Automatically migrate to CLOSED state in TIME-WAIT state alike in TCP
+			SetState(CLOSED);
+			Notify(FSP_NotifyToFinish);
+		}
 	case CLOSED:
 		if ((t1 - tMigrate) > (RECYCLABLE_TIMEOUT_ms << 10))
 		{
@@ -151,7 +192,6 @@ void CSocketItemEx::KeepAlive()
 #endif
 			TIMED_OUT();
 		}
-	case PRE_CLOSED:
 	case CLOSABLE:	// CLOSABLE does not automatically timeout to CLOSED
 		if(t1 - tSessionBegin >  (MAXIMUM_SESSION_LIFE_ms << 10))
 		{
@@ -180,6 +220,7 @@ void CSocketItemEx::KeepAlive()
 		Destroy();
 	}
 
+	tLazyAck_us = 0;	// May be redundant, but it makes the code safe in the sense that next AddLazyAckTimer won't fail
 	SetMutexFree();
 }
 
@@ -211,8 +252,14 @@ void CSocketItemEx::DoResend()
 	// SendKeepAlive would scan the receive buffer, which might be lengthy, and it might hold the lock too long time
 	// So maximum buffer capacity should be limitted anyway
 	if (shouldAppendCommit)
+	{
 		SendKeepAlive();
-	//^TODO: optimization: eliminate the long-interval KEEP_ALIVE, until short-interval KEEP_ALIVE is stopped
+#if (TRACE & (TRACE_HEARTBEAT | TRACE_PACKET | TRACE_SLIDEWIN))
+		printf_s("Piggyback EoT on KEEP_ALIVE packet.\n"
+			"TODO: optimization: eliminate the long-interval KEEP_ALIVE, \n"
+			"until short-interval KEEP_ALIVE is stopped.\n");		
+#endif
+	}
 
 	SetMutexFree();
 	//^Try to make it lockless
@@ -255,7 +302,7 @@ void CSocketItemEx::DoResend()
 
 		if (!p->GetFlag<IS_ACKNOWLEDGED>())
 		{
-#if defined(TRACE) && (TRACE & TRACE_HEARTBEAT)
+#if (TRACE & TRACE_HEARTBEAT)
 			printf_s("Fiber#%u, to retransmit packet #%u\n", fidPair.source, seq1);
 #endif
 #ifndef UNIT_TEST
@@ -298,31 +345,9 @@ void CSocketItemEx::DoResend()
 	}
 	else
 	{
-		EmitQ();	// retry to send those pending on the queue
+		EmitProbe();
 	}
 
-	SetMutexFree();
-}
-
-
-
-// The lazy selective negative acknowledgement time-out handler
-void CSocketItemEx::LazilySendSNACK()
-{
-	lazyAckTimer = NULL;
-	if(! WaitUseMutex())
-	{
-		if(IsInUse())
-			AddLazyAckTimer();
-		return;
-	}
-
-#ifdef TRACE
-	if(!InState(ESTABLISHED) && !InState(COMMITTING) && !InState(COMMITTED))
-		printf_s("\n#0x%X's LazilySendSNACK should not execute for it has migrated to state %s.\n"
-			, fidPair.source, stateNames[lowState]);
-#endif
-	SendKeepAlive();
 	SetMutexFree();
 }
 
@@ -336,39 +361,18 @@ void CSocketItemEx::LazilySendSNACK()
 // TODO: suppress rate of sending KEEP_ALIVE
 bool CSocketItemEx::SendKeepAlive()
 {
-	ALIGN(MAC_ALIGNMENT)
+	EmitProbe();	// Conditionally, actually.
+
 	struct
 	{
 		FSP_NormalPacketHeader	hdr;
 		FSP_ConnectParam		mp;
 		FSP_PreparedKEEP_ALIVE	snack;
 	} buf3;	// a buffer with three headers
-	FSP_ConnectParam &mp = buf3.mp;	// this alias make the code a little concise
 
-	u_int k = CLowerInterface::Singleton.sdSet.fd_count;
-	u_int j = 0;
-	LONG w = CLowerInterface::Singleton.disableFlags;
-	for (register u_int i = 0; i < k; i++)
-	{
-		if (!BitTest(&w, i))
-		{
-			mp.subnets[j++] = SOCKADDR_SUBNET(&CLowerInterface::Singleton.addresses[i]);
-			if (j >= sizeof(mp.subnets) / sizeof(uint64_t))
-				break;
-		}
-	}
-	// temporarily there is no path to the local end:
-	if (j <= 0)
-		return false;
-	//
-	while (j < sizeof(mp.subnets) / sizeof(uint64_t))
-	{
-		mp.subnets[j] = mp.subnets[j - 1];
-		j++;
-	}
-	//^Let's the compiler do loop-unrolling
-	mp.idHost = SOCKADDR_HOSTID(&CLowerInterface::Singleton.addresses[0]);
-	mp.hs.Set(PEER_SUBNETS, sizeof(FSP_NormalPacketHeader));
+	memcpy(buf3.mp.subnets, savedPathsToNearEnd, sizeof(TSubnets));
+	buf3.mp.idHost = SOCKADDR_HOSTID(&CLowerInterface::Singleton.addresses[0]);
+	buf3.mp.hs.Set(PEER_SUBNETS, sizeof(FSP_NormalPacketHeader));
 
 	ControlBlock::seq_t	snKeepAliveExp;
 	LONG len = GenerateSNACK(buf3.snack, snKeepAliveExp, sizeof(FSP_NormalPacketHeader) + sizeof(FSP_ConnectParam));
@@ -377,7 +381,7 @@ bool CSocketItemEx::SendKeepAlive()
 		printf_s("Fatal error %d encountered when generate SNACK\n", len);
 		return false;
 	}
-#if defined(TRACE) && (TRACE & (TRACE_HEARTBEAT | TRACE_PACKET | TRACE_SLIDEWIN))
+#if (TRACE & (TRACE_HEARTBEAT | TRACE_PACKET | TRACE_SLIDEWIN))
 	printf_s("Keep-alive: local fiber#%u, peer's fiber#%u\n"
 		"\tAcknowledged seq#%u, keep-alive header size = %d\n"
 		, fidPair.source, fidPair.peer
@@ -394,7 +398,7 @@ bool CSocketItemEx::SendKeepAlive()
 		buf3.hdr.SetFlag<TransactionEnded>();
 	//
 	SetIntegrityCheckCode(&buf3.hdr, NULL, 0, buf3.snack.GetSaltValue());
-#if defined(TRACE) && (TRACE & (TRACE_HEARTBEAT | TRACE_PACKET | TRACE_SLIDEWIN))
+#if (TRACE & (TRACE_HEARTBEAT | TRACE_PACKET | TRACE_SLIDEWIN))
 	printf_s("To send KEEP_ALIVE seq #%u, acknowledge #%u\n\tsource ALFID = %u\n"
 		, be32toh(buf3.hdr.sequenceNo)
 		, snKeepAliveExp
@@ -414,18 +418,18 @@ bool CSocketItemEx::SendKeepAlive()
 //	false if send was failed
 bool CSocketItemEx::SendAckFlush()
 {
-	ALIGN(16)
 	struct
 	{
 		FSP_NormalPacketHeader	hdr;
 		FSP_SelectiveNACK		snack;
 	} buf2;	// a buffer with two headers
 
-	++nextOOBSN;
+	InterlockedIncrement(& nextOOBSN);
+	buf2.snack.tLazyAck = htobe64(NowUTC() - tLastRecv);
 	buf2.snack.serialNo = htobe32(nextOOBSN);
 	buf2.snack.hs.Set(SELECTIVE_NACK, sizeof(buf2.hdr));
 
-#if defined(TRACE) && (TRACE & (TRACE_HEARTBEAT | TRACE_PACKET | TRACE_SLIDEWIN))
+#if (TRACE & (TRACE_HEARTBEAT | TRACE_PACKET | TRACE_SLIDEWIN))
 	printf_s("Acknowledge flush: local fiber#%u, peer's fiber#%u\n\tAcknowledged seq#%u\n"
 		, fidPair.source, fidPair.peer
 		, pControlBlock->recvWindowNextSN);
@@ -460,7 +464,7 @@ bool CSocketItemEx::SendAckFlush()
 //	Side effect: the integer value in the gap descriptors are translated to host byte order here
 int LOCALAPI CSocketItemEx::RespondToSNACK(ControlBlock::seq_t expectedSN, FSP_SelectiveNACK::GapDescriptor *gaps, int n)
 {
-	const ControlBlock::seq_t headSN = pControlBlock->sendWindowFirstSN;
+	const ControlBlock::seq_t headSN = _InterlockedOr((LONG *)& pControlBlock->sendWindowFirstSN, 0);
 	if(int(expectedSN - headSN) < 0)
 		return -EDOM;
 
@@ -468,7 +472,7 @@ int LOCALAPI CSocketItemEx::RespondToSNACK(ControlBlock::seq_t expectedSN, FSP_S
 	if (capacity <= 0
 	 ||	sizeof(ControlBlock) + (sizeof(ControlBlock::FSP_SocketBuf) + MAX_BLOCK_SIZE) * capacity > dwMemorySize)
 	{
-#if defined(TRACE)
+#ifdef TRACE
 		BREAK_ON_DEBUG();	//TRACE_HERE("memory overflow");
 		printf_s("Given memory size: %d, wanted limit: %zd\n"
 			, dwMemorySize
@@ -486,8 +490,7 @@ int LOCALAPI CSocketItemEx::RespondToSNACK(ControlBlock::seq_t expectedSN, FSP_S
 	if(sentWidth == 0)
 		return 0;	// there is nothing to be acknowledged
 
-	uint64_t	rtt64_us = NowUTC();
-	const int	nAck = pControlBlock->DealWithSNACK(expectedSN, gaps, n, rtt64_us);
+	const int	nAck = pControlBlock->DealWithSNACK(expectedSN, gaps, n);
 #if (TRACE & (TRACE_HEARTBEAT | TRACE_PACKET | TRACE_SLIDEWIN))
 	printf_s("Accumulatively acknowledged SN = %u, %d packet(s) acknowledged.\n", expectedSN, nAck);
 #endif
@@ -499,23 +502,32 @@ int LOCALAPI CSocketItemEx::RespondToSNACK(ControlBlock::seq_t expectedSN, FSP_S
 		return nAck;
 	}
 
-	// Note that the raw round trip time includes the lazy-acknowledgement delay
-	// We hard-coded the lazy-acknowledgement delay as one RTT
 #if (TRACE & TRACE_HEARTBEAT)
 	printf_s("Round trip time to calibrate = %u, packet(s) acknowledged = %d\n", tRoundTrip_us, nAck);
+#endif
+	if (nAck == 0)
+		return nAck;
+
 	// new = ((current + old) / 2 + old) / 2 = current/4 + old * 3/4
 	// new = ((current + old - timer-slice/2) / 2
-	// here we have to fight against RTT creeping because of lazy acknowledgement
-#endif
-	if(nAck > 0)
+	ControlBlock::seq_t seq0 = pControlBlock->sendWindowFirstSN;
+	pControlBlock->SlideSendWindow();
+	// Calibrate RTT ONLY if left edge of the window windows was advanced
+	if (pControlBlock->sendWindowFirstSN != seq0 && gaps != NULL)
 	{
-		if (rtt64_us > TIMER_SLICE_ms * 1000 / 2)
+		ControlBlock::PFSP_SocketBuf skb = pControlBlock->GetSendQueueHead();
+		FSP_SelectiveNACK *pSNACK = (FSP_SelectiveNACK *)(void *) & gaps[n];
+		uint64_t tDelay = be64toh(pSNACK->tLazyAck);
+		// If ever the peer cheats by giving the acknowledgement delay value larger than the real value
+		// it would be eventually punished by a very large RTO!?
+		uint64_t rtt64_us = NowUTC() - skb->timeSent - tDelay;
+		if (rtt64_us < TIMER_SLICE_ms * 1000 / 2)
 			tRoundTrip_us = uint32_t(min((rtt64_us - TIMER_SLICE_ms * 1000 / 2  + 1) >> 1, UINT32_MAX));
 		else
 			tRoundTrip_us = uint32_t(((rtt64_us + 1) >> 1) + tRoundTrip_us) >> 1;
-		//
-		pControlBlock->SlideSendWindow();
+#if (TRACE & TRACE_HEARTBEAT)
+		printf_s("Round trip time calibrated: %u\n\tAcknowledgement delay: %llu\n", tRoundTrip_us, tDelay);
+#endif
 	}
-
 	return nAck;
 }

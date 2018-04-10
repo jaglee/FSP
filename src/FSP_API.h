@@ -51,7 +51,11 @@
 #define DllSpec
 #endif
 
-#define MAX_FSP_SHM_SIZE		0x400000	// 4MB
+#ifdef NDEBUG
+# define MAX_FSP_SHM_SIZE		0x400000	// 4MB
+#else
+# define MAX_FSP_SHM_SIZE		0x1000		// 4KB
+#endif
 
 #if defined(_M_X64) || defined(_M_IA64)
     typedef unsigned __int64 ulong_ptr;

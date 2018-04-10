@@ -116,7 +116,7 @@ void CSocketSrvTLB::AcquireMutex()
 			BREAK_ON_DEBUG();	// To trace the call stack
 			throw -EDEADLK;
 		}
-		Sleep(50);	// if there is some thread that has exclusive access on the lock, wait patiently
+		Sleep(TIMER_SLICE_ms);	// if there is some thread that has exclusive access on the lock, wait patiently
 	}
 }
 #endif
@@ -757,7 +757,7 @@ inline void CLowerInterface::ProcessRemotePacket()
 		// a more sophisticated implementation should be event-driven - wait the IP change event instead
 		if (r <= 0)
 		{
-			Sleep(1000);
+			Sleep(TIMER_SLICE_ms * 20);
 			continue;
 		}
 		// It is documented that select returns total number of sockets that are ready, however, if one socket is closed
@@ -771,13 +771,13 @@ inline void CLowerInterface::ProcessRemotePacket()
 			int	err = WSAGetLastError();
 			if(err == WSAENETDOWN)
 			{
-				Sleep(1000);	// wait for the network service up again
+				Sleep(TIMER_SLICE_ms * 20);	// wait for the network service up again
 				continue;
 			}
 			else if (err = WSAENOTSOCK)
 			// One of the descriptor sets contains an entry that is not a socket. deliberately close a socket
 			{
-				Sleep(50);
+				Sleep(TIMER_SLICE_ms);
 				continue;
 			}
 			REPORT_WSAERROR_TRACE("select failure");
@@ -915,6 +915,7 @@ int CLowerInterface::AcceptAndProcess(SOCKET sdRecv)
 		printf_s("%s[%d] packet #%u\n\tpayload length %d, to put onto the queue\n"
 			, opCodeStrings[opCode], opCode, pktBuf->pktSeqNo, pktBuf->lenData);
 #endif
+		memcpy(& pSocket->tempAddrAccept, & nearInfo.u, sizeof(FSP_SINKINF));
 		// save the source address temporarily as it is not necessariy legitimate
 		pSocket->sockAddrTo[MAX_PHY_INTERFACES] = addrFrom;
 		pSocket->HandleFullICC(pktBuf, opCode);
@@ -1145,19 +1146,14 @@ bool LOCALAPI CSocketItemEx::ReplaceTimer(uint32_t period)
 
 
 
-// Return
-//	true if the timer was set, false if it failed.
-// Remark
 // A lazy acknowledgement is hard coded to one RTT, with an implementation depended floor value
-bool CSocketItemEx::AddLazyAckTimer()
+void CSocketItemEx::AddLazyAckTimer()
 {
-	return (lazyAckTimer == NULL
-		&& ::CreateTimerQueueTimer(&lazyAckTimer, TimerWheel::Singleton()
-			, LazilySendSNACK
-			, this
-			, max(LAZY_ACK_DELAY_MIN_ms, (tRoundTrip_us >> 10))
-			, 0
-			, WT_EXECUTEINTIMERTHREAD));
+	if (InterlockedCompareExchange((LONG *)& tLazyAck_us, max(LAZY_ACK_DELAY_MIN_us, tRoundTrip_us), 0) != 0)
+		return;
+	if (timer == NULL)
+		return;
+	::ChangeTimerQueueTimer(TimerWheel::Singleton(), timer, tLazyAck_us >> 10, tKeepAlive_ms);
 }
 
 
@@ -1165,13 +1161,13 @@ bool CSocketItemEx::AddLazyAckTimer()
 // Return
 //	true if the timer was set, false if it failed.
 // Remark
-// A retransmission timer should be hard coded to 4 RTT, with an implementation depended floor value
+//  A retransmission timer should be hard coded to 4 RTT
 bool CSocketItemEx::AddResendTimer(uint32_t tPeriod_ms)
 {
-#if !defined(TRACE) || !(TRACE & TRACE_PACKET)
-			tPeriod_ms = max(LAZY_ACK_DELAY_MIN_ms, tPeriod_ms);
+#if defined(NDEBUG) || !(TRACE & TRACE_PACKET) || !(TRACE & TRACE_HEARTBEAT)
+	tPeriod_ms = max(TIMER_SLICE_ms, tPeriod_ms);	// donot retransmit in the same time slice
 #else
-			tPeriod_ms = INIT_RETRANSMIT_TIMEOUT_ms;
+	tPeriod_ms = INIT_RETRANSMIT_TIMEOUT_ms;
 #endif
 	return (resendTimer == NULL
 		&& ::CreateTimerQueueTimer(&resendTimer, TimerWheel::Singleton()
@@ -1192,9 +1188,6 @@ void CSocketItemEx::RemoveTimers()
 	if((h = (HANDLE)InterlockedExchangePointer(& timer, NULL)) != NULL)
 		::DeleteTimerQueueTimer(TimerWheel::Singleton(), h, NULL);
 	
-	if((h = (HANDLE)InterlockedExchangePointer(& lazyAckTimer, NULL)) != NULL)
-		::DeleteTimerQueueTimer(TimerWheel::Singleton(), h, NULL);
-
 	if((h = (HANDLE)InterlockedExchangePointer(& resendTimer, NULL)) != NULL)
 		::DeleteTimerQueueTimer(TimerWheel::Singleton(), h, NULL);
 }
@@ -1289,7 +1282,7 @@ bool CSocketItemEx::WaitUseMutex()
 	{
 		if (! IsInUse() || GetTickCount64() - t0 > MAX_LOCK_WAIT_ms)
 			return false;
-		Sleep(50);	// if there is some thread that has exclusive access on the lock, wait patiently
+		Sleep(TIMER_SLICE_ms);	// if there is some thread that has exclusive access on the lock, wait patiently
 	}
 
 	if(IsInUse())
@@ -1305,8 +1298,6 @@ void CSocketItemEx::SetMutexFree()
 {
 	if(_InterlockedExchange8(& locked, 0) == 0)
 		printf_s("Warning: to release the spinlock of the socket#0x%p, but it was released\n", this);
-	// yield out the CPU as soon as the mutex is free
-	Sleep(0);
 }
 
 
@@ -1455,7 +1446,7 @@ bool CLightMutex::WaitSetMutex()
 			return false;
 		}
 		//
-		Sleep(0);	// if there is some thread that has exclusive access on the lock, wait patiently
+		Sleep(TIMER_SLICE_ms);	// if there is some thread that has exclusive access on the lock, wait patiently
 	}
 	return true;
 }

@@ -76,7 +76,7 @@ void UnitTestSendRecvWnd()
 	Assert::IsTrue(skb5 != skb4);	// out of order, and it depends that IsNull(skb5)
 	//
 	skb5 = pSCB->AllocRecvBuf(FIRST_SN + 6);
-	Assert::IsNull(skb5);			// no more advertised window space
+	Assert::IsNull(skb5);			// no more advertisable receive window space
 
 	// emulate a received message that crosses two packet
 	// assume the packets are received out of the order

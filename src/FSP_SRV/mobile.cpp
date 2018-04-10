@@ -135,11 +135,8 @@ uint64_t LOCALAPI CalculateCookie(const void *header, int sizeHdr, timestamp_t t
 {
 	static struct
 	{
-		ALIGN(MAC_ALIGNMENT)
 		timestamp_t timeStamp;
-		ALIGN(MAC_ALIGNMENT)
 		timestamp_t timeSign;
-		ALIGN(MAC_ALIGNMENT)
 		GCM_AES_CTX	ctx;
 	} prevCookieContext, cookieContext;
 	//
@@ -648,6 +645,21 @@ inline void CSocketItemEx::ChangeRemoteValidatedIP()
 
 
 
+// Check whether previous KEEP_ALIVE is implicitly acknowledged on gettting a validated packet
+inline void CSocketItemEx::CheckAckToKeepAlive()
+{
+	// ONLY if the packet is accepted at new edge may mobileNoticeInFlight cleared.
+	// It costs a little more KEEP_ALIVE packet in flight but it is safer
+	register uint64_t subnet = ((PFSP_IN6_ADDR)& tempAddrAccept)->subnet;
+	for (register int i = 0; i < MAX_PHY_INTERFACES; i++)
+	{
+		if (savedPathsToNearEnd[i] = subnet)
+			_InterlockedExchange8(&mobileNoticeInFlight, 0);
+	}
+}
+
+
+
 // Given
 //	FSP_NormalPacketHeader *	The pointer to the fixed header, plaintext may or may not follow
 //	void *	[in,out]			The plaintext/ciphertext, either payload or optional header
@@ -822,8 +834,8 @@ bool LOCALAPI CSocketItemEx::ValidateICC(FSP_NormalPacketHeader *p1, int32_t ctL
 	if(! r)
 		return false;
 
-
 	ChangeRemoteValidatedIP();
+	CheckAckToKeepAlive();
 	return true;
 }
 
@@ -970,6 +982,47 @@ int CSocketItemEx::EmitWithICC(ControlBlock::PFSP_SocketBuf skb, ControlBlock::s
 
 
 
+// Check whether local address of the near end is changed because of, say, reconfiguration or hand-over
+bool CSocketItemEx::IsNearEndMoved()
+{
+	u_int k = CLowerInterface::Singleton.sdSet.fd_count;
+	u_int j = 0;
+	LONG w = CLowerInterface::Singleton.disableFlags;
+	TSubnets subnets;
+
+	for (register u_int i = 0; i < k; i++)
+	{
+		if (!BitTest(&w, i))
+		{
+			subnets[j++] = SOCKADDR_SUBNET(&CLowerInterface::Singleton.addresses[i]);
+			if (j >= sizeof(subnets) / sizeof(uint64_t))
+				break;
+		}
+	}
+	if (j <= 0)
+	{
+#if (TRACE & TRACE_HEARTBEAT)
+		printf_s("SendKeepAlive-IsNearEndMoved: temporarily there is no path to the near end.\n");
+#endif
+		return false;
+	}
+	//
+	while (j < sizeof(subnets) / sizeof(uint64_t))
+	{
+		subnets[j] = subnets[j - 1];
+		j++;
+	}
+	//^Let's the compiler do loop-unrolling
+	if (memcmp(savedPathsToNearEnd, subnets, sizeof(TSubnets)) == 0)
+		return false;
+
+	memcpy(savedPathsToNearEnd, subnets, sizeof(TSubnets));
+	mobileNoticeInFlight = 1;
+	return true;
+}
+
+
+
 #ifndef OVER_UDP_IPv4
 // On near end's IPv6 address changed automatically send KEEP_ALIVE
 // No matter whether the KEEP_ALIVE flag was set when the connection was setup
@@ -1028,54 +1081,44 @@ bool CSocketItemEx::HandlePeerSubnets(PFSP_HeaderSignature optHdr)
 
 
 
+int CSocketItemEx::EmitNextToSend()
+{
+	register ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend() + pControlBlock->sendWindowNextPos;
+	if (!skb->GetFlag<IS_COMPLETED>())
+		return -EBUSY;	// ULA is still to fill the buffer
+
+	if (!skb->Lock())
+		return -EDEADLK; 
+
+	if (EmitWithICC(skb, pControlBlock->sendWindowNextSN) <= 0)
+	{
+		skb->Unlock();
+		return -EIO;
+	}
+
+	skb->SetFlag<IS_SENT>();
+	return 0;
+}
+
+
+
 // Emit packet in the send queue, by default transmission of new packets takes precedence
 // To make life easier assume it has gain unique access to the LLS socket
-// for the protocol to work it should allow at least one packet in flight
 // TODO: rate-control/quota control
+// for the protocol to work it should allow at least one packet in flight?
 void CSocketItemEx::EmitQ()
 {
-	const ControlBlock::seq_t sendBufferNextSN = _InterlockedOr((LONG *) & pControlBlock->sendBufferNextSN, 0);
-	const ControlBlock::seq_t lastSN
-		= int(pControlBlock->sendWindowLimitSN - pControlBlock->sendWindowFirstSN) <= 0
-		? pControlBlock->sendWindowFirstSN + 1
-		: pControlBlock->sendWindowLimitSN;
-	ControlBlock::seq_t & nextSN = pControlBlock->sendWindowNextSN;
-	bool shouldRetry = pControlBlock->CountSendBuffered() > 0;
-	//
-	const int32_t maxPos = pControlBlock->sendBufferBlockN;
-	LONG *pNextPos = (LONG *)& pControlBlock->sendWindowNextPos;
-	while (int(nextSN - sendBufferNextSN) < 0 && int(nextSN - lastSN) < 0)
+	const ControlBlock::seq_t sendBufferNextSN = _InterlockedOr((LONG *)& pControlBlock->sendBufferNextSN, 0);
+	const ControlBlock::seq_t lastSN = int(sendBufferNextSN - pControlBlock->sendWindowLimitSN) > 0
+		? pControlBlock->sendWindowLimitSN
+		: sendBufferNextSN;
+	while (int32_t(pControlBlock->sendWindowNextSN - lastSN) < 0)
 	{
-		register ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend() + *pNextPos;
-		if (!skb->GetFlag<IS_COMPLETED>())
-		{
-#if defined(TRACE) && (TRACE & TRACE_PACKET)
-			printf_s("Not ready to send packet SN#%u; next to buffer SN#%u\n", nextSN, sendBufferNextSN);
-#endif 
-			break;
-		}
-
-		if (!skb->Lock())
-		{
-#ifndef NDEBUG
-			printf_s("Should be rare: cannot get the exclusive lock on the packet to send SN#%u\n", nextSN);
-#endif
-			break;
-		}
-
-		if (EmitWithICC(skb, nextSN) <= 0)
-		{
-			skb->Unlock();
-			break;
-		}
-		skb->SetFlag<IS_SENT>();
-
-		register int32_t a = _InterlockedIncrement(pNextPos) - maxPos;
-		if (a >= 0)
-			_InterlockedExchange(pNextPos, a);
-		nextSN++;
+		EmitNextToSend();
+		pControlBlock->sendWindowNextSN++;
+		pControlBlock->RoundIncrementSendWinNextPos();
 	}
 	//
-	if(shouldRetry)
+	if (int32_t(sendBufferNextSN - _InterlockedOr((LONG *)&pControlBlock->sendWindowFirstSN, 0) > 0))
 		AddResendTimer(tRoundTrip_us >> 8);
 }

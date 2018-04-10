@@ -38,24 +38,23 @@ int FSPAPI Dispose(FSPHANDLE hFSPSocket)
 		return -EFAULT;
 	if(! p->WaitUseMutex())
 		return (p->IsInUse() ? -EDEADLK : 0);
-	return p->Recycle();
+	return p->RecycLocked();
 }
 
 
 
 // return 0 if no error, positive if some warning
-// an ill-behaviored ULA could be punished by dead-lock
-int CSocketItemDl::Recycle()
+// assume the socket has been locked
+int CSocketItemDl::RecycLocked()
 {
-	if(! IsInUse())
-		return EAGAIN;	// warning: already disposed
-
 	register int r = 0;
 	if (! lowerLayerRecycled)
 	{
-		bool b = Call<FSP_Recycle>();
-		if(b)
+		if (Call<FSP_Recycle>())
+		{
+			SetMutexFree();
 			return r;	// Free the socket item when FSP_Recycle called back
+		}
 		// Shall be rare to fall through:
 		r = EIO;		// LLS would eventually timed-out
 	}
@@ -77,9 +76,6 @@ void CSocketItemDl::Disable()
 	CancelTimeout();
 	if((h = InterlockedExchangePointer((PVOID *) & theWaitObject, NULL)) != NULL)
 		UnregisterWaitEx(h, NULL);
-	//
-	if (inCritical > 0)
-		return;
 	//
 	CSocketItem::Destroy();
 }
@@ -134,13 +130,14 @@ int CSocketItemDl::Shutdown()
 		return 0;
 	}
 
-	// Send RELEASE and wait echoed RELEASE. LLS to signal FSP_NotifyRecycled, NotifyReset or NotifyTimeout
+#ifndef _NO_LLS_CALLABLE
 	if(! AddOneShotTimer(TRANSIENT_STATE_TIMEOUT_ms))
 	{
 		REPORT_ERRMSG_ON_TRACE("Cannot set time-out clock for shutdown");
 		SetMutexFree();
 		return -EFAULT;
 	}
+#endif
 
 	if (fpCommitted != NULL && context.onFinish != NULL)
 	{
@@ -148,6 +145,7 @@ int CSocketItemDl::Shutdown()
 		return 0;	// Full-fledged asynchronous mode
 	}
 
+	// Send RELEASE and wait echoed RELEASE. LLS to signal FSP_NotifyRecycled, NotifyReset or NotifyTimeout
 #ifndef _NO_LLS_CALLABLE
 	do
 	{
@@ -162,7 +160,6 @@ int CSocketItemDl::Shutdown()
 		//
 		if (InState(CLOSABLE))
 		{
-			SetState(PRE_CLOSED);
 			bool b = Call<FSP_Shutdown>();
 			if (context.onFinish != NULL || !b)
 			{
@@ -178,6 +175,6 @@ int CSocketItemDl::Shutdown()
 		//
 		Sleep(TIMER_SLICE_ms);
 	} while (WaitUseMutex());
-	return (IsInUse() ? -EDEADLK : 0);
 #endif
+	return (IsInUse() ? -EDEADLK : 0);
 }

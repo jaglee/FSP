@@ -195,7 +195,7 @@ FSPHANDLE CSocketItemDl::CompleteMultiply(CommandCloneConnect & cmd)
 	if(skb != NULL)
 	{
 		skb->opCode = MULTIPLY;
-		skb->SetFlag<IS_COMPLETED>(); 
+		skb->SetFlag<IS_COMPLETED>();
 	}
 	// See also InitCommand, CallCreate
 	cmd.fiberID = pControlBlock->idParent;
@@ -234,7 +234,7 @@ bool LOCALAPI CSocketItemDl::ToWelcomeMultiply(BackLogItem & backLog)
 	SetNewTransaction();
 	if (context.onAccepting != NULL	&& context.onAccepting(this, & backLog.acceptAddr, remoteAddr) < 0)
 	{
-		Recycle();
+		RecycLocked();
 		return false;
 	}
 	ControlBlock::PFSP_SocketBuf skb = SetHeadPacketIfEmpty(ACK_START);

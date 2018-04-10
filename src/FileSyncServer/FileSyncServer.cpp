@@ -81,7 +81,7 @@ void FSPAPI WaitConnection(const char *thisWelcome, unsigned short mLen, Callbac
 	hFspListen = ListenAt(& atAddress, & params);
 
 	while(!r2Finish || !finished)
-		Sleep(1);	// yield CPU out for at least 1ms/one time slice
+		Sleep(50);	// yield CPU out for about 1/20 second
 
 	if(hFspListen != NULL)
 		Dispose(hFspListen);

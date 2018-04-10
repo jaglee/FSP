@@ -140,7 +140,6 @@ class CSocketItemDl: public CSocketItem
 	// for sake of buffered, streamed I/O
 	ControlBlock::PFSP_SocketBuf skbImcompleteToSend;
 
-	uint8_t			inCritical;		// to handle the situation of emulated NMI that free the socket before previous notice processed
 	char			inUse;
 
 protected:
@@ -266,7 +265,7 @@ public:
 	}
 
 	int LOCALAPI Initialize(PFSP_Context, char[MAX_NAME_LENGTH]);
-	int Recycle();
+	int RecycLocked();
 
 	// Convert the relative address in the control block to the address in process space, unchecked
 	BYTE * GetSendPtr(const ControlBlock::PFSP_SocketBuf skb) const
@@ -357,8 +356,10 @@ public:
 			return r;
 		}
 		//
+		if(r > 0 && !Call<FSP_Send>())
+			r = -EIO;
 		SetMutexFree();
-		return (r == 0 ? r : (Call<FSP_Send>() ? r : -EIO));
+		return r;
 	}
 	//
 	int Commit();

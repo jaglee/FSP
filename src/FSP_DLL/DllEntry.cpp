@@ -350,7 +350,7 @@ bool CSocketItemDl::LockAndValidate()
 			, this
 			, stateNames[pControlBlock->state], pControlBlock->state);
 #endif
-		Recycle();
+		RecycLocked();
 		return false;
 	}
 
@@ -362,8 +362,6 @@ bool CSocketItemDl::LockAndValidate()
 // The asynchronous, multi-thread friendly soft interrupt handler
 void CSocketItemDl::WaitEventToDispatch()
 {
-	++inCritical;	// Memory barrier in LockAndValidate() make this statement executed first
-	//
 	while(LockAndValidate())
 	{
 		FSP_ServiceCode notice = pControlBlock->notices.Pop();
@@ -421,8 +419,8 @@ void CSocketItemDl::WaitEventToDispatch()
 				int r = context.onAccepted(this, &context);
 				if (!LockAndValidate() || r < 0)
 				{
-					Recycle();		// SetMutexFree();
-					goto l_return;
+					RecycLocked();	// SetMutexFree();
+					return;
 				}
 			}
 			ProcessReceiveBuffer();	// SetMutexFree();
@@ -432,7 +430,7 @@ void CSocketItemDl::WaitEventToDispatch()
 			fidPair.source = pControlBlock->nearEndInfo.idALF;
 			ProcessReceiveBuffer();
 			if (!LockAndValidate())
-				goto l_return;
+				return;
 			//
 			ProcessPendingSend();	// To inherently chain WriteTo/SendInline with Multiply
 			break;
@@ -445,7 +443,7 @@ void CSocketItemDl::WaitEventToDispatch()
 		case FSP_NotifyToCommit:
 			ProcessReceiveBuffer();	// See FSP_NotifyDataReady, FSP_NotifyFlushed and CSocketItemDl::Shutdown()
 			if (!LockAndValidate())
-				goto l_return;
+				return;
 			// Even if there's no callback function to accept data/flags (as in blocking receive mode)
 			// the peerCommitted flag can be set if no further data to deliver
 			if (!HasDataToDeliver())
@@ -459,12 +457,12 @@ void CSocketItemDl::WaitEventToDispatch()
 			committing = 0;			// Must clear the flag firstly or else transmit transactions is splitted unproperly
 			ProcessPendingSend();	// SetMutexFree();
 			if (!LockAndValidate())
-				goto l_return;
+				return;
 			//
 			if(InState(CLOSABLE) && initiatingShutdown)
 			{
-				SetMutexFree();
 				Call<FSP_Shutdown>();
+				SetMutexFree();
 			}
 			else
 			{
@@ -481,7 +479,7 @@ void CSocketItemDl::WaitEventToDispatch()
 			fp1 = context.onFinish;	// For security reason recycle MAY reset context
 			if(initiatingShutdown)
 			{
-				Recycle();	// CancelTimer(); SetMutexFree();
+				RecycLocked();		// CancelTimer(); SetMutexFree();
 				if (fp1 != NULL)
 					fp1(this, FSP_NotifyRecycled, 0);
 			}
@@ -493,36 +491,33 @@ void CSocketItemDl::WaitEventToDispatch()
 			}
 			break;
 		case FSP_NotifyRecycled:
-			Recycle();		// CancelTimer(); SetMutexFree();
-			goto l_return;
+			fp1 = context.onError;
+			RecycLocked();		// CancelTimer(); SetMutexFree();
+			if (!initiatingShutdown && fp1 != NULL)
+				fp1(this, notice, -EINTR);
+			return;
 		case FSP_IPC_CannotReturn:
 			s0 = pControlBlock->state;
 			fp1 = context.onError;
-			Recycle();		// CancelTimer(); SetMutexFree();
+			RecycLocked();		// CancelTimer(); SetMutexFree();
 			if(fp1 == NULL)
-				goto l_return;
+				return;
+			//
 			if (s0 == LISTENING)
 				fp1(this, FSP_Listen, -EIO);
 			else if (s0 != CHALLENGING)
 				fp1(this, (s0 == CLONING ? FSP_Multiply : InitConnection), -EIO);
-			//
-			goto l_return;
+			return;
 		case FSP_MemoryCorruption:
 		case FSP_NotifyOverflow:
 		case FSP_NotifyTimeout:
 		case FSP_NotifyNameResolutionFailed:
 		case FSP_NotifyReset:
 			DisableAndNotify(notice, EINTR);
-			goto l_return;
+			return;
 			// UNRESOLVED!? There could be some remedy if name resolution failed?
 		}
 	}
-	//
-l_return:
-	// There might be memory leak if it relies on longRunCallback to release dynamically allocated
-	// resource recorded by context.signuatureULA!
-	if(--inCritical == 0 && !IsInUse())
-		CSocketItem::Destroy();	// delayed destroy
 }
 
 
@@ -655,8 +650,21 @@ bool CSocketItemDl::CancelTimeout()
 // See also Recycle
 void CSocketItemDl::TimeOut()
 {
-	if(! LockAndValidate())
+	BOOLEAN b = TryAcquireSRWLockExclusive(&rtSRWLock);
+	if (!IsInUse() || pControlBlock == NULL)
+	{
+		if(b)
+			SetMutexFree();
 		return;
+	}
+
+	assert(timer != NULL);
+	if (!b)
+	{
+		::ChangeTimerQueueTimer(::timerQueue, timer, TIMER_SLICE_ms, 0);
+		inUse = 0;	// Force WaitUseMutex to abort
+		return;
+	}
 
 	if (! lowerLayerRecycled)
 		Call<FSP_Recycle>();
