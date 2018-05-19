@@ -645,16 +645,23 @@ inline void CSocketItemEx::ChangeRemoteValidatedIP()
 
 
 
-// Check whether previous KEEP_ALIVE is implicitly acknowledged on gettting a validated packet
+// Check whether previous KEEP_ALIVE is implicitly acknowledged on getting a validated packet
+// It is conservative in the sense that
+// it would not suppress overwhelming KEEP_ALIVE if the change is only removal of some subnet entry
 inline void CSocketItemEx::CheckAckToKeepAlive()
 {
+	if (!mobileNoticeInFlight)
+		return;
 	// ONLY if the packet is accepted at new edge may mobileNoticeInFlight cleared.
 	// It costs a little more KEEP_ALIVE packet in flight but it is safer
 	register uint64_t subnet = ((PFSP_IN6_ADDR)& tempAddrAccept)->subnet;
 	for (register int i = 0; i < MAX_PHY_INTERFACES; i++)
 	{
-		if (savedPathsToNearEnd[i] = subnet)
+		if (newPathsToNearEnd[i] == subnet)
+		{
 			_InterlockedExchange8(&mobileNoticeInFlight, 0);
+			return;
+		}
 	}
 }
 
@@ -894,11 +901,11 @@ bool CSocketItemEx::EmitStart()
 		break;
 	case PERSIST:	// PERSIST is an in-band control packet with payload that start a transmit transaction
 		result = EmitWithICC(skb, pControlBlock->sendWindowFirstSN);
-		skb->SetFlag<IS_SENT>();
+		skb->MarkSent();
 		break;
 	case ACK_START:	// ACK_START is an in-band payloadless control packet that confirms a connection
 		result = EmitWithICC(skb, pControlBlock->sendWindowFirstSN);
-		skb->SetFlag<IS_SENT>();
+		skb->MarkSent();
 		break;
 		// Only possible for retransmission
 	case MULTIPLY:	// The MULTIPLY command head is stored in the queue while the encrypted payload is buffered in cipherText
@@ -982,21 +989,46 @@ int CSocketItemEx::EmitWithICC(ControlBlock::PFSP_SocketBuf skb, ControlBlock::s
 
 
 
+// Let the compiler do loop-unrolling and embedding
+bool LOCALAPI IsInSubnetSet(uint64_t prefix, TSubnets subnets)
+{
+	for (register int i = 0; i < MAX_PHY_INTERFACES; i++)
+	{
+		if (subnets[i] == prefix)
+			return true;
+	}
+	return false;
+}
+
+
+
 // Check whether local address of the near end is changed because of, say, reconfiguration or hand-over
+// It is conservative in the sense that
+// it would not suppress overwhelming KEEP_ALIVE if the change is only removal of some subnet entry
 bool CSocketItemEx::IsNearEndMoved()
 {
+	if (InterlockedExchange8(&isNearEndHandedOver, 0) == 0)
+		return false;
+
 	u_int k = CLowerInterface::Singleton.sdSet.fd_count;
 	u_int j = 0;
-	LONG w = CLowerInterface::Singleton.disableFlags;
+	LONG & w = CLowerInterface::Singleton.disableFlags;
 	TSubnets subnets;
+	register u_int i;
+	register uint64_t prefix;
 
-	for (register u_int i = 0; i < k; i++)
+	memset(subnets, 0, sizeof(TSubnets));
+	for (i = 0; i < k; i++)
 	{
 		if (!BitTest(&w, i))
 		{
-			subnets[j++] = SOCKADDR_SUBNET(&CLowerInterface::Singleton.addresses[i]);
-			if (j >= sizeof(subnets) / sizeof(uint64_t))
-				break;
+			prefix = SOCKADDR_SUBNET(&CLowerInterface::Singleton.addresses[i]);
+			if (!IsInSubnetSet(prefix, subnets))
+			{
+				subnets[j++] = prefix;
+				if (j >= MAX_PHY_INTERFACES)
+					break;
+			}
 		}
 	}
 	if (j <= 0)
@@ -1006,47 +1038,23 @@ bool CSocketItemEx::IsNearEndMoved()
 #endif
 		return false;
 	}
-	//
-	while (j < sizeof(subnets) / sizeof(uint64_t))
-	{
-		subnets[j] = subnets[j - 1];
-		j++;
-	}
-	//^Let's the compiler do loop-unrolling
+
 	if (memcmp(savedPathsToNearEnd, subnets, sizeof(TSubnets)) == 0)
 		return false;
+
+	// Scan and find out the really new entry
+	memset(newPathsToNearEnd, 0, sizeof(TSubnets));
+	k = 0;
+	for (i = 0; i < j; i++)
+	{
+		if(! IsInSubnetSet(subnets[i], savedPathsToNearEnd))
+			newPathsToNearEnd[k++] = subnets[i];
+	}
 
 	memcpy(savedPathsToNearEnd, subnets, sizeof(TSubnets));
 	mobileNoticeInFlight = 1;
 	return true;
 }
-
-
-
-#ifndef OVER_UDP_IPv4
-// On near end's IPv6 address changed automatically send KEEP_ALIVE
-// No matter whether the KEEP_ALIVE flag was set when the connection was setup
-void CSocketItemEx::OnLocalAddressChanged()
-{
-	if (!WaitUseMutex())
-		return;
-	if (IsPassive())
-		goto l_return;
-	
-	SendKeepAlive();
-
-	// If destination interface happen to be on the same host, update the registered address simultaneously
-	// UNRESOLVED!? The default interface should be the one that is set to promiscuous
-	if (SOCKADDR_SUBNET(sockAddrTo) == 0 && SOCKADDR_HOSTID(sockAddrTo) == 0)
-	{
-		PSOCKADDR_IN6 p = CLowerInterface::Singleton.addresses + CLowerInterface::Singleton.iRecvAddr;
-		SOCKADDR_SUBNET(sockAddrTo) = SOCKADDR_SUBNET(p);
-		SOCKADDR_HOSTID(sockAddrTo) = SOCKADDR_HOSTID(p);
-	}
-l_return:
-	SetMutexFree();
-}
-#endif
 
 
 
@@ -1057,7 +1065,6 @@ l_return:
 // Remark
 //	Although the subnet that the host belong to could be mobile, the hostID should be stable
 //	PEER_SUBNETS used to be MOBILE_PARAM
-//	TODO: prove that FSP is compatible with Identifier-Locator-Addressing
 bool CSocketItemEx::HandlePeerSubnets(PFSP_HeaderSignature optHdr)
 {
 	if (optHdr == NULL || optHdr->opCode != PEER_SUBNETS)
@@ -1070,12 +1077,13 @@ bool CSocketItemEx::HandlePeerSubnets(PFSP_HeaderSignature optHdr)
 	SOCKADDR_SUBNET(&sockAddrTo[1]) = pMobileParam->subnets[1];
 	SOCKADDR_SUBNET(&sockAddrTo[2]) = pMobileParam->subnets[2];
 	SOCKADDR_SUBNET(&sockAddrTo[3]) = pMobileParam->subnets[3];
-#if defined(TRACE) && (TRACE & TRACE_ADDRESS)
-	printf_s("New target address set for host 0x%X (== 0x%X)\n", SOCKADDR_HOSTID(sockAddrTo), pMobileParam->idHost);
-#endif
+	// generally speaking host id should not be changed often
+	SOCKADDR_HOSTID(&sockAddrTo[0]) = pMobileParam->idListener;
+	SOCKADDR_HOSTID(&sockAddrTo[1]) = pMobileParam->idListener;
+	SOCKADDR_HOSTID(&sockAddrTo[2]) = pMobileParam->idListener;
+	SOCKADDR_HOSTID(&sockAddrTo[3]) = pMobileParam->idListener;
 	//
 #endif
-	//
 	return true;
 }
 
@@ -1084,19 +1092,14 @@ bool CSocketItemEx::HandlePeerSubnets(PFSP_HeaderSignature optHdr)
 int CSocketItemEx::EmitNextToSend()
 {
 	register ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend() + pControlBlock->sendWindowNextPos;
-	if (!skb->GetFlag<IS_COMPLETED>())
+
+	if (!skb->IsComplete())
 		return -EBUSY;	// ULA is still to fill the buffer
 
-	if (!skb->Lock())
-		return -EDEADLK; 
-
 	if (EmitWithICC(skb, pControlBlock->sendWindowNextSN) <= 0)
-	{
-		skb->Unlock();
 		return -EIO;
-	}
 
-	skb->SetFlag<IS_SENT>();
+	skb->MarkSent();
 	return 0;
 }
 
@@ -1115,8 +1118,8 @@ void CSocketItemEx::EmitQ()
 	while (int32_t(pControlBlock->sendWindowNextSN - lastSN) < 0)
 	{
 		EmitNextToSend();
-		pControlBlock->sendWindowNextSN++;
-		pControlBlock->RoundIncrementSendWinNextPos();
+		pControlBlock->AddRoundSendBlockN(pControlBlock->sendWindowNextPos, 1);
+		InterlockedIncrement((LONG *)& pControlBlock->sendWindowNextSN);
 	}
 	//
 	if (int32_t(sendBufferNextSN - _InterlockedOr((LONG *)&pControlBlock->sendWindowFirstSN, 0) > 0))

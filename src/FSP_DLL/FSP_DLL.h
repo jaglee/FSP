@@ -106,7 +106,7 @@ public:
 
 
 
-class CSocketItemDl: public CSocketItem
+class CSocketItemDl : public CSocketItem
 {
 	friend class	CSocketDLLTLB;
 	friend struct	CommandToLLS;
@@ -137,12 +137,12 @@ class CSocketItemDl: public CSocketItem
 	// for sake of incarnating new accepted connection
 	FSP_SocketParameter context;
 
+protected:
 	// for sake of buffered, streamed I/O
 	ControlBlock::PFSP_SocketBuf skbImcompleteToSend;
 
 	char			inUse;
-
-protected:
+	char			toDispose;
 	char			newTransaction;	// it may simultaneously start a transmit transaction and flush/commit it
 
 	char			initiatingShutdown : 1;
@@ -152,7 +152,6 @@ protected:
 	char			peerCommitted : 1;
 	char			chainingReceive : 1;
 	char			chainingSend : 1;
-	char			toIgnoreNextPoll : 1;
 
 	HANDLE			pollingTimer;
 	ALIGN(8)		HANDLE theWaitObject;
@@ -180,17 +179,17 @@ protected:
 	// Pair of functions meant to mimic hardware vector interrupt. It is yet OS-dependent, however
 	static VOID NTAPI WaitOrTimeOutCallBack(PVOID param, BOOLEAN isTimeout)
 	{
-		if(isTimeout)
+		if (isTimeout)
 			((CSocketItemDl *)param)->TimeOut();
 		else
 			((CSocketItemDl *)param)->WaitEventToDispatch();
 	}
 
-	static VOID NTAPI PollingTimedoutCallBack(PVOID param, BOOLEAN) { ((CSocketItemDl *)param)->PollingTimedout();}
+	static VOID NTAPI PollingTimedoutCallBack(PVOID param, BOOLEAN) { ((CSocketItemDl *)param)->PollingTimedout(); }
 
 	BOOL RegisterDrivingEvent()
 	{
-		return RegisterWaitForSingleObject(& theWaitObject
+		return RegisterWaitForSingleObject(&theWaitObject
 			, hEvent
 			, WaitOrTimeOutCallBack
 			, this
@@ -242,7 +241,7 @@ protected:
 	bool HasInternalBufferedToSend();
 	bool HasDataToCommit() { return (pendingSendSize > 0 || HasInternalBufferedToSend()); }
 	bool FlushDecodeBuffer();
-	void FreeStreamState() { if(pStreamState != NULL) { free(pStreamState); pStreamState = NULL; } }
+	void FreeStreamState() { if (pStreamState != NULL) { free(pStreamState); pStreamState = NULL; } }
 	bool HasInternalBufferedToDeliver();
 	bool HasDataToDeliver() { return (pControlBlock->CountDeliverable() > 0 || HasInternalBufferedToDeliver()); }
 
@@ -254,7 +253,7 @@ public:
 		Disable();
 		SetMutexFree();
 		socketsTLB.FreeItem(this);
-		if(fp1 != NULL)
+		if (fp1 != NULL)
 			fp1(this, c, -v);
 	}
 	//^The error handler need not and should not do further clean-up work
@@ -265,6 +264,7 @@ public:
 	}
 
 	int LOCALAPI Initialize(PFSP_Context, char[MAX_NAME_LENGTH]);
+	int Dispose();
 	int RecycLocked();
 
 	// Convert the relative address in the control block to the address in process space, unchecked

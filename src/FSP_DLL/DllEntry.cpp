@@ -518,6 +518,9 @@ void CSocketItemDl::WaitEventToDispatch()
 			// UNRESOLVED!? There could be some remedy if name resolution failed?
 		}
 	}
+	//
+	if(_InterlockedExchange8(&toDispose, 0) != 0)
+		Dispose();	// The delayed dispose
 }
 
 
@@ -676,24 +679,21 @@ void CSocketItemDl::TimeOut()
 
 void CSocketItemDl::PollingTimedout()
 {
-	if(! LockAndValidate())
+	if (!TryAcquireSRWLockExclusive(&rtSRWLock))
+		return;	// Patiently wait the next time slice instead to spin here
+	if (pControlBlock == NULL)
 		return;
-
-	if(toIgnoreNextPoll)
-	{
-		toIgnoreNextPoll = 0;
-		SetMutexFree();
+	if (!IsInUse() || InIllegalState())
 		return;
-	}
 
 	// To make it less stressing, process either receive or send, but not both
 	// and receive takes precedence because receiving is to free resource
-	if( (fpReceived != NULL || fpPeeked != NULL) && !chainingReceive && HasDataToDeliver())
-		SelfNotify(FSP_NotifyDataReady);
-	else if(fpSent != NULL && !chainingSend && HasFreeSendBuffer())
-		SelfNotify(FSP_NotifyBufferReady);
-
-	SetMutexFree();
+	if ((fpReceived != NULL || fpPeeked != NULL) && !chainingReceive && HasDataToDeliver())
+		ProcessReceiveBuffer();
+	else if (fpSent != NULL && !chainingSend && HasFreeSendBuffer())
+		ProcessPendingSend();
+	else
+		SetMutexFree();
 }
 
 

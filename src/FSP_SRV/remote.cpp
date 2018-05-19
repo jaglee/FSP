@@ -317,7 +317,7 @@ void LOCALAPI CLowerInterface::OnGetConnectRequest()
 	else
 	{	// FSP over UDP/IPv4
 		register PFSP_IN6_ADDR fspAddr = (PFSP_IN6_ADDR) & backlogItem.acceptAddr;
-		memset(&backlogItem.allowedPrefixes[1], 0, sizeof(TSubnets));
+		memset(backlogItem.allowedPrefixes, 0, sizeof(TSubnets));
 		// For sake of NAT ignore the subnet prefixes reported by the initiator
 		fspAddr->_6to4.prefix = PREFIX_FSP_IP6to4;
 		//
@@ -506,9 +506,6 @@ bool LOCALAPI CSocketItemEx::ValidateSNACK(ControlBlock::seq_t & ackSeqNo, FSP_S
 	if (!ResizeSendWindow(ackSeqNo, p1->GetRecvWS()))
 		return false;
 
-	if(p1->GetFlag<TransactionEnded>())
-		OnGetEOT();
-
 	n = offset - be16toh(pSNACK->hs.hsp) - sizeof(FSP_SelectiveNACK);
 	if (n < 0 || n % sizeof(FSP_SelectiveNACK::GapDescriptor) != 0)
 	{
@@ -601,9 +598,11 @@ void CSocketItemEx::OnConnectRequestAck(PktBufferBlock *pktBuf, int lenData)
 	skb->len = lenData;
 	if(lenData > 0)
 		memcpy(ubuf, (BYTE *) & response + sizeof(response), lenData);
-	skb->SetFlag<IS_FULFILLED>();	// See also PlacePayload()
+	// Built-in rule: ACK_CONNECT_REQ is always a singleton transmit transaction
+	skb->InitFlags<TransactionEnded>();	// See also PlacePayload()
+	skb->ReInitMarkComplete();
 
-	// the officially annouced IP address of the responder shall be accepted by the initiator
+	// the officially announced IP address of the responder shall be accepted by the initiator
 	// assert(response.params.subnets >= sizeof(sizeof(par->allowedPrefixes));
 	SConnectParam * par = &pControlBlock->connectParams;
 	memset(par->allowedPrefixes, 0, sizeof(par->allowedPrefixes));
@@ -626,7 +625,9 @@ l_return:
 
 
 
-// ACK_START is the acknowledgement to ACK_CONNECT_REQ or MULTIPLY, and/or start a new transmit transaction
+// ACK_START is supposed to both start and commit a payloadless transmit transaction which SHALL be skipped
+// It is the in-band acknowledgement to ACK_CONNECT_REQ or MULTIPLY
+// It cannot be substituted by ACK_FLUSH which is out-of-band
 //	CHALLENGING-->/ACK_START/-->CLOSABLE-->[Send ACK_FLUSH]-->[Notify]
 //	PEER_COMMIT-->/ACK_START/-->[Send ACK_FLUSH]
 //	CLOSABLE-->/ACK_START/-->{keep state}[Send ACK_FLUSH]
@@ -698,11 +699,10 @@ void CSocketItemEx::OnGetAckStart()
 #if (TRACE & (TRACE_SLIDEWIN | TRACE_HEARTBEAT))
 	printf_s("\nACK_START received, acknowledged SN = %u\n\tThe responder calculate RTT: %uus\n", ackSeqNo, tRoundTrip_us);
 #endif
-
 	if (isMultiplying)
 	{
-		StopKeepAlive();
 		SetState(_InterlockedExchange8(&shouldAppendCommit, 0) ? CLOSABLE : PEER_COMMIT);
+		StopKeepAlive();
 		SignalFirstEvent(FSP_NotifyMultiplied);
 	}
 	else // if (lowState == CHALLENGING)
@@ -827,7 +827,9 @@ void CSocketItemEx::OnGetPersist()
 		return;
 #endif
 
+	// Note that TransitOnPeerCommit may SendAckFlush which relies on correctness of tLastRecv
 	bool committed = HasBeenCommitted();
+	tLastRecv = NowUTC();
 	if(committed)
 	{
 		TransitOnPeerCommit();
@@ -867,17 +869,12 @@ void CSocketItemEx::OnGetPersist()
 	if (isInitiativeState)
 	{
 		pControlBlock->SlideSendWindowByOne();	// See also RespondToSNACK
-		tLastRecv = NowUTC();
 		tRoundTrip_us = (uint32_t)min(UINT32_MAX, tLastRecv - tRecentSend);
 #if (TRACE & (TRACE_SLIDEWIN | TRACE_HEARTBEAT))
 		printf_s("\nPERSIST received, acknowledged SN = %u\n\tThe responder calculate RTT: %uus\n", ackSeqNo, tRoundTrip_us);
 #endif
 	}
 
-#if defined(TRACE) && (TRACE & TRACE_PACKET)
-	if (countPlaced > 0)
-		printf_s("There is optional payload in the PERSIST packet, payload length = %d\n", countPlaced);
-#endif
 	if (isMultiplying)
 		SignalFirstEvent(FSP_NotifyMultiplied);
 	else if (isInitiativeState)
@@ -893,8 +890,6 @@ void CSocketItemEx::OnGetPersist()
 // KEEP_ALIVE is out-of-band and may carry a special optional header for multi-homed mobility support
 //	{ACTIVE, COMMITTING, PEER_COMMIT, COMMITTING2}-->/KEEP_ALIVE/<-->{keep state}[Notify]
 //	{COMMITTED, CLOSABLE, PRE_CLOSED}-->/KEEP_ALIVE/<-->{keep state}{Update Peer's Authorized Addresses}
-// Remark
-//	KEEP_ALIVE may carry out-of-band EoT flag. See also ValidateSNACK
 void CSocketItemEx::OnGetKeepAlive()
 {
 #if defined(TRACE) && (TRACE & (TRACE_HEARTBEAT | TRACE_PACKET | TRACE_SLIDEWIN))
@@ -917,15 +912,17 @@ void CSocketItemEx::OnGetKeepAlive()
 #if (TRACE & (TRACE_HEARTBEAT | TRACE_PACKET | TRACE_SLIDEWIN))
 	printf_s("Fiber#%u: SNACK packet with %d gap(s) advertised received\n", fidPair.source, n);
 #endif
+	// It urges ULA to put more data only when the send buffer is thoroughly empty
+	// By default ULA should poll the send buffer, instead to rely on soft-interrupt
 	if (acknowledgible)
 	{
 		ControlBlock::seq_t seq0 = pControlBlock->sendWindowFirstSN;
 		int r = RespondToSNACK(ackSeqNo, gaps, n);
-		if (r > 0 && pControlBlock->sendWindowFirstSN != seq0)
+		if (r > 0 && pControlBlock->CountSendBuffered() == 0)
 			Notify(FSP_NotifyBufferReady);
-#ifdef TRACE
+#ifndef NDEBUG
 		else if (r < 0)
-			printf_s("RespondToSNACK unexpectedly return %d\n", r);
+			printf_s(__FUNCDNAME__ "RespondToSNACK unexpectedly return %d\n", r);
 #endif		// UNRESOLVED?! Should log this very unexpected case
 	}
 
@@ -1003,22 +1000,14 @@ void CSocketItemEx::OnGetPureData()
 		AddLazyAckTimer();
 		return;
 	}
-#if defined(_DEBUG) && defined(TRACE)
-	if(r == 0)
-	{
-		printf_s("Either a PURE_DATA does not carry payload or the payload it is not stored safely\n");
-		return;
-	}
+	// If r == 0 the EoT flag MUST be set. But we put such check at DLL level
 	if(r < 0)
 	{
+#ifndef NDEBUG
 		printf_s("Fatal error when place payload, error number = %d\n", r);
+#endif
 		return;
 	}
-#else
-	// r == 0 || r == -ENOENT, shall not occur in a stable implementation
-	if(r <= 0)
-		return;
-#endif
 
 	tLastRecv = NowUTC();
 	// State transition signaled to DLL CSocketItemDl::WaitEventToDispatch()
@@ -1027,61 +1016,16 @@ void CSocketItemEx::OnGetPureData()
 		TransitOnPeerCommit();
 		Notify(FSP_NotifyToCommit);
 	}
-	// PURE_DATA cannot start a transmit transaction, so in state like CLONING just prebuffer
-	else if(! InStates(4, CLONING, PEER_COMMIT, COMMITTING2, CLOSABLE))
+	else
 	{
-		_InterlockedExchange((LONG *)&savedCountDeliverable, pControlBlock->CountDeliverable());
-		if (savedCountDeliverable > 0)
+		// PURE_DATA cannot start a transmit transaction, so in state like CLONING just prebuffer
+		if (!InStates(4, CLONING, PEER_COMMIT, COMMITTING2, CLOSABLE))
+			AddLazyAckTimer();
+		// Normally the ULA work in polling mode. Urge it to process the receive buffer if the buffer is full
+		if (pControlBlock->CountDeliverable() == pControlBlock->recvBufferBlockN)
 			Notify(FSP_NotifyDataReady);
-		//
-		AddLazyAckTimer();
 	}
 	// See also OnGetPersist()
-}
-
-
-
-// On
-//	getting the set End of Transaction flag piggybacked on the KEEP_ALIVE or ACK_FLUSH packet
-// Do
-//	 some state migration
-// Remark
-//	Take snapshot of the right edge of the receive window for sake of possibly synchronizing new session key
-void CSocketItemEx::OnGetEOT()
-{
-	// As the EoT flag is piggybacked only if the last packet of the transmit transaction has been sent
-	// the last packet of the receive buffer is need to be checked
-	if(headPacket->pktSeqNo != pControlBlock->recvWindowNextSN - 1)
-		return;
-
-	// See also ControlBlock::AllocRecvBuf
-	ControlBlock::PFSP_SocketBuf skb = pControlBlock->recvWindowNextPos <= 0
-		? pControlBlock->HeadRecv() + pControlBlock->recvWindowNextPos - 1
-		: pControlBlock->HeadRecv() + pControlBlock->recvBufferBlockN - 1;
-
-	// Unnecessary EOT is simply ignored
-	if(skb->opCode == _COMMIT || skb->GetFlag<TransactionEnded>())
-		return;
-
-	// but maynot change the opCode as it is mark of delivery
-	if(skb->opCode != 0)
-	{
-		skb->SetFlag<TransactionEnded>();
-		skb->opCode = _COMMIT;
-		if(! pControlBlock->HasBeenCommitted())
-			return;
-	}
-	// if(skb->opCode == 0) every packet has been delivered. EOT make it committed
-	// slightly different against CSocketItemEx::HasBeenCommitted
-	pControlBlock->SnapshotReceiveWindowRightEdge();
-#if (TRACE & TRACE_OUTBAND)
-	printf_s("\nEoT got, transit from state %s to ", stateNames[lowState]);
-#endif
-	TransitOnPeerCommit();
-#if (TRACE & TRACE_OUTBAND)
-	printf_s("%s\n", stateNames[lowState]);
-#endif
-	Notify(FSP_NotifyToCommit);
 }
 
 
@@ -1107,8 +1051,8 @@ void CSocketItemEx::TransitOnPeerCommit()
 		StopKeepAlive();
 		break;
 	case CLONING:
-		StopKeepAlive();
 		SetState(_InterlockedExchange8(&shouldAppendCommit, 0) ? CLOSABLE : PEER_COMMIT);
+		StopKeepAlive();
 		break;
 		// default:	// case PEER_COMMIT: case COMMITTING2: case CLOSABLE:	// keep state
 	}
@@ -1120,11 +1064,8 @@ void CSocketItemEx::TransitOnPeerCommit()
 // ACK_FLUSH, now a pure out-of-band control packet. A special norm of KEEP_ALIVE
 //	COMMITTING-->/ACK_FLUSH/-->COMMITTED-->[Notify]
 //	COMMITTING2-->/ACK_FLUSH/-->{stop keep-alive}CLOSABLE-->[Notify]
-// Remark
-//	Like KEEP_ALIVE, ACK_FLUSH may carry out-of-band EoT flag. See also OnGetEOT
 void CSocketItemEx::OnAckFlush()
 {
-	// As ACK_FLUSH is rare we trace every appearance
 	TRACE_SOCKET();
 
 	if (!InState(COMMITTING) && !InState(COMMITTING2))
@@ -1142,7 +1083,6 @@ void CSocketItemEx::OnAckFlush()
 		return;
 	}
 #endif
-	_InterlockedExchange8(& shouldAppendCommit, 0);	// might be redundant, but it do little harm
 
 	if (InState(COMMITTING2))
 	{
@@ -1313,7 +1253,7 @@ void CSocketItemEx::OnGetMultiply()
 	// Be free to accept: we accept an imcomplete MULTIPLY
 	if(headPacket->lenData != MAX_BLOCK_SIZE)
 		skb->SetFlag<TransactionEnded>();
-	skb->SetFlag<IS_FULFILLED>();
+	skb->ReInitMarkComplete();
 	//^See also PlacePayload
 
 	// The first packet received is in the parent's session key while
@@ -1365,7 +1305,7 @@ int CSocketItemEx::PlacePayload()
 	if (!CheckMemoryBorder(skb))
 		return -EFAULT;
 
-	if (skb->GetFlag<IS_FULFILLED>())
+	if (skb->IsComplete())
 		return -EEXIST;
 
 	FSP_NormalPacketHeader *pHdr = headPacket->GetHeaderFSP();
@@ -1376,18 +1316,13 @@ int CSocketItemEx::PlacePayload()
 			return -EFAULT;
 		//
 		memcpy(ubuf, (BYTE *)pHdr + be16toh(pHdr->hs.hsp), headPacket->lenData);
-		skb->CopyInFlags(pHdr);
 	}
 	skb->version = pHdr->hs.major;
-	// Force the last packet descriptor of the transaction in the receive buffer to be _COMMIT.
-	// See also Check HasBeenCommitted()
-	skb->opCode = skb->GetFlag<TransactionEnded>() ? _COMMIT : pHdr->hs.opCode;
+	skb->opCode = pHdr->hs.opCode;
+	skb->CopyInFlags(pHdr);
 	skb->len = headPacket->lenData;
 	skb->timeRecv = NowUTC();
-	skb->SetFlag<IS_FULFILLED>();
-
-	// This is a fresh packet that filling the gap, so it can be suppressed active KEEP_ALIVE to adverise receive window
-	savedCountDeliverable = pControlBlock->CountDeliverable();
+	skb->ReInitMarkComplete();
 
 	return headPacket->lenData;	// Might be zero for PERSIST or MULTIPLY packet
 }

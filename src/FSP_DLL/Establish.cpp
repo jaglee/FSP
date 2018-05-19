@@ -338,7 +338,6 @@ bool LOCALAPI CSocketItemDl::ToWelcomeConnect(BackLogItem & backLog)
 	skb->version = THIS_FSP_VERSION;
 	skb->opCode = ACK_CONNECT_REQ;
 	skb->len = sizeof(TSubnets);	// And the fixed header part is generated on the fly
-	skb->InitFlags();
 	//
 	if(pendingSendBuf != NULL)
 	{
@@ -349,9 +348,8 @@ bool LOCALAPI CSocketItemDl::ToWelcomeConnect(BackLogItem & backLog)
 		pendingSendSize = 0;
 	}
 	// else let ProcessPendingSend eventually transmit the welcome message, if any
-	skb->SetFlag<TransactionEnded>();
-	skb->SetFlag<IS_COMPLETED>();
-	// the packet is still locked
+	skb->InitFlags<TransactionEnded>();
+	skb->ReInitMarkComplete();
 
 	return true;
 }
@@ -404,8 +402,6 @@ void CSocketItemDl::ToConcludeConnect()
 // Return
 //	The pointer to the descriptor of the original header packet, or
 //	NULL if the send queue used to be empty
-// Remark
-//	The payloadless PERSIST/MULTIPLY does NOT necessarily terminate the transmit transaction
 ControlBlock::PFSP_SocketBuf LOCALAPI CSocketItemDl::SetHeadPacketIfEmpty(FSPOperationCode c)
 {
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend();
@@ -417,8 +413,8 @@ ControlBlock::PFSP_SocketBuf LOCALAPI CSocketItemDl::SetHeadPacketIfEmpty(FSPOpe
 	skb->version = THIS_FSP_VERSION;
 	skb->opCode = c;
 	skb->len = 0;
-	skb->flags = 0;
-	skb->SetFlag<IS_COMPLETED>();
+	skb->InitFlags<TransactionEnded>();
+	skb->ReInitMarkComplete();
 	return NULL;
 }
 

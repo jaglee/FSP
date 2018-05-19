@@ -1324,7 +1324,7 @@ CommandNewSessionSrv::CommandNewSessionSrv(const CommandToLLS *p1)
 DWORD WINAPI HandleSendQ(LPVOID p0)
 {
 	CSocketItemEx *p = (CSocketItemEx *)p0;
-	if (!p->WaitUseMutex())
+	if (!p->LockWithActiveULA())
 	{
 		BREAK_ON_DEBUG();
 		return 0;
@@ -2031,9 +2031,9 @@ inline void CLowerInterface::OnIPv6AddressMayAdded(NET_IFINDEX ifIndex, const SO
 	InterlockedBitTestAndReset(& disableFlags, i);
 
 	// The code is naive but simple enough to explain itself
-	for (i = 0; i < MAX_CONNECTION_NUM; i++)
+	for (register int i = 0; i < MAX_CONNECTION_NUM; i++)
 	{
-		itemStorage[i].OnLocalAddressChanged();
+		InterlockedExchange8(&itemStorage[i].isNearEndHandedOver, 1);
 	}
 }
 

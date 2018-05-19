@@ -350,20 +350,6 @@ public:
 
 
 
-// Name of the flags for protocol use are in camel-case.
-// The flags for internal buffering are in upper case
-// 0~7 : reserved for protocol use. See also enum FSP_FlagPosition
-enum: uint8_t
-{
-	EXCLUSIVE_LOCK = 8,
-	IS_ACKNOWLEDGED = 9,
-	IS_COMPLETED = 10,
-	IS_SENT = 11,
-	IS_FULFILLED = IS_COMPLETED,// mutual-mirroring flags for send and receive
-};
-
-
-
 class CSocketItem;	// forward declaration for sake of declaring ControlBlock
 
 
@@ -385,7 +371,7 @@ struct ControlBlock
 	//
 	ALFID_T			idParent;
 
-	ALIGN(8)	// 64-bit aligment
+	ALIGN(8)	// 64-bit alignment
 	FSP_NormalPacketHeader tmpHeader;	// for sending; assume sending is single-threaded for a single session
 
 	// 1, 2.
@@ -405,7 +391,7 @@ struct ControlBlock
 	} peerAddr;
 
 	// 3: The negotiated connection parameter
-	ALIGN(8)	// 64-bit aligment, make sure that the session key overlays 'initCheckCode' and 'cookie' only
+	ALIGN(8)	// 64-bit alignment, make sure that the session key overlays 'initCheckCode' and 'cookie' only
 	SConnectParam connectParams;
 
 	// 4: The queue of returned notices
@@ -421,7 +407,7 @@ struct ControlBlock
 	//
 	// (head position, send window first sn), (send window next posistion, send window next sequence nuber)
 	// and (buffer next position, send buffer next sequence number) are managed independently
-	// for maximum parallism in DLL and LLS
+	// for maximum parallelism in DLL and LLS
 	// the send queue is empty when sendWindowFirstSN == sendWindowNextSN
 	seq_t		sendWindowFirstSN;	// left-border of the send window
 	int32_t		sendWindowHeadPos;	// the index number of the block with sendWindowFirstSN
@@ -462,40 +448,28 @@ struct ControlBlock
 		timestamp_t timeRecv;
 		};
 		int32_t		len;
-		uint16_t	flags;
+		char		marks;
+		octet		flags;
 		uint8_t		version;	// should be the same as in the FSP fixed header
 		FSPOperationCode opCode;// should be the same as in the FSP fixed header
 		//
-#if ARCH_BIG_ENDIAN
-		template<uint8_t i>
-		bool SetFlag(bool value = true)
-		{
-			return (value
-				? InterlockedBitTestAndSet((LONG *) & flags, i + 16) 
-				: InterlockedBitTestAndReset((LONG *) & flags, i + 16)
-				) != 0;
-		}
-		template<uint8_t i>
-		bool GetFlag() { return BitTest((LONG *) & flags, i + 16) != 0; }
-#else
-		template<uint8_t i>
-		bool SetFlag(bool value = true)
-		{
-			return (value
-				? InterlockedBitTestAndSet((LONG *) & flags, i) 
-				: InterlockedBitTestAndReset((LONG *) & flags, i)
-				) != 0;
-		}
+		void InitMarkLocked() { InterlockedExchange8(&marks, 1); }
+		void ReInitMarkComplete() { InterlockedExchange8(&marks, 2); }
+		void ResetMarkAcked() { InterlockedExchange8(&marks, 8); }
 		//
-		template<uint8_t i>
-		bool GetFlag() { return BitTest((LONG *) & flags, i) != 0; }
-#endif
-		bool Lock()	{ return ! SetFlag<EXCLUSIVE_LOCK>(); }
-		void Unlock() { SetFlag<EXCLUSIVE_LOCK>(false); }
-		bool TestAndClearBusy() { return SetFlag<IS_FULFILLED>(false);  }
+		bool IsComplete() { return (marks & 2) != 0; }
+		bool IsSent() { return (marks & 4) != 0; }
+		bool IsAcked() { return (marks & 8) != 0; }
 		//
-		void InitFlags() { _InterlockedExchange16((SHORT *) & flags, 1 << EXCLUSIVE_LOCK); }
-		void CopyFlagsTo(FSP_NormalPacketHeader *p) { p->flags_ws[0]  = (uint8_t)flags; }
+		void MarkComplete() { InterlockedOr8(&marks, 2); }
+		void MarkSent() { InterlockedOr8(&marks, 4); }
+		//
+		void ClearFlags() { InterlockedExchange8((char *)&flags, 0); }
+		template<FSP_FlagPosition pos> void InitFlags() { flags = (1 << pos); }
+		template<FSP_FlagPosition pos> void SetFlag() { flags |= (1 << pos); }
+		template<FSP_FlagPosition pos> void ClearFlag() { flags &= ~(1 << pos); }
+		template<FSP_FlagPosition pos> bool GetFlag() { return (flags & (1 << pos)) != 0; }
+		void CopyFlagsTo(FSP_NormalPacketHeader *p) { _InterlockedExchange8((char *)p->flags_ws, flags); }
 		void CopyInFlags(const FSP_NormalPacketHeader *p) { _InterlockedExchange8((char *) & flags, p->flags_ws[0]); }
 	} *PFSP_SocketBuf;
 	//
@@ -558,7 +532,7 @@ struct ControlBlock
 	PFSP_SocketBuf HeadRecv() const { return (PFSP_SocketBuf)((BYTE *)this + recvBufDescriptors); }
 
 	// Return the head packet even if the send queue is empty
-	PFSP_SocketBuf GetSendQueueHead() const { return HeadSend() + sendWindowHeadPos; }
+	PFSP_SocketBuf GetSendQueueHead() { return HeadSend() + sendWindowHeadPos; }
 
 	// Return
 	//	0 if used to be no packet at all
@@ -572,13 +546,10 @@ struct ControlBlock
 	// Allocate a new send buffer
 	PFSP_SocketBuf	GetSendBuf();
 
-	void RoundSendBufferNextPos() { int32_t m = sendBufferNextPos - sendBufferBlockN; if(m >= 0) sendBufferNextPos = m; }
-	void RoundIncrementSendWinNextPos()
-	{
-		register int32_t a = _InterlockedIncrement((LONG *)& sendWindowNextPos) - sendBufferBlockN;
-		if (a >= 0)
-			_InterlockedExchange((LONG *)& sendWindowNextPos, a);
-	}
+	void AddRoundRecvBlockN(int32_t & tgt, int32_t a) { tgt += a; if (tgt >= recvBufferBlockN) tgt -= recvBufferBlockN; }
+	void SubstractRoundRecvBlockN(int32_t & tgt, int32_t d) { tgt -= d; if (tgt < 0) tgt += recvBufferBlockN; }
+
+	void AddRoundSendBlockN(int32_t & tgt, int32_t a) { tgt += a; if (tgt >= sendBufferBlockN) tgt -= sendBufferBlockN; }
 
 	// Given
 	//	FSP_NormalPacketHeader*	the place-holder of sequence number and flags
@@ -611,19 +582,21 @@ struct ControlBlock
 	// Slide the left border of the receive window by one slot
 	void SlideRecvWindowByOne()	// shall be atomic!
 	{
-		if(++recvWindowHeadPos - recvBufferBlockN >= 0)
-			recvWindowHeadPos -= recvBufferBlockN;
-		InterlockedIncrement((LONG *) & recvWindowFirstSN);
+		GetFirstReceived()->ResetMarkAcked();
+		GetFirstReceived()->ClearFlags();
+		InterlockedIncrement((LONG *)& recvWindowFirstSN);
+		AddRoundRecvBlockN(recvWindowHeadPos, 1);
 	}
 
 	void SlideRecvSlotNextTo(seq_t);
 
 	// Given
-	//	int & : [_Out_] place holder of the number of bytes [to be] peeked.
+	//	int32_t & : [_Out_] place holder of the number of bytes [to be] peeked
+	//	int32_t & : [_Out_] place holder of the number of blocks peeked
 	//	bool &: [_Out_] place holder of the End of Transaction flag
 	// Return
 	//	Start address of the received message
-	void * LOCALAPI InquireRecvBuf(int32_t &, bool &);
+	void * LOCALAPI InquireRecvBuf(int32_t &, int32_t &, bool &);
 	// Given
 	//	int :	the number of bytes peeked to be free
 	// Return
@@ -643,19 +616,29 @@ struct ControlBlock
 	}
 
 	// Whether both the End of Transaction flag is received and there is no receiving gap left
-	bool HasBeenCommitted() const;
-
-	// Slide the send window to skip all of the acknowledged
-	void SlideSendWindow();
+	bool HasBeenCommitted();
 
 	// Slide the send window to skip the head slot, supposing that it has been acknowledged
 	void SlideSendWindowByOne()
 	{
+		GetSendQueueHead()->ResetMarkAcked();
+		GetSendQueueHead()->ClearFlags();
+		_InterlockedIncrement((LONG *)& sendWindowFirstSN);
 		register int32_t a = _InterlockedIncrement((LONG *)& sendWindowHeadPos) - sendBufferBlockN;
 		if (a >= 0)
 			sendWindowHeadPos = a;
-		//
-		_InterlockedIncrement((LONG *)& sendWindowFirstSN);
+	}
+
+	// Slide the left border of the send window and mark the acknowledged buffer block free
+	void ControlBlock::SlideSendWindow()
+	{
+		while (CountSentInFlight() > 0)
+		{
+			register PFSP_SocketBuf p = GetSendQueueHead();
+			if (! p->IsAcked())
+				break;
+			SlideSendWindowByOne();
+		}
 	}
 
 	// Set the right edge of the send window after the very first packet of the queue is sent
@@ -663,7 +646,7 @@ struct ControlBlock
 	{
 		seq_t k = sendWindowFirstSN;
 		if (_InterlockedCompareExchange((LONG *)& sendWindowNextSN, k + 1, k) == k)
-			RoundIncrementSendWinNextPos();
+			AddRoundSendBlockN(sendWindowNextPos, 1);
 	}
 	//
 	bool LOCALAPI ResizeSendWindow(seq_t, unsigned int);

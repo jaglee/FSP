@@ -78,7 +78,7 @@ FSPHANDLE FSPAPI MultiplyAndWrite(FSPHANDLE hFSP, PFSP_Context psp1, int8_t flag
 //	the handle of the new created socket
 //	or NULL if there is some immediate error, more information may be got from the flags set in the context parameter
 // remark
-//	The MULTIPLY request is sent to the remote peer only when following SendInPlace was called
+//	The MULTIPLY request is sent to the remote peer only when following SendInplace was called
 //	The handle returned might be useless, if CallbackConnected report error laterly
 //	the capacity of immediately available buffer (might be 0) is outputted in the reference
 //	As it is in CLONING state if onBufferReady is specified, it would be called but data would just be prebuffered
@@ -195,7 +195,7 @@ FSPHANDLE CSocketItemDl::CompleteMultiply(CommandCloneConnect & cmd)
 	if(skb != NULL)
 	{
 		skb->opCode = MULTIPLY;
-		skb->SetFlag<IS_COMPLETED>();
+		skb->MarkComplete();
 	}
 	// See also InitCommand, CallCreate
 	cmd.fiberID = pControlBlock->idParent;

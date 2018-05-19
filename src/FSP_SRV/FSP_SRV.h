@@ -42,13 +42,13 @@
 #include "gcm-aes.h"
 
 #pragma intrinsic(_InterlockedCompareExchange, _InterlockedCompareExchange8)
-#pragma intrinsic(_InterlockedExchange, _InterlockedExchange16, _InterlockedExchange8)
+#pragma intrinsic(_InterlockedExchange, _InterlockedExchange8)
 #pragma intrinsic(_InterlockedIncrement, _InterlockedOr, _InterlockedOr8)
 
 #define COOKIE_KEY_LEN			20	// salt include, as in RFC4543 5.4
 #define MULTIPLY_BACKLOG_SIZE	8
 
- // For testability
+// For testability
 #define TRACE_ADDRESS	1
 #define TRACE_HEARTBEAT	2
 #define TRACE_PACKET	4
@@ -57,7 +57,7 @@
 #define TRACE_OUTBAND	32	// Other than KEEP_ALIVE
 
 
- // random generatator is somehow dependent on implementation. hardware prefered.
+ // random generator is somehow dependent on implementation. hardware preferred.
  // might be optimized by loop unrolling
 static inline
 void rand_w32(uint32_t *p, int n) { for (register int i = 0; i < min(n, 32); i++) { rand_s(p + i); } }
@@ -95,6 +95,7 @@ struct FSP_PreparedKEEP_ALIVE
 	uint32_t		n;	// n >= 0, number of (gapWidth, dataLength) tuples
 	uint32_t		GetSaltValue() const { return gaps[n].gapWidth; }	// it overlays on serialNo
 };
+
 
 
 #if _WIN32_WINNT < 0x0602
@@ -359,10 +360,19 @@ class CSocketItemEx: public CSocketItem
 	//
 	bool IsProcessAlive();
 	//
+	struct SKeepAliveCache
+	{
+		FSP_NormalPacketHeader	hdr;
+		FSP_ConnectParam		mp;
+		FSP_PreparedKEEP_ALIVE	snack;
+		void SetHostID(PSOCKADDR_IN6 ipi6) { mp.idListener = SOCKADDR_HOSTID(ipi6); }
+	} keepAliveCache;
+
 protected:
 	PktBufferBlock * headPacket;	// But UNRESOLVED! There used to be an independent packet queue for each SCB for sake of fairness
 	TSubnets	savedPathsToNearEnd;
-	int32_t		savedCountDeliverable;
+	TSubnets	newPathsToNearEnd;
+	char		isNearEndHandedOver;
 	char		mobileNoticeInFlight;
 	//
 	ICC_Context	contextOfICC;
@@ -541,8 +551,6 @@ public:
 	bool ValidateICC() { return ValidateICC(headPacket->GetHeaderFSP(), headPacket->lenData, fidPair.peer, 0); }
 
 	bool LOCALAPI ValidateSNACK(ControlBlock::seq_t &, FSP_SelectiveNACK::GapDescriptor * &, int &);
-	// On near end's IPv6 address changed automatically send an out-of-sync KEEP_ALIVE
-	void OnLocalAddressChanged();
 	// Register source IPv6 address of a validated received packet as the favorite returning IP address
 	inline void ChangeRemoteValidatedIP();
 	// Check whether previous KEEP_ALIVE is implicitly acknowledged on gettting a validated packet
@@ -574,7 +582,6 @@ public:
 	void OnGetAckStart();
 	void OnGetPersist();
 	void OnGetPureData();	// PURE_DATA
-	void OnGetEOT();		// Used to be a standalone COMMIT packet, now the EoT flag
 	void OnAckFlush();		// ACK_FLUSH is always out-of-band
 	void OnGetRelease();	// RELEASE may not carry payload
 	void OnGetMultiply();	// MULTIPLY is in-band at the initiative side, out-of-band at the passive side

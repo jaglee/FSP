@@ -20,6 +20,9 @@ public:
 		// isMilky = 0;	// RespondToSNACK cares it
 		hMemoryMap = NULL;
 		hEvent = NULL;
+		tRoundTrip_us = 0;
+		tKeepAlive_ms = 0;
+		tLazyAck_us = 0;
 		pControlBlock = (ControlBlock *)malloc
 			(sizeof(ControlBlock) + (sizeof(ControlBlock::FSP_SocketBuf) + MAX_BLOCK_SIZE) * (nSend + nRecv));
 		//

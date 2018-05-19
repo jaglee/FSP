@@ -21,6 +21,7 @@ void FlowTestAcknowledge()
 
 	pSCB->welcomedNextSNtoSend = pSCB->sendWindowFirstSN = FIRST_SN;
 	pSCB->sendBufferNextSN = pSCB->sendWindowNextSN = FIRST_SN + 1;
+	pSCB->sendWindowLimitSN = FIRST_SN + MAX_BLOCK_NUM;
 	// Pretend that the first packet has been sent and is waiting acknowledgement...
 	int r = socket.RespondToSNACK(FIRST_SN + 1, NULL, 0);
 	assert(r == 1 && pSCB->sendBufferNextSN == pSCB->sendWindowFirstSN);
@@ -28,18 +29,16 @@ void FlowTestAcknowledge()
 	assert(pSCB->sendWindowNextSN == FIRST_SN + 1);
 
 	pSCB->SetSendWindow(FIRST_SN);
+	pSCB->sendWindowLimitSN = FIRST_SN + MAX_BLOCK_NUM;	// don't let size of send window limit the test
 	ControlBlock::PFSP_SocketBuf skb = pSCB->GetSendBuf();
 	//Assert::IsNotNull(skb);
 	assert(pSCB->sendBufferNextSN == FIRST_SN + 1);
-	skb->SetFlag<IS_COMPLETED>();
-	skb->Lock();
+	skb->ReInitMarkComplete();
 
 	skb = pSCB->GetSendBuf();
-	skb->SetFlag<IS_COMPLETED>();
-	skb->Lock();
+	skb->ReInitMarkComplete();
 	pSCB->GetSendBuf();
-	skb->SetFlag<IS_COMPLETED>();
-	skb->Lock();
+	skb->ReInitMarkComplete();
 	assert(pSCB->sendBufferNextSN == FIRST_SN + 3);
 
 	// A NULL acknowledgement, Keep-Alive
@@ -48,7 +47,6 @@ void FlowTestAcknowledge()
 
 	// emulate sending, assume 3 packets sent
 	pSCB->sendWindowNextSN += 3;
-	pSCB->sendWindowLimitSN = FIRST_SN + MAX_BLOCK_NUM;	// don't let size of send window limit the test
 	assert(pSCB->sendWindowNextSN == FIRST_SN + 3);
 
 	// acknowledge the first two
@@ -61,8 +59,7 @@ void FlowTestAcknowledge()
 	{
 		skb = pSCB->GetSendBuf();
 		assert(skb != NULL);
-		skb->SetFlag<IS_COMPLETED>();
-		skb->Lock();
+		skb->ReInitMarkComplete();
 	}
 	pSCB->sendWindowNextSN += MAX_BLOCK_NUM - 3;
 	assert(pSCB->sendWindowNextSN == FIRST_SN + MAX_BLOCK_NUM);
@@ -70,9 +67,9 @@ void FlowTestAcknowledge()
 	// All buffer blocks should have been consumed after the two acknowledged have been allocated
 	// [however, sendWindowSize is not reduced yet]
 	skb = pSCB->GetSendBuf();	// the two acknowledged
-	skb->SetFlag<IS_COMPLETED>();
+	skb->MarkComplete();
 	skb = pSCB->GetSendBuf();
-	skb->SetFlag<IS_COMPLETED>();
+	skb->MarkComplete();
 	skb = pSCB->GetSendBuf();	// no space in the send buffer.
 	assert(skb == NULL);
 
@@ -140,10 +137,10 @@ void FlowTestAcknowledge()
 		skb = pSCB->GetSendBuf();
 		if(skb == NULL)
 			break;
-		skb->SetFlag<IS_COMPLETED>();
-		skb->Lock();
+		skb->ReInitMarkComplete();
 	}
 	pSCB->sendWindowNextSN += 0x10000;	// queuing to send is not the same as sending
+	pSCB->sendWindowLimitSN = pSCB->sendWindowNextSN + MAX_BLOCK_NUM;
 
 	// an even larger continuous data segment is acknowledged
 	gaps[0].dataLength = htobe32(1);
@@ -180,19 +177,19 @@ void PrepareFlowTestResend(CSocketItemExDbg & dbgSocket, PControlBlock & pSCB)
 
 	pSCB->SetSendWindow(FIRST_SN);
 	ControlBlock::PFSP_SocketBuf skb = pSCB->GetSendBuf();
-	skb->SetFlag<IS_COMPLETED>();
+	skb->MarkComplete();
 	assert(pSCB->sendBufferNextSN == FIRST_SN + 1);
 
 	skb = pSCB->GetSendBuf();
-	skb->SetFlag<IS_COMPLETED>();
+	skb->MarkComplete();
 	assert(pSCB->sendBufferNextSN == FIRST_SN + 2);
 
 	skb = pSCB->GetSendBuf();
-	skb->SetFlag<IS_COMPLETED>();
+	skb->MarkComplete();
 	assert(pSCB->sendBufferNextSN == FIRST_SN + 3);
 
 	skb = pSCB->GetSendBuf();
-	skb->SetFlag<IS_COMPLETED>();
+	skb->MarkComplete();
 	assert(pSCB->sendBufferNextSN == FIRST_SN + 4);
 
 	skb = pSCB->GetSendBuf();
@@ -211,20 +208,20 @@ void PrepareFlowTestResend(CSocketItemExDbg & dbgSocket, PControlBlock & pSCB)
 	// emulate received the first data packet
 	ControlBlock::PFSP_SocketBuf skb5 = pSCB->AllocRecvBuf(FIRST_SN);
 	assert(skb5 != NULL);
-	skb5->SetFlag<IS_FULFILLED>();
+	skb5->MarkComplete();
 
 	// emulate a received message that crosses two packet
 	skb5 = pSCB->AllocRecvBuf(FIRST_SN + 1);
 	assert(skb5 != NULL);
 	assert(pSCB->recvWindowNextSN == FIRST_SN + 2);
 
-	skb5->SetFlag<IS_FULFILLED>();
+	skb5->MarkComplete();
 
 	skb5 = pSCB->AllocRecvBuf(FIRST_SN + 3);
 	assert(skb5 != NULL);
 	assert(pSCB->recvWindowNextSN == FIRST_SN + 4);
 
-	skb5->SetFlag<IS_FULFILLED>();
+	skb5->MarkComplete();
 
 	skb5 = pSCB->AllocRecvBuf(FIRST_SN + 4);
 	assert(skb5 == NULL);	// No more space in the receive buffer
@@ -297,7 +294,7 @@ void FlowTestRetransmission()
 	ControlBlock::PFSP_SocketBuf skb = pSCB->HeadSend();
 	assert(skb->flags == 0);	// GetFlag<IS_ACKNOWLEDGED>()
 	assert((skb + 1)->flags == 0);	// GetFlag<IS_ACKNOWLEDGED>()
-	assert((skb + 3)->GetFlag<IS_ACKNOWLEDGED>());
+	assert((skb + 3)->IsAcked());
 	assert(dbgSocket.GetControlBlock()->sendWindowFirstSN == FIRST_SN + 2);
 
 	//
@@ -305,12 +302,12 @@ void FlowTestRetransmission()
 	//
 	skb = pSCB->GetSendBuf();
 	assert(skb != NULL);
-	skb->SetFlag<IS_COMPLETED>();
+	skb->MarkComplete();
 	assert(pSCB->sendBufferNextSN == FIRST_SN + 5);
 
 	skb = pSCB->GetSendBuf();
 	assert(skb != NULL);
-	skb->SetFlag<IS_COMPLETED>();
+	skb->MarkComplete();
 	assert(pSCB->sendBufferNextSN == FIRST_SN + 6);
 
 	// the receive window is slided
@@ -320,11 +317,11 @@ void FlowTestRetransmission()
 	// further receiving
 	skb = pSCB->AllocRecvBuf(FIRST_SN + 4);
 	assert(skb != NULL);
-	skb->SetFlag<IS_FULFILLED>();
+	skb->MarkComplete();
 
 	skb = pSCB->AllocRecvBuf(FIRST_SN + 5);
 	assert(skb != NULL);
-	skb->SetFlag<IS_FULFILLED>();
+	skb->MarkComplete();
 
 	skb = pSCB->AllocRecvBuf(FIRST_SN + 6);
 	assert(skb == NULL);
@@ -360,7 +357,7 @@ void FlowTestRecvWinRoundRobin()
 	// The send buffer space is fulfilled, while the third receive buffer block is free
 	PrepareFlowTestResend(dbgSocket, pSCB);
 
-	int32_t m;
+	int32_t m, n;
 	void * buf = pSCB->InquireSendBuf(& m);
 	// should be NULL, 0
 	printf_s("InquireSendBuf: buf = %p, size = %d\n", buf, m);
@@ -382,57 +379,112 @@ void FlowTestRecvWinRoundRobin()
 
 	// but eot? don't care it yet.
 	bool eot;
-	buf = pSCB->InquireRecvBuf(m, eot);
+	buf = pSCB->InquireRecvBuf(m, n, eot);
 	printf_s("Should return the first two blocks:\n"
-		"InquireRecvBuf#1, buf = %p, size = %d, eot = %d\n", buf, m, eot);
-
-	if (m > 0)
-		pSCB->MarkReceivedFree(m);
+		"InquireRecvBuf#1, buf = %p, size = %d, blocks = %d, eot = %d\n", buf, m, n, eot);
+	pSCB->MarkReceivedFree(n);
 
 	skb = pSCB->AllocRecvBuf(FIRST_SN + 2);	// used to be free
 	assert(skb != NULL);
 	skb->opCode = PURE_DATA;
 	skb->len = MAX_BLOCK_SIZE;
-	skb->SetFlag<IS_FULFILLED>();
+	skb->MarkComplete();
 
 	// Round-robin allocation
 	skb = pSCB->AllocRecvBuf(FIRST_SN + 4);
 	assert(skb != NULL);
 	skb->opCode = PURE_DATA;
 	skb->len = MAX_BLOCK_SIZE;
-	skb->SetFlag<IS_FULFILLED>();
+	skb->MarkComplete();
 
 	skb = pSCB->AllocRecvBuf(FIRST_SN + 5);
 	assert(skb != NULL);
 	skb->opCode = PURE_DATA;
 	skb->len = MAX_BLOCK_SIZE;
-	skb->SetFlag<IS_FULFILLED>();
+	skb->MarkComplete();
 
-	buf = pSCB->InquireRecvBuf(m, eot);
+	buf = pSCB->InquireRecvBuf(m, n, eot);
 	printf_s("Should return the last two blocks:\n"
-		"InquireRecvBuf#3, buf = %p, size = %d, eot = %d\n", buf, m, eot);
-
-	if (m > 0)
-		pSCB->MarkReceivedFree(m);
+		"InquireRecvBuf#3, buf = %p, size = %d, blocks = %d, eot = %d\n", buf, m, n, eot);
+	pSCB->MarkReceivedFree(n);
 
 	skb = pSCB->AllocRecvBuf(FIRST_SN + 6);
 	skb->opCode = PURE_DATA;
 	skb->len = MAX_BLOCK_SIZE;
-	skb->SetFlag<IS_FULFILLED>();
+	skb->MarkComplete();
 
 	skb = pSCB->AllocRecvBuf(FIRST_SN + 7);
 	skb->opCode = PURE_DATA;
 	skb->len = MAX_BLOCK_SIZE;
-	skb->SetFlag<IS_FULFILLED>();
+	skb->MarkComplete();
 
 	skb = pSCB->AllocRecvBuf(FIRST_SN + 8);
 	assert(skb == NULL);
 
-	buf = pSCB->InquireRecvBuf(m, eot);
+	buf = pSCB->InquireRecvBuf(m, n, eot);
 	printf_s("Should round-robin to the start, return the whole buffer space:\n"
-		"InquireRecvBuf, #4, buf = %p, size = %d, eot = %d\n", buf, m, eot);
+		"InquireRecvBuf - buf = %p, size = %d, blocks = %d, eot = %d\n", buf, m, n, eot);
+	pSCB->MarkReceivedFree(n);
 
-	if (m > 0)
-		pSCB->MarkReceivedFree(m);
-	//TODO: more test, now EOT should be taken into care of
+	skb = pSCB->AllocRecvBuf(FIRST_SN + 8);
+	skb->opCode = PURE_DATA;
+	skb->len = MAX_BLOCK_SIZE - 2;
+	skb->SetFlag<TransactionEnded>();
+	skb->MarkComplete();
+
+	skb = pSCB->AllocRecvBuf(FIRST_SN + 9);
+	skb->opCode = PURE_DATA;
+	skb->len = MAX_BLOCK_SIZE;
+	skb->MarkComplete();
+
+	skb = pSCB->AllocRecvBuf(FIRST_SN + 10);
+	skb->opCode = PURE_DATA;
+	skb->len = MAX_BLOCK_SIZE;
+	skb->MarkComplete();
+
+	buf = pSCB->InquireRecvBuf(m, n, eot);
+	printf_s("Should return the first block, with eot flag set:\n"
+		"InquireRecvBuf - buf = %p, size = %d, blocks = %d, eot = %d\n", buf, m, n, eot);
+	pSCB->MarkReceivedFree(n);
+
+	skb = pSCB->AllocRecvBuf(FIRST_SN + 11);
+	skb->opCode = PURE_DATA;
+	skb->len = MAX_BLOCK_SIZE;
+	skb->MarkComplete();
+
+	// This block round-robin
+	skb = pSCB->AllocRecvBuf(FIRST_SN + 12);
+	assert(skb != NULL);
+	skb->opCode = PURE_DATA;
+	skb->len = MAX_BLOCK_SIZE;
+	skb->MarkComplete();
+
+	buf = pSCB->InquireRecvBuf(m, n, eot);
+	printf_s("Should return the 2nd, 3rd and 4th blocks:\n"
+		"InquireRecvBuf - buf = %p, size = %d, blocks = %d, eot = %d\n", buf, m, n, eot);
+	pSCB->MarkReceivedFree(n);
+
+	buf = pSCB->InquireRecvBuf(m, n, eot);
+	printf_s("Should round-robin to the 1st block again:\n"
+		"InquireRecvBuf - buf = %p, size = %d, blocks = %d, eot = %d\n", buf, m, n, eot);
+	pSCB->MarkReceivedFree(n);
+
+	// Rare but possible case of a fulfilled payload with a payload-less EoT
+	skb = pSCB->AllocRecvBuf(FIRST_SN + 13);
+	assert(skb != NULL);
+	skb->opCode = PURE_DATA;
+	skb->len = MAX_BLOCK_SIZE;
+	skb->MarkComplete();
+
+	skb = pSCB->AllocRecvBuf(FIRST_SN + 14);
+	assert(skb != NULL);
+	skb->opCode = PURE_DATA;
+	skb->len = 0;
+	skb->SetFlag<TransactionEnded>();
+	skb->MarkComplete();
+
+	buf = pSCB->InquireRecvBuf(m, n, eot);
+	printf_s("Should round-robin to the 2nd and 3rd blocks:\n"
+		"InquireRecvBuf - buf = %p, size = %d, blocks = %d, eot = %d\n", buf, m, n, eot);
+	pSCB->MarkReceivedFree(n);
 }

@@ -67,14 +67,20 @@ void UnitTestBufferData()
 			printf_s("Short#%d differs\n", i);
 	}
 
+	assert(pSocketItem->skbImcompleteToSend != NULL);	// the last packet is incomplete)
 	// Now, reset, but this time the head packet is set
 	pSCB->SetSendWindow(FIRST_SN);
+	skb = pSocketItem->SetHeadPacketIfEmpty(ACK_START);
+	assert(skb == NULL);	// The queue IS empty
+	pSocketItem->newTransaction = 1;
 	pSocketItem->SetEndTransaction();
-	pSocketItem->SetHeadPacketIfEmpty(PERSIST);
+	pSocketItem->skbImcompleteToSend = NULL;
 
 	// now, there was no enough buffer and the data were partly buffered
 	pSocketItem->pendingSendBuf = preparedTestData;
 	r = pSocketItem->BufferData(MIN_RESERVED_BUF - 2);
+	skb = pSocketItem->SetHeadPacketIfEmpty(ACK_START);
+	assert(skb != NULL);	// The queue is not empty
 	printf_s("%d packets completed, %d octets remains\n", r, pSocketItem->pendingSendSize);
 	printf_s("Buffer next SN = %u\n", pSCB->sendBufferNextSN);
 	assert(pSCB->sendBufferNextSN == FIRST_SN + MIN_RESERVED_BUF / MAX_BLOCK_SIZE);
@@ -116,7 +122,6 @@ void UnitTestBufferData()
 	//
 	// But a payload less PERSIST is treated specially: it may carry no compressed flag
 	pSCB->SetSendWindow(FIRST_SN);
-	pSocketItem->SetHeadPacketIfEmpty(PERSIST);
 	bool successful = pSocketItem->AllocStreamState();
 	assert(successful);
 
@@ -127,6 +132,7 @@ void UnitTestBufferData()
 	}
 
 	pSocketItem->pendingSendBuf = preparedTestData;
+	pSocketItem->newTransaction = 1;
 	pSocketItem->SetEndTransaction();
 	pSocketItem->bytesBuffered = 0;
 	r = pSocketItem->BufferData(MIN_RESERVED_BUF - 2);
@@ -411,7 +417,7 @@ void UnitTestFetchReceived()
 	{
 		skb->len = MAX_BLOCK_SIZE;
 		skb->opCode = PURE_DATA;
-		skb->SetFlag<IS_FULFILLED>();
+		skb->MarkComplete();
 	}
 	// pSCB->recvWindowNextSN == pSCB->recvWindowFirstSN + pSCB->recvBufferBlockN;
 	// And pSCB->recvWindowNextPos is rounded
@@ -731,18 +737,16 @@ void UnitTestCompressAndDecode()
 
 int _tmain(int argc, _TCHAR* argv[])
 {
-	//FUZ_unitTests();
+	FUZ_unitTests();
 	UnitTestCompressAndDecode();
 
-	//UnitTestCheckedRevertCommit();
-
-	//UnitTestBufferData();
+	UnitTestBufferData();
 
 	LogicTestPackedSend();
 
-	//UnitTestPrepareToSend();
+	UnitTestPrepareToSend();
 
-	//UnitTestFetchReceived();
+	UnitTestFetchReceived();
 
 	return 0;
 }

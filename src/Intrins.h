@@ -37,7 +37,7 @@ typedef uint8_t octet;
 #define ALIGN(n)
 #endif
 
-// assume the compiler support 64-bit integer. and it is assumed that the operand is properly alligned
+// assume the compiler support 64-bit integer. and it is assumed that the operand is properly aligned
 #ifndef htobe64
 
 #if !defined(_MSC_VER) || !defined(_M_IA64) && !defined(_M_X64) && (!defined(_M_IX86) || _MSC_VER < 1400)

@@ -405,11 +405,13 @@ void UnitTestQuasibitfield()
 
 
 
-void UnitTestTestSetFlag()
+void UnitTestTestSetMark()
 {
-	static ControlBlock::FSP_SocketBuf buf;
-	buf.SetFlag<IS_COMPLETED>();
-	Assert::IsTrue(buf.flags == 1 << IS_COMPLETED);
+	ControlBlock::FSP_SocketBuf buf;
+	buf.InitMarkLocked();
+	Assert::IsTrue(buf.marks == 1);
+	buf.ReInitMarkComplete();
+	Assert::IsTrue(buf.marks == 2);
 }
 
 
@@ -775,9 +777,9 @@ namespace UnitTestFSP
 		}
 
 
-		TEST_METHOD(TestTestSetFlag)
+		TEST_METHOD(TestTestSetMark)
 		{
-			UnitTestTestSetFlag();
+			UnitTestTestSetMark();
 		}
 
 

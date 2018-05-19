@@ -373,19 +373,12 @@ void CSocketItemEx::UrgeCommit()
 		if (lowState == COMMITTING || lowState == COMMITTING2)
 			RestartKeepAlive();
 	}
-	//
+	// It is assumed that if commit is pending the ULA would not manipulate the send queue
 	int r = pControlBlock->MarkSendQueueEOT();
-	if (r == 2)
-	{
-		EmitQ();
-		return;
-	}
-	if (r <= 0)
-	{
+	if (r < 0)
 		shouldAppendCommit = 1;
-		SendKeepAlive();
-	}
-	AddResendTimer(tRoundTrip_us >> 8);
+	else
+		EmitQ();	// It would AddResendTimer
 }
 
 

@@ -36,9 +36,21 @@ int FSPAPI Dispose(FSPHANDLE hFSPSocket)
 	CSocketItemDl *p = CSocketDLLTLB::HandleToRegisteredSocket(hFSPSocket);
 	if(p == NULL)
 		return -EFAULT;
-	if(! p->WaitUseMutex())
-		return (p->IsInUse() ? -EDEADLK : 0);
-	return p->RecycLocked();
+	return p->Dispose();
+}
+
+
+
+int  CSocketItemDl::Dispose()
+{
+
+	if (!WaitUseMutex())
+		return (IsInUse() ? -EDEADLK : 0);
+	if (chainingReceive == 0 && chainingSend == 0)
+		return RecycLocked();
+	toDispose = 1;
+	SetMutexFree();
+	return 0;
 }
 
 

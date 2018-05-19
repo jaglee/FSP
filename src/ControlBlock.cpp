@@ -86,9 +86,7 @@ const char * CStringizeState::names[LARGEST_FSP_STATE + 1] =
 	// after getting responder's cookie and sending formal CONNECT_REQUEST
 	// before getting ACK_CONNECT_REQ, timeout to retry or NON_EXISTENT
 	"CONNECT_AFFIRMING",
-	// initiator: after getting the ACK_CONNECT_REQ 
-	// responder: after getting the first PERSIST
-	// no default timeout. however, implementation could arbitrarily limit a session life
+	// after getting a non-EoT PERSIST
 	"ESTABLISHED",
 	// after sending FLUSH, before getting all packet-in-flight acknowledged
 	"COMMITTING",
@@ -453,9 +451,10 @@ ControlBlock::PFSP_SocketBuf ControlBlock::GetSendBuf()
 	if(i < 0 || i >= sendBufferBlockN)
 		return NULL;
 
-	register PFSP_SocketBuf p = HeadSend() + sendBufferNextPos++;
-	RoundSendBufferNextPos();
-	p->InitFlags();	// and locked
+	register PFSP_SocketBuf p = HeadSend() + sendBufferNextPos;
+	p->InitMarkLocked();
+	p->ClearFlags();
+	AddRoundSendBlockN(sendBufferNextPos, 1);
 	_InterlockedIncrement((LONG *) & sendBufferNextSN);
 
 	return p;
@@ -528,21 +527,24 @@ ControlBlock::PFSP_SocketBuf LOCALAPI ControlBlock::AllocRecvBuf(seq_t seq1)
 			recvWindowNextPos = d + 1 >= recvBufferBlockN ? 0 : d + 1;
 			_InterlockedExchange((LONG *) & recvWindowNextSN, seq1 + 1);
 		}
-		else if(p->GetFlag<IS_FULFILLED>())
+		else if(p->IsComplete())
 		{
 			return p;	// this is an out-of-order packet and the payload buffer has been filled already
 		}
 	}
 	//
-	p->InitFlags();	// and locked
+	p->ClearFlags();
+	// Case 1: out-of-order packet received in a gap but it is not the left-edge of the gap
 	if (seq1 != recvWindowExpectedSN)
 		return p;
-
 	// distance of the right edge of the receive window to the probable left edge of the first gap
 	d = recvWindowNextSN - ++recvWindowExpectedSN;
+	// Case 2: orderly delivery at the right-edge
 	if (d <= 0)	// <? but it is safe
 		return p;
 
+	// Case 3 out-of-order packet received in a gap and it is the left-edge of the gap
+	// To slide left edge of the advertisable receive window
 	register int32_t i = recvWindowNextPos - d;
 	if (i < 0)
 		i += recvBufferBlockN;
@@ -554,7 +556,7 @@ ControlBlock::PFSP_SocketBuf LOCALAPI ControlBlock::AllocRecvBuf(seq_t seq1)
 	i = 0;
 	do
 	{
-		if (!q->GetFlag<IS_FULFILLED>())
+		if (!q->IsComplete())
 			return p;
 		q++;
 		recvWindowExpectedSN++;
@@ -567,7 +569,7 @@ ControlBlock::PFSP_SocketBuf LOCALAPI ControlBlock::AllocRecvBuf(seq_t seq1)
 	i = 0;
 	do
 	{
-		if (!q->GetFlag<IS_FULFILLED>())
+		if (!q->IsComplete())
 			return p;
 		q++;
 		recvWindowExpectedSN++;
@@ -598,6 +600,7 @@ void ControlBlock::SlideRecvSlotNextTo(seq_t seq1)
 
 // Given
 //	int32_t & : [_Out_] place holder of the number of bytes [to be] peeked.
+//	int32_t & : [_Out_] place holder of the number of blocks peeked
 //	bool & :	[_Out_] place holder of the End of Transaction flag
 // Do
 //	Peek the receive buffer, figure out not only the start address but also the length of the next message
@@ -615,8 +618,8 @@ void ControlBlock::SlideRecvSlotNextTo(seq_t seq1)
 //	-EFAULT		the descriptor is corrupted (illegal payload length:
 //				payload length of an intermediate packet of a message should be MAX_BLOCK_SIZE,
 //				payload length of any packet should be no less than 0 and no greater than MAX_BLOCK_SIZE)
-//	-EPERM		imconformant to the protocol, which is prohibitted
-void * LOCALAPI ControlBlock::InquireRecvBuf(int32_t & nIO, bool & eotFlag)
+//	-EPERM		non-conforming to the protocol, shall be prohibited
+void * LOCALAPI ControlBlock::InquireRecvBuf(int32_t & nIO, int32_t & nBlock, bool & eotFlag)
 {
 	const int tail = recvWindowNextPos;
 	eotFlag = false;
@@ -658,20 +661,13 @@ void * LOCALAPI ControlBlock::InquireRecvBuf(int32_t & nIO, bool & eotFlag)
 		pMsg = GetRecvPtr(p);
 	}
 	//
-	for(i = 0; i < m && p->GetFlag<IS_FULFILLED>(); i++)
+	for(i = 0; i < m && p->IsComplete(); i++)
 	{
 		if(p->len > MAX_BLOCK_SIZE || p->len < 0)
 		{
 			BREAK_ON_DEBUG();	// TRACE_HERE("Unrecoverable error! memory corruption might have occurred");
 			nIO = -EFAULT;
 			return NULL;
-		}
-		if (p->opCode == 0)
-		{
-			BREAK_ON_DEBUG();	//Should not happen if properly locked!
-			p++;
-			pMsg = GetRecvPtr(p);
-			continue;
 		}
 		nIO += p->len;
 		//
@@ -691,17 +687,18 @@ void * LOCALAPI ControlBlock::InquireRecvBuf(int32_t & nIO, bool & eotFlag)
 		p++;
 	}
 	//
+	nBlock = i;
 	return pMsg;
 }
 
 
 
 // Given
-//	int32_t		the number of bytes be free, shall equal the value passed out by InquireRecvBuf
+//	int32_t		number of blocks to mark free, shall equal the value passed out by InquireRecvBuf
 // Do
 //	Free the packet buffer blocks that cover at least the given number of bytes.
 // Return
-//	non-negative if number of blocks marked free
+//	non-negative if the number of bytes be free
 //	negative if error:
 //	-EACCES		the buffer space is corrupted and unaccessible
 //	-EFAULT		the descriptor is corrupted (illegal payload length:
@@ -712,10 +709,10 @@ void * LOCALAPI ControlBlock::InquireRecvBuf(int32_t & nIO, bool & eotFlag)
 // Remark
 //	It would mark the buffer block descriptors even if error encountered.
 //	Only the number of the last error would be preserved and reported.
-int LOCALAPI ControlBlock::MarkReceivedFree(int32_t nIO)
+int LOCALAPI ControlBlock::MarkReceivedFree(int32_t m)
 {
-	if (nIO <= 0)
-		return 0;
+	if (m <= 0)
+		return m;
 
 	const int tail = recvWindowNextPos;
 	if (tail > recvBufferBlockN)
@@ -723,37 +720,45 @@ int LOCALAPI ControlBlock::MarkReceivedFree(int32_t nIO)
 
 	register PFSP_SocketBuf p = GetFirstReceived();
 	register int i;
-	int m = (nIO - 1) / MAX_BLOCK_SIZE + 1;
-	int r = m;
-	for (i = 0; i < m && p->TestAndClearBusy(); i++)
+	int32_t nIO = 0;
+	for (i = 0; i < m && p->IsComplete(); i++)
 	{
-		_InterlockedExchange8((char *)& p->opCode, 0);
 		if (p->len > MAX_BLOCK_SIZE || p->len < 0)
-			r = -EFAULT;
+		{
+			BREAK_ON_DEBUG();
+			return  -EFAULT;
+		}
 		//
-		nIO -= p->len;
+		nIO += p->len;
 		//
-		if (p->GetFlag<TransactionEnded>())
+		bool b = p->GetFlag<TransactionEnded>();
+		p->InitMarkLocked();
+		p->ClearFlags();
+		if (b)
 		{
 			++i;
 			break;
 		}
 		//
 		if (p->len != MAX_BLOCK_SIZE)
-			r = -EPERM;
+		{
+			BREAK_ON_DEBUG();
+			return -EPERM;
+		}
 		//
 		p++;
 	}
+#ifndef NDEBUG
+	if (i != m)
+	{
+		BREAK_ON_DEBUG();
+		nIO = -EDOM;
+	}
+#endif // !NDEBUG
+	AddRoundRecvBlockN(recvWindowHeadPos, i);
+	InterlockedAdd((LONG *)& recvWindowFirstSN, i);
 
-	if (r > 0 && (nIO != 0 || i != m))
-		r = -EDOM;
-
-	recvWindowFirstSN += i;
-	recvWindowHeadPos += i;
-	if (recvWindowHeadPos - recvBufferBlockN >= 0)
-		recvWindowHeadPos -= recvBufferBlockN;
-
-	return r;
+	return nIO;
 }
 
 
@@ -799,7 +804,7 @@ int LOCALAPI ControlBlock::GetSelectiveNACK(seq_t & snExpect, FSP_SelectiveNACK:
 	int			m = 0;
 	do	// termination condition is embedded in the loop body
 	{
-		for(dataLength = 0; int(seq0 - recvWindowNextSN) < 0 && p->GetFlag<IS_FULFILLED>(); seq0++)
+		for(dataLength = 0; int(seq0 - recvWindowNextSN) < 0 && p->IsComplete(); seq0++)
 		{
 			dataLength++;
 			iHead++;
@@ -815,7 +820,7 @@ int LOCALAPI ControlBlock::GetSelectiveNACK(seq_t & snExpect, FSP_SelectiveNACK:
 		}
 		//
 		// the gap
-		for(gapWidth = 0; int(seq0 - recvWindowNextSN) < 0 && !p->GetFlag<IS_FULFILLED>(); seq0++)
+		for(gapWidth = 0; int(seq0 - recvWindowNextSN) < 0 && !p->IsComplete(); seq0++)
 		{
 			gapWidth++;
 			//
@@ -847,26 +852,6 @@ int LOCALAPI ControlBlock::GetSelectiveNACK(seq_t & snExpect, FSP_SelectiveNACK:
 
 
 
-// Slide the left border of the send window and mark the acknowledged buffer block free
-void ControlBlock::SlideSendWindow()
-{
-	while(CountSentInFlight() > 0)
-	{
-		register PFSP_SocketBuf p = GetSendQueueHead();
-		if(! p->GetFlag<IS_ACKNOWLEDGED>())
-			break;
-
-		p->flags = 0;
-
-		if(++sendWindowHeadPos - sendBufferBlockN >= 0)
-			sendWindowHeadPos -= sendBufferBlockN;
-		//
-		_InterlockedIncrement((LONG *)& sendWindowFirstSN);
-	}
-}
-
-
-
 // Given
 //	ControlBlock::seq_t		the sequence number that was accumulatively acknowledged
 //	const GapDescriptor *	array of the gap descriptors
@@ -894,12 +879,12 @@ int LOCALAPI ControlBlock::DealWithSNACK(seq_t expectedSN, FSP_SelectiveNACK::Ga
 	for(int	k = 0; ; k++)
 	{
 		seq0 += nAck;
-		// Make acknowledgement
+		// Make acknowledgment
 		while(--nAck >= 0)
 		{
-			if(! p->GetFlag<IS_ACKNOWLEDGED>())
+			if(! p->IsAcked())
 			{
-				p->SetFlag<IS_ACKNOWLEDGED>();
+				p->ResetMarkAcked();
 				countAck++;
 			}
 			//
@@ -933,12 +918,16 @@ int LOCALAPI ControlBlock::DealWithSNACK(seq_t expectedSN, FSP_SelectiveNACK::Ga
 
 
 // Return
-//	true if the last packet in the queue is a _COMMIT and there is neither gap before _COMMIT nor after _COMMIT
-//	false if there is no _COMMIT packet in the queue, or there is some gap before or after the _COMMIT packet
-bool ControlBlock::HasBeenCommitted() const
+//	true if the last packet in the queue is a packet with EoT flag set
+//	false if otherwise
+bool ControlBlock::HasBeenCommitted()
 {
 	register int32_t d = int32_t(recvWindowExpectedSN - recvWindowNextSN); 	// there should be no gap
 	if (d != 0)
+		return false;
+
+	d = int32_t(recvWindowNextSN - recvWindowFirstSN);
+	if (d <= 0)
 		return false;
 
 	d = recvWindowNextPos - 1;
@@ -947,66 +936,45 @@ bool ControlBlock::HasBeenCommitted() const
 	else if (d < 0)
 		d += recvBufferBlockN;
 
-	if ((HeadRecv() + d)->opCode != _COMMIT)
-		return false;
-
-	// Now scan the receive queue to found the gap. See also GetSelectiveNACK
-	// Normally recvWindowExpectedSN == recvWindowNextSN if no gap, but...
-#ifndef NDEBUG
-	d = int32_t(recvWindowNextSN - recvWindowFirstSN);
-	if (d <= 0)
-		return true;
-	//
-	register int	iHead = recvWindowNextPos - d; 
-	seq_t			seq0 = recvWindowNextSN - d;	// Because of parallism it is not necessarily recvWindowFirstSN now
-	if (iHead < 0)
-		iHead += recvBufferBlockN;
-	// it is possible that the head packet is the gap because of delivery
-	for (PFSP_SocketBuf	p = HeadRecv() + iHead; int(seq0 - recvWindowNextSN) < 0 && p->GetFlag<IS_FULFILLED>(); seq0++)
-	{
-		iHead++;
-		if (iHead - recvBufferBlockN >= 0)
-		{
-			iHead = 0;
-			p = HeadRecv();
-		}
-		else
-		{
-			p++;
-		}
-	}
-	//
-	if (int(seq0 - recvWindowNextSN) < 0)
-	{
-		BREAK_ON_DEBUG();
-		return false;
-	}
-#endif
-	return true;
+	return (HeadRecv() + d)->GetFlag<TransactionEnded>();
 }
 
 
 
 // Return
-//	0 if used to be no packet at all
-//	1 if there existed a sent packet at the tail which has already marked EOT 
-//	2 if there existed an unsent packet at the tail and it is marked EOT
-//  -1 if there existed a sent packet at the tail which could not be marked EOT
+//	0 if there existed a sent packet at the tail which has already marked EOT 
+//	1 if there existed an unsent packet at the tail and it is marked EOT
+//	2 if there existed free slot to put a new EoT packet into the queue
+//  -1 if there is no packet to piggyback EoT and no free slot at all
 // See also @LLS::EmitQ()
 int ControlBlock::MarkSendQueueEOT()
 {
-	if(CountSendBuffered() <= 0)
-		return 0;
+	if(CountSendBuffered() >= sendBufferBlockN)
+		return -1;
 
 	register int i = sendBufferNextPos - 1;
 	register PFSP_SocketBuf p;
 	p = HeadSend() + (i < 0 ? sendBufferBlockN - 1 : i);
 
-	if(p->GetFlag<IS_SENT>())
-		return p->GetFlag<TransactionEnded>() ? 1 : -1;
+	if (p->IsSent() && p->GetFlag<TransactionEnded>())
+		return 0;
 
+	if (!p->IsSent())
+	{
+		p->SetFlag<TransactionEnded>();
+		p->ReInitMarkComplete();
+		return 1;
+	}
+
+	p = HeadSend() + sendBufferNextPos++;
+	p->opCode = PURE_DATA;
+	p->len = 0;
 	p->SetFlag<TransactionEnded>();
-	p->SetFlag<IS_COMPLETED>();
+	p->ReInitMarkComplete();
+	if (sendBufferNextPos >= sendBufferBlockN)
+		sendBufferNextPos = 0;
+	InterlockedIncrement(&sendBufferNextSN);
+
 	return 2;
 }
 

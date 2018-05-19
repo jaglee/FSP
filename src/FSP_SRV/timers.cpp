@@ -136,7 +136,7 @@ void CSocketItemEx::KeepAlive()
 		SendKeepAlive();	// No matter which state it is in
 		keepAliveNeeded = false;
 	}
-	else if(mobileNoticeInFlight != 0 || pControlBlock->CountDeliverable() != savedCountDeliverable)
+	else if(mobileNoticeInFlight != 0)
 	{
 		keepAliveNeeded = true;
 	}
@@ -249,18 +249,6 @@ void CSocketItemEx::DoResend()
 	int32_t				n = pControlBlock->CountSentInFlight();
 	timestamp_t			tNow = NowUTC();
 
-	// SendKeepAlive would scan the receive buffer, which might be lengthy, and it might hold the lock too long time
-	// So maximum buffer capacity should be limitted anyway
-	if (shouldAppendCommit)
-	{
-		SendKeepAlive();
-#if (TRACE & (TRACE_HEARTBEAT | TRACE_PACKET | TRACE_SLIDEWIN))
-		printf_s("Piggyback EoT on KEEP_ALIVE packet.\n"
-			"TODO: optimization: eliminate the long-interval KEEP_ALIVE, \n"
-			"until short-interval KEEP_ALIVE is stopped.\n");		
-#endif
-	}
-
 	SetMutexFree();
 	//^Try to make it lockless
 
@@ -291,7 +279,7 @@ void CSocketItemEx::DoResend()
 			break;
 		}
 
-		if (!p->GetFlag<IS_COMPLETED>())	// due to parallism the last 'gap' may include imcomplete buffered data
+		if (!p->IsComplete())	// due to parallism the last 'gap' may include imcomplete buffered data
 		{
 #ifdef TRACE
 			printf_s("Imcomplete packet: SN = %u, index position = %d\n", seq1, index1);
@@ -300,7 +288,7 @@ void CSocketItemEx::DoResend()
 			break;
 		}
 
-		if (!p->GetFlag<IS_ACKNOWLEDGED>())
+		if (!p->IsAcked())
 		{
 #if (TRACE & TRACE_HEARTBEAT)
 			printf_s("Fiber#%u, to retransmit packet #%u\n", fidPair.source, seq1);
@@ -332,9 +320,6 @@ void CSocketItemEx::DoResend()
 		SetMutexFree();
 	}
 
-	if (shouldAppendCommit)
-		return;
-
 	if (!WaitUseMutex())
 		return;
 
@@ -358,20 +343,13 @@ void CSocketItemEx::DoResend()
 // Return
 //	true if KEEP_ALIVE was sent successfully
 //	false if send was failed
-// TODO: suppress rate of sending KEEP_ALIVE
 bool CSocketItemEx::SendKeepAlive()
 {
+	SKeepAliveCache & buf3 = keepAliveCache;	// a buffer with three headers
 	EmitProbe();	// Conditionally, actually.
 
-	struct
-	{
-		FSP_NormalPacketHeader	hdr;
-		FSP_ConnectParam		mp;
-		FSP_PreparedKEEP_ALIVE	snack;
-	} buf3;	// a buffer with three headers
-
 	memcpy(buf3.mp.subnets, savedPathsToNearEnd, sizeof(TSubnets));
-	buf3.mp.idHost = SOCKADDR_HOSTID(&CLowerInterface::Singleton.addresses[0]);
+	buf3.SetHostID(CLowerInterface::Singleton.addresses);
 	buf3.mp.hs.Set(PEER_SUBNETS, sizeof(FSP_NormalPacketHeader));
 
 	ControlBlock::seq_t	snKeepAliveExp;
@@ -393,9 +371,6 @@ bool CSocketItemEx::SendKeepAlive()
 		, pControlBlock->sendWindowNextSN - 1
 		, snKeepAliveExp
 		, pControlBlock->AdRecvWS(pControlBlock->recvWindowNextSN - 1));
-	//
-	if (shouldAppendCommit)
-		buf3.hdr.SetFlag<TransactionEnded>();
 	//
 	SetIntegrityCheckCode(&buf3.hdr, NULL, 0, buf3.snack.GetSaltValue());
 #if (TRACE & (TRACE_HEARTBEAT | TRACE_PACKET | TRACE_SLIDEWIN))
@@ -467,7 +442,8 @@ int LOCALAPI CSocketItemEx::RespondToSNACK(ControlBlock::seq_t expectedSN, FSP_S
 	const ControlBlock::seq_t headSN = _InterlockedOr((LONG *)& pControlBlock->sendWindowFirstSN, 0);
 	if(int(expectedSN - headSN) < 0)
 		return -EDOM;
-
+	if (int(expectedSN - pControlBlock->sendWindowLimitSN) > 0)
+		return -EDOM;
 	const int32_t capacity = pControlBlock->sendBufferBlockN;
 	if (capacity <= 0
 	 ||	sizeof(ControlBlock) + (sizeof(ControlBlock::FSP_SocketBuf) + MAX_BLOCK_SIZE) * capacity > dwMemorySize)
@@ -512,6 +488,14 @@ int LOCALAPI CSocketItemEx::RespondToSNACK(ControlBlock::seq_t expectedSN, FSP_S
 	// new = ((current + old - timer-slice/2) / 2
 	ControlBlock::seq_t seq0 = pControlBlock->sendWindowFirstSN;
 	pControlBlock->SlideSendWindow();
+
+	// It is assumed that if commit is pending the ULA would not manipulate the send queue
+	if (_InterlockedExchange8(&shouldAppendCommit, 0) != 0)
+	{
+		pControlBlock->MarkSendQueueEOT();
+		EmitQ();
+	}
+
 	// Calibrate RTT ONLY if left edge of the window windows was advanced
 	if (pControlBlock->sendWindowFirstSN != seq0 && gaps != NULL)
 	{
@@ -522,9 +506,9 @@ int LOCALAPI CSocketItemEx::RespondToSNACK(ControlBlock::seq_t expectedSN, FSP_S
 		// it would be eventually punished by a very large RTO!?
 		uint64_t rtt64_us = NowUTC() - skb->timeSent - tDelay;
 		if (rtt64_us < TIMER_SLICE_ms * 1000 / 2)
-			tRoundTrip_us = uint32_t(min((rtt64_us - TIMER_SLICE_ms * 1000 / 2  + 1) >> 1, UINT32_MAX));
-		else
 			tRoundTrip_us = uint32_t(((rtt64_us + 1) >> 1) + tRoundTrip_us) >> 1;
+		else
+			tRoundTrip_us = uint32_t(min((rtt64_us - TIMER_SLICE_ms * 1000 / 2 + 1) >> 1, UINT32_MAX));
 #if (TRACE & TRACE_HEARTBEAT)
 		printf_s("Round trip time calibrated: %u\n\tAcknowledgement delay: %llu\n", tRoundTrip_us, tDelay);
 #endif

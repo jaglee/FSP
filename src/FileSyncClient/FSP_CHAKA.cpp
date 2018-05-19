@@ -378,9 +378,10 @@ static void FSPAPI onAcknowledgeSent(FSPHANDLE h, FSP_ServiceCode c, int r)
 		return;
 	}
 
-	if(Shutdown(h) < 0)
+	r = Shutdown(h);
+	if(r < 0)
 	{
-		printf_s("Cannot shutdown gracefully in the final stage.\n");
+		printf_s("Cannot shutdown gracefully in the final stage, error#: %d\n", r);
 		Dispose(h);
 	}
 }

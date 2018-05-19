@@ -6,7 +6,12 @@
 
 // A shared global parameter to configure the time to wait the connection multiplication request is sent and acknowledged:
 // by default there is no reverse socket and wait for about 30 seconds to wait one. see also main()
+#ifdef NDEBUG
 int32_t ticksToWait = 600;
+#else
+int32_t ticksToWait = 6000;
+#endif
+// 50ms per tick.
 bool	r2finish = true;
 
 // The call back function to be executed when the clone connection is closed

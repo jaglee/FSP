@@ -156,9 +156,21 @@ int32_t LOCALAPI CSocketItemDl::AcquireSendBuf()
 	}
 
 	void *buf = pControlBlock->InquireSendBuf(& pendingSendSize);
-	bool b = (chainingSend || buf == NULL);
-	SetMutexFree();
-	return ((b || SelfNotify(FSP_NotifyBufferReady) >= 0) ? pendingSendSize : -EFAULT);
+	if (buf == NULL)
+	{
+		SetMutexFree();
+		return 0;
+	}
+	// Exploit soft-interrupt work thread queue to avoid risk of stack overflow
+	if(chainingSend)
+	{
+		pControlBlock->notices.Put(FSP_NotifyBufferReady);
+		SetMutexFree();
+		return pendingSendSize;
+	}
+	int32_t k = pendingSendSize;
+	ProcessPendingSend();
+	return k;
 }
 
 
@@ -221,7 +233,7 @@ int32_t LOCALAPI CSocketItemDl::SendStream(const void * buffer, int32_t len, boo
 		{
 			SetMutexFree();
 			Sleep(TIMER_SLICE_ms);
-			if (GetTickCount64() - t0 > MAX_LOCK_WAIT_ms)
+			if (GetTickCount64() - t0 > COMMITTING_TIMEOUT_ms)
 				return -EBUSY;
 			if (!WaitUseMutex())
 				return (IsInUse() ? -EDEADLK : -EINTR);
@@ -269,7 +281,7 @@ int32_t LOCALAPI CSocketItemDl::SendStream(const void * buffer, int32_t len, boo
 		{
 			SetMutexFree();
 			Sleep(TIMER_SLICE_ms);
-			if (GetTickCount64() - t0 > MAX_LOCK_WAIT_ms)
+			if (GetTickCount64() - t0 > COMMITTING_TIMEOUT_ms)
 				return -EBUSY;
 			if (!WaitUseMutex())
 				return (IsInUse() ? -EDEADLK : -EINTR);
@@ -338,10 +350,10 @@ int CSocketItemDl::LockAndCommit(NotifyOrReturn fp1)
 // When FSP_NotifyBufferReady was triggered the header packet of the sender queue SHALL be acknowledged
 void CSocketItemDl::ProcessPendingSend()
 {
+l_recursion:
 #ifdef TRACE
 	printf_s("Fiber#%u process pending send in %s\n", fidPair.source, stateNames[pControlBlock->state]);
 #endif
-	toIgnoreNextPoll = 1;
 	// Set fpSent to NULL BEFORE calling back so that chained send may set new value
 	CallbackBufferReady fp2 = (CallbackBufferReady)InterlockedExchangePointer((PVOID volatile *)& fpSent, NULL);
 	if(pendingSendBuf != NULL || pStreamState != NULL)
@@ -395,10 +407,10 @@ void CSocketItemDl::ProcessPendingSend()
 		TestSetSendReturn(fp2);
 	chainingSend = 0;
 	// The callback function should consume at least one buffer block to avoid dead-loop
-	b = b && (pControlBlock->CountSendBuffered() > k) && HasFreeSendBuffer();
+	if(b && (pControlBlock->CountSendBuffered() > k) && HasFreeSendBuffer())
+		goto l_recursion;
+	//
 	SetMutexFree();
-	if(b)
-		SelfNotify(FSP_NotifyBufferReady);
 }
 
 
@@ -465,12 +477,12 @@ int LOCALAPI CSocketItemDl::BufferData(int m)
 			int m2 = Compress(tgtBuf, k, pendingSendBuf, m);
 			if (m2 < 0)
 				return m2;
+			p->SetFlag<Compressed>();
 			p->len += k;
 			bytesBuffered += k;
 			//
 			m -= m2;
 			pendingSendBuf += m2;
-			p->SetFlag<Compressed>();
 		}
 		//
 		if (p->len >= MAX_BLOCK_SIZE)
@@ -499,7 +511,6 @@ int LOCALAPI CSocketItemDl::BufferData(int m)
 		skbImcompleteToSend = NULL;
 		if(count > 0)
 			goto l_finalize;
-		skb0->Unlock();
 		return 0;
 	}
 	//
@@ -509,8 +520,6 @@ int LOCALAPI CSocketItemDl::BufferData(int m)
 		skbImcompleteToSend = (k > 0 ? p : NULL);
 		if(count > 0)
 			goto l_finalize;
-		// assert(p == skb0);
-		p->Unlock();
 		return 0;
 	}
 	// pendingSendSize == 0 && committing:
@@ -544,8 +553,8 @@ int LOCALAPI CSocketItemDl::BufferData(int m)
 		Compress(GetSendPtr(p), k, NULL, 0);
 		p->version = THIS_FSP_VERSION;
 		p->opCode = PURE_DATA;
-		p->len = k;
 		p->SetFlag<Compressed>();
+		p->len = k;
 		count++;
 		bytesBuffered += k;
 	}	// end if the internal buffer of on-the-wire compression is not empty
@@ -559,11 +568,11 @@ l_finalize:
 #ifndef NDEBUG
 		if (p != skb0)
 			printf_s("Erroneous implementation!? May not start a new transaction\n");
-		if (p->GetFlag<IS_SENT>())
+		if (p->IsSent())
 			printf_s("Erroneous implementation!? Packet to start a new transaction locked but sent?\n");
 #endif
 		p->opCode = PERSIST;
-		p->SetFlag<IS_COMPLETED>();	// Might be redundant, but it doesn't matter!
+		p->MarkComplete();	// Might be redundant, but it doesn't matter!
 	}
 	//
 	MigrateToNewStateOnSend();
@@ -572,8 +581,7 @@ l_finalize:
 	p = skb0;
 	do
 	{
-		p->SetFlag<IS_COMPLETED>();
-		p->Unlock();
+		p->ReInitMarkComplete();
 #ifndef NDEBUG
 		if (p->len < MAX_BLOCK_SIZE && !p->GetFlag<TransactionEnded>())
 			printf_s("Erroneous implementation!? Length of a non-terminating packet is %d\n", p->len);
@@ -605,8 +613,7 @@ int32_t LOCALAPI CSocketItemDl::PrepareToSend(void * buf, int32_t len)
 	// Automatically mark the last unsent packet as completed. See also BufferData()
 	if(skbImcompleteToSend != NULL)
 	{
-		skbImcompleteToSend->SetFlag<IS_COMPLETED>();
-		skbImcompleteToSend->Unlock();
+		skbImcompleteToSend->ReInitMarkComplete();
 		skbImcompleteToSend = NULL;
 	}
 
@@ -629,25 +636,24 @@ int32_t LOCALAPI CSocketItemDl::PrepareToSend(void * buf, int32_t len)
 	register ControlBlock::PFSP_SocketBuf p0 = p;
 	for(register int j = 0; j < m; j++)
 	{
-		p->InitFlags();	// and locked
 		p->version = THIS_FSP_VERSION;
 		p->opCode = PURE_DATA;
+		p->ClearFlags();
 		p->len = MAX_BLOCK_SIZE;
-		p->SetFlag<IS_COMPLETED>();
 		p++;
 	}
 	//
-	p->InitFlags();	// and locked
 	p->version = THIS_FSP_VERSION;
-	p->len = len - MAX_BLOCK_SIZE * m;
 	p->opCode = PURE_DATA;
-	p->SetFlag<TransactionEnded>(committing != 0);
-	p->SetFlag<IS_COMPLETED>();
+	if (committing)
+		p->InitFlags<TransactionEnded>();
+	else
+		p->ClearFlags();
+	p->len = len - MAX_BLOCK_SIZE * m;
 	//
 	m++;
-	pControlBlock->sendBufferNextPos += m;
-	pControlBlock->RoundSendBufferNextPos();
-	pControlBlock->sendBufferNextSN += m;
+	pControlBlock->AddRoundSendBlockN(pControlBlock->sendBufferNextPos, m);
+	InterlockedAdd((LONG *)& pControlBlock->sendBufferNextSN, m);
 
 	MigrateToNewStateOnSend();
 
@@ -657,7 +663,7 @@ int32_t LOCALAPI CSocketItemDl::PrepareToSend(void * buf, int32_t len)
 	p = p0;
 	for(register int j = 0; j < m; j++)
 	{
-		(p++)->Unlock();
+		(p++)->ReInitMarkComplete();
 	}
 
 	return m;
@@ -747,21 +753,26 @@ int CSocketItemDl::Commit()
 	{
 		BufferData(pendingSendSize);
 		yetSomeDataToBuffer = HasDataToCommit();
+#ifndef _NO_LLS_CALLABLE
 		if (yetSomeDataToBuffer)
 			Call<FSP_Send>();	// Or else FSP_Commit would trigger sending the queue
+#endif
 	}
 	if (!yetSomeDataToBuffer && skbImcompleteToSend != NULL)
 	{
 		skbImcompleteToSend->SetFlag<TransactionEnded>();
-		skbImcompleteToSend->Unlock();	// further processing is done on FSP_Commit
+		skbImcompleteToSend->ReInitMarkComplete();
+		// further processing is done on FSP_Commit
 		skbImcompleteToSend = NULL;
 	}
-
-#ifndef _NO_LLS_CALLABLE
 	// Case 1 is handled in DLL while case 2~5 are handled in LLS
-	if (fpCommitted != NULL)
-	{
+#ifndef _NO_LLS_CALLABLE
+	if (fpCommitted != NULL) {
 		int r = yetSomeDataToBuffer ? 0 : (Call<FSP_Commit>() ? 0 : -EIO);
+#else
+	{
+		int r = 0;
+#endif
 		SetMutexFree();
 		return r;
 	}
@@ -775,7 +786,7 @@ int CSocketItemDl::Commit()
 		if (!WaitUseMutex())
 			return (IsInUse() ? -EDEADLK : 0);
 	} while (!InState(COMMITTED) && !InState(CLOSABLE) && !InState(CLOSED) && !InState(NON_EXISTENT));
-#endif
+	//
 	return 0;
 }
 
@@ -795,7 +806,7 @@ int CSocketItemDl::Flush()
 		return 0;
 	}
 
-	p->SetFlag<IS_COMPLETED>();
+	p->MarkComplete();
 	skbImcompleteToSend = NULL;
 
 	int r = Call<FSP_Send>() ? 0 : -EIO;

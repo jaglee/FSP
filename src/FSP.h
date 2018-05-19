@@ -81,6 +81,26 @@ typedef ALFID_T	 ULTID_T;
 # define FSP_REKEY_THRESHOLD	0x20000000
 #endif
 
+
+/**
+* Protocol defined timeouts
+*/
+// In debug mode we allow pre-definition via compiler's command-line option
+#ifdef _DEBUG
+# define INIT_RETRANSMIT_TIMEOUT_ms		60000	// 1 minute
+# define RECYCLABLE_TIMEOUT_ms			300000	// 5 minutes
+# define TRANSIENT_STATE_TIMEOUT_ms		300000	// 5 minutes
+#else
+# define INIT_RETRANSMIT_TIMEOUT_ms		15000	// 15 seconds
+# define RECYCLABLE_TIMEOUT_ms			3600000	// 1 hour
+# define TRANSIENT_STATE_TIMEOUT_ms		60000	// 1 minute
+#endif
+
+#define COMMITTING_TIMEOUT_ms			300000	// 5 minutes // hard-coded time-out for committing a transmit transaction
+#define LAZY_ACK_DELAY_MIN_us			1024	// 1 millisecond (after shifted 10 bits right)
+#define KEEP_ALIVE_TIMEOUT_ms			600000	// 10 minutes
+#define MAXIMUM_SESSION_LIFE_ms			43200000// 12 hours
+
 /**
   error number may appear as REJECT packet 'reason code' where it is unsigned or near-end API return value where it is negative
   standard C	FSP error meaning
@@ -121,9 +141,7 @@ typedef enum _FSP_Session_State: char
 	// after getting responder's cookie and sending formal CONNECT_REQUEST
 	// before getting ACK_CONNECT_REQ, timeout to retry or NON_EXISTENT
 	CONNECT_AFFIRMING,
-	// initiator: after getting ACK_CONNECT_REQ 
-	// responder: after getting ACK_START or the first PERSIST
-	// no default timeout. however, implementation could arbitrarily limit a session life
+	// after getting a non-EoT PERSIST
 	ESTABLISHED,
 	// after sending EoT flag, before getting all packet-in-flight acknowledged.
 	COMMITTING,	// A.K.A. FLUSHING; used to be PAUSING
@@ -155,7 +173,6 @@ typedef enum _FSP_Operation_Code : char
 	ACK_CONNECT_REQ,	// may piggyback payload
 	RESET,
 	ACK_START,	// Payloadless acknowledgement to CLONE or ACK_CONNECT_REQUEST. Used to be payloadless PERSIST
-	_COMMIT = ACK_START,	// Overloaded as a sentinel to terminatate a transmit transaction in the receive queue
 	PURE_DATA,	// Without any optional header
 	PERSIST,	// Start a new transmit transaction, while EoT flag make it transactional
 	ACK_FLUSH,
@@ -218,25 +235,8 @@ typedef enum: char
 typedef uint64_t timestamp_t;
 
 // the typeof the subnets field of some structures
-typedef uint64_t			TSubnets[MAX_PHY_INTERFACES];
+typedef uint64_t TSubnets[MAX_PHY_INTERFACES];
 
-/**
- * Protocol defined timeouts
- */
-// In debug mode we allow pre-definition via compiler's command-line option
-#ifdef _DEBUG
-# define INIT_RETRANSMIT_TIMEOUT_ms		60000	// 1 minute
-# define RECYCLABLE_TIMEOUT_ms			300000	// 5 minutes
-# define TRANSIENT_STATE_TIMEOUT_ms		300000	// 5 minutes
-#else
-# define INIT_RETRANSMIT_TIMEOUT_ms		15000	// 15 seconds
-# define RECYCLABLE_TIMEOUT_ms			3600000	// 1 hour
-# define TRANSIENT_STATE_TIMEOUT_ms		60000	// 1 minute
-#endif
-
-#define LAZY_ACK_DELAY_MIN_us			1024	// 1 millisecond (after shifted 10 bits right)
-#define KEEP_ALIVE_TIMEOUT_ms			600000	// 10 minutes
-#define MAXIMUM_SESSION_LIFE_ms			43200000// 12 hours
 
 #include <pshpack1.h>
 
@@ -348,9 +348,6 @@ struct FSP_NormalPacketHeader
 	void SetRecvWS(int32_t v) { flags_ws[1] = (octet)(v >> 16); flags_ws[2] = (octet)(v >> 8); flags_ws[3] = (octet)v; }
 
 	void ClearFlags() { flags_ws[0] = 0; }
-	template<FSP_FlagPosition pos> void SetFlag() { flags_ws[0] |= (1 << pos); }
-	template<FSP_FlagPosition pos> void ClearFlag() { flags_ws[0] &= ~(1 << pos); }
-	template<FSP_FlagPosition pos> int GetFlag() const { return flags_ws[0] & (1 << pos); }
 
 	// Get the first extension header
 	PFSP_HeaderSignature PFirstExtHeader() const
@@ -406,11 +403,8 @@ struct FSP_ConnectParam
 {
 	TSubnets	subnets;
 	ALFID_T		idListener;
-	ALFID_T		idHost;
-	//
-	octet		flags_ws[4];
 	$FSP_HeaderSignature hs;
-};	// Totally 6 QWORDs, 48 octets
+};	// Totally 5 QWORDs, 40 octets
 
 
 

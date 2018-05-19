@@ -178,7 +178,7 @@ void UnitTestICC()
 	// Merge the KEEP_ALIVE packet testing...
 	// It's most complicated in the sense that 
 	ControlBlock::PFSP_SocketBuf skb1 = socketR2.AllocRecvBuf(FIRST_SN + 1);
-	skb1->SetFlag<IS_FULFILLED>();
+	skb1->MarkComplete();
 	pCBR->recvWindowNextSN++;		// == FIRST_SN + 1
 
 	// See also: timer.cpp::KeepAlive
@@ -307,7 +307,7 @@ void UnitTestHMAC()
 	// Merge the KEEP_ALIVE packet testing...
 	// It's most complicated in the sense that 
 	ControlBlock::PFSP_SocketBuf skb1 = socketR2.AllocRecvBuf(FIRST_SN + 1);
-	skb1->SetFlag<IS_FULFILLED>();
+	skb1->MarkComplete();
 
 	// See also: timer.cpp::KeepAlive
 	ControlBlock::seq_t seq0;

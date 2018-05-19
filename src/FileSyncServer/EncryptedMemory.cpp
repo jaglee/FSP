@@ -109,6 +109,12 @@ static int FSPAPI toSendNextBlock(FSPHANDLE h, void * batchBuffer, int32_t capac
 	// Would wait until acknowledgement is received. Shutdown is called in onResponseReceived
 	bool r = (offset >= (int)sizeOfBuffer);
 	int n = SendInline(h, batchBuffer, bytesRead, r);
+	if (n < 0)
+	{
+		printf_s("SendInline return error#%d\n", n);
+		Dispose(h);
+		return n;
+	}
 	printf_s("%d bytes sent to the remote end in %d block(s). Totally %d bytes sent.\n", bytesRead, n, offset);
 	if(r)
 	{

@@ -53,7 +53,7 @@ void StartToSendSignature(FSPHANDLE h)
 	parms.onAccepted = onMultiplied;
 	parms.onError = onError;
 	parms.recvSize = 0;	// the underlying service would give the minimum, however
-	parms.sendSize = USHRT_MAX;
+	parms.sendSize = 500;	// no, not USHRT_MAX. We just want to send a arbitrary short acknowledgement
 	parms.welcome = signature;
 	parms.len = (unsigned short)sizeof(signature);
 	if(MultiplyAndWrite(h, & parms, TO_END_TRANSACTION, onSignatureSent) == NULL)

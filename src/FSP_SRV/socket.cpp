@@ -633,7 +633,7 @@ void CSocketItemEx::InitiateConnect()
 	q->hs.Set<FSP_InitiateRequest, INIT_CONNECT>();	// See also AffirmConnect()
 
 	q->timeStamp = initState.nboTimeStamp;
-	skb->SetFlag<IS_COMPLETED>();	// for resend
+	skb->MarkComplete();	// for resend
 	// it neednot be unlocked
 	SendPacket(1, ScatteredSendBuffers(q, sizeof(FSP_InitiateRequest)));
 	skb->timeSent = tRecentSend;
