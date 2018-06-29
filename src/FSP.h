@@ -96,8 +96,9 @@ typedef ALFID_T	 ULTID_T;
 # define TRANSIENT_STATE_TIMEOUT_ms		60000	// 1 minute
 #endif
 
-#define COMMITTING_TIMEOUT_ms			300000	// 5 minutes // hard-coded time-out for committing a transmit transaction
-#define LAZY_ACK_DELAY_MIN_us			1024	// 1 millisecond (after shifted 10 bits right)
+#define COMMITTING_TIMEOUT_ms			30000	// half a minute
+//^ time-out for committing a transmit transaction starting from last acknowledgement, not from start of the transaction
+#define LAZY_ACK_DELAY_MIN_us			5120	// 5 millisecond (after shifted 10 bits right)
 #define KEEP_ALIVE_TIMEOUT_ms			600000	// 10 minutes
 #define MAXIMUM_SESSION_LIFE_ms			43200000// 12 hours
 
@@ -333,42 +334,9 @@ struct FSP_NormalPacketHeader
 	//
 	octet	flags_ws[4];
 	$FSP_HeaderSignature hs;
-
 #ifdef __cplusplus
-	void Set(FSPOperationCode code, uint16_t hsp, uint32_t seqThis, uint32_t seqExpected, int32_t advRecvWinSize)
-	{
-		hs.Set(code, hsp);
-		expectedSN = htobe32(seqExpected);
-		sequenceNo = htobe32(seqThis);
-		ClearFlags();
-		SetRecvWS(advRecvWinSize);
-	}
 	// A brute-force but safe method of set or retrieve receive window size, with byte order translation
 	int32_t GetRecvWS()	const { return ((int32_t)flags_ws[1] << 16) + ((unsigned)flags_ws[2] << 8) + flags_ws[3]; }
-	void SetRecvWS(int32_t v) { flags_ws[1] = (octet)(v >> 16); flags_ws[2] = (octet)(v >> 8); flags_ws[3] = (octet)v; }
-
-	void ClearFlags() { flags_ws[0] = 0; }
-
-	// Get the first extension header
-	PFSP_HeaderSignature PFirstExtHeader() const
-	{
-		return (PFSP_HeaderSignature)((uint8_t *)this + be16toh(hs.hsp) - sizeof($FSP_HeaderSignature));
-	}
-
-	// Get next extension header
-	// Given
-	//	The pointer to the current extension header
-	// Return
-	//	The pointer to the next optional header, NULL if it is illegal
-	// Remark
-	//	The caller should check that pStackPointer does not fall into dead-loop
-	template<typename THdr>	PFSP_HeaderSignature PHeaderNextTo(void *p0) const
-	{
-		uint16_t sp = be16toh(((THdr *)p0)->hs.hsp);
-		if (sp < sizeof(FSP_NormalPacketHeader) || sp >(uint8_t *)p0 - (uint8_t *)this)
-			return NULL;
-		return (PFSP_HeaderSignature)((uint8_t *)this + sp - sizeof($FSP_HeaderSignature));
-	}
 #endif
 };
 

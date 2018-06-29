@@ -555,8 +555,8 @@ l_bailout:
 int32_t LOCALAPI CSocketItemEx::GenerateSNACK(FSP_PreparedKEEP_ALIVE &buf, ControlBlock::seq_t &seq0, int nPrefix)
 {
 	register int n = (sizeof(buf.gaps) - nPrefix + sizeof(FSP_NormalPacketHeader)) / sizeof(buf.gaps[0]);
-	register FSP_SelectiveNACK::GapDescriptor *pGaps = buf.gaps;
-	n = pControlBlock->GetSelectiveNACK(seq0, pGaps, n);
+	register FSP_SelectiveNACK::GapDescriptor *gaps = buf.gaps;
+	n = pControlBlock->GetSelectiveNACK(seq0, gaps, n);
 	if (n < 0)
 	{
 #ifdef TRACE
@@ -566,13 +566,13 @@ int32_t LOCALAPI CSocketItemEx::GenerateSNACK(FSP_PreparedKEEP_ALIVE &buf, Contr
 	}
 	// Suffix the effective gap descriptors block with the FSP_SelectiveNACK struct
 	// built-in rule: an optional header MUST be 64-bit aligned
-	register FSP_SelectiveNACK *pSNACK = (FSP_SelectiveNACK *)(pGaps + n);
-	if (n > 0)
+	register FSP_SelectiveNACK *pSNACK = (FSP_SelectiveNACK *)(gaps + n);
+	// TODO: hope to minimize internal state to save
+	if (n > 0 && int32_t(seq0 - pControlBlock->recvWindowFirstSN) > 0)
 	{
-		int32_t k = int32_t(seq0 - pControlBlock->recvWindowFirstSN) + pControlBlock->recvWindowHeadPos;
+		int32_t k = int32_t(seq0 - pControlBlock->recvWindowFirstSN) - 1;
+		pControlBlock->AddRoundRecvBlockN(k, pControlBlock->recvWindowHeadPos);
 		if (k >= pControlBlock->recvBufferBlockN)
-			k -= pControlBlock->recvBufferBlockN;
-		if (k < 0 || k >= pControlBlock->recvBufferBlockN)
 			return -EACCES;	// memory access error!
 		ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadRecv() + k;
 		pSNACK->tLazyAck = htobe64(NowUTC() - skb->timeRecv);
@@ -588,14 +588,14 @@ int32_t LOCALAPI CSocketItemEx::GenerateSNACK(FSP_PreparedKEEP_ALIVE &buf, Contr
 	buf.n = n;
 	while(--n >= 0)
 	{
-		pGaps[n].dataLength = htobe32(pGaps[n].dataLength);
-		pGaps[n].gapWidth = htobe32(pGaps[n].gapWidth);
+		gaps[n].dataLength = htobe32(gaps[n].dataLength);
+		gaps[n].gapWidth = htobe32(gaps[n].gapWidth);
 	}
 
 	InterlockedIncrement(& nextOOBSN);	// Because lastOOBSN start from zero as well. See ValidateSNACK
 	pSNACK->serialNo = htobe32(nextOOBSN);
 	pSNACK->hs.Set(SELECTIVE_NACK, nPrefix);
-	return int32_t((uint8_t *)pSNACK + sizeof(FSP_SelectiveNACK) - (uint8_t *)pGaps) + nPrefix;
+	return int32_t((uint8_t *)pSNACK + sizeof(FSP_SelectiveNACK) - (uint8_t *)gaps) + nPrefix;
 }
 
 
@@ -603,7 +603,6 @@ int32_t LOCALAPI CSocketItemEx::GenerateSNACK(FSP_PreparedKEEP_ALIVE &buf, Contr
 // INIT_CONNECT, timestamp, Cookie, Salt, ephemeral-key, half-connection parameters [, resource requirement]
 void CSocketItemEx::InitiateConnect()
 {
-	// Note tht we cannot put initial SN into ephemeral session key as the peers do not have the same initial SN
 	SConnectParam & initState = pControlBlock->connectParams;
 	rand_w32((uint32_t *) & initState,
 		( sizeof(initState.initCheckCode)
@@ -633,8 +632,7 @@ void CSocketItemEx::InitiateConnect()
 	q->hs.Set<FSP_InitiateRequest, INIT_CONNECT>();	// See also AffirmConnect()
 
 	q->timeStamp = initState.nboTimeStamp;
-	skb->MarkComplete();	// for resend
-	// it neednot be unlocked
+	skb->ReInitMarkComplete();
 	SendPacket(1, ScatteredSendBuffers(q, sizeof(FSP_InitiateRequest)));
 	skb->timeSent = tRecentSend;
 
@@ -726,7 +724,7 @@ void CSocketItemEx::InitiateMultiply(CSocketItemEx *srcItem)
 	// MULTIPLY can only be the very first packet
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend();
 	void * payload = GetSendPtr(skb);
-	FSP_NormalPacketHeader q;
+	ALIGN(MAC_ALIGNMENT) FSP_InternalFixedHeader q;
 	lastOOBSN = 0;	// As the response from the peer, if any, is not an out-of-band packet
 	q.Set(MULTIPLY
 		, sizeof(FSP_NormalPacketHeader)
@@ -744,12 +742,13 @@ void CSocketItemEx::InitiateMultiply(CSocketItemEx *srcItem)
 	if (paidLoad != this->cipherText)
 		memcpy(this->cipherText, paidLoad, skb->len);
 	memcpy(payload, &q, sizeof(FSP_NormalPacketHeader));
-	//
-	SendPacket(2, ScatteredSendBuffers(payload, sizeof(FSP_NormalPacketHeader), this->cipherText, skb->len));
+
 	pControlBlock->SetFirstSendWindowRightEdge();
+	SyncState();
+	SendPacket(2, ScatteredSendBuffers(payload, sizeof(FSP_NormalPacketHeader), this->cipherText, skb->len));
+	skb->MarkSent();
 	//
 	tSessionBegin = skb->timeSent = tRecentSend;	// UNRESOLVED!? But if SendPacket failed?
-	SyncState();
 	// tRoundTrip_us would be calculated when PERSIST is got, when tLastRecv is set as well
 	ReplaceTimer(INIT_RETRANSMIT_TIMEOUT_ms);
 }
@@ -828,7 +827,7 @@ void CMultiplyBacklogItem::ResponseToMultiply()
 // Do
 //	Acknowledge the connection/multiplication of connection request by sending the head packet in the send queue
 // Remark
-//	Send the first packet in the send queuea only, for sake of congestion control
+//	Send the first packet in the send queue only, for sake of congestion control
 //	ACK_CONNECT_REQUEST is resent on requested only.
 //	bind to the interface as soon as the control block mapped into server's memory space
 // See also
@@ -840,24 +839,23 @@ void CSocketItemEx::Accept()
 
 	InitAssociation();
 	//
+	pControlBlock->SetFirstSendWindowRightEdge();
 	if(lowState == CHALLENGING)
 	{
-		ReplaceTimer(TRANSIENT_STATE_TIMEOUT_ms);	// The socket slot might be a reused one
 		InstallEphemeralKey();
 		//^ ephemeral session key material was ready when CSocketItemDl::PrepareToAccept
+		EmitStart();
 		pControlBlock->notices.SetHead(NullCommand);
 		//^ The success or failure signal is delayed until ACK_START, PERSIST or RESET received
+		ReplaceTimer(TRANSIENT_STATE_TIMEOUT_ms);	// The socket slot might be a reused one
 	}
 	else
 	{
 		// Timer has been set when the socket slot was prepared on getting MULTIPLY
 		((CMultiplyBacklogItem *)this)->ResponseToMultiply();
-		// UNRESOLVED!? Implement lazy notification to wait further data?
-		AddResendTimer(tRoundTrip_us >> 8);	// tRoundTrip_us was set OnGetMultiply
+		EmitStart();
+		AddResendTimer();
 	}
-	//
-	EmitStart();
-	pControlBlock->SetFirstSendWindowRightEdge();
 	//
 	tSessionBegin = tRecentSend;
 	SetMutexFree();
@@ -865,14 +863,35 @@ void CSocketItemEx::Accept()
 
 
 
-// Send the normal 'RELEASE' command
+// Send or resend the normal 'RELEASE' command. RELEASE includes the ACK_FLUSH semantics
 bool CSocketItemEx::SendRelease()
 {
-	FSP_NormalPacketHeader hdr;		// See also AffirmConnect and EmitStart
-	pControlBlock->SetSequenceFlags(& hdr, pControlBlock->sendWindowNextSN);
-	hdr.hs.Set<FSP_NormalPacketHeader, RELEASE>();
-	SetIntegrityCheckCode(& hdr);
-	return (SendPacket(1, ScatteredSendBuffers(&hdr, sizeof(hdr))) >= 0);
+	uint32_t N = (uint32_t)pControlBlock->CountSendBuffered();
+	if (N > 1)
+		return false;
+
+	ControlBlock::PFSP_SocketBuf skb;
+	PFSP_InternalFixedHeader pHdr;
+	if (N == 1)
+	{
+		skb = pControlBlock->GetSendQueueHead();
+		if (skb->opCode != RELEASE)
+			return false;
+		pHdr = (PFSP_InternalFixedHeader)GetSendPtr(skb);
+	}
+	else // N == 0
+	{
+		skb = pControlBlock->GetSendBuf();
+		skb->opCode = RELEASE;
+		skb->len = sizeof(FSP_NormalPacketHeader);
+		//
+		pHdr = (PFSP_InternalFixedHeader)GetSendPtr(skb);
+		pHdr->SetSequenceFlags(pControlBlock, pControlBlock->sendWindowNextSN);
+		pHdr->hs.Set<FSP_NormalPacketHeader, RELEASE>();
+		SetIntegrityCheckCode(pHdr);
+	}
+
+	return (SendPacket(1, ScatteredSendBuffers(pHdr, sizeof(FSP_NormalPacketHeader))) >= 0);
 }
 
 
@@ -880,8 +899,8 @@ bool CSocketItemEx::SendRelease()
 // Send the abnormal 'RESET' command
 void CSocketItemEx::SendReset()
 {
-	FSP_NormalPacketHeader hdr;		// See also SendKeepAlive and SendAckFlush
-	pControlBlock->SetSequenceFlags(& hdr, pControlBlock->sendWindowNextSN - 1);
+	ALIGN(MAC_ALIGNMENT) FSP_InternalFixedHeader hdr;
+	hdr.SetSequenceFlags(pControlBlock, pControlBlock->welcomedNextSNtoSend);
 	hdr.hs.Set<FSP_NormalPacketHeader, RESET>();
 	SetIntegrityCheckCode(& hdr);
 	SendPacket(1, ScatteredSendBuffers(&hdr, sizeof(hdr)));

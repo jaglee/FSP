@@ -373,7 +373,7 @@ void UnitTestGCM_AES()
 
 void UnitTestQuasibitfield()
 {
-	FSP_AckConnectRequest acknowledgement;
+	FSP_InternalFixedHeader acknowledgement;
 
 	acknowledgement.SetRecvWS(0x1);
 	Assert::IsTrue(acknowledgement.flags_ws[1] == 0
@@ -393,14 +393,7 @@ void UnitTestQuasibitfield()
 		&& acknowledgement.flags_ws[3] == 1);
 
 	acknowledgement.ClearFlags();
-
-	acknowledgement.SetFlag<TransactionEnded>();
-	Assert::AreEqual<int>(acknowledgement.GetFlag<TransactionEnded>(), 128);
-	Assert::IsTrue(acknowledgement.flags_ws[0] == 128);
-	//
-	acknowledgement.ClearFlag<TransactionEnded>();
 	Assert::IsTrue(acknowledgement.flags_ws[0] == 0);
-	Assert::AreEqual<int>(acknowledgement.GetFlag<TransactionEnded>(), 0);
 }
 
 

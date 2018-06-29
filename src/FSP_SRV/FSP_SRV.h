@@ -66,6 +66,8 @@ void rand_w32(uint32_t *p, int n) { for (register int i = 0; i < min(n, 32); i++
 // Return the number of microseconds elapsed since Jan 1, 1970 (unix epoch time)
 extern "C" timestamp_t NowUTC();
 
+
+
 /**
 * It requires Advanced IPv6 API support to get the application layer thread ID from the IP packet control structure
 */
@@ -81,19 +83,6 @@ struct CtrlMsgHdr
 	FSP_SINKINF	u;
 
 	bool IsIPv6() const { return (pktHdr.cmsg_level == IPPROTO_IPV6); }
-};
-
-
-
-// Applier should make sure together with the optional header it would be fit in one IPv6 or UDP packet
-struct FSP_PreparedKEEP_ALIVE
-{
-	FSP_SelectiveNACK::GapDescriptor gaps
-		[(MAX_BLOCK_SIZE - sizeof(FSP_SelectiveNACK)) / sizeof(FSP_SelectiveNACK::GapDescriptor)];
-	FSP_SelectiveNACK sentinel;
-	//
-	uint32_t		n;	// n >= 0, number of (gapWidth, dataLength) tuples
-	uint32_t		GetSaltValue() const { return gaps[n].gapWidth; }	// it overlays on serialNo
 };
 
 
@@ -197,16 +186,69 @@ public:
 
 
 
+typedef struct FSP_InternalFixedHeader : FSP_NormalPacketHeader
+{
+	void Set(FSPOperationCode code, uint16_t hsp, uint32_t seqThis, uint32_t seqExpected, int32_t advRecvWinSize)
+	{
+		hs.Set(code, hsp);
+		expectedSN = htobe32(seqExpected);
+		sequenceNo = htobe32(seqThis);
+		ClearFlags();
+		SetRecvWS(advRecvWinSize);
+	}
+	void SetRecvWS(int32_t v) { flags_ws[1] = (octet)(v >> 16); flags_ws[2] = (octet)(v >> 8); flags_ws[3] = (octet)v; }
+
+	void ClearFlags() { flags_ws[0] = 0; }
+
+	// Given
+	//	ControlBlock *			the context of the packet header to prepar
+	//	ControlBlock::seq_t		the intent sequence number of the packet
+	// Do
+	//	Set the sequence number, expected sequence number for accumulative acknowledgement,
+	//	flags and the advertised receive window size field of the FSP header 
+	void SetSequenceFlags(ControlBlock *pControlBlock, ControlBlock::seq_t seq1)
+	{
+		expectedSN = htobe32(pControlBlock->recvWindowNextSN);
+		sequenceNo = htobe32(seq1);
+		ClearFlags();
+		SetRecvWS(pControlBlock->AdRecvWS(pControlBlock->recvWindowNextSN));
+	}
+
+
+	// Get the first extension header
+	PFSP_HeaderSignature PFirstExtHeader() const
+	{
+		return (PFSP_HeaderSignature)((uint8_t *)this + be16toh(hs.hsp) - sizeof($FSP_HeaderSignature));
+	}
+
+	// Get next extension header
+	// Given
+	//	The pointer to the current extension header
+	// Return
+	//	The pointer to the next optional header, NULL if it is illegal
+	// Remark
+	//	The caller should check that pStackPointer does not fall into dead-loop
+	template<typename THdr>	PFSP_HeaderSignature PHeaderNextTo(void *p0) const
+	{
+		uint16_t sp = be16toh(((THdr *)p0)->hs.hsp);
+		if (sp < sizeof(FSP_NormalPacketHeader) || sp >(uint8_t *)p0 - (uint8_t *)this)
+			return NULL;
+		return (PFSP_HeaderSignature)((uint8_t *)this + sp - sizeof($FSP_HeaderSignature));
+	}
+} *PFSP_InternalFixedHeader;
+
+
+
 struct PktBufferBlock
 {
 	ALIGN(MAC_ALIGNMENT)
 	int32_t	lenData;
 	ControlBlock::seq_t	pktSeqNo;	// in host byte-order
 	ALFIDPair	fidPair;
-	FSP_NormalPacketHeader hdr;
+	FSP_InternalFixedHeader hdr;
 	BYTE	payload[MAX_BLOCK_SIZE];
 	//
-	FSP_NormalPacketHeader *GetHeaderFSP() { return &(this->hdr); }
+	PFSP_InternalFixedHeader GetHeaderFSP() { return &(this->hdr); }
 };
 
 
@@ -223,6 +265,29 @@ struct ScatteredSendBuffers
 		scattered[2].buf = (CHAR *)p2;
 		scattered[2].len = n2;
 	}
+};
+
+
+
+// Applier should make sure together with the optional header it would be fit in one IPv6 or UDP packet
+struct FSP_PreparedKEEP_ALIVE
+{
+	FSP_SelectiveNACK::GapDescriptor gaps
+		[(MAX_BLOCK_SIZE - sizeof(FSP_SelectiveNACK)) / sizeof(FSP_SelectiveNACK::GapDescriptor)];
+	FSP_SelectiveNACK sentinel;
+	//
+	uint32_t		n;	// n >= 0, number of (gapWidth, dataLength) tuples
+	uint32_t		GetSaltValue() const { return gaps[n].gapWidth; }	// it overlays on serialNo
+};
+
+
+
+struct SKeepAliveCache
+{
+	FSP_InternalFixedHeader	hdr;
+	FSP_ConnectParam		mp;
+	FSP_PreparedKEEP_ALIVE	snack;
+	void SetHostID(PSOCKADDR_IN6 ipi6) { mp.idListener = SOCKADDR_HOSTID(ipi6); }
 };
 
 
@@ -360,14 +425,6 @@ class CSocketItemEx: public CSocketItem
 	//
 	bool IsProcessAlive();
 	//
-	struct SKeepAliveCache
-	{
-		FSP_NormalPacketHeader	hdr;
-		FSP_ConnectParam		mp;
-		FSP_PreparedKEEP_ALIVE	snack;
-		void SetHostID(PSOCKADDR_IN6 ipi6) { mp.idListener = SOCKADDR_HOSTID(ipi6); }
-	} keepAliveCache;
-
 protected:
 	PktBufferBlock * headPacket;	// But UNRESOLVED! There used to be an independent packet queue for each SCB for sake of fairness
 	TSubnets	savedPathsToNearEnd;
@@ -376,6 +433,8 @@ protected:
 	char		mobileNoticeInFlight;
 	//
 	ICC_Context	contextOfICC;
+	ALIGN(MAC_ALIGNMENT)
+	SKeepAliveCache keepAliveCache;
 	ALIGN(MAC_ALIGNMENT)
 	octet		cipherText[MAX_BLOCK_SIZE];
 
@@ -418,7 +477,7 @@ protected:
 	void AbortLLS(bool haveTLBLocked = false);
 
 	void AddLazyAckTimer();
-	bool AddResendTimer(uint32_t);
+	bool AddResendTimer();
 	// Side-effect: clear the isInUse flag
 	void RemoveTimers();
 	bool LOCALAPI ReplaceTimer(uint32_t);
@@ -432,17 +491,13 @@ protected:
 	// synchronize the state in the 'cache' and the real state in the session control block
 	void SyncState() { _InterlockedExchange8((char *)& lowState, pControlBlock->state); tMigrate = NowUTC(); }
 	void SetState(FSP_Session_State s) { _InterlockedExchange8((char *)& pControlBlock->state, s); SyncState(); }
-	bool HasBeenCommitted()
-	{
-		bool b = pControlBlock->HasBeenCommitted();
-		if (b)
-			pControlBlock->SnapshotReceiveWindowRightEdge();
-		return b;
-	}
+
+	bool HasBeenCommitted() { return pControlBlock->HasBeenCommitted(); }
 	inline void TransitOnPeerCommit();
+
 	bool HandlePeerSubnets(PFSP_HeaderSignature);
 
-	// return -EEXIST if overriden, -EFAULT if memory error, or payload effectively placed
+	// return -EEXIST if overridden, -EFAULT if memory error, or payload effectively placed
 	int	PlacePayload();
 
 	int	 SendPacket(register ULONG, ScatteredSendBuffers);
@@ -526,7 +581,7 @@ public:
 
 	void AffirmConnect(const SConnectParam &, ALFID_T);
 
-	// Calculte offset of the given sequence number to the left edge of the receive window
+	// Calculate offset of the given sequence number to the left edge of the receive window
 	int32_t OffsetToRecvWinLeftEdge(ControlBlock::seq_t seq1)
 	{
 		return int32_t(seq1 - _InterlockedOr((LONG *)& pControlBlock->recvWindowFirstSN, 0));
@@ -534,18 +589,19 @@ public:
 
 	// Given
 	//	ControlBlock::seq_t	The sequence number of the packet that mostly expected by the remote end
-	//	unsigned int		The advertised size of the receive window, start from aforementioned most expected packet
 	// Return
-	//	Whether the given sequence number is legitimate
-	// Remark
-	//	If the given sequence number is legitimate, send window size of the near end is adjusted
-	bool LOCALAPI ResizeSendWindow(ControlBlock::seq_t seq1, unsigned int adRecvWS)
+	//	true if the sequence number of the expected packet fall in the send window of the near end
+	//	false if otherwise
+	// Apply this function to counter back some replay-attack
+	bool IsAckExpected(ControlBlock::seq_t seq1)
 	{
-		return pControlBlock->ResizeSendWindow(seq1, adRecvWS);
+		int32_t d = int32_t(seq1 - pControlBlock->sendWindowNextSN);
+		return (0 <= d + pControlBlock->sendBufferBlockN && d <= 0);
 	}
 
-	// Given the fixed header, the content (plaintext), the length of the context and the xor-value of salt
+	// Given the fixed header, the content (plain-text), the length of the context and the xor-value of salt
 	void * LOCALAPI SetIntegrityCheckCode(FSP_NormalPacketHeader *, void * = NULL, int32_t = 0, uint32_t = 0);
+
 	// Solid input,  the payload, if any, is copied later
 	bool LOCALAPI ValidateICC(FSP_NormalPacketHeader *, int32_t, ALFID_T, uint32_t);
 	bool ValidateICC() { return ValidateICC(headPacket->GetHeaderFSP(), headPacket->lenData, fidPair.peer, 0); }
@@ -553,20 +609,13 @@ public:
 	bool LOCALAPI ValidateSNACK(ControlBlock::seq_t &, FSP_SelectiveNACK::GapDescriptor * &, int &);
 	// Register source IPv6 address of a validated received packet as the favorite returning IP address
 	inline void ChangeRemoteValidatedIP();
-	// Check whether previous KEEP_ALIVE is implicitly acknowledged on gettting a validated packet
+	// Check whether previous KEEP_ALIVE is implicitly acknowledged on getting a validated packet
 	inline void CheckAckToKeepAlive();
 
 	int	EmitNextToSend();
 	// Normally those pended on the queue would be eventually sent if the send window size is greater than 0
 	// retry to probe the advertised receive window size of the peer to adjust the send window size.
-	void EmitProbe()
-	{
-		if (int(pControlBlock->sendWindowLimitSN - pControlBlock->sendWindowFirstSN) <= 0)
-			EmitNextToSend();
-		AddResendTimer(tRoundTrip_us >> 8);
-	}
 	void EmitQ();
-	void ScheduleEmitQ();
 	void ScheduleConnect(CommandNewSessionSrv *);
 
 	// Command of ULA
@@ -786,7 +835,6 @@ public:
 
 // OS-specific thread-pool related, for Windows LPTHREAD_START_ROUTINE function
 DWORD WINAPI HandleConnect(LPVOID);
-DWORD WINAPI HandleSendQ(LPVOID);
 
 // defined in socket.cpp
 void LOCALAPI DumpHexical(const void *, int);

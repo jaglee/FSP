@@ -178,15 +178,15 @@ void UnitTestICC()
 	// Merge the KEEP_ALIVE packet testing...
 	// It's most complicated in the sense that 
 	ControlBlock::PFSP_SocketBuf skb1 = socketR2.AllocRecvBuf(FIRST_SN + 1);
-	skb1->MarkComplete();
+	skb1->ReInitMarkComplete();
 	pCBR->recvWindowNextSN++;		// == FIRST_SN + 1
 
 	// See also: timer.cpp::KeepAlive
 	ControlBlock::seq_t seq0;
 	struct
 	{
-		FSP_NormalPacketHeader hdr;
-		FSP_PreparedKEEP_ALIVE buf;
+		FSP_InternalFixedHeader hdr;
+		FSP_PreparedKEEP_ALIVE	buf;
 	} mp;
 	int sizeSNACK = socketR2.GenerateSNACK(mp.buf, seq0, sizeof(FSP_NormalPacketHeader));
 	uint32_t salt = mp.buf.sentinel.serialNo;
@@ -194,7 +194,7 @@ void UnitTestICC()
 
 	mp.hdr.hs.Set(KEEP_ALIVE, sizeof(FSP_NormalPacketHeader) + sizeSNACK);
 	// pSCB->SetSequenceFlags(& mp.hdr, FIRST_SN + FSP_REKEY_THRESHOLD);
-	pSCB->SetSequenceFlags(& mp.hdr, FIRST_SN + 1);
+	mp.hdr.SetSequenceFlags(pSCB, FIRST_SN + 1);
 	mp.hdr.expectedSN = htobe32(seq0);
 	//
 	socket.SetIntegrityCheckCode(& mp.hdr, NULL, 0, salt);
@@ -307,21 +307,21 @@ void UnitTestHMAC()
 	// Merge the KEEP_ALIVE packet testing...
 	// It's most complicated in the sense that 
 	ControlBlock::PFSP_SocketBuf skb1 = socketR2.AllocRecvBuf(FIRST_SN + 1);
-	skb1->MarkComplete();
+	skb1->ReInitMarkComplete();
 
 	// See also: timer.cpp::KeepAlive
 	ControlBlock::seq_t seq0;
 	struct
 	{
-		FSP_NormalPacketHeader hdr;
-		FSP_PreparedKEEP_ALIVE buf;
+		FSP_InternalFixedHeader hdr;
+		FSP_PreparedKEEP_ALIVE	buf;
 	} mp;
 	int sizeSNACK = socketR2.GenerateSNACK(mp.buf, seq0, sizeof(FSP_NormalPacketHeader));
 	uint32_t salt = mp.buf.sentinel.serialNo;
 	printf_s("Size of the SNACK header = %d, expected SN = %u, salt=0x%X\n", sizeSNACK, seq0, salt);
 
 	mp.hdr.hs.Set(KEEP_ALIVE, sizeof(FSP_NormalPacketHeader) + sizeSNACK);
-	pSCB->SetSequenceFlags(&mp.hdr, pSCB->sendWindowNextSN);
+	mp.hdr.SetSequenceFlags(pSCB, pSCB->sendWindowNextSN);
 	mp.hdr.expectedSN = htobe32(seq0);
 	//
 	socketR2.SetIntegrityCheckCode(&mp.hdr, NULL, 0, salt);

@@ -43,12 +43,18 @@ struct _CookieMaterial
 
 
 
-#if defined(TRACE) && (TRACE & TRACE_HEARTBEAT) && (TRACE & TRACE_PACKET)
+#if (TRACE & (TRACE_HEARTBEAT | TRACE_OUTBAND | TRACE_SLIDEWIN)) && (TRACE & TRACE_PACKET)
 #define TRACE_SOCKET()	\
 	(printf_s(__FUNCTION__ ": local fiber#%u(_%X_) in state %s\n"	\
 		, fidPair.source, be32toh(fidPair.source)		\
 		, stateNames[lowState])	\
 	&& pControlBlock->DumpSendRecvWindowInfo())
+#elif (TRACE & (TRACE_ULACALL | TRACE_SLIDEWIN))
+#define TRACE_SOCKET()	\
+	(printf_s(__FUNCTION__ ": local fiber#%u(_%X_) in state %s\n"	\
+		, fidPair.source, be32toh(fidPair.source)		\
+		, stateNames[lowState])	\
+	&& pControlBlock->DumpRecvQueueInfo())
 #else
 #define TRACE_SOCKET()
 #endif
@@ -164,7 +170,7 @@ void LOCALAPI CLowerInterface::OnGetInitConnect()
 	if(fiberID == 0)
 	{
 		SendPrematureReset(ENOENT);
-		return;
+		goto l_return;
 	}
 
 	// To make the FSP challenge of the responder	
@@ -187,6 +193,7 @@ void LOCALAPI CLowerInterface::OnGetInitConnect()
 	SetLocalFiberID(fiberID);
 	SendBack((char *) & challenge, sizeof(challenge));
 
+l_return:
 	pSocket->SetMutexFree();
 }
 
@@ -263,7 +270,7 @@ void LOCALAPI CLowerInterface::OnGetConnectRequest()
 		{
 			if(! pSocket->WaitUseMutex())
 				return;
-			pSocket->EmitStart();	// hitted
+			pSocket->EmitStart(); // hit
 			pSocket->SetMutexFree();
 
 		}
@@ -349,7 +356,6 @@ void LOCALAPI CLowerInterface::OnGetConnectRequest()
 	backlogItem.idParent = 0;
 	rand_w32(& backlogItem.initialSN, 1);
 	backlogItem.expectedSN = be32toh(q->initialSN);	// CONNECT_REQUEST does NOT consume a sequence number
-
 
 	// lastly, put it into the backlog
 	if (pSocket->pControlBlock->backLog.Put(&backlogItem) < 0)
@@ -475,7 +481,7 @@ bool LOCALAPI CSocketItemEx::ValidateSNACK(ControlBlock::seq_t & ackSeqNo, FSP_S
 	uint32_t salt = pSNACK->serialNo;
 	uint32_t sn = be32toh(salt);
 
-	if(int32_t(sn - lastOOBSN) <= 0)
+	if (int32_t(sn - lastOOBSN) <= 0)
 	{
 #ifdef TRACE
 		printf_s("%s has encountered replay attack? Sequence number:\n\tinband %u, oob %u - %u\n"
@@ -494,17 +500,18 @@ bool LOCALAPI CSocketItemEx::ValidateSNACK(ControlBlock::seq_t & ackSeqNo, FSP_S
 	DumpNetworkUInt16((uint16_t *)p1, offset / 2);
 #endif
 
+	ackSeqNo = be32toh(p1->expectedSN);
+	if (!IsAckExpected(ackSeqNo))
+		return false;
+
 	if(! ValidateICC(p1, 0, fidPair.peer, salt))	// No! Extension header is not encrypted!
 	{
 #ifdef TRACE
-		printf_s("Invalid intergrity check code of %s!? Acknowledged sequence number: %u\n", opCodeStrings[p1->hs.opCode], ackSeqNo);
+		printf_s("Invalid integrity check code of %s for fiber#%u!?\n"
+				 "Acknowledged sequence number: %u\n" , opCodeStrings[p1->hs.opCode], fidPair.source, ackSeqNo);
 #endif
 		return false;
 	}
-
-	ackSeqNo = be32toh(p1->expectedSN);
-	if (!ResizeSendWindow(ackSeqNo, p1->GetRecvWS()))
-		return false;
 
 	n = offset - be16toh(pSNACK->hs.hsp) - sizeof(FSP_SelectiveNACK);
 	if (n < 0 || n % sizeof(FSP_SelectiveNACK::GapDescriptor) != 0)
@@ -513,10 +520,9 @@ bool LOCALAPI CSocketItemEx::ValidateSNACK(ControlBlock::seq_t & ackSeqNo, FSP_S
 		return false;
 	}
 
-	gaps = (FSP_SelectiveNACK::GapDescriptor *)((BYTE *)pSNACK - n);
-	if(n == 0)
-		return true;
+	pControlBlock->ResizeSendWindow(ackSeqNo, p1->GetRecvWS());
 
+	gaps = (FSP_SelectiveNACK::GapDescriptor *)((BYTE *)pSNACK - n);
 	n /= sizeof(FSP_SelectiveNACK::GapDescriptor);
 #if defined(TRACE) && (TRACE & (TRACE_PACKET | TRACE_SLIDEWIN))
 	printf_s("%s has %d gap(s), sequence number: %u\t%u\n", opCodeStrings[p1->hs.opCode], n, headPacket->pktSeqNo, sn);
@@ -588,10 +594,10 @@ void CSocketItemEx::OnConnectRequestAck(PktBufferBlock *pktBuf, int lenData)
 	}
 
 	// Now the packet can be legitimately accepted
-	tSessionBegin = tLastRecv = NowUTC();
 	// Enable the time-out mechanism
+	// Ignore granularity of OS time-slice here, which may slightly affect calculation of RTT
+	tSessionBegin = tMigrate = tLastRecv = NowUTC();
 	lowState = PRE_CLOSED;
-	// OS time-slice, if any, might somewhat affect calculating of RTT. But it can be igored for large BDP pipe
 	tRoundTrip_us = (uint32_t)min(UINT32_MAX, (tRoundTrip_us + (tSessionBegin - tRecentSend) + 1) >> 1);
 
 	// Attention Please! ACK_CONNECT_REQ may carry payload and thus consume the packet sequence space
@@ -644,15 +650,11 @@ void CSocketItemEx::OnGetAckStart()
 	bool isInitiativeState = InState(CHALLENGING) || InState(CLONING);
 	bool isMultiplying = InState(CLONING);
 
-	if (headPacket->lenData != 0)
-	{
-#ifdef TRACE
-		printf_s("ACK_START should be payloadless, but payload length received is %d\n", headPacket->lenData);
-#endif
-		return;
-	}
-
 	FSP_NormalPacketHeader *p1 = headPacket->GetHeaderFSP();
+	ControlBlock::seq_t ackSeqNo = be32toh(p1->expectedSN);
+	if (!IsAckExpected(ackSeqNo))
+		return;
+
 	if (!isMultiplying)	// the normality
 	{
 		// Although it lets ill-behaviored peer take advantage by sending ill-formed ACK_START
@@ -684,16 +686,17 @@ void CSocketItemEx::OnGetAckStart()
 		return;
 	}
 
-	ControlBlock::seq_t ackSeqNo = be32toh(p1->expectedSN);
-	if (!ResizeSendWindow(ackSeqNo, p1->GetRecvWS()))
-		return;
+	pControlBlock->ResizeSendWindow(ackSeqNo, p1->GetRecvWS());
 
-	// Just make it consume the sequence space slot in the receive queue
+	ControlBlock::PFSP_SocketBuf skb = pControlBlock->AllocRecvBuf(headPacket->pktSeqNo);
+	if (skb == NULL)
+		return;
 	// ACK_START has nothing to deliver to ULA
-	pControlBlock->SlideRecvSlotNextTo(headPacket->pktSeqNo);
+	pControlBlock->SlideRecvWindowByOne();
 
 	// ACK_START is always the accumulative acknowledgement to ACK_CONNECT_REQ or MULTIPLY
 	pControlBlock->SlideSendWindowByOne();	// See also RespondToSNACK
+
 	tLastRecv = NowUTC();
 	tRoundTrip_us = (uint32_t)min(UINT32_MAX, tLastRecv - tRecentSend);
 #if (TRACE & (TRACE_SLIDEWIN | TRACE_HEARTBEAT))
@@ -768,6 +771,10 @@ void CSocketItemEx::OnGetPersist()
 	}
 
 	FSP_NormalPacketHeader *p1 = headPacket->GetHeaderFSP();
+	ControlBlock::seq_t ackSeqNo = be32toh(p1->expectedSN);
+	if (!IsAckExpected(ackSeqNo))
+		return;
+
 	if (! isMultiplying)	// the normality
 	{
 		int32_t d = OffsetToRecvWinLeftEdge(headPacket->pktSeqNo);
@@ -798,9 +805,7 @@ void CSocketItemEx::OnGetPersist()
 		return;
 	}
 
-	ControlBlock::seq_t ackSeqNo = be32toh(p1->expectedSN);
-	if (!ResizeSendWindow(ackSeqNo, p1->GetRecvWS()))
-		return;
+	pControlBlock->ResizeSendWindow(ackSeqNo, p1->GetRecvWS());
 
 	int countPlaced = PlacePayload();
 	if (countPlaced == -EFAULT)
@@ -949,7 +954,7 @@ void CSocketItemEx::OnGetKeepAlive()
 // However ULA protocol designer must keep in mind that these prebuffered may be discarded
 void CSocketItemEx::OnGetPureData()
 {
-#if defined(TRACE) && (TRACE & TRACE_PACKET)
+#if (TRACE & TRACE_PACKET)
 	TRACE_SOCKET();
 #endif
 	if (!InStates(7, ESTABLISHED, COMMITTING, COMMITTED, CLONING, PEER_COMMIT, COMMITTING2, CLOSABLE))
@@ -974,22 +979,25 @@ void CSocketItemEx::OnGetPureData()
 		AddLazyAckTimer();	// It costs much less than to ValidateICC() or Notify()
 		return;
 	}
+
+	FSP_NormalPacketHeader *p1 = headPacket->GetHeaderFSP();
+	ControlBlock::seq_t ackSeqNo = be32toh(p1->expectedSN);
+	if (!IsAckExpected(ackSeqNo))
+		return;
+
 	if (!ValidateICC())
 	{
-#if defined(TRACE) && (TRACE & TRACE_SLIDEWIN)
+#if (TRACE & TRACE_SLIDEWIN)
 		printf_s("@%s: invalid ICC received\n", __FUNCTION__);
 		pControlBlock->DumpSendRecvWindowInfo();
 #endif
 		return;
 	}
 
-	FSP_NormalPacketHeader *p1 = headPacket->GetHeaderFSP();
-	ControlBlock::seq_t ackSeqNo = be32toh(p1->expectedSN);	
-	if (!ResizeSendWindow(ackSeqNo, p1->GetRecvWS()))
-		return;
+	pControlBlock->ResizeSendWindow(ackSeqNo, p1->GetRecvWS());
 
 	int r = PlacePayload();
-	if(r == -EFAULT)
+	if (r == -EFAULT)
 	{
 		BREAK_ON_DEBUG();	//TRACE_HERE("No buffer when the receive window is not closed?");
 		Notify(FSP_NotifyOverflow);
@@ -1001,7 +1009,7 @@ void CSocketItemEx::OnGetPureData()
 		return;
 	}
 	// If r == 0 the EoT flag MUST be set. But we put such check at DLL level
-	if(r < 0)
+	if (r < 0)
 	{
 #ifndef NDEBUG
 		printf_s("Fatal error when place payload, error number = %d\n", r);
@@ -1011,7 +1019,7 @@ void CSocketItemEx::OnGetPureData()
 
 	tLastRecv = NowUTC();
 	// State transition signaled to DLL CSocketItemDl::WaitEventToDispatch()
-	if(HasBeenCommitted())
+	if (HasBeenCommitted())
 	{
 		TransitOnPeerCommit();
 		Notify(FSP_NotifyToCommit);
@@ -1034,7 +1042,9 @@ void CSocketItemEx::OnGetPureData()
 // Side-effect: send ACK_FLUSH immediately
 void CSocketItemEx::TransitOnPeerCommit()
 {
-	_InterlockedExchange(&tLazyAck_us, 0);	// Cancel lazy acknowledgement, if any
+	pControlBlock->SnapshotReceiveWindowRightEdge();
+	// Cancel lazy acknowledgment, if any
+	_InterlockedExchange(&tLazyAck_us, 0);
 	switch (lowState)
 	{
 	case CHALLENGING:
@@ -1175,9 +1185,9 @@ void CSocketItemEx::OnGetMultiply()
 		return;	// stale packets are silently discarded
 	}
 
-	FSP_NormalPacketHeader *pFH = (FSP_NormalPacketHeader *)headPacket->GetHeaderFSP();	// the fixed header
 	uint32_t remoteHostID = pControlBlock->connectParams.remoteHostID;
 	ALFID_T idSource = headPacket->fidPair.source;
+	PFSP_InternalFixedHeader pFH = headPacket->GetHeaderFSP();
 	uint32_t salt = pFH->expectedSN;
 	// The out-of-band serial number is stored in p1->expectedSN
 	// Recover the hidden expected SN exploited by the peer
@@ -1185,7 +1195,7 @@ void CSocketItemEx::OnGetMultiply()
 	if (!ValidateICC(pFH, headPacket->lenData, idSource, salt))
 	{
 #if defined(TRACE) && (TRACE & TRACE_OUTBAND)
-		printf_s("Invalid intergrity check code of MULTIPLY\n"
+		printf_s("Invalid integrity check code of MULTIPLY\n"
 				 "  might be in the race condition that MULTIPLY received before ULA installed new key\n");
 #endif
 		return;
@@ -1317,6 +1327,8 @@ int CSocketItemEx::PlacePayload()
 		//
 		memcpy(ubuf, (BYTE *)pHdr + be16toh(pHdr->hs.hsp), headPacket->lenData);
 	}
+	// Or else might be zero for ACK_START or MULTIPLY packet
+
 	skb->version = pHdr->hs.major;
 	skb->opCode = pHdr->hs.opCode;
 	skb->CopyInFlags(pHdr);
@@ -1324,5 +1336,5 @@ int CSocketItemEx::PlacePayload()
 	skb->timeRecv = NowUTC();
 	skb->ReInitMarkComplete();
 
-	return headPacket->lenData;	// Might be zero for PERSIST or MULTIPLY packet
+	return headPacket->lenData;
 }

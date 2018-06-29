@@ -70,7 +70,7 @@ int FSPAPI ReadFrom(FSPHANDLE hFSPSocket, void *buf, int capacity, NotifyOrRetur
 int CSocketItemDl::RecvInline(CallbackPeeked fp1)
 {
 	if (!WaitUseMutex())
-		return -EDEADLK;
+		return (IsInUse() ? -EDEADLK : -EINTR);
 
 	if (waitingRecvBuf != NULL)
 	{
@@ -91,17 +91,15 @@ int CSocketItemDl::RecvInline(CallbackPeeked fp1)
 #endif
 	}
 	//
-	AddPollingTimer(TIMER_SLICE_ms);
-	peerCommitted = 0;	// peerCommitted is actually a per-transaction flag
+	EnablePolling();
 	if (! HasDataToDeliver())
 	{
 		SetMutexFree();
 		return 0;
 	}
-	// Exploit soft-interrupt work thread queue to avoid risk of stack overflow
+	// Let's the polling timer to call ProcessReceiveBuffer if nested
 	if (chainingReceive)
 	{
-		pControlBlock->notices.Put(FSP_NotifyDataReady);
 		SetMutexFree();
 		return 0;
 	}
@@ -126,11 +124,8 @@ int CSocketItemDl::RecvInline(CallbackPeeked fp1)
 // TODO: check whether the buffer overlapped?
 int LOCALAPI CSocketItemDl::ReadFrom(void * buffer, int capacity, NotifyOrReturn fp1)
 {
-#ifdef TRACE
-	printf_s("ReadFrom the FSP pipe to %p: byte[%d]\n", buffer, capacity);
-#endif
 	if (!WaitUseMutex())
-		return -EDEADLK;
+		return (IsInUse() ? -EDEADLK : -EINTR);
 	//
 	if (InterlockedCompareExchangePointer((PVOID *)& fpReceived, fp1, NULL) != NULL)
 	{
@@ -154,19 +149,15 @@ int LOCALAPI CSocketItemDl::ReadFrom(void * buffer, int capacity, NotifyOrReturn
 		SetMutexFree();
 		return 0;
 	}
+	peerCommitted = 0;	// See also ProcessReceiveBuffer
 
 	if (fpReceived != NULL)
 	{
 		bool b = HasDataToDeliver();
-		AddPollingTimer(TIMER_SLICE_ms);
-		if (!b)
+		EnablePolling();
+		// Let's the polling timer to call ProcessReceiveBuffer if nested
+		if (!b || chainingReceive)
 		{
-			SetMutexFree();
-			return 0;
-		}
-		if (chainingReceive)
-		{
-			pControlBlock->notices.Put(FSP_NotifyDataReady);
 			SetMutexFree();
 			return 0;
 		}
@@ -176,7 +167,6 @@ int LOCALAPI CSocketItemDl::ReadFrom(void * buffer, int capacity, NotifyOrReturn
 
 	// If it is blocking, wait until every slot in the receive buffer has been filled
 	// or the peer has committed the transmit transaction
-	peerCommitted = 0;	// See also ProcessReceiveBuffer, ReadInline
 	int32_t r;
 	while ((r = FetchReceived()) >= 0 && _InterlockedOr((LONG *)&bytesReceived, 0) < capacity)
 	{
@@ -228,12 +218,12 @@ int32_t CSocketItemDl::FetchReceived()
 		return 0;
 
 	ControlBlock::PFSP_SocketBuf p = pControlBlock->GetFirstReceived();
-	int sum = 0;
-	int n;
-	//
 	if(p->GetFlag<Compressed>() && pDecodeState == NULL && !AllocDecodeState())
 		return -ENOMEM;
 	//
+	int nPacket = 0;
+	int sum = 0;
+	int n;
 	for (; p->IsComplete(); p = pControlBlock->GetFirstReceived())
 	{
 		if(p->len > MAX_BLOCK_SIZE || p->len < 0)
@@ -272,8 +262,9 @@ int32_t CSocketItemDl::FetchReceived()
 		offsetInLastRecvBlock = 0;
 
 		bool b = p->GetFlag<TransactionEnded>();
-		// Slide the left border of the receive window before possibly set the flag 'end of received message'
-		pControlBlock->SlideRecvWindowByOne();
+		p->InitMarkLocked();
+		p->ClearFlags();
+		nPacket++;
 		//
 		if(b)
 		{
@@ -295,6 +286,8 @@ int32_t CSocketItemDl::FetchReceived()
 		}
 	}
 	//
+	pControlBlock->AddRoundRecvBlockN(pControlBlock->recvWindowHeadPos, nPacket);
+	InterlockedAdd((LONG *)&pControlBlock->recvWindowFirstSN, nPacket);
 	return sum;
 }
 
@@ -306,98 +299,79 @@ int32_t CSocketItemDl::FetchReceived()
 void CSocketItemDl::ProcessReceiveBuffer()
 {
 l_recursion:
-#ifdef TRACE
-	printf_s("Fiber#%u process receive buffer in %s\n", fidPair.source, stateNames[pControlBlock->state]);
-#endif
-	if (pControlBlock->state >= PRE_CLOSED)
-	{
-		SetMutexFree();
-		return;
-	}
-	CallbackPeeked fp1;
 	int32_t n;
-	//^in case that the flag set by previous RecvInline or FetchReceived disturbs current process
-	// RecvInline takes precedence
-	if ((fp1 = (CallbackPeeked)InterlockedExchangePointer((PVOID *)& fpPeeked, NULL)) != NULL)
+
+	// Conventional stream mode takes precedence
+	if (waitingRecvBuf != NULL && waitingRecvSize > 0)
 	{
-		int32_t m;
-		bool eot;
-		void *p = pControlBlock->InquireRecvBuf(n, m, eot);
-#ifdef TRACE
-		printf_s("RecvInline, data to deliver@%p, length = %d, eot = %d\n", p, n, (int)eot);
-#endif
-		if (eot)
+		peerCommitted = 0;	// So that new flag might be retrieved
+		n = FetchReceived();
+		if (n < 0)
 		{
-#ifdef TRACE
-			printf_s("Transmit transaction terminated\n");
-#endif
-			peerCommitted = 1;
-		}
-		else if (n == 0)	// Redundant soft-interrupt shall be simply ignored
-		{
-			fpPeeked = fp1;
 			SetMutexFree();
+#ifdef TRACE
+			printf_s("FetchReceived() return %d when ProcessReceiveBuffer\n", n);
+#endif		
+			if (fpReceived != NULL)
+				fpReceived(this, FSP_NotifyDataReady, n);
+			else
+				NotifyError(FSP_NotifyDataReady, n);
 			return;
 		}
-		chainingReceive = 1;
-		SetMutexFree();
 
-		// It is possible that no meaningful payload is received but an EoT flag is got.
-		// The callback function should work in such senario
-		// It is also possible that p == NULL while n is the error code. The callback function MUST handle such scenario
-		bool b = fp1(this, p, n, eot);
-		if(!WaitUseMutex())
-			return;	// it could be disposed in the callback function
-		chainingReceive = 0;
-		if (n < 0)
-			goto l_recursion;
-
-		// If the callback function happens to be updated, prefer the new one
-		if (b)
-			InterlockedCompareExchangePointer((PVOID *)&fpPeeked, fp1, NULL);
-		// Assume the call-back function did not mess up the receive queue
-		pControlBlock->MarkReceivedFree(m);
-
-		if (HasDataToDeliver())
-			goto l_recursion;
-		//
-		SetMutexFree();
-		return;
-	}
-
-	// it is possible that data is buffered and waiting to be delivered to ULA
-	if (waitingRecvBuf == NULL || waitingRecvSize <= 0 || fpReceived == NULL || !HasDataToDeliver())
-	{
-		SetMutexFree();
-		return;
-	}
-
-	peerCommitted = 0;	// Safely suppose there's some data to deliver
-	n = FetchReceived();
-	if (n < 0)
-	{
-		SetMutexFree();
-#ifdef TRACE
-		printf_s("FetchReceived() return %d when ProcessReceiveBuffer\n", n);
-#endif		
-		if (fpReceived != NULL)
-			fpReceived(this, FSP_NotifyDataReady, n);
+		if (peerCommitted || waitingRecvSize <= 0)
+		{
+			NotifyOrReturn fp1 = (NotifyOrReturn)InterlockedExchangePointer((PVOID *)& fpReceived, NULL);
+			waitingRecvBuf = NULL;
+			SetMutexFree();
+			// due to multi-task nature it could be already reset in the caller although fpReceived has been checked here
+			if (fp1 != NULL)
+				fp1(this, FSP_NotifyDataReady, bytesReceived);
+		}
 		else
-			NotifyError(FSP_NotifyDataReady, n);
+		{
+			SetMutexFree();
+		}
+
 		return;
 	}
 
-	if (peerCommitted || waitingRecvSize <= 0)
-	{
-		NotifyOrReturn fp1 = (NotifyOrReturn)InterlockedExchangePointer((PVOID *)& fpReceived, NULL);
-		waitingRecvBuf = NULL;
-		SetMutexFree();
-		// due to multi-task nature it could be already reset in the caller although fpReceived has been checked here
-		if (fp1 != NULL)
-			fp1(this, FSP_NotifyDataReady, bytesReceived);
-	}
-	else
+	CallbackPeeked fp1 = (CallbackPeeked)InterlockedExchangePointer((PVOID *)& fpPeeked, NULL);
+	if (fp1 == NULL)
 	{
 		SetMutexFree();
+		return;
 	}
+	int32_t m;
+	bool eot;
+	void *p = pControlBlock->InquireRecvBuf(n, m, eot);
+#ifdef TRACE
+	printf_s("RecvInline, data to deliver@%p, length = %d, eot = %d\n", p, n, (int)eot);
+#endif
+	if (!eot && n == 0)	// Redundant soft-interrupt shall be simply ignored
+	{
+		fpPeeked = fp1;
+		SetMutexFree();
+		return;
+	}
+
+	chainingReceive = 1;
+	SetMutexFree();
+	// It is possible that no meaningful payload is received but an EoT flag is got.
+	// The callback function should work in such senario
+	// It is also possible that p == NULL while n is the error code. The callback function MUST handle such scenario
+	// If the callback function happens to be updated, prefer the new one
+	if (fp1(this, p, n, eot))
+		InterlockedCompareExchangePointer((PVOID *)&fpPeeked, fp1, NULL);
+	chainingReceive = 0;
+	if (!WaitUseMutex())
+		return;	// it could be disposed in the callback function
+
+	// Assume the call-back function did not mess up the receive queue
+	pControlBlock->MarkReceivedFree(m);
+
+	if (HasDataToDeliver())
+		goto l_recursion;
+	//
+	SetMutexFree();
 }

@@ -689,11 +689,6 @@ void * LOCALAPI CSocketItemEx::SetIntegrityCheckCode(FSP_NormalPacketHeader *p1,
 		return NULL;
 	//
 	uint32_t seqNo = be32toh(p1->sequenceNo);
-#if defined(TRACE) && (TRACE & TRACE_PACKET)
-	printf_s("\nBefore SetIntegrityCheckCode: ptLen = %d\n", ptLen);
-	DumpNetworkUInt16((uint16_t *)p1, sizeof(FSP_NormalPacketHeader) / 2);
-#endif
-
 	void * buf = content;
 	// CRC64 is the initial integrity check algorithm
 	if(contextOfICC.keyLifeRemain == 0)
@@ -739,6 +734,14 @@ void * LOCALAPI CSocketItemEx::SetIntegrityCheckCode(FSP_NormalPacketHeader *p1,
 
 		ALIGN(MAC_ALIGNMENT) uint64_t tag[FSP_TAG_SIZE / sizeof(uint64_t)];
 		p1->integrity.id = fidPair;
+#ifdef DEBUG_ICC
+		printf_s("\nBefore SetIntegrityCheckCode: plain-text Len = %d, salt is %X\n", ptLen, salt);
+		printf_s("Context selected: ");
+		DumpNetworkUInt16((uint16_t *)pCtx->H, 8);
+		DumpNetworkUInt16((uint16_t *)pCtx->J, 8);
+		printf_s("Header, len = %d, and at most 8 octets of payload:\n", byteA);
+		DumpNetworkUInt16((uint16_t *)p1, byteA / 2 + min(4, ptLen / 2));
+#endif
 		GCM_AES_XorSalt(pCtx, salt);
 		if(GCM_AES_AuthenticatedEncrypt(pCtx, *(uint64_t *)p1
 			, (const uint8_t *)content, ptLen
@@ -755,9 +758,9 @@ void * LOCALAPI CSocketItemEx::SetIntegrityCheckCode(FSP_NormalPacketHeader *p1,
 		p1->integrity.code = tag[0];
 	}
 
-#if defined(TRACE) && (TRACE & TRACE_PACKET)
+#ifdef DEBUG_ICC
 	printf_s("After SetIntegrityCheckCode:\n");
-	DumpNetworkUInt16((uint16_t *)p1, sizeof(FSP_NormalPacketHeader) / 2);
+	DumpNetworkUInt16((uint16_t *)p1, byteA / 2 + min(4, ptLen / 2));
 #endif
 	return buf;
 }
@@ -782,10 +785,7 @@ bool LOCALAPI CSocketItemEx::ValidateICC(FSP_NormalPacketHeader *p1, int32_t ctL
 		return false;
 
 	tag[0] = p1->integrity.code;
-#if defined(TRACE) && (TRACE & TRACE_PACKET)
-	printf_s("Before ValidateICC:\n");
-	DumpNetworkUInt16((uint16_t *)p1, byteA / 2 + 4);
-#endif
+
 	uint32_t seqNo = be32toh(p1->sequenceNo);
 	register bool r;
 	// CRC64 is the initial integrity check algorithm
@@ -822,9 +822,17 @@ bool LOCALAPI CSocketItemEx::ValidateICC(FSP_NormalPacketHeader *p1, int32_t ctL
 		if(byteA < sizeof(FSP_NormalPacketHeader) || byteA > MAX_LLS_BLOCK_SIZE || (byteA & (sizeof(uint64_t) - 1)) != 0)
 			return false;
 
-		GCM_AES_XorSalt(pCtx, salt);
 		p1->integrity.id.source = idSource;
 		p1->integrity.id.peer = fidPair.source;
+#ifdef DEBUG_ICC
+		printf_s("Before ValidateICC, cipher-text Len = %d, salt is %X\n", ctLen, salt);
+		printf_s("Context selected: ");
+		DumpNetworkUInt16((uint16_t *)pCtx->H, 8);
+		DumpNetworkUInt16((uint16_t *)pCtx->J, 8);
+		printf_s("Header, len = %d, and at most 8 octets of payload:\n", byteA);
+		DumpNetworkUInt16((uint16_t *)p1, byteA / 2 + min(4, ctLen / 2));
+#endif
+		GCM_AES_XorSalt(pCtx, salt);
 		r = (GCM_AES_AuthenticateAndDecrypt(pCtx, *(uint64_t *)p1
 			, (const uint8_t *)p1 + byteA, ctLen
 			, (const uint64_t *)p1 + 1, byteA - sizeof(uint64_t)
@@ -834,9 +842,9 @@ bool LOCALAPI CSocketItemEx::ValidateICC(FSP_NormalPacketHeader *p1, int32_t ctL
 		GCM_AES_XorSalt(pCtx, salt);
 	}
 	p1->integrity.code = tag[0];
-#if defined(TRACE) && (TRACE & TRACE_PACKET)
+#ifdef DEBUG_ICC
 	printf_s("After ValidateICC:\n");
-	DumpNetworkUInt16((uint16_t *)p1, byteA / 2 + 4);
+	DumpNetworkUInt16((uint16_t *)p1, byteA / 2 + min(4, ctLen / 2));
 #endif
 	if(! r)
 		return false;
@@ -872,10 +880,12 @@ bool LOCALAPI CSocketItemEx::ValidateICC(FSP_NormalPacketHeader *p1, int32_t ctL
 //	Transmit the head packet in the send queue to the remote end
 // Remark
 //  The IP address of the near end may change dynamically
+//	The function shall be idempotent
+//	And it may only be exploited to send packet whose sequence number is the first in the send queue
 bool CSocketItemEx::EmitStart()
 {
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->GetSendQueueHead();
-	void  *payload = this->GetSendPtr(skb);
+	BYTE *payload = GetSendPtr(skb);
 	if(payload == NULL)
 	{
 		REPORT_ERRMSG_ON_TRACE("TODO: debug log memory corruption error");
@@ -883,33 +893,30 @@ bool CSocketItemEx::EmitStart()
 		return false;
 	}
 
-	register FSP_NormalPacketHeader * const pHdr = & pControlBlock->tmpHeader;
+	register PFSP_InternalFixedHeader pHdr;
 	int result;
 	skb->timeSent = NowUTC();	// This make the initial RTT including the near end's send delay, including timer slice jitter
 	switch (skb->opCode)
 	{
 	case ACK_CONNECT_REQ:
-		pControlBlock->SetSequenceFlags(pHdr, pControlBlock->sendWindowNextSN);
+		pHdr = (PFSP_InternalFixedHeader)payload;
+		pHdr->SetSequenceFlags(pControlBlock, pControlBlock->sendWindowFirstSN);
 		pHdr->integrity.code = htobe64(skb->timeSent);
 
 		CLowerInterface::Singleton.EnumEffectiveAddresses(pControlBlock->connectParams.allowedPrefixes);
-		memcpy((BYTE *)payload, pControlBlock->connectParams.allowedPrefixes, sizeof(TSubnets));
-
+		memcpy(pHdr + 1, pControlBlock->connectParams.allowedPrefixes, sizeof(TSubnets));
 		pHdr->hs.Set<FSP_AckConnectRequest, ACK_CONNECT_REQ>();
-		//
-		result = SendPacket(2, ScatteredSendBuffers(pHdr, sizeof(FSP_NormalPacketHeader), payload, skb->len));
+
+		result = SendPacket(1, ScatteredSendBuffers(payload, skb->len));
 		break;
+	case ACK_START:	// ACK_START is an in-band payload-less control packet that confirms a connection
 	case PERSIST:	// PERSIST is an in-band control packet with payload that start a transmit transaction
 		result = EmitWithICC(skb, pControlBlock->sendWindowFirstSN);
 		skb->MarkSent();
 		break;
-	case ACK_START:	// ACK_START is an in-band payloadless control packet that confirms a connection
-		result = EmitWithICC(skb, pControlBlock->sendWindowFirstSN);
-		skb->MarkSent();
-		break;
-		// Only possible for retransmission
 	case MULTIPLY:	// The MULTIPLY command head is stored in the queue while the encrypted payload is buffered in cipherText
 		result = SendPacket(2, ScatteredSendBuffers(payload, sizeof(FSP_NormalPacketHeader), this->cipherText, skb->len));
+		// Only possible for retransmission
 		break;
 	case INIT_CONNECT:
 	case CONNECT_REQUEST:
@@ -918,7 +925,7 @@ bool CSocketItemEx::EmitStart()
 		break;
 	default:
 		BREAK_ON_DEBUG();
-		result = 0;	// unrecognized packet type is simply ignored?!
+		return false;
 	}
 #if defined(TRACE) && (TRACE & TRACE_PACKET)
 	printf_s("Session#%u emit %s, result = %d, time : 0x%016llX\n"
@@ -939,8 +946,10 @@ bool CSocketItemEx::EmitStart()
 //	Negative if failed otherwise
 // Remark
 //  The IP address of the near end may change dynamically
+//	ICC, if required, is always set just before being sent
 int CSocketItemEx::EmitWithICC(ControlBlock::PFSP_SocketBuf skb, ControlBlock::seq_t seq)
 {
+	ALIGN(MAC_ALIGNMENT) FSP_InternalFixedHeader hdr;
 #if (TRACE & TRACE_HEARTBEAT)  || defined(EMULATE_LOSS)
 	volatile unsigned int vRand = 0;
 	if (rand_s((unsigned int *)&vRand) == 0 && vRand > (UINT_MAX >> 2) + (UINT_MAX >> 1))
@@ -969,21 +978,19 @@ int CSocketItemEx::EmitWithICC(ControlBlock::PFSP_SocketBuf skb, ControlBlock::s
 		return -EFAULT;
 	}
 
-	register FSP_NormalPacketHeader *pHdr = & pControlBlock->tmpHeader;
-	// ICC, if required, is always set just before being sent
-	pControlBlock->SetSequenceFlags(pHdr, seq);
-	skb->CopyFlagsTo(pHdr);
-	pHdr->hs.Set(skb->opCode, sizeof(FSP_NormalPacketHeader));
+	hdr.SetSequenceFlags(pControlBlock, seq);
+	skb->CopyFlagsTo(&hdr);
+	hdr.hs.Set(skb->opCode, sizeof(FSP_NormalPacketHeader));
 
-	// here we needn't check memory corruption as mishavior only harms himself
-	void * paidLoad = SetIntegrityCheckCode(pHdr, (BYTE *)payload, skb->len);
+	// here we needn't check memory corruption as misbehavior only harms himself
+	void * paidLoad = SetIntegrityCheckCode(&hdr, (BYTE *)payload, skb->len);
 	if(paidLoad == NULL)
 		return -EPERM;
 	//
 	int r = skb->len > 0
-		? SendPacket(2, ScatteredSendBuffers(pHdr, sizeof(FSP_NormalPacketHeader), paidLoad, skb->len))
-		: SendPacket(1, ScatteredSendBuffers(pHdr, sizeof(FSP_NormalPacketHeader)));
-	skb->timeSent = InterlockedOr((ULONGLONG *)& tRecentSend, 0);
+		? SendPacket(2, ScatteredSendBuffers(&hdr, sizeof(FSP_NormalPacketHeader), paidLoad, skb->len))
+		: SendPacket(1, ScatteredSendBuffers(&hdr, sizeof(FSP_NormalPacketHeader)));
+	skb->timeSent = tRecentSend;
 	return r;
 }
 
@@ -1095,33 +1102,43 @@ int CSocketItemEx::EmitNextToSend()
 
 	if (!skb->IsComplete())
 		return -EBUSY;	// ULA is still to fill the buffer
-
+#ifndef UNIT_TEST
 	if (EmitWithICC(skb, pControlBlock->sendWindowNextSN) <= 0)
 		return -EIO;
-
+#endif
 	skb->MarkSent();
+
+	pControlBlock->IncRoundSendBlockN(pControlBlock->sendWindowNextPos);
+	InterlockedIncrement(&pControlBlock->sendWindowNextSN);
 	return 0;
 }
 
 
 
-// Emit packet in the send queue, by default transmission of new packets takes precedence
-// To make life easier assume it has gain unique access to the LLS socket
+// To make life easier assume it has gained unique access to the LLS socket
+// Probe the size of the peer's receive window if
+// 1. there is some packet to send, but
+// 2. the advertised receive window to too small to accept further packet, and
+// 3. there is no packet on flight to detect the size of the peer's receive window
 // TODO: rate-control/quota control
-// for the protocol to work it should allow at least one packet in flight?
 void CSocketItemEx::EmitQ()
 {
-	const ControlBlock::seq_t sendBufferNextSN = _InterlockedOr((LONG *)& pControlBlock->sendBufferNextSN, 0);
-	const ControlBlock::seq_t lastSN = int(sendBufferNextSN - pControlBlock->sendWindowLimitSN) > 0
-		? pControlBlock->sendWindowLimitSN
-		: sendBufferNextSN;
-	while (int32_t(pControlBlock->sendWindowNextSN - lastSN) < 0)
+	if (pControlBlock->CountSendBuffered() <= 0)
+		return;
+
+	const ControlBlock::seq_t limitSN = pControlBlock->GetSendLimitSN();
+	if (int32_t(pControlBlock->sendWindowNextSN - limitSN) < 0)
+	{
+		int r;
+		do
+			r = EmitNextToSend();
+		while (r >= 0 && int32_t(pControlBlock->sendWindowNextSN - limitSN) <= 0);
+
+	}
+	else if (pControlBlock->CountSentInFlight() == 0)
 	{
 		EmitNextToSend();
-		pControlBlock->AddRoundSendBlockN(pControlBlock->sendWindowNextPos, 1);
-		InterlockedIncrement((LONG *)& pControlBlock->sendWindowNextSN);
 	}
-	//
-	if (int32_t(sendBufferNextSN - _InterlockedOr((LONG *)&pControlBlock->sendWindowFirstSN, 0) > 0))
-		AddResendTimer(tRoundTrip_us >> 8);
+	
+	AddResendTimer();
 }

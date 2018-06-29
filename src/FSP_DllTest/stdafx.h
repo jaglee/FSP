@@ -23,6 +23,7 @@ class CSocketItemDbg: CSocketItemDl
 {
 public:
 	ControlBlock * GetControlBlock() const { return pControlBlock; }
+	FSP_Session_State GetState() { return pControlBlock->state;  }
 	void SetEndTransaction() { committing = 1; }
 
 	friend void UnitTestPrepareToSend();

@@ -190,7 +190,6 @@ void Multiply(CommandCloneSessionSrv &cmd)
 	CSocketItemEx *newItem = CLowerInterface::Singleton.AllocItem();
 	if (newItem == NULL || !newItem->MapControlBlock(cmd))
 	{
-		srcItem->SetMutexFree();
 		if(newItem == NULL)
 		{
 			REPORT_ERRMSG_ON_TRACE("Cannot allocate new socket slot");
@@ -201,7 +200,7 @@ void Multiply(CommandCloneSessionSrv &cmd)
 			CLowerInterface::Singleton.FreeItem(newItem);
 		}
 		::SetEvent(cmd.hEvent);
-		return;
+		goto l_return;
 	}
 
 	newItem->shouldAppendCommit = cmd.committing;
@@ -236,7 +235,21 @@ void CSocketItemEx::ProcessCommand(CommandToLLS *pCmd)
 		SetMutexFree();
 		return;
 	}
-	//
+
+#if defined(TRACE) && (TRACE & TRACE_ULACALL)
+	printf_s(__FUNCTION__ " called (%s), LLS state: %s(%d) <== ULA state: %s(%d)\n"
+		, noticeNames[pCmd->opCode]
+		, stateNames[lowState], lowState
+		, stateNames[pControlBlock->state], pControlBlock->state);
+#endif
+
+	// synchronize the state in the 'cache' and the real state
+	if (_InterlockedExchange8((char *)& lowState, pControlBlock->state) != pControlBlock->state)
+	{
+		if (lowState == COMMITTING || lowState == COMMITTING2)
+			RestartKeepAlive();
+	}
+
 	switch(pCmd->opCode)
 	{
 	case FSP_Reject:
@@ -249,7 +262,7 @@ void CSocketItemEx::ProcessCommand(CommandToLLS *pCmd)
 		Start();
 		break;
 	case FSP_Send:			// send a packet/group of packets
-		ScheduleEmitQ();
+		EmitQ();
 		break;
 	case FSP_Commit:
 		UrgeCommit();
@@ -340,19 +353,16 @@ void CSocketItemEx::Connect()
 //	DLL::FinalizeSend, DLL::ToConcludeConnect
 void CSocketItemEx::Start()
 {
-#if (TRACE & TRACE_ULACALL)
-	printf_s("To send first packet %s\n\tin %s[%d] => %s[%d] state\n\tfirstSN = %u, nextSN = %u\n"
+#if (TRACE & TRACE_SLIDEWIN)
+	printf_s("To send first packet %s\n\tfirstSN = %u, nextSN = %u\n"
 		, opCodeStrings[(pControlBlock->HeadSend() + pControlBlock->sendWindowHeadPos)->opCode]
-		, stateNames[lowState], lowState
-		, stateNames[pControlBlock->state], pControlBlock->state
 		, pControlBlock->sendWindowFirstSN
 		, pControlBlock->sendWindowNextSN);
 #endif
-	SyncState();
-	EmitStart();
 	pControlBlock->SetFirstSendWindowRightEdge();
+	EmitStart();
 	//
-	AddResendTimer(tRoundTrip_us >> 8);
+	AddResendTimer();
 	// While the KEEP_ALIVE_TIMEOUT was set already in OnConnectRequestAck
 }
 
@@ -361,18 +371,12 @@ void CSocketItemEx::Start()
 // Mean to urge sending of the End of Transaction flag
 void CSocketItemEx::UrgeCommit()
 {
-#if defined(TRACE) && (TRACE & TRACE_ULACALL)
-	printf_s("%s called, LLS state: %s(%d), ULA state: %s(%d)\n"
-		, __FUNCDNAME__
-		, stateNames[lowState], lowState
-		, stateNames[pControlBlock->state], pControlBlock->state);
-#endif
-	// synchronize the state in the 'cache' and the real state
-	if (_InterlockedExchange8((char *)& lowState, pControlBlock->state) != pControlBlock->state)
+	if (lowState == COMMITTED || lowState >= CLOSABLE)
 	{
-		if (lowState == COMMITTING || lowState == COMMITTING2)
-			RestartKeepAlive();
+		shouldAppendCommit = 0;	// Might be redundant, but do little harm
+		return;
 	}
+
 	// It is assumed that if commit is pending the ULA would not manipulate the send queue
 	int r = pControlBlock->MarkSendQueueEOT();
 	if (r < 0)

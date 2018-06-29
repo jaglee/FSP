@@ -1147,6 +1147,7 @@ bool LOCALAPI CSocketItemEx::ReplaceTimer(uint32_t period)
 
 
 // A lazy acknowledgement is hard coded to one RTT, with an implementation depended floor value
+// ASSERT: round trip time is no longer than keep alive period
 void CSocketItemEx::AddLazyAckTimer()
 {
 	if (InterlockedCompareExchange((LONG *)& tLazyAck_us, max(LAZY_ACK_DELAY_MIN_us, tRoundTrip_us), 0) != 0)
@@ -1161,13 +1162,13 @@ void CSocketItemEx::AddLazyAckTimer()
 // Return
 //	true if the timer was set, false if it failed.
 // Remark
-//  A retransmission timer should be hard coded to 4 RTT
-bool CSocketItemEx::AddResendTimer(uint32_t tPeriod_ms)
+//  A retransmission timer is hard coded to 4 RTT. Do not retransmit in the same time slice.
+bool CSocketItemEx::AddResendTimer()
 {
-#if defined(NDEBUG) || !(TRACE & TRACE_PACKET) || !(TRACE & TRACE_HEARTBEAT)
-	tPeriod_ms = max(TIMER_SLICE_ms, tPeriod_ms);	// donot retransmit in the same time slice
+#if defined(NDEBUG) || !(TRACE & (TRACE_PACKET | TRACE_HEARTBEAT | TRACE_OUTBAND))
+	DWORD tPeriod_ms = max(TIMER_SLICE_ms, tRoundTrip_us >> 8);	
 #else
-	tPeriod_ms = INIT_RETRANSMIT_TIMEOUT_ms;
+	DWORD tPeriod_ms = INIT_RETRANSMIT_TIMEOUT_ms / 3;
 #endif
 	return (resendTimer == NULL
 		&& ::CreateTimerQueueTimer(&resendTimer, TimerWheel::Singleton()
@@ -1190,14 +1191,6 @@ void CSocketItemEx::RemoveTimers()
 	
 	if((h = (HANDLE)InterlockedExchangePointer(& resendTimer, NULL)) != NULL)
 		::DeleteTimerQueueTimer(TimerWheel::Singleton(), h, NULL);
-}
-
-
-
-// The OS-depending implementation of scheduling transmission queue
-void CSocketItemEx::ScheduleEmitQ()
-{
-	QueueUserWorkItem(HandleSendQ, this, WT_EXECUTEDEFAULT);
 }
 
 
@@ -1312,26 +1305,6 @@ CommandNewSessionSrv::CommandNewSessionSrv(const CommandToLLS *p1)
 	hMemoryMap = (HANDLE)pCmd->hMemoryMap;
 	dwMemorySize = pCmd->dwMemorySize;
 	hEvent = OpenEventA(EVENT_MODIFY_STATE, FALSE, (LPCSTR)pCmd->szEventName);
-}
-
-
-
-/**
- *	The OS-depending callback functions of QueueUserWorkItem
- */
-
-// For ScheduleEmitQ
-DWORD WINAPI HandleSendQ(LPVOID p0)
-{
-	CSocketItemEx *p = (CSocketItemEx *)p0;
-	if (!p->LockWithActiveULA())
-	{
-		BREAK_ON_DEBUG();
-		return 0;
-	}
-	p->EmitQ();
-	p->SetMutexFree();
-	return 1;
 }
 
 

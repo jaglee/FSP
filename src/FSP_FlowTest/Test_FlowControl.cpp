@@ -67,9 +67,9 @@ void FlowTestAcknowledge()
 	// All buffer blocks should have been consumed after the two acknowledged have been allocated
 	// [however, sendWindowSize is not reduced yet]
 	skb = pSCB->GetSendBuf();	// the two acknowledged
-	skb->MarkComplete();
+	skb->ReInitMarkComplete();
 	skb = pSCB->GetSendBuf();
-	skb->MarkComplete();
+	skb->ReInitMarkComplete();
 	skb = pSCB->GetSendBuf();	// no space in the send buffer.
 	assert(skb == NULL);
 
@@ -174,22 +174,22 @@ void PrepareFlowTestResend(CSocketItemExDbg & dbgSocket, PControlBlock & pSCB)
 
 	pSCB->Init(s1, s2);
 	pSCB->SetRecvWindow(FIRST_SN);
-
 	pSCB->SetSendWindow(FIRST_SN);
+
 	ControlBlock::PFSP_SocketBuf skb = pSCB->GetSendBuf();
-	skb->MarkComplete();
+	skb->ReInitMarkComplete();
 	assert(pSCB->sendBufferNextSN == FIRST_SN + 1);
 
 	skb = pSCB->GetSendBuf();
-	skb->MarkComplete();
+	skb->ReInitMarkComplete();
 	assert(pSCB->sendBufferNextSN == FIRST_SN + 2);
 
 	skb = pSCB->GetSendBuf();
-	skb->MarkComplete();
+	skb->ReInitMarkComplete();
 	assert(pSCB->sendBufferNextSN == FIRST_SN + 3);
 
 	skb = pSCB->GetSendBuf();
-	skb->MarkComplete();
+	skb->ReInitMarkComplete();
 	assert(pSCB->sendBufferNextSN == FIRST_SN + 4);
 
 	skb = pSCB->GetSendBuf();
@@ -203,25 +203,21 @@ void PrepareFlowTestResend(CSocketItemExDbg & dbgSocket, PControlBlock & pSCB)
 
 	++(pSCB->sendWindowNextSN);
 
-	skb = pSCB->HeadSend();
-
-	// emulate received the first data packet
 	ControlBlock::PFSP_SocketBuf skb5 = pSCB->AllocRecvBuf(FIRST_SN);
 	assert(skb5 != NULL);
-	skb5->MarkComplete();
+	skb5->ReInitMarkComplete();
 
-	// emulate a received message that crosses two packet
 	skb5 = pSCB->AllocRecvBuf(FIRST_SN + 1);
 	assert(skb5 != NULL);
 	assert(pSCB->recvWindowNextSN == FIRST_SN + 2);
 
-	skb5->MarkComplete();
+	skb5->ReInitMarkComplete();
 
 	skb5 = pSCB->AllocRecvBuf(FIRST_SN + 3);
 	assert(skb5 != NULL);
 	assert(pSCB->recvWindowNextSN == FIRST_SN + 4);
 
-	skb5->MarkComplete();
+	skb5->ReInitMarkComplete();
 
 	skb5 = pSCB->AllocRecvBuf(FIRST_SN + 4);
 	assert(skb5 == NULL);	// No more space in the receive buffer
@@ -251,8 +247,8 @@ void FlowTestRetransmission()
 	//
 	struct _KEEP_ALIVE
 	{
-		FSP_NormalPacketHeader hdr;
-		FSP_PreparedKEEP_ALIVE ext;
+		FSP_InternalFixedHeader hdr;
+		FSP_PreparedKEEP_ALIVE	ext;
 	} *p = (_KEEP_ALIVE *)& placeholder.pktBuffer.hdr;
 	//
 	ControlBlock::seq_t seq4;
@@ -302,12 +298,12 @@ void FlowTestRetransmission()
 	//
 	skb = pSCB->GetSendBuf();
 	assert(skb != NULL);
-	skb->MarkComplete();
+	skb->ReInitMarkComplete();
 	assert(pSCB->sendBufferNextSN == FIRST_SN + 5);
 
 	skb = pSCB->GetSendBuf();
 	assert(skb != NULL);
-	skb->MarkComplete();
+	skb->ReInitMarkComplete();
 	assert(pSCB->sendBufferNextSN == FIRST_SN + 6);
 
 	// the receive window is slided
@@ -317,14 +313,15 @@ void FlowTestRetransmission()
 	// further receiving
 	skb = pSCB->AllocRecvBuf(FIRST_SN + 4);
 	assert(skb != NULL);
-	skb->MarkComplete();
+	skb->ReInitMarkComplete();
 
 	skb = pSCB->AllocRecvBuf(FIRST_SN + 5);
 	assert(skb != NULL);
-	skb->MarkComplete();
+	skb->ReInitMarkComplete();
 
 	skb = pSCB->AllocRecvBuf(FIRST_SN + 6);
 	assert(skb == NULL);
+	//skb->ReInitMarkComplete();
 
 	len = dbgSocket.GenerateSNACK(p->ext, seq4, sizeof(FSP_NormalPacketHeader));
 	p->hdr.hs.hsp = htobe16(uint16_t(len));
@@ -388,20 +385,20 @@ void FlowTestRecvWinRoundRobin()
 	assert(skb != NULL);
 	skb->opCode = PURE_DATA;
 	skb->len = MAX_BLOCK_SIZE;
-	skb->MarkComplete();
+	skb->ReInitMarkComplete();
 
 	// Round-robin allocation
 	skb = pSCB->AllocRecvBuf(FIRST_SN + 4);
 	assert(skb != NULL);
 	skb->opCode = PURE_DATA;
 	skb->len = MAX_BLOCK_SIZE;
-	skb->MarkComplete();
+	skb->ReInitMarkComplete();
 
 	skb = pSCB->AllocRecvBuf(FIRST_SN + 5);
 	assert(skb != NULL);
 	skb->opCode = PURE_DATA;
 	skb->len = MAX_BLOCK_SIZE;
-	skb->MarkComplete();
+	skb->ReInitMarkComplete();
 
 	buf = pSCB->InquireRecvBuf(m, n, eot);
 	printf_s("Should return the last two blocks:\n"
@@ -411,12 +408,12 @@ void FlowTestRecvWinRoundRobin()
 	skb = pSCB->AllocRecvBuf(FIRST_SN + 6);
 	skb->opCode = PURE_DATA;
 	skb->len = MAX_BLOCK_SIZE;
-	skb->MarkComplete();
+	skb->ReInitMarkComplete();
 
 	skb = pSCB->AllocRecvBuf(FIRST_SN + 7);
 	skb->opCode = PURE_DATA;
 	skb->len = MAX_BLOCK_SIZE;
-	skb->MarkComplete();
+	skb->ReInitMarkComplete();
 
 	skb = pSCB->AllocRecvBuf(FIRST_SN + 8);
 	assert(skb == NULL);
@@ -430,17 +427,17 @@ void FlowTestRecvWinRoundRobin()
 	skb->opCode = PURE_DATA;
 	skb->len = MAX_BLOCK_SIZE - 2;
 	skb->SetFlag<TransactionEnded>();
-	skb->MarkComplete();
+	skb->ReInitMarkComplete();
 
 	skb = pSCB->AllocRecvBuf(FIRST_SN + 9);
 	skb->opCode = PURE_DATA;
 	skb->len = MAX_BLOCK_SIZE;
-	skb->MarkComplete();
+	skb->ReInitMarkComplete();
 
 	skb = pSCB->AllocRecvBuf(FIRST_SN + 10);
 	skb->opCode = PURE_DATA;
 	skb->len = MAX_BLOCK_SIZE;
-	skb->MarkComplete();
+	skb->ReInitMarkComplete();
 
 	buf = pSCB->InquireRecvBuf(m, n, eot);
 	printf_s("Should return the first block, with eot flag set:\n"
@@ -450,14 +447,14 @@ void FlowTestRecvWinRoundRobin()
 	skb = pSCB->AllocRecvBuf(FIRST_SN + 11);
 	skb->opCode = PURE_DATA;
 	skb->len = MAX_BLOCK_SIZE;
-	skb->MarkComplete();
+	skb->ReInitMarkComplete();
 
 	// This block round-robin
 	skb = pSCB->AllocRecvBuf(FIRST_SN + 12);
 	assert(skb != NULL);
 	skb->opCode = PURE_DATA;
 	skb->len = MAX_BLOCK_SIZE;
-	skb->MarkComplete();
+	skb->ReInitMarkComplete();
 
 	buf = pSCB->InquireRecvBuf(m, n, eot);
 	printf_s("Should return the 2nd, 3rd and 4th blocks:\n"
@@ -474,14 +471,14 @@ void FlowTestRecvWinRoundRobin()
 	assert(skb != NULL);
 	skb->opCode = PURE_DATA;
 	skb->len = MAX_BLOCK_SIZE;
-	skb->MarkComplete();
+	skb->ReInitMarkComplete();
 
 	skb = pSCB->AllocRecvBuf(FIRST_SN + 14);
 	assert(skb != NULL);
 	skb->opCode = PURE_DATA;
 	skb->len = 0;
 	skb->SetFlag<TransactionEnded>();
-	skb->MarkComplete();
+	skb->ReInitMarkComplete();
 
 	buf = pSCB->InquireRecvBuf(m, n, eot);
 	printf_s("Should round-robin to the 2nd and 3rd blocks:\n"

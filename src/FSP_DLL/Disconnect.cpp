@@ -46,11 +46,7 @@ int  CSocketItemDl::Dispose()
 
 	if (!WaitUseMutex())
 		return (IsInUse() ? -EDEADLK : 0);
-	if (chainingReceive == 0 && chainingSend == 0)
-		return RecycLocked();
-	toDispose = 1;
-	SetMutexFree();
-	return 0;
+	return RecycLocked();
 }
 
 
@@ -117,13 +113,13 @@ int FSPAPI Shutdown(FSPHANDLE hFSPSocket)
 // Remark
 //	Shutdown is always somewhat blocking. It is deliberate blocking
 //	if 'onFinish' function pointer in the connection context is NULL,
-//	undeliberate if it internally waits for previous Commit to finish.
+//	indeliberate if it internally waits for previous Commit to finish.
 //	And it always assume that the caller does not accept further data
 //	In deliberate blocking mode, it sends RELEASE immediately
 //	after data has been committed but does not wait for acknowledgement
 int CSocketItemDl::Shutdown()
 {
-	if(! WaitUseMutex())
+	if (!WaitUseMutex())
 		return (IsInUse() ? -EDEADLK : 0);
 
 	if(initiatingShutdown)
@@ -151,17 +147,20 @@ int CSocketItemDl::Shutdown()
 	}
 #endif
 
-	if (fpCommitted != NULL && context.onFinish != NULL)
+	if (fpCommitted != NULL)
 	{
 		SetMutexFree();
-		return 0;	// Full-fledged asynchronous mode
+		return (context.onFinish != NULL ? 0 : -EBUSY);
+		//^Full-fledged asynchronous mode, or unproper mixed-mode
 	}
 
 	// Send RELEASE and wait echoed RELEASE. LLS to signal FSP_NotifyRecycled, NotifyReset or NotifyTimeout
 #ifndef _NO_LLS_CALLABLE
+	int32_t deinitWait = DEINIT_WAIT_TIMEOUT_ms;
 	do
 	{
-		if (!InState(COMMITTED) && !InState(CLOSABLE) && !InState(PRE_CLOSED))
+		FSP_Session_State s = GetState();
+		if (s != COMMITTED && s < CLOSABLE && s != NON_EXISTENT)
 		{
 			int r = Commit();
 			if (r < 0)
@@ -169,8 +168,7 @@ int CSocketItemDl::Shutdown()
 			if (!WaitUseMutex())
 				return (IsInUse() ? -EDEADLK : 0);
 		}
-		//
-		if (InState(CLOSABLE))
+		else if (s == CLOSABLE)
 		{
 			bool b = Call<FSP_Shutdown>();
 			if (context.onFinish != NULL || !b)
@@ -179,13 +177,19 @@ int CSocketItemDl::Shutdown()
 				return (b ? 0 : -EIO);
 			}
 		}
-		//
+		// chance may happen that it has immediately migrate to CLOSED state
 		bool b = InState(CLOSED) || InState(NON_EXISTENT);
 		SetMutexFree();
 		if (b)
 			return 0;
 		//
 		Sleep(TIMER_SLICE_ms);
+		if (s >= CLOSABLE)
+		{
+			deinitWait -= TIMER_SLICE_ms;
+			if (deinitWait <= 0)
+				return ETIMEDOUT;		// Warning, not fatal error
+		}
 	} while (WaitUseMutex());
 #endif
 	return (IsInUse() ? -EDEADLK : 0);

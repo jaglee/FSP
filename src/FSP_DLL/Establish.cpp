@@ -329,19 +329,17 @@ bool LOCALAPI CSocketItemDl::ToWelcomeConnect(BackLogItem & backLog)
 	pControlBlock->sendBufferNextSN = pControlBlock->sendWindowFirstSN + 1;
 	pControlBlock->sendBufferNextPos = 1;	// reserve the head packet
 	//
-	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend();
-	BYTE *pSubnets = GetSendPtr(skb);
-
 	memcpy(&pControlBlock->connectParams, &backLog, FSP_MAX_KEY_SIZE);
 	//^following fields are filled later
 	//
+	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend();
 	skb->version = THIS_FSP_VERSION;
 	skb->opCode = ACK_CONNECT_REQ;
-	skb->len = sizeof(TSubnets);	// And the fixed header part is generated on the fly
-	//
+	skb->len = sizeof(FSP_AckConnectRequest);
+	// And the content of the header is generated on the fly
 	if(pendingSendBuf != NULL)
 	{
-		memcpy(pSubnets + skb->len, pendingSendBuf, pendingSendSize);
+		memcpy(GetSendPtr(skb) + skb->len, pendingSendBuf, pendingSendSize);
 		skb->len += pendingSendSize;
 		//
 		pendingSendBuf = NULL;
@@ -374,6 +372,8 @@ void CSocketItemDl::ToConcludeConnect()
 	context.welcome = payload;
 	context.len = skb->len;
 
+	skb->InitMarkLocked();
+	skb->ClearFlags();
 	pControlBlock->SlideRecvWindowByOne();	// ACK_CONNECT_REQ, which may carry welcome
 	// But // CONNECT_REQUEST does NOT consume a sequence number
 	// See @LLS::OnGetConnectRequest
@@ -489,8 +489,8 @@ int FSPAPI InstallMasterKey(FSPHANDLE h, octet * key, int32_t keyBytes)
 //	the input key material would be truncated if it exceeds the internal command buffer capacity
 int LOCALAPI CSocketItemDl::InstallRawKey(octet *key, int32_t keyBits, uint64_t keyLife)
 {
-	if(! WaitUseMutex())
-		return -EDEADLK;
+	if (!WaitUseMutex())
+		return (IsInUse() ? -EDEADLK : -EINTR);
 
 	CommandInstallKey objCommand(pControlBlock->sendBufferNextSN, keyLife);
 	this->InitCommand<FSP_InstallKey>(objCommand);

@@ -376,7 +376,7 @@ void CSocketItemDl::WaitEventToDispatch()
 			, fidPair.source, be32toh(fidPair.source)
 			, stateNames[pControlBlock->state], noticeNames[notice]);
 #endif
-		// If recyled or in the state not earlier than ToFinish, LLS should have recyle the session context mapping already
+		// If recycled or in the state not earlier than ToFinish, LLS should have recyle the session context mapping already
 		if(notice == FSP_NotifyRecycled || notice >= FSP_NotifyToFinish)
 			lowerLayerRecycled = 1;
 		// Initially lowerLayerRecycled is 0 and it is never reset
@@ -454,7 +454,6 @@ void CSocketItemDl::WaitEventToDispatch()
 			SetMutexFree();
 			break;
 		case FSP_NotifyFlushed:
-			committing = 0;			// Must clear the flag firstly or else transmit transactions is splitted unproperly
 			ProcessPendingSend();	// SetMutexFree();
 			if (!LockAndValidate())
 				return;
@@ -518,9 +517,6 @@ void CSocketItemDl::WaitEventToDispatch()
 			// UNRESOLVED!? There could be some remedy if name resolution failed?
 		}
 	}
-	//
-	if(_InterlockedExchange8(&toDispose, 0) != 0)
-		Dispose();	// The delayed dispose
 }
 
 
@@ -603,13 +599,16 @@ bool LOCALAPI CSocketItemDl::AddOneShotTimer(uint32_t dueTime)
 
 
 
-// Given
-//	uint32_t		number of milli-seconds of the interval
 // Return
 //	true if the repeative timer is registered successfully
 //	false if it failed
-bool LOCALAPI CSocketItemDl::AddPollingTimer(uint32_t interval)
+bool CSocketItemDl::EnablePolling()
 {
+#ifndef NDEBUG
+	const DWORD interval = 5000;	// hard-coded to 5 seconds per poll for easy to debug
+#else
+	const DWORD interval = TIMER_SLICE_ms;
+#endif
 	return (pollingTimer == NULL
 		&&::CreateTimerQueueTimer(& pollingTimer, ::timerQueue
 			, PollingTimedoutCallBack
@@ -690,7 +689,7 @@ void CSocketItemDl::PollingTimedout()
 	// and receive takes precedence because receiving is to free resource
 	if ((fpReceived != NULL || fpPeeked != NULL) && !chainingReceive && HasDataToDeliver())
 		ProcessReceiveBuffer();
-	else if (fpSent != NULL && !chainingSend && HasFreeSendBuffer())
+	else if ((fpSent != NULL || pendingSendBuf != NULL) && !chainingSend && HasFreeSendBuffer())
 		ProcessPendingSend();
 	else
 		SetMutexFree();

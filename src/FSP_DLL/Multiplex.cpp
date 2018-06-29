@@ -195,7 +195,7 @@ FSPHANDLE CSocketItemDl::CompleteMultiply(CommandCloneConnect & cmd)
 	if(skb != NULL)
 	{
 		skb->opCode = MULTIPLY;
-		skb->MarkComplete();
+		skb->ReInitMarkComplete();
 	}
 	// See also InitCommand, CallCreate
 	cmd.fiberID = pControlBlock->idParent;

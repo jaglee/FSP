@@ -189,7 +189,7 @@ int FSPAPI toReadTCPData(FSPHANDLE h, void *buf, int32_t capacity)
 
 	do
 	{
-		r = SendInline(h, buf, n, true);
+		r = SendInline(h, buf, n, true, NULL);
 		if (r >= 0)
 			break;
 		Sleep(1);	// yield CPU out for at least 1ms/one time slice

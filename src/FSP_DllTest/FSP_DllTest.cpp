@@ -50,7 +50,7 @@ void UnitTestBufferData()
 	// Emulate SendStream()
 	//
 	pSocketItem->SetState(ESTABLISHED);
-	pSocketItem->CheckTransmitaction(0);
+	pSocketItem->committing = 0;
 	pSocketItem->pendingSendBuf = preparedTestData;
 	pSocketItem->BufferData(MIN_RESERVED_BUF - 2);
 	printf_s("Buffer next SN = %u\n", pSCB->sendBufferNextSN);
@@ -374,8 +374,7 @@ void UnitTestPrepareToSend()
 	// One packet
 	pSocketItem->SetState(ESTABLISHED);
 	pSocketItem->SetNewTransaction();
-	pSocketItem->SetEndTransaction();
-	pSocketItem->PrepareToSend(buf, MAX_BLOCK_SIZE - 2);
+	pSocketItem->PrepareToSend(buf, MAX_BLOCK_SIZE - 2, true);
 	assert(pSCB->sendBufferNextSN == FIRST_SN + 1);
 	printf_s("Buffer next SN = %u; start packet operation is %s, state is %s\n"
 		, pSCB->sendBufferNextSN
@@ -385,9 +384,8 @@ void UnitTestPrepareToSend()
 	// Reset, two packets
 	pSocketItem->SetState(ESTABLISHED);
 	pSocketItem->SetNewTransaction();
-	pSocketItem->SetEndTransaction();
 	pSCB->SetSendWindow(FIRST_SN);
-	pSocketItem->PrepareToSend(buf, MIN_RESERVED_BUF - 2);
+	pSocketItem->PrepareToSend(buf, MIN_RESERVED_BUF - 2, true);
 	printf_s("Buffer next SN = %u; start packet operation is %s, state is %s\n\n"
 		, pSCB->sendBufferNextSN
 		, opCodeStrings[skb->opCode]
@@ -417,7 +415,7 @@ void UnitTestFetchReceived()
 	{
 		skb->len = MAX_BLOCK_SIZE;
 		skb->opCode = PURE_DATA;
-		skb->MarkComplete();
+		skb->ReInitMarkComplete();
 	}
 	// pSCB->recvWindowNextSN == pSCB->recvWindowFirstSN + pSCB->recvBufferBlockN;
 	// And pSCB->recvWindowNextPos is rounded

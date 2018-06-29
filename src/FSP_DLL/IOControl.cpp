@@ -128,9 +128,6 @@ void * FSPAPI GetExtPointer(FSPHANDLE hFSPSocket)
 
 
 
-// Return the extent pointer set by ULA, either stored directly in FSP_SocketParameter.extentI64ULA
-// or set by calling FSPControl(FSPHANDLE, FSP_SET_EXT_POINTER, ...);
-// A shortcut for FSPControl(FSPHANDLE, FSP_GET_EXT_POINTER, ...);
 DllSpec
 bool FSPAPI HasReadEoT(FSPHANDLE hFSPSocket)
 {

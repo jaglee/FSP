@@ -285,7 +285,7 @@ static int FSPAPI toSendNextBlock(FSPHANDLE h, void * batchBuffer, int32_t capac
 
 	printf_s("To send %d bytes to the remote end\n", bytesRead);
 
-	int err = SendInline(h, batchBuffer, bytesRead, r != 0);
+	int err = SendInline(h, batchBuffer, bytesRead, r != 0, NULL);
 	return (r ? -1 : err);	// if EOF, tell DLL to terminate send
 }
 

@@ -371,9 +371,6 @@ struct ControlBlock
 	//
 	ALFID_T			idParent;
 
-	ALIGN(8)	// 64-bit alignment
-	FSP_NormalPacketHeader tmpHeader;	// for sending; assume sending is single-threaded for a single session
-
 	// 1, 2.
 	// Used to be the matched list of local and remote addresses.
 	// for security reason the remote addresses were moved to LLS
@@ -455,20 +452,17 @@ struct ControlBlock
 		//
 		void InitMarkLocked() { InterlockedExchange8(&marks, 1); }
 		void ReInitMarkComplete() { InterlockedExchange8(&marks, 2); }
-		void ResetMarkAcked() { InterlockedExchange8(&marks, 8); }
+		void ResetMarkAcked() { InterlockedExchange8(&marks, 12); }	// sent and acknowledged
 		//
-		bool IsComplete() { return (marks & 2) != 0; }
-		bool IsSent() { return (marks & 4) != 0; }
-		bool IsAcked() { return (marks & 8) != 0; }
-		//
-		void MarkComplete() { InterlockedOr8(&marks, 2); }
+		bool IsComplete() { return (InterlockedOr8(&marks, 0) & 2) != 0; }
+		bool IsSent() { return (InterlockedOr8(&marks, 0) & 4) != 0; }
+		bool IsAcked() { return (InterlockedOr8(&marks, 0) & 8) != 0; }
 		void MarkSent() { InterlockedOr8(&marks, 4); }
 		//
 		void ClearFlags() { InterlockedExchange8((char *)&flags, 0); }
-		template<FSP_FlagPosition pos> void InitFlags() { flags = (1 << pos); }
-		template<FSP_FlagPosition pos> void SetFlag() { flags |= (1 << pos); }
-		template<FSP_FlagPosition pos> void ClearFlag() { flags &= ~(1 << pos); }
-		template<FSP_FlagPosition pos> bool GetFlag() { return (flags & (1 << pos)) != 0; }
+		template<FSP_FlagPosition pos> void InitFlags() { InterlockedExchange8((char *)&flags, (char)(1 << pos)); }
+		template<FSP_FlagPosition pos> void SetFlag() { InterlockedExchange8((char *)&flags, flags | (char)(1 << pos)); }
+		template<FSP_FlagPosition pos> bool GetFlag() { return (InterlockedOr8((char *)&flags, 0) & (char)(1 << pos)) != 0; }
 		void CopyFlagsTo(FSP_NormalPacketHeader *p) { _InterlockedExchange8((char *)p->flags_ws, flags); }
 		void CopyInFlags(const FSP_NormalPacketHeader *p) { _InterlockedExchange8((char *) & flags, p->flags_ws[0]); }
 	} *PFSP_SocketBuf;
@@ -517,6 +511,8 @@ struct ControlBlock
 		register int32_t a = _InterlockedOr((volatile LONG *)&sendWindowNextSN, 0);
 		return int32_t(a - sendWindowFirstSN);
 	}
+	seq_t GetSendLimitSN() { return int(sendBufferNextSN - sendWindowLimitSN) > 0 ? sendWindowLimitSN : sendBufferNextSN; }
+
 	int32_t CountDeliverable()
 	{
 		register int32_t a = _InterlockedOr((volatile LONG *)&recvWindowExpectedSN, 0);
@@ -524,8 +520,10 @@ struct ControlBlock
 	}
 #if defined(TRACE) && !defined(NDEBUG)
 	int DumpSendRecvWindowInfo() const;
+	int DumpRecvQueueInfo() const;
 #else
 	int DumpSendRecvWindowInfo() const { return 0; }
+	int DumpRecvQueueInfo() const { return 0; }
 #endif
 
 	PFSP_SocketBuf HeadSend() const { return (PFSP_SocketBuf)((BYTE *)this + sendBufDescriptors); }
@@ -535,11 +533,12 @@ struct ControlBlock
 	PFSP_SocketBuf GetSendQueueHead() { return HeadSend() + sendWindowHeadPos; }
 
 	// Return
-	//	0 if used to be no packet at all
-	//	1 if there existed a sent packet at the tail which has ready marked EOT 
-	//	2 if there existed an unsent packet at the tail and it is marked EOT
-	//  -1 if there existed a sent packet at the tail which could not be marked EOT
+	//	0 if there existed a sent packet at the tail which has already marked EOT 
+	//	1 if there existed an unsent packet at the tail and it is marked EOT
+	//	2 if there existed free slot to put a new EoT packet into the queue
+	//  -1 if there is no packet to piggyback EoT and no free slot at all
 	int MarkSendQueueEOT();
+
 	// Take snapshot of the right edge of the receive window, typically on transmit transaction committed
 	void SnapshotReceiveWindowRightEdge() { connectParams.nextKey$initialSN = recvWindowNextSN; }
 
@@ -550,19 +549,10 @@ struct ControlBlock
 	void SubstractRoundRecvBlockN(int32_t & tgt, int32_t d) { tgt -= d; if (tgt < 0) tgt += recvBufferBlockN; }
 
 	void AddRoundSendBlockN(int32_t & tgt, int32_t a) { tgt += a; if (tgt >= sendBufferBlockN) tgt -= sendBufferBlockN; }
-
-	// Given
-	//	FSP_NormalPacketHeader*	the place-holder of sequence number and flags
-	//	ControlBlock::seq_t		the intent sequence number of the packet
-	// Do
-	//	Set the sequence number, expected sequence number for accumulative acknowledgement,
-	//	flags and the advertised receive window size field of the FSP header 
-	void LOCALAPI SetSequenceFlags(FSP_NormalPacketHeader *pHdr, ControlBlock::seq_t seq1)
+	void IncRoundSendBlockN(int32_t & tgt)
 	{
-		pHdr->expectedSN = htobe32(recvWindowNextSN);
-		pHdr->sequenceNo = htobe32(seq1);
-		pHdr->ClearFlags();
-		pHdr->SetRecvWS(AdRecvWS(recvWindowNextSN));
+		register int32_t a = InterlockedIncrement((LONG *)&tgt) - sendBufferBlockN;
+		if (a >= 0) tgt = a;
 	}
 
 	void * LOCALAPI InquireSendBuf(int32_t *);
@@ -582,13 +572,9 @@ struct ControlBlock
 	// Slide the left border of the receive window by one slot
 	void SlideRecvWindowByOne()	// shall be atomic!
 	{
-		GetFirstReceived()->ResetMarkAcked();
-		GetFirstReceived()->ClearFlags();
-		InterlockedIncrement((LONG *)& recvWindowFirstSN);
 		AddRoundRecvBlockN(recvWindowHeadPos, 1);
+		InterlockedIncrement((LONG *)& recvWindowFirstSN);
 	}
-
-	void SlideRecvSlotNextTo(seq_t);
 
 	// Given
 	//	int32_t & : [_Out_] place holder of the number of bytes [to be] peeked
@@ -623,35 +609,42 @@ struct ControlBlock
 	{
 		GetSendQueueHead()->ResetMarkAcked();
 		GetSendQueueHead()->ClearFlags();
-		_InterlockedIncrement((LONG *)& sendWindowFirstSN);
-		register int32_t a = _InterlockedIncrement((LONG *)& sendWindowHeadPos) - sendBufferBlockN;
-		if (a >= 0)
-			sendWindowHeadPos = a;
-	}
-
-	// Slide the left border of the send window and mark the acknowledged buffer block free
-	void ControlBlock::SlideSendWindow()
-	{
-		while (CountSentInFlight() > 0)
-		{
-			register PFSP_SocketBuf p = GetSendQueueHead();
-			if (! p->IsAcked())
-				break;
-			SlideSendWindowByOne();
-		}
+		InterlockedIncrement(&sendWindowFirstSN);
+		IncRoundSendBlockN(sendWindowHeadPos);
 	}
 
 	// Set the right edge of the send window after the very first packet of the queue is sent
 	void SetFirstSendWindowRightEdge()
 	{
-		seq_t k = sendWindowFirstSN;
-		if (_InterlockedCompareExchange((LONG *)& sendWindowNextSN, k + 1, k) == k)
-			AddRoundSendBlockN(sendWindowNextPos, 1);
+		register seq_t k = sendWindowFirstSN;
+		if (InterlockedCompareExchange(&sendWindowNextSN, k + 1, k) == k)
+			IncRoundSendBlockN(sendWindowNextPos);
 	}
-	//
-	bool LOCALAPI ResizeSendWindow(seq_t, unsigned int);
 
-	// Width of the advertisable receive window (i.e. free receive buffers to advertize), in blocks
+
+	// Given
+	//	ControlBlock::seq_t	The sequence number of the packet that mostly expected by the remote end
+	//	unsigned int		The advertised size of the receive window, start from aforementioned most expected packet
+	// Do
+	//	Adjust the size of the send window size of the near end
+	// Remark
+	//	Assume the parameters is legitimate, shall call this function only after ICC has been validated
+	void ResizeSendWindow(seq_t seq1, uint32_t adRecvWin)
+	{
+		int32_t d = int32_t(seq1 - welcomedNextSNtoSend);
+		if (d > 0)
+		{
+			sendWindowLimitSN = seq1 + adRecvWin;
+			welcomedNextSNtoSend = seq1;
+		}
+		else if (d == 0 && int32_t(seq1 + adRecvWin - sendWindowLimitSN) > 0)
+		{
+			sendWindowLimitSN = seq1 + adRecvWin;
+		}
+	}
+
+
+	// Width of the advertisable receive window (i.e. free receive buffers to advertise), in blocks
 	int32_t AdRecvWS(seq_t expectedSN)
 	{
 		seq_t a = _InterlockedOr((LONG *) & recvWindowFirstSN, 0);

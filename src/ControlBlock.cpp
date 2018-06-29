@@ -454,8 +454,8 @@ ControlBlock::PFSP_SocketBuf ControlBlock::GetSendBuf()
 	register PFSP_SocketBuf p = HeadSend() + sendBufferNextPos;
 	p->InitMarkLocked();
 	p->ClearFlags();
-	AddRoundSendBlockN(sendBufferNextPos, 1);
-	_InterlockedIncrement((LONG *) & sendBufferNextSN);
+	IncRoundSendBlockN(sendBufferNextPos);
+	InterlockedIncrement(&sendBufferNextSN);
 
 	return p;
 }
@@ -533,6 +533,7 @@ ControlBlock::PFSP_SocketBuf LOCALAPI ControlBlock::AllocRecvBuf(seq_t seq1)
 		}
 	}
 	//
+	p->InitMarkLocked();
 	p->ClearFlags();
 	// Case 1: out-of-order packet received in a gap but it is not the left-edge of the gap
 	if (seq1 != recvWindowExpectedSN)
@@ -576,24 +577,6 @@ ControlBlock::PFSP_SocketBuf LOCALAPI ControlBlock::AllocRecvBuf(seq_t seq1)
 	} while (++i < n2);
 	//
 	return p;
-}
-
-
-
-
-// Given
-//	seq_t		the sequence number of the receive buffer slot to slide
-// Do
-//	Make it consume the sequence space slot in the receive queue
-void ControlBlock::SlideRecvSlotNextTo(seq_t seq1)
-{
-	if (++recvWindowNextPos - recvBufferBlockN >= 0)
-		recvWindowNextPos -= recvBufferBlockN;
-	_InterlockedIncrement((LONG *)& recvWindowNextSN);
-	//
-	if (++recvWindowHeadPos - recvBufferBlockN >= 0)
-		recvWindowHeadPos -= recvBufferBlockN;
-	InterlockedIncrement((LONG *)& recvWindowFirstSN);
 }
 
 
@@ -946,12 +929,9 @@ bool ControlBlock::HasBeenCommitted()
 //	1 if there existed an unsent packet at the tail and it is marked EOT
 //	2 if there existed free slot to put a new EoT packet into the queue
 //  -1 if there is no packet to piggyback EoT and no free slot at all
-// See also @LLS::EmitQ()
+// See also @LLS::UrgeCommit(), @LLS::RespondToSNACK
 int ControlBlock::MarkSendQueueEOT()
 {
-	if(CountSendBuffered() >= sendBufferBlockN)
-		return -1;
-
 	register int i = sendBufferNextPos - 1;
 	register PFSP_SocketBuf p;
 	p = HeadSend() + (i < 0 ? sendBufferBlockN - 1 : i);
@@ -959,64 +939,29 @@ int ControlBlock::MarkSendQueueEOT()
 	if (p->IsSent() && p->GetFlag<TransactionEnded>())
 		return 0;
 
-	if (!p->IsSent())
+	const int32_t N = CountSendBuffered();
+	if(N > 0 && !p->IsSent())
 	{
 		p->SetFlag<TransactionEnded>();
 		p->ReInitMarkComplete();
 		return 1;
 	}
+	else if (N >= sendBufferBlockN)
+	{
+		return -1;
+	}
 
-	p = HeadSend() + sendBufferNextPos++;
+	p = HeadSend() + sendBufferNextPos;
 	p->opCode = PURE_DATA;
 	p->len = 0;
 	p->SetFlag<TransactionEnded>();
 	p->ReInitMarkComplete();
-	if (sendBufferNextPos >= sendBufferBlockN)
-		sendBufferNextPos = 0;
+	IncRoundSendBlockN(sendBufferNextPos);
 	InterlockedIncrement(&sendBufferNextSN);
 
 	return 2;
 }
 
-
-
-// Given
-//	seq_t			The sequence number of the packet that mostly expected by the remote end
-//	unsigned int	The advertised size of the receive window, start from aforementioned most expected packet
-// Return
-//	Whether the given sequence number is legitimate
-// Remark
-//	If the given sequence number is legitimate, send window size of the near end is adjusted
-//	advertisement of an out-of order packet about the receive window size is simply ignored
-bool LOCALAPI ControlBlock::ResizeSendWindow(seq_t seq1, unsigned int adRecvWin)
-{
-	int32_t d = int32_t(seq1 - sendWindowFirstSN);
-	if (d < 0 || d > CountSentInFlight())
-		return false;
-	//^Out of order packet received | You cannot acknowledge a packet not sent yet
-#if (TRACE & TRACE_SLIDEWIN)
-	if ((uint64_t)adRecvWin + CountSentInFlight() >= UINT32_MAX)
-	{
-		printf_s("Broken protocol implementation? Advertised window size too large!\n");
-		return false;
-	}
-#endif
-
-	d = int32_t(seq1 - welcomedNextSNtoSend);
-	if (d < 0)
-		return true;
-
-	if (d > 0)
-	{
-		sendWindowLimitSN = seq1 + adRecvWin;
-		welcomedNextSNtoSend = seq1;
-	}
-	else if (int32_t(seq1 + adRecvWin - sendWindowLimitSN) > 0)
-	{
-		sendWindowLimitSN = seq1 + adRecvWin;
-	}
-	return true;
-}
 
 
 #if defined(TRACE) && !defined(NDEBUG)
@@ -1029,6 +974,14 @@ int ControlBlock::DumpSendRecvWindowInfo() const
 		, sendWindowHeadPos, sendBufferNextPos, int(sendWindowNextSN - sendWindowFirstSN)
 		, sendWindowNextSN, sendWindowNextPos, welcomedNextSNtoSend
 		, recvWindowHeadPos, recvWindowNextPos, int(recvWindowNextSN - recvWindowFirstSN)
+		, recvWindowFirstSN, recvWindowNextSN);
+}
+
+int ControlBlock::DumpRecvQueueInfo() const
+{
+	return printf_s("\tRecv[head, tail] = [%d, %d], right edge is %u\n"
+		"\tSN first received = %u, max expected = %u\n"
+		, recvWindowHeadPos, recvWindowNextPos, recvWindowNextSN
 		, recvWindowFirstSN, recvWindowNextSN);
 }
 #endif

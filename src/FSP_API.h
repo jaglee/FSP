@@ -290,17 +290,22 @@ int FSPAPI GetSendBuffer(FSPHANDLE, CallbackBufferReady);
 //	FSPHANDLE	the socket handle
 //	void *		the buffer pointer
 //	int32_t		the number of octets to send
-//	bool		whether terminate the transmit transaction
+//	bool		EoT, whether to terminate the transmit transaction
+//	NotifyOrReturn	the pointer to the callback function if EoT
 // Return
 //	positive if it is number of blocks scheduled to send
 //	negative if it is the error number
 // Remark
 //	The buffer MUST begin from what GetSendBuffer has returned and
 //	may not exceed the capacity that GetSendBuffer has returned
-//	if the buffer is to be continued, its size MUST be multiplier of MAX_BLOCK_SIZE
+//	If it is to commit the transmit transaction the callback function
+//	is called if and only if all packets sent are acknowledged
+//	If it is not to commit the transmit transaction	the callback function
+//	will be ignored and the number of octets to send
+//	MUST be multiple of MAX_BLOCK_SIZE
 //	SendInline could be chained in tandem with GetSendBuffer
 DllSpec
-int FSPAPI SendInline(FSPHANDLE, void *, int32_t, bool);
+int FSPAPI SendInline(FSPHANDLE, void *, int32_t, bool, NotifyOrReturn);
 
 
 // Given
@@ -356,7 +361,7 @@ DllSpec
 int FSPAPI ReadFrom(FSPHANDLE, void *, int, NotifyOrReturn);
 
 
-// Return whether previous ReadFrom or ReadInline has reach an end-of-transaction mark.
+// Return whether previous ReadFrom has enncountered an end-of-transaction mark. DOES NOT work with ReadInline!
 // A shortcut for FSPControl(FSPHANDLE, FSP_GET_PEER_COMMITTED, ...);
 DllSpec
 bool FSPAPI HasReadEoT(FSPHANDLE);
@@ -401,6 +406,7 @@ int FSPAPI Flush(FSPHANDLE);
 //	0 if no error
 //	-EDEADLK if no mutual-exclusive lock available
 //	-EFAULT if internal resource error encountered, typical time-out clock unavailable
+//	-EBUSY if it is still sending asynchronously
 //	-EIO if the shutdown packet cannot be sent
 // Remark
 //	If the pointer of the callback function 'onFinish' is null,

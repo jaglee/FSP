@@ -62,7 +62,7 @@ void UnitTestSendRecvWnd()
 	skb4->opCode = PURE_DATA;
 	skb4->len = MAX_BLOCK_SIZE - 13;
 	skb4->SetFlag<TransactionEnded>();
-	skb4->MarkComplete();
+	skb->ReInitMarkComplete();
 
 	int m2;	// onReturn it should == skb4->len, i.e. MAX_BLOCK_SIZE - 13
 	int32_t n;
@@ -98,7 +98,7 @@ void UnitTestSendRecvWnd()
 
 	skb5->opCode = PURE_DATA;
 	skb5->len = MAX_BLOCK_SIZE;
-	skb5->ClearFlag<TransactionEnded>();
+	skb5->ClearFlags();
 	skb5->ReInitMarkComplete();
 
 	// emulate a received-ahead packet
@@ -111,7 +111,7 @@ void UnitTestSendRecvWnd()
 	skb5->opCode = PURE_DATA;
 	skb5->len = MAX_BLOCK_SIZE - 13;
 	skb5->SetFlag<TransactionEnded>();
-	skb5->MarkComplete();
+	skb->ReInitMarkComplete();
 
 	// what is the content of the selective negative acknowledgement?
 	FSP_SelectiveNACK::GapDescriptor snack[4];
@@ -147,7 +147,7 @@ void UnitTestSendRecvWnd()
 	Assert::IsNotNull(skb4);
 	skb4->opCode = PURE_DATA;
 	skb4->len = MAX_BLOCK_SIZE - 13;
-	skb4->MarkComplete();
+	skb->ReInitMarkComplete();
 
 	skb5 = pSCB->AllocRecvBuf(FIRST_SN + 7);
 
@@ -188,13 +188,13 @@ void UnitTestGenerateSNACK()
 	skb1->opCode = PERSIST;	// start of the transmit transaction
 	skb1->len = 1;			// A PERSIST cannot be NULL
 	skb1->SetFlag<TransactionEnded>();
-	skb1->MarkComplete();
+	skb1->ReInitMarkComplete();
 	Assert::IsTrue(pSCB->recvWindowNextSN == FIRST_SN + 1);
 
 	skb1 = socket.AllocRecvBuf(FIRST_SN + 2);
 	Assert::IsNotNull(skb1);
 	skb1->opCode = PURE_DATA;
-	skb1->MarkComplete();
+	skb1->ReInitMarkComplete();
 	Assert::IsTrue(pSCB->recvWindowNextSN == FIRST_SN + 3);
 
 	r = pSCB->GetSelectiveNACK(seq0, gaps, MAX_GAPS_NUM);
@@ -204,7 +204,7 @@ void UnitTestGenerateSNACK()
 	skb1 = socket.AllocRecvBuf(FIRST_SN + 0x10003);
 	Assert::IsNotNull(skb1);
 	skb1->opCode = PURE_DATA;	// A PUER_DATA can be payloadless, however
-	skb1->MarkComplete();
+	skb1->ReInitMarkComplete();
 	Assert::IsTrue(pSCB->recvWindowNextSN == FIRST_SN + 0x10004);
 
 	r = pSCB->GetSelectiveNACK(seq0, gaps, MAX_GAPS_NUM);
@@ -217,7 +217,7 @@ void UnitTestGenerateSNACK()
 	skb1 = socket.AllocRecvBuf(FIRST_SN + 0x8003);
 	Assert::IsNotNull(skb1);
 	skb1->opCode = PURE_DATA;
-	skb1->MarkComplete();
+	skb1->ReInitMarkComplete();
 	Assert::IsTrue(pSCB->recvWindowNextSN == FIRST_SN + 0x10004);
 
 	r = pSCB->GetSelectiveNACK(seq0, gaps, MAX_GAPS_NUM);
@@ -233,7 +233,7 @@ void UnitTestGenerateSNACK()
 		skb1 = socket.AllocRecvBuf(FIRST_SN + i);
 		Assert::IsNotNull(skb1);
 		skb1->opCode = PURE_DATA;
-		skb1->MarkComplete();
+		skb1->ReInitMarkComplete();
 	}
 
 	r = pSCB->GetSelectiveNACK(seq0, gaps, MAX_GAPS_NUM);
@@ -250,7 +250,7 @@ void UnitTestGenerateSNACK()
 	skb1 = socket.AllocRecvBuf(FIRST_SN + 1);
 	Assert::IsNotNull(skb1);
 	skb1->opCode = PURE_DATA;
-	skb1->MarkComplete();
+	skb1->ReInitMarkComplete();
 
 	ControlBlock::PFSP_SocketBuf p = pSCB->HeadRecv();
 	(++p)->len = MAX_BLOCK_SIZE;
@@ -263,7 +263,7 @@ void UnitTestGenerateSNACK()
 	skb1 = socket.AllocRecvBuf(FIRST_SN + 3);
 	Assert::IsNotNull(skb1);
 	skb1->opCode = PURE_DATA;
-	skb1->MarkComplete();
+	skb1->ReInitMarkComplete();
 
 	for(int i = 0; i < 0x10000; i++, p++)	// position 3 to position 0x10002
 	{
@@ -282,7 +282,7 @@ void UnitTestGenerateSNACK()
 	skb1 = socket.AllocRecvBuf(FIRST_SN + 0x20001);
 	Assert::IsNotNull(skb1);
 	skb1->opCode = PURE_DATA;
-	skb1->MarkComplete();
+	skb1->ReInitMarkComplete();
 	Assert::IsTrue(pSCB->recvWindowNextSN == FIRST_SN + 0x20002);
 	// But the last dataLength == 2 because of buffer round-robin
 

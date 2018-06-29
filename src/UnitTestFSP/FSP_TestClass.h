@@ -11,33 +11,27 @@ public:
 		int32_t ss = MAX_BLOCK_SIZE * 2;
 		int32_t sr = MAX_BLOCK_SIZE * 2;
 		memset(this, 0, sizeof(CSocketItemEx));
-		pControlBlock = (ControlBlock *)malloc
-			(sizeof(ControlBlock) + (sizeof(ControlBlock::FSP_SocketBuf) + MAX_BLOCK_SIZE) * 8);
+		dwMemorySize = sizeof(ControlBlock) + (sizeof(ControlBlock::FSP_SocketBuf) + MAX_BLOCK_SIZE) * 8;
+		pControlBlock = (ControlBlock *)malloc(dwMemorySize);
 		pControlBlock->Init(ss, sr);
 	};
+
 	CSocketItemExDbg(int nSend, int nRecv)
 	{
-		// isMilky = 0;	// RespondToSNACK cares it
-		hMemoryMap = NULL;
-		hEvent = NULL;
-		tRoundTrip_us = 0;
-		tKeepAlive_ms = 0;
-		tLazyAck_us = 0;
-		pControlBlock = (ControlBlock *)malloc
-			(sizeof(ControlBlock) + (sizeof(ControlBlock::FSP_SocketBuf) + MAX_BLOCK_SIZE) * (nSend + nRecv));
+		memset(this, 0, sizeof(CSocketItemEx));
+		dwMemorySize = sizeof(ControlBlock) + (sizeof(ControlBlock::FSP_SocketBuf) + MAX_BLOCK_SIZE) * (nSend + nRecv);
+		pControlBlock = (ControlBlock *)malloc(dwMemorySize);
 		//
 		nSend *= MAX_BLOCK_SIZE;
 		nRecv *= MAX_BLOCK_SIZE;
 		pControlBlock->Init(nSend, nRecv);
 	};
+
 	~CSocketItemExDbg()
 	{
 		free(pControlBlock);
 	}
-	//void LOCALAPI ResetVMAC()
-	//{
-	//	vhash_reset(& pControlBlock->mac_ctx);	// vmac_set_key
-	//}
+
 	void SetState(FSP_Session_State s) { CSocketItemEx::SetState(s); }
 
 	bool NotInStates(FSP_Session_State first, FSP_Session_State second)

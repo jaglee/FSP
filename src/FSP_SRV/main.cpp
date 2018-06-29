@@ -183,7 +183,7 @@ static void LOCALAPI ProcessCommand(HANDLE md)
 {
 	BYTE buffer[MAX_CTRLBUF_LEN];
 	DWORD nBytesRead;
-	CommandToLLS *pCmd = (CommandToLLS *) buffer;
+	CommandToLLS *pCmd = (CommandToLLS *)buffer;
 	CSocketItemEx *pSocket;
 	// TODO: UNRESOLVED!there should be performance profiling variables to record how many commands have been processed?
     static int n = 0;
@@ -193,7 +193,7 @@ static void LOCALAPI ProcessCommand(HANDLE md)
 			continue;
 #if defined(TRACE) && (TRACE & TRACE_ULACALL)
 		printf_s("\n\n#%d command"
-			", fiber#%X(_%u_)"
+			", fiber#%u(_%X_)"
 			", %s(code = %d, size = %d)\n"
 			, n
 			, pCmd->fiberID, be32toh(pCmd->fiberID)

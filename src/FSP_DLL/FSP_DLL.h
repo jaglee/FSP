@@ -142,23 +142,22 @@ protected:
 	ControlBlock::PFSP_SocketBuf skbImcompleteToSend;
 
 	char			inUse;
-	char			toDispose;
 	char			newTransaction;	// it may simultaneously start a transmit transaction and flush/commit it
 
-	char			initiatingShutdown : 1;
-	char			committing : 1;
-	char			lowerLayerRecycled : 1;
-	char			peerCommitPending : 1;
-	char			peerCommitted : 1;
+	// Flags, in dictionary order
 	char			chainingReceive : 1;
 	char			chainingSend : 1;
+	char			committing : 1;
+	char			initiatingShutdown : 1;
+	char			lowerLayerRecycled : 1;
+	char			peerCommitPending : 1;
+	char			peerCommitted : 1;	// Only for conventional buffered, streamed read
 
 	HANDLE			pollingTimer;
 	ALIGN(8)		HANDLE theWaitObject;
 
 	// to support full-duplex send and receive does not share the same call back function
 	NotifyOrReturn	fpReceived;
-	// to support superior RecvInline() over ReadFrom() make CallbackPeeked an independent function
 	CallbackPeeked	fpPeeked;
 	CallbackBufferReady fpSent;
 	NotifyOrReturn	fpCommitted;
@@ -198,7 +197,7 @@ protected:
 	}
 
 	bool LOCALAPI AddOneShotTimer(uint32_t);
-	bool LOCALAPI AddPollingTimer(uint32_t);
+	bool EnablePolling();
 	bool CancelPolling();
 	bool CancelTimeout();
 	void TimeOut();
@@ -277,19 +276,24 @@ public:
 		return pControlBlock->GetRecvPtr(skb);
 	}
 
-	FSP_Session_State GetState() const { return pControlBlock->state; }
-	bool InState(FSP_Session_State s) const { return pControlBlock->state == s; }
-	void SetState(FSP_Session_State s) { _InterlockedExchange8((char *) & pControlBlock->state, s); }
+
+	FSP_Session_State GetState() { return (FSP_Session_State)InterlockedOr8((char *)& pControlBlock->state, 0); }
+	bool InState(FSP_Session_State s) { return GetState() == s; }
+	void SetState(FSP_Session_State s) { _InterlockedExchange8((char *)& pControlBlock->state, s); }
 	bool TestSetState(FSP_Session_State s0, FSP_Session_State s2)
 	{
 		return (_InterlockedCompareExchange8((char *) & pControlBlock->state, s2, s0) == s0);
 	}
-	bool InIllegalState() const { return pControlBlock->state <= 0 || pControlBlock->state > LARGEST_FSP_STATE; }
+	bool InIllegalState()
+	{
+		register FSP_Session_State s = (FSP_Session_State)InterlockedOr8((char *)& pControlBlock->state, 0);
+		return (s <= 0 || s > LARGEST_FSP_STATE);
+	}
 
-	uint64_t GetExtentOfULA() const { return context.extentI64ULA; }
+	uint64_t GetExtentOfULA() { return context.extentI64ULA; }
 	void SetExtentOfULA(uint64_t value) { context.extentI64ULA = value; }
 
-	bool HasPeerCommitted() const { return peerCommitted != 0; }
+	bool HasPeerCommitted() { return peerCommitted != 0; }
 
 	bool WaitUseMutex();
 	void SetMutexFree() { ReleaseSRWLockExclusive(& rtSRWLock); }
@@ -338,15 +342,20 @@ public:
 
 	ControlBlock::PFSP_SocketBuf GetSendBuf() { return pControlBlock->GetSendBuf(); }
 
-	int32_t LOCALAPI PrepareToSend(void *, int32_t);
+	int32_t LOCALAPI PrepareToSend(void *, int32_t, bool);
 	int32_t LOCALAPI SendStream(const void *, int32_t, bool, bool);
 	int Flush();
 
+	bool TestSetOnCommit(PVOID fp1)
+	{
+		return InterlockedCompareExchangePointer((PVOID *)& fpCommitted, fp1, NULL) == NULL;
+	}
+	//
 	bool TestSetSendReturn(PVOID fp1)
 	{
 		return InterlockedCompareExchangePointer((PVOID *) & fpSent, fp1, NULL) == NULL; 
 	}
-	//
+
 	int LOCALAPI FinalizeSend(int r)
 	{
 		// Prevent premature FSP_Send	// Just prebuffer.
@@ -362,6 +371,7 @@ public:
 		return r;
 	}
 	//
+	int BlockOnCommit();
 	int Commit();
 	int LockAndCommit(NotifyOrReturn);
 
@@ -375,18 +385,30 @@ public:
 	void SetCallbackOnFinish(NotifyOrReturn fp1) { context.onFinish = fp1; }
 
 	void SetNewTransaction() { committing = 0; newTransaction = 1; }
-	// Given
-	//	bool	whether to terminate the transmit transaction
-	// Do
-	//	Set committing and newTransaction conditionally, respectively
-	void CheckTransmitaction(bool eotFlag)
+
+	//	Because there may be race condition between LLS and DLL state transition shall be render
+	//	after all new packets has been put into the send queue beforer marked ready to send
+	void CSocketItemDl::MigrateToNewStateOnSend()
 	{
-		if(eotFlag)
-			committing = 1;
-		if (InState(COMMITTED) || InState(CLOSABLE))
-			newTransaction = 1;
+		if (InState(ESTABLISHED))
+		{
+			if (committing)
+				SetState(COMMITTING);
+		}
+		else if (InState(PEER_COMMIT))
+		{
+			if (committing)
+				SetState(COMMITTING2);
+		}
+		else if (InState(COMMITTED))
+		{
+			SetState(committing ? COMMITTING : ESTABLISHED);
+		}
+		else if (InState(CLOSABLE))
+		{
+			SetState(committing ? COMMITTING2 : PEER_COMMIT);
+		}
 	}
-	void MigrateToNewStateOnSend();
 
 	int SelfNotify(FSP_ServiceCode c);
 	void SetCallbackOnError(NotifyOrReturn fp1) { context.onError = fp1; }

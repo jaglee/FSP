@@ -86,5 +86,5 @@ static int FSPAPI toSendNextBlock(FSPHANDLE h, void * batchBuffer, int32_t capac
 
 	offset += bytesRead;
 
-	return SendInline(h, batchBuffer, bytesRead, (offset >= sizeof(bytesToSend)));
+	return SendInline(h, batchBuffer, bytesRead, (offset >= sizeof(bytesToSend)), NULL);
 }
