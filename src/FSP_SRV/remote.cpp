@@ -1187,6 +1187,7 @@ void CSocketItemEx::OnGetMultiply()
 
 	uint32_t remoteHostID = pControlBlock->connectParams.remoteHostID;
 	ALFID_T idSource = headPacket->fidPair.source;
+	ALFID_T idParent = this->fidPair.source;
 	PFSP_InternalFixedHeader pFH = headPacket->GetHeaderFSP();
 	uint32_t salt = pFH->expectedSN;
 	// The out-of-band serial number is stored in p1->expectedSN
@@ -1203,7 +1204,7 @@ void CSocketItemEx::OnGetMultiply()
 
 	// Check whether it is a collision: a retransmitted MULTIPLY MAY refresh the ICC context
 	// See also CLowerInterface::OnGetInitConnect
-	CMultiplyBacklogItem *newItem  = CLowerInterface::Singleton.FindByRemoteId(remoteHostID, idSource, fidPair.source);
+	CMultiplyBacklogItem *newItem  = CLowerInterface::Singleton.FindByRemoteId(remoteHostID, idSource, idParent);
 	if (newItem != NULL)
 	{
 		if( newItem->contextOfICC.snFirstRecvWithCurrKey == headPacket->pktSeqNo + 1
@@ -1240,7 +1241,7 @@ void CSocketItemEx::OnGetMultiply()
 	backlogItem.expectedSN = headPacket->pktSeqNo;
 	rand_w32(&backlogItem.initialSN, 1);
 	// Inherit the parent's session key:
-	backlogItem.idParent = fidPair.source;
+	backlogItem.idParent = idParent;
 	backlogItem.acceptAddr = pControlBlock->nearEndInfo;
 	backlogItem.acceptAddr.idALF = newItem->fidPair.source;
 	memcpy(backlogItem.allowedPrefixes, pControlBlock->peerAddr.ipFSP.allowedPrefixes, sizeof(uint64_t)* MAX_PHY_INTERFACES);
@@ -1249,7 +1250,7 @@ void CSocketItemEx::OnGetMultiply()
 	SOCKADDR_HOSTID(newItem->sockAddrTo) = remoteHostID;
 	// While the ALFID part which was assigned dynamically by AllocItem() is preserved
 	newItem->fidPair.peer = idSource;
-	newItem->idParent = fidPair.source;
+	newItem->idParent = idParent;
 	newItem->nextOOBSN = this->nextOOBSN;
 	newItem->lastOOBSN = be32toh(salt);
 	//^As a salt it is of neutral byte-order, as an OOBSN it should be transformed to host byte order.
@@ -1275,13 +1276,13 @@ void CSocketItemEx::OnGetMultiply()
 #if defined(TRACE) && (TRACE & TRACE_OUTBAND)
 	printf_s("\nTo acknowledge MULTIPLY/send a PERSIST in LLS, ICC context:\n"
 		"\tSN of MULTIPLY received = %09u, salt = %09u\n"
-		"\tALFID of peer's parent = %u, ALFID of near end's parent = %u\n"
+		"\tALFID of peer's branch = %u, ALFID of near end's parent = %u\n"
 		, backlogItem.expectedSN, salt
-		, this->fidPair.peer, newItem->idParent);
+		, idSource, idParent);
 #endif
 	// note that the responder's key material mirrors the initiator's
 	if (newItem->contextOfICC.keyLifeRemain != 0)
-		newItem->DeriveKey(backlogItem.expectedSN, salt, this->fidPair.peer, newItem->idParent);
+		newItem->DeriveKey(idSource, idParent);
 
 	newItem->tLastRecv = tLastRecv;	// inherit the time when the MULTIPLY packet was received
 	newItem->tRoundTrip_us = tRoundTrip_us;	// inherit the value of the parent as the initial

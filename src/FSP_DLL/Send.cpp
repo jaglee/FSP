@@ -205,7 +205,6 @@ int LOCALAPI CSocketItemDl::SendInplace(void * buffer, int32_t len, bool eot)
 	}
 	// UNRESOLVED!? Or wait until commitment has been acknowledged?
 
-	bytesBuffered = 0;
 	return FinalizeSend(PrepareToSend(buffer, len, eot));
 }
 
@@ -390,7 +389,7 @@ l_recursion:
 		if (fp2 != NULL)
 		{
 			SetMutexFree();
-			fp2(this, FSP_NotifyFlushed, 0);
+			fp2(this, FSP_NotifyFlushed, bytesBuffered);
 			return;
 		}
 	}
@@ -618,7 +617,10 @@ l_finalize:
 int32_t LOCALAPI CSocketItemDl::PrepareToSend(void * buf, int32_t len, bool eot)
 {
 	if(len <= 0 || len % MAX_BLOCK_SIZE != 0 && !eot)
+	{
+		bytesBuffered = 0;
 		return -EDOM;
+	}
 
 	// Automatically mark the last unsent packet as completed. See also BufferData()
 	if(skbImcompleteToSend != NULL)
@@ -668,6 +670,7 @@ int32_t LOCALAPI CSocketItemDl::PrepareToSend(void * buf, int32_t len, bool eot)
 	pControlBlock->AddRoundSendBlockN(pControlBlock->sendBufferNextPos, m);
 	InterlockedAdd((LONG *)& pControlBlock->sendBufferNextSN, m);
 
+	bytesBuffered = len;
 	MigrateToNewStateOnSend();
 
 	// unlock them in a batch

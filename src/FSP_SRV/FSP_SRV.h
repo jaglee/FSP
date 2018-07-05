@@ -529,7 +529,7 @@ public:
 
 	void InstallEphemeralKey();
 	void InstallSessionKey(const CommandInstallKey &);
-	void LOCALAPI DeriveKey(ControlBlock::seq_t, uint32_t, ALFID_T, ALFID_T);
+	void LOCALAPI DeriveKey(ALFID_T idInitiator, ALFID_T idResponder);
 
 	bool CheckMemoryBorder(ControlBlock::PFSP_SocketBuf p)
 	{

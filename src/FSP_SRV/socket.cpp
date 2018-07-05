@@ -714,12 +714,12 @@ void CSocketItemEx::InitiateMultiply(CSocketItemEx *srcItem)
 #if defined(TRACE) && (TRACE & TRACE_OUTBAND)
 	printf_s("\nTo send MULTIPLY in LLS, ICC context:\n"
 		"\tSN of MULTIPLY to send = %09u, salt = %09u\n"
-		"\tALFID of near end's parent = %u, ALFID of peer's parent = %u\n"
+		"\tALFID of near end's branch = %u, ALFID of peer's parent = %u\n"
 		, seq0, salt
-		, idParent, fidPair.peer);
+		, fidPair.source, fidPair.peer);
 #endif
 	if (contextOfICC.keyLifeRemain != 0)
-		DeriveKey(seq0, salt, idParent, fidPair.peer);
+		DeriveKey(fidPair.source, fidPair.peer);
 
 	// MULTIPLY can only be the very first packet
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend();

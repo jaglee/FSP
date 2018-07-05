@@ -562,9 +562,7 @@ void ICC_Context::Derive(const octet *info, int LEN)
 
 
 // Given
-//	ControlBlock::seq_t sn1			The sequence number of the initiator's MULTIPLY packet
-//	ControlBlock::seq_t ackSN		The sequence number of the responder's first packet
-//	ALFID_T idInitiator				The initiator's original ALFID (the parent ALFID)
+//	ALFID_T idInitiator				The initiator's branch ALFID (the new ALFID)
 //	ALFID_T idResponder				The responder's original ALFID (the parent ALFID)
 // Do
 //  Set the session key for the packet next sent and the next received. 
@@ -572,30 +570,27 @@ void ICC_Context::Derive(const octet *info, int LEN)
 //	[d]		- Depth. It is alike the KDF counter mode as the NIST SP800-108 (not the feedback mode)
 //	Label	¨C A string that identifies the purpose for the derived keying material,
 //	          here we set to "Multiply an FSP connection"
-//	Context	- SN of MULTIPLY (host byte order), Salt, idInitiator, idResponder
+//	Context	- idInitiator, idResponder
 //	Length	- An integer specifying the length (in bits) of the derived keying material K-output
 // Remark
-//	The Salt is actually the out-of-band serial number (OOBSN) field in the MULTIPLY packet
 //	Assume other fields of contextOfICC have been filled properly,
 //	especially contextOfICC.prev = contextOfICC.curr
 //  Assume internal of SConnectParam is properly padded
 //	It is a bad idea to access internal round key of AES (to utilize blake2b)!
 //	Deliberately hard-coded. Depth of key derivation is always 1 for this version of FSP
-void LOCALAPI CSocketItemEx::DeriveKey(ControlBlock::seq_t sn1, uint32_t salt, ALFID_T idInitiator, ALFID_T idResponder)
+void LOCALAPI CSocketItemEx::DeriveKey(ALFID_T idInitiator, ALFID_T idResponder)
 {
 	ALIGN(8)
-	octet paddedData[48];
+	octet paddedData[40];
 	paddedData[0] = 1;
 	memcpy(paddedData + 1, "Multiply an FSP connection", 26); // works in multi-byte character set/ASCII encoding source only
 	paddedData[27] = 0;
-	*(uint32_t *)(paddedData + 28) = htobe32((uint32_t)sn1);
-	*(uint32_t *)(paddedData + 32) = (uint32_t)salt;
 	// ALFIDs were transmitted in neutral byte order, actually
-	*(uint32_t *)(paddedData + 36) = idInitiator;
-	*(uint32_t *)(paddedData + 40) = idResponder;
-	*(uint32_t *)(paddedData + 44) = htobe32(contextOfICC.originalKeyLength * 8);
+	*(uint32_t *)(paddedData + 28) = idInitiator;
+	*(uint32_t *)(paddedData + 32) = idResponder;
+	*(uint32_t *)(paddedData + 36) = htobe32(contextOfICC.originalKeyLength * 8);
 	//
-	contextOfICC.Derive(paddedData, 48);
+	contextOfICC.Derive(paddedData, 40);
 }
 
 
