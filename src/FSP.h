@@ -315,8 +315,9 @@ typedef	struct $FSP_HeaderSignature
 enum FSP_FlagPosition : uint8_t
 {
 	TransactionEnded = 7,	// share with the buffer block descriptor
-	Compressed = 6,			// In this version of FSP, LZ4 is exploited
-	CongestionAlarm = 5,	// Accurate ECN/Scalable Congestion Control
+	MinimalDelay = 6,		// MINimal Delay for milk-like payload
+	Compressed = 5,			// In this version of FSP, LZ4 is exploited
+	CongestionAlarm = 4,	// Explicit Congestion Notification
 };
 
 

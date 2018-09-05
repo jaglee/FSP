@@ -165,11 +165,13 @@ protected:
 	// For network streaming *Buf is not NULL
 	BYTE *			pendingSendBuf;
 	BYTE *			waitingRecvBuf;
-	// the count of to send or to receive
+	// count of octets to send
 	int32_t			pendingSendSize;
+	// count of octets expected to receive maximumly
 	int32_t			waitingRecvSize;
-	// the count of sent or received
+	// count of octets sent
 	int32_t			bytesBuffered;
+	// count of octets received
 	int32_t			bytesReceived;
 	// For sake of scattered I/O and online compression, a block may include multiple message segment 
 	int32_t			pendingStreamingSize;
