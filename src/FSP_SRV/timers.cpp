@@ -60,15 +60,6 @@ bool CSocketItemEx::LockWithActiveULA()
 
 // Main purpose is to send the mandatory low-frequence KEEP_ALIVE
 /**
-  [Idle Timeout]
-	ACTIVE-->NON_EXISTENT
-	PEER_COMMIT-->NON_EXISTENT
-	COMMITTED-->NON_EXISTENT
-	CLOSABLE-->NON_EXISTENT
-
-  Retransmission time-out in CONNECT_BOOTSTRAP, CONNECT_AFFIRMING
-  Transient state time-out in CHALLENGING, CLONING
-
   But the transaction commit time-out is handled in DLL, i.e. in ULA's work set.
 	{COMMITTING, COMMITTING2}-->NON_EXISTENT
  */

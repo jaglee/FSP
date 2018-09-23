@@ -129,6 +129,14 @@ void * FSPAPI GetExtPointer(FSPHANDLE hFSPSocket)
 
 
 DllSpec
+PFSP_Context FSPAPI GetFSPContext(FSPHANDLE hFSPSocket, PFSP_Context pCtx)
+{
+	((CSocketItemDl *)hFSPSocket)->CopyOutContext(pCtx);
+	return pCtx;
+}
+
+
+DllSpec
 bool FSPAPI HasReadEoT(FSPHANDLE hFSPSocket)
 {
 	try

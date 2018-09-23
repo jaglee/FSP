@@ -31,6 +31,31 @@
 #include <time.h>
 
 
+/* FSM:  State migration on sending. See also MigrateToNewStateOnSend. *\
+
+{CHALLENGING, CONNECT_AFFIRMING}
+[API: Send{new data}]
+	|<-->{just prebuffer}
+
+{ACTIVE, PEER_COMMIT}
+|<-->[API: Send{more data}][Send PURE_DATA]
+
+ACTIVE
+	|--[API: Send{flush}]-->COMMITTING{Urge COMMIT}
+
+PEER_COMMIT
+	|--[API: Send{flush}]-->COMMITTING2-->[Urge COMMIT]
+
+COMMITTED
+	|--[API: Send{more data}]-->ACTIVE-->[Send PERSIST]
+	|--[API: Send{flush}]-->COMMITTING{Urge COMMIT}
+
+CLOSABLE
+	|--[API: Send{more data}]-->PEER_COMMIT-->[Send PERSIST]
+	|--[API: Send{flush}]-->COMMITTING2-->[Urge COMMIT]
+
+  */
+
 
 // Given
 //	FSPHANDLE			the socket handle

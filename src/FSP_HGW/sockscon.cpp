@@ -186,8 +186,8 @@ void ToServeSOCKS(char *nameAppLayer, int port)
 
 	FSP_SocketParameter parms;
 	memset(& parms, 0, sizeof(parms));
-	parms.onAccepting = NULL;
-	parms.onAccepted = onConnected;
+	// blocking mode, both onAccepting and onAccepted are default to NULL
+	// parms.onAccepted = onConnected;
 	parms.onError = onError;
 	parms.recvSize = MAX_FSP_SHM_SIZE/2;
 	parms.sendSize = MAX_FSP_SHM_SIZE/2;
@@ -197,6 +197,11 @@ void ToServeSOCKS(char *nameAppLayer, int port)
 		printf_s("Failed to initialize the FSP connection towards the tunnel server\n");
 		return;
 	}
+
+	// synchronous mode
+	if (parms.onAccepted == NULL)
+		onConnected(hClientMaster, GetFSPContext(hClientMaster, &parms));
+
 	//
 	if(! requestPool.Init(MAX_WORKING_THREADS))
 	{

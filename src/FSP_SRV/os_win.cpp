@@ -1222,7 +1222,7 @@ void CSocketItemEx::HandleFullICC(PktBufferBlock *pktBuf, FSPOperationCode opCod
 		goto l_return;
 
 	// MULTIPLY is semi-out-of-band COMMAND starting from a fresh new ALFID. Note that pktBuf is the received
-	// In the CLONING state only PERSIST is the legitimate acknowledgement to MULTIPLY,
+	// In the CLONING state ACK_START or PERSIST is the legitimate acknowledgement to MULTIPLY,
 	// while the acknowledgement itself shall typically originate from some new ALFID.
 	if (fidPair.peer != pktBuf->fidPair.source	// it should be rare
 		&& opCode != MULTIPLY && (lowState != CLONING || opCode != ACK_START && opCode != PERSIST) )

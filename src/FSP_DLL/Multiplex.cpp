@@ -70,14 +70,16 @@ FSPHANDLE FSPAPI MultiplyAndWrite(FSPHANDLE hFSP, PFSP_Context psp1, int8_t flag
 
 
 
-// given
-//	the handle of the FSP socket whose connection is to be duplicated,
-//	the pointer to the socket parameter
-//	the pointer to the callback function
-// return
+//[API: Multiply]
+//	NON_EXISTENT-->CLONING-->[Send MULTIPLY]{enable retry}
+// Given
+//	FSP_HANDLE			the handle of the FSP socket whose connection is to be duplicated,
+//	PFSP_Context		the pointer to the socket parameter
+//	CallbackBufferReady the pointer to the callback function
+// Return
 //	the handle of the new created socket
 //	or NULL if there is some immediate error, more information may be got from the flags set in the context parameter
-// remark
+// Remark
 //	The MULTIPLY request is sent to the remote peer only when following SendInplace was called
 //	The handle returned might be useless, if CallbackConnected report error laterly
 //	the capacity of immediately available buffer (might be 0) is outputted in the reference
@@ -124,6 +126,8 @@ FSPHANDLE FSPAPI MultiplyAndGetSendBuffer(FSPHANDLE hFSP, PFSP_Context psp1, Cal
 //	The new socket item
 // Remark
 //	Requirement of a command structure is rendered by CreateControlBlock
+//	It is not hard-limited, but ULA shall only clone a connection in the
+//	ESTABLISHED(COMMITTING, COMMITTED, PEER_COMMIT, COMMITTING2 or CLOSABLE) state
 CSocketItemDl * LOCALAPI CSocketItemDl::ToPrepareMultiply(FSPHANDLE h, PFSP_Context psp1, CommandCloneConnect & objCommand)
 {
 	CSocketItemDl *p = CSocketDLLTLB::HandleToRegisteredSocket(h);

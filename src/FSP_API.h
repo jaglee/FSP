@@ -51,10 +51,10 @@
 #define DllSpec
 #endif
 
-#ifdef NDEBUG
-# define MAX_FSP_SHM_SIZE		0x400000	// 4MB
-#else
-# define MAX_FSP_SHM_SIZE		0x1000		// 4KB
+#ifdef NDEBUG	// Run-time default for release version
+# define MAX_FSP_SHM_SIZE		0x4000000	// 64MB
+#elif !defined(MAX_FSP_SHM_SIZE)
+# define MAX_FSP_SHM_SIZE		0x100000	// 1MB
 #endif
 
 #if defined(_M_X64) || defined(_M_IA64)
@@ -441,6 +441,16 @@ int FSPAPI FSPControl(FSPHANDLE, FSP_ControlCode, ulong_ptr);
 // A shortcut for FSPControl(FSPHANDLE, FSP_GET_EXT_POINTER, ...);
 DllSpec
 void * FSPAPI GetExtPointer(FSPHANDLE);
+
+
+// Given
+//	FSPHANDLE		The handle of the FSP socket
+//	PFSP_Context	The pointer to the placeholder of context copy
+// Return
+//	the pointer to the copy of ULA context
+DllSpec
+PFSP_Context FSPAPI GetFSPContext(FSPHANDLE, PFSP_Context);
+
 
 // Exported by the DLL
 DllSpec

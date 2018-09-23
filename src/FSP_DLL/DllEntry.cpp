@@ -778,9 +778,9 @@ CSocketItemDl * CSocketDLLTLB::AllocItem()
 	memset((BYTE *)item + sizeof(CSocketItem)
 		, 0
 		, sizeof(CSocketItemDl) - sizeof(CSocketItem));
-	// We are confident that RTL_SRWLOCK_INIT is all zero
-	// so InitializeSRWLock(& item->rtSRWLock) or assign to SRWLOCK_INIT is unneccessary
-	//
+	InitializeSRWLock(&item->rtSRWLock);
+	// Are we confident that RTL_SRWLOCK_INIT is all zero
+	// so assign to SRWLOCK_INIT is unneccessary?
 	pSockets[sizeOfWorkSet++] = item;
 	_InterlockedExchange8(& item->inUse, 1);
 

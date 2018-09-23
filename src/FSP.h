@@ -131,31 +131,31 @@ typedef enum _FSP_Session_State: char
 	NON_EXISTENT = 0, 
 	// the passiver listener to folk new connection handle:
 	LISTENING,
-	// context cloned/connection multiplying (ESTABLISHED:CLOSABLE)
-	CLONING,
 	// initiative, after sending initiator's check code, before getting responder's cookie
 	// timeout to retry or NON_EXISTENT:
 	CONNECT_BOOTSTRAP,
-	// after getting legal CONNECT_REQUEST and sending back ACK_CONNECT_REQ
-	// before getting ACK_START or first PERSIST. timeout to NON_EXISTENT:
-	CHALLENGING,
 	// after getting responder's cookie and sending formal CONNECT_REQUEST
 	// before getting ACK_CONNECT_REQ, timeout to retry or NON_EXISTENT
 	CONNECT_AFFIRMING,
+	// after getting legal CONNECT_REQUEST and sending back ACK_CONNECT_REQ
+	// before getting ACK_START or first PERSIST. timeout to NON_EXISTENT:
+	CHALLENGING,
 	// after getting a non-EoT PERSIST
 	ESTABLISHED,
 	// after sending EoT flag, before getting all packet-in-flight acknowledged.
 	COMMITTING,	// A.K.A. FLUSHING; used to be PAUSING
-	// after getting the peer's EoT flag
-	PEER_COMMIT,
-	// after getting the peer's EoT flag and the near end has sent EoT
-	COMMITTING2,
 	// after getting ACK_FLUSH, i.e. both EoT flag and all packet-in-flight have been acknowledged
 	COMMITTED,	// unilaterally adjourned
+	// after getting the peer's EoT flag
+	PEER_COMMIT,
+	// after getting the peer's EoT flag and the near end has sent EoT, before getting ACK_FLUSH
+	COMMITTING2,
 	// after getting the peer's EoT flag in the COMMITTED state, or ACK_FLUSH in the COMMITTING2 state
 	CLOSABLE,
 	// asymmetrically shutdown
 	PRE_CLOSED,
+	// local context cloned/connection multiplying
+	CLONING,
 	// after ULA shutdown the connection in CLOSABLE state gracefully
 	// it isn't a pseudo-state alike TCP, but a physical, resumable/reusable state
 	CLOSED,

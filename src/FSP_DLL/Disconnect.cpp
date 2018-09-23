@@ -89,7 +89,13 @@ void CSocketItemDl::Disable()
 }
 
 
-
+// [API:Shutdown]
+//	{ESTABLISHED, COMMITTING}-->{try to commit first}COMMITTED-->{wait for peer's commit}CLOSABLE
+//	PEER_COMMIT->{try to commit first}COMMITTING2-->CLOSABLE
+//	CLOSABLE-->PRE_CLOSED-->[Send RELEASE]
+//	PRE_CLOSED<-->{keep state}
+//	{otherwise: connection not ever established yet}-->{Treat 'Shutdown' command as 'Abort'}
+// It should be illegal to call Shutdown in the state 'earlier' than PEER_COMMIT
 // Try to terminate the session gracefully, automatically commit if not yet 
 // Return 0 if no immediate error, or else the error number
 // The callback function 'onFinish' might return code of delayed error
@@ -104,12 +110,6 @@ int FSPAPI Shutdown(FSPHANDLE hFSPSocket)
 
 
 
-// [API:Shutdown]
-//	CLOSABLE-->PRE_CLOSED-->[Send RELEASE]
-//	PRE_CLOSED<-->{keep state}
-//	{ESTABLISHED, COMMITTING, PEER_COMMIT, COMMITTED, COMMITTING2}{try to commit first, chain async-shutdown}
-//	{otherwise: connection not ever established yet}-->{Treat 'Shutdown' command as 'Abort'}
-//	ALWAYS assume that only after it has finished receiving is shutdown called
 // Remark
 //	Shutdown is always somewhat blocking. It is deliberate blocking
 //	if 'onFinish' function pointer in the connection context is NULL,

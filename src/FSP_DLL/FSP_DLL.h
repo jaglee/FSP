@@ -292,6 +292,8 @@ public:
 		return (s <= 0 || s > LARGEST_FSP_STATE);
 	}
 
+	void CopyOutContext(PFSP_Context pCtx) { memcpy(pCtx, &context, sizeof(FSP_SocketParameter)); }
+
 	uint64_t GetExtentOfULA() { return context.extentI64ULA; }
 	void SetExtentOfULA(uint64_t value) { context.extentI64ULA = value; }
 
@@ -372,6 +374,8 @@ public:
 		SetMutexFree();
 		return r;
 	}
+
+	CSocketItemDl * WaitingConnectAck();
 	//
 	int BlockOnCommit();
 	int Commit();

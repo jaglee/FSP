@@ -251,6 +251,8 @@ l_return:
 	however, it is not justified, for throughput throttling is overriding
  */
 //LISTENING-->/CONNECT_REQUEST/-->[API{new context, callback}]
+//	|<-->[Rcv.CONNECT_REQUEST]{&& duplication detected}
+//		[Retransmit ACK_CONNECT_REQ]{at the head of the queue}
 //	|-->[{return}Accept]
 //		-->{new context}CHALLENGING-->[Send ACK_CONNECT_REQ]
 //	|-->[{return}Reject]-->[Send RESET]{abort creating new context}
@@ -272,7 +274,6 @@ void LOCALAPI CLowerInterface::OnGetConnectRequest()
 				return;
 			pSocket->EmitStart(); // hit
 			pSocket->SetMutexFree();
-
 		}
 		// Or else it is a collision and is silently discard in case an out-of-order RESET reset a legitimate connection
 		return;
@@ -537,13 +538,9 @@ bool LOCALAPI CSocketItemEx::ValidateSNACK(ControlBlock::seq_t & ackSeqNo, FSP_S
 //	int					the content length of the packet buffer, which holds both the header and the optional payload
 // Do
 //	Check the validity of the ackowledgement to the CONNECT_REQUEST command and establish the ephemeral session key
-// Remark
-//	CONNECT_AFFIRMING-->/ACK_CONNECT_REQ/-->[API{callback}]
-//		|-->{Return Accept}
-//			{to piggyback data}|-->PEER_COMMIT-->[Send PERSIST] {start keep-alive}
-//			{payloadless}|-->COMMITTING2-->[Send ACK_START] {start keep-alive}
-//		|-->{Return Reject}-->NON_EXISTENT-->[Send RESET]
-// See also {FSP_DLL}CSocketItemDl::ToConcludeConnect()
+// CONNECT_AFFIRMING
+//	|--[Rcv.ACK_CONNECT_REQ]-->[Notifiy]
+// See also @DLL::ToConcludeConnect()
 void CSocketItemEx::OnConnectRequestAck(PktBufferBlock *pktBuf, int lenData)
 {
 	if (!LockWithActiveULA())
@@ -594,10 +591,10 @@ void CSocketItemEx::OnConnectRequestAck(PktBufferBlock *pktBuf, int lenData)
 	}
 
 	// Now the packet can be legitimately accepted
-	// Enable the time-out mechanism
+
 	// Ignore granularity of OS time-slice here, which may slightly affect calculation of RTT
 	tSessionBegin = tMigrate = tLastRecv = NowUTC();
-	lowState = PRE_CLOSED;
+	lowState = CHALLENGING;	// Disable retransmission of head packet in the send queue
 	tRoundTrip_us = (uint32_t)min(UINT32_MAX, (tRoundTrip_us + (tSessionBegin - tRecentSend) + 1) >> 1);
 
 	// Attention Please! ACK_CONNECT_REQ may carry payload and thus consume the packet sequence space
@@ -635,7 +632,8 @@ l_return:
 // It is the in-band acknowledgement to ACK_CONNECT_REQ or MULTIPLY
 // It cannot be substituted by ACK_FLUSH which is out-of-band
 //	CHALLENGING-->/ACK_START/-->CLOSABLE-->[Send ACK_FLUSH]-->[Notify]
-//	PEER_COMMIT-->/ACK_START/-->[Send ACK_FLUSH]
+//	PEER_COMMIT-->/ACK_START/-->{keep state}[Send ACK_FLUSH]
+//	COMMITTING2-->/ACK_START/-->{keep state}[Send ACK_FLUSH]
 //	CLOSABLE-->/ACK_START/-->{keep state}[Send ACK_FLUSH]
 //  CLONING-->/ACK_START/
 //		|-->{Not ULA-flushing}-->PEER_COMMIT
@@ -644,7 +642,7 @@ l_return:
 void CSocketItemEx::OnGetAckStart()
 {
 	TRACE_SOCKET();
-	if (!InStates(4, CHALLENGING, PEER_COMMIT, CLOSABLE, CLONING))
+	if (!InStates(5, CHALLENGING, PEER_COMMIT, COMMITTING2, CLOSABLE, CLONING))
 		return;
 
 	bool isInitiativeState = InState(CHALLENGING) || InState(CLONING);
@@ -659,6 +657,7 @@ void CSocketItemEx::OnGetAckStart()
 	{
 		// Although it lets ill-behaviored peer take advantage by sending ill-formed ACK_START
 		// it costs much less than to ValidateICC() or Notify()
+		// PEER_COMMIT, COMMITTING2, CLOSABLE: retransmit ACK_FLUSH on get ACK_START
 		if (OffsetToRecvWinLeftEdge(headPacket->pktSeqNo) < 0 || !isInitiativeState)
 		{
 			AddLazyAckTimer();
@@ -721,7 +720,7 @@ void CSocketItemEx::OnGetAckStart()
 //PERSIST is the acknowledgement to ACK_CONNECT_REQ or MULTIPLY, and/or start a new transmit transaction
 //	CHALLENGING-->/PERSIST/
 //		--{EOT}-->CLOSABLE-->[Send ACK_FLUSH]-->[Notify]
-//		--{otherwise}-->COMMITTED{start keep-alive}-->[Notify]
+//		--{otherwise}-->COMMITTED-->[Notify]
 //	ESTABLISHED-->/PERSIST/
 //		--{EOT}-->PEER_COMMIT-->[Send ACK_FLUSH]-->[Notify]
 //		--{otherwise}-->[Send SNACK]{keep state}
@@ -756,7 +755,7 @@ void CSocketItemEx::OnGetAckStart()
 void CSocketItemEx::OnGetPersist()
 {
 	TRACE_SOCKET();
-	if (!InStates(8, CHALLENGING, ESTABLISHED, PEER_COMMIT, COMMITTING2, COMMITTED, CLOSABLE, CLONING))
+	if (!InStates(7, CHALLENGING, ESTABLISHED, PEER_COMMIT, COMMITTING2, COMMITTED, CLOSABLE, CLONING))
 		return;
 
 	bool isInitiativeState = InState(CHALLENGING) || InState(CLONING);
@@ -940,16 +939,16 @@ void CSocketItemEx::OnGetKeepAlive()
 
 //ACTIVE-->/PURE_DATA/
 //	|-->{EOT}
-//		-->{stop keep-alive}PEER_COMMIT-->[Send ACK_FLUSH]-->[Notify]
-//	|-->{otherwise}-->{keep state}[Send SNACK]-->[Notify]
+//		-->PEER_COMMIT-->[Send ACK_FLUSH]-->[Notify]
+//	|-->{otherwise}-->[Send SNACK]-->[Notify]
 //COMMITTING-->/PURE_DATA/
 //	|-->{EOT}
 //		-->COMMITTING2-->[Send ACK_FLUSH]-->[Notify]
-//	|-->{otherwise}-->{keep state}[Send SNACK]-->[Notify]
+//	|-->{otherwise}-->[Send SNACK]-->[Notify]
 //COMMITTED-->/PURE_DATA/
 //	|-->{EOT}
-//		-->{stop keep-alive}CLOSABLE-->[Send ACK_FLUSH]-->[Notify]
-//	|-->{otherwise}-->{keep state}[Send SNACK]-->[Notify]
+//		-->CLOSABLE-->[Send ACK_FLUSH]-->[Notify]
+//	|-->{otherwise}-->[Send SNACK]-->[Notify]
 //{CLONING, PEER_COMMIT, COMMITTING2, CLOSABLE}<-->/PURE_DATA/{just prebuffer}
 // However ULA protocol designer must keep in mind that these prebuffered may be discarded
 void CSocketItemEx::OnGetPureData()
@@ -957,14 +956,6 @@ void CSocketItemEx::OnGetPureData()
 #if (TRACE & TRACE_PACKET)
 	TRACE_SOCKET();
 #endif
-	if (!InStates(7, ESTABLISHED, COMMITTING, COMMITTED, CLONING, PEER_COMMIT, COMMITTING2, CLOSABLE))
-	{
-#ifdef TRACE
-		printf_s("In state %s data may not be accepted.\n", stateNames[lowState]);
-#endif
-		return;
-	}
-
 	int32_t d = OffsetToRecvWinLeftEdge(headPacket->pktSeqNo);
 	if (d > pControlBlock->recvBufferBlockN)
 	{
@@ -977,6 +968,21 @@ void CSocketItemEx::OnGetPureData()
 	if (d < 0)
 	{
 		AddLazyAckTimer();	// It costs much less than to ValidateICC() or Notify()
+		return;
+	}
+
+	// Just ignore the unexpected PURE_DATA
+	if (InStates(4, CLONING, PEER_COMMIT, COMMITTING2, CLOSABLE))
+	{
+		if(d == 0)
+			return;
+		// else just prebuffer
+	}
+	else if(! InStates(3, ESTABLISHED, COMMITTING, COMMITTED))
+	{
+#ifdef TRACE
+		printf_s("In state %s data may not be accepted.\n", stateNames[lowState]);
+#endif
 		return;
 	}
 
@@ -1112,7 +1118,7 @@ void CSocketItemEx::OnAckFlush()
 
 // CLOSABLE-->/RELEASE/-->CLOSED-->[Send RELEASE]-->[Notify]
 // {COMMITTING2, PRE_CLOSED}-->/RELEASE/
-//    -->{stop keep-alive}CLOSED-->[Send RELEASE]-->[Notify]
+//    -->CLOSED-->[Send RELEASE]-->[Notify]
 // Remark
 //	RELEASE carries no payload but consumes the sequence space via ValidateICC to fight against play-back DoS attack
 //	Duplicate RELEASE might be received AFTER the control block has been released already, so check before trace

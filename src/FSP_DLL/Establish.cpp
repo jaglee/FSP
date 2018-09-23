@@ -147,9 +147,9 @@ CSocketItemDl *CSocketItemDl::Accept1()
 //	or NULL if there is some immediate error, more information may be got from the flags set in the context parameter
 // Remark
 //	Socket address of the remote end would be resolved by LLS and stored in the control block
-//	the call back function whose pointer 'onConnected' was given in the structure pointed by PSP_SocketParameter
-//  would report later error by passing a NULL FSP handle as the first parameter
-//	and a negative integer, which is the error number, as the second parameter if connection failed
+//	the function called back on connected should be given as the onAccepted function pointer
+//  in the structure pointed by PSP_SocketParameter.
+//	If it is NULL, this function is blocking
 DllSpec
 FSPHANDLE FSPAPI Connect2(const char *peerName, PFSP_Context psp1)
 {
@@ -189,6 +189,10 @@ FSPHANDLE FSPAPI Connect2(const char *peerName, PFSP_Context psp1)
 		REPORT_ERRMSG_ON_TRACE("Cannot create the LLS socket to request connection establishment");
 		socketItem->FreeAndDisable();
 	}
+
+	if (psp1->onAccepted == NULL)
+		return socketItem->WaitingConnectAck();
+
 	return p;
 }
 
@@ -299,6 +303,10 @@ CSocketItemDl * CSocketItemDl::PrepareToAccept(BackLogItem & backLog, CommandNew
 
 
 
+// LISTENING-->|--[Rcv.CONNECT_REQUEST]-->{Notify}
+//	| --[Rcv.CONNECT_REQUEST]-->{Notify}
+//		| -->[API:Accept]
+//			-->{new context}CHALLENGING-->[Send ACK_CONNECT_REQ]
 // Given
 //	BackLogItem &	the reference to the acception backlog item
 // Do
@@ -355,9 +363,15 @@ bool LOCALAPI CSocketItemDl::ToWelcomeConnect(BackLogItem & backLog)
 
 
 // Auxiliary function that is called when a new connection request is acknowledged by the responder
-// CONNECT_AFFIRMING-->[Rcv.ACK_CONNECT_REQ]-->[API{callback}]
-//	|-->{Return Accept}-->PEER_COMMIT/COMMITTING2-->{start keep-alive}
-//	|-->{Return Reject}-->NON_EXISTENT-->[Send RESET]
+// CONNECT_AFFIRMING
+//	|--[Rcv.ACK_CONNECT_REQ]-->[Notifiy]
+//		|-->{Callback return to accept}
+//			|-->{No Payload}-->COMMITTING2-->[Send ACK_START]
+//			|-->{Has Payload}
+//				|-->{EOT}-->COMMITTING2-->[Send PERSIST with EoT]
+//				|-->{Not EOT}-->PEER_COMMIT-->[Send PERSIST]
+//		|-->{Callback return to reject]-->NON_EXISTENT-->[Send RESET]
+// See also @LLS::OnConnectRequestAck
 void CSocketItemDl::ToConcludeConnect()
 {
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadRecv();
@@ -501,4 +515,33 @@ int LOCALAPI CSocketItemDl::InstallRawKey(octet *key, int32_t keyBits, uint64_t 
 
 	SetMutexFree();
 	return Call(objCommand, sizeof(objCommand)) ? 0 : -EIO;
+}
+
+
+
+// For blocking mode Connect2. See also ToConcludeConnect() and WaitEventToDispatch()
+// SetState((skb == NULL || committing) ? COMMITTING2 : PEER_COMMIT);
+CSocketItemDl * CSocketItemDl::WaitingConnectAck()
+{
+	uint64_t t0 = GetTickCount64();
+	FSP_Session_State s;
+	while ((s = GetState()) != PEER_COMMIT && s != COMMITTING2 && s != CLOSABLE && s != NON_EXISTENT)
+	{
+		if (GetTickCount64() - t0 > TRANSIENT_STATE_TIMEOUT_ms)
+		{
+			context.flags = -ETIMEDOUT;
+			FreeAndDisable();
+			return NULL;
+		}
+		Sleep(TIMER_SLICE_ms);
+	}
+
+	if (s == NON_EXISTENT)
+	{
+		context.flags = -ECONNRESET;
+		FreeAndDisable();
+		return NULL;
+	}
+
+	return this;
 }

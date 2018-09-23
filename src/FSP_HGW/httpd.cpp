@@ -263,6 +263,11 @@ void StartHTTPoverFSP()
 #endif
 
 	hListener = ListenAt(&atAddress, &params);
+	if (hListener == NULL)
+	{
+		printf_s("Cannot start the FSP Listener.\n");
+		return;
+	}
 
 	FSPHANDLE hService;
 	while((hService = Accept1(hListener)) != NULL)
