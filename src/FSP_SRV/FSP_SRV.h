@@ -156,12 +156,10 @@ public:
 class CommandCloneSessionSrv: CommandNewSessionSrv
 {
 	friend void Multiply(CommandCloneSessionSrv &);
-	ALIGN(4)
-	char	committing;
 public:
 	CommandCloneSessionSrv(const CommandToLLS *p): CommandNewSessionSrv(p)
 	{
-		committing = ((CommandCloneConnect *)p)->committing;
+		// Used to receive 'committing' flag in the command
 	}
 };
 
@@ -186,20 +184,8 @@ public:
 
 
 
-typedef struct FSP_InternalFixedHeader : FSP_NormalPacketHeader
+typedef struct FSP_InternalFixedHeader : FSP_FixedHeader
 {
-	void Set(FSPOperationCode code, uint16_t hsp, uint32_t seqThis, uint32_t seqExpected, int32_t advRecvWinSize)
-	{
-		hs.Set(code, hsp);
-		expectedSN = htobe32(seqExpected);
-		sequenceNo = htobe32(seqThis);
-		ClearFlags();
-		SetRecvWS(advRecvWinSize);
-	}
-	void SetRecvWS(int32_t v) { flags_ws[1] = (octet)(v >> 16); flags_ws[2] = (octet)(v >> 8); flags_ws[3] = (octet)v; }
-
-	void ClearFlags() { flags_ws[0] = 0; }
-
 	// Given
 	//	ControlBlock *			the context of the packet header to prepar
 	//	ControlBlock::seq_t		the intent sequence number of the packet
@@ -208,10 +194,9 @@ typedef struct FSP_InternalFixedHeader : FSP_NormalPacketHeader
 	//	flags and the advertised receive window size field of the FSP header 
 	void SetSequenceFlags(ControlBlock *pControlBlock, ControlBlock::seq_t seq1)
 	{
-		expectedSN = htobe32(pControlBlock->recvWindowNextSN);
+		pControlBlock->SetExpectedSNof(this);
 		sequenceNo = htobe32(seq1);
 		ClearFlags();
-		SetRecvWS(pControlBlock->AdRecvWS(pControlBlock->recvWindowNextSN));
 	}
 
 
@@ -434,8 +419,6 @@ protected:
 	//
 	ICC_Context	contextOfICC;
 	ALIGN(MAC_ALIGNMENT)
-	SKeepAliveCache keepAliveCache;
-	ALIGN(MAC_ALIGNMENT)
 	octet		cipherText[MAX_BLOCK_SIZE];
 
 	// multihome/mobility/resilence support (see also CInterface::EnumEffectiveAddresses):
@@ -449,6 +432,7 @@ protected:
 
 	char	locked;	// emulate spinlock linux-kernel
 	char	inUse;
+	char	transactional;	// The cache value of the EoT flag of the very first packet
 	char	shouldAppendCommit;
 	FSP_Session_State lowState;
 
@@ -463,24 +447,42 @@ protected:
 
 	uint32_t	tRoundTrip_us;	// round trip time evaluated in microsecond
 	uint32_t	tKeepAlive_ms;	// keep-alive time-out limit in millisecond
-	uint32_t	tLazyAck_us;	// lazy-acknowledgement evaluated in microsecond
 	HANDLE		timer;			// the repeating timer
 	HANDLE		resendTimer;	// retransmission timer
-	timestamp_t	tSessionBegin;
+	HANDLE		lazyAckTimer;	// timer for lazy-acknowledgement
+
+	// As the first packet received in the clone(new) connection is actually received
+	// BEFORE the new connection's session begin to send the first packet
+	// the temporary socket buffer descriptor for the first packet
+	// may overlap tRecentSend and tSessionBegin
 	timestamp_t	tLastRecv;
-	timestamp_t tRecentSend;
 	timestamp_t tMigrate;
+	union
+	{
+		struct ControlBlock::FSP_SocketBuf skbRecvClone;
+		struct
+		{
+			timestamp_t tRecentSend;
+			timestamp_t	tSessionBegin;
+		};
+	};
 
 	uint32_t	nextOOBSN;	// host byte order for near end. if it overflow the session MUST be terminated
 	uint32_t	lastOOBSN;	// host byte order, the serial number of peer's last out-of-band packet
 
 	void AbortLLS(bool haveTLBLocked = false);
 
-	void AddLazyAckTimer();
+	bool AddLazyAckTimer();
 	bool AddResendTimer();
+
 	// Side-effect: clear the isInUse flag
 	void RemoveTimers();
+
 	bool LOCALAPI ReplaceTimer(uint32_t);
+
+	// Given the index of the acknowledged packet and peer's delay to make the acknowledgement
+	// Adjust long-term round-trip-time
+	bool AdjustRTT(int32_t, uint64_t);
 
 	// KeepAlive interval in established mode is hard-coded to ~16RTT
 	void RestartKeepAlive() { ReplaceTimer(max(TIMER_SLICE_ms, uint32_t(tRoundTrip_us >> 6))); }
@@ -489,7 +491,12 @@ protected:
 	bool InState(FSP_Session_State s) { return lowState == s; }
 	bool InStates(int n, ...);
 	// synchronize the state in the 'cache' and the real state in the session control block
-	void SyncState() { _InterlockedExchange8((char *)& lowState, pControlBlock->state); tMigrate = NowUTC(); }
+	void SyncState()
+	{
+		register FSP_Session_State s = pControlBlock->state;
+		if (_InterlockedExchange8((char *)& lowState, s) != s)
+			tMigrate = NowUTC();
+	}
 	void SetState(FSP_Session_State s) { _InterlockedExchange8((char *)& pControlBlock->state, s); SyncState(); }
 
 	bool HasBeenCommitted() { return pControlBlock->HasBeenCommitted(); }
@@ -504,15 +511,17 @@ protected:
 	bool EmitStart();
 	bool SendAckFlush();
 	bool SendKeepAlive();
-	bool SendRelease();
+	void SendRelease();
 	void SendReset();
 
 	bool IsNearEndMoved();
 	int	 EmitWithICC(ControlBlock::PFSP_SocketBuf, ControlBlock::seq_t);
 
+	void DoAcknowledge();
 	void DoResend();
 	void KeepAlive();
 
+	static VOID NTAPI DoAcknowledge(PVOID c, BOOLEAN) { ((CSocketItemEx *)c)->DoAcknowledge(); }
 	static VOID NTAPI DoResend(PVOID c, BOOLEAN) { ((CSocketItemEx *)c)->DoResend(); }
 	static VOID NTAPI KeepAlive(PVOID c, BOOLEAN) { ((CSocketItemEx *)c)->KeepAlive(); }
 	//
@@ -616,6 +625,7 @@ public:
 	// Normally those pended on the queue would be eventually sent if the send window size is greater than 0
 	// retry to probe the advertised receive window size of the peer to adjust the send window size.
 	void EmitQ();
+
 	void ScheduleConnect(CommandNewSessionSrv *);
 
 	// Command of ULA
@@ -623,8 +633,6 @@ public:
 	void Listen();
 	void Connect();
 	void Accept();
-	void Start();
-	void UrgeCommit();
 
 	// Event triggered by the remote peer
 	void OnConnectRequestAck(PktBufferBlock *, int);
@@ -644,22 +652,25 @@ public:
 
 
 // The backlog of connection multiplication, for buffering the payload piggybacked by the MULTIPLY packet
-// By reuse
-//	cipherText field of CSocketItemEx
-//	tSessionBegin: FSP_SocketBuf minus timestamp
+// By reuse the fields 'cipherText' and 'skbRecvClone' of CSocketItemEx
 //	contextOfICC.snFirstRecvWithCurrKey => initialSN
 //	SOCKADDR_ALFID and SOCKADDR_HOSTID of sockAddrTo: idRemote and remoteHostID
 class CMultiplyBacklogItem: public CSocketItemEx
 {
 	friend	class CSocketSrvTLB;
 public:
-	// Get the temporary FSP_SocketBuf descriptor,
-	ControlBlock::PFSP_SocketBuf TempSocketBuf() { return (ControlBlock::PFSP_SocketBuf)(& tSessionBegin - 1); }
-	// and we knew FSP_SocketBuf descriptor start with a timestamp_t member
-	void	CopyInPlainText(const uint8_t *buf, int32_t n) { TempSocketBuf()->len = n; if(n > 0) memcpy(cipherText, buf, n); }
-	int		CopyOutPlainText(uint8_t *buf) { int32_t n = TempSocketBuf()->len; if(n > 0) memcpy(buf, cipherText, n); return n; }
+	// copy in the payload, reuse the encryption buffer as the plaintext buffer. left-aligned as normal
+	void	CopyInPlainText(const uint8_t *buf, int32_t n) { skbRecvClone.len = n; if(n > 0) memcpy(cipherText, buf, n); }
 	// copy out the flag, version and opcode fields. assume 32-bit alignment
-	void	CopyOutFVO(void *buf) { *(int32_t *)buf = *(int32_t *)& TempSocketBuf()->flags; }
+	void	CopyOutFVO(ControlBlock::PFSP_SocketBuf skb) { *(int32_t *)&skb->marks = *(int32_t *)& skbRecvClone.marks; }
+	// copy out fhe payload, make it right-aligned in the target buffer
+	int		CopyOutPlainText(uint8_t *buf)
+	{
+		int32_t n = skbRecvClone.len;
+		if (n > 0 && n <= MAX_BLOCK_SIZE)
+			memcpy(buf + MAX_BLOCK_SIZE - n, cipherText, n);
+		return n;
+	}
 	//
 	void	ResponseToMultiply();
 };

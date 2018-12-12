@@ -203,7 +203,8 @@ void Multiply(CommandCloneSessionSrv &cmd)
 		goto l_return;
 	}
 
-	newItem->shouldAppendCommit = cmd.committing;
+	newItem->transactional = newItem->pControlBlock->GetSendQueueHead()->GetFlag<TransactionEnded>();
+	//^See also @DLL::SetHeadPacketIfEmpty
 	newItem->InitiateMultiply(srcItem);
 l_return:
 	// Only on exception would it signal event to DLL
@@ -258,14 +259,8 @@ void CSocketItemEx::ProcessCommand(CommandToLLS *pCmd)
 	case FSP_Recycle:
 		Recycle();
 		break;
-	case FSP_Start:
-		Start();
-		break;
 	case FSP_Send:			// send a packet/group of packets
 		EmitQ();
-		break;
-	case FSP_Commit:
-		UrgeCommit();
 		break;
 	case FSP_Shutdown:
 		Release();
@@ -346,43 +341,51 @@ void CSocketItemEx::Connect()
 
 
 
-// Start sending queued packet(s) in the session control block
-// Remark
-//	Operation code in the given command context would be cleared if send is pending
-// See also
-//	DLL::FinalizeSend, DLL::ToConcludeConnect
-void CSocketItemEx::Start()
+// Recycle the socket, send RESET to the remote peer if not in CLOSED state
+void CSocketItemEx::Recycle()
 {
-#if (TRACE & TRACE_SLIDEWIN)
-	printf_s("To send first packet %s\n\tfirstSN = %u, nextSN = %u\n"
-		, opCodeStrings[(pControlBlock->HeadSend() + pControlBlock->sendWindowHeadPos)->opCode]
-		, pControlBlock->sendWindowFirstSN
-		, pControlBlock->sendWindowNextSN);
-#endif
-	pControlBlock->SetFirstSendWindowRightEdge();
-	EmitStart();
+	if (!IsInUse())
+		return;
 	//
-	AddResendTimer();
-	// While the KEEP_ALIVE_TIMEOUT was set already in OnConnectRequestAck
+#if (TRACE & TRACE_ULACALL)
+	printf_s("Recycle called in %s(%d) state\n", stateNames[lowState], lowState);
+#endif
+	// It is legitimate to recycle in PRE_CLOSED state unilaterally to support timeout in the upper layer
+	if (lowState == CHALLENGING || lowState == CONNECT_AFFIRMING)
+		CLowerInterface::Singleton.SendPrematureReset(EINTR, this);
+	else if (lowState != CLOSED && lowState != LISTENING && lowState != PRE_CLOSED)
+		SendReset();
+
+	// Donot [pControlBlock->state = NON_EXISTENT;] as the ULA might do further cleanup
+	// See also RejectOrReset, Destroy and @DLL::RespondToRecycle
+	SignalFirstEvent(FSP_NotifyRecycled);
+	Destroy();
 }
 
 
 
-// Mean to urge sending of the End of Transaction flag
-void CSocketItemEx::UrgeCommit()
+// Send RESET to the remote peer to reject some request in pre-active state.
+// The RESET packet is not guaranteed to be received.
+// See also DisposeOnReset, Recycle
+void CSocketItemEx::Reject(uint32_t reasonCode)
 {
-	if (lowState == COMMITTED || lowState >= CLOSABLE)
-	{
-		shouldAppendCommit = 0;	// Might be redundant, but do little harm
-		return;
-	}
+	CLowerInterface::Singleton.SendPrematureReset(reasonCode, this);
+	SignalFirstEvent(FSP_NotifyRecycled);
+	Destroy();	// MUST signal event before Destroy
+}
 
-	// It is assumed that if commit is pending the ULA would not manipulate the send queue
-	int r = pControlBlock->MarkSendQueueEOT();
-	if (r < 0)
-		shouldAppendCommit = 1;
-	else
-		EmitQ();	// It would AddResendTimer
+
+
+// Set to PRE_CLOSED state and send RELEASE to the remote end.
+// The RELEASE packet is not guaranteed to be received
+// so that PRE_CLOSED is alike TCP TIME-WAIT state.
+void CSocketItemEx::Release()
+{
+	if (lowState == PRE_CLOSED)
+		return;			// Refuse to send redundant RELEASE packet
+	ReplaceTimer(TRANSIENT_STATE_TIMEOUT_ms);
+	SetState(PRE_CLOSED);
+	SendRelease();
 }
 
 

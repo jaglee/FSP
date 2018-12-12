@@ -12,19 +12,21 @@ static uint8_t	*bytesToSend;
 static size_t	sizeOfBuffer;
 
 
-void PrepareMemoryPattern(size_t sz1)
+bool PrepareMemoryPattern(size_t sz1)
 {
 	bytesToSend = (uint8_t *)malloc(sizeOfBuffer = sz1);
 	if(bytesToSend == NULL)
 	{
 		printf_s("Cannot allocate memory block size of %zu bytes\n", sizeOfBuffer);
-		return;
+		return false;
 	}
 
 	for(register int i = 0; (size_t)i < sizeOfBuffer / sizeof(uint32_t); i++)
 	{
 		* (uint32_t *) & bytesToSend[i * sizeof(uint32_t)] = htobe32(i);
 	}
+
+	return true;
 }
 
 

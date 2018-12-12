@@ -42,21 +42,6 @@
 		return
 
 
-// Lock the session context if the process of upper layer application is still active
-// Abort the FSP session if ULA is not active
-// Return true if the session context is locked, false if not
-bool CSocketItemEx::LockWithActiveULA()
-{
-	char c = _InterlockedCompareExchange8(& locked, 1, 0);
-	if(IsProcessAlive())
-		return (c == 0 || WaitUseMutex());
-	//
-	AbortLLS();
-	locked = 0;
-	return false;
-}
-
-
 
 // Main purpose is to send the mandatory low-frequence KEEP_ALIVE
 /**
@@ -120,8 +105,7 @@ void CSocketItemEx::KeepAlive()
 	}
 
 	// To suppress unnecessary KEEP_ALIVE
-	bool keepAliveNeeded = _InterlockedExchange(&tLazyAck_us, 0) != 0;
-	keepAliveNeeded = IsNearEndMoved() || keepAliveNeeded;
+	bool keepAliveNeeded = (lazyAckTimer == NULL) && IsNearEndMoved();
 	if (keepAliveNeeded)
 	{
 		SendKeepAlive();	// No matter which state it is in
@@ -155,17 +139,15 @@ void CSocketItemEx::KeepAlive()
 	case COMMITTED:
 	case PEER_COMMIT:
 	case COMMITTING2:
-		if(t1 - tSessionBegin > (MAXIMUM_SESSION_LIFE_ms << 10))
+		if(int64_t(t1 - SESSION_IDLE_TIMEOUT_us - tRecentSend) > 0
+		&& int64_t(t1 - SESSION_IDLE_TIMEOUT_us - tLastRecv) > 0)
 		{
 #ifdef TRACE
-			printf_s("\nSession time out in the %s state\n", stateNames[lowState]);
+			printf_s("\nSession idle time out in the %s state\n", stateNames[lowState]);
 #endif
 			TIMED_OUT();
 		}
-		// If the peer has committed an ACK_FLUSH has accumulatively acknowledged it.
-		// The near end needn't send periodical KEEP_ALIVE anymore
-		// EXPERIMENTAL: To suppress unnecessary KEEP_ALIVE
-		if (lowState != PEER_COMMIT && lowState != COMMITTING2 && keepAliveNeeded)
+		if (keepAliveNeeded)
 			SendKeepAlive();
 		break;
 	// assert: TRANSIENT_STATE_TIMEOUT_ms < RECYCLABLE_TIMEOUT_ms && RECYCLABLE_TIMEOUT_ms < MAXIMUM_SESSION_LIFE_ms
@@ -184,18 +166,12 @@ void CSocketItemEx::KeepAlive()
 #endif
 			TIMED_OUT();
 		}
-	case CLOSABLE:	// CLOSABLE does not automatically timeout to CLOSED
-		if(t1 - tSessionBegin >  (MAXIMUM_SESSION_LIFE_ms << 10))
-		{
-			if(lowState != CLOSED)
-				SendReset();	// See also RejectOrReset
-			TIMED_OUT();
-		}
-		break;
+	//case CLOSABLE:
+	//	// CLOSABLE does not automatically timeout to CLOSED
+	//	break;
 	//
 	case CLONING:
-		if (t1 - tMigrate > (TRANSIENT_STATE_TIMEOUT_ms << 10)
-		 || t1 - tSessionBegin >  (MAXIMUM_SESSION_LIFE_ms << 10) )
+		if (t1 - tMigrate > (TRANSIENT_STATE_TIMEOUT_ms << 10))
 		{
 #ifdef TRACE
 			printf_s("\nTransient state time out or key out of life in the %s state\n", stateNames[lowState]);
@@ -212,7 +188,53 @@ void CSocketItemEx::KeepAlive()
 		Destroy();
 	}
 
-	tLazyAck_us = 0;	// May be redundant, but it makes the code safe in the sense that next AddLazyAckTimer won't fail
+	SetMutexFree();
+}
+
+
+
+// Given the index of the acknowledged packet and peer's delay to make the acknowledgement
+// Adjust long-term round-trip-time
+bool CSocketItemEx::AdjustRTT(int32_t k, uint64_t tDelay)
+{
+	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend() + k;
+	// Resent packet is simply excluded from calculating RTT with
+	if (skb->IsResent())
+		return false;
+
+	uint64_t rtt64_us = NowUTC() - skb->timeSent - tDelay;
+	// If ever the peer cheats by giving the acknowledgment delay value larger than the real value
+	// it would be eventually punished by a very large RTO!?
+	// Do not bother to guess delay caused by near-end task-scheduling
+	tRoundTrip_us = uint32_t(min((((rtt64_us + tRoundTrip_us) >> 1) + tRoundTrip_us) >> 1, UINT32_MAX));
+#if (TRACE & TRACE_HEARTBEAT)
+	printf_s("Round trip time calibrated: %u\n\tAcknowledgement delay: %llu\n", tRoundTrip_us, tDelay);
+#endif
+
+	// TODO: refresh the RTT of the bundle path [source net-prefix][target net-prefix][traffic class]
+	// congestion management
+	return true;
+}
+
+
+
+void CSocketItemEx::DoAcknowledge()
+{
+	lazyAckTimer = NULL;
+
+	if (!WaitUseMutex())
+	{
+#ifdef TRACE
+		printf_s("\n#0x%X's DoAcknowledge not executed due to lack of locks in state %s. InUse: %d\n"
+			, fidPair.source, stateNames[lowState], IsInUse());
+#endif
+		if (IsInUse())
+			AddLazyAckTimer();
+		return;
+	}
+
+	SendKeepAlive();
+
 	SetMutexFree();
 }
 
@@ -222,12 +244,7 @@ void CSocketItemEx::KeepAlive()
 // Retransmission time-out handler
 void CSocketItemEx::DoResend()
 {
-	if (pControlBlock->CountSendBuffered() <= 0)
-	{
-		HANDLE h = (HANDLE)InterlockedExchangePointer(&resendTimer, NULL);
-		::DeleteTimerQueueTimer(TimerWheel::Singleton(), h, NULL);
-		return;
-	}
+	resendTimer = NULL;
 
 	if (!WaitUseMutex())
 	{
@@ -235,6 +252,8 @@ void CSocketItemEx::DoResend()
 		printf_s("\n#0x%X's DoResend not executed due to lack of locks in state %s. InUse: %d\n"
 			, fidPair.source, stateNames[lowState], IsInUse());
 #endif
+		if(IsInUse())
+			AddResendTimer();
 		return;
 	}
 
@@ -243,21 +262,24 @@ void CSocketItemEx::DoResend()
 	// if the assertion failed, memory access exception might be raised.
 
 	// To minimize waste of network bandwidth, try to resend packet that was not acknowledged but sent earliest
-	int32_t				index1 = InterlockedOr((long *)&pControlBlock->sendWindowHeadPos, 0);
 	const int32_t		N = pControlBlock->CountSentInFlight();
+	int32_t				i1 = pControlBlock->sendWindowHeadPos;
 	timestamp_t			tNow = NowUTC();
 	const int32_t		capacity = pControlBlock->sendBufferBlockN;
 
-	register ControlBlock::PFSP_SocketBuf p = pControlBlock->HeadSend() + index1;
+	register ControlBlock::PFSP_SocketBuf p = pControlBlock->HeadSend() + i1;
 	register ControlBlock::seq_t seq1 = pControlBlock->sendWindowFirstSN;
-	bool b = false;
+	bool furtherResendNeeded = false;
 	for (register int k = 0; k < N; k++)
 	{
 		// retransmission time-out is hard coded to 4RTT
 		if ((tNow - p->timeSent) < ((uint64_t)tRoundTrip_us << 2))
 		{
 			if (!p->IsAcked())
+			{
+				furtherResendNeeded = true;
 				break;
+			}
 #if defined(UNIT_TEST)
 			printf_s("Packet #%u has been acknowledged already\n", seq1);
 #endif
@@ -271,7 +293,8 @@ void CSocketItemEx::DoResend()
 			if (EmitWithICC(p, seq1) <= 0)
 				break;
 #endif
-			b = true;
+			p->MarkResent();
+			furtherResendNeeded = true;
 		}
 #if defined(UNIT_TEST)
 		else
@@ -279,9 +302,9 @@ void CSocketItemEx::DoResend()
 #endif
 		//
 		++seq1;
-		if (++index1 - capacity >= 0)
+		if (++i1 - capacity >= 0)
 		{
-			index1 = 0;
+			i1 = 0;
 			p = pControlBlock->HeadSend();
 		}
 		else
@@ -290,9 +313,12 @@ void CSocketItemEx::DoResend()
 		}
 	}
 
-	// To further probe the receive window size if no packet was resent
-	if (!b)
-		EmitQ();
+	if (furtherResendNeeded)
+		AddResendTimer();
+
+	// It is sub-optimal, but is safe to avoid starving of remote end's receive queue
+	// To further probe the receive window size.
+	EmitQ();
 
 	SetMutexFree();
 }
@@ -306,7 +332,12 @@ void CSocketItemEx::DoResend()
 //	false if send was failed
 bool CSocketItemEx::SendKeepAlive()
 {
-	SKeepAliveCache & buf3 = keepAliveCache;	// a buffer with three headers
+	if (lowState == PEER_COMMIT || lowState == COMMITTING2 || lowState == CLOSABLE)
+		return SendAckFlush();
+	if (lowState > CLOSABLE)
+		return false;
+
+	SKeepAliveCache buf3;
 
 	memcpy(buf3.mp.subnets, savedPathsToNearEnd, sizeof(TSubnets));
 	buf3.SetHostID(CLowerInterface::Singleton.addresses);
@@ -327,11 +358,9 @@ bool CSocketItemEx::SendKeepAlive()
 		, len);
 #endif
 
-	buf3.hdr.Set(KEEP_ALIVE, (uint16_t)len
+	pControlBlock->SignHeaderWith(&buf3.hdr, KEEP_ALIVE, (uint16_t)len
 		, pControlBlock->sendWindowNextSN - 1
-		, snKeepAliveExp
-		, pControlBlock->AdRecvWS(pControlBlock->recvWindowNextSN - 1));
-	//
+		, snKeepAliveExp);
 	SetIntegrityCheckCode(&buf3.hdr, NULL, 0, buf3.snack.GetSaltValue());
 #if (TRACE & (TRACE_HEARTBEAT | TRACE_PACKET | TRACE_SLIDEWIN))
 	printf_s("To send KEEP_ALIVE seq #%u, acknowledge #%u\n\tsource ALFID = %u\n"
@@ -352,6 +381,9 @@ bool CSocketItemEx::SendKeepAlive()
 // Return
 //	true if the accumulative acknowledgement was sent successfully
 //	false if send was failed
+// Remark
+//	ACK_FLUSH is sent immediately when the last packet of the is received, where the delay shall be ignored
+//	or resent as the heartbeat where the delay shall be ignored as well
 bool CSocketItemEx::SendAckFlush()
 {
 	struct
@@ -361,7 +393,7 @@ bool CSocketItemEx::SendAckFlush()
 	} ALIGN(MAC_ALIGNMENT) buf2;	// a buffer with two headers
 
 	InterlockedIncrement(& nextOOBSN);
-	buf2.snack.tLazyAck = htobe64(NowUTC() - tLastRecv);
+	buf2.snack.tLazyAck = 0;
 	buf2.snack.serialNo = htobe32(nextOOBSN);
 	buf2.snack.hs.Set(SELECTIVE_NACK, sizeof(buf2.hdr));
 
@@ -371,10 +403,10 @@ bool CSocketItemEx::SendAckFlush()
 		, pControlBlock->recvWindowNextSN);
 #endif
 	assert(pControlBlock->recvWindowExpectedSN == pControlBlock->recvWindowNextSN);
-	buf2.hdr.Set(ACK_FLUSH, (uint16_t)sizeof(buf2)
+	pControlBlock->SignHeaderWith(&buf2.hdr, ACK_FLUSH, (uint16_t)sizeof(buf2)
 		, pControlBlock->sendWindowNextSN - 1
 		, pControlBlock->recvWindowNextSN
-		, pControlBlock->AdRecvWS(pControlBlock->recvWindowNextSN - 1));
+	);
 	SetIntegrityCheckCode(&buf2.hdr, NULL, 0, buf2.snack.serialNo);
 	return SendPacket(1, ScatteredSendBuffers(&buf2, sizeof(buf2))) > 0;
 }
@@ -392,7 +424,7 @@ bool CSocketItemEx::SendAckFlush()
 //  -EBADF	if gap description insane
 //	-EDOM	if parameter error
 //	-EFAULT if memory corrupted
-//	>=0		the number of packets positively acknowledged
+//	>=0		the number of packets accumulatively acknowledged
 // Remark
 //	Milky payload might be retransmitted on demand, but it isn't implemented here
 //  It is an accumulative acknowledgment if n == 0
@@ -400,9 +432,6 @@ bool CSocketItemEx::SendAckFlush()
 //	Side effect: the integer value in the gap descriptors are translated to host byte order here
 int LOCALAPI CSocketItemEx::RespondToSNACK(ControlBlock::seq_t expectedSN, FSP_SelectiveNACK::GapDescriptor *gaps, int n)
 {
-	const ControlBlock::seq_t headSN = _InterlockedOr((LONG *)& pControlBlock->sendWindowFirstSN, 0);
-	if(int(expectedSN - headSN) < 0)
-		return -EDOM;
 	if (int(expectedSN - pControlBlock->sendWindowLimitSN) > 0)
 		return -EDOM;
 	const int32_t capacity = pControlBlock->sendBufferBlockN;
@@ -427,10 +456,8 @@ int LOCALAPI CSocketItemEx::RespondToSNACK(ControlBlock::seq_t expectedSN, FSP_S
 	if(sentWidth == 0)
 		return 0;	// there is nothing to be acknowledged
 
-	const int	nAck = pControlBlock->DealWithSNACK(expectedSN, gaps, n);
-#if (TRACE & (TRACE_HEARTBEAT | TRACE_PACKET | TRACE_SLIDEWIN))
-	printf_s("Accumulatively acknowledged SN = %u, %d packet(s) acknowledged.\n", expectedSN, nAck);
-#endif
+	// Note that the returned value is the number of packets accumulatively acknowledged
+	const int32_t nAck = pControlBlock->DealWithSNACK(expectedSN, gaps, n);
 	if (nAck < 0)
 	{
 #ifdef TRACE
@@ -439,14 +466,7 @@ int LOCALAPI CSocketItemEx::RespondToSNACK(ControlBlock::seq_t expectedSN, FSP_S
 		return nAck;
 	}
 
-#if (TRACE & TRACE_HEARTBEAT)
-	printf_s("Round trip time to calibrate = %u, packet(s) acknowledged = %d\n", tRoundTrip_us, nAck);
-#endif
 	if (nAck == 0)
-		return nAck;
-
-	// Sliding is possible as there is at least one packet acknowledged
-	if (!pControlBlock->GetSendQueueHead()->IsAcked())
 		return nAck;
 
 	// Calibrate RTT ONLY if left edge of the send window is to be advanced
@@ -455,37 +475,17 @@ int LOCALAPI CSocketItemEx::RespondToSNACK(ControlBlock::seq_t expectedSN, FSP_S
 	{
 		FSP_SelectiveNACK *pSNACK = (FSP_SelectiveNACK *)(void *)& gaps[n];
 		uint64_t tDelay = be64toh(pSNACK->tLazyAck);
-		//
-		int32_t k = int32_t(expectedSN - headSN) - 1;
-		assert(k >= 0);
-		pControlBlock->AddRoundSendBlockN(k, pControlBlock->sendWindowHeadPos);
+		int32_t k = nAck - 1;
+		// assert(k >= 0);
 		if (k >= capacity)
 			return -EACCES;	// memory access error!
-		//
-		uint64_t rtt64_us = NowUTC() - (pControlBlock->HeadSend() + k)->timeSent - tDelay;
-		// If ever the peer cheats by giving the acknowledgment delay value larger than the real value
-		// it would be eventually punished by a very large RTO!?
-		// Do not bother to guess delay caused by near-end task-scheduling
-		tRoundTrip_us = uint32_t(min((((rtt64_us + tRoundTrip_us) >> 1) + tRoundTrip_us) >> 1, UINT32_MAX));
-#if (TRACE & TRACE_HEARTBEAT)
-		printf_s("Round trip time calibrated: %u\n\tAcknowledgement delay: %llu\n", tRoundTrip_us, tDelay);
-#endif
+		pControlBlock->AddRoundSendBlockN(k, pControlBlock->sendWindowHeadPos);
+
+		AdjustRTT(k, tDelay);
 	}
 
-	do
-	{
-		pControlBlock->SlideSendWindowByOne();
-		if (pControlBlock->CountSentInFlight() <= 0)
-			break;
-	} while (pControlBlock->GetSendQueueHead()->IsAcked());
-
-	// Only when the left edge of the send window is slided may payload-less packet with EoT set appended
-	// It is assumed that if commit is pending the ULA would not manipulate the send queue
-	if (_InterlockedExchange8(&shouldAppendCommit, 0) != 0)
-	{
-		pControlBlock->MarkSendQueueEOT();
-		EmitQ();
-	}
+	pControlBlock->AddRoundSendBlockN(pControlBlock->sendWindowHeadPos, nAck);
+	InterlockedExchange((LONG *)&pControlBlock->sendWindowFirstSN, expectedSN);
 
 	return nAck;
 }

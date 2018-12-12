@@ -100,7 +100,7 @@ int _tmain(int argc, TCHAR * argv[])
 
 	if(argc != 1 && (argc != 2 || _tcslen(argv[1]) >= MAX_PATH) && argc != 3)
 	{
-		_tprintf_s(_T("Usage: %s [<filename> [length-of-memory-pattern]]\n"), argv[0]);
+		_tprintf_s(_T("Usage: %s [<filename> [length-of-memory-pattern, >= 4]]\n"), argv[0]);
 		return -1;
 	}
 
@@ -125,15 +125,17 @@ int _tmain(int argc, TCHAR * argv[])
 			size_t sizeOfBuffer = (size_t)_ttoi64(argv[2]);
 			if(sizeOfBuffer < 4)
 			{
-				_tprintf_s(_T("Usage: %s <filename> [length-of-memory-pattern]\n"), argv[0]);
+				_tprintf_s(_T("Usage: %s <filename> [length-of-memory-pattern >= 4]\n"), argv[0]);
 				err = -1;
 				goto l_return;
 			}
-			PrepareMemoryPattern(sizeOfBuffer);
+			//
+			if(!PrepareMemoryPattern(sizeOfBuffer))
+				goto l_return;
 		}
-		else
+		else if(! PrepareMemoryPattern(TEST_MEM_SIZE))
 		{
-			PrepareMemoryPattern(TEST_MEM_SIZE);
+			goto l_return;
 		}
 		//
 		WaitConnection(thisWelcome, mLen + CRYPTO_NACL_KEYBYTES, SendMemory_onAccepted);
@@ -154,7 +156,8 @@ int _tmain(int argc, TCHAR * argv[])
 	}
 	else if(err == EACCES)
 	{
-		PrepareServiceSAWS(fileName);
+		if(! PrepareServiceSAWS(fileName))
+			goto l_return;
 		WaitConnection(thisWelcome, mLen + CRYPTO_NACL_KEYBYTES, ServiceSAWS_onAccepted);
 	}
 	else

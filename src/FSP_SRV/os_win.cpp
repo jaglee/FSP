@@ -1146,15 +1146,29 @@ bool LOCALAPI CSocketItemEx::ReplaceTimer(uint32_t period)
 
 
 
-// A lazy acknowledgement is hard coded to one RTT, with an implementation depended floor value
-// ASSERT: round trip time is no longer than keep alive period
-void CSocketItemEx::AddLazyAckTimer()
+// Return
+//	true if the timer was set, false if it failed.
+// Remark
+//	Make it a one-shot timer because we assume retransmission is sufficiently rare
+//  A retransmission timer is hard coded to 4 RTT. Do not retransmit in the same time slice.
+bool CSocketItemEx::AddResendTimer()
 {
-	if (InterlockedCompareExchange((LONG *)& tLazyAck_us, max(LAZY_ACK_DELAY_MIN_us, tRoundTrip_us), 0) != 0)
-		return;
-	if (timer == NULL)
-		return;
-	::ChangeTimerQueueTimer(TimerWheel::Singleton(), timer, tLazyAck_us >> 10, tKeepAlive_ms);
+#if !defined(NDEBUG) || !(TRACE & TRACE_HEARTBEAT) || !(TRACE & (TRACE_PACKET || TRACE_OUTBAND))
+	DWORD tPeriod_ms = max(TIMER_SLICE_ms, tRoundTrip_us >> 8);	
+#else
+	DWORD tPeriod_ms = INIT_RETRANSMIT_TIMEOUT_ms / 3;
+#endif
+#if defined(UNIT_TEST)
+	return true;
+#else
+	return (resendTimer != NULL
+		|| ::CreateTimerQueueTimer(&resendTimer, TimerWheel::Singleton()
+			, DoResend
+			, this
+			, tPeriod_ms
+			, 0
+			, WT_EXECUTEINTIMERTHREAD));
+#endif
 }
 
 
@@ -1162,23 +1176,22 @@ void CSocketItemEx::AddLazyAckTimer()
 // Return
 //	true if the timer was set, false if it failed.
 // Remark
-//  A retransmission timer is hard coded to 4 RTT. Do not retransmit in the same time slice.
-bool CSocketItemEx::AddResendTimer()
+//  A lazy acknowledgement timer is hard coded to 1 RTT.
+bool CSocketItemEx::AddLazyAckTimer()
 {
-#if defined(NDEBUG) || !(TRACE & (TRACE_PACKET | TRACE_HEARTBEAT | TRACE_OUTBAND))
-	DWORD tPeriod_ms = max(TIMER_SLICE_ms, tRoundTrip_us >> 8);	
+#if !defined(NDEBUG) || !(TRACE & TRACE_HEARTBEAT) || !(TRACE & (TRACE_PACKET || TRACE_OUTBAND))
+	DWORD tPeriod_ms = max(TIMER_SLICE_ms, tRoundTrip_us >> 10);
 #else
 	DWORD tPeriod_ms = INIT_RETRANSMIT_TIMEOUT_ms / 3;
 #endif
-	return (resendTimer == NULL
-		&& ::CreateTimerQueueTimer(&resendTimer, TimerWheel::Singleton()
-			, DoResend
+	return (lazyAckTimer != NULL
+		|| ::CreateTimerQueueTimer(& lazyAckTimer, TimerWheel::Singleton()
+			, DoAcknowledge
 			, this
 			, tPeriod_ms
-			, tPeriod_ms
+			, 0
 			, WT_EXECUTEINTIMERTHREAD));
 }
-
 
 
 // Assume a mutex has been obtained
@@ -1186,11 +1199,15 @@ void CSocketItemEx::RemoveTimers()
 {
 	ClearInUse();
 	HANDLE h;
+	if ((h = (HANDLE)InterlockedExchangePointer(&lazyAckTimer, NULL)) != NULL)
+		::DeleteTimerQueueTimer(TimerWheel::Singleton(), h, NULL);
+
+	if ((h = (HANDLE)InterlockedExchangePointer(&resendTimer, NULL)) != NULL)
+		::DeleteTimerQueueTimer(TimerWheel::Singleton(), h, NULL);
+
 	if((h = (HANDLE)InterlockedExchangePointer(& timer, NULL)) != NULL)
 		::DeleteTimerQueueTimer(TimerWheel::Singleton(), h, NULL);
-	
-	if((h = (HANDLE)InterlockedExchangePointer(& resendTimer, NULL)) != NULL)
-		::DeleteTimerQueueTimer(TimerWheel::Singleton(), h, NULL);
+
 }
 
 
@@ -1214,10 +1231,11 @@ void CSocketItemEx::ScheduleConnect(CommandNewSessionSrv *pCmd)
 inline 
 void CSocketItemEx::HandleFullICC(PktBufferBlock *pktBuf, FSPOperationCode opCode)
 {
-	if (!LockWithActiveULA())
+	if(! WaitUseMutex())
 		return;
 
 	// Because some service call may recycle the FSP socket in a concurrent way
+	SyncState();
 	if (lowState <= 0 || lowState > LARGEST_FSP_STATE)
 		goto l_return;
 
@@ -1233,9 +1251,6 @@ void CSocketItemEx::HandleFullICC(PktBufferBlock *pktBuf, FSPOperationCode opCod
 		goto l_return;
 	}
 	//
-
-	// synchronize the state in the 'cache' and the real state
-	lowState = pControlBlock->state;
 	headPacket = pktBuf;
 	switch (opCode)
 	{

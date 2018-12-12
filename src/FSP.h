@@ -100,7 +100,7 @@ typedef ALFID_T	 ULTID_T;
 //^ time-out for committing a transmit transaction starting from last acknowledgement, not from start of the transaction
 #define LAZY_ACK_DELAY_MIN_us			5120	// 5 millisecond (after shifted 10 bits right)
 #define KEEP_ALIVE_TIMEOUT_ms			600000	// 10 minutes
-#define MAXIMUM_SESSION_LIFE_ms			43200000// 12 hours
+#define SESSION_IDLE_TIMEOUT_us			(4*3600*1000000ULL)	// 4 hours
 
 /**
   error number may appear as REJECT packet 'reason code' where it is unsigned or near-end API return value where it is negative
@@ -140,6 +140,8 @@ typedef enum _FSP_Session_State: char
 	// after getting legal CONNECT_REQUEST and sending back ACK_CONNECT_REQ
 	// before getting ACK_START or first PERSIST. timeout to NON_EXISTENT:
 	CHALLENGING,
+	// local context cloned/connection multiplying
+	CLONING,
 	// after getting a non-EoT PERSIST
 	ESTABLISHED,
 	// after sending EoT flag, before getting all packet-in-flight acknowledged.
@@ -154,8 +156,6 @@ typedef enum _FSP_Session_State: char
 	CLOSABLE,
 	// asymmetrically shutdown
 	PRE_CLOSED,
-	// local context cloned/connection multiplying
-	CLONING,
 	// after ULA shutdown the connection in CLOSABLE state gracefully
 	// it isn't a pseudo-state alike TCP, but a physical, resumable/reusable state
 	CLOSED,
@@ -201,10 +201,8 @@ typedef enum: char
 	FSP_Accept,			// accept the connection, make SCB of LLS synchronized with DLL 
 	FSP_Reject,			// a forward command, explicitly reject some request
 	FSP_Recycle,		// a forward command, connection might be aborted
-	FSP_Start,			// send a packet starting a new send-transaction
 	FSP_Send,			// send a packet/a group of packets
-	FSP_Commit,			// force to send a EoT flag,
-	//^ The EoT flag is either embedded in the last in-band packet, or piggybacked on the most recent KEEP_ALIVE/ACK_FLUSH
+	FSP_COMMAND_CODE_8,	// Used to be FSP_Commit, force to send a EoT flag, reserved now
 	FSP_Shutdown,		// close the connection
 	FSP_InstallKey,		// install the authenticated encryption key
 	FSP_Multiply,		// clone the connection, make SCB of LLS synchronized with DLL

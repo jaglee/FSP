@@ -103,7 +103,7 @@ FSPHANDLE FSPAPI MultiplyAndGetSendBuffer(FSPHANDLE hFSP, PFSP_Context psp1, Cal
 	if(onBufferReady != NULL)
 	{
 		int32_t m;
-		void *buf = p->pControlBlock->InquireSendBuf(& m);
+		BYTE *buf = p->pControlBlock->InquireSendBuf(& m);
 		if(buf == NULL)
 		{
 			p->FreeAndDisable();
@@ -177,10 +177,10 @@ FSPHANDLE LOCALAPI CSocketItemDl::WriteOnMultiplied(CommandCloneConnect &objComm
 			return NULL;
 		pendingSendBuf = (BYTE *)psp1->welcome;
 		bytesBuffered = 0;
-		committing = char((flag & TO_END_TRANSACTION) != 0);
 		// pendingSendSize set in BufferData
 		if (!WaitUseMutex())
 			return NULL;
+		SetToCommit((flag & TO_END_TRANSACTION) != 0);
 		BufferData(psp1->len);
 		SetMutexFree();
 	}
@@ -207,7 +207,6 @@ FSPHANDLE CSocketItemDl::CompleteMultiply(CommandCloneConnect & cmd)
 	cmd.hMemoryMap = (uint64_t)hMemoryMap;
 	cmd.dwMemorySize = dwMemorySize;
 	//
-	cmd.committing = this->committing;
 	cmd.opCode = FSP_Multiply;
 	SetState(CLONING);
 	if(! Call(cmd, sizeof(cmd)))
@@ -241,8 +240,9 @@ bool LOCALAPI CSocketItemDl::ToWelcomeMultiply(BackLogItem & backLog)
 		RecycLocked();
 		return false;
 	}
-	ControlBlock::PFSP_SocketBuf skb = SetHeadPacketIfEmpty(ACK_START);
-	if (skb == NULL || committing)	// ACK_START implies to Commit
+
+	// ACK_START implies to Commit. See also ToConcludeConnect:
+	if (SetHeadPacketIfEmpty(ACK_START) == NULL)
 		SetState(COMMITTING);
 
 	return true;

@@ -180,6 +180,22 @@ extern CStringizeNotice noticeNames;
  */
 #include <pshpack1.h>
 
+class FSP_FixedHeader : public FSP_NormalPacketHeader
+{
+	friend struct ControlBlock;
+protected:
+	void Set(FSPOperationCode code, uint16_t hsp, uint32_t seqThis, uint32_t seqExpected, int32_t advRecvWinSize)
+	{
+		hs.Set(code, hsp);
+		expectedSN = htobe32(seqExpected);
+		sequenceNo = htobe32(seqThis);
+		ClearFlags();
+		SetRecvWS(advRecvWinSize);
+	}
+	//
+	void ClearFlags() { flags_ws[0] = 0; }
+	void SetRecvWS(int32_t v) { flags_ws[1] = (octet)(v >> 16); flags_ws[2] = (octet)(v >> 8); flags_ws[3] = (octet)v; }
+};
 
 /**
  * Command to lower layer service
@@ -229,8 +245,7 @@ struct CommandInstallKey : CommandToLLS
 
 struct CommandCloneConnect : CommandNewSession
 {
-	ALIGN(4)
-	char		committing;
+	// used to pass 'committing' flag in the command
 };
 
 
@@ -365,7 +380,7 @@ struct ControlBlock
 	ALIGN(8)
 	FSP_Session_State state;
 	char			_reserved1;
-	char			_reserved2;
+	char			pendingEoT;			// EoT flag is pending to be added on a packet
 	char			milky :		1;		// by default 0: a normal wine-style payload assumed. FIFO
 	char			noEncrypt:	1;		// by default 0: if install session key, encrypt the payload
 	//
@@ -414,8 +429,6 @@ struct ControlBlock
 	int32_t		sendBufferNextPos;	// the index number of the block with sendBufferNextSN
 	//
 	seq_t		sendWindowLimitSN;	// the right edge of the send window
-	//
-	seq_t		lastRecvCacheSN;	// the SN of the packet that stored in the receive cache. not used yet
 
 	// (head position, receive window first sn) (next position, receive buffer maximum sn)
 	// are managed independently for maximum parallism in DLL and LLS
@@ -425,7 +438,6 @@ struct ControlBlock
 	seq_t		recvWindowNextSN;	// the next to the right-border of the received area
 	int32_t		recvWindowNextPos;	// the index number of the block with recvWindowNextSN
 	//
-	seq_t		welcomedNextSNtoSend;
 	seq_t		recvWindowExpectedSN;
 	//
 	int32_t		sendBufferBlockN;	// capacity of the send buffer in blocks
@@ -436,6 +448,15 @@ struct ControlBlock
 	int32_t		sendBuffer;			// relative to start of the control block
 	int32_t		recvBuffer;			// relative to start of the control block
 
+	enum FSP_SocketBufMark : char
+	{
+		FSP_BUF_LOCKED = 1,
+		FSP_BUF_COMPLETE = 2,
+		FSP_BUF_SENT = 4,
+		FSP_BUF_ACKED = 8,
+		FSP_BUF_RESENT = 16,
+		FSP_BUF_DELIVERED = 32
+	};
 	// Total size of FSP_SocketBuf (descriptor): 8 bytes (a 64-bit word)
 	typedef struct FSP_SocketBuf
 	{
@@ -450,19 +471,29 @@ struct ControlBlock
 		uint8_t		version;	// should be the same as in the FSP fixed header
 		FSPOperationCode opCode;// should be the same as in the FSP fixed header
 		//
-		void InitMarkLocked() { InterlockedExchange8(&marks, 1); }
-		void ReInitMarkComplete() { InterlockedExchange8(&marks, 2); }
-		void ResetMarkAcked() { InterlockedExchange8(&marks, 12); }	// sent and acknowledged
+		void InitMarkLocked() { _InterlockedExchange8(&marks, FSP_BUF_LOCKED); }
+		void ReInitMarkComplete() { _InterlockedExchange8(&marks, FSP_BUF_COMPLETE); }
+		void ReInitMarkAcked() { _InterlockedExchange8(&marks, FSP_BUF_ACKED); }
+		// Delivered is special in the sense that it is for receive only and it uses the same bit as Resent
+		void ReInitMarkDelivered() { _InterlockedExchange8(&marks, FSP_BUF_DELIVERED); }
+		void MarkSent() { _InterlockedOr8(&marks, FSP_BUF_SENT); }
+		void MarkAcked() { _InterlockedOr8(&marks, FSP_BUF_ACKED); }
+		void MarkResent() { _InterlockedOr8(&marks, FSP_BUF_RESENT); }
+
+		bool IsDelivered() { return (_InterlockedOr8(&marks, 0) & FSP_BUF_DELIVERED) != 0; }
+		bool IsComplete() { return (_InterlockedOr8(&marks, 0) & FSP_BUF_COMPLETE) != 0; }
+		bool IsAcked() { return (_InterlockedOr8(&marks, 0) & FSP_BUF_ACKED) != 0; }
+		bool IsResent() { return (_InterlockedOr8(&marks, 0) & FSP_BUF_RESENT) != 0; }
 		//
-		bool IsComplete() { return (InterlockedOr8(&marks, 0) & 2) != 0; }
-		bool IsSent() { return (InterlockedOr8(&marks, 0) & 4) != 0; }
-		bool IsAcked() { return (InterlockedOr8(&marks, 0) & 8) != 0; }
-		void MarkSent() { InterlockedOr8(&marks, 4); }
+		char GetResetMarks() { return _InterlockedExchange8(&marks, 0); }
+		void SetMarks(char c) { _InterlockedExchange8(&marks, c); }
+		void SetMarksWithComplete(char c) { _InterlockedExchange8(&marks, c | FSP_BUF_COMPLETE); }
+		static bool TestMarkSent(char c) { return (c & FSP_BUF_SENT) != 0; }
 		//
-		void ClearFlags() { InterlockedExchange8((char *)&flags, 0); }
-		template<FSP_FlagPosition pos> void InitFlags() { InterlockedExchange8((char *)&flags, (char)(1 << pos)); }
-		template<FSP_FlagPosition pos> void SetFlag() { InterlockedExchange8((char *)&flags, flags | (char)(1 << pos)); }
-		template<FSP_FlagPosition pos> bool GetFlag() { return (InterlockedOr8((char *)&flags, 0) & (char)(1 << pos)) != 0; }
+		void ClearFlags() { _InterlockedExchange8((char *)&flags, 0); }
+		template<FSP_FlagPosition pos> void InitFlags() { _InterlockedExchange8((char *)&flags, (char)(1 << pos)); }
+		template<FSP_FlagPosition pos> void SetFlag() { _InterlockedExchange8((char *)&flags, flags | (char)(1 << pos)); }
+		template<FSP_FlagPosition pos> bool GetFlag() { return (_InterlockedOr8((char *)&flags, 0) & (char)(1 << pos)) != 0; }
 		void CopyFlagsTo(FSP_NormalPacketHeader *p) { _InterlockedExchange8((char *)p->flags_ws, flags); }
 		void CopyInFlags(const FSP_NormalPacketHeader *p) { _InterlockedExchange8((char *) & flags, p->flags_ws[0]); }
 	} *PFSP_SocketBuf;
@@ -545,17 +576,29 @@ struct ControlBlock
 	// Allocate a new send buffer
 	PFSP_SocketBuf	GetSendBuf();
 
+	// Assume followed by interlocked/memory-barrier operation 
 	void AddRoundRecvBlockN(int32_t & tgt, int32_t a) { tgt += a; if (tgt >= recvBufferBlockN) tgt -= recvBufferBlockN; }
-	void SubstractRoundRecvBlockN(int32_t & tgt, int32_t d) { tgt -= d; if (tgt < 0) tgt += recvBufferBlockN; }
-
 	void AddRoundSendBlockN(int32_t & tgt, int32_t a) { tgt += a; if (tgt >= sendBufferBlockN) tgt -= sendBufferBlockN; }
+	// 
+	void IncRoundRecvBlockN(int32_t & tgt)
+	{
+		register int32_t a = InterlockedIncrement((LONG *)&tgt) - recvBufferBlockN;
+		if (a >= 0) InterlockedExchange((LONG *)&tgt, a);
+	}
 	void IncRoundSendBlockN(int32_t & tgt)
 	{
 		register int32_t a = InterlockedIncrement((LONG *)&tgt) - sendBufferBlockN;
-		if (a >= 0) tgt = a;
+		if (a >= 0) InterlockedExchange((LONG *)&tgt, a);
+	}
+	// Set the right edge of the send window after the very first packet of the queue is sent
+	void SetFirstSendWindowRightEdge()
+	{
+		register seq_t k = sendWindowFirstSN;
+		if (InterlockedCompareExchange(&sendWindowNextSN, k + 1, k) == k)
+			IncRoundSendBlockN(sendWindowNextPos);
 	}
 
-	void * LOCALAPI InquireSendBuf(int32_t *);
+	BYTE * LOCALAPI InquireSendBuf(int32_t *);
 
 	PFSP_SocketBuf GetFirstReceived()
 	{
@@ -563,7 +606,7 @@ struct ControlBlock
 		return HeadRecv() + a;
 	}
 
-	int LOCALAPI GetSelectiveNACK(seq_t &, FSP_SelectiveNACK::GapDescriptor *, int) const;
+	int LOCALAPI GetSelectiveNACK(seq_t &, FSP_SelectiveNACK::GapDescriptor *, int);
 	int LOCALAPI DealWithSNACK(seq_t, FSP_SelectiveNACK::GapDescriptor *, int);
 
 	// Return the locked descriptor of the receive buffer block with the given sequence number
@@ -572,7 +615,7 @@ struct ControlBlock
 	// Slide the left border of the receive window by one slot
 	void SlideRecvWindowByOne()	// shall be atomic!
 	{
-		AddRoundRecvBlockN(recvWindowHeadPos, 1);
+		IncRoundRecvBlockN(recvWindowHeadPos);
 		InterlockedIncrement((LONG *)& recvWindowFirstSN);
 	}
 
@@ -582,7 +625,7 @@ struct ControlBlock
 	//	bool &: [_Out_] place holder of the End of Transaction flag
 	// Return
 	//	Start address of the received message
-	void * LOCALAPI InquireRecvBuf(int32_t &, int32_t &, bool &);
+	BYTE * LOCALAPI InquireRecvBuf(int32_t &, int32_t &, bool &);
 	// Given
 	//	int :	the number of bytes peeked to be free
 	// Return
@@ -596,7 +639,7 @@ struct ControlBlock
 	}
 	void SetSendWindow(seq_t initialSN)
 	{
-		welcomedNextSNtoSend = sendBufferNextSN = sendWindowNextSN = sendWindowFirstSN = initialSN;
+		sendBufferNextSN = sendWindowNextSN = sendWindowFirstSN = initialSN;
 		sendBufferNextPos = sendWindowNextPos = sendWindowHeadPos = 0;
 		sendWindowLimitSN = initialSN + 1;	// for the protocol to work it should allow at least one packet in flight
 	}
@@ -607,20 +650,12 @@ struct ControlBlock
 	// Slide the send window to skip the head slot, supposing that it has been acknowledged
 	void SlideSendWindowByOne()
 	{
-		GetSendQueueHead()->ResetMarkAcked();
-		GetSendQueueHead()->ClearFlags();
-		InterlockedIncrement(&sendWindowFirstSN);
+		PFSP_SocketBuf skb = GetSendQueueHead();
+		skb->ReInitMarkAcked();
+		skb->ClearFlags();
 		IncRoundSendBlockN(sendWindowHeadPos);
+		InterlockedIncrement(&sendWindowFirstSN);
 	}
-
-	// Set the right edge of the send window after the very first packet of the queue is sent
-	void SetFirstSendWindowRightEdge()
-	{
-		register seq_t k = sendWindowFirstSN;
-		if (InterlockedCompareExchange(&sendWindowNextSN, k + 1, k) == k)
-			IncRoundSendBlockN(sendWindowNextPos);
-	}
-
 
 	// Given
 	//	ControlBlock::seq_t	The sequence number of the packet that mostly expected by the remote end
@@ -631,25 +666,23 @@ struct ControlBlock
 	//	Assume the parameters is legitimate, shall call this function only after ICC has been validated
 	void ResizeSendWindow(seq_t seq1, uint32_t adRecvWin)
 	{
-		int32_t d = int32_t(seq1 - welcomedNextSNtoSend);
-		if (d > 0)
-		{
-			sendWindowLimitSN = seq1 + adRecvWin;
-			welcomedNextSNtoSend = seq1;
-		}
-		else if (d == 0 && int32_t(seq1 + adRecvWin - sendWindowLimitSN) > 0)
-		{
-			sendWindowLimitSN = seq1 + adRecvWin;
-		}
+		seq_t seqL = seq1 + adRecvWin;
+		if (int32_t(seqL - sendWindowLimitSN) > 0)
+			sendWindowLimitSN = seqL;
 	}
 
-
-	// Width of the advertisable receive window (i.e. free receive buffers to advertise), in blocks
-	int32_t AdRecvWS(seq_t expectedSN)
+	void SignHeaderWith(FSP_FixedHeader *p, FSPOperationCode code, uint16_t hsp, uint32_t seqThis, uint32_t snExpected)
 	{
-		seq_t a = _InterlockedOr((LONG *) & recvWindowFirstSN, 0);
-		return int32_t(a + recvBufferBlockN - expectedSN);
+		p->Set(code, hsp, seqThis, snExpected, int32_t(recvWindowFirstSN + recvBufferBlockN - snExpected));
 	}
+	// 
+	void SetExpectedSNof(FSP_FixedHeader *p) { SetExpectedSNof(p, recvWindowExpectedSN); }
+	void SetExpectedSNof(FSP_FixedHeader *p, seq_t snExpected)
+	{
+		p->expectedSN = htobe32(snExpected);
+		p->SetRecvWS(int32_t(recvWindowFirstSN + recvBufferBlockN - snExpected));
+	}
+
 
 	bool HasBacklog() const { return backLog.count > 0; }
 

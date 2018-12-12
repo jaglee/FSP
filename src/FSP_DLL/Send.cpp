@@ -33,9 +33,8 @@
 
 /* FSM:  State migration on sending. See also MigrateToNewStateOnSend. *\
 
-{CHALLENGING, CONNECT_AFFIRMING}
-[API: Send{new data}]
-	|<-->{just prebuffer}
+{CHALLENGING, CLONING}
+|<-->[API: Send{new data}]{just prebuffer}
 
 {ACTIVE, PEER_COMMIT}
 |<-->[API: Send{more data}][Send PURE_DATA]
@@ -185,7 +184,7 @@ int32_t LOCALAPI CSocketItemDl::AcquireSendBuf()
 		return -EBUSY;
 	}
 
-	void *buf = pControlBlock->InquireSendBuf(& pendingSendSize);
+	BYTE *buf = pControlBlock->InquireSendBuf(& pendingSendSize);
 	if (buf == NULL)
 	{
 		SetMutexFree();
@@ -256,13 +255,16 @@ int32_t LOCALAPI CSocketItemDl::SendStream(const void * buffer, int32_t len, boo
 	{
 		r = BlockOnCommit();
 		if (r != 0)
+		{
+			SetMutexFree();
 			return r;
-		committing = 1;
+		}
+		SetToCommit();
 		newTransaction = 1;
 	}
 	else
 	{
-		committing = eot ? 1 : 0;
+		SetToCommit(eot);
 		if (state1 == COMMITTED || state1 == CLOSABLE)
 			newTransaction = 1;
 	}
@@ -290,9 +292,7 @@ int32_t LOCALAPI CSocketItemDl::SendStream(const void * buffer, int32_t len, boo
 	// If it is blocking, wait until every byte has been put into the queue
 	while ((r = BufferData(len)) >= 0)
 	{
-		if (r > 0
-		 && !InState(CONNECT_AFFIRMING) && !InState(CHALLENGING) && !InState(CLONING)
-		 && !Call<FSP_Send>())
+		if (r > 0 && pControlBlock->state >= ESTABLISHED && !Call<FSP_Send>())
 		{
 			r = -EIO;
 			break;
@@ -356,7 +356,9 @@ int CSocketItemDl::LockAndCommit(NotifyOrReturn fp1)
 		return -EFAULT;
 	}
 
-	return Commit();
+	int r = Commit();
+	SetMutexFree();
+	return r;
 }
 
 
@@ -400,23 +402,18 @@ l_recursion:
 		// Or else fall through to check whether it has intent to commit the transmit transaction
 	}
 
-	// If it was to commit the transmit transaction check whether all packets in flight acknowledged
-	FSP_Session_State state1 = GetState();
-	if (committing != 0 && state1 != COMMITTED && state1 < CLOSABLE && state1 != NON_EXISTENT)
+	// SendInplace does not rely on keeping 'ToCommit' state internally so it MUST be Commit pending
+	if (ToCommit())
 	{
+		int r = pControlBlock->MarkSendQueueEOT();
+		if (r > 0)
+		{
+			MigrateToNewStateOnCommit();
+			if (r == 2)
+				Call<FSP_Send>();
+		}
 		SetMutexFree();
 		return;
-	}
-	if (committing != 0)
-	{
-		NotifyOrReturn fp2 = (NotifyOrReturn)InterlockedExchangePointer((PVOID volatile *)& fpCommitted, NULL);
-		committing = 0;
-		if (fp2 != NULL)
-		{
-			SetMutexFree();
-			fp2(this, FSP_NotifyFlushed, bytesBuffered);
-			return;
-		}
 	}
 
 	// Or else it's pending GetSendBuffer()
@@ -429,7 +426,7 @@ l_recursion:
 
 	int32_t k = pControlBlock->CountSendBuffered();
 	int32_t m;
-	void *p = pControlBlock->InquireSendBuf(& m);
+	BYTE *p = pControlBlock->InquireSendBuf(& m);
 	if(p == NULL)
 	{
 		TestSetSendReturn(fp2);
@@ -497,6 +494,7 @@ int LOCALAPI CSocketItemDl::BufferData(int m)
 		p->len = 0;
 		tgtBuf = GetSendPtr(p);
 	}
+	MigrateToNewStateOnSend();
 	// p->buf was set when the send buffer control structure itself was initialized
 	// flags are already initialized when GetSendBuf
 	// only after every field, including flag, has been set may it be unlocked
@@ -558,7 +556,7 @@ int LOCALAPI CSocketItemDl::BufferData(int m)
 	}
 	//
 	k = MAX_BLOCK_SIZE - p->len;	// To compress internally buffered: it may be that k == 0
-	if(pendingSendSize != 0 || !committing)
+	if(pendingSendSize != 0 || !ToCommit())
 	{
 		skbImcompleteToSend = (k > 0 ? p : NULL);
 		if(count > 0)
@@ -566,11 +564,12 @@ int LOCALAPI CSocketItemDl::BufferData(int m)
 		return 0;
 		//^As there is no packet physically put into the send queue do not migrate to new state.
 	}
-	// pendingSendSize == 0 && committing:
+	// else if(pendingSendSize == 0 && ToCommit())
 	skbImcompleteToSend = NULL;
 	if (pStreamState == NULL)
 	{
 		p->SetFlag<TransactionEnded>();
+		MigrateToNewStateOnCommit();
 		if(k > 0)
 			count++;
 		goto l_finalize;
@@ -603,11 +602,11 @@ int LOCALAPI CSocketItemDl::BufferData(int m)
 		bytesBuffered += k;
 	}	// end if the internal buffer of on-the-wire compression is not empty
 	p->SetFlag<TransactionEnded>();
+	MigrateToNewStateOnCommit();
 	FreeStreamState();
 	//
 l_finalize:
-	MigrateToNewStateOnSend();
-	//
+	// When sending PERSIST packet is tightly packed, not right-aligned yet
 	p = skb0;
 	if (_InterlockedCompareExchange8(&newTransaction, 0, 1) != 0)
 		p->opCode = PERSIST;
@@ -615,10 +614,6 @@ l_finalize:
 	do
 	{
 		p->ReInitMarkComplete();
-#ifndef NDEBUG
-		if (p->len < MAX_BLOCK_SIZE && !p->GetFlag<TransactionEnded>())
-			printf_s("Erroneous implementation!? Length of a non-terminating packet is %d\n", p->len);
-#endif
 		if((++p - pControlBlock->HeadSend()) >= pControlBlock->sendBufferBlockN)
 			p = pControlBlock->HeadSend();
 	} while (--k > 0);
@@ -656,7 +651,7 @@ int32_t LOCALAPI CSocketItemDl::PrepareToSend(void * buf, int32_t len, bool eot)
 
 	int32_t m;
 #ifndef NDEBUG
-	void *bufToCheck = pControlBlock->InquireSendBuf(&m);
+	BYTE *bufToCheck = pControlBlock->InquireSendBuf(&m);
 	if (bufToCheck != buf)
 	{
 		printf_s("The caller should not mess up the reserved the buffer space!\n");
@@ -666,10 +661,9 @@ int32_t LOCALAPI CSocketItemDl::PrepareToSend(void * buf, int32_t len, bool eot)
 		return -ENOMEM;
 #endif
 
-	committing = eot ? 1 : 0;
-
 	if (InState(COMMITTED) || InState(CLOSABLE))
 		newTransaction = 1;
+	MigrateToNewStateOnSend();
 
 	register ControlBlock::PFSP_SocketBuf p = pControlBlock->HeadSend() + pControlBlock->sendBufferNextPos;
 	// p now is the descriptor of the first available buffer block
@@ -688,25 +682,29 @@ int32_t LOCALAPI CSocketItemDl::PrepareToSend(void * buf, int32_t len, bool eot)
 	p->version = THIS_FSP_VERSION;
 	p->opCode = PURE_DATA;
 	if (eot)
+	{
 		p->InitFlags<TransactionEnded>();
+		MigrateToNewStateOnCommit();
+	}
 	else
+	{
 		p->ClearFlags();
+	}
 	p->len = len - MAX_BLOCK_SIZE * m++;
 	pControlBlock->AddRoundSendBlockN(pControlBlock->sendBufferNextPos, m);
 	InterlockedAdd((LONG *)& pControlBlock->sendBufferNextSN, m);
 
 	bytesBuffered = len;
-	MigrateToNewStateOnSend();
 
-	// unlock them in a batch
+	// When sending PERSIST packet is tightly packed, not right-aligned yet
 	p = p0;
 	if (_InterlockedCompareExchange8(&newTransaction, 0, 1) != 0)
 		p->opCode = PERSIST;
+	// unlock them in a batch
 	for(register int j = 0; j < m; j++)
 	{
 		(p++)->ReInitMarkComplete();
 	}
-
 	return m;
 }
 
@@ -758,7 +756,7 @@ int CSocketItemDl::BlockOnCommit()
 //	However the LLS would prevent abnormally frequent FSP_Commit from abusing
 int CSocketItemDl::Commit()
 {
-	committing = 1;
+	SetToCommit();
 
 	// The last resort: flush sending stream if it has not yet been committed
 	// Assume the caller has set time-out clock
@@ -793,22 +791,13 @@ int CSocketItemDl::Commit()
 		skbImcompleteToSend->ReInitMarkComplete();
 		// further processing is done on FSP_Commit
 		skbImcompleteToSend = NULL;
-	}
-	// Case 1 is handled in DLL while case 2~5 are handled in LLS
-#ifndef _NO_LLS_CALLABLE
-	if (fpCommitted != NULL) {
-		int r = yetSomeDataToBuffer ? 0 : (Call<FSP_Commit>() ? 0 : -EIO);
-#else
-	{
-		int r = 0;
-#endif
-		SetMutexFree();
-		return r;
+		MigrateToNewStateOnCommit();
 	}
 
-	int r = BlockOnCommit();
-	committing = 0;
-	return r;
+	if (fpCommitted != NULL)
+		return 0;
+
+	return BlockOnCommit();
 }
 
 

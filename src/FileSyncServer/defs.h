@@ -31,8 +31,8 @@ extern int	FSPAPI SendMemory_onAccepted(FSPHANDLE, PFSP_Context);
 extern int	FSPAPI SendOneFile_onAccepted(FSPHANDLE, PFSP_Context);
 
 // Branch auxilary functions
-extern void PrepareMemoryPattern(size_t);
-extern void	PrepareServiceSAWS(LPCTSTR);
+extern bool PrepareMemoryPattern(size_t);
+extern bool	PrepareServiceSAWS(LPCTSTR);
 
 // Shared call-backs
 extern void FSPAPI WaitConnection(const char *, unsigned short, CallbackConnected);

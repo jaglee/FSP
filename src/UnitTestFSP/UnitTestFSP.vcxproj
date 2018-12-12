@@ -167,6 +167,7 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClInclude Include="..\FSP_SRV\ecn_rc_cm.h" />
     <ClInclude Include="targetver.h" />
     <ClInclude Include="FSP_TestClass.h" />
   </ItemGroup>

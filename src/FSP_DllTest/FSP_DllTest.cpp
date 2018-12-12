@@ -50,7 +50,7 @@ void UnitTestBufferData()
 	// Emulate SendStream()
 	//
 	pSocketItem->SetState(ESTABLISHED);
-	pSocketItem->committing = 0;
+	pSocketItem->SetToCommit(false);
 	pSocketItem->pendingSendBuf = preparedTestData;
 	pSocketItem->BufferData(MIN_RESERVED_BUF - 2);
 	printf_s("Buffer next SN = %u\n", pSCB->sendBufferNextSN);
@@ -67,7 +67,7 @@ void UnitTestBufferData()
 			printf_s("Short#%d differs\n", i);
 	}
 
-	assert(pSocketItem->skbImcompleteToSend != NULL);	// the last packet is incomplete)
+	assert(pSocketItem->skbImcompleteToSend != NULL);	// the last packet is incomplete
 	// Now, reset, but this time the head packet is set
 	pSCB->SetSendWindow(FIRST_SN);
 	skb = pSocketItem->SetHeadPacketIfEmpty(ACK_START);
@@ -146,8 +146,16 @@ void UnitTestBufferData()
 	while(int(pSCB->recvWindowNextSN - pSCB->sendBufferNextSN) < 0)
 	{
 		ControlBlock::PFSP_SocketBuf skb1 = pSCB->HeadSend() + (pSCB->recvWindowNextSN - FIRST_SN);
-		ControlBlock::PFSP_SocketBuf skb = pSCB->AllocRecvBuf(pSCB->recvWindowNextSN);
+		skb = pSCB->AllocRecvBuf(pSCB->recvWindowNextSN);
+		assert(skb != NULL);
 		*skb = *skb1;
+	}
+	// Right-aligned the first packet. See also @LLS::Placepayload
+	skb = pSCB->HeadRecv();
+	if (skb->opCode == PERSIST && skb->len < MAX_BLOCK_SIZE)
+	{
+		octet *src = pSCB->GetRecvPtr(skb);
+		memmove(src + MAX_BLOCK_SIZE - skb->len, src, skb->len);
 	}
 
 	// Decompress
@@ -166,24 +174,43 @@ void UnitTestBufferData()
 	pSCB->SetSendWindow(FIRST_SN);
 	pSCB->SetRecvWindow(FIRST_SN);
 
+	const int TEST_BUF_SIZE = MIN_RESERVED_BUF - 8;
 	uint32_t randValue;
-	FUZ_fillCompressibleNoiseBuffer(preparedTestData, MIN_RESERVED_BUF, 0.5, &randValue);
+	FUZ_fillCompressibleNoiseBuffer(preparedTestData, TEST_BUF_SIZE, 0.5, &randValue);
 
 	pSocketItem->pendingSendBuf = preparedTestData;
 	pSocketItem->SetEndTransaction();
 	pSocketItem->bytesBuffered = 0;
-	r = pSocketItem->BufferData(MIN_RESERVED_BUF - 2);
+	r = pSocketItem->BufferData(TEST_BUF_SIZE);
 	printf_s("%d packets completed, %d octets remains, %d internally buffered\n"
 		, r, pSocketItem->pendingSendSize, pSocketItem->pendingStreamingSize);
 	printf_s("Buffer next SN = %u\n", pSCB->sendBufferNextSN);
 
+	// Size of 'compressed' result MAY be larger than the orginal
+	// Check here, or else it may be indeterministic
+	if (pSocketItem->pendingSendSize > 0
+	 || pSocketItem->pendingStreamingSize > 0
+	 || pSocketItem->bytesBuffered > TEST_BUF_SIZE)
+	{
+		DebugBreak();
+		return;
+	}
+
 	// Pretend that all the data packet have been received:
-	memcpy(pSCB->GetRecvPtr(pSCB->HeadRecv()), pSCB->GetSendPtr(pSCB->HeadSend()), MIN_RESERVED_BUF - 2);
+	memcpy(pSCB->GetRecvPtr(pSCB->HeadRecv()), pSCB->GetSendPtr(pSCB->HeadSend()), TEST_BUF_SIZE);
 	while(int(pSCB->recvWindowNextSN - pSCB->sendBufferNextSN) < 0)
 	{
 		ControlBlock::PFSP_SocketBuf skb1 = pSCB->HeadSend() + (pSCB->recvWindowNextSN - FIRST_SN);
-		ControlBlock::PFSP_SocketBuf skb = pSCB->AllocRecvBuf(pSCB->recvWindowNextSN);
+		skb = pSCB->AllocRecvBuf(pSCB->recvWindowNextSN);
+		assert(skb != NULL);
 		*skb = *skb1;
+	}
+	// Right-aligned the first packet. See also @LLS::Placepayload
+	skb = pSCB->HeadRecv();
+	if (skb->opCode == PERSIST && skb->len < MAX_BLOCK_SIZE)
+	{
+		octet *src = pSCB->GetRecvPtr(skb);
+		memmove(src + MAX_BLOCK_SIZE - skb->len, src, skb->len);
 	}
 
 	// Decompress
@@ -191,6 +218,11 @@ void UnitTestBufferData()
 	pSocketItem->waitingRecvBuf = buf;
 	pSocketItem->bytesReceived = 0;
 	pSocketItem->FetchReceived();
+	if (pSocketItem->HasInternalBufferedToDeliver())
+	{
+		DebugBreak();
+		return;
+	}
 	r = memcmp(buf, preparedTestData, MIN_RESERVED_BUF - 2);
 	assert(r == 0);
 }
@@ -323,8 +355,18 @@ void LogicTestPackedSend()
 	{
 		ControlBlock::PFSP_SocketBuf skb1 = pSCB->HeadSend() + (pSCB->recvWindowNextSN - FIRST_SN);
 		ControlBlock::PFSP_SocketBuf skb = pSCB->AllocRecvBuf(pSCB->recvWindowNextSN);
+		assert(skb != NULL);
 		*skb = *skb1;
 	}
+	// Right-aligned the first packet. See also @LLS::Placepayload
+	ControlBlock::PFSP_SocketBuf skb = pSCB->HeadRecv();
+	if (skb->opCode == PERSIST && skb->len < MAX_BLOCK_SIZE)
+	{
+		octet *src = pSCB->GetRecvPtr(skb);
+		memmove(src + MAX_BLOCK_SIZE - skb->len, src, skb->len);
+	}
+
+	//
 	//
 	// Emulate receive (with decompression)
 	//
@@ -392,6 +434,115 @@ void UnitTestPrepareToSend()
 		, stateNames[pSocketItem->GetState()]);
 }
 
+
+
+// Depends on MarkReceivedFree as well as well some underlying subroutines
+// More complex than a common 'unit' test of AllocRecvBuf
+static const int MAX_GAPS_NUM = 2;
+void UnitTestAllocRecvBuf()
+{
+	const int RECV_BUFFER_SIZE = MAX_BLOCK_SIZE * 3;	// Limit the receive buffer to 3 blocks
+	CSocketItemDbg *pSocketItem = GetPreparedSocket(MAX_FSP_SHM_SIZE - RECV_BUFFER_SIZE);
+	ControlBlock *pSCB = pSocketItem->GetControlBlock();
+
+	FSP_SelectiveNACK::GapDescriptor gaps[MAX_GAPS_NUM];
+	ControlBlock::seq_t seq0;
+
+	pSCB->state = ESTABLISHED;
+	pSCB->SetRecvWindow(FIRST_SN);
+	pSCB->SetSendWindow(FIRST_SN);
+
+	// firstly, without a gap
+	int r = pSCB->GetSelectiveNACK(seq0, gaps, MAX_GAPS_NUM);
+	assert(r == 0 && seq0 == FIRST_SN);
+
+	// prepare the receive buffer
+	ControlBlock::PFSP_SocketBuf skb = pSCB->HeadRecv();
+	BYTE *preparedTestData = pSocketItem->GetRecvPtr(skb);
+	for (register int i = 0; i < RECV_BUFFER_SIZE; i += sizeof(int))
+	{
+		*(int *)(preparedTestData + i) = i;
+	}
+
+#define INIT_SKB()	\
+	skb->len = MAX_BLOCK_SIZE;	\
+	skb->opCode = PURE_DATA;	\
+	skb->ReInitMarkComplete()	\
+
+	while ((skb = pSCB->AllocRecvBuf(pSCB->recvWindowNextSN)) != NULL)
+	{
+		INIT_SKB();
+		printf_s("Position of next receive buffer block = %d\n", pSCB->recvWindowNextPos);
+		printf_s("Next SN = %u\n", pSCB->recvWindowNextSN);
+		printf_s("Expected SN of the receive window = %u\n\n", pSCB->recvWindowExpectedSN);
+	}
+
+	printf_s("Before InquireRecvBuf\n"
+		"Head position = %d, head SN = %u\n\n", pSCB->recvWindowHeadPos, pSCB->recvWindowFirstSN);
+	skb = pSCB->GetFirstReceived();
+	int32_t nBlock;
+	int32_t nIO;
+	bool eot;
+	octet *buf = pSCB->InquireRecvBuf(nIO, nBlock, eot);
+	assert(buf == pSCB->GetRecvPtr(skb));
+	assert(nIO == RECV_BUFFER_SIZE && nBlock == 3);
+	pSCB->MarkReceivedFree(nBlock);
+	printf_s("After MarkReceivedFree\n"
+		"Head position = %d, head SN = %u\n\n", pSCB->recvWindowHeadPos, pSCB->recvWindowFirstSN);
+
+	// The next round
+	skb = pSCB->AllocRecvBuf(pSCB->recvWindowNextSN);	// FIRST_SN + 3
+	assert(skb != NULL);
+	INIT_SKB();
+
+	skb = pSCB->AllocRecvBuf(pSCB->recvWindowNextSN + 1);	// FIRST_SN + 5
+	assert(skb != NULL);
+	INIT_SKB();
+
+	skb = pSCB->AllocRecvBuf(pSCB->recvWindowNextSN + 1);	// FIRST_SN + 6
+	assert(skb == NULL);
+
+	skb = pSCB->AllocRecvBuf(pSCB->recvWindowNextSN + 3);
+	assert(skb == NULL);
+
+	skb = pSCB->AllocRecvBuf(FIRST_SN + 4);	// the gap
+	assert(skb != NULL);
+	INIT_SKB();
+
+	pSCB->MarkReceivedFree(3);
+
+	skb = pSCB->AllocRecvBuf(FIRST_SN + 6);
+	assert(skb != NULL);
+	INIT_SKB();
+	assert(pSCB->recvWindowNextPos == 1);
+	assert(pSCB->recvWindowExpectedSN = FIRST_SN + 7);
+	pSCB->MarkReceivedFree(1);	// 
+
+	skb = pSCB->AllocRecvBuf(FIRST_SN + 8);
+	assert(skb != NULL);
+	INIT_SKB();
+	assert(pSCB->recvWindowNextPos == 0);
+	assert(pSCB->recvWindowExpectedSN = FIRST_SN + 7);
+
+	skb = pSCB->AllocRecvBuf(FIRST_SN + 9);
+	assert(skb != NULL);
+	INIT_SKB();
+	assert(pSCB->recvWindowNextPos == 1);
+	assert(pSCB->recvWindowExpectedSN = FIRST_SN + 7);
+
+	r = pSCB->GetSelectiveNACK(seq0, gaps, MAX_GAPS_NUM);
+	assert(r == 1 && seq0 == FIRST_SN + 7);
+
+	skb = pSCB->AllocRecvBuf(FIRST_SN + 7);
+	assert(skb != NULL);
+	INIT_SKB();
+	assert(pSCB->recvWindowNextPos == 1);
+	assert(pSCB->recvWindowExpectedSN = FIRST_SN + 10);
+
+	r = pSCB->GetSelectiveNACK(seq0, gaps, MAX_GAPS_NUM);
+	assert(r == 0 && seq0 == FIRST_SN + 10);
+#undef INIT_SKB
+}
 
 
 //
@@ -495,6 +646,73 @@ void UnitTestFetchReceived()
 	// the 8th: buffer full
 	// free(buffer);	// a heap has been corrupted!... well, InterlockedCompareExchangePointer...
 }
+
+
+
+void UnitTestInquireRecvBuf()
+{
+	const int RECV_BUFFER_SIZE = MAX_BLOCK_SIZE * 3;	// Limit the receive buffer to 3 blocks
+	CSocketItemDbg *pSocketItem = GetPreparedSocket(MAX_FSP_SHM_SIZE - RECV_BUFFER_SIZE);
+	ControlBlock *pSCB = pSocketItem->GetControlBlock();
+	pSCB->state = ESTABLISHED;
+	pSCB->SetRecvWindow(FIRST_SN);
+	pSCB->SetSendWindow(FIRST_SN);
+
+	// prepare the receive buffer
+	ControlBlock::PFSP_SocketBuf skb = pSCB->HeadRecv();
+	BYTE *preparedTestData = pSocketItem->GetRecvPtr(skb);
+	for (register int i = 0; i < RECV_BUFFER_SIZE; i += sizeof(int))
+	{
+		*(int *)(preparedTestData + i) = i;
+	}
+
+	while ((skb = pSCB->AllocRecvBuf(pSCB->recvWindowNextSN)) != NULL)
+	{
+		skb->len = MAX_BLOCK_SIZE;
+		skb->opCode = PURE_DATA;
+		skb->ReInitMarkComplete();
+	}
+	printf_s("After initialization, receive next SN = %u\n", pSCB->recvWindowNextSN);
+
+	// Firstly, the whole block
+	skb = pSCB->GetFirstReceived();
+	int32_t nBlock;
+	int32_t nIO;
+	bool eot;
+	octet *buf = pSCB->InquireRecvBuf(nIO, nBlock, eot);
+	assert(buf == pSCB->GetRecvPtr(skb));
+	assert(nIO == RECV_BUFFER_SIZE && nBlock == 3);
+	printf_s("Expected SN of the receive window after query the whole block = %u\n", pSCB->recvWindowExpectedSN);
+
+	// Free the first block only
+	pSCB->MarkReceivedFree(1);
+	skb = pSCB->GetFirstReceived();
+	buf = pSCB->InquireRecvBuf(nIO, nBlock, eot);
+	assert(buf == pSCB->GetRecvPtr(skb));
+	assert(nIO == RECV_BUFFER_SIZE - MAX_BLOCK_SIZE && nBlock == 2);
+
+	// Allocate (reuse) the first block, free the 2nd block
+	skb = pSCB->AllocRecvBuf(pSCB->recvWindowNextSN);
+	assert(pSCB->recvWindowHeadPos == 1);
+	assert(skb != NULL);
+	skb->len = MAX_BLOCK_SIZE;
+	skb->opCode = PURE_DATA;
+	skb->ReInitMarkComplete();
+	//
+	pSCB->MarkReceivedFree(1);
+	skb = pSCB->GetFirstReceived();
+	buf = pSCB->InquireRecvBuf(nIO, nBlock, eot);
+	assert(buf == pSCB->GetRecvPtr(skb));
+	assert(nIO == MAX_BLOCK_SIZE && nBlock == 1);
+
+	// After the third block is marked free, it shall round-robin to the beginning
+	pSCB->MarkReceivedFree(1);
+	skb = pSCB->HeadRecv();
+	buf = pSCB->InquireRecvBuf(nIO, nBlock, eot);
+	assert(buf == pSCB->GetRecvPtr(skb));
+	assert(nIO == MAX_BLOCK_SIZE && nBlock == 1);
+}
+
 
 
 
@@ -740,11 +958,15 @@ int _tmain(int argc, _TCHAR* argv[])
 
 	UnitTestBufferData();
 
+	UnitTestAllocRecvBuf();
+
+	UnitTestFetchReceived();
+
 	LogicTestPackedSend();
 
 	UnitTestPrepareToSend();
 
-	UnitTestFetchReceived();
+	UnitTestInquireRecvBuf();
 
 	return 0;
 }

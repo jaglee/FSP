@@ -543,6 +543,62 @@ l_bailout:
 
 
 
+// Lock the session context if the process of upper layer application is still active
+// Abort the FSP session if ULA is not active
+// Return true if the session context is locked, false if not
+bool CSocketItemEx::LockWithActiveULA()
+{
+	char c = _InterlockedCompareExchange8(&locked, 1, 0);
+	if (IsProcessAlive())
+		return (c == 0 || WaitUseMutex());
+	//
+	AbortLLS();
+	locked = 0;
+	return false;
+}
+
+
+
+// Given
+//	FSP_ServiceCode		the code of the notification to alert DLL
+// Do
+//	Put the notification code into the notice queue
+// Return
+//	true if the notification was put into the queue successfully
+//	false if it failed
+// Remark
+//	Successive notifications of the same code are automatically merged
+bool CSocketItemEx::Notify(FSP_ServiceCode n)
+{
+	int r = pControlBlock->notices.Put(n);
+	if (r < 0)
+	{
+#ifdef TRACE
+		printf_s("\nSession #%u, cannot put soft interrupt %s(%d) into the queue.\n", fidPair.source, noticeNames[n], n);
+#endif
+		return false;
+	}
+	//
+	if (r > 0)
+	{
+#if (TRACE & TRACE_ULACALL)
+		if (r == FSP_MAX_NUM_NOTICE)
+			printf_s("\nSession #%u, duplicate soft interrupt %s(%d) eliminated.\n", fidPair.source, noticeNames[n], n);
+		else
+			printf_s("\nSession #%u append soft interrupt %s(%d)\n", fidPair.source, noticeNames[n], n);
+#endif
+		return true;
+	}
+	//
+	SignalEvent();
+#if (TRACE & TRACE_ULACALL)
+	printf_s("\nSession #%u raise soft interrupt %s(%d)\n", fidPair.source, noticeNames[n], n);
+#endif
+	return true;
+}
+
+
+
 // Given
 //	FSP_PreparedKEEP_ALIVE& 	the placeholder for the returned gap descriptors, shall be of at least MAX_BLOCK_SIZE bytes
 //	seq_t &						the placeholder for the returned maximum expected sequence number
@@ -567,14 +623,18 @@ int32_t LOCALAPI CSocketItemEx::GenerateSNACK(FSP_PreparedKEEP_ALIVE &buf, Contr
 	// Suffix the effective gap descriptors block with the FSP_SelectiveNACK struct
 	// built-in rule: an optional header MUST be 64-bit aligned
 	register FSP_SelectiveNACK *pSNACK = (FSP_SelectiveNACK *)(gaps + n);
-	// TODO: hope to minimize internal state to save
-	if (n > 0 && int32_t(seq0 - pControlBlock->recvWindowFirstSN) > 0)
+	// TODO: to minimize internal state to save
+	// record the receive time of the most recently receivd packet
+	register int32_t k = int32_t(seq0 - pControlBlock->recvWindowFirstSN) - 1;
+	if (k >= 0)
 	{
-		int32_t k = int32_t(seq0 - pControlBlock->recvWindowFirstSN) - 1;
-		pControlBlock->AddRoundRecvBlockN(k, pControlBlock->recvWindowHeadPos);
+		ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadRecv();
+		k += pControlBlock->recvWindowHeadPos;
+		if (k - pControlBlock->recvBufferBlockN >= 0)
+			k -= pControlBlock->recvBufferBlockN;
 		if (k >= pControlBlock->recvBufferBlockN)
 			return -EACCES;	// memory access error!
-		ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadRecv() + k;
+		skb += k;
 		pSNACK->tLazyAck = htobe64(NowUTC() - skb->timeRecv);
 #if (TRACE & TRACE_HEARTBEAT)
 		printf_s("GetSelectiveNACK reported there were %d gap blocks.\n"
@@ -695,6 +755,7 @@ void CSocketItemEx::AffirmConnect(const SConnectParam & initState, ALFID_T idLis
 // Given
 //	CSocketItemEx *		Pointer to the source socket slot. The nextOOBSN field would be updated
 // See also
+//	EmitWithICC
 //	OnConnectRequestAck; CSocketItemDl::ToWelcomeConnect; CSocketItemDl::ToWelcomeMultiply
 void CSocketItemEx::InitiateMultiply(CSocketItemEx *srcItem)
 {
@@ -705,7 +766,7 @@ void CSocketItemEx::InitiateMultiply(CSocketItemEx *srcItem)
 	pControlBlock->connectParams = srcItem->pControlBlock->connectParams;
 	InitAssociation();
 	// pControlBlock->idParent was set in @DLL::ToPrepareMultiply()
-	assert(idParent == pControlBlock->idParent);	// Set in InitAssocation
+	assert(idParent == pControlBlock->idParent);	// Set in InitAssociation
 	assert(fidPair.peer == srcItem->fidPair.peer);	// Set in InitAssociation
 
 	ControlBlock::seq_t seq0 = pControlBlock->sendWindowNextSN;	// See also @DLL::ToPrepareMultiply
@@ -726,11 +787,10 @@ void CSocketItemEx::InitiateMultiply(CSocketItemEx *srcItem)
 	void * payload = GetSendPtr(skb);
 	ALIGN(MAC_ALIGNMENT) FSP_InternalFixedHeader q;
 	lastOOBSN = 0;	// As the response from the peer, if any, is not an out-of-band packet
-	q.Set(MULTIPLY
-		, sizeof(FSP_NormalPacketHeader)
-		, seq0
-		, srcItem->contextOfICC.snFirstRecvWithCurrKey
-		, pControlBlock->recvBufferBlockN);
+
+	pControlBlock->SignHeaderWith(&q, MULTIPLY, sizeof(FSP_NormalPacketHeader), seq0, pControlBlock->recvWindowFirstSN);
+	skb->CopyFlagsTo(& q);
+	// Do not mess with 'salt'. New value has to be set after ICC is got
 	void * paidLoad = SetIntegrityCheckCode(& q, payload, skb->len, salt);
 	q.expectedSN = salt;
 	if (paidLoad == NULL || skb->len > sizeof(this->cipherText))
@@ -804,8 +864,10 @@ void CMultiplyBacklogItem::ResponseToMultiply()
 		return;
 	}
 
-	*(& skb->len + 1) = *(& TempSocketBuf()->len + 1);
 	skb->len = CopyOutPlainText(ubuf);
+	CopyOutFVO(skb);
+	skb->ReInitMarkComplete();
+
 	pControlBlock->recvWindowExpectedSN = ++pControlBlock->recvWindowNextSN;
 	_InterlockedIncrement((LONG *)&pControlBlock->recvWindowNextPos);
 	// The receive buffer is eventually ready
@@ -863,46 +925,42 @@ void CSocketItemEx::Accept()
 
 
 
-// Send or resend the normal 'RELEASE' command. RELEASE includes the ACK_FLUSH semantics
-bool CSocketItemEx::SendRelease()
+// Send the abnormal 'RESET' command
+void CSocketItemEx::SendReset()
 {
-	uint32_t N = (uint32_t)pControlBlock->CountSendBuffered();
-	if (N > 1)
-		return false;
-
-	ControlBlock::PFSP_SocketBuf skb;
-	PFSP_InternalFixedHeader pHdr;
-	if (N == 1)
-	{
-		skb = pControlBlock->GetSendQueueHead();
-		if (skb->opCode != RELEASE)
-			return false;
-		pHdr = (PFSP_InternalFixedHeader)GetSendPtr(skb);
-	}
-	else // N == 0
-	{
-		skb = pControlBlock->GetSendBuf();
-		skb->opCode = RELEASE;
-		skb->len = sizeof(FSP_NormalPacketHeader);
-		//
-		pHdr = (PFSP_InternalFixedHeader)GetSendPtr(skb);
-		pHdr->SetSequenceFlags(pControlBlock, pControlBlock->sendWindowNextSN);
-		pHdr->hs.Set<FSP_NormalPacketHeader, RELEASE>();
-		SetIntegrityCheckCode(pHdr);
-	}
-
-	return (SendPacket(1, ScatteredSendBuffers(pHdr, sizeof(FSP_NormalPacketHeader))) >= 0);
+	ControlBlock::seq_t seqR = pControlBlock->sendWindowFirstSN;
+	ALIGN(MAC_ALIGNMENT) FSP_InternalFixedHeader hdr;
+	// Make sure that the packet falls into the receive window
+	if (int32_t(pControlBlock->sendWindowNextSN - seqR) > 0)
+		seqR = pControlBlock->sendWindowNextSN - 1;
+	hdr.SetSequenceFlags(pControlBlock, seqR);
+	hdr.hs.Set<FSP_NormalPacketHeader, RESET>();
+	SetIntegrityCheckCode(& hdr);
+	SendPacket(1, ScatteredSendBuffers(&hdr, sizeof(hdr)));
 }
 
 
 
-// Send the abnormal 'RESET' command
-void CSocketItemEx::SendReset()
+// Send the out-of-band(unlike TCP FIN/FIN-ACK) RELEASE command
+// RELEASE does not really tear down the connection thoroughly
+void CSocketItemEx::SendRelease()
 {
+	ControlBlock::seq_t seqR = pControlBlock->sendWindowFirstSN;
 	ALIGN(MAC_ALIGNMENT) FSP_InternalFixedHeader hdr;
-	hdr.SetSequenceFlags(pControlBlock, pControlBlock->welcomedNextSNtoSend);
-	hdr.hs.Set<FSP_NormalPacketHeader, RESET>();
-	SetIntegrityCheckCode(& hdr);
+	// Make sure that the packet falls into the receive window
+	if (pControlBlock->sendWindowNextSN != seqR)
+	{
+		BREAK_ON_DEBUG();
+		return;	// silently ignore the abnormal command
+	}
+	if (pControlBlock->recvWindowExpectedSN != pControlBlock->recvWindowNextSN)
+	{
+		BREAK_ON_DEBUG();
+		pControlBlock->recvWindowExpectedSN = pControlBlock->recvWindowNextSN;
+	}
+	hdr.SetSequenceFlags(pControlBlock, seqR);
+	hdr.hs.Set<FSP_NormalPacketHeader, RELEASE>();
+	SetIntegrityCheckCode(&hdr);
 	SendPacket(1, ScatteredSendBuffers(&hdr, sizeof(hdr)));
 }
 
@@ -974,54 +1032,6 @@ void CSocketItemEx::AbortLLS(bool haveTLBLocked)
 	
 }
 
-
-
-// Recycle the socket, send RESET to the remote peer if not in CLOSED state
-void CSocketItemEx::Recycle()
-{
-	if(!IsInUse())
-		return;
-	//
-#if (TRACE & TRACE_ULACALL)
-	printf_s("Recycle called in %s(%d) state\n", stateNames[lowState], lowState);
-#endif
-	// It is legitimate to recycle in PRE_CLOSED state unilaterally to support timeout in the upper layer
-	if (lowState == CHALLENGING || lowState == CONNECT_AFFIRMING)
-		CLowerInterface::Singleton.SendPrematureReset(EINTR, this);
-	else if (lowState != CLOSED && lowState != LISTENING && lowState != PRE_CLOSED)
-		SendReset();
-
-	// Donot [pControlBlock->state = NON_EXISTENT;] as the ULA might do further cleanup
-	// See also RejectOrReset, Destroy and @DLL::RespondToRecycle
-	SignalFirstEvent(FSP_NotifyRecycled);
-	Destroy();
-}
-
-
-
-// Send RESET to the remote peer to reject some request in pre-active state.
-// The RESET packet is not guaranteed to be received.
-// See also DisposeOnReset, Recycle
-void CSocketItemEx::Reject(uint32_t reasonCode)
-{
-	CLowerInterface::Singleton.SendPrematureReset(reasonCode, this);
-	SignalFirstEvent(FSP_NotifyRecycled);
-	Destroy();	// MUST signal event before Destroy
-}
-
-
-
-// Set to PRE_CLOSED state and send RELEASE to the remote end.
-// The RELEASE packet is not guaranteed to be received
-// so that PRE_CLOSED is alike TCP TIME-WAIT state.
-void CSocketItemEx::Release()
-{
-	if (lowState == PRE_CLOSED)
-		return;			// Refuse to send redundant RELEASE packet
-	ReplaceTimer(TRANSIENT_STATE_TIMEOUT_ms);
-	SetState(PRE_CLOSED);
-	SendRelease();
-}
 
 
 // Given

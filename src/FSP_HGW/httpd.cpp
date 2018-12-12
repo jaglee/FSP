@@ -1,6 +1,8 @@
 /*
  * Simple HTTP 1.0 server over FSP version 0. SOCKS gateway and tunnel server as well
  *
+ * Usage 1: as the SOCKSv4 proxy: fsp_socks -p <port number> [Remote FSP address]
+ * Usage 2: as the HTTP server (and tunnel responder)£º fsp_http -d <local web root>
     Copyright (c) 2017, Jason Gao
     All rights reserved.
 
@@ -69,7 +71,6 @@ static void FSPAPI onClientResponseReceived(FSPHANDLE h, FSP_ServiceCode c, int 
 
 // The FSP handle that listens for tunnel service request
 static FSPHANDLE hListener; 
-static bool finished;
 static char DEFAULT_ROOT[MAX_PATH];
 
 static int	FSPAPI onAccepted(FSPHANDLE, PFSP_Context);
@@ -143,7 +144,6 @@ inline void FreeExtent(FSPHANDLE h, bool disposing = false)
 }
 
 
-// [%s] ['-p' <port number>] | ['-d' <local web root>]
 // Convention over configuration:
 // By default it is a local SOCKS4a server that listen on the default port number 1080
 // The port number could be configured on the command line only.
@@ -287,8 +287,8 @@ static void FSPAPI onNotice(FSPHANDLE h, FSP_ServiceCode code, int value)
 	if(value >= 0)
 		return;	// waring is simply ignored
 	//
-	if(h == hListener)
-		finished = true;
+	if (h == hListener)
+		Abort("Fatal error occured in the main loop, to abort.\n");
 	else
 		FreeExtent(h);
 }
@@ -350,9 +350,8 @@ static void FSPAPI onPublicKeyReceived(FSPHANDLE h, FSP_ServiceCode c, int r)
 	// TODO: check connection context further
 	if (!HasReadEoT(h))
 	{
-		printf_s("Protocol is broken: length of client's id should not exceed MAX_PATH\n");
 		FreeExtent(h, true);
-		return;
+		Abort("Protocol is broken: length of client's id should not exceed MAX_PATH\n");
 	}
 
 	// TODO: map the client's id to its salt and password hash value
@@ -363,7 +362,7 @@ static void FSPAPI onPublicKeyReceived(FSPHANDLE h, FSP_ServiceCode c, int r)
 	if(! CHAKAChallengeByServer(pdFSA->chakaPubInfo, serverResponse, pdFSA->passwordHash))
 	{
 		FreeExtent(h, true);
-		return;
+		Abort("Client authentication error.\n");
 	}
 
 	int n = sizeof(pdFSA->chakaPubInfo.salt)

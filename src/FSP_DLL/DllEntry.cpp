@@ -680,16 +680,34 @@ void CSocketItemDl::PollingTimedout()
 {
 	if (!TryAcquireSRWLockExclusive(&rtSRWLock))
 		return;	// Patiently wait the next time slice instead to spin here
+
 	if (pControlBlock == NULL)
 		return;
 	if (!IsInUse() || InIllegalState())
 		return;
 
-	// To make it less stressing, process either receive or send, but not both
-	// and receive takes precedence because receiving is to free resource
+#if defined(TRACE)
+	printf_s("FSPSocket %p, Receive window: \n"
+		"  (%u - %u), expected: %u\n"
+		" Send window: \n"
+		"  (%u - %u), limited: %u\n"
+		, this
+		, pControlBlock->recvWindowFirstSN
+		, pControlBlock->recvWindowNextSN
+		, pControlBlock->recvWindowExpectedSN
+		, pControlBlock->sendWindowFirstSN
+		, pControlBlock->sendWindowNextSN
+		, pControlBlock->sendWindowLimitSN);
+#endif
+	// Receive takes precedence because receiving is to free resource
 	if ((fpReceived != NULL || fpPeeked != NULL) && !chainingReceive && HasDataToDeliver())
+	{
 		ProcessReceiveBuffer();
-	else if ((fpSent != NULL || pendingSendBuf != NULL) && !chainingSend && HasFreeSendBuffer())
+		if (!TryAcquireSRWLockExclusive(&rtSRWLock))
+			return;
+	}
+	//
+	if ((fpSent != NULL || pendingSendBuf != NULL) && !chainingSend && HasFreeSendBuffer())
 		ProcessPendingSend();
 	else
 		SetMutexFree();

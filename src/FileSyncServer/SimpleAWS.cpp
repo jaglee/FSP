@@ -69,7 +69,7 @@ static void FSPAPI onFileListSent(FSPHANDLE h, FSP_ServiceCode c, int r);
 //
 // by default return the file 'index.saws' under the given path
 //
-void PrepareServiceSAWS(LPCTSTR pathName)
+bool PrepareServiceSAWS(LPCTSTR pathName)
 {
 	HANDLE h = CreateFile(pathName
 		, GENERIC_READ
@@ -81,7 +81,7 @@ void PrepareServiceSAWS(LPCTSTR pathName)
 	if(h == INVALID_HANDLE_VALUE)
 	{
 		REPORT_ERRMSG_ON_TRACE("path not accessible");
-		return;
+		return false;
 	}
 	CloseHandle(h);
 
@@ -89,6 +89,7 @@ void PrepareServiceSAWS(LPCTSTR pathName)
 	_tcscat_s(pattern, _T("\\*"));
 	//
 	MakeSaltedPassword(passwordHash, salt, password);
+	return true;
 }
 
 

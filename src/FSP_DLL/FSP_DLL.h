@@ -147,7 +147,6 @@ protected:
 	// Flags, in dictionary order
 	char			chainingReceive : 1;
 	char			chainingSend : 1;
-	char			committing : 1;
 	char			initiatingShutdown : 1;
 	char			lowerLayerRecycled : 1;
 	char			peerCommitPending : 1;
@@ -286,6 +285,32 @@ public:
 	{
 		return (_InterlockedCompareExchange8((char *) & pControlBlock->state, s2, s0) == s0);
 	}
+	// In ESTABLISHED or PEER_COMMIT state: does not make state transition on send
+	// Send and Commit are separate atomic operations
+	void MigrateToNewStateOnSend()
+	{
+		register FSP_Session_State s = pControlBlock->state;
+		if (s == COMMITTED)
+			SetState(ESTABLISHED);
+		else if (s == CLOSABLE)
+			SetState(PEER_COMMIT);
+	}
+	// Make state transition after and only after an EoT packet is to be sent
+	void MigrateToNewStateOnCommit()
+	{
+		register FSP_Session_State s = pControlBlock->state;
+		if (s == ESTABLISHED || s == COMMITTED)
+		{
+			SetState(COMMITTING);
+			SetToCommit(false);
+		}
+		else if (s == PEER_COMMIT || s == CLOSABLE)
+		{
+			SetState(COMMITTING2);
+			SetToCommit(false);
+		}
+	}
+
 	bool InIllegalState()
 	{
 		register FSP_Session_State s = (FSP_Session_State)InterlockedOr8((char *)& pControlBlock->state, 0);
@@ -363,7 +388,7 @@ public:
 	int LOCALAPI FinalizeSend(int r)
 	{
 		// Prevent premature FSP_Send	// Just prebuffer.
-		if (r < 0 || InState(CONNECT_AFFIRMING) || InState(CHALLENGING) || InState(CLONING))
+		if (r < 0 || pControlBlock->state < ESTABLISHED)
 		{
 			SetMutexFree();
 			return r;
@@ -390,31 +415,9 @@ public:
 	void SetCallbackOnAccept(CallbackConnected fp1) { context.onAccepted = fp1; }
 	void SetCallbackOnFinish(NotifyOrReturn fp1) { context.onFinish = fp1; }
 
-	void SetNewTransaction() { committing = 0; newTransaction = 1; }
-
-	//	Because there may be race condition between LLS and DLL state transition shall be render
-	//	after all new packets has been put into the send queue beforer marked ready to send
-	void CSocketItemDl::MigrateToNewStateOnSend()
-	{
-		if (InState(ESTABLISHED))
-		{
-			if (committing)
-				SetState(COMMITTING);
-		}
-		else if (InState(PEER_COMMIT))
-		{
-			if (committing)
-				SetState(COMMITTING2);
-		}
-		else if (InState(COMMITTED))
-		{
-			SetState(committing ? COMMITTING : ESTABLISHED);
-		}
-		else if (InState(CLOSABLE))
-		{
-			SetState(committing ? COMMITTING2 : PEER_COMMIT);
-		}
-	}
+	void SetNewTransaction() { newTransaction = 1; }
+	void SetToCommit(bool v = true) { pControlBlock->pendingEoT = v ? 1 : 0; }
+	bool ToCommit() { return pControlBlock->pendingEoT != 0; }
 
 	int SelfNotify(FSP_ServiceCode c);
 	void SetCallbackOnError(NotifyOrReturn fp1) { context.onError = fp1; }

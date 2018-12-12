@@ -220,7 +220,16 @@ int32_t CSocketItemDl::FetchReceived()
 	ControlBlock::PFSP_SocketBuf p = pControlBlock->GetFirstReceived();
 	if(p->GetFlag<Compressed>() && pDecodeState == NULL && !AllocDecodeState())
 		return -ENOMEM;
-	//
+
+	// First received block of a clone connection or a new transmit transaction is right-aligned
+	// See also @LLS::PlacePayload and @LLS::CopyOutPlainText
+	if ((p->opCode == MULTIPLY || p->opCode == PERSIST) && p->len > 0 && offsetInLastRecvBlock == 0)
+	{
+		offsetInLastRecvBlock = MAX_BLOCK_SIZE - p->len;
+		p->len = MAX_BLOCK_SIZE;	// make sure it is right-aligned
+	}
+	// Note that decompression may make offsetInLastRecvBlock > MAX_BLOCK_SIZE - p->len
+
 	int nPacket = 0;
 	int sum = 0;
 	int n;
@@ -262,7 +271,7 @@ int32_t CSocketItemDl::FetchReceived()
 		offsetInLastRecvBlock = 0;
 
 		bool b = p->GetFlag<TransactionEnded>();
-		p->InitMarkLocked();
+		p->ReInitMarkDelivered();
 		p->ClearFlags();
 		nPacket++;
 		//
@@ -342,9 +351,15 @@ l_recursion:
 		SetMutexFree();
 		return;
 	}
+
+	// First received block of a clone connection or a new transmit transaction is right-aligned
+	// See also @LLS::PlacePayload and @LLS::CopyOutPlainText
+	ControlBlock::PFSP_SocketBuf skb = pControlBlock->GetFirstReceived();
 	int32_t m;
 	bool eot;
-	void *p = pControlBlock->InquireRecvBuf(n, m, eot);
+	BYTE *p = pControlBlock->InquireRecvBuf(n, m, eot);
+	if(p != NULL && (skb->opCode == PERSIST || skb->opCode == MULTIPLY))
+		p += MAX_BLOCK_SIZE - skb->len;	// See also FetchReceived()
 #ifdef TRACE
 	printf_s("RecvInline, data to deliver@%p, length = %d, eot = %d\n", p, n, (int)eot);
 #endif
@@ -366,12 +381,22 @@ l_recursion:
 	chainingReceive = 0;
 	if (!WaitUseMutex())
 		return;	// it could be disposed in the callback function
-
+#ifndef NDEBUG
+	if (skb != pControlBlock->GetFirstReceived())
+	{
+		printf_s("The receive queue was messed up?!\n");
+		BREAK_ON_DEBUG();
+	}
+#endif
 	// Assume the call-back function did not mess up the receive queue
-	pControlBlock->MarkReceivedFree(m);
+	if (eot || n > 0)
+	{
+		pControlBlock->MarkReceivedFree(m);
+		offsetInLastRecvBlock = 0;
+		if (HasDataToDeliver())
+			goto l_recursion;
+	}
+	// If (n < 0) some unrecoverable error has occur. Should avoid the risk of dead-loop.
 
-	if (HasDataToDeliver())
-		goto l_recursion;
-	//
 	SetMutexFree();
 }

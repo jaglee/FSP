@@ -174,12 +174,7 @@ bool CHAKAResponseByClient(SCHAKAPublicInfo &chakaPubInfo, octet * clientInputHa
 
 	// The client check the response of the server
 	if ( (memcmp(cResponse, chakaPubInfo.peerResponse, CRYPTO_NACL_HASHBYTES)) != 0)
-	{
-#ifdef TRACE
-		printf_s("Username or password is wrong.\n");
-#endif
 		return false;
-	}
 
 	// generate the client's response
 	MakeResponse(cResponse, clientInputHash, chakaPubInfo.peerPublicKey, chakaPubInfo.serverNonce, chakaPubInfo.serverRandom);

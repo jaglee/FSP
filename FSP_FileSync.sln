@@ -1,5 +1,7 @@
 Microsoft Visual Studio Solution File, Format Version 12.00
-# Visual Studio Express 2012 for Windows Desktop
+# Visual Studio Express 14 for Windows Desktop
+VisualStudioVersion = 14.0.25420.1
+MinimumVisualStudioVersion = 10.0.40219.1
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "FileSyncClient", "src\FileSyncClient\FileSyncClient.vcxproj", "{32D3225B-5236-4A59-BFA7-E3224CE55814}"
 	ProjectSection(ProjectDependencies) = postProject
 		{DC63E2B4-BA8D-4540-936A-63106FFCB999} = {DC63E2B4-BA8D-4540-936A-63106FFCB999}
@@ -20,6 +22,9 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "FSP_SOCKS", "src\FSP_HGW\fs
 	EndProjectSection
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "FSP_HTTP", "src\FSP_HGW\fsp_hgw.vcxproj", "{C46952CD-9930-417D-97DC-F1FC24BDBB81}"
+	ProjectSection(ProjectDependencies) = postProject
+		{DC63E2B4-BA8D-4540-936A-63106FFCB999} = {DC63E2B4-BA8D-4540-936A-63106FFCB999}
+	EndProjectSection
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution

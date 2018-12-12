@@ -377,12 +377,14 @@ void UnitTestTweetNacl()
 }
 
 #include <pshpack1.h>
-struct FREWS
+
+struct $FREWS
 {
 	uint32_t	adRecvWS : 24;
 	uint32_t	flags : 8;
 };
-struct FSP_FixedHeader
+
+struct $FSP_FixedHeader
 {
 	uint32_t		sequenceNo;
 	uint32_t		expectedSN;
@@ -396,7 +398,7 @@ struct FSP_FixedHeader
 		} id;
 	} integrity;
 	//
-	struct FREWS frews;
+	struct $FREWS frews;
 	//
 	uint8_t		version;
 	uint8_t		opCode;		// Operation Code
@@ -421,7 +423,7 @@ void UnitTestByteOrderDefinitin()
 
 	printf_s("FHS = %08x\n", rFHS);	// 02 01 03 03
 
-	FSP_FixedHeader fh;
+	$FSP_FixedHeader fh;
 	printf_s("size of fixed header: %d\n", sizeof(fh)); // 24
 
 	fh.frews.flags = 1;

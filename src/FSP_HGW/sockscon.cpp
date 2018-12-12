@@ -115,6 +115,15 @@ static void FSPAPI onSubrequestSent(FSPHANDLE, FSP_ServiceCode, int);
 void ReportErrorToClient(SOCKET, ERepCode);
 void CloseGracefully(SOCKET);
 
+// Given
+//	const *		the error message meant to be put on system console (and should be logged)
+// Do
+//	Exit the program abruptly for some fatal reason
+static inline void Abort(const char * sc)
+{
+	perror(sc);
+	exit(-1);
+}
 
 //
 // Thread pool wait callback function template
@@ -497,12 +506,10 @@ static void FSPAPI onFinish(FSPHANDLE h, FSP_ServiceCode code, int)
 // buffer block available and the public key fits in one buffer block 
 static int	FSPAPI  onConnected(FSPHANDLE h, PFSP_Context ctx)
 {
-	printf_s("\nConnecting to remote FSP SOCKS tunnel server... Handle of FSP session: %p\n", h);
-	if(h == NULL)
-	{
-		printf_s("\n\tConnection failed.\n");
-		return -1;
-	}
+	printf_s("\nConnecting to remote FSP SOCKS tunnel server...");
+	if (h == NULL)
+		Abort("\n\tConnection failed.\n");
+	printf_s("Handle of FSP session : %p\n", h);
 
 	int mLen = strlen((const char *)ctx->welcome) + 1;
 	printf_s("Welcome message received: %s\n", (const char *)ctx->welcome);
@@ -544,9 +551,8 @@ static void FSPAPI onCHAKASRReceived(FSPHANDLE h, FSP_ServiceCode c, int r)
 	// The peer should have commit the transmit transaction. Integrity is assured
 	if (!HasReadEoT(h))
 	{
-		printf_s("Protocol is broken: length of client's id should not exceed MAX_PATH\n");
 		Dispose(h);
-		return;
+		Abort("Protocol is broken: length of client's id should not exceed MAX_PATH\n");
 	}
 
 	octet clientInputHash[CRYPTO_NACL_HASHBYTES];
@@ -556,7 +562,7 @@ static void FSPAPI onCHAKASRReceived(FSPHANDLE h, FSP_ServiceCode c, int r)
 	if(! CHAKAResponseByClient(chakaPubInfo, clientInputHash, clientResponse))
 	{
 		Dispose(h);
-		return;
+		Abort("Server authencation error.\n");
 	}
 
 	WriteTo(h, clientResponse, sizeof(clientResponse), TO_END_TRANSACTION, NULL);

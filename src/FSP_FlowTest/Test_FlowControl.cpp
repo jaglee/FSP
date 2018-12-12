@@ -19,8 +19,8 @@ void FlowTestAcknowledge()
 	FSP_SelectiveNACK::GapDescriptor gaps[MAX_GAPS_NUM + 1];
 	// the last descriptor place holder is for the sentinel/tail gap descriptor appended later
 
-	pSCB->welcomedNextSNtoSend = pSCB->sendWindowFirstSN = FIRST_SN;
 	pSCB->sendBufferNextSN = pSCB->sendWindowNextSN = FIRST_SN + 1;
+	pSCB->sendWindowFirstSN = FIRST_SN;
 	pSCB->sendWindowLimitSN = FIRST_SN + MAX_BLOCK_NUM;
 	// Pretend that the first packet has been sent and is waiting acknowledgement...
 	int r = socket.RespondToSNACK(FIRST_SN + 1, NULL, 0);
@@ -87,7 +87,7 @@ void FlowTestAcknowledge()
 
 	// this is a legal one: the first two has been acknowledged; the 3rd and the 5th is to be acknowledged
 	r = socket.RespondToSNACK(FIRST_SN + 3, gaps, 1);
-	assert(r == 2 && pSCB->sendWindowFirstSN == FIRST_SN + 3);
+	assert(r == 1 && pSCB->sendWindowFirstSN == FIRST_SN + 3);	// used to be r == 2
 	assert(pSCB->CountSentInFlight() >= 0);
 
 	// this is a legal but one gap is redundant, one is additional
@@ -96,7 +96,7 @@ void FlowTestAcknowledge()
 	gaps[1].dataLength = htobe32(1);
 	gaps[1].gapWidth = htobe32(1);
 	r = socket.RespondToSNACK(FIRST_SN + 3, gaps, 2);
-	assert(r == 1 && pSCB->sendWindowFirstSN == FIRST_SN + 3);
+	assert(r == 0 && pSCB->sendWindowFirstSN == FIRST_SN + 3);	// used to be r == 1
 	assert(pSCB->CountSentInFlight() >= 0);
 
 	// two gaps, overlap with previous one [only to urge retransmission of those negatively acknowledged]
@@ -256,17 +256,7 @@ void FlowTestRetransmission()
 	memset(& placeholder, 0, sizeof(placeholder));
 	int32_t len = dbgSocket.GenerateSNACK(p->ext, seq4, sizeof(FSP_NormalPacketHeader));
 
-	p->hdr.hs.opCode = KEEP_ALIVE;
-	p->hdr.hs.major = THIS_FSP_VERSION;
-	p->hdr.hs.hsp = htobe16(uint16_t(len));
-
-	// Both KEEP_ALIVE and ACK_FLUSH are payloadless out-of-band control block which always apply current session key
-	// See also ControlBlock::SetSequenceFlags
-	p->hdr.sequenceNo = htobe32(pSCB->sendWindowNextSN - 1);
-	p->hdr.expectedSN = htobe32(seq4);
-	p->hdr.ClearFlags();
-	p->hdr.SetRecvWS(pSCB->AdRecvWS(seq4));
-
+	pSCB->SignHeaderWith(& p->hdr, KEEP_ALIVE, uint16_t(len), pSCB->sendWindowNextSN - 1, seq4);
 	dbgSocket.SetIntegrityCheckCode(& p->hdr, NULL, 0, p->ext.GetSaltValue());
 
 	// Firstly emulate receive the packet before emulate OnGetKeepAlive
@@ -284,7 +274,7 @@ void FlowTestRetransmission()
 	assert(seq5 == seq4 && n == 1);
 
 	dbgSocket.RespondToSNACK(seq5, snack, n);
-
+	dbgSocket.TestSetInUse();
 	dbgSocket.DoResend();
 
 	ControlBlock::PFSP_SocketBuf skb = pSCB->HeadSend();
@@ -324,13 +314,7 @@ void FlowTestRetransmission()
 	//skb->ReInitMarkComplete();
 
 	len = dbgSocket.GenerateSNACK(p->ext, seq4, sizeof(FSP_NormalPacketHeader));
-	p->hdr.hs.hsp = htobe16(uint16_t(len));
-
-	p->hdr.sequenceNo = htobe32(pSCB->sendWindowNextSN - 1);
-	p->hdr.expectedSN = htobe32(seq4);
-	p->hdr.ClearFlags();
-	p->hdr.SetRecvWS(pSCB->AdRecvWS(seq4));
-
+	pSCB->SignHeaderWith(& p->hdr, KEEP_ALIVE, uint16_t(len), pSCB->sendWindowNextSN - 1, seq4);
 	dbgSocket.SetIntegrityCheckCode(&p->hdr, NULL, 0, p->ext.GetSaltValue());
 	// as it is an out-of-band packet, assume pre-set values are kept
 	dbgSocket.tRecentSend = NowUTC() + 3;
@@ -339,6 +323,7 @@ void FlowTestRetransmission()
 	assert(seq5 == seq4 && n == 1);
 
 	dbgSocket.RespondToSNACK(seq5, snack, n);
+	dbgSocket.TestSetInUse();
 	dbgSocket.DoResend();
 
 	// TODO: Test calculation of RTT and Keep alive timeout 

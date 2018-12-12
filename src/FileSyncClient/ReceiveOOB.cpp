@@ -30,7 +30,8 @@ static void FSPAPI onShutdown(FSPHANDLE hRev, FSP_ServiceCode code, int value)
 static bool FSPAPI onSignatureReceived(FSPHANDLE hRev, void * buf, int32_t length, bool eot)
 {
 	printf_s("Cloned session, socket %p, %d bytes received, message:\n", hRev, length);
-	printf_s("%s\n", (CHAR *)buf);
+	if(buf != NULL)
+		printf_s("%s\n", (CHAR *)buf);
 	// assert(eot);
 	Shutdown(hRev);
 	return false;

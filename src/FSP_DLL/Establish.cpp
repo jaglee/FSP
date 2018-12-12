@@ -371,6 +371,9 @@ bool LOCALAPI CSocketItemDl::ToWelcomeConnect(BackLogItem & backLog)
 //				|-->{EOT}-->COMMITTING2-->[Send PERSIST with EoT]
 //				|-->{Not EOT}-->PEER_COMMIT-->[Send PERSIST]
 //		|-->{Callback return to reject]-->NON_EXISTENT-->[Send RESET]
+// Remark
+//	Unlike ToWelcomeMultiply, 0RTT connection establishment is forbidden
+//	for the end-to-end negotiation of the "root" session
 // See also @LLS::OnConnectRequestAck
 void CSocketItemDl::ToConcludeConnect()
 {
@@ -386,12 +389,14 @@ void CSocketItemDl::ToConcludeConnect()
 	context.welcome = payload;
 	context.len = skb->len;
 
-	skb->InitMarkLocked();
+	skb->ReInitMarkDelivered();
 	skb->ClearFlags();
 	pControlBlock->SlideRecvWindowByOne();	// ACK_CONNECT_REQ, which may carry welcome
 	// But // CONNECT_REQUEST does NOT consume a sequence number
 	// See @LLS::OnGetConnectRequest
 
+	ControlBlock::seq_t seq0 = pControlBlock->sendBufferNextSN;
+	SetState(ESTABLISHED);
 	SetNewTransaction();
 	SetMutexFree();
 	if(context.onAccepted != NULL && context.onAccepted(this, &context) < 0)
@@ -400,11 +405,14 @@ void CSocketItemDl::ToConcludeConnect()
 			RecycLocked();
 		return;
 	}
-	skb = SetHeadPacketIfEmpty(ACK_START);
-	// ACK_START implies to Commit. See also ToWelcomeMultiply:
-	SetState((skb == NULL || committing) ? COMMITTING2 : PEER_COMMIT);
 
-	Call<FSP_Start>();
+	if (pControlBlock->sendBufferNextSN != seq0)
+		return;
+	//^it works as pControlBlock->sendBufferBlockN <= INT32_MAX
+	// ACK_START implies to Commit. See also ToWelcomeMultiply:
+	SetHeadPacketIfEmpty(ACK_START);
+	SetState(COMMITTING2);
+	Call<FSP_Send>();
 }
 
 
@@ -520,12 +528,11 @@ int LOCALAPI CSocketItemDl::InstallRawKey(octet *key, int32_t keyBits, uint64_t 
 
 
 // For blocking mode Connect2. See also ToConcludeConnect() and WaitEventToDispatch()
-// SetState((skb == NULL || committing) ? COMMITTING2 : PEER_COMMIT);
 CSocketItemDl * CSocketItemDl::WaitingConnectAck()
 {
+	FSP_Session_State s = NON_EXISTENT;
 	uint64_t t0 = GetTickCount64();
-	FSP_Session_State s;
-	while ((s = GetState()) != PEER_COMMIT && s != COMMITTING2 && s != CLOSABLE && s != NON_EXISTENT)
+	while (WaitUseMutex() && pControlBlock != NULL && (s = GetState()) < ESTABLISHED)
 	{
 		if (GetTickCount64() - t0 > TRANSIENT_STATE_TIMEOUT_ms)
 		{
@@ -533,15 +540,17 @@ CSocketItemDl * CSocketItemDl::WaitingConnectAck()
 			FreeAndDisable();
 			return NULL;
 		}
+		SetMutexFree();
 		Sleep(TIMER_SLICE_ms);
 	}
 
-	if (s == NON_EXISTENT)
+	if (s < ESTABLISHED)
 	{
 		context.flags = -ECONNRESET;
 		FreeAndDisable();
 		return NULL;
 	}
 
+	SetMutexFree();
 	return this;
 }

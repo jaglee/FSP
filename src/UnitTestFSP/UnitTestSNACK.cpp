@@ -46,8 +46,8 @@ void UnitTestSendRecvWnd()
 		return;
 
 	ControlBlock::PFSP_SocketBuf skb3 = pSCB->HeadSend() + 2;
-	skb->ResetMarkAcked();
-	skb3->ResetMarkAcked();
+	skb->ReInitMarkAcked();
+	skb3->ReInitMarkAcked();
 
 	// emulate received the first data packet
 	ControlBlock::PFSP_SocketBuf skb4 = pSCB->AllocRecvBuf(FIRST_SN);
@@ -62,7 +62,7 @@ void UnitTestSendRecvWnd()
 	skb4->opCode = PURE_DATA;
 	skb4->len = MAX_BLOCK_SIZE - 13;
 	skb4->SetFlag<TransactionEnded>();
-	skb->ReInitMarkComplete();
+	skb4->ReInitMarkComplete();
 
 	int m2;	// onReturn it should == skb4->len, i.e. MAX_BLOCK_SIZE - 13
 	int32_t n;
@@ -111,7 +111,7 @@ void UnitTestSendRecvWnd()
 	skb5->opCode = PURE_DATA;
 	skb5->len = MAX_BLOCK_SIZE - 13;
 	skb5->SetFlag<TransactionEnded>();
-	skb->ReInitMarkComplete();
+	skb5->ReInitMarkComplete();
 
 	// what is the content of the selective negative acknowledgement?
 	FSP_SelectiveNACK::GapDescriptor snack[4];
@@ -136,7 +136,7 @@ void UnitTestSendRecvWnd()
 	while(p->IsComplete() && _InterlockedExchange8((char *)& p->opCode, 0) != 0)
 	{
 		pSCB->SlideRecvWindowByOne();
-		p->ResetMarkAcked();		// so that it would not be re-delivered
+		p->ReInitMarkAcked();
 		if(p->GetFlag<TransactionEnded>())
 			break;
 		p = pSCB->GetFirstReceived();
@@ -147,7 +147,7 @@ void UnitTestSendRecvWnd()
 	Assert::IsNotNull(skb4);
 	skb4->opCode = PURE_DATA;
 	skb4->len = MAX_BLOCK_SIZE - 13;
-	skb->ReInitMarkComplete();
+	skb4->ReInitMarkComplete();
 
 	skb5 = pSCB->AllocRecvBuf(FIRST_SN + 7);
 

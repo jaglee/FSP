@@ -945,7 +945,7 @@ bool CSocketItemEx::EmitStart()
 int CSocketItemEx::EmitWithICC(ControlBlock::PFSP_SocketBuf skb, ControlBlock::seq_t seq)
 {
 	ALIGN(MAC_ALIGNMENT) FSP_InternalFixedHeader hdr;
-#if (TRACE & TRACE_HEARTBEAT)  || defined(EMULATE_LOSS)
+#ifdef EMULATE_LOSS
 	volatile unsigned int vRand = 0;
 	if (rand_s((unsigned int *)&vRand) == 0 && vRand > (UINT_MAX >> 2) + (UINT_MAX >> 1))
 	{
@@ -985,7 +985,10 @@ int CSocketItemEx::EmitWithICC(ControlBlock::PFSP_SocketBuf skb, ControlBlock::s
 	int r = skb->len > 0
 		? SendPacket(2, ScatteredSendBuffers(&hdr, sizeof(FSP_NormalPacketHeader), paidLoad, skb->len))
 		: SendPacket(1, ScatteredSendBuffers(&hdr, sizeof(FSP_NormalPacketHeader)));
-	skb->timeSent = tRecentSend;
+	// Time of resent is lost. However it makes selective retransmission a more efficients
+	// by avoiding transpass the whole send queue. See also DoResend
+	if (!skb->IsResent())
+		skb->timeSent = tRecentSend;
 	return r;
 }
 
@@ -1009,7 +1012,7 @@ bool LOCALAPI IsInSubnetSet(uint64_t prefix, TSubnets subnets)
 // it would not suppress overwhelming KEEP_ALIVE if the change is only removal of some subnet entry
 bool CSocketItemEx::IsNearEndMoved()
 {
-	if (InterlockedExchange8(&isNearEndHandedOver, 0) == 0)
+	if (_InterlockedExchange8(&isNearEndHandedOver, 0) == 0)
 		return false;
 
 	u_int k = CLowerInterface::Singleton.sdSet.fd_count;
@@ -1091,6 +1094,7 @@ bool CSocketItemEx::HandlePeerSubnets(PFSP_HeaderSignature optHdr)
 
 
 
+// TODO: rate-control/quota control/send queue pacing
 int CSocketItemEx::EmitNextToSend()
 {
 	register ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend() + pControlBlock->sendWindowNextPos;
@@ -1115,25 +1119,23 @@ int CSocketItemEx::EmitNextToSend()
 // 1. there is some packet to send, but
 // 2. the advertised receive window to too small to accept further packet, and
 // 3. there is no packet on flight to detect the size of the peer's receive window
-// TODO: rate-control/quota control
 void CSocketItemEx::EmitQ()
 {
 	if (pControlBlock->CountSendBuffered() <= 0)
 		return;
+	// Make it compatible with polling mode
+	SyncState();
 
 	const ControlBlock::seq_t limitSN = pControlBlock->GetSendLimitSN();
 	if (int32_t(pControlBlock->sendWindowNextSN - limitSN) < 0)
-	{
-		int r;
 		do
-			r = EmitNextToSend();
-		while (r >= 0 && int32_t(pControlBlock->sendWindowNextSN - limitSN) <= 0);
-
-	}
+		{
+			if (EmitNextToSend() < 0)
+				break;
+		} while (int32_t(pControlBlock->sendWindowNextSN - limitSN) <= 0);
 	else if (pControlBlock->CountSentInFlight() == 0)
-	{
 		EmitNextToSend();
-	}
-	
+
+	// As we have made sure that the send queue is not empty
 	AddResendTimer();
 }
