@@ -65,12 +65,11 @@ void UnitTestSendRecvWnd()
 	skb4->ReInitMarkComplete();
 
 	int m2;	// onReturn it should == skb4->len, i.e. MAX_BLOCK_SIZE - 13
-	int32_t n;
 	bool b;
-	uint8_t *recvBuf2 = (uint8_t *)pSCB->InquireRecvBuf(m2, n, b);
+	uint8_t *recvBuf2 = (uint8_t *)pSCB->InquireRecvBuf(m2, b);
 	Assert::IsTrue(recvBuf2 == recvBuf);
 	Assert::IsTrue(m2 == MAX_BLOCK_SIZE - 13);
-	pSCB->MarkReceivedFree(n);
+	pSCB->MarkReceivedFree();
 	Assert::IsTrue(pSCB->recvWindowFirstSN == FIRST_SN + 1);
 
 	ControlBlock::PFSP_SocketBuf skb5 = pSCB->AllocRecvBuf(FIRST_SN);
@@ -192,6 +191,7 @@ void UnitTestGenerateSNACK()
 	Assert::IsTrue(pSCB->recvWindowNextSN == FIRST_SN + 1);
 
 	skb1 = socket.AllocRecvBuf(FIRST_SN + 2);
+	Assert::IsTrue(pSCB->recvWindowExpectedSN == FIRST_SN + 1);
 	Assert::IsNotNull(skb1);
 	skb1->opCode = PURE_DATA;
 	skb1->ReInitMarkComplete();
@@ -205,6 +205,7 @@ void UnitTestGenerateSNACK()
 	Assert::IsNotNull(skb1);
 	skb1->opCode = PURE_DATA;	// A PUER_DATA can be payloadless, however
 	skb1->ReInitMarkComplete();
+	Assert::IsTrue(pSCB->recvWindowExpectedSN == FIRST_SN + 1);
 	Assert::IsTrue(pSCB->recvWindowNextSN == FIRST_SN + 0x10004);
 
 	r = pSCB->GetSelectiveNACK(seq0, gaps, MAX_GAPS_NUM);
@@ -218,6 +219,7 @@ void UnitTestGenerateSNACK()
 	Assert::IsNotNull(skb1);
 	skb1->opCode = PURE_DATA;
 	skb1->ReInitMarkComplete();
+	Assert::IsTrue(pSCB->recvWindowExpectedSN == FIRST_SN + 1);
 	Assert::IsTrue(pSCB->recvWindowNextSN == FIRST_SN + 0x10004);
 
 	r = pSCB->GetSelectiveNACK(seq0, gaps, MAX_GAPS_NUM);
@@ -235,35 +237,38 @@ void UnitTestGenerateSNACK()
 		skb1->opCode = PURE_DATA;
 		skb1->ReInitMarkComplete();
 	}
+	Assert::IsTrue(pSCB->recvWindowExpectedSN == FIRST_SN + 1);
 
 	r = pSCB->GetSelectiveNACK(seq0, gaps, MAX_GAPS_NUM);
 	Assert::IsTrue(r == 2 && seq0 == FIRST_SN + 1);
 
 	bool b;	// Used to be test for 'To be Continued', now for 'End of Transaction'
-	int32_t n;
-	pSCB->InquireRecvBuf(r, n, b);
+	pSCB->InquireRecvBuf(r, b);
 	Assert::IsTrue(r == 1);
 	Assert::IsTrue(b);
-	pSCB->MarkReceivedFree(n);
+	pSCB->MarkReceivedFree();
 	Assert::IsTrue(pSCB->recvWindowHeadPos == 1 && pSCB->recvWindowFirstSN == (FIRST_SN + 1));
+	Assert::IsTrue(pSCB->recvWindowExpectedSN == FIRST_SN + 1);
 
 	skb1 = socket.AllocRecvBuf(FIRST_SN + 1);
 	Assert::IsNotNull(skb1);
 	skb1->opCode = PURE_DATA;
 	skb1->ReInitMarkComplete();
+	Assert::IsTrue(pSCB->recvWindowExpectedSN == FIRST_SN + 3);
 
 	ControlBlock::PFSP_SocketBuf p = pSCB->HeadRecv();
 	(++p)->len = MAX_BLOCK_SIZE;
 	(++p)->len = MAX_BLOCK_SIZE;
 
-	pSCB->InquireRecvBuf(r, n, b);
-	pSCB->MarkReceivedFree(n);
+	pSCB->InquireRecvBuf(r, b);
+	pSCB->MarkReceivedFree();
 	Assert::IsTrue(!b && r == MAX_BLOCK_SIZE * 2);	// positon 0 skipped; position 3 is the gap
 
 	skb1 = socket.AllocRecvBuf(FIRST_SN + 3);
 	Assert::IsNotNull(skb1);
 	skb1->opCode = PURE_DATA;
 	skb1->ReInitMarkComplete();
+	Assert::IsTrue(pSCB->recvWindowExpectedSN == FIRST_SN + 0x10004);
 
 	for(int i = 0; i < 0x10000; i++, p++)	// position 3 to position 0x10002
 	{
@@ -272,26 +277,27 @@ void UnitTestGenerateSNACK()
 	p->InitMarkLocked(); // partial delivery should work
 
 	int32_t m;
-	void * buf = pSCB->InquireRecvBuf(m, r, b);
+	void * buf = pSCB->InquireRecvBuf(m, b);
 	Assert::IsNotNull(buf);
 	Assert::IsFalse(b);
-	pSCB->MarkReceivedFree(r);
+	pSCB->MarkReceivedFree();
 	Assert::IsTrue(pSCB->recvWindowHeadPos == 0x10002 && pSCB->recvWindowFirstSN == (FIRST_SN + 0x10002));
 
 	//
 	skb1 = socket.AllocRecvBuf(FIRST_SN + 0x20001);
+	Assert::IsTrue(pSCB->recvWindowExpectedSN == FIRST_SN + 0x10004);
 	Assert::IsNotNull(skb1);
 	skb1->opCode = PURE_DATA;
 	skb1->ReInitMarkComplete();
 	Assert::IsTrue(pSCB->recvWindowNextSN == FIRST_SN + 0x20002);
-	// But the last dataLength == 2 because of buffer round-robin
 
 	r = pSCB->GetSelectiveNACK(seq0, gaps, MAX_GAPS_NUM);
 	// there's a continuous data block which is not delivered yet. however, it is not considered needing a gap descriptor
-	Assert::IsTrue(r == 2 && seq0 == FIRST_SN + 0x10002);	// because position 0x10003's NOT IS_FULFILLED was cleared
-	// gap1: 0x10002, data1: 0x10003, gap2: 0x10004~0x20000 (inclusive), data2: 0x20001
-	Assert::IsTrue(gaps[0].gapWidth == 1 && gaps[0].dataLength == 1
-				&& gaps[1].gapWidth == 0xFFFD && gaps[1].dataLength == 1);
+	Assert::IsTrue(r == 1 && seq0 == FIRST_SN + 0x10004);
+	// because recvWindowExepctedSN has advanced to this position,
+	// although packet descriptor at 0x10003's flag IS_FULFILLED was NOT set
+	// gap: 0x10004~0x20000 (inclusive), data: 0x20001
+	Assert::IsTrue(gaps[0].gapWidth == 0x20001 - 0x10004 && gaps[0].dataLength == 1);
 }
 
 

@@ -222,18 +222,24 @@ void CSocketItemEx::ProcessCommand(CommandToLLS *pCmd)
 {
 	if (!WaitUseMutex())
 	{
+		if (!inUse && pControlBlock != NULL)
+		{
+			SignalFirstEvent(FSP_NotifyRecycled);
+			Destroy();
+		}	// See also Recycle()
 #ifdef TRACE
-		printf_s("ProcessCommand of socket %p: possible dead-lock, inUse = %d\n", this, inUse);
+		else
+			printf_s("ProcessCommand of socket %p: possible dead-lock\n"
+				"\tin state %s, inUse = %d\n", this, stateNames[lowState], inUse);
 #endif
 		return;
 	}
 
-	if(lowState <= 0 || lowState > LARGEST_FSP_STATE)
+	if (pControlBlock == NULL)
 	{
 #ifdef TRACE
-		printf_s("Socket(%p) is not in working state, inUse = %d, %s[%d]\n", this, inUse, stateNames[lowState], lowState);
+		printf_s("Socket(%p) is not in working, cache state is  %s[%d]\n", this, stateNames[lowState], lowState);
 #endif
-		SetMutexFree();
 		return;
 	}
 
@@ -245,10 +251,19 @@ void CSocketItemEx::ProcessCommand(CommandToLLS *pCmd)
 #endif
 
 	// synchronize the state in the 'cache' and the real state
-	if (_InterlockedExchange8((char *)& lowState, pControlBlock->state) != pControlBlock->state)
+	char prevState = _InterlockedExchange8((char *)& lowState, pControlBlock->state);
+	if (prevState != lowState)
 	{
 		if (lowState == COMMITTING || lowState == COMMITTING2)
 			RestartKeepAlive();
+	}
+	if (lowState <= 0 || lowState > LARGEST_FSP_STATE)
+	{
+#ifdef TRACE
+		printf_s("Socket(%p) is in an absurd state %d\n", this, lowState);
+#endif
+		Recycle();
+		return;
 	}
 
 	switch(pCmd->opCode)
@@ -263,7 +278,11 @@ void CSocketItemEx::ProcessCommand(CommandToLLS *pCmd)
 		EmitQ();
 		break;
 	case FSP_Shutdown:
-		Release();
+		// Send RELEASE to the remote end
+		if (prevState == PRE_CLOSED)
+			return;			// Refuse to send redundant RELEASE packet
+		ReplaceTimer(TRANSIENT_STATE_TIMEOUT_ms);
+		SendRelease();
 		break;
 	case FSP_InstallKey:
 		InstallSessionKey((CommandInstallKey &)*pCmd);
@@ -372,20 +391,6 @@ void CSocketItemEx::Reject(uint32_t reasonCode)
 	CLowerInterface::Singleton.SendPrematureReset(reasonCode, this);
 	SignalFirstEvent(FSP_NotifyRecycled);
 	Destroy();	// MUST signal event before Destroy
-}
-
-
-
-// Set to PRE_CLOSED state and send RELEASE to the remote end.
-// The RELEASE packet is not guaranteed to be received
-// so that PRE_CLOSED is alike TCP TIME-WAIT state.
-void CSocketItemEx::Release()
-{
-	if (lowState == PRE_CLOSED)
-		return;			// Refuse to send redundant RELEASE packet
-	ReplaceTimer(TRANSIENT_STATE_TIMEOUT_ms);
-	SetState(PRE_CLOSED);
-	SendRelease();
 }
 
 

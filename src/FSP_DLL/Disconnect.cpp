@@ -117,29 +117,31 @@ int FSPAPI Shutdown(FSPHANDLE hFSPSocket)
 //	And it always assume that the caller does not accept further data
 //	In deliberate blocking mode, it sends RELEASE immediately
 //	after data has been committed but does not wait for acknowledgement
+//	Although the result is a side-effect,
+//	reset of context.onFinish prevents it from being called recursively.
 int CSocketItemDl::Shutdown()
 {
 	if (!WaitUseMutex())
 		return (IsInUse() ? -EDEADLK : 0);
 
-	if(initiatingShutdown)
+	if (lowerLayerRecycled || InState(CLOSED))
+	{
+		NotifyOrReturn fp1 = (NotifyOrReturn)InterlockedExchangePointer((PVOID *)&context.onFinish, NULL);
+		RecycLocked();		// CancelTimer(); SetMutexFree();
+		if (fp1 != NULL)
+			fp1(this, FSP_NotifyRecycled, EAGAIN);
+		return 0;
+	}
+
+	if (initiatingShutdown != 0)
 	{
 		SetMutexFree();
 		return EAGAIN;	// A warning saying that the socket is already in graceful shutdown process
 	}
 	initiatingShutdown = 1;
 
-	if (lowerLayerRecycled || InState(CLOSED))
-	{
-		SetMutexFree(); // So that SelfNotify may call back instantly
-		if (context.onFinish != NULL)
-			SelfNotify(FSP_NotifyToFinish);
-		//^because initiatingShutdown is set FSP_NotifyRecycled is reported to ULA instead
-		return 0;
-	}
-
 #ifndef _NO_LLS_CALLABLE
-	if(! AddOneShotTimer(TRANSIENT_STATE_TIMEOUT_ms))
+	if(! AddOneShotTimer(CLOSING_TIME_WAIT_ms))
 	{
 		REPORT_ERRMSG_ON_TRACE("Cannot set time-out clock for shutdown");
 		SetMutexFree();
@@ -160,7 +162,12 @@ int CSocketItemDl::Shutdown()
 	do
 	{
 		FSP_Session_State s = GetState();
-		if (s != COMMITTED && s < CLOSABLE && s != NON_EXISTENT)
+		if (s == CLOSED || s == NON_EXISTENT)
+		{
+			SetMutexFree();
+			return 0;
+		}
+		if (s != COMMITTED && s < CLOSABLE)
 		{
 			int r = Commit();
 			if (r < 0)
@@ -170,19 +177,21 @@ int CSocketItemDl::Shutdown()
 		}
 		else if (s == CLOSABLE)
 		{
-			bool b = Call<FSP_Shutdown>();
-			if (context.onFinish != NULL || !b)
+			// handle race condition here
+			SetState(PRE_CLOSED);
+			if (!Call<FSP_Shutdown>())
 			{
 				SetMutexFree();
-				return (b ? 0 : -EIO);
+				return -EIO;
+			}
+			if (context.onFinish != NULL)
+			{
+				SetMutexFree();
+				return 0;
 			}
 		}
-		// chance may happen that it has immediately migrate to CLOSED state
-		bool b = InState(CLOSED) || InState(NON_EXISTENT);
-		SetMutexFree();
-		if (b)
-			return 0;
 		//
+		SetMutexFree();
 		Sleep(TIMER_SLICE_ms);
 		if (s >= CLOSABLE)
 		{

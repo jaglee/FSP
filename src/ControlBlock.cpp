@@ -49,7 +49,7 @@ const char * CStringizeOpCode::names[LARGEST_OP_CODE + 1] =
 	"CONNECT_REQUEST",
 	"ACK_CONNECT_REQ",
 	"RESET",
-	"ACK_START",
+	"NULCOMMIT",	// Used to be ACK_START
 	"PURE_DATA",	// Without any optional header
 	"PERSIST",		// Alias: DATA_WITH_ACK
 	"ACK_FLUSH",
@@ -117,10 +117,11 @@ const char * CStringizeNotice::names[LARGEST_FSP_NOTICE + 1] =
 	"FSP_Reject",		// a forward command, explicitly reject some request
 	"FSP_Recycle",		// a forward command, connection might be aborted
 	"FSP_Send",			// send a packet/a group of packets
-	"FSP_Commit",		// commit a transmit transaction by send an EOT flag
 	"FSP_Shutdown",		// close the connection
 	"FSP_InstallKey",	// install the authenticated encryption key
 	"FSP_Multiply",		// clone the connection, make SCB of LLS synchronized with DLL
+	"Reserved10",		// FSP_Start, code 7, obsolesced
+	"Reserved11",		// FSP_Commit, code 8, obsolesced
 	// 12-15, 4 reserved
 	"Reserved12",
 	"Reserved13",
@@ -586,7 +587,6 @@ ControlBlock::PFSP_SocketBuf LOCALAPI ControlBlock::AllocRecvBuf(seq_t seq1)
 
 // Given
 //	int32_t & : [_Out_] place holder of the number of bytes [to be] peeked.
-//	int32_t & : [_Out_] place holder of the number of blocks peeked
 //	bool & :	[_Out_] place holder of the End of Transaction flag
 // Do
 //	Peek the receive buffer, figure out not only the start address but also the length of the next message
@@ -595,7 +595,6 @@ ControlBlock::PFSP_SocketBuf LOCALAPI ControlBlock::AllocRecvBuf(seq_t seq1)
 // Return
 //	Start address of the received message
 // Remark
-//	No receive buffer block is released, except the first block which is a payloadless PERSIST as well
 //	However, it is not meant to be thoroughly idempotent in the sense that
 //	receive buffers that have been inquired may not be delivered by ReadFrom
 //	If the returned value is NULL, stored in int & [_Out_] is the error number
@@ -605,7 +604,7 @@ ControlBlock::PFSP_SocketBuf LOCALAPI ControlBlock::AllocRecvBuf(seq_t seq1)
 //				payload length of an intermediate packet of a message should be MAX_BLOCK_SIZE,
 //				payload length of any packet should be no less than 0 and no greater than MAX_BLOCK_SIZE)
 //	-EPERM		non-conforming to the protocol, shall be prohibited
-BYTE * LOCALAPI ControlBlock::InquireRecvBuf(int32_t & nIO, int32_t & nBlock, bool & eotFlag)
+BYTE * LOCALAPI ControlBlock::InquireRecvBuf(int32_t & nIO, bool & eotFlag)
 {
 	const int tail = recvWindowNextPos;
 	eotFlag = false;
@@ -615,7 +614,6 @@ BYTE * LOCALAPI ControlBlock::InquireRecvBuf(int32_t & nIO, int32_t & nBlock, bo
 		return NULL;
 	}
 
-	nBlock = 0;	// somewhat redundant, but it makes the code a little safer
 	nIO = 0;
 	if(CountDeliverable() <= 0)
 		return NULL;
@@ -645,7 +643,7 @@ BYTE * LOCALAPI ControlBlock::InquireRecvBuf(int32_t & nIO, int32_t & nBlock, bo
 	}
 #endif
 	//
-	for(i = 0; i < m && p->IsComplete(); i++)
+	for(i = 0; i < m && p->IsComplete() && ! p->IsDelivered(); i++)
 	{
 		if(p->len > MAX_BLOCK_SIZE || p->len < 0)
 		{
@@ -655,6 +653,8 @@ BYTE * LOCALAPI ControlBlock::InquireRecvBuf(int32_t & nIO, int32_t & nBlock, bo
 		}
 		nIO += p->len;
 		//
+		p->MarkDelivered();
+
 		if(p->GetFlag<TransactionEnded>())
 		{
 			eotFlag = true;
@@ -673,56 +673,43 @@ BYTE * LOCALAPI ControlBlock::InquireRecvBuf(int32_t & nIO, int32_t & nBlock, bo
 		p++;
 	}
 	//
-	nBlock = i;
 	return pMsg;
 }
 
 
 
 // Given
-//	int32_t		number of blocks to mark free, shall equal the value passed out by InquireRecvBuf
+//	PFSP_SocketBuf		the head packet that is expected to be free at first
 // Do
-//	Free the packet buffer blocks that cover at least the given number of bytes.
+//	Free the packet buffer blocks that were marked as delivered by InquireRecvBuf
 // Return
 //	non-negative if the number of bytes be free
 //	negative if error:
-//	-EACCES		the buffer space is corrupted and unaccessible
-//	-EFAULT		the descriptor is corrupted (illegal payload length:
-//				payload length of an intermediate packet of a message should be MAX_BLOCK_SIZE,
-//				payload length of any packet should be no less than 0 and no greater than MAX_BLOCK_SIZE)
-//	-EPERM		imconformant to the protocol, which is prohibitted
+//	-EPERM		non-conforming to the protocol, shall be prohibited
+//	-EFAULT		some packet descriptor is corrupted
 //	-EDOM		parameter error
 // Remark
 //	It would mark the buffer block descriptors even if error encountered.
 //	Only the number of the last error would be preserved and reported.
-int LOCALAPI ControlBlock::MarkReceivedFree(int32_t m)
+int LOCALAPI ControlBlock::MarkReceivedFree(PFSP_SocketBuf p)
 {
-	if (m <= 0)
-		return m;
+	if (p != GetFirstReceived())
+		return -EPERM;
 
-	register PFSP_SocketBuf p = GetFirstReceived();
-	register int i;
+	register int i, m;
+	if (recvWindowNextPos > recvWindowHeadPos)
+		m = recvWindowNextPos - recvWindowHeadPos;
+	else
+		m = recvBufferBlockN - recvWindowHeadPos;
+
 	int32_t nIO = 0;
-	for (i = 0; i < m && p->IsComplete(); i++)
+	for (i = 0; i < m && p->IsDelivered(); p++, i++)
 	{
 		if (p->len > MAX_BLOCK_SIZE || p->len < 0)
-		{
-			BREAK_ON_DEBUG();
-			return  -EFAULT;
-		}
-		//
+			return -EFAULT;
 		nIO += p->len;
-		//
-		bool b = p->GetFlag<TransactionEnded>();
 		p->ReInitMarkDelivered();
-		p->ClearFlags();
-		if (b)
-		{
-			++i;
-			break;
-		}
-		//
-		p++;
+		// but preserve the packet flag for EoT detection, etc.
 	}
 #ifndef NDEBUG
 	if (i != m)
@@ -892,54 +879,6 @@ bool ControlBlock::HasBeenCommitted()
 		d += recvBufferBlockN;
 
 	return (HeadRecv() + d)->GetFlag<TransactionEnded>();
-}
-
-
-
-// Return
-//	0 if there existed a sent packet at the tail which has already marked EOT
-//	1 if there existed an unsent packet at the tail and it is marked EOT
-//	2 if there existed free slot to put a new EoT packet into the queue
-//  -1 if there is no packet to piggyback EoT and no free slot at all
-// See also @LLS::UrgeCommit(), @LLS::RespondToSNACK
-int ControlBlock::MarkSendQueueEOT()
-{
-	register int i = sendBufferNextPos - 1;
-	register PFSP_SocketBuf p;
-	p = HeadSend() + (i < 0 ? sendBufferBlockN - 1 : i);
-
-	char marks = p->GetResetMarks();	// to handle race condition
-	bool beenSent = FSP_SocketBuf::TestMarkSent(marks);
-	if (beenSent && p->GetFlag<TransactionEnded>())
-	{
-		p->SetMarks(marks);
-		return 0;
-	}
-
-	const int32_t N = CountSendBuffered();
-	if(N > 0)
-	{
-		if (! beenSent)
-		{
-			p->SetFlag<TransactionEnded>();
-			p->SetMarksWithComplete(marks);
-			return 1;
-		}
-		//
-		p->SetMarks(marks);
-		if (N >= sendBufferBlockN)
-			return -1;
-	}
-
-	p = HeadSend() + sendBufferNextPos;
-	p->opCode = PURE_DATA;
-	p->len = 0;
-	p->SetFlag<TransactionEnded>();
-	p->ReInitMarkComplete();
-	IncRoundSendBlockN(sendBufferNextPos);
-	InterlockedIncrement(&sendBufferNextSN);
-
-	return 2;
 }
 
 

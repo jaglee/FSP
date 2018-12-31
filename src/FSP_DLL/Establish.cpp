@@ -320,8 +320,9 @@ bool LOCALAPI CSocketItemDl::ToWelcomeConnect(BackLogItem & backLog)
 {
 	PFSP_IN6_ADDR p = (PFSP_IN6_ADDR) & pControlBlock->peerAddr.ipFSP.allowedPrefixes[MAX_PHY_INTERFACES - 1];
 	//
-	SetNewTransaction();	// ACK_CONNECT_REQ is a singleton transmit transaction
 	SetState(CHALLENGING);
+	SetNewTransaction();
+	// ACK_CONNECT_REQ is a singleton transmit transaction
 	// Ask ULA whether to accept the connection
 	if(context.onAccepting != NULL && context.onAccepting(this, & backLog.acceptAddr, p) < 0)
 	{
@@ -390,7 +391,7 @@ void CSocketItemDl::ToConcludeConnect()
 	context.len = skb->len;
 
 	skb->ReInitMarkDelivered();
-	skb->ClearFlags();
+	// but preserve the packet flag for EoT detection, etc.
 	pControlBlock->SlideRecvWindowByOne();	// ACK_CONNECT_REQ, which may carry welcome
 	// But // CONNECT_REQUEST does NOT consume a sequence number
 	// See @LLS::OnGetConnectRequest

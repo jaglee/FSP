@@ -413,17 +413,10 @@ void CSocketItemDl::WaitEventToDispatch()
 				ToConcludeConnect();// SetMutexFree();
 				break;
 			}
-			if(context.onAccepted != NULL)
-			{
-				SetMutexFree();
-				int r = context.onAccepted(this, &context);
-				if (!LockAndValidate() || r < 0)
-				{
-					RecycLocked();	// SetMutexFree();
-					return;
-				}
-			}
-			ProcessReceiveBuffer();	// SetMutexFree();
+			fp1 = (NotifyOrReturn) context.onAccepted;
+			SetMutexFree();
+			if(fp1 != NULL)
+				((CallbackConnected)fp1)(this, &context);
 			break;
 		case FSP_NotifyMultiplied:	// See also @LLS::Connect()
 			CancelTimeout();		// If any
@@ -431,8 +424,8 @@ void CSocketItemDl::WaitEventToDispatch()
 			ProcessReceiveBuffer();
 			if (!LockAndValidate())
 				return;
-			//
-			ProcessPendingSend();	// To inherently chain WriteTo/SendInline with Multiply
+			// To inherently chain WriteTo/SendInline with Multiply
+			ProcessPendingSend();
 			break;
 		case FSP_NotifyDataReady:
 			ProcessReceiveBuffer();	// SetMutexFree();
@@ -441,7 +434,8 @@ void CSocketItemDl::WaitEventToDispatch()
 			ProcessPendingSend();	// SetMutexFree();
 			break;
 		case FSP_NotifyToCommit:
-			ProcessReceiveBuffer();	// See FSP_NotifyDataReady, FSP_NotifyFlushed and CSocketItemDl::Shutdown()
+			// See also FSP_NotifyDataReady, FSP_NotifyFlushed and CSocketItemDl::Shutdown()
+			ProcessReceiveBuffer();	// SetMutexFree();
 			if (!LockAndValidate())
 				return;
 			// Even if there's no callback function to accept data/flags (as in blocking receive mode)
@@ -449,8 +443,11 @@ void CSocketItemDl::WaitEventToDispatch()
 			if (!HasDataToDeliver())
 				peerCommitted = 1;
 			//
-			if(InState(CLOSABLE) && initiatingShutdown)
+			if (InState(CLOSABLE) && initiatingShutdown)
+			{
+				SetState(PRE_CLOSED);
 				Call<FSP_Shutdown>();
+			}
 			SetMutexFree();
 			break;
 		case FSP_NotifyFlushed:
@@ -458,15 +455,16 @@ void CSocketItemDl::WaitEventToDispatch()
 			if (!LockAndValidate())
 				return;
 			//
-			if(InState(CLOSABLE) && initiatingShutdown)
+			if (InState(CLOSABLE) && initiatingShutdown)
 			{
+				SetState(PRE_CLOSED);
 				Call<FSP_Shutdown>();
 				SetMutexFree();
 			}
 			else
 			{
 				fp1 = NULL;
-				if (InState(COMMITTED) || InState(CLOSABLE) || InState(PRE_CLOSED) || InState(CLOSED))
+				if (InState(COMMITTED) || pControlBlock->state >= CLOSABLE)
 					fp1 = (NotifyOrReturn)InterlockedExchangePointer((PVOID *)& fpCommitted, fp1);
 				CancelTimeout();// If any
 				SetMutexFree();
@@ -686,7 +684,7 @@ void CSocketItemDl::PollingTimedout()
 	if (!IsInUse() || InIllegalState())
 		return;
 
-#if defined(TRACE)
+#if (TRACE & TRACE_SLIDEWIN)
 	printf_s("FSPSocket %p, Receive window: \n"
 		"  (%u - %u), expected: %u\n"
 		" Send window: \n"
@@ -700,14 +698,14 @@ void CSocketItemDl::PollingTimedout()
 		, pControlBlock->sendWindowLimitSN);
 #endif
 	// Receive takes precedence because receiving is to free resource
-	if ((fpReceived != NULL || fpPeeked != NULL) && !chainingReceive && HasDataToDeliver())
+	if ((fpReceived != NULL || fpPeeked != NULL) && HasDataToDeliver())
 	{
 		ProcessReceiveBuffer();
 		if (!TryAcquireSRWLockExclusive(&rtSRWLock))
 			return;
 	}
 	//
-	if ((fpSent != NULL || pendingSendBuf != NULL) && !chainingSend && HasFreeSendBuffer())
+	if ((fpSent != NULL || pendingSendBuf != NULL) && HasFreeSendBuffer())
 		ProcessPendingSend();
 	else
 		SetMutexFree();

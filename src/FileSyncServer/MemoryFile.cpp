@@ -81,6 +81,9 @@ static int FSPAPI toSendNextBlock(FSPHANDLE h, void * batchBuffer, int32_t capac
 	}
 
 	int bytesRead = __min(sizeof(bytesToSend) - offset, (size_t)capacity);
+	if (bytesRead <= 0)
+		return EOF;
+
 	memcpy(batchBuffer, bytesToSend + offset, bytesRead);
 	printf_s("To send %d bytes to the remote end. %d bytes have been sent before.\n", bytesRead, offset);
 

@@ -850,6 +850,15 @@ bool CSocketItemEx::FinalizeMultiply()
 
 
 
+//{ESTABLISHED, COMMITTING, PEER_COMMIT, COMMITTING2, COMMITTED, CLOSABLE}
+//	|-->/MULTIPLY/-->[API{Callback}]
+//		|-->[{Return Accept}]-->{new context}-->{further LLS process}
+//			|{Send queue EoT}
+//				|{Peer's MULTIPLY was not EoT}-->COMMITTING
+//				|{Peer's MULTIPLY was EoT}-->COMMITTING2
+//			|{Send queue not EoT}
+//				|{Peer's MULTIPLY was not EoT}-->ESTABLISHED
+//				|{Peer's MULTIPLY was EoT}-->PEER_COMMIT
 // Congest the peer's MULTIPLY payload and make response designated by ULA transmitted
 // See also OnGetMultiply(), @DLL::PrepareToAccept, ToWelcomeMultiply
 void CMultiplyBacklogItem::ResponseToMultiply()
@@ -872,16 +881,20 @@ void CMultiplyBacklogItem::ResponseToMultiply()
 	_InterlockedIncrement((LONG *)&pControlBlock->recvWindowNextPos);
 	// The receive buffer is eventually ready
 
+	ControlBlock::PFSP_SocketBuf skbOut = pControlBlock->GetLastBuffered();
 	if (skb->GetFlag<TransactionEnded>())
 	{
-		SetState(pControlBlock->state == COMMITTING ? COMMITTING2 : PEER_COMMIT);
+		SetState(skbOut->GetFlag<TransactionEnded>() ? COMMITTING2 : PEER_COMMIT);
+		SendAckFlush();
 		SignalFirstEvent(FSP_NotifyToCommit);					// And deliver data instantly if it is to commit
 	}
 	else
 	{
-		SyncState();
+		SetState(skbOut->GetFlag<TransactionEnded>() ? COMMITTING : ESTABLISHED);
 		pControlBlock->notices.SetHead(FSP_NotifyDataReady);	// But do not signal until next packet is received
 	}
+
+	EmitQ();
 }
 
 
@@ -893,7 +906,7 @@ void CMultiplyBacklogItem::ResponseToMultiply()
 //	ACK_CONNECT_REQUEST is resent on requested only.
 //	bind to the interface as soon as the control block mapped into server's memory space
 // See also
-//	CSocketItemEx::Start(), OnConnectRequestAck(); CSocketItemDl::ToWelcomeConnect(), ToWelcomeMultiply()
+//	CSocketItemEx::OnConnectRequestAck(); CSocketItemDl::ToWelcomeConnect(), ToWelcomeMultiply()
 void CSocketItemEx::Accept()
 {
 	if (!WaitUseMutex())
@@ -915,8 +928,6 @@ void CSocketItemEx::Accept()
 	{
 		// Timer has been set when the socket slot was prepared on getting MULTIPLY
 		((CMultiplyBacklogItem *)this)->ResponseToMultiply();
-		EmitStart();
-		AddResendTimer();
 	}
 	//
 	tSessionBegin = tRecentSend;
@@ -936,31 +947,6 @@ void CSocketItemEx::SendReset()
 	hdr.SetSequenceFlags(pControlBlock, seqR);
 	hdr.hs.Set<FSP_NormalPacketHeader, RESET>();
 	SetIntegrityCheckCode(& hdr);
-	SendPacket(1, ScatteredSendBuffers(&hdr, sizeof(hdr)));
-}
-
-
-
-// Send the out-of-band(unlike TCP FIN/FIN-ACK) RELEASE command
-// RELEASE does not really tear down the connection thoroughly
-void CSocketItemEx::SendRelease()
-{
-	ControlBlock::seq_t seqR = pControlBlock->sendWindowFirstSN;
-	ALIGN(MAC_ALIGNMENT) FSP_InternalFixedHeader hdr;
-	// Make sure that the packet falls into the receive window
-	if (pControlBlock->sendWindowNextSN != seqR)
-	{
-		BREAK_ON_DEBUG();
-		return;	// silently ignore the abnormal command
-	}
-	if (pControlBlock->recvWindowExpectedSN != pControlBlock->recvWindowNextSN)
-	{
-		BREAK_ON_DEBUG();
-		pControlBlock->recvWindowExpectedSN = pControlBlock->recvWindowNextSN;
-	}
-	hdr.SetSequenceFlags(pControlBlock, seqR);
-	hdr.hs.Set<FSP_NormalPacketHeader, RELEASE>();
-	SetIntegrityCheckCode(&hdr);
 	SendPacket(1, ScatteredSendBuffers(&hdr, sizeof(hdr)));
 }
 
@@ -1022,14 +1008,12 @@ void CSocketItemEx::AbortLLS(bool haveTLBLocked)
 	if (!haveTLBLocked)
 	{
 		Destroy();
+		return;
 	}
-	else
-	{
-		RemoveTimers();
-		CSocketItem::Destroy();
-		CLowerInterface::Singleton.FreeItemDonotCareLock(this);
-	}
-	
+	// If TLB has been locked, 'Destroy' is simplified:
+	RemoveTimers();
+	CSocketItem::Destroy();
+	CLowerInterface::Singleton.FreeItemDonotCareLock(this);
 }
 
 

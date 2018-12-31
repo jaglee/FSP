@@ -144,9 +144,10 @@ protected:
 	char			inUse;
 	char			newTransaction;	// it may simultaneously start a transmit transaction and flush/commit it
 
+	char			chainingReceive;
+	char			chainingSend;
+
 	// Flags, in dictionary order
-	char			chainingReceive : 1;
-	char			chainingSend : 1;
 	char			initiatingShutdown : 1;
 	char			lowerLayerRecycled : 1;
 	char			peerCommitPending : 1;
@@ -281,10 +282,7 @@ public:
 	FSP_Session_State GetState() { return (FSP_Session_State)InterlockedOr8((char *)& pControlBlock->state, 0); }
 	bool InState(FSP_Session_State s) { return GetState() == s; }
 	void SetState(FSP_Session_State s) { _InterlockedExchange8((char *)& pControlBlock->state, s); }
-	bool TestSetState(FSP_Session_State s0, FSP_Session_State s2)
-	{
-		return (_InterlockedCompareExchange8((char *) & pControlBlock->state, s2, s0) == s0);
-	}
+
 	// In ESTABLISHED or PEER_COMMIT state: does not make state transition on send
 	// Send and Commit are separate atomic operations
 	void MigrateToNewStateOnSend()
@@ -300,15 +298,11 @@ public:
 	{
 		register FSP_Session_State s = pControlBlock->state;
 		if (s == ESTABLISHED || s == COMMITTED)
-		{
 			SetState(COMMITTING);
-			SetToCommit(false);
-		}
 		else if (s == PEER_COMMIT || s == CLOSABLE)
-		{
 			SetState(COMMITTING2);
-			SetToCommit(false);
-		}
+		// else just clear the 'EoT is pending' flag
+		SetEoTPending(false);
 	}
 
 	bool InIllegalState()
@@ -375,6 +369,19 @@ public:
 	int32_t LOCALAPI SendStream(const void *, int32_t, bool, bool);
 	int Flush();
 
+	bool ApendEoTPacket()
+	{
+		ControlBlock::PFSP_SocketBuf p = pControlBlock->GetSendBuf();
+		if (p == NULL)
+			return false;
+		p->opCode = NULCOMMIT;
+		p->len = 0;
+		p->SetFlag<TransactionEnded>();
+		p->ReInitMarkComplete();
+		MigrateToNewStateOnCommit();
+		return true;
+	}
+
 	bool TestSetOnCommit(PVOID fp1)
 	{
 		return InterlockedCompareExchangePointer((PVOID *)& fpCommitted, fp1, NULL) == NULL;
@@ -416,8 +423,8 @@ public:
 	void SetCallbackOnFinish(NotifyOrReturn fp1) { context.onFinish = fp1; }
 
 	void SetNewTransaction() { newTransaction = 1; }
-	void SetToCommit(bool v = true) { pControlBlock->pendingEoT = v ? 1 : 0; }
-	bool ToCommit() { return pControlBlock->pendingEoT != 0; }
+	void SetEoTPending(bool v = true) { pControlBlock->pendingEoT = v ? 1 : 0; }
+	bool IsEoTPending() { return pControlBlock->pendingEoT != 0; }
 
 	int SelfNotify(FSP_ServiceCode c);
 	void SetCallbackOnError(NotifyOrReturn fp1) { context.onError = fp1; }

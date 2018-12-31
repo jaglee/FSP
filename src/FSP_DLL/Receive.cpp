@@ -91,20 +91,12 @@ int CSocketItemDl::RecvInline(CallbackPeeked fp1)
 #endif
 	}
 	//
+	bool b = HasDataToDeliver();
 	EnablePolling();
-	if (! HasDataToDeliver())
-	{
+	if (! b)
 		SetMutexFree();
-		return 0;
-	}
-	// Let's the polling timer to call ProcessReceiveBuffer if nested
-	if (chainingReceive)
-	{
-		SetMutexFree();
-		return 0;
-	}
-
-	ProcessReceiveBuffer();
+	else
+		ProcessReceiveBuffer();
 	return 0;
 }
 
@@ -156,12 +148,10 @@ int LOCALAPI CSocketItemDl::ReadFrom(void * buffer, int capacity, NotifyOrReturn
 		bool b = HasDataToDeliver();
 		EnablePolling();
 		// Let's the polling timer to call ProcessReceiveBuffer if nested
-		if (!b || chainingReceive)
-		{
+		if (!b)
 			SetMutexFree();
-			return 0;
-		}
-		ProcessReceiveBuffer();
+		else
+			ProcessReceiveBuffer();
 		return 0;
 	}
 
@@ -272,7 +262,7 @@ int32_t CSocketItemDl::FetchReceived()
 
 		bool b = p->GetFlag<TransactionEnded>();
 		p->ReInitMarkDelivered();
-		p->ClearFlags();
+		// but preserve the packet flag for EoT detection, etc.
 		nPacket++;
 		//
 		if(b)
@@ -345,9 +335,16 @@ l_recursion:
 		return;
 	}
 
+	if (_InterlockedCompareExchange8(&chainingReceive, 1, 0) != 0)
+	{
+		SetMutexFree();
+		return;
+	}
+
 	CallbackPeeked fp1 = (CallbackPeeked)InterlockedExchangePointer((PVOID *)& fpPeeked, NULL);
 	if (fp1 == NULL)
 	{
+		chainingReceive = 0;
 		SetMutexFree();
 		return;
 	}
@@ -355,9 +352,8 @@ l_recursion:
 	// First received block of a clone connection or a new transmit transaction is right-aligned
 	// See also @LLS::PlacePayload and @LLS::CopyOutPlainText
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->GetFirstReceived();
-	int32_t m;
 	bool eot;
-	BYTE *p = pControlBlock->InquireRecvBuf(n, m, eot);
+	BYTE *p = pControlBlock->InquireRecvBuf(n, eot);
 	if(p != NULL && (skb->opCode == PERSIST || skb->opCode == MULTIPLY))
 		p += MAX_BLOCK_SIZE - skb->len;	// See also FetchReceived()
 #ifdef TRACE
@@ -365,12 +361,12 @@ l_recursion:
 #endif
 	if (!eot && n == 0)	// Redundant soft-interrupt shall be simply ignored
 	{
+		chainingReceive = 0;
 		fpPeeked = fp1;
 		SetMutexFree();
 		return;
 	}
 
-	chainingReceive = 1;
 	SetMutexFree();
 	// It is possible that no meaningful payload is received but an EoT flag is got.
 	// The callback function should work in such senario
@@ -381,22 +377,19 @@ l_recursion:
 	chainingReceive = 0;
 	if (!WaitUseMutex())
 		return;	// it could be disposed in the callback function
+	// Assume the call-back function did not mess up the receive queue
+	int m = pControlBlock->MarkReceivedFree(skb);
 #ifndef NDEBUG
-	if (skb != pControlBlock->GetFirstReceived())
+	if (m != n)
 	{
-		printf_s("The receive queue was messed up?!\n");
+		printf_s("MarkReceivedFree returned %d, expected %d: the receive queue was messed up?!\n", m, n);
 		BREAK_ON_DEBUG();
 	}
 #endif
-	// Assume the call-back function did not mess up the receive queue
-	if (eot || n > 0)
-	{
-		pControlBlock->MarkReceivedFree(m);
-		offsetInLastRecvBlock = 0;
-		if (HasDataToDeliver())
-			goto l_recursion;
-	}
+	offsetInLastRecvBlock = 0;
 	// If (n < 0) some unrecoverable error has occur. Should avoid the risk of dead-loop.
+	if (n >= 0 && m == n && HasDataToDeliver())
+		goto l_recursion;
 
 	SetMutexFree();
 }

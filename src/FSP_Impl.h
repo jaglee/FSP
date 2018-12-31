@@ -67,6 +67,12 @@ void TraceLastError(char * fileName, int lineNo, char *funcName, char *s1);
 # define REPORT_ERRMSG_ON_TRACE(s) (s)
 #endif
 
+#define TRACE_ADDRESS	1
+#define TRACE_HEARTBEAT	2
+#define TRACE_PACKET	4
+#define TRACE_SLIDEWIN	8
+#define TRACE_ULACALL	16
+#define TRACE_OUTBAND	32	// Other than KEEP_ALIVE
 
 
 /**
@@ -378,11 +384,11 @@ class CSocketItem;	// forward declaration for sake of declaring ControlBlock
 struct ControlBlock
 {
 	ALIGN(8)
-	FSP_Session_State state;
+		FSP_Session_State state;
 	char			_reserved1;
 	char			pendingEoT;			// EoT flag is pending to be added on a packet
-	char			milky :		1;		// by default 0: a normal wine-style payload assumed. FIFO
-	char			noEncrypt:	1;		// by default 0: if install session key, encrypt the payload
+	char			milky : 1;		// by default 0: a normal wine-style payload assumed. FIFO
+	char			noEncrypt : 1;		// by default 0: if install session key, encrypt the payload
 	//
 	ALFID_T			idParent;
 
@@ -404,7 +410,7 @@ struct ControlBlock
 
 	// 3: The negotiated connection parameter
 	ALIGN(8)	// 64-bit alignment, make sure that the session key overlays 'initCheckCode' and 'cookie' only
-	SConnectParam connectParams;
+		SConnectParam connectParams;
 
 	// 4: The queue of returned notices
 	LLSNotice	notices;
@@ -462,8 +468,8 @@ struct ControlBlock
 	{
 		union
 		{
-		timestamp_t	timeSent;
-		timestamp_t timeRecv;
+			timestamp_t	timeSent;
+			timestamp_t timeRecv;
 		};
 		int32_t		len;
 		char		marks;
@@ -476,26 +482,23 @@ struct ControlBlock
 		void ReInitMarkAcked() { _InterlockedExchange8(&marks, FSP_BUF_ACKED); }
 		// Delivered is special in the sense that it is for receive only and it uses the same bit as Resent
 		void ReInitMarkDelivered() { _InterlockedExchange8(&marks, FSP_BUF_DELIVERED); }
+
 		void MarkSent() { _InterlockedOr8(&marks, FSP_BUF_SENT); }
 		void MarkAcked() { _InterlockedOr8(&marks, FSP_BUF_ACKED); }
 		void MarkResent() { _InterlockedOr8(&marks, FSP_BUF_RESENT); }
+		void MarkDelivered() { _InterlockedOr8(&marks, FSP_BUF_DELIVERED); }
 
 		bool IsDelivered() { return (_InterlockedOr8(&marks, 0) & FSP_BUF_DELIVERED) != 0; }
 		bool IsComplete() { return (_InterlockedOr8(&marks, 0) & FSP_BUF_COMPLETE) != 0; }
 		bool IsAcked() { return (_InterlockedOr8(&marks, 0) & FSP_BUF_ACKED) != 0; }
 		bool IsResent() { return (_InterlockedOr8(&marks, 0) & FSP_BUF_RESENT) != 0; }
 		//
-		char GetResetMarks() { return _InterlockedExchange8(&marks, 0); }
-		void SetMarks(char c) { _InterlockedExchange8(&marks, c); }
-		void SetMarksWithComplete(char c) { _InterlockedExchange8(&marks, c | FSP_BUF_COMPLETE); }
-		static bool TestMarkSent(char c) { return (c & FSP_BUF_SENT) != 0; }
-		//
 		void ClearFlags() { _InterlockedExchange8((char *)&flags, 0); }
 		template<FSP_FlagPosition pos> void InitFlags() { _InterlockedExchange8((char *)&flags, (char)(1 << pos)); }
 		template<FSP_FlagPosition pos> void SetFlag() { _InterlockedExchange8((char *)&flags, flags | (char)(1 << pos)); }
 		template<FSP_FlagPosition pos> bool GetFlag() { return (_InterlockedOr8((char *)&flags, 0) & (char)(1 << pos)) != 0; }
 		void CopyFlagsTo(FSP_NormalPacketHeader *p) { _InterlockedExchange8((char *)p->flags_ws, flags); }
-		void CopyInFlags(const FSP_NormalPacketHeader *p) { _InterlockedExchange8((char *) & flags, p->flags_ws[0]); }
+		void CopyInFlags(const FSP_NormalPacketHeader *p) { _InterlockedExchange8((char *)& flags, p->flags_ws[0]); }
 	} *PFSP_SocketBuf;
 	//
 	// END REGION: buffer descriptors
@@ -511,7 +514,7 @@ struct ControlBlock
 	BYTE * GetSendPtr(const ControlBlock::PFSP_SocketBuf skb, uint32_t &offset)
 	{
 		PFSP_SocketBuf p0 = PFSP_SocketBuf((BYTE *)this + sendBufDescriptors);
-		offset = sendBuffer	+ MAX_BLOCK_SIZE * uint32_t(skb - p0);
+		offset = sendBuffer + MAX_BLOCK_SIZE * uint32_t(skb - p0);
 		return (BYTE *)this + offset;
 	}
 
@@ -524,7 +527,7 @@ struct ControlBlock
 	BYTE * GetRecvPtr(const ControlBlock::PFSP_SocketBuf skb, uint32_t &offset) const
 	{
 		PFSP_SocketBuf p0 = PFSP_SocketBuf((BYTE *)this + recvBufDescriptors);
-		offset = recvBuffer	+ MAX_BLOCK_SIZE * uint32_t(skb - p0);
+		offset = recvBuffer + MAX_BLOCK_SIZE * uint32_t(skb - p0);
 		return (BYTE *)this + offset;
 	}
 
@@ -563,12 +566,12 @@ struct ControlBlock
 	// Return the head packet even if the send queue is empty
 	PFSP_SocketBuf GetSendQueueHead() { return HeadSend() + sendWindowHeadPos; }
 
-	// Return
-	//	0 if there existed a sent packet at the tail which has already marked EOT 
-	//	1 if there existed an unsent packet at the tail and it is marked EOT
-	//	2 if there existed free slot to put a new EoT packet into the queue
-	//  -1 if there is no packet to piggyback EoT and no free slot at all
-	int MarkSendQueueEOT();
+	// Given that the caller has made sure the queue is not empty, return the last packet of the send queue
+	PFSP_SocketBuf GetLastBuffered()
+	{
+		register int i = sendBufferNextPos - 1;
+		return (HeadSend() + (i < 0 ? sendBufferBlockN - 1 : i));
+	}
 
 	// Take snapshot of the right edge of the receive window, typically on transmit transaction committed
 	void SnapshotReceiveWindowRightEdge() { connectParams.nextKey$initialSN = recvWindowNextSN; }
@@ -621,16 +624,20 @@ struct ControlBlock
 
 	// Given
 	//	int32_t & : [_Out_] place holder of the number of bytes [to be] peeked
-	//	int32_t & : [_Out_] place holder of the number of blocks peeked
 	//	bool &: [_Out_] place holder of the End of Transaction flag
 	// Return
 	//	Start address of the received message
-	BYTE * LOCALAPI InquireRecvBuf(int32_t &, int32_t &, bool &);
+	// Remark
+	//	Would automatically mark the packet peeked as delivered, but would not slide the receive window
+	BYTE * LOCALAPI InquireRecvBuf(int32_t &, bool &);
+
 	// Given
-	//	int :	the number of bytes peeked to be free
+	//	PFSP_SocketBuf		the head packet that is expected to be free at first
 	// Return
-	//	Number of blocks that were free
-	int	LOCALAPI MarkReceivedFree(int32_t);
+	//	Number of bytes that were free, shall equal to what InquireRecvBuf has put into the output parameter
+	int	LOCALAPI MarkReceivedFree(PFSP_SocketBuf);
+	int	MarkReceivedFree() { return MarkReceivedFree(GetFirstReceived()); }
+
 
 	void SetRecvWindow(seq_t pktSeqNo)
 	{
@@ -652,7 +659,7 @@ struct ControlBlock
 	{
 		PFSP_SocketBuf skb = GetSendQueueHead();
 		skb->ReInitMarkAcked();
-		skb->ClearFlags();
+		// but preserve packet flags for possible later reference to EoT, etc.
 		IncRoundSendBlockN(sendWindowHeadPos);
 		InterlockedIncrement(&sendWindowFirstSN);
 	}

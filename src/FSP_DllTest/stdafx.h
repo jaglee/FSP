@@ -24,7 +24,7 @@ class CSocketItemDbg: CSocketItemDl
 public:
 	ControlBlock * GetControlBlock() const { return pControlBlock; }
 	FSP_Session_State GetState() { return pControlBlock->state;  }
-	void SetEndTransaction() { SetToCommit(); }
+	void SetEndTransaction() { SetEoTPending(); }
 
 	friend void UnitTestPrepareToSend();
 	friend void UnitTestBufferData();

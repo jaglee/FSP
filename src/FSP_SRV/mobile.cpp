@@ -904,7 +904,7 @@ bool CSocketItemEx::EmitStart()
 
 		result = SendPacket(1, ScatteredSendBuffers(payload, skb->len));
 		break;
-	case ACK_START:	// ACK_START is an in-band payload-less control packet that confirms a connection
+	case ACK_START:	// ACK_START is an in-band payload-less control packet that confirms and/or commits a transmit transaction
 	case PERSIST:	// PERSIST is an in-band control packet with payload that start a transmit transaction
 		result = EmitWithICC(skb, pControlBlock->sendWindowFirstSN);
 		skb->MarkSent();
@@ -1107,8 +1107,6 @@ int CSocketItemEx::EmitNextToSend()
 #endif
 	skb->MarkSent();
 
-	pControlBlock->IncRoundSendBlockN(pControlBlock->sendWindowNextPos);
-	InterlockedIncrement(&pControlBlock->sendWindowNextSN);
 	return 0;
 }
 
@@ -1123,18 +1121,15 @@ void CSocketItemEx::EmitQ()
 {
 	if (pControlBlock->CountSendBuffered() <= 0)
 		return;
-	// Make it compatible with polling mode
-	SyncState();
 
 	const ControlBlock::seq_t limitSN = pControlBlock->GetSendLimitSN();
-	if (int32_t(pControlBlock->sendWindowNextSN - limitSN) < 0)
-		do
-		{
-			if (EmitNextToSend() < 0)
-				break;
-		} while (int32_t(pControlBlock->sendWindowNextSN - limitSN) <= 0);
-	else if (pControlBlock->CountSentInFlight() == 0)
-		EmitNextToSend();
+	while (int32_t(pControlBlock->sendWindowNextSN - limitSN) < 0)
+	{
+		if (EmitNextToSend() < 0)
+			break;
+		pControlBlock->IncRoundSendBlockN(pControlBlock->sendWindowNextPos);
+		InterlockedIncrement(&pControlBlock->sendWindowNextSN);
+	}
 
 	// As we have made sure that the send queue is not empty
 	AddResendTimer();

@@ -180,7 +180,7 @@ FSPHANDLE LOCALAPI CSocketItemDl::WriteOnMultiplied(CommandCloneConnect &objComm
 		// pendingSendSize set in BufferData
 		if (!WaitUseMutex())
 			return NULL;
-		SetToCommit((flag & TO_END_TRANSACTION) != 0);
+		SetEoTPending((flag & TO_END_TRANSACTION) != 0);
 		BufferData(psp1->len);
 		SetMutexFree();
 	}
@@ -221,19 +221,18 @@ FSPHANDLE CSocketItemDl::CompleteMultiply(CommandCloneConnect & cmd)
 
 
 //{ESTABLISHED, COMMITTING, PEER_COMMIT, COMMITTING2, COMMITTED, CLOSABLE}
-//	|-->/MULTIPLY/-->[API{Callback}]
-//		|-->[{Return Accept}]-->{new context}
-//			{to piggyback payload}|-->[Send PERSIST]{start keep-alive}-->ESTABLISHED
-//			{without payload}|-->[Send ACK_START]{start keep-alive}-->COMMITTING
-//		|-->[{Return}:Reject]-->[Send RESET] {abort creating new context}
-// Remark
-//	Unlike in ToWelcomeConnect, context.onAccepting MAY read or write here as multiplication is of 0-RTT
+//	|-->/MULTIPLY/-->[API{Callback}]-->{new context}CONNECT_AFFIRMING
+//		|-->[{Return Accept}]
+//			|{has payload prebuffered}-->{further LLS process}
+//			|{without payload}-->[Prebuffer ACK_START]-->{further LLS process}
+//		|-->[{Return}:Reject]-->{abort creating new context}
 // See also
-//	ToConcludeConnect()
+//	ToWelcomeConnect, ToConcludeConnect(), @LLS::ResponseToMultiply, @LLS::Recycle
 bool LOCALAPI CSocketItemDl::ToWelcomeMultiply(BackLogItem & backLog)
 {
 	PFSP_IN6_ADDR remoteAddr = (PFSP_IN6_ADDR) & pControlBlock->peerAddr.ipFSP.allowedPrefixes[MAX_PHY_INTERFACES - 1];
-	SetState(ESTABLISHED);
+	// Multiplcation is 0-RTT, it's allowed to prebuffer data to transmit
+	SetState(CONNECT_AFFIRMING);
 	SetNewTransaction();
 	if (context.onAccepting != NULL	&& context.onAccepting(this, & backLog.acceptAddr, remoteAddr) < 0)
 	{
@@ -241,9 +240,6 @@ bool LOCALAPI CSocketItemDl::ToWelcomeMultiply(BackLogItem & backLog)
 		return false;
 	}
 
-	// ACK_START implies to Commit. See also ToConcludeConnect:
-	if (SetHeadPacketIfEmpty(ACK_START) == NULL)
-		SetState(COMMITTING);
-
+	SetHeadPacketIfEmpty(ACK_START);
 	return true;
 }

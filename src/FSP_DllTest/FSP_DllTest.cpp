@@ -50,7 +50,7 @@ void UnitTestBufferData()
 	// Emulate SendStream()
 	//
 	pSocketItem->SetState(ESTABLISHED);
-	pSocketItem->SetToCommit(false);
+	pSocketItem->SetEoTPending(false);
 	pSocketItem->pendingSendBuf = preparedTestData;
 	pSocketItem->BufferData(MIN_RESERVED_BUF - 2);
 	printf_s("Buffer next SN = %u\n", pSCB->sendBufferNextSN);
@@ -480,13 +480,12 @@ void UnitTestAllocRecvBuf()
 	printf_s("Before InquireRecvBuf\n"
 		"Head position = %d, head SN = %u\n\n", pSCB->recvWindowHeadPos, pSCB->recvWindowFirstSN);
 	skb = pSCB->GetFirstReceived();
-	int32_t nBlock;
 	int32_t nIO;
 	bool eot;
-	octet *buf = pSCB->InquireRecvBuf(nIO, nBlock, eot);
+	octet *buf = pSCB->InquireRecvBuf(nIO, eot);
 	assert(buf == pSCB->GetRecvPtr(skb));
-	assert(nIO == RECV_BUFFER_SIZE && nBlock == 3);
-	pSCB->MarkReceivedFree(nBlock);
+	assert(nIO == RECV_BUFFER_SIZE);
+	pSCB->MarkReceivedFree();
 	printf_s("After MarkReceivedFree\n"
 		"Head position = %d, head SN = %u\n\n", pSCB->recvWindowHeadPos, pSCB->recvWindowFirstSN);
 
@@ -509,14 +508,14 @@ void UnitTestAllocRecvBuf()
 	assert(skb != NULL);
 	INIT_SKB();
 
-	pSCB->MarkReceivedFree(3);
+	pSCB->MarkReceivedFree();
 
 	skb = pSCB->AllocRecvBuf(FIRST_SN + 6);
 	assert(skb != NULL);
 	INIT_SKB();
 	assert(pSCB->recvWindowNextPos == 1);
 	assert(pSCB->recvWindowExpectedSN = FIRST_SN + 7);
-	pSCB->MarkReceivedFree(1);	// 
+	pSCB->MarkReceivedFree();	// 
 
 	skb = pSCB->AllocRecvBuf(FIRST_SN + 8);
 	assert(skb != NULL);
@@ -676,20 +675,19 @@ void UnitTestInquireRecvBuf()
 
 	// Firstly, the whole block
 	skb = pSCB->GetFirstReceived();
-	int32_t nBlock;
 	int32_t nIO;
 	bool eot;
-	octet *buf = pSCB->InquireRecvBuf(nIO, nBlock, eot);
+	octet *buf = pSCB->InquireRecvBuf(nIO, eot);
 	assert(buf == pSCB->GetRecvPtr(skb));
-	assert(nIO == RECV_BUFFER_SIZE && nBlock == 3);
+	assert(nIO == RECV_BUFFER_SIZE);
 	printf_s("Expected SN of the receive window after query the whole block = %u\n", pSCB->recvWindowExpectedSN);
 
 	// Free the first block only
-	pSCB->MarkReceivedFree(1);
+	pSCB->MarkReceivedFree();
 	skb = pSCB->GetFirstReceived();
-	buf = pSCB->InquireRecvBuf(nIO, nBlock, eot);
+	buf = pSCB->InquireRecvBuf(nIO, eot);
 	assert(buf == pSCB->GetRecvPtr(skb));
-	assert(nIO == RECV_BUFFER_SIZE - MAX_BLOCK_SIZE && nBlock == 2);
+	assert(nIO == RECV_BUFFER_SIZE - MAX_BLOCK_SIZE);
 
 	// Allocate (reuse) the first block, free the 2nd block
 	skb = pSCB->AllocRecvBuf(pSCB->recvWindowNextSN);
@@ -699,18 +697,18 @@ void UnitTestInquireRecvBuf()
 	skb->opCode = PURE_DATA;
 	skb->ReInitMarkComplete();
 	//
-	pSCB->MarkReceivedFree(1);
+	pSCB->MarkReceivedFree();
 	skb = pSCB->GetFirstReceived();
-	buf = pSCB->InquireRecvBuf(nIO, nBlock, eot);
+	buf = pSCB->InquireRecvBuf(nIO, eot);
 	assert(buf == pSCB->GetRecvPtr(skb));
-	assert(nIO == MAX_BLOCK_SIZE && nBlock == 1);
+	assert(nIO == MAX_BLOCK_SIZE);
 
 	// After the third block is marked free, it shall round-robin to the beginning
-	pSCB->MarkReceivedFree(1);
+	pSCB->MarkReceivedFree();
 	skb = pSCB->HeadRecv();
-	buf = pSCB->InquireRecvBuf(nIO, nBlock, eot);
+	buf = pSCB->InquireRecvBuf(nIO, eot);
 	assert(buf == pSCB->GetRecvPtr(skb));
-	assert(nIO == MAX_BLOCK_SIZE && nBlock == 1);
+	assert(nIO == MAX_BLOCK_SIZE);
 }
 
 

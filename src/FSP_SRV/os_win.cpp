@@ -1239,6 +1239,14 @@ void CSocketItemEx::HandleFullICC(PktBufferBlock *pktBuf, FSPOperationCode opCod
 	if (lowState <= 0 || lowState > LARGEST_FSP_STATE)
 		goto l_return;
 
+#if (TRACE & (TRACE_HEARTBEAT | TRACE_OUTBAND | TRACE_SLIDEWIN | TRACE_PACKET))
+	printf_s(__FUNCTION__ ": local fiber#%u(_%X_) in state %s\n"
+		"\t%s(%d) received, seq#%u\n"
+		, fidPair.source, be32toh(fidPair.source), stateNames[lowState]
+		, opCodeStrings[opCode], opCode, pktBuf->pktSeqNo
+	);
+#endif
+
 	// MULTIPLY is semi-out-of-band COMMAND starting from a fresh new ALFID. Note that pktBuf is the received
 	// In the CLONING state ACK_START or PERSIST is the legitimate acknowledgement to MULTIPLY,
 	// while the acknowledgement itself shall typically originate from some new ALFID.
@@ -1255,7 +1263,7 @@ void CSocketItemEx::HandleFullICC(PktBufferBlock *pktBuf, FSPOperationCode opCod
 	switch (opCode)
 	{
 	case ACK_START:
-		OnGetAckStart();
+		OnGetNulCommit();
 		break;
 	case PURE_DATA:
 		OnGetPureData();

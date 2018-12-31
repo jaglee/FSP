@@ -48,14 +48,6 @@
 #define COOKIE_KEY_LEN			20	// salt include, as in RFC4543 5.4
 #define MULTIPLY_BACKLOG_SIZE	8
 
-// For testability
-#define TRACE_ADDRESS	1
-#define TRACE_HEARTBEAT	2
-#define TRACE_PACKET	4
-#define TRACE_SLIDEWIN	8
-#define TRACE_ULACALL	16
-#define TRACE_OUTBAND	32	// Other than KEEP_ALIVE
-
 
  // random generator is somehow dependent on implementation. hardware preferred.
  // might be optimized by loop unrolling
@@ -511,7 +503,7 @@ protected:
 	bool EmitStart();
 	bool SendAckFlush();
 	bool SendKeepAlive();
-	void SendRelease();
+	bool SendRelease();
 	void SendReset();
 
 	bool IsNearEndMoved();
@@ -584,7 +576,6 @@ public:
 	void DisposeOnReset();
 	void Recycle();
 	void Reject(uint32_t);
-	void Release();
 	void InitiateMultiply(CSocketItemEx *);
 	bool FinalizeMultiply();
 
@@ -636,7 +627,7 @@ public:
 
 	// Event triggered by the remote peer
 	void OnConnectRequestAck(PktBufferBlock *, int);
-	void OnGetAckStart();
+	void OnGetNulCommit();
 	void OnGetPersist();
 	void OnGetPureData();	// PURE_DATA
 	void OnAckFlush();		// ACK_FLUSH is always out-of-band

@@ -105,6 +105,9 @@ static int FSPAPI toSendNextBlock(FSPHANDLE h, void * batchBuffer, int32_t capac
 	}
 
 	int bytesRead = __min((int32_t)sizeOfBuffer - offset, capacity);
+	if (bytesRead <= 0)
+		return EOF;
+
 	memcpy(batchBuffer, bytesToSend + offset, bytesRead);
 	offset += bytesRead;
 
@@ -117,7 +120,7 @@ static int FSPAPI toSendNextBlock(FSPHANDLE h, void * batchBuffer, int32_t capac
 		Dispose(h);
 		return n;
 	}
-	printf_s("%d bytes sent to the remote end in %d block(s). Totally %d bytes sent.\n", bytesRead, n, offset);
+	printf_s("%d bytes sent to the remote end. Totally %d bytes sent.\n", bytesRead, offset);
 	if(r)
 	{
 		printf("All content has been sent. To wait acknowledgement and shutdown.\n");

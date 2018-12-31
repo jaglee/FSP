@@ -122,6 +122,7 @@ void CSocketItemEx::KeepAlive()
 	case CONNECT_BOOTSTRAP:
 	case CONNECT_AFFIRMING:
 	case CHALLENGING:
+	case CLONING:
 		if (t1 - tMigrate > (TRANSIENT_STATE_TIMEOUT_ms << 10))
 		{
 #ifdef TRACE
@@ -150,9 +151,12 @@ void CSocketItemEx::KeepAlive()
 		if (keepAliveNeeded)
 			SendKeepAlive();
 		break;
+	case CLOSABLE:
+		// CLOSABLE does NOT time out to CLOSED, and does NOT automatically recycled.
+		break;
 	// assert: TRANSIENT_STATE_TIMEOUT_ms < RECYCLABLE_TIMEOUT_ms && RECYCLABLE_TIMEOUT_ms < MAXIMUM_SESSION_LIFE_ms
 	case PRE_CLOSED:
-		if (t1 - tMigrate > (TRANSIENT_STATE_TIMEOUT_ms << 10))
+		if (t1 - tMigrate > (CLOSING_TIME_WAIT_ms << 10))
 		{
 			// Automatically migrate to CLOSED state in TIME-WAIT state alike in TCP
 			SetState(CLOSED);
@@ -166,23 +170,10 @@ void CSocketItemEx::KeepAlive()
 #endif
 			TIMED_OUT();
 		}
-	//case CLOSABLE:
-	//	// CLOSABLE does not automatically timeout to CLOSED
-	//	break;
-	//
-	case CLONING:
-		if (t1 - tMigrate > (TRANSIENT_STATE_TIMEOUT_ms << 10))
-		{
-#ifdef TRACE
-			printf_s("\nTransient state time out or key out of life in the %s state\n", stateNames[lowState]);
-#endif
-			TIMED_OUT();
-		}
-		EmitStart();
 		break;
 	default:
 #ifndef NDEBUG
-		printf_s("\n*** ULA could not change state arbitrarily (%d) and beat the implementation! ***\n", lowState);
+		printf_s("\n*** Implementation may not add state arbitrarily %s(%d)! ***\n", stateNames[lowState], lowState);
 		// The shared memory portion of ControlBlock might be inaccessible.
 #endif
 		Destroy();
@@ -256,6 +247,9 @@ void CSocketItemEx::DoResend()
 			AddResendTimer();
 		return;
 	}
+
+	// Make it ready for polling mode
+	SyncState();
 
 	// Because RemoveTimers() clear the isInUse flag before reset the handle resendTimer
 	// we assert that resendTimer != NULL and pControlBlock != NULL
@@ -335,7 +329,7 @@ bool CSocketItemEx::SendKeepAlive()
 	if (lowState == PEER_COMMIT || lowState == COMMITTING2 || lowState == CLOSABLE)
 		return SendAckFlush();
 	if (lowState > CLOSABLE)
-		return false;
+		return SendRelease();
 
 	SKeepAliveCache buf3;
 
@@ -410,6 +404,56 @@ bool CSocketItemEx::SendAckFlush()
 	SetIntegrityCheckCode(&buf2.hdr, NULL, 0, buf2.snack.serialNo);
 	return SendPacket(1, ScatteredSendBuffers(&buf2, sizeof(buf2))) > 0;
 }
+
+
+
+// Send the out-of-band(unlike TCP FIN/FIN-ACK) RELEASE command
+// RELEASE does not really tear down the connection thoroughly
+// RELEASE includes semantics of ACK_FLUSH
+bool CSocketItemEx::SendRelease()
+{
+	struct
+	{
+		FSP_InternalFixedHeader	hdr;
+		FSP_SelectiveNACK		snack;
+	} ALIGN(MAC_ALIGNMENT) buf2;	// a buffer with two headers
+
+	InterlockedIncrement(&nextOOBSN);
+	buf2.snack.tLazyAck = 0;
+	buf2.snack.serialNo = htobe32(nextOOBSN);
+	buf2.snack.hs.Set(SELECTIVE_NACK, sizeof(buf2.hdr));
+
+	// Make sure that the packet falls into the receive window
+	ControlBlock::seq_t snExpect = pControlBlock->recvWindowExpectedSN;
+	if (snExpect != pControlBlock->recvWindowNextSN)
+	{
+		BREAK_ON_DEBUG();
+		return false;
+	}
+
+#if (TRACE & (TRACE_ULACALL | TRACE_PACKET | TRACE_SLIDEWIN))
+	printf_s("Release: local fiber#%u, peer's fiber#%u\n\tAcknowledged seq#%u\n"
+		, fidPair.source, fidPair.peer
+		, pControlBlock->recvWindowNextSN);
+#endif
+	// UNRESOLVED! Recover from possible protocol implementation error?
+	ControlBlock::seq_t seqR = pControlBlock->sendWindowNextSN;
+	if (pControlBlock->sendWindowFirstSN != seqR)
+	{
+#ifndef NDEBUG
+		DebugBreak();
+		printf_s("Release: local fiber#%u, send window [%u, %u]\n"
+		, fidPair.source, pControlBlock->sendWindowFirstSN, seqR);
+#endif
+		pControlBlock->sendWindowFirstSN = seqR;
+		pControlBlock->sendWindowHeadPos = pControlBlock->sendWindowNextPos;
+	}
+
+	pControlBlock->SignHeaderWith(&buf2.hdr, RELEASE, (uint16_t)sizeof(buf2), seqR - 1, snExpect);
+	SetIntegrityCheckCode(&buf2.hdr, NULL, 0, buf2.snack.serialNo);
+	return SendPacket(1, ScatteredSendBuffers(&buf2, sizeof(buf2))) > 0;
+}
+
 
 
 

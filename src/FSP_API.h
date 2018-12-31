@@ -293,7 +293,7 @@ int FSPAPI GetSendBuffer(FSPHANDLE, CallbackBufferReady);
 //	bool		EoT, whether to terminate the transmit transaction
 //	NotifyOrReturn	the pointer to the callback function if EoT
 // Return
-//	positive if it is number of blocks scheduled to send
+//	zero or positive, number of payload octets in the send queue
 //	negative if it is the error number
 // Remark
 //	The buffer MUST begin from what GetSendBuffer has returned and

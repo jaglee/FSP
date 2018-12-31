@@ -96,8 +96,10 @@ typedef ALFID_T	 ULTID_T;
 # define TRANSIENT_STATE_TIMEOUT_ms		60000	// 1 minute
 #endif
 
-#define COMMITTING_TIMEOUT_ms			30000	// half a minute
-//^ time-out for committing a transmit transaction starting from last acknowledgement, not from start of the transaction
+#define COMMITTING_TIMEOUT_ms			90000	// one and a half minutes
+//^time-out for committing a transmit transaction starting from last acknowledgement,
+// not from start of the transaction. Should be larger than the Maximum Segment Life
+#define CLOSING_TIME_WAIT_ms			120000	// 2 minutes
 #define LAZY_ACK_DELAY_MIN_us			5120	// 5 millisecond (after shifted 10 bits right)
 #define KEEP_ALIVE_TIMEOUT_ms			600000	// 10 minutes
 #define SESSION_IDLE_TIMEOUT_us			(4*3600*1000000ULL)	// 4 hours
@@ -173,7 +175,7 @@ typedef enum _FSP_Operation_Code : char
 	CONNECT_REQUEST,
 	ACK_CONNECT_REQ,	// may piggyback payload
 	RESET,
-	ACK_START,	// Payloadless acknowledgement to CLONE or ACK_CONNECT_REQUEST. Used to be payloadless PERSIST
+	NULCOMMIT,	// Payloadless trasmit transaction commitment
 	PURE_DATA,	// Without any optional header
 	PERSIST,	// Start a new transmit transaction, while EoT flag make it transactional
 	ACK_FLUSH,
@@ -186,6 +188,8 @@ typedef enum _FSP_Operation_Code : char
 	//
 	PEER_SUBNETS = 16,
 	SELECTIVE_NACK,
+	ACK_START = NULCOMMIT,
+	//^Inband acknowledgement to CLONE or ACK_CONNECT_REQUEST if no data to send back.
 	LARGEST_OP_CODE = SELECTIVE_NACK
 } FSPOperationCode;
 
@@ -202,7 +206,6 @@ typedef enum: char
 	FSP_Reject,			// a forward command, explicitly reject some request
 	FSP_Recycle,		// a forward command, connection might be aborted
 	FSP_Send,			// send a packet/a group of packets
-	FSP_COMMAND_CODE_8,	// Used to be FSP_Commit, force to send a EoT flag, reserved now
 	FSP_Shutdown,		// close the connection
 	FSP_InstallKey,		// install the authenticated encryption key
 	FSP_Multiply,		// clone the connection, make SCB of LLS synchronized with DLL

@@ -473,7 +473,10 @@ bool LOCALAPI CSocketItemEx::ValidateSNACK(ControlBlock::seq_t & ackSeqNo, FSP_S
 	gaps = (FSP_SelectiveNACK::GapDescriptor *)((BYTE *)pSNACK - n);
 	n /= sizeof(FSP_SelectiveNACK::GapDescriptor);
 #if defined(TRACE) && (TRACE & (TRACE_PACKET | TRACE_SLIDEWIN))
-	printf_s("%s has %d gap(s), sequence number: %u\t%u\n", opCodeStrings[p1->hs.opCode], n, headPacket->pktSeqNo, sn);
+	printf_s("%s sequence number: %u^|^%u\n"
+		"\taccumulatively acknowledged %u with %d gap(s)\n"
+		, opCodeStrings[p1->hs.opCode], headPacket->pktSeqNo, sn
+		, ackSeqNo, n);
 #endif
 	return true;
 }
@@ -576,21 +579,27 @@ l_return:
 
 
 
-// ACK_START is supposed to both start and commit a payloadless transmit transaction which SHALL be skipped
-// It is the in-band acknowledgement to ACK_CONNECT_REQ or MULTIPLY
-// It cannot be substituted by ACK_FLUSH which is out-of-band
+// ACK_START reuse NULCOMMIT effectively as the in-band acknowledgement to ACK_CONNECT_REQ or MULTIPLY
+// when there is no immediate data to send back start,
+// and it is to both start and commit the payloadless transmit transaction which SHALL be skipped
+// NULCOMMIT is to commit a payloadless transmit transaction
 //	CHALLENGING-->/ACK_START/-->CLOSABLE-->[Send ACK_FLUSH]-->[Notify]
-//	PEER_COMMIT-->/ACK_START/-->{keep state}[Send ACK_FLUSH]
-//	COMMITTING2-->/ACK_START/-->{keep state}[Send ACK_FLUSH]
-//	CLOSABLE-->/ACK_START/-->{keep state}[Send ACK_FLUSH]
 //  CLONING-->/ACK_START/
-//		|-->{Not ULA-flushing}-->PEER_COMMIT
-//		|-->{ULA-flushing}-->CLOSABLE
-//	-->{stop keep-alive}[Send ACK_FLUSH]-->[Notify]
-void CSocketItemEx::OnGetAckStart()
+//			|-->{Not ULA-flushing}-->PEER_COMMIT
+//			|-->{ULA-flushing}-->CLOSABLE]
+//		-->[Send ACK_FLUSH]-->[Notify]
+//	ESTABLISHED-->/NULCOMMIT/-->COMMITTED-->[Send ACK_FLUSH]-->[Notify]
+//  COMMITTED-->/NULCOMMIT/-->CLOSABLE-->[Send ACK_FLUSH]-->[Notify]
+//	PEER_COMMIT-->/ACK_START/NULCOMMIT-->{keep state}[Send ACK_FLUSH]
+//	COMMITTING2-->/ACK_START/NULCOMMIT-->{keep state}[Send ACK_FLUSH]
+//	CLOSABLE-->/ACK_START/NULCOMMIT-->{keep state}[Send ACK_FLUSH]
+//	PRE_CLOSED<-->/ACK_START/NULCOMMIT-->{keep state}[Send RELEASE]
+// It is possible that the peer resend the final packet in COMMITTING2 state
+// while the near end has migrated to CLOSABLE state and then to PRE_CLOSED state by SHUTDOWN
+void CSocketItemEx::OnGetNulCommit()
 {
 	TRACE_SOCKET();
-	if (!InStates(5, CHALLENGING, PEER_COMMIT, COMMITTING2, CLOSABLE, CLONING))
+	if (!InStates(8, CHALLENGING, CLONING, ESTABLISHED, COMMITTED, PEER_COMMIT, COMMITTING2, CLOSABLE, PRE_CLOSED))
 		return;
 
 	bool isInitiativeState = InState(CHALLENGING) || InState(CLONING);
@@ -627,6 +636,11 @@ void CSocketItemEx::OnGetAckStart()
 #endif
 			return;
 		}
+		if (InState(PRE_CLOSED))
+		{
+			SendRelease();
+			return;
+		}
 	}
 	else if (!FinalizeMultiply())	// if (lowState == CLONING)
 	{
@@ -638,20 +652,31 @@ void CSocketItemEx::OnGetAckStart()
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->AllocRecvBuf(headPacket->pktSeqNo);
 	if (skb == NULL)
 		return;
+
 	// ACK_START has nothing to deliver to ULA
 	skb->ReInitMarkDelivered();
 	pControlBlock->SlideRecvWindowByOne();
-
-	// ACK_START is always the accumulative acknowledgement to ACK_CONNECT_REQ or MULTIPLY
-	skb = pControlBlock->GetSendQueueHead();
-	skb->ReInitMarkAcked();
-	pControlBlock->SlideSendWindowByOne();	// See also RespondToSNACK
 
 	tLastRecv = NowUTC();
 	tRoundTrip_us = (uint32_t)min(UINT32_MAX, tLastRecv - tRecentSend);
 #if (TRACE & (TRACE_SLIDEWIN | TRACE_HEARTBEAT))
 	printf_s("\nACK_START received, acknowledged SN = %u\n\tThe responder calculate RTT: %uus\n", ackSeqNo, tRoundTrip_us);
 #endif
+
+	if (!isInitiativeState)
+	{
+		bool b = !InState(COMMITTED) && !InState(CLOSABLE);
+		TransitOnPeerCommit();
+		if (b)
+			Notify(FSP_NotifyToCommit);
+		return;
+	}
+
+	// ACK_START is always the accumulative acknowledgement to ACK_CONNECT_REQ or MULTIPLY
+	skb = pControlBlock->GetSendQueueHead();
+	skb->ReInitMarkAcked();
+	pControlBlock->SlideSendWindowByOne();	// See also RespondToSNACK
+
 	if (isMultiplying)
 	{
 		SetState(_InterlockedExchange8(&transactional, 0) ? CLOSABLE : PEER_COMMIT);
@@ -703,10 +728,13 @@ void CSocketItemEx::OnGetAckStart()
 //			|-->{ULA-flushing}-->COMMITTED
 //		  >-->[Send SNACK]
 //	  >-->[Notify]
+//{PRE_CLOSED}<-->/PERSIST/-->[Send RELEASE]
+// It is possible that the peer resend the final packet in COMMITTING2 state
+// while the near end has migrated to CLOSABLE state and then to PRE_CLOSED state by SHUTDOWN
 void CSocketItemEx::OnGetPersist()
 {
 	TRACE_SOCKET();
-	if (!InStates(7, CHALLENGING, ESTABLISHED, PEER_COMMIT, COMMITTING2, COMMITTED, CLOSABLE, CLONING))
+	if (!InStates(8, CHALLENGING, CLONING, ESTABLISHED, COMMITTED, PEER_COMMIT, COMMITTING2, CLOSABLE, PRE_CLOSED))
 		return;
 
 	bool isInitiativeState = InState(CHALLENGING) || InState(CLONING);
@@ -747,6 +775,11 @@ void CSocketItemEx::OnGetPersist()
 			printf_s("@%s: invalid ICC received\n", __FUNCTION__);
 			pControlBlock->DumpSendRecvWindowInfo();
 #endif
+			return;
+		}
+		if (InState(PRE_CLOSED))
+		{
+			SendRelease();
 			return;
 		}
 	}
@@ -901,6 +934,9 @@ void CSocketItemEx::OnGetKeepAlive()
 //		-->CLOSABLE-->[Send ACK_FLUSH]-->[Notify]
 //	|-->{otherwise}-->[Send SNACK]-->[Notify]
 //{CLONING, PEER_COMMIT, COMMITTING2, CLOSABLE}<-->/PURE_DATA/{just prebuffer}
+//{PRE_CLOSED}<-->/PURE_DATA/-->[Send RELEASE]
+// It is possible that the peer resend the final packet in COMMITTING2 state
+// while the near end has migrated to CLOSABLE state and then to PRE_CLOSED state by SHUTDOWN
 // However ULA protocol designer must keep in mind that these prebuffered may be discarded
 void CSocketItemEx::OnGetPureData()
 {
@@ -929,8 +965,8 @@ void CSocketItemEx::OnGetPureData()
 			return;
 		// else just prebuffer
 	}
-	else if(! InStates(3, ESTABLISHED, COMMITTING, COMMITTED))
-	{
+	else if(! InStates(4, ESTABLISHED, COMMITTING, COMMITTED, PRE_CLOSED))
+	{	
 #ifdef TRACE
 		printf_s("In state %s data may not be accepted.\n", stateNames[lowState]);
 #endif
@@ -948,6 +984,11 @@ void CSocketItemEx::OnGetPureData()
 		printf_s("@%s: invalid ICC received\n", __FUNCTION__);
 		pControlBlock->DumpSendRecvWindowInfo();
 #endif
+		return;
+	}
+	if (InState(PRE_CLOSED))
+	{
+		SendRelease();
 		return;
 	}
 
@@ -1049,6 +1090,7 @@ void CSocketItemEx::OnAckFlush()
 		return;
 	}
 #endif
+	RespondToSNACK(ackSeqNo, gaps, 0);
 
 	if (InState(COMMITTING2))
 	{
@@ -1060,47 +1102,50 @@ void CSocketItemEx::OnAckFlush()
 		SetState(COMMITTED);
 	}
 
-	RespondToSNACK(ackSeqNo, gaps, 0);
 	Notify(FSP_NotifyFlushed);
 }
 
 
 
-// CLOSABLE-->/RELEASE/-->CLOSED-->[Send RELEASE]-->[Notify]
-// {COMMITTING2, PRE_CLOSED}-->/RELEASE/
+// PRE_CLOSED-->/RELEASE/-->CLOSED-->[Notify]
+// {COMMITTING2, CLOSABLE}-->/RELEASE/
 //    -->CLOSED-->[Send RELEASE]-->[Notify]
 // Remark
 //	RELEASE implies ACK_FLUSH as well so a lost ACK_FLUSH does not prevent it to shutdown gracefully
-// UNRESOLVED!
-//	To support connection context reuse/connection resurrection
-//	should not destroy the connection context
 void CSocketItemEx::OnGetRelease()
 {
-	if (!InState(COMMITTING2) && !InState(CLOSABLE) && !InState(PRE_CLOSED))
+	bool reactive = InState(COMMITTING2) || InState(CLOSABLE);
+	if (!reactive && !InState(PRE_CLOSED))
 		return;
-	TRACE_SOCKET();
 
 	if (headPacket->lenData != 0)
 		return;
 
-	if (headPacket->pktSeqNo != pControlBlock->recvWindowNextSN)
+	if (headPacket->pktSeqNo != pControlBlock->recvWindowNextSN - 1)
 		return;
 
+	FSP_SelectiveNACK::GapDescriptor *gaps;
+	int n;
+	ControlBlock::seq_t ackSeqNo;
+	if (!ValidateSNACK(ackSeqNo, gaps, n))
+		return;
 #ifndef NDEBUG
-	FSP_NormalPacketHeader *p1 = headPacket->GetHeaderFSP();
-	ControlBlock::seq_t ackSeqNo = be32toh(p1->expectedSN);
+	if (n != 0)
+	{
+		BREAK_ON_DEBUG();	//TRACE_HERE("RELEASE should carry accumulatively positively acknowledge only");
+		return;
+	}
 	if (ackSeqNo != pControlBlock->sendWindowNextSN && !InState(COMMITTING2))
 	{
 		BREAK_ON_DEBUG();
 		return;
 	}
 #endif
-	if (!ValidateICC())
-		return;
-
 	RespondToSNACK(pControlBlock->sendWindowNextSN, NULL, 0);
+
 	SetState(CLOSED);
-	SendRelease();
+	if (reactive)
+		SendRelease();
 	Notify(FSP_NotifyToFinish);
 	//
 	ReplaceTimer(RECYCLABLE_TIMEOUT_ms);

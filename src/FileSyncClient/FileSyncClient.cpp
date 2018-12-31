@@ -18,7 +18,6 @@ extern int32_t ticksToWait;
 extern bool r2finish;
 
 // Branch controllers
-extern int	CompareMemoryPattern(TCHAR *fileName);
 extern int	ToAcceptPushedDirectory(char *);
 extern int	FSPAPI onMultiplying(FSPHANDLE, PFSP_SINKINF, PFSP_IN6_ADDR);
 
