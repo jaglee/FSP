@@ -35,7 +35,7 @@ static void FSPAPI onError(FSPHANDLE hRev, FSP_ServiceCode code, int value)
 static void FSPAPI onSignatureSent(FSPHANDLE hRev, FSP_ServiceCode c, int r)
 {
 	printf_s("Clone session, socket %p, result of sending the signature: %d\n", hRev, r);
-	Shutdown(hRev);
+	Shutdown(hRev, NULL);
 	r2Finish = true;
 	return;
 }

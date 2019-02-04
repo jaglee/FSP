@@ -165,7 +165,6 @@
     <ClCompile Include="..\ControlBlock.cpp" />
     <ClCompile Include="..\Crypto\CryptoStub.c" />
     <ClCompile Include="..\Crypto\tweetnacl.c" />
-    <ClCompile Include="..\FileSyncClient\MemoryFile.cpp" />
     <ClCompile Include="..\FSP_SRV\blake2b.c" />
     <ClCompile Include="..\FSP_SRV\command.cpp" />
     <ClCompile Include="..\FSP_SRV\CRC64.c" />

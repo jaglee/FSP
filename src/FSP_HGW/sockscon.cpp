@@ -108,7 +108,6 @@ static void FSPAPI onCHAKASRReceived(FSPHANDLE, FSP_ServiceCode, int);
 static bool	FSPAPI onResponseReceived(FSPHANDLE, void *, int32_t, bool);
 
 // for child connection
-static void FSPAPI onFinish(FSPHANDLE, FSP_ServiceCode, int);
 static void FSPAPI onSubrequestSent(FSPHANDLE, FSP_ServiceCode, int);
 
 // Client-to SOCKS4 service interface
@@ -431,7 +430,6 @@ TpWorkCallBack(PTP_CALLBACK_INSTANCE Instance, PVOID parameter, PTP_WORK Work)
 	parms.onAccepting = NULL;
 	parms.onAccepted = NULL;
 	parms.onError = onError;
-	parms.onFinish = onFinish;
 	parms.recvSize = BUFFER_POOL_SIZE;
 	parms.sendSize = BUFFER_POOL_SIZE;
 	parms.welcome = &p->req;
@@ -483,19 +481,6 @@ static void FSPAPI onError(FSPHANDLE h, FSP_ServiceCode code, int value)
 		printf_s("Fatal IPC %d, error %d encountered in the session with the tunnel server.\n", code, value);
 		closesocket(hListener);	// And thus the main loop would be aborted
 	}
-	return;
-}
-
-
-
-// The call back function on actively or passively shut down
-static void FSPAPI onFinish(FSPHANDLE h, FSP_ServiceCode code, int)
-{
-#ifdef TRACE
-	printf_s("Connection closed: socket %p, service code = %d\n", h, code);
-#endif
-	if (code == FSP_NotifyToFinish)
-		Dispose(h);
 	return;
 }
 

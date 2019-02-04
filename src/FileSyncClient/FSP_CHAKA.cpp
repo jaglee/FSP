@@ -95,21 +95,6 @@ static void FSPAPI onError(FSPHANDLE h, FSP_ServiceCode code, int value)
 
 
 
-// Forward definition of the callback function that handles the event of Connection Released (Shutdown)
-static void FSPAPI onFinish(FSPHANDLE h, FSP_ServiceCode code, int)
-{
-	printf_s("Socket %p, session was to shut down, service code = %d.\n", h, code);
-	if(code == FSP_NotifyToFinish)
-	{
-		FSPControl(h, FSP_SET_CALLBACK_ON_FINISH, NULL);
-		Shutdown(h);
-	}
-	finalize();
-	return;
-}
-
-
-
 int ToAcceptPushedDirectory(char *remoteAppURL)
 {
 	int result = 0;
@@ -119,7 +104,6 @@ int ToAcceptPushedDirectory(char *remoteAppURL)
 	parms.onAccepting = NULL;
 	parms.onAccepted = onConnected;
 	parms.onError = onError;
-	parms.onFinish = onFinish;
 	parms.recvSize = MAX_FSP_SHM_SIZE;
 	parms.sendSize = 0;	// the underlying service would give the minimum, however
 	if(Connect2(remoteAppURL, & parms) == NULL)
@@ -378,7 +362,7 @@ static void FSPAPI onAcknowledgeSent(FSPHANDLE h, FSP_ServiceCode c, int r)
 		return;
 	}
 
-	r = Shutdown(h);
+	r = Shutdown(h, NULL);
 	if(r < 0)
 	{
 		printf_s("Cannot shutdown gracefully in the final stage, error#: %d\n", r);

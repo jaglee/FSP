@@ -70,12 +70,11 @@ void CSocketItemEx::KeepAlive()
 		return;
 	}
 
-	// Whether it has been released elsewhere
-	if (!IsInUse() || pControlBlock == NULL)
+	if (!IsInUse())
 	{
 		if (c == 0)
 			SetMutexFree();
-		return;
+		return;		// the socket has been released elsewhere
 	}
 
 	// If the lock could not be obtained this time, fire the timer a short while later
@@ -96,9 +95,12 @@ void CSocketItemEx::KeepAlive()
 
 	if (lowState == NON_EXISTENT)
 	{
+		assert(pControlBlock != NULL);
 #if (TRACE & TRACE_HEARTBEAT)
 		printf_s("\nFiber#%u's session control block is released in a delayed timer handler.\n", fidPair.source);
 #endif
+		if (pControlBlock->state >= ESTABLISHED)
+			SendReset();
 		Destroy();
 		SetMutexFree();
 		return;
@@ -216,8 +218,10 @@ void CSocketItemEx::DoAcknowledge()
 	if (!WaitUseMutex())
 	{
 #ifdef TRACE
-		printf_s("\n#0x%X's DoAcknowledge not executed due to lack of locks in state %s. InUse: %d\n"
-			, fidPair.source, stateNames[lowState], IsInUse());
+		printf_s("\nDoAcknowledge not executed due to lack of locks in state %s\n"
+			"#0x%X: InUse = %d, pSCB = %p\n"
+			, stateNames[lowState]
+			, fidPair.source, inUse, pControlBlock);
 #endif
 		if (IsInUse())
 			AddLazyAckTimer();
@@ -329,7 +333,7 @@ bool CSocketItemEx::SendKeepAlive()
 	if (lowState == PEER_COMMIT || lowState == COMMITTING2 || lowState == CLOSABLE)
 		return SendAckFlush();
 	if (lowState > CLOSABLE)
-		return SendRelease();
+		return false;
 
 	SKeepAliveCache buf3;
 
@@ -407,56 +411,6 @@ bool CSocketItemEx::SendAckFlush()
 
 
 
-// Send the out-of-band(unlike TCP FIN/FIN-ACK) RELEASE command
-// RELEASE does not really tear down the connection thoroughly
-// RELEASE includes semantics of ACK_FLUSH
-bool CSocketItemEx::SendRelease()
-{
-	struct
-	{
-		FSP_InternalFixedHeader	hdr;
-		FSP_SelectiveNACK		snack;
-	} ALIGN(MAC_ALIGNMENT) buf2;	// a buffer with two headers
-
-	InterlockedIncrement(&nextOOBSN);
-	buf2.snack.tLazyAck = 0;
-	buf2.snack.serialNo = htobe32(nextOOBSN);
-	buf2.snack.hs.Set(SELECTIVE_NACK, sizeof(buf2.hdr));
-
-	// Make sure that the packet falls into the receive window
-	ControlBlock::seq_t snExpect = pControlBlock->recvWindowExpectedSN;
-	if (snExpect != pControlBlock->recvWindowNextSN)
-	{
-		BREAK_ON_DEBUG();
-		return false;
-	}
-
-#if (TRACE & (TRACE_ULACALL | TRACE_PACKET | TRACE_SLIDEWIN))
-	printf_s("Release: local fiber#%u, peer's fiber#%u\n\tAcknowledged seq#%u\n"
-		, fidPair.source, fidPair.peer
-		, pControlBlock->recvWindowNextSN);
-#endif
-	// UNRESOLVED! Recover from possible protocol implementation error?
-	ControlBlock::seq_t seqR = pControlBlock->sendWindowNextSN;
-	if (pControlBlock->sendWindowFirstSN != seqR)
-	{
-#ifndef NDEBUG
-		DebugBreak();
-		printf_s("Release: local fiber#%u, send window [%u, %u]\n"
-		, fidPair.source, pControlBlock->sendWindowFirstSN, seqR);
-#endif
-		pControlBlock->sendWindowFirstSN = seqR;
-		pControlBlock->sendWindowHeadPos = pControlBlock->sendWindowNextPos;
-	}
-
-	pControlBlock->SignHeaderWith(&buf2.hdr, RELEASE, (uint16_t)sizeof(buf2), seqR - 1, snExpect);
-	SetIntegrityCheckCode(&buf2.hdr, NULL, 0, buf2.snack.serialNo);
-	return SendPacket(1, ScatteredSendBuffers(&buf2, sizeof(buf2))) > 0;
-}
-
-
-
-
 // Given
 //	ControlBlock::seq_t		the accumulatedly acknowledged sequence number
 //	GapDescriptor *			array of the gap descriptors
@@ -474,7 +428,7 @@ bool CSocketItemEx::SendRelease()
 //  It is an accumulative acknowledgment if n == 0
 //	Memory integrity is checked here as well
 //	Side effect: the integer value in the gap descriptors are translated to host byte order here
-int LOCALAPI CSocketItemEx::RespondToSNACK(ControlBlock::seq_t expectedSN, FSP_SelectiveNACK::GapDescriptor *gaps, int n)
+int LOCALAPI CSocketItemEx::AcceptSNACK(ControlBlock::seq_t expectedSN, FSP_SelectiveNACK::GapDescriptor *gaps, int n)
 {
 	if (int(expectedSN - pControlBlock->sendWindowLimitSN) > 0)
 		return -EDOM;

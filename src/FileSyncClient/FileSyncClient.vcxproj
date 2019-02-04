@@ -179,6 +179,7 @@
     <ClCompile Include="..\Crypto\tweetnacl.c" />
     <ClCompile Include="FileSyncClient.cpp" />
     <ClCompile Include="FSP_CHAKA.cpp" />
+    <ClCompile Include="MemoryFile.cpp" />
     <ClCompile Include="ReceiveOOB.cpp" />
   </ItemGroup>
   <ItemGroup>

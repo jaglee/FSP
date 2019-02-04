@@ -191,7 +191,11 @@ FSPHANDLE FSPAPI Connect2(const char *peerName, PFSP_Context psp1)
 	}
 
 	if (psp1->onAccepted == NULL)
-		return socketItem->WaitingConnectAck();
+	{
+		p = socketItem->WaitingConnectAck();
+		if (p != NULL)
+			p->CopyOutContext(psp1);
+	}
 
 	return p;
 }
@@ -533,7 +537,7 @@ CSocketItemDl * CSocketItemDl::WaitingConnectAck()
 {
 	FSP_Session_State s = NON_EXISTENT;
 	uint64_t t0 = GetTickCount64();
-	while (WaitUseMutex() && pControlBlock != NULL && (s = GetState()) < ESTABLISHED)
+	while (WaitUseMutex() && (s = GetState()) < ESTABLISHED)
 	{
 		if (GetTickCount64() - t0 > TRANSIENT_STATE_TIMEOUT_ms)
 		{

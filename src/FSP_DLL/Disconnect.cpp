@@ -41,9 +41,18 @@ int FSPAPI Dispose(FSPHANDLE hFSPSocket)
 
 
 
+// Dispose the socket, recycle the ULA TCB, inform LLS on demand
+// Return
+//	0 if no error
+//	negative if it is the error number
+// Remark
+//	For active/initiative socket the LLS TCB cache is kept
+//	For passive/listening socket it releases LLS TCB as well, and to expect NotifyRecycled
 int  CSocketItemDl::Dispose()
 {
-
+	if (InState(LISTENING))
+		return Call<FSP_Reject>() ? 0 : -EIO;
+	//^refuse to accept further connection request, do not send back anything (including reason code)
 	if (!WaitUseMutex())
 		return (IsInUse() ? -EDEADLK : 0);
 	return RecycLocked();
@@ -51,25 +60,13 @@ int  CSocketItemDl::Dispose()
 
 
 
-// return 0 if no error, positive if some warning
+// UNRESOLVED!? Implement LRU for better performance
 // assume the socket has been locked
 int CSocketItemDl::RecycLocked()
 {
-	register int r = 0;
-	if (! lowerLayerRecycled)
-	{
-		if (Call<FSP_Recycle>())
-		{
-			SetMutexFree();
-			return r;	// Free the socket item when FSP_Recycle called back
-		}
-		// Shall be rare to fall through:
-		r = EIO;		// LLS would eventually timed-out
-	}
-	//
 	FreeAndDisable();
 	SetMutexFree();
-	return r;
+	return 0;
 }
 
 
@@ -86,39 +83,35 @@ void CSocketItemDl::Disable()
 		UnregisterWaitEx(h, NULL);
 	//
 	CSocketItem::Destroy();
+	memset((octet *)this + sizeof(CSocketItem), 0, sizeof(CSocketItemDl) - sizeof(CSocketItem));
 }
 
 
-// [API:Shutdown]
-//	{ESTABLISHED, COMMITTING}-->{try to commit first}COMMITTED-->{wait for peer's commit}CLOSABLE
-//	PEER_COMMIT->{try to commit first}COMMITTING2-->CLOSABLE
-//	CLOSABLE-->PRE_CLOSED-->[Send RELEASE]
-//	PRE_CLOSED<-->{keep state}
-//	{otherwise: connection not ever established yet}-->{Treat 'Shutdown' command as 'Abort'}
-// It should be illegal to call Shutdown in the state 'earlier' than PEER_COMMIT
-// Try to terminate the session gracefully, automatically commit if not yet 
+
+// Try to terminate the session gracefully provided that the peer has commit the transmit transaction
 // Return 0 if no immediate error, or else the error number
-// The callback function 'onFinish' might return code of delayed error
+// The callback function might return code of delayed error
 DllSpec
-int FSPAPI Shutdown(FSPHANDLE hFSPSocket)
+int FSPAPI Shutdown(FSPHANDLE hFSPSocket, NotifyOrReturn fp1)
 {
 	CSocketItemDl *p = CSocketDLLTLB::HandleToRegisteredSocket(hFSPSocket);
 	if(p == NULL)
 		return -EFAULT;
-	return p->Shutdown();
+	return p->Shutdown(fp1);
 }
 
 
 
+// [API:Shutdown]
+//	PEER_COMMIT-->COMMITTING2-->{try to commit first}CLOSABLE-->PRE_CLOSED-->[Send RELEASE]
+//	COMMITTING2-->{try to commit first}CLOSABLE-->PRE_CLOSED-->[Send RELEASE]
+//	CLOSABLE-->PRE_CLOSED-->[Send RELEASE]
+//	PRE_CLOSED<-->{keep state with warning}
+//	CLOSED<-->{keep state with warning}
+//	{otherwise: illegal to Shutdown. May abort the connection by calling Dispose instead}
 // Remark
-//	Shutdown is always somewhat blocking. It is deliberate blocking
-//	if 'onFinish' function pointer in the connection context is NULL,
-//	indeliberate if it internally waits for previous Commit to finish.
-//	And it always assume that the caller does not accept further data
-//	In deliberate blocking mode, it sends RELEASE immediately
-//	after data has been committed but does not wait for acknowledgement
-//	Although the result is a side-effect,
-//	reset of context.onFinish prevents it from being called recursively.
+//	Although the result is a side-effect, when the socket is already closed 
+//	reset of fpFinished prevents it from being called recursively.
 int CSocketItemDl::Shutdown()
 {
 	if (!WaitUseMutex())
@@ -126,7 +119,7 @@ int CSocketItemDl::Shutdown()
 
 	if (lowerLayerRecycled || InState(CLOSED))
 	{
-		NotifyOrReturn fp1 = (NotifyOrReturn)InterlockedExchangePointer((PVOID *)&context.onFinish, NULL);
+		NotifyOrReturn fp1 = (NotifyOrReturn)InterlockedExchangePointer((PVOID *)&fpFinished, NULL);
 		RecycLocked();		// CancelTimer(); SetMutexFree();
 		if (fp1 != NULL)
 			fp1(this, FSP_NotifyRecycled, EAGAIN);
@@ -149,57 +142,107 @@ int CSocketItemDl::Shutdown()
 	}
 #endif
 
-	if (fpCommitted != NULL)
-	{
-		SetMutexFree();
-		return (context.onFinish != NULL ? 0 : -EBUSY);
-		//^Full-fledged asynchronous mode, or unproper mixed-mode
-	}
-
-	// Send RELEASE and wait echoed RELEASE. LLS to signal FSP_NotifyRecycled, NotifyReset or NotifyTimeout
+	// Send RELEASE and wait echoed RELEASE. LLS to signal FSP_NotifyToFinish, NotifyReset or NotifyTimeout
 #ifndef _NO_LLS_CALLABLE
 	int32_t deinitWait = DEINIT_WAIT_TIMEOUT_ms;
-	do
+	FSP_Session_State s = GetState();
+	int released = 0;
+	//^handle race condition of migrating to CLOSABLE or CLOSED (race between ACK_FLUSH and RELEASE)
+	if (s <= ESTABLISHED || s == COMMITTING || s == COMMITTED)
 	{
-		FSP_Session_State s = GetState();
-		if (s == CLOSED || s == NON_EXISTENT)
+		SetMutexFree();
+		return -EDOM;	// Wait for the peer to commit a transmit transaction first before shutdown!
+	}
+	//
+	if (fpFinished != NULL)
+	{
+		SetMutexFree();
+		return 0;		// asynchronous mode
+	}
+	//
+	if(s == PEER_COMMIT)
+	{
+		SetEoTPending();
+		if (HasDataToCommit())
+		{
+			// flush internal buffer for compression, if it is non-empty
+			if (HasFreeSendBuffer())
+			{
+				BufferData(pendingSendSize);
+				if(!Call<FSP_Send>())
+					released = -EIO;
+			}
+			// else Case 4.1, the send queue is full and there is some payload to wait free buffer
+		}
+		else if (skbImcompleteToSend != NULL)
+		{
+			// terminating the last packet of the stream
+			skbImcompleteToSend->SetFlag<TransactionEnded>();
+			skbImcompleteToSend->ReInitMarkComplete();
+			skbImcompleteToSend = NULL;
+			MigrateToNewStateOnCommit();
+			// No, RELEASE packet may not carry payload.
+			if(AppendEoTPacket())
+				released = Call<FSP_Send>() ? 1 : -EIO;
+			else if(! Call<FSP_Send>())
+				released = -EIO;
+			//^It may or may not be success, but it does not matter
+		}
+		// Case 3, there is at least one idle slot to put an EoT packet
+		// Where RELEASE shall be merged with NULCOMMIT
+		else if (AppendEoTPacket(RELEASE))
+		{
+			released = Call<FSP_Send>() ? 1 : -EIO;
+		}
+		// else Case 4.2, the send queue is full and is to append a RELEASE
+		// Case 4: just to wait some buffer ready. See also ProcessPendingSend
+		if (released < 0)
 		{
 			SetMutexFree();
-			return 0;
+			return released;
 		}
-		if (s != COMMITTED && s < CLOSABLE)
+		s = GetState();	// it may be in COMMITTING2 or still in PEER_COMMIT state
+	}
+	//
+	if (s == COMMITTING2)
+	{
+		int r = BlockOnCommit();
+		if (r < 0)
+			return r;
+		// BlockOnCommit would free the mutex lock on error
+		s = GetState();
+	}
+	//
+	for(; s != CLOSED && s != NON_EXISTENT; s = GetState())
+	{
+		if (s == CLOSABLE)
 		{
-			int r = Commit();
-			if (r < 0)
-				return r;
-			if (!WaitUseMutex())
-				return (IsInUse() ? -EDEADLK : 0);
-		}
-		else if (s == CLOSABLE)
-		{
-			// handle race condition here
 			SetState(PRE_CLOSED);
-			if (!Call<FSP_Shutdown>())
+			if (released <= 0 && AppendEoTPacket() && !Call<FSP_Send>())
 			{
 				SetMutexFree();
 				return -EIO;
 			}
-			if (context.onFinish != NULL)
+			if (fpFinished != NULL)
 			{
 				SetMutexFree();
 				return 0;
 			}
 		}
-		//
 		SetMutexFree();
 		Sleep(TIMER_SLICE_ms);
+		//
 		if (s >= CLOSABLE)
 		{
 			deinitWait -= TIMER_SLICE_ms;
 			if (deinitWait <= 0)
 				return ETIMEDOUT;		// Warning, not fatal error
 		}
-	} while (WaitUseMutex());
+		//
+		if(! WaitUseMutex())
+			return (IsInUse() ? -EDEADLK : 0);
+	}
 #endif
-	return (IsInUse() ? -EDEADLK : 0);
+	SetMutexFree();
+	return 0;
 }

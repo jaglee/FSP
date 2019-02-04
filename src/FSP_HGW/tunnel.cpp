@@ -103,7 +103,7 @@ static void FreeRequestItem(PRequestPoolItem p, bool graceful = false)
 	if(p->hFSP != NULL)
 	{
 		if(graceful)
-			Shutdown(p->hFSP);
+			Shutdown(p->hFSP, NULL);
 		else
 			Dispose(p->hFSP);
 	}
@@ -175,7 +175,7 @@ int FSPAPI toReadTCPData(FSPHANDLE h, void *buf, int32_t capacity)
 #ifndef NDEBUG
 		printf_s("Proxy TCP recv() returned %d\n", r);
 #endif
-		Shutdown(h);
+		Shutdown(h, NULL);
 		FreeRequestItem(pReq, (n == 0));
 		return 0;
 	}

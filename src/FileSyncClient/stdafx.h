@@ -15,3 +15,6 @@
 
 // Forward declaration of an auxilary function
 int ReportLastError();
+
+extern HANDLE	hFinished;
+extern HANDLE	hFile;

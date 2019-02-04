@@ -248,7 +248,7 @@ int32_t LOCALAPI CSocketItemDl::SendStream(const void * buffer, int32_t len, boo
 	if (eot && (state1 == COMMITTING || state1 == COMMITTING2))
 	{
 		r = BlockOnCommit();
-		if (r != 0)
+		if (r < 0)
 		{
 			SetMutexFree();
 			return r;
@@ -406,7 +406,7 @@ l_recursion:
 	// SendInplace does not rely on keeping 'pendingEoT' state internally, and such state takes precedence
 	if (IsEoTPending())
 	{
-		ApendEoTPacket();
+		AppendEoTPacket();
 		SetMutexFree();
 		return;
 	}
@@ -714,7 +714,10 @@ int32_t LOCALAPI CSocketItemDl::PrepareToSend(void * buf, int32_t len, bool eot)
 
 // Return
 //	0 if no error
-//	negative if error
+//	negative if error:
+//	-EDEADLK if no mutex lock available
+//	-EINTR if the connection is interrupted when waiting state migration
+//	-EBUSY if can not reach target state in the limited time
 // Remark
 //	Assume it has obtain mutex lock on entry and it would keep the lock on success but free the lock on error
 int CSocketItemDl::BlockOnCommit()
@@ -727,7 +730,7 @@ int CSocketItemDl::BlockOnCommit()
 		SetMutexFree();
 		Sleep(TIMER_SLICE_ms);
 		if (!WaitUseMutex())
-			return (IsInUse() ? -EDEADLK : EINTR);
+			return (IsInUse() ? -EDEADLK : -EINTR);
 		//
 		if (pControlBlock->CountSentInFlight() < k)
 		{
@@ -794,7 +797,7 @@ int CSocketItemDl::Commit()
 		r = Call<FSP_Send>();
 	}
 	// Case 3, there is at least one idle slot to put an EoT packet
-	else if (ApendEoTPacket())
+	else if (AppendEoTPacket())
 	{
 		r = Call<FSP_Send>();
 	}

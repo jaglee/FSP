@@ -5,46 +5,15 @@
 #include "stdafx.h"
 #include "defs.h"
 
-static int FSPAPI onAccepted(FSPHANDLE, PFSP_Context);
-
-static char		*fileName = "$memory.^";
-static uint8_t	bytesToSend[TEST_MEM_SIZE];
-
-
-// The entry function of the group
-void SendMemoryPattern()
-{
-	for(register int i = 0; i < sizeof(bytesToSend) / sizeof(uint32_t); i++)
-	{
-		* (uint32_t *) & bytesToSend[i * sizeof(uint32_t)] = htobe32(i);
-	}
-
-	WaitConnection(defaultWelcome, (uint16_t)strlen(defaultWelcome) + 1, onAccepted);
-}
-
-
-
-// If the request of the connection by the remote end is accepted send the hard-coded
-// filename designated a large memory block to the remote end
-// (for memory pattern this is a 'virtual' filename)
-static int FSPAPI onAccepted(FSPHANDLE h, PFSP_Context ctx)
-{
-	printf_s("\nMemoryFile onAccepted: handle of FSP session %p\n", h);
-	// TODO: check connection context
-
-	printf_s("\tTo send filename to the remote end...\n");
-	WriteTo(h, fileName, (int)strlen(fileName) + 1, TO_END_TRANSACTION, onFileNameSent);
-
-	return 0;
-}
-
-
+// Following file scope variables and functions have limited access border 
+static uint64_t nRequested;
+static uint64_t nPrepared;
 
 // Request send buffer to send the content of the large memory block
 // when it is acknowledged that the filename has been sent.
 // We insisted on sending even if only a small buffer of 1 octet is available
 // And we expected success acknowledgement on the application layer
-static void FSPAPI onFileNameSent(FSPHANDLE h, FSP_ServiceCode c, int r)
+static void FSPAPI onRequestedSizeReceived(FSPHANDLE h, FSP_ServiceCode c, int r)
 {
 	if(r < 0)
 	{
@@ -52,9 +21,9 @@ static void FSPAPI onFileNameSent(FSPHANDLE h, FSP_ServiceCode c, int r)
 		return;
 	}
 
-	printf("Filename has been sent to remote end,\n"
-		"to get send buffer for reading file and sending inline...\n");
-
+	// No needs to preallocate memory! Arbitrarily long stream might be sent
+	printf_s("To send memory segment of %llu octets.\n", nRequested);
+	//
 	r = GetSendBuffer(h, toSendNextBlock);
 	if(r < 0)
 	{
@@ -62,8 +31,6 @@ static void FSPAPI onFileNameSent(FSPHANDLE h, FSP_ServiceCode c, int r)
 		Dispose(h);
 		return;
 	}
-
-	ReadFrom(h, linebuf, sizeof(linebuf), onResponseReceived);
 }
 
 
@@ -73,21 +40,48 @@ static void FSPAPI onFileNameSent(FSPHANDLE h, FSP_ServiceCode c, int r)
 // function is called. Here the buffer space memory is shared between ULA and LLS.
 static int FSPAPI toSendNextBlock(FSPHANDLE h, void * batchBuffer, int32_t capacity)
 {
-	static int offset = 0;
-	if(capacity < 0)
+	if(capacity <= 0)
 	{
 		Dispose(h);
 		return -ENOMEM;
 	}
 
-	int bytesRead = __min(sizeof(bytesToSend) - offset, (size_t)capacity);
-	if (bytesRead <= 0)
+	int32_t nToSend = (int32_t)__min(nRequested - nPrepared, capacity);
+	if (nToSend <= 0)
 		return EOF;
 
-	memcpy(batchBuffer, bytesToSend + offset, bytesRead);
-	printf_s("To send %d bytes to the remote end. %d bytes have been sent before.\n", bytesRead, offset);
+	// Set the memory pattern on fly; very long stream (whose length may be up to 2^64 -1 ) is possible
+	int nDWord = nToSend / (int)sizeof(uint32_t);
+	for (register int i = 0; i < nDWord; i++)
+	{
+		((uint32_t *)batchBuffer)[i] = htobe32(uint32_t(nPrepared + i));
+	}
+	// to make life easier just apply zero padding; let the optimizer make the code effecient 
+	for (register int i = 0; i < nToSend - (int)sizeof(uint32_t) * nDWord; i++)
+	{
+		((octet *)batchBuffer)[sizeof(uint32_t) * nDWord + i] = 0;
+	}
 
-	offset += bytesRead;
+	printf_s("To send %d bytes to the remote end. %llu bytes have been sent before.\n", nToSend, nPrepared);
+	nPrepared += nToSend;
 
-	return SendInline(h, batchBuffer, bytesRead, (offset >= sizeof(bytesToSend)), NULL);
+	return SendInline(h, batchBuffer, nToSend, (nPrepared >= nRequested), NULL);
+}
+
+
+
+// If the request of the connection by the remote end is accepted send the hard-coded
+// filename designated a large memory block to the remote end
+// (for memory pattern this is a 'virtual' filename)
+int FSPAPI WeakSecurity_onAccepted(FSPHANDLE h, PFSP_Context ctx)
+{
+	printf_s("\nMemoryFile onAccepted: handle of FSP session %p\n", h);
+	printf_s("To send memory pattern to the remote end directly:\n");
+
+	// Suppose the host byte orders of the peers are the same
+	// Read length of request memory pattern length.
+	nPrepared = 0;
+	ReadFrom(h, &nRequested, sizeof(nRequested), onRequestedSizeReceived);
+
+	return 0;
 }

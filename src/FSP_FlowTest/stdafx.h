@@ -42,5 +42,3 @@ void TrySRP6();
 void TryCHAKA();
 
 void TryWideChar();
-
-int CompareMemoryPattern(TCHAR *);

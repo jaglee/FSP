@@ -75,7 +75,6 @@ static char DEFAULT_ROOT[MAX_PATH];
 
 static int	FSPAPI onAccepted(FSPHANDLE, PFSP_Context);
 static void FSPAPI onNotice(FSPHANDLE, FSP_ServiceCode, int);
-static void FSPAPI onFinish(FSPHANDLE, FSP_ServiceCode, int);
 
 static void FSPAPI onFirstLineRead(FSPHANDLE, FSP_ServiceCode, int);
 static void FSPAPI onFurtherTunnelRequest(FSPHANDLE, FSP_ServiceCode, int);
@@ -248,7 +247,6 @@ void StartHTTPoverFSP()
 	params.onAccepting = NULL;	// make it blocking
 	params.onAccepted = onAccepted;
 	params.onError = onNotice;
-	params.onFinish = onFinish;
 	params.welcome = thisWelcome;
 	params.len = mLen;
 	params.sendSize = BUFFER_POOL_SIZE;
@@ -291,20 +289,6 @@ static void FSPAPI onNotice(FSPHANDLE h, FSP_ServiceCode code, int value)
 		Abort("Fatal error occured in the main loop, to abort.\n");
 	else
 		FreeExtent(h);
-}
-
-
-
-// The function called back when an FSP connection was released. Parameters are self-describing
-static void FSPAPI onFinish(FSPHANDLE h, FSP_ServiceCode code, int)
-{
-	printf_s("Socket %p, session was to shut down, service code = %d.\n", h, code);
-	if(code == FSP_NotifyToFinish)
-	{
-		FSPControl(h, FSP_SET_CALLBACK_ON_FINISH, NULL);
-		Shutdown(h);
-	}
-	return;
 }
 
 
@@ -512,7 +496,7 @@ static void FSPAPI onFirstLineRead(FSPHANDLE client, FSP_ServiceCode c, int r)
 	}
 
 	FreeExtent(client);
-	Shutdown(client);
+	Shutdown(client, NULL);
 }
 
 

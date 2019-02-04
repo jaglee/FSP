@@ -450,7 +450,5 @@ int _tmain(int argc, _TCHAR* argv[])
 	TryWideChar();
 	UnitTestByteOrderDefinitin();
 
-	CompareMemoryPattern("$memory.^");
-
 	return 0;
 }

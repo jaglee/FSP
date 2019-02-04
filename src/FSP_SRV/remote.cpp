@@ -593,23 +593,20 @@ l_return:
 //	PEER_COMMIT-->/ACK_START/NULCOMMIT-->{keep state}[Send ACK_FLUSH]
 //	COMMITTING2-->/ACK_START/NULCOMMIT-->{keep state}[Send ACK_FLUSH]
 //	CLOSABLE-->/ACK_START/NULCOMMIT-->{keep state}[Send ACK_FLUSH]
-//	PRE_CLOSED<-->/ACK_START/NULCOMMIT-->{keep state}[Send RELEASE]
-// It is possible that the peer resend the final packet in COMMITTING2 state
-// while the near end has migrated to CLOSABLE state and then to PRE_CLOSED state by SHUTDOWN
 void CSocketItemEx::OnGetNulCommit()
 {
 	TRACE_SOCKET();
-	if (!InStates(8, CHALLENGING, CLONING, ESTABLISHED, COMMITTED, PEER_COMMIT, COMMITTING2, CLOSABLE, PRE_CLOSED))
-		return;
 
 	bool isInitiativeState = InState(CHALLENGING) || InState(CLONING);
-	bool isMultiplying = InState(CLONING);
+	if (! isInitiativeState && lowState < ESTABLISHED)
+		return;
 
 	FSP_NormalPacketHeader *p1 = headPacket->GetHeaderFSP();
 	ControlBlock::seq_t ackSeqNo = be32toh(p1->expectedSN);
 	if (!IsAckExpected(ackSeqNo))
 		return;
 
+	bool isMultiplying = InState(CLONING);
 	if (!isMultiplying)	// the normality
 	{
 		// Although it lets ill-behaviored peer take advantage by sending ill-formed ACK_START
@@ -620,7 +617,7 @@ void CSocketItemEx::OnGetNulCommit()
 			AddLazyAckTimer();
 			return;
 		}
-		if (headPacket->pktSeqNo != pControlBlock->recvWindowExpectedSN)
+		if (isInitiativeState && headPacket->pktSeqNo != pControlBlock->recvWindowExpectedSN)
 		{
 #if (TRACE & TRACE_SLIDEWIN)
 			printf_s("ACK_START should have the very sequence number awaited to receive.\n");
@@ -636,11 +633,6 @@ void CSocketItemEx::OnGetNulCommit()
 #endif
 			return;
 		}
-		if (InState(PRE_CLOSED))
-		{
-			SendRelease();
-			return;
-		}
 	}
 	else if (!FinalizeMultiply())	// if (lowState == CLONING)
 	{
@@ -654,9 +646,11 @@ void CSocketItemEx::OnGetNulCommit()
 		return;
 
 	// ACK_START has nothing to deliver to ULA
-	skb->ReInitMarkDelivered();
-	pControlBlock->SlideRecvWindowByOne();
-
+	if (isInitiativeState)
+	{
+		skb->ReInitMarkDelivered();
+		pControlBlock->SlideRecvWindowByOne();
+	}
 	tLastRecv = NowUTC();
 	tRoundTrip_us = (uint32_t)min(UINT32_MAX, tLastRecv - tRecentSend);
 #if (TRACE & (TRACE_SLIDEWIN | TRACE_HEARTBEAT))
@@ -665,9 +659,7 @@ void CSocketItemEx::OnGetNulCommit()
 
 	if (!isInitiativeState)
 	{
-		bool b = !InState(COMMITTED) && !InState(CLOSABLE);
-		TransitOnPeerCommit();
-		if (b)
+		if (HasBeenCommitted() && TransitOnPeerCommit())
 			Notify(FSP_NotifyToCommit);
 		return;
 	}
@@ -675,7 +667,7 @@ void CSocketItemEx::OnGetNulCommit()
 	// ACK_START is always the accumulative acknowledgement to ACK_CONNECT_REQ or MULTIPLY
 	skb = pControlBlock->GetSendQueueHead();
 	skb->ReInitMarkAcked();
-	pControlBlock->SlideSendWindowByOne();	// See also RespondToSNACK
+	pControlBlock->SlideSendWindowByOne();	// See also AcceptSNACK
 
 	if (isMultiplying)
 	{
@@ -728,17 +720,13 @@ void CSocketItemEx::OnGetNulCommit()
 //			|-->{ULA-flushing}-->COMMITTED
 //		  >-->[Send SNACK]
 //	  >-->[Notify]
-//{PRE_CLOSED}<-->/PERSIST/-->[Send RELEASE]
-// It is possible that the peer resend the final packet in COMMITTING2 state
-// while the near end has migrated to CLOSABLE state and then to PRE_CLOSED state by SHUTDOWN
 void CSocketItemEx::OnGetPersist()
 {
 	TRACE_SOCKET();
-	if (!InStates(8, CHALLENGING, CLONING, ESTABLISHED, COMMITTED, PEER_COMMIT, COMMITTING2, CLOSABLE, PRE_CLOSED))
-		return;
 
 	bool isInitiativeState = InState(CHALLENGING) || InState(CLONING);
-	bool isMultiplying = InState(CLONING);
+	if (!isInitiativeState  && lowState < ESTABLISHED)
+		return;
 
 	if (headPacket->lenData < 0 || headPacket->lenData > MAX_BLOCK_SIZE)
 	{
@@ -753,7 +741,8 @@ void CSocketItemEx::OnGetPersist()
 	if (!IsAckExpected(ackSeqNo))
 		return;
 
-	if (! isMultiplying)	// the normality
+	bool isMultiplying = InState(CLONING);
+	if (!isMultiplying)	// the normality
 	{
 		int32_t d = OffsetToRecvWinLeftEdge(headPacket->pktSeqNo);
 		if (d >= pControlBlock->recvBufferBlockN)
@@ -777,13 +766,8 @@ void CSocketItemEx::OnGetPersist()
 #endif
 			return;
 		}
-		if (InState(PRE_CLOSED))
-		{
-			SendRelease();
-			return;
-		}
 	}
-	else if(! FinalizeMultiply())	// if (lowState == CLONING)
+	else if (!FinalizeMultiply())	// if (lowState == CLONING)
 	{
 		return;
 	}
@@ -822,7 +806,7 @@ void CSocketItemEx::OnGetPersist()
 	{
 		ControlBlock::PFSP_SocketBuf skb = pControlBlock->GetSendQueueHead();
 		skb->ReInitMarkAcked();
-		pControlBlock->SlideSendWindowByOne();	// See also RespondToSNACK
+		pControlBlock->SlideSendWindowByOne();	// See also AcceptSNACK
 		tRoundTrip_us = (uint32_t)min(UINT32_MAX, tLastRecv - tRecentSend);
 #if (TRACE & (TRACE_SLIDEWIN | TRACE_HEARTBEAT))
 		printf_s("\nPERSIST received, acknowledged SN = %u\n\tThe responder calculate RTT: %uus\n", ackSeqNo, tRoundTrip_us);
@@ -830,46 +814,43 @@ void CSocketItemEx::OnGetPersist()
 	}
 
 	// Note that TransitOnPeerCommit may SendAckFlush which relies on correctness of tLastRecv
-	bool committed = HasBeenCommitted();
-	if(committed)
+	if (HasBeenCommitted())
 	{
-		TransitOnPeerCommit();
+		if (TransitOnPeerCommit())
+			Notify(FSP_NotifyToCommit);
+		return;
 	}
-	else
+
+	RestartKeepAlive();
+	switch (lowState)
 	{
-		RestartKeepAlive();
-		switch(lowState)
-		{
-		case CHALLENGING:
-			SetState(COMMITTED);
-			break;
-		case PEER_COMMIT:
-			SetState(ESTABLISHED);
-			break;
-		case COMMITTING2:
-			SetState(COMMITTING);
-			break;
-		case CLOSABLE:
-			SetState(COMMITTED);
-			break;
-		case CLONING:
-			SetState(_InterlockedExchange8(&transactional, 0) ? COMMITTED : ESTABLISHED);
+	case CHALLENGING:
+		SetState(COMMITTED);
+		break;
+	case PEER_COMMIT:
+		SetState(ESTABLISHED);
+		break;
+	case COMMITTING2:
+		SetState(COMMITTING);
+		break;
+	case CLOSABLE:
+		SetState(COMMITTED);
+		break;
+	case CLONING:
+		SetState(_InterlockedExchange8(&transactional, 0) ? COMMITTED : ESTABLISHED);
 #if (TRACE & TRACE_OUTBAND)
-			printf_s("\nTransit to %s state from CLONING\n", stateNames[lowState]);
+		printf_s("\nTransit to %s state from CLONING\n", stateNames[lowState]);
 #endif
-			break;
+		break;
 		// default:	// case ESTABLISHED: case COMMITTED:	// keep state
-		}
-		//
-		SendKeepAlive();
 	}
+	//
+	SendKeepAlive();
 
 	if (isMultiplying)
 		SignalFirstEvent(FSP_NotifyMultiplied);
 	else if (isInitiativeState)
 		SignalFirstEvent(FSP_NotifyAccepted);
-	else if (committed)
-		Notify(FSP_NotifyToCommit);
 	else if (countPlaced > 0)
 		Notify(FSP_NotifyDataReady);
 }
@@ -905,12 +886,12 @@ void CSocketItemEx::OnGetKeepAlive()
 	if (acknowledgible)
 	{
 		ControlBlock::seq_t seq0 = pControlBlock->sendWindowFirstSN;
-		int r = RespondToSNACK(ackSeqNo, gaps, n);
+		int r = AcceptSNACK(ackSeqNo, gaps, n);
 		if (r > 0 && pControlBlock->CountSendBuffered() == 0)
 			Notify(FSP_NotifyBufferReady);
 #ifndef NDEBUG
 		else if (r < 0)
-			printf_s(__FUNCDNAME__ "RespondToSNACK unexpectedly return %d\n", r);
+			printf_s(__FUNCDNAME__ "AcceptSNACK unexpectedly return %d\n", r);
 #endif		// UNRESOLVED?! Should log this very unexpected case
 	}
 
@@ -934,9 +915,6 @@ void CSocketItemEx::OnGetKeepAlive()
 //		-->CLOSABLE-->[Send ACK_FLUSH]-->[Notify]
 //	|-->{otherwise}-->[Send SNACK]-->[Notify]
 //{CLONING, PEER_COMMIT, COMMITTING2, CLOSABLE}<-->/PURE_DATA/{just prebuffer}
-//{PRE_CLOSED}<-->/PURE_DATA/-->[Send RELEASE]
-// It is possible that the peer resend the final packet in COMMITTING2 state
-// while the near end has migrated to CLOSABLE state and then to PRE_CLOSED state by SHUTDOWN
 // However ULA protocol designer must keep in mind that these prebuffered may be discarded
 void CSocketItemEx::OnGetPureData()
 {
@@ -961,12 +939,12 @@ void CSocketItemEx::OnGetPureData()
 	// Just ignore the unexpected PURE_DATA
 	if (InStates(4, CLONING, PEER_COMMIT, COMMITTING2, CLOSABLE))
 	{
-		if(d == 0)
+		if (d == 0)
 			return;
 		// else just prebuffer
 	}
-	else if(! InStates(4, ESTABLISHED, COMMITTING, COMMITTED, PRE_CLOSED))
-	{	
+	else if (lowState < ESTABLISHED)
+	{
 #ifdef TRACE
 		printf_s("In state %s data may not be accepted.\n", stateNames[lowState]);
 #endif
@@ -984,11 +962,6 @@ void CSocketItemEx::OnGetPureData()
 		printf_s("@%s: invalid ICC received\n", __FUNCTION__);
 		pControlBlock->DumpSendRecvWindowInfo();
 #endif
-		return;
-	}
-	if (InState(PRE_CLOSED))
-	{
-		SendRelease();
 		return;
 	}
 
@@ -1018,18 +991,16 @@ void CSocketItemEx::OnGetPureData()
 	// State transition signaled to DLL CSocketItemDl::WaitEventToDispatch()
 	if (HasBeenCommitted())
 	{
-		TransitOnPeerCommit();
-		Notify(FSP_NotifyToCommit);
+		if(TransitOnPeerCommit())
+			Notify(FSP_NotifyToCommit);
+		return;
 	}
-	else
-	{
-		// PURE_DATA cannot start a transmit transaction, so in state like CLONING just prebuffer
-		if (!InStates(4, CLONING, PEER_COMMIT, COMMITTING2, CLOSABLE))
-			AddLazyAckTimer();
-		// Normally the ULA work in polling mode. Urge it to process the receive buffer if the buffer is full
-		if (pControlBlock->CountDeliverable() == pControlBlock->recvBufferBlockN)
-			Notify(FSP_NotifyDataReady);
-	}
+	// PURE_DATA cannot start a transmit transaction, so in state like CLONING just prebuffer
+	if (!InState(CLONING) && !InState(PEER_COMMIT) && lowState < COMMITTING2)
+		AddLazyAckTimer();
+	// Normally the ULA work in polling mode. Urge it to process the receive buffer if the buffer is full
+	if (pControlBlock->CountDeliverable() == pControlBlock->recvBufferBlockN)
+		Notify(FSP_NotifyDataReady);
 	// See also OnGetPersist()
 }
 
@@ -1037,9 +1008,21 @@ void CSocketItemEx::OnGetPureData()
 
 // Make state transition on end-of-transmit-transaction got from the peer
 // Side-effect: send ACK_FLUSH immediately
-void CSocketItemEx::TransitOnPeerCommit()
+// Return
+//	true if state is successfully migrated
+//	false if ULA state has yet to be changed by NotifyToFinish
+bool CSocketItemEx::TransitOnPeerCommit()
 {
 	pControlBlock->SnapshotReceiveWindowRightEdge();
+	if (hasAcceptedRELEASE)
+	{
+		Notify(FSP_NotifyToFinish);
+		lowState = CLOSED;
+		RecycleTimers();
+		SendAckFlush();
+		return false;
+	}
+	//
 	switch (lowState)
 	{
 	case CHALLENGING:
@@ -1064,18 +1047,20 @@ void CSocketItemEx::TransitOnPeerCommit()
 	//
 	if(lazyAckTimer == NULL)
 		SendAckFlush();
+	return true;
 }
 
 
 
 // ACK_FLUSH, now a pure out-of-band control packet. A special norm of KEEP_ALIVE
 //	COMMITTING-->/ACK_FLUSH/-->COMMITTED-->[Notify]
-//	COMMITTING2-->/ACK_FLUSH/-->{stop keep-alive}CLOSABLE-->[Notify]
+//	COMMITTING2-->/ACK_FLUSH/-->CLOSABLE-->[Notify]
+//	PRE_CLOSED-->/ACK_FLUSH/-->CLOSED-->[Nofity]
 void CSocketItemEx::OnAckFlush()
 {
 	TRACE_SOCKET();
 
-	if (!InState(COMMITTING) && !InState(COMMITTING2))
+	if (!InState(COMMITTING) && !InState(COMMITTING2) && !InState(PRE_CLOSED))
 		return;
 
 	FSP_SelectiveNACK::GapDescriptor *gaps;
@@ -1090,7 +1075,15 @@ void CSocketItemEx::OnAckFlush()
 		return;
 	}
 #endif
-	RespondToSNACK(ackSeqNo, gaps, 0);
+	AcceptSNACK(ackSeqNo, gaps, 0);
+
+	if (InState(PRE_CLOSED))
+	{
+		SetState(CLOSED);
+		Notify(FSP_NotifyToFinish);
+		RecycleTimers();
+		return;
+	}
 
 	if (InState(COMMITTING2))
 	{
@@ -1107,48 +1100,61 @@ void CSocketItemEx::OnAckFlush()
 
 
 
+// {COMMITTING, COMMITTED}-->/RELEASE/
+//	 |--{Whole transaction not finished yet]-->{buffer it first}		
+//	 |--{Whole transaction finished}-->[Send ACK_FLUSH]
+//		|-->[Notify]-->CLOSED
+// {COMMITTING2, CLOSABLE}-->/RELEASE-->[Send ACK_FLUSH]
+//	 -->[Notify]-->CLOSED
 // PRE_CLOSED-->/RELEASE/-->CLOSED-->[Notify]
-// {COMMITTING2, CLOSABLE}-->/RELEASE/
-//    -->CLOSED-->[Send RELEASE]-->[Notify]
 // Remark
+//	RELEASE implies NULCOMMIT
 //	RELEASE implies ACK_FLUSH as well so a lost ACK_FLUSH does not prevent it to shutdown gracefully
+//	There's a race condition that
+//	while NotifiedToFinsh immediately follows a NotifyToCommit, RELEASE may arrive before ACK_FLUSH
+//	And accept RELEASE in PRE_CLOSED state because ACK_FLUSH may race with RELEASE in some scenario
 void CSocketItemEx::OnGetRelease()
 {
-	bool reactive = InState(COMMITTING2) || InState(CLOSABLE);
-	if (!reactive && !InState(PRE_CLOSED))
+	if (!InStates(5, COMMITTING, COMMITTED, COMMITTING2, CLOSABLE, PRE_CLOSED))
 		return;
 
 	if (headPacket->lenData != 0)
 		return;
 
-	if (headPacket->pktSeqNo != pControlBlock->recvWindowNextSN - 1)
-		return;
-
-	FSP_SelectiveNACK::GapDescriptor *gaps;
-	int n;
-	ControlBlock::seq_t ackSeqNo;
-	if (!ValidateSNACK(ackSeqNo, gaps, n))
-		return;
-#ifndef NDEBUG
-	if (n != 0)
+	if (headPacket->pktSeqNo != pControlBlock->recvWindowNextSN)
 	{
-		BREAK_ON_DEBUG();	//TRACE_HERE("RELEASE should carry accumulatively positively acknowledge only");
-		return;
-	}
-	if (ackSeqNo != pControlBlock->sendWindowNextSN && !InState(COMMITTING2))
-	{
-		BREAK_ON_DEBUG();
-		return;
-	}
+#if defined(TRACE) && (TRACE & TRACE_PACKET)
+		printf_s("\nThe RELEASE packet to %u is valid only if it is the last expected\n"
+			"\tSequence number of this packet = %u, right edge of receive window is %u\n"
+			, fidPair.source
+			, headPacket->pktSeqNo, pControlBlock->recvWindowNextSN);
 #endif
-	RespondToSNACK(pControlBlock->sendWindowNextSN, NULL, 0);
+		return;
+	}
 
-	SetState(CLOSED);
-	if (reactive)
-		SendRelease();
+	if (!ValidateICC())
+	{
+		BREAK_ON_DEBUG();	//TRACE_HERE("Invalid intergrity check code!?");
+		return;
+	}
+
+	// Place a payloadless EoT packet into the receive queue,
+	// and the duplicate RELEASE packet would be rejected
+	PlacePayload();
+	AcceptSNACK(pControlBlock->sendWindowNextSN, NULL, 0);
+
+	hasAcceptedRELEASE = 1;
+	if (InState(COMMITTING))
+		SetState(COMMITTED);
+	if (InState(COMMITTED) && !HasBeenCommitted())
+		return;
+
+	RecycleTimers();
+	if (!InState(PRE_CLOSED))
+		SendAckFlush();
+	lowState = CLOSED;
 	Notify(FSP_NotifyToFinish);
-	//
-	ReplaceTimer(RECYCLABLE_TIMEOUT_ms);
+	//^Just to make internal recycling work. Let ULA do further state transition
 }
 
 

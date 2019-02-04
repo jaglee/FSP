@@ -115,13 +115,16 @@ const char * CStringizeNotice::names[LARGEST_FSP_NOTICE + 1] =
 	"InitConnection",	// register an initiative socket
 	"FSP_Accept",		// accept the connection, make SCB of LLS synchronized with DLL
 	"FSP_Reject",		// a forward command, explicitly reject some request
-	"FSP_Recycle",		// a forward command, connection might be aborted
 	"FSP_Send",			// send a packet/a group of packets
-	"FSP_Shutdown",		// close the connection
 	"FSP_InstallKey",	// install the authenticated encryption key
 	"FSP_Multiply",		// clone the connection, make SCB of LLS synchronized with DLL
-	"Reserved10",		// FSP_Start, code 7, obsolesced
-	"Reserved11",		// FSP_Commit, code 8, obsolesced
+	// FSP_Start, obsolesced
+	// FSP_Commit, obsolesced
+	// FSP_Shutdown, obsolesced
+	"Reserved8",
+	"Reserved9",
+	"Reserved10",
+	"Reserved11",
 	// 12-15, 4 reserved
 	"Reserved12",
 	"Reserved13",
@@ -130,7 +133,6 @@ const char * CStringizeNotice::names[LARGEST_FSP_NOTICE + 1] =
 	// 16~23: LLS to DLL in the backlog
 	//FSP_NotifyListening = FSP_Listen,		// a reverse command to signal success execution of FSP_Listen
 	//FSP_NotifyAccepting = FSP_Accept,		// a reverse command to make context ready
-	//FSP_NotifyRecycled = FSP_Recycle,		// a reverse command to inform DLL to release resource passively
 	//FSP_NotifyMultiplied = FSP_Multiply,	// a reverse command to inform DLL to accept a multiply request
 	"FSP_NotifyAccepted",
 	"FSP_NotifyDataReady",
@@ -139,7 +141,7 @@ const char * CStringizeNotice::names[LARGEST_FSP_NOTICE + 1] =
 	"FSP_NotifyFlushed",
 	"FSP_NotifyToFinish",
 	"FSP_NotifyReset",		// used to be FSP_Dispose or Reserved22
-	"Reserved23",
+	"FSP_NotifyRecycled",	// used to be "Reserved23"
 	// 24~31: near end error status
 	"FSP_IPC_CannotReturn",	// LLS cannot return to DLL for some reason
 	"FSP_MemoryCorruption",
@@ -643,9 +645,9 @@ BYTE * LOCALAPI ControlBlock::InquireRecvBuf(int32_t & nIO, bool & eotFlag)
 	}
 #endif
 	//
-	for(i = 0; i < m && p->IsComplete() && ! p->IsDelivered(); i++)
+	for (i = 0; i < m && p->IsComplete() && !p->IsDelivered(); i++)
 	{
-		if(p->len > MAX_BLOCK_SIZE || p->len < 0)
+		if (p->len > MAX_BLOCK_SIZE || p->len < 0)
 		{
 			BREAK_ON_DEBUG();	// TRACE_HERE("Unrecoverable error! memory corruption might have occurred");
 			nIO = -EFAULT;
@@ -655,11 +657,10 @@ BYTE * LOCALAPI ControlBlock::InquireRecvBuf(int32_t & nIO, bool & eotFlag)
 		//
 		p->MarkDelivered();
 
-		if(p->GetFlag<TransactionEnded>())
+		if (p->GetFlag<TransactionEnded>())
 		{
 			eotFlag = true;
-			i++;
-			break;
+			return pMsg;
 		}
 #ifndef NDEBUG
 		if (p->opCode == PURE_DATA && p->len != MAX_BLOCK_SIZE)
@@ -711,13 +712,6 @@ int LOCALAPI ControlBlock::MarkReceivedFree(PFSP_SocketBuf p)
 		p->ReInitMarkDelivered();
 		// but preserve the packet flag for EoT detection, etc.
 	}
-#ifndef NDEBUG
-	if (i != m)
-	{
-		BREAK_ON_DEBUG();
-		nIO = -EDOM;
-	}
-#endif // !NDEBUG
 	AddRoundRecvBlockN(recvWindowHeadPos, i);
 	InterlockedExchange((LONG *)&recvWindowFirstSN, recvWindowFirstSN + i);
 

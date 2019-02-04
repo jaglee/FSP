@@ -160,7 +160,9 @@ protected:
 	NotifyOrReturn	fpReceived;
 	CallbackPeeked	fpPeeked;
 	CallbackBufferReady fpSent;
+	//
 	NotifyOrReturn	fpCommitted;
+	NotifyOrReturn	fpFinished;		// NULL if synchronous shutdown, non-NULL if asynchronous
 
 	// For network streaming *Buf is not NULL
 	BYTE *			pendingSendBuf;
@@ -320,7 +322,7 @@ public:
 
 	bool WaitUseMutex();
 	void SetMutexFree() { ReleaseSRWLockExclusive(& rtSRWLock); }
-	bool IsInUse() { return (_InterlockedXor8(& inUse, 0) != 0); }
+	bool IsInUse() { return (_InterlockedXor8(&inUse, 0) != 0) && (pControlBlock != NULL); }
 
 	void SetPeerName(const char *cName, size_t len)
 	{
@@ -369,18 +371,19 @@ public:
 	int32_t LOCALAPI SendStream(const void *, int32_t, bool, bool);
 	int Flush();
 
-	bool ApendEoTPacket()
+	bool AppendEoTPacket(FSPOperationCode op1)
 	{
 		ControlBlock::PFSP_SocketBuf p = pControlBlock->GetSendBuf();
 		if (p == NULL)
 			return false;
-		p->opCode = NULCOMMIT;
+		p->opCode = op1;
 		p->len = 0;
 		p->SetFlag<TransactionEnded>();
 		p->ReInitMarkComplete();
 		MigrateToNewStateOnCommit();
 		return true;
 	}
+	bool AppendEoTPacket() { return AppendEoTPacket(initiatingShutdown ? RELEASE : NULCOMMIT); }
 
 	bool TestSetOnCommit(PVOID fp1)
 	{
@@ -391,6 +394,7 @@ public:
 	{
 		return InterlockedCompareExchangePointer((PVOID *) & fpSent, fp1, NULL) == NULL; 
 	}
+
 
 	int LOCALAPI FinalizeSend(int r)
 	{
@@ -417,10 +421,10 @@ public:
 	int LOCALAPI ReadFrom(void *, int, NotifyOrReturn);
 
 	int Shutdown();
+	int Shutdown(NotifyOrReturn fp1) { fpFinished = fp1; return Shutdown(); }
 
 	void SetCallbackOnRequest(CallbackRequested fp1) { context.onAccepting = fp1; }
 	void SetCallbackOnAccept(CallbackConnected fp1) { context.onAccepted = fp1; }
-	void SetCallbackOnFinish(NotifyOrReturn fp1) { context.onFinish = fp1; }
 
 	void SetNewTransaction() { newTransaction = 1; }
 	void SetEoTPending(bool v = true) { pControlBlock->pendingEoT = v ? 1 : 0; }

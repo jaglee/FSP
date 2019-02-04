@@ -73,7 +73,6 @@ typedef enum
 	FSP_SET_CALLBACK_ON_REQUEST,// CallbackRequested
 	FSP_SET_CALLBACK_ON_CONNECT,// CallbackConnected
 	FSP_GET_PEER_COMMITTED,
-	FSP_SET_CALLBACK_ON_FINISH,	// NotifyOrReturn
 } FSP_ControlCode;
 
 
@@ -168,8 +167,7 @@ struct FSP_SocketParameter
 	CallbackRequested	onAccepting;	// NULL if synchronous accepting, non-NULL if asynchronous
 	CallbackConnected	onAccepted;		// SHOULD be non-NULL for sake of piggybacking payload
 	NotifyOrReturn		onError;		// SHOULD be non-NULL
-	NotifyOrReturn		onFinish;		// NULL if synchronous shutdown, non-NULL if asynchronous 
-	//
+										//
 	const void *	welcome;		// default welcome message, may be NULL
 	unsigned short	len;			// length of the default welcome message
 	union
@@ -399,6 +397,7 @@ int FSPAPI Flush(FSPHANDLE);
 
 // Given
 //	FSPHANDLE		the FSP socket
+//	NotifyOrReturn	the function pointer for call back
 // Return
 //	EDOM warning if the connection is to shutdown prematurely, i.e. it is a RESET actually
 //	EBUSY warning if it is COMMITTING
@@ -409,10 +408,10 @@ int FSPAPI Flush(FSPHANDLE);
 //	-EBUSY if it is still sending asynchronously
 //	-EIO if the shutdown packet cannot be sent
 // Remark
-//	If the pointer of the callback function 'onFinish' is null,
+//	If the pointer of the callback function is null,
 //	it would block the caller until the connection is closed or reset
 DllSpec
-int FSPAPI Shutdown(FSPHANDLE);
+int FSPAPI Shutdown(FSPHANDLE, NotifyOrReturn);
 
 
 // return 0 if no zero, negative if error, positive if warning

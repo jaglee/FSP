@@ -204,15 +204,12 @@ typedef enum: char
 	InitConnection,		// register an initiative socket
 	FSP_Accept,			// accept the connection, make SCB of LLS synchronized with DLL 
 	FSP_Reject,			// a forward command, explicitly reject some request
-	FSP_Recycle,		// a forward command, connection might be aborted
 	FSP_Send,			// send a packet/a group of packets
-	FSP_Shutdown,		// close the connection
 	FSP_InstallKey,		// install the authenticated encryption key
 	FSP_Multiply,		// clone the connection, make SCB of LLS synchronized with DLL
 	// 16~23: LLS to DLL in the backlog
 	FSP_NotifyListening = FSP_Listen,		// a reverse command to signal success execution of FSP_Listen
 	FSP_NotifyAccepting = FSP_Accept,		// a reverse command to make context ready
-	FSP_NotifyRecycled = FSP_Recycle,		// a reverse command to inform DLL to release resource passively
 	FSP_NotifyMultiplied = FSP_Multiply,	// a reverse command to inform DLL to accept a multiply request
 	FSP_NotifyAccepted = 16,
 	FSP_NotifyDataReady,
@@ -221,8 +218,7 @@ typedef enum: char
 	FSP_NotifyFlushed,
 	FSP_NotifyToFinish,
 	FSP_NotifyReset,	// 22: used to be FSP_Dispose
-	// 23: Reserved
-	// 24~31: near end error status
+	FSP_NotifyRecycled,	// 23: used to be reserved; a reverse command to inform DLL to release resource
 	FSP_IPC_CannotReturn = 24,
 	FSP_MemoryCorruption,
 	FSP_NotifyOverflow,

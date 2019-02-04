@@ -242,6 +242,8 @@ void CSocketSrvTLB::PutToListenTLB(CSocketItemEx * p, int k)
 //	Assume having obtained the lock of TLB. Will free the lock in the end.
 void CSocketSrvTLB::FreeItemDonotCareLock(CSocketItemEx *p)
 {
+	p->inUse = 0;
+
 	// if it is allocated by AllocItem(ALFID_T idListener):
 	if(p->IsPassive())
 	{

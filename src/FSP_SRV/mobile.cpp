@@ -904,8 +904,13 @@ bool CSocketItemEx::EmitStart()
 
 		result = SendPacket(1, ScatteredSendBuffers(payload, skb->len));
 		break;
-	case ACK_START:	// ACK_START is an in-band payload-less control packet that confirms and/or commits a transmit transaction
-	case PERSIST:	// PERSIST is an in-band control packet with payload that start a transmit transaction
+	case NULCOMMIT:
+		// NULCOMMIT is an in-band payload-less packet that commits a transmit transaction
+		// NULCOMMIT is alias to ACK_START to confirm ACK_CONNECT_REQ or MULTIPLY as well
+	case PERSIST:
+		// PERSIST is a packet with payload that starts a transmit transaction as well
+	case RELEASE:
+		// RELEASE is an in-band control packet that has both NULCOMMIT and ACK_FLUSH semantics
 		result = EmitWithICC(skb, pControlBlock->sendWindowFirstSN);
 		skb->MarkSent();
 		break;

@@ -386,7 +386,7 @@ struct ICC_Context
 
 
 
-class CSocketItemEx: public CSocketItem
+class CSocketItemEx : public CSocketItem
 {
 	friend class CLowerInterface;
 	friend class CSocketSrvTLB;
@@ -411,7 +411,7 @@ protected:
 	//
 	ICC_Context	contextOfICC;
 	ALIGN(MAC_ALIGNMENT)
-	octet		cipherText[MAX_BLOCK_SIZE];
+		octet		cipherText[MAX_BLOCK_SIZE];
 
 	// multihome/mobility/resilence support (see also CInterface::EnumEffectiveAddresses):
 	// MAX_PHY_INTERFACES is hard-coded to 4
@@ -422,10 +422,10 @@ protected:
 	SOCKADDR_INET	sockAddrTo[MAX_PHY_INTERFACES + 1];
 	FSP_ADDRINFO_EX	tempAddrAccept;
 
+	char	hasAcceptedRELEASE : 1;
+	char	inUse : 1;
 	char	locked;	// emulate spinlock linux-kernel
-	char	inUse;
 	char	transactional;	// The cache value of the EoT flag of the very first packet
-	char	shouldAppendCommit;
 	FSP_Session_State lowState;
 
 	ALFID_T		idParent;
@@ -467,7 +467,7 @@ protected:
 	bool AddLazyAckTimer();
 	bool AddResendTimer();
 
-	// Side-effect: clear the isInUse flag
+	void RecycleTimers();
 	void RemoveTimers();
 
 	bool LOCALAPI ReplaceTimer(uint32_t);
@@ -492,7 +492,8 @@ protected:
 	void SetState(FSP_Session_State s) { _InterlockedExchange8((char *)& pControlBlock->state, s); SyncState(); }
 
 	bool HasBeenCommitted() { return pControlBlock->HasBeenCommitted(); }
-	inline void TransitOnPeerCommit();
+	// Return true if really transit, false if the (half) connection is finised and to notify
+	inline bool TransitOnPeerCommit();
 
 	bool HandlePeerSubnets(PFSP_HeaderSignature);
 
@@ -503,7 +504,6 @@ protected:
 	bool EmitStart();
 	bool SendAckFlush();
 	bool SendKeepAlive();
-	bool SendRelease();
 	void SendReset();
 
 	bool IsNearEndMoved();
@@ -524,9 +524,10 @@ public:
 	//
 	bool WaitUseMutex();
 	void SetMutexFree();
-	bool IsInUse() { return (_InterlockedOr8(& inUse, 0) != 0); }
-	void ClearInUse() { _InterlockedExchange8(&inUse, 0); }
-	bool TestSetInUse() { return (_InterlockedCompareExchange8(& inUse, 1, 0) == 0); }
+	bool IsInUse() { return inUse != 0 && pControlBlock != NULL; }
+	void ClearInUse() { inUse = 0; }
+	bool TestSetInUse() { if (inUse != 0) { return false; } else { inUse = 1; return true; } }
+	//^We need no interlocked bitfield operation because the whole TLB is locked on allocating the socket
 
 	void InstallEphemeralKey();
 	void InstallSessionKey(const CommandInstallKey &);
@@ -569,12 +570,11 @@ public:
 	void SignalEvent() { ::SetEvent(hEvent); }
 	void SignalFirstEvent(FSP_ServiceCode code) { pControlBlock->notices.SetHead(code); ::SetEvent(hEvent); }
 	//
-	int LOCALAPI RespondToSNACK(ControlBlock::seq_t, FSP_SelectiveNACK::GapDescriptor *, int);
+	int LOCALAPI AcceptSNACK(ControlBlock::seq_t, FSP_SelectiveNACK::GapDescriptor *, int);
 	int32_t LOCALAPI GenerateSNACK(FSP_PreparedKEEP_ALIVE &, ControlBlock::seq_t &, int);
 	//
 	void InitiateConnect();
 	void DisposeOnReset();
-	void Recycle();
 	void Reject(uint32_t);
 	void InitiateMultiply(CSocketItemEx *);
 	bool FinalizeMultiply();

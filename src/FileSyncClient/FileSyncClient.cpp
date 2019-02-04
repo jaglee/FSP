@@ -13,23 +13,30 @@
 # define REMOTE_APPLAYER_NAME "E000:AAAA::1"
 #endif
 
-// the reverse socket, count to finish
-extern int32_t ticksToWait;
-extern bool r2finish;
-
 // Branch controllers
-extern int	ToAcceptPushedDirectory(char *);
-extern int	FSPAPI onMultiplying(FSPHANDLE, PFSP_SINKINF, PFSP_IN6_ADDR);
+int BeginReceiveMemoryPattern(FSPHANDLE, size_t);
+int	ToAcceptPushedDirectory(char *);
+int	FSPAPI onMultiplying(FSPHANDLE, PFSP_SINKINF, PFSP_IN6_ADDR);
+
+// A retrieable entry
+int StartConnection(char *);
+
+// A shared global parameter to configure the time to wait the connection multiplication request is sent and acknowledged:
+// by default there is no reverse socket and wait for about 30 seconds to wait one. see also main()
+int32_t ticksToWait;
+bool	r2finish;	// whether the reverse channel is about to finish.
+
+HANDLE	hFinished;
+HANDLE	hFile;		// A shared file descriptor
 
 static unsigned char bufPrivateKey[CRYPTO_NACL_KEYBYTES];
 
 static char fileName[sizeof(TCHAR) * MAX_PATH + 4];
-static HANDLE hFile;
 
+// The signal that the mainloop is finished
 static bool finished;
 
 // Forward declarations
-static int	FSPAPI onConnected(FSPHANDLE, PFSP_Context);
 static void FSPAPI onPublicKeySent(FSPHANDLE, FSP_ServiceCode, int);
 static void FSPAPI onReceiveFileNameReturn(FSPHANDLE, FSP_ServiceCode, int);
 static bool FSPAPI onReceiveNextBlock(FSPHANDLE, void *, int32_t, bool);
@@ -77,76 +84,93 @@ int _tmain(int argc, TCHAR *argv[])
 	char *urlRemote = REMOTE_APPLAYER_NAME;
 #endif
 	Sleep(2000);	// wait the server up when debug simultaneously
-	if(argc == 3)	//  && argv[2] isString "."
+	if (argc == 3)	//  && argv[2] isString "."
 	{
 		result = ToAcceptPushedDirectory(urlRemote);
 		goto l_bailout;
 	}
 
-	FSP_SocketParameter parms;
-	memset(& parms, 0, sizeof(parms));
-	parms.onAccepting = onMultiplying;
-	parms.onAccepted = onConnected;
-	parms.onError = onError;
-	//parms.onFinish == NULL; // On this client side, we test blocking mode
-	//while on server side we test asynchronous mode
-	parms.recvSize = MAX_FSP_SHM_SIZE;
-	parms.sendSize = 0;	// the underlying service would give the minimum, however
-	if(Connect2(urlRemote, & parms) == NULL)
-	{
+	result = StartConnection(urlRemote);
+	if (result < 0)
 		printf("Failed to initialize the connection in the very beginning\n");
-		goto l_bailout;
-	}
 
-	while(ticksToWait-- > 0 && !(finished && r2finish))
-		Sleep(50);	// yield CPU out for about 1/20 second
-
-	if(hFile != NULL && hFile != INVALID_HANDLE_VALUE)
-		CloseHandle(hFile);
-	//
-	result = 0;
-	//
 l_bailout:
-	printf("\n\nTicksToWait = %d, press Enter to exit...", ticksToWait);
+	printf("\n\nPress Enter to exit...");
 	getchar();
-	// Sleep(3000);	// so that the other thread may send RESET successfully
+	// handles are automatically closed on exit
 	exit(result);
 }
 
 
 
-// On connected, send the public key to the remote end. We save the public key
-// temporarily on the stack because we're sure that there is at least one
-// buffer block available and the public key fits in one buffer block 
-static int	FSPAPI  onConnected(FSPHANDLE h, PFSP_Context ctx)
+// On this client side we test blocking mode while on server side we test asynchronous mode
+int StartConnection(char *urlRemote)
 {
-	unsigned char bufPublicKey[CRYPTO_NACL_KEYBYTES];
-	unsigned char bufPeersKey[CRYPTO_NACL_KEYBYTES];
-	unsigned char bufSharedKey[CRYPTO_NACL_KEYBYTES];
+	static size_t	arrayTestSizes[] = { 511, 512, 513
+		, 1023, 1024, 1025
+		, 1536, 2048, 4095
+		, 4096, 4097, 4608
+		, 4609, 1000000, 10000000	// 1MB, 10MB
+		, 100000000, 1000000000		// 100MB, 1GB
+	};
+	static int		indexOfSizeArray;	// start from zero
 
-	printf_s("\nHandle of FSP session: %p", h);
-	if(h == NULL)
-	{
-		printf_s("\n\tConnection failed.\n");
-		r2finish = finished = true;
+	hFinished = CreateEventA(NULL, FALSE, FALSE, NULL);
+	if (hFinished == NULL)
+		return -ENOMEM;	// no resource, actually
+
+	FSP_SocketParameter parms;
+	memset(&parms, 0, sizeof(parms));
+	parms.onAccepting = onMultiplying;
+	// parms.onAccepted = NULL;
+	parms.onError = onError;
+	parms.recvSize = MAX_FSP_SHM_SIZE;
+	parms.sendSize = 0;	// the underlying service would give the minimum, however
+
+l_nextSize:
+	// by default there is no reverse socket and wait for about 30 seconds to wait one.
+#ifndef NDEBUG
+	ticksToWait = 6000;
+#else
+	ticksToWait = 600;
+#endif
+	finished = false;
+	r2finish = true;
+
+	FSPHANDLE h = Connect2(urlRemote, &parms);
+	if (h == NULL)
 		return -1;
-	}
 
+	PFSP_Context ctx = &parms;
 	int mLen = (int)strlen((const char *)ctx->welcome) + 1;
 	printf_s("\tWelcome message length: %d\n", ctx->len);
 	printf_s("%s\n", (char *)ctx->welcome);
-	if(ctx->len <= 0 || mLen >= ctx->len)
+	if (ctx->len <= 0 || mLen >= ctx->len)
 	{
 		printf_s("Security context is not fulfilled: the peer did not provide the public key.\n");
-		printf_s("To read the filename directly...\t");
-		if(ReadFrom(h, fileName, sizeof(fileName), onReceiveFileNameReturn) < 0)
-		{
-			r2finish = finished = true;
-			return -1;
-		}
-		return 0;
+		printf_s("To read the memory pattern directly...\t");
+		//
+		int r = BeginReceiveMemoryPattern(h, arrayTestSizes[indexOfSizeArray]);
+		if (r < 0)
+			return r;
+		//
+		WaitForSingleObject(hFinished, INFINITE);
+		//
+		HANDLE h = InterlockedExchangePointer((PVOID *)& hFile, NULL);
+		if (h != NULL)
+			CloseHandle(h);
+		//
+		if (++indexOfSizeArray >= sizeof(arrayTestSizes) / sizeof(size_t))
+			return 0;
+		goto l_nextSize;
 	}
-	memcpy(bufPeersKey, (const char *)ctx->welcome + mLen, CRYPTO_NACL_KEYBYTES);
+
+	// On connected, send the public key to the remote end. We save the public key
+	// temporarily on the stack because we're sure that there is at least one
+	// buffer block available and the public key fits in one buffer block
+	const octet *bufPeersKey = (const octet *)ctx->welcome + mLen;
+	octet bufPublicKey[CRYPTO_NACL_KEYBYTES];
+	octet bufSharedKey[CRYPTO_NACL_KEYBYTES];
 
 	CryptoNaClKeyPair(bufPublicKey, bufPrivateKey);
 
@@ -160,8 +184,13 @@ static int	FSPAPI  onConnected(FSPHANDLE h, PFSP_Context ctx)
 	printf_s("\tTo install the shared key instantly...\n");
 	InstallMasterKey(h, bufSharedKey, CRYPTO_NACL_KEYBYTES);
 
-	return 0;
+	// Note that WriteTo is called asynchronously
+	while (ticksToWait-- > 0 && !(finished && r2finish))
+		Sleep(50);	// yield CPU out for about 1/20 second
+
+	return (ticksToWait > 0 ? 0 : -ETIMEDOUT);
 }
+
 
 
 
@@ -307,7 +336,7 @@ static void FSPAPI onAcknowledgeSent(FSPHANDLE h, FSP_ServiceCode c, int r)
 	}
 
 	// On server side we test asynchronous mode
-	r = Shutdown(h);
+	r = Shutdown(h, NULL);
 	if(r < 0)
 	{
 		printf_s("Cannot shutdown gracefully in the final stage, error#: %d\n", r);

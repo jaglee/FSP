@@ -222,24 +222,10 @@ void CSocketItemEx::ProcessCommand(CommandToLLS *pCmd)
 {
 	if (!WaitUseMutex())
 	{
-		if (!inUse && pControlBlock != NULL)
-		{
-			SignalFirstEvent(FSP_NotifyRecycled);
-			Destroy();
-		}	// See also Recycle()
-#ifdef TRACE
-		else
-			printf_s("ProcessCommand of socket %p: possible dead-lock\n"
-				"\tin state %s, inUse = %d\n", this, stateNames[lowState], inUse);
-#endif
-		return;
-	}
-
-	if (pControlBlock == NULL)
-	{
-#ifdef TRACE
-		printf_s("Socket(%p) is not in working, cache state is  %s[%d]\n", this, stateNames[lowState], lowState);
-#endif
+		printf_s("Socket %p[fiber#%u] in state %s: process command %s[%d]\n"
+			"probably encountered dead-lock: inUse = %d, pSCB: %p\n"
+			, this, fidPair.source, stateNames[lowState], noticeNames[pCmd->opCode], pCmd->opCode
+			, inUse, pControlBlock);
 		return;
 	}
 
@@ -262,27 +248,23 @@ void CSocketItemEx::ProcessCommand(CommandToLLS *pCmd)
 #ifdef TRACE
 		printf_s("Socket(%p) is in an absurd state %d\n", this, lowState);
 #endif
-		Recycle();
+		Destroy();
 		return;
 	}
 
 	switch(pCmd->opCode)
 	{
 	case FSP_Reject:
+		if (IsPassive())
+		{
+			SignalFirstEvent(FSP_NotifyRecycled);
+			Destroy();
+			break;
+		}
 		Reject(((CommandRejectRequest *)pCmd)->reasonCode);
-		break;
-	case FSP_Recycle:
-		Recycle();
 		break;
 	case FSP_Send:			// send a packet/group of packets
 		EmitQ();
-		break;
-	case FSP_Shutdown:
-		// Send RELEASE to the remote end
-		if (prevState == PRE_CLOSED)
-			return;			// Refuse to send redundant RELEASE packet
-		ReplaceTimer(TRANSIENT_STATE_TIMEOUT_ms);
-		SendRelease();
 		break;
 	case FSP_InstallKey:
 		InstallSessionKey((CommandInstallKey &)*pCmd);
@@ -356,29 +338,6 @@ void CSocketItemEx::Connect()
 	InitAssociation();
 	InitiateConnect();
 	// Only after ACK_CONNECT_REQ received may it 'SignalReturned();'
-}
-
-
-
-// Recycle the socket, send RESET to the remote peer if not in CLOSED state
-void CSocketItemEx::Recycle()
-{
-	if (!IsInUse())
-		return;
-	//
-#if (TRACE & TRACE_ULACALL)
-	printf_s("Recycle called in %s(%d) state\n", stateNames[lowState], lowState);
-#endif
-	// It is legitimate to recycle in PRE_CLOSED state unilaterally to support timeout in the upper layer
-	if (lowState == CHALLENGING || lowState == CONNECT_AFFIRMING)
-		CLowerInterface::Singleton.SendPrematureReset(EINTR, this);
-	else if (lowState != CLOSED && lowState != LISTENING && lowState != PRE_CLOSED)
-		SendReset();
-
-	// Donot [pControlBlock->state = NON_EXISTENT;] as the ULA might do further cleanup
-	// See also RejectOrReset, Destroy and @DLL::RespondToRecycle
-	SignalFirstEvent(FSP_NotifyRecycled);
-	Destroy();
 }
 
 

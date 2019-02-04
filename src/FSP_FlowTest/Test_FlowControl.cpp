@@ -23,7 +23,7 @@ void FlowTestAcknowledge()
 	pSCB->sendWindowFirstSN = FIRST_SN;
 	pSCB->sendWindowLimitSN = FIRST_SN + MAX_BLOCK_NUM;
 	// Pretend that the first packet has been sent and is waiting acknowledgement...
-	int r = socket.RespondToSNACK(FIRST_SN + 1, NULL, 0);
+	int r = socket.AcceptSNACK(FIRST_SN + 1, NULL, 0);
 	assert(r == 1 && pSCB->sendBufferNextSN == pSCB->sendWindowFirstSN);
 	assert(pSCB->sendWindowFirstSN == FIRST_SN + 1);
 	assert(pSCB->sendWindowNextSN == FIRST_SN + 1);
@@ -42,7 +42,7 @@ void FlowTestAcknowledge()
 	assert(pSCB->sendBufferNextSN == FIRST_SN + 3);
 
 	// A NULL acknowledgement, Keep-Alive
-	r = socket.RespondToSNACK(FIRST_SN, NULL, 0);
+	r = socket.AcceptSNACK(FIRST_SN, NULL, 0);
 	assert(r == 0 && pSCB->sendWindowFirstSN == FIRST_SN);
 
 	// emulate sending, assume 3 packets sent
@@ -50,7 +50,7 @@ void FlowTestAcknowledge()
 	assert(pSCB->sendWindowNextSN == FIRST_SN + 3);
 
 	// acknowledge the first two
-	r = socket.RespondToSNACK(FIRST_SN + 2, NULL, 0);
+	r = socket.AcceptSNACK(FIRST_SN + 2, NULL, 0);
 	assert(r == 2 && pSCB->sendWindowFirstSN == FIRST_SN + 2);
 	assert(pSCB->CountSentInFlight() >= 0);
 
@@ -77,16 +77,16 @@ void FlowTestAcknowledge()
 	gaps[0].dataLength = htobe32(1);
 	gaps[0].gapWidth = htobe32(1);
 	//// this is an illegal one	// now it is perfectly OK
-	//r = socket.RespondToSNACK(FIRST_SN, gaps, 1);
+	//r = socket.AcceptSNACK(FIRST_SN, gaps, 1);
 	//assert(r == -EBADF && pSCB->sendWindowFirstSN == FIRST_SN + 2);
 	//assert(pSCB->CountUnacknowledged() >= 0);
 	//// again, an outdated one
-	//r = socket.RespondToSNACK(FIRST_SN + 2, gaps, 1);
+	//r = socket.AcceptSNACK(FIRST_SN + 2, gaps, 1);
 	//assert(r == -EDOM && pSCB->sendWindowFirstSN == FIRST_SN + 2);
 	//assert(pSCB->CountUnacknowledged() >= 0);
 
 	// this is a legal one: the first two has been acknowledged; the 3rd and the 5th is to be acknowledged
-	r = socket.RespondToSNACK(FIRST_SN + 3, gaps, 1);
+	r = socket.AcceptSNACK(FIRST_SN + 3, gaps, 1);
 	assert(r == 1 && pSCB->sendWindowFirstSN == FIRST_SN + 3);	// used to be r == 2
 	assert(pSCB->CountSentInFlight() >= 0);
 
@@ -95,7 +95,7 @@ void FlowTestAcknowledge()
 	gaps[0].gapWidth = htobe32(1);
 	gaps[1].dataLength = htobe32(1);
 	gaps[1].gapWidth = htobe32(1);
-	r = socket.RespondToSNACK(FIRST_SN + 3, gaps, 2);
+	r = socket.AcceptSNACK(FIRST_SN + 3, gaps, 2);
 	assert(r == 0 && pSCB->sendWindowFirstSN == FIRST_SN + 3);	// used to be r == 1
 	assert(pSCB->CountSentInFlight() >= 0);
 
@@ -104,7 +104,7 @@ void FlowTestAcknowledge()
 	gaps[0].gapWidth = htobe32(1);
 	gaps[1].dataLength = htobe32(1);
 	gaps[1].gapWidth = htobe32(1);
-	r = socket.RespondToSNACK(FIRST_SN + 3, gaps, 2);
+	r = socket.AcceptSNACK(FIRST_SN + 3, gaps, 2);
 	assert(r == 0 && pSCB->sendWindowFirstSN == FIRST_SN + 3);
 	assert(pSCB->CountSentInFlight() >= 0);
 
@@ -113,7 +113,7 @@ void FlowTestAcknowledge()
 	gaps[0].gapWidth = htobe32(1);
 	gaps[1].dataLength = htobe32(1);
 	gaps[1].gapWidth = htobe32(1);
-	r = socket.RespondToSNACK(FIRST_SN + 5, gaps, 2);
+	r = socket.AcceptSNACK(FIRST_SN + 5, gaps, 2);
 	assert(r == 2 && pSCB->sendWindowFirstSN == FIRST_SN + 5);
 	assert(pSCB->CountSentInFlight() >= 0);
 
@@ -123,9 +123,9 @@ void FlowTestAcknowledge()
 	gaps[0].gapWidth = htobe32(1);
 	gaps[1].dataLength = htobe32(1);
 	gaps[1].gapWidth = htobe32(1);
-	r = socket.RespondToSNACK(FIRST_SN + 0x1000A, gaps, 2);	
+	r = socket.AcceptSNACK(FIRST_SN + 0x1000A, gaps, 2);	
 	//^ but the expectedSN is impossible for the small sending window!
-	printf_s("RespondToSNACK(FIRST_SN + 0x1000A, gaps, 2):\n"
+	printf_s("AcceptSNACK(FIRST_SN + 0x1000A, gaps, 2):\n"
 		"\tnAck = %d, CountSentInFlight() = %d\n"
 		"\tsendWindowHeadPos = %d, sendWindowFirstSN = %u, sendWindowLimitSN = %u\n"
 		, r, pSCB->CountSentInFlight()
@@ -147,8 +147,8 @@ void FlowTestAcknowledge()
 	gaps[0].gapWidth = htobe32(1);
 	gaps[1].dataLength = htobe32(1);
 	gaps[1].gapWidth = htobe32(1);
-	r = socket.RespondToSNACK(FIRST_SN + MAX_BLOCK_NUM_L + 0xF000, gaps, 2);
-	printf_s("RespondToSNACK(FIRST_SN + MAX_BLOCK_NUM_L + 0xF000, gaps, 2):\n"
+	r = socket.AcceptSNACK(FIRST_SN + MAX_BLOCK_NUM_L + 0xF000, gaps, 2);
+	printf_s("AcceptSNACK(FIRST_SN + MAX_BLOCK_NUM_L + 0xF000, gaps, 2):\n"
 		"\tnAck = %d, CountSentInFlight() = %d\n"
 		"\tsendWindowHeadPos = %d, sendWindowFirstSN = %u, sendWindowLimitSN = %u\n"
 		, r, pSCB->CountSentInFlight()
@@ -229,7 +229,7 @@ void PrepareFlowTestResend(CSocketItemExDbg & dbgSocket, PControlBlock & pSCB)
  * GetSendBuf
  * AllocRecvBuf
  * GetSelectiveNACK
- * RespondToSNACK
+ * AcceptSNACK
  */
 void FlowTestRetransmission()
 {
@@ -273,7 +273,7 @@ void FlowTestRetransmission()
 
 	assert(seq5 == seq4 && n == 1);
 
-	dbgSocket.RespondToSNACK(seq5, snack, n);
+	dbgSocket.AcceptSNACK(seq5, snack, n);
 	dbgSocket.TestSetInUse();
 	dbgSocket.DoResend();
 
@@ -322,7 +322,7 @@ void FlowTestRetransmission()
 
 	assert(seq5 == seq4 && n == 1);
 
-	dbgSocket.RespondToSNACK(seq5, snack, n);
+	dbgSocket.AcceptSNACK(seq5, snack, n);
 	dbgSocket.TestSetInUse();
 	dbgSocket.DoResend();
 

@@ -3,16 +3,8 @@
  */
 #include "stdafx.h"
 
-
-// A shared global parameter to configure the time to wait the connection multiplication request is sent and acknowledged:
-// by default there is no reverse socket and wait for about 30 seconds to wait one. see also main()
-#ifdef NDEBUG
-int32_t ticksToWait = 600;
-#else
-int32_t ticksToWait = 6000;
-#endif
-// 50ms per tick.
-bool	r2finish = true;
+extern int32_t ticksToWait;
+extern bool r2finish;
 
 // The call back function to be executed when the clone connection is closed
 static void FSPAPI onShutdown(FSPHANDLE hRev, FSP_ServiceCode code, int value)
@@ -20,6 +12,7 @@ static void FSPAPI onShutdown(FSPHANDLE hRev, FSP_ServiceCode code, int value)
 	printf_s("Clone session, socket %p has been shutdown.\n", hRev);
 	if(code != FSP_NotifyRecycled)
 		printf_s("Should got ON_RECYCLED, but service code = %d, return %d\n", code, value);
+	//
 	r2finish = true;
 	return;
 }
@@ -33,7 +26,7 @@ static bool FSPAPI onSignatureReceived(FSPHANDLE hRev, void * buf, int32_t lengt
 	if(buf != NULL)
 		printf_s("%s\n", (CHAR *)buf);
 	// assert(eot);
-	Shutdown(hRev);
+	Shutdown(hRev, NULL);
 	return false;
 }
 
@@ -50,7 +43,6 @@ int	FSPAPI onMultiplying(FSPHANDLE hRev, PFSP_SINKINF p, PFSP_IN6_ADDR remoteAdd
 	// no be32toh() for local; note that for IPv6 network, little-endian CPU, the peer's remoteAddr->idALF wouldn't match it
 	printf_s("Remote address: 0x%llX::%X::%X\n", be64toh(remoteAddr->subnet), be32toh(remoteAddr->idHost), be32toh(remoteAddr->idALF));
 
-	FSPControl(hRev, FSP_SET_CALLBACK_ON_FINISH, (ulong_ptr)onShutdown);
 	RecvInline(hRev, onSignatureReceived);
 	return 0;	// no opposition
 }

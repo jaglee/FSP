@@ -330,17 +330,8 @@ CSocketItemDl * LOCALAPI CSocketItemDl::CallCreate(CommandNewSession & objComman
 //	Dispose the DLL FSP socket resource if to return false
 bool CSocketItemDl::LockAndValidate()
 {
-	if(! WaitUseMutex())
+	if (!WaitUseMutex())
 		return false;
-
-	if(pControlBlock == NULL)
-	{
-#ifndef NDEBUG
-		printf_s("\nDescriptor#%p: event to be processed, but the Control Block is missing!\n", this);
-#endif
-		DisableAndNotify(FSP_NotifyReset, EBADF);
-		return false;
-	}
 
 	if(InIllegalState())
 	{
@@ -376,21 +367,8 @@ void CSocketItemDl::WaitEventToDispatch()
 			, fidPair.source, be32toh(fidPair.source)
 			, stateNames[pControlBlock->state], noticeNames[notice]);
 #endif
-		// If recycled or in the state not earlier than ToFinish, LLS should have recyle the session context mapping already
-		if(notice == FSP_NotifyRecycled || notice >= FSP_NotifyToFinish)
+		if(notice > FSP_NotifyToFinish)
 			lowerLayerRecycled = 1;
-		// Initially lowerLayerRecycled is 0 and it is never reset
-		if(! IsInUse() && lowerLayerRecycled != 0)
-		{
-#ifndef NDEBUG
-			printf_s(
-				"\nEvent to be processed, but the socket has been recycled!?\n"
-				"\tdescriptor=%p, state: %s[%d]\n"
-				, this, stateNames[pControlBlock->state], pControlBlock->state);
-#endif
-			DisableAndNotify(FSP_NotifyReset, EBADF);
-			break;
-		}
 		//
 		FSP_Session_State s0;
 		NotifyOrReturn fp1;
@@ -446,7 +424,8 @@ void CSocketItemDl::WaitEventToDispatch()
 			if (InState(CLOSABLE) && initiatingShutdown)
 			{
 				SetState(PRE_CLOSED);
-				Call<FSP_Shutdown>();
+				AppendEoTPacket();
+				Call<FSP_Send>();
 			}
 			SetMutexFree();
 			break;
@@ -458,13 +437,14 @@ void CSocketItemDl::WaitEventToDispatch()
 			if (InState(CLOSABLE) && initiatingShutdown)
 			{
 				SetState(PRE_CLOSED);
-				Call<FSP_Shutdown>();
+				AppendEoTPacket();
+				Call<FSP_Send>();
 				SetMutexFree();
 			}
 			else
 			{
 				fp1 = NULL;
-				if (InState(COMMITTED) || pControlBlock->state >= CLOSABLE)
+				if (InState(COMMITTED) || GetState() >= CLOSABLE)
 					fp1 = (NotifyOrReturn)InterlockedExchangePointer((PVOID *)& fpCommitted, fp1);
 				CancelTimeout();// If any
 				SetMutexFree();
@@ -473,29 +453,38 @@ void CSocketItemDl::WaitEventToDispatch()
 			}
 			break;
 		case FSP_NotifyToFinish:
-			fp1 = context.onFinish;	// For security reason recycle MAY reset context
+			// See also @LLS::OnGetRelease
+			s0 = GetState();
+			SetState(CLOSED);
 			if(initiatingShutdown)
 			{
+				fp1 = fpFinished;
 				RecycLocked();		// CancelTimer(); SetMutexFree();
 				if (fp1 != NULL)
 					fp1(this, FSP_NotifyRecycled, 0);
 			}
 			else
 			{
-				SetMutexFree();
-				if (fp1 != NULL)
-					fp1(this, FSP_NotifyToFinish, 0);
+#ifndef NDEBUG
+				printf_s("Fiber#%u, reactive shutdown pended in state %s[%d]\n"
+					, this->fidPair.source, stateNames[s0], s0);
+				// ULA shall eventually call shutdown or dispose
+#endif
+				if (s0 == COMMITTING || s0 == COMMITTED)
+					ProcessReceiveBuffer();	// SetMutexFree();
+				else
+					SetMutexFree();
 			}
 			break;
 		case FSP_NotifyRecycled:
 			fp1 = context.onError;
 			RecycLocked();		// CancelTimer(); SetMutexFree();
 			if (!initiatingShutdown && fp1 != NULL)
-				fp1(this, notice, -EINTR);
+				fp1(this, notice, 0);
 			return;
 		case FSP_IPC_CannotReturn:
-			s0 = pControlBlock->state;
 			fp1 = context.onError;
+			s0 = GetState();
 			RecycLocked();		// CancelTimer(); SetMutexFree();
 			if(fp1 == NULL)
 				return;
@@ -515,6 +504,9 @@ void CSocketItemDl::WaitEventToDispatch()
 			// UNRESOLVED!? There could be some remedy if name resolution failed?
 		}
 	}
+	//
+	if (pControlBlock == NULL)
+		Disable();
 }
 
 
@@ -647,11 +639,11 @@ bool CSocketItemDl::CancelTimeout()
 
 
 // The function called back as soon as the one-shot timer counts down to 0
-// See also Recycle
+// Suppose that the lower layer recycle LRU
 void CSocketItemDl::TimeOut()
 {
 	BOOLEAN b = TryAcquireSRWLockExclusive(&rtSRWLock);
-	if (!IsInUse() || pControlBlock == NULL)
+	if (!IsInUse())
 	{
 		if(b)
 			SetMutexFree();
@@ -666,9 +658,6 @@ void CSocketItemDl::TimeOut()
 		return;
 	}
 
-	if (! lowerLayerRecycled)
-		Call<FSP_Recycle>();
-
 	DisableAndNotify(FSP_NotifyTimeout, ETIMEDOUT);
 }
 
@@ -679,8 +668,6 @@ void CSocketItemDl::PollingTimedout()
 	if (!TryAcquireSRWLockExclusive(&rtSRWLock))
 		return;	// Patiently wait the next time slice instead to spin here
 
-	if (pControlBlock == NULL)
-		return;
 	if (!IsInUse() || InIllegalState())
 		return;
 
@@ -720,7 +707,7 @@ CSocketItemDl *	CSocketDLLTLB::HandleToRegisteredSocket(FSPHANDLE h)
 	for(register int i = 0; i < MAX_CONNECTION_NUM; i++)
 	{
 		if (CSocketItemDl::socketsTLB.pSockets[i] == p)
-			return ((p->pControlBlock == NULL || p->InIllegalState()) ? NULL : p);
+			return ((!p->IsInUse() || p->InIllegalState()) ? NULL : p);
 	}
 	//
 	return NULL;
@@ -754,7 +741,7 @@ CSocketItemDl * CSocketDLLTLB::AllocItem()
 		for(register int i = 0; i < sizeOfWorkSet; i++)
 		{
 			register int j = 0;
-			while(! pSockets[i + j]->IsInUse())
+			while(! pSockets[i + j]->inUse)	// UNRESOLVED!?
 				j++;
 			if(j == 0)
 				continue;

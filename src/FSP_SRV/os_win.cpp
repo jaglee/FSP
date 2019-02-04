@@ -1197,7 +1197,6 @@ bool CSocketItemEx::AddLazyAckTimer()
 // Assume a mutex has been obtained
 void CSocketItemEx::RemoveTimers()
 {
-	ClearInUse();
 	HANDLE h;
 	if ((h = (HANDLE)InterlockedExchangePointer(&lazyAckTimer, NULL)) != NULL)
 		::DeleteTimerQueueTimer(TimerWheel::Singleton(), h, NULL);
@@ -1207,9 +1206,23 @@ void CSocketItemEx::RemoveTimers()
 
 	if((h = (HANDLE)InterlockedExchangePointer(& timer, NULL)) != NULL)
 		::DeleteTimerQueueTimer(TimerWheel::Singleton(), h, NULL);
-
 }
 
+
+
+// Assume a mutex has been obtained
+void CSocketItemEx::RecycleTimers()
+{
+	HANDLE h;
+	if ((h = (HANDLE)InterlockedExchangePointer(&lazyAckTimer, NULL)) != NULL)
+		::DeleteTimerQueueTimer(TimerWheel::Singleton(), h, NULL);
+
+	if ((h = (HANDLE)InterlockedExchangePointer(&resendTimer, NULL)) != NULL)
+		::DeleteTimerQueueTimer(TimerWheel::Singleton(), h, NULL);
+
+	if (timer != NULL)
+		::ChangeTimerQueueTimer(TimerWheel::Singleton(), timer, RECYCLABLE_TIMEOUT_ms, RECYCLABLE_TIMEOUT_ms);
+}
 
 
 // The OS-depending implementation of scheduling connection-request queue

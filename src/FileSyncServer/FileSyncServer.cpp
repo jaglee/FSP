@@ -1,5 +1,5 @@
 /**
-  Usage 1, transfer a non-encrypted memory pattern to the remote end: <FileSyncServer>
+  Usage 1, transfer non-encrypted memory patterns to the remote end on request: <FileSyncServer>
   Usage 2, transfer an encrypted memory pattern to the remot end: <FileSyncServer> $memory.^ [length-of-memory-pattern]
   Usage 3, transfer the name and content of a given file: <FileSyncServer> filename
   Usage 4, act as the prototyped file server for the Simple Artcrafted Web Site in the given work path: <FileSyncServer> pathname 
@@ -37,14 +37,9 @@ void FSPAPI onNotice(FSPHANDLE h, FSP_ServiceCode code, int value)
 
 
 // The function called back when an FSP connection was released. Parameters are self-describing
-void FSPAPI onFinish(FSPHANDLE h, FSP_ServiceCode code, int)
+static void FSPAPI onFinish(FSPHANDLE h, FSP_ServiceCode code, int)
 {
 	printf_s("Socket %p, session was to shut down, service code = %d.\n", h, code);
-	if(code == FSP_NotifyToFinish)
-	{
-		FSPControl(h, FSP_SET_CALLBACK_ON_FINISH, NULL);
-		Shutdown(h);
-	}
 	finished = true;
 	return;
 }
@@ -64,7 +59,6 @@ void FSPAPI WaitConnection(const char *thisWelcome, unsigned short mLen, Callbac
 	params.onAccepting = onAccepting;
 	params.onAccepted = onAccepted;
 	params.onError = onNotice;
-	params.onFinish = onFinish;
 	params.welcome = thisWelcome;
 	params.len = mLen;
 	params.sendSize = MAX_FSP_SHM_SIZE;
@@ -106,8 +100,7 @@ int _tmain(int argc, TCHAR * argv[])
 
 	if(argc == 1)
 	{
-		_tcscpy_s(fileName, MAX_PATH, _T("$memory.^"));
-		SendMemoryPattern();
+		WaitConnection(defaultWelcome, (uint16_t)strlen(defaultWelcome) + 1, WeakSecurity_onAccepted);
 		goto l_return;
 	}
 	
@@ -133,7 +126,7 @@ int _tmain(int argc, TCHAR * argv[])
 			if(!PrepareMemoryPattern(sizeOfBuffer))
 				goto l_return;
 		}
-		else if(! PrepareMemoryPattern(TEST_MEM_SIZE))
+		else if(! PrepareMemoryPattern(FSP_MAX_KEY_SIZE))	// Just send a key
 		{
 			goto l_return;
 		}
@@ -306,7 +299,7 @@ l_bailout:
 	}
 
 	printf_s("Response received: %s. To shutdown.\n", linebuf);
-	if(Shutdown(h) < 0)
+	if (Shutdown(h, onFinish) < 0)
 	{
 		printf_s("What? Cannot shutdown gracefully!\n");
 		goto l_bailout;
