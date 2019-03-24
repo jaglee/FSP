@@ -72,10 +72,10 @@ typedef ALFID_T	 ULTID_T;
 //	if a single packet size limit is 2^17, invocations shall be limited to 2^29 for 64 bit tags
 //	As an FSP packet may not exceed 2^16 octets, and because out-of-band packet consume invocation space as well
 //	we infer that maximum sequence number consumed on either direction shall be limit to 2^29
-//	If rekeying occurs more frequently than the length of the send queue
+//	If re-keying occurs more frequently than the length of the send queue
 //	earliest packet that shall be retransmitted may always be rejected
 //	because this implementation only store one historical key
-//	while the earliest packet require ealiear key than stored
+//	while the earliest packet require earlier key than stored
 //	The macro might be defined on command line for purpose of boundary test
 #ifndef  FSP_REKEY_THRESHOLD
 # define FSP_REKEY_THRESHOLD	0x20000000
@@ -88,11 +88,9 @@ typedef ALFID_T	 ULTID_T;
 // In debug mode we allow pre-definition via compiler's command-line option
 #ifdef _DEBUG
 # define INIT_RETRANSMIT_TIMEOUT_ms		60000	// 1 minute
-# define RECYCLABLE_TIMEOUT_ms			300000	// 5 minutes
 # define TRANSIENT_STATE_TIMEOUT_ms		300000	// 5 minutes
 #else
 # define INIT_RETRANSMIT_TIMEOUT_ms		15000	// 15 seconds
-# define RECYCLABLE_TIMEOUT_ms			3600000	// 1 hour
 # define TRANSIENT_STATE_TIMEOUT_ms		60000	// 1 minute
 #endif
 
@@ -100,7 +98,6 @@ typedef ALFID_T	 ULTID_T;
 //^time-out for committing a transmit transaction starting from last acknowledgement,
 // not from start of the transaction. Should be larger than the Maximum Segment Life
 #define CLOSING_TIME_WAIT_ms			120000	// 2 minutes
-#define LAZY_ACK_DELAY_MIN_us			5120	// 5 millisecond (after shifted 10 bits right)
 #define KEEP_ALIVE_TIMEOUT_ms			600000	// 10 minutes
 #define SESSION_IDLE_TIMEOUT_us			(4*3600*1000000ULL)	// 4 hours
 
@@ -118,7 +115,7 @@ typedef ALFID_T	 ULTID_T;
 	EBADF		Near end only: given socket handle is invalid
 	ECHILD		-
 	EAGAIN		-
-	ENOMEM		Near end only: no mememory
+	ENOMEM		Near end only: no memory
 	EACCES		Memory access out of border
 	EFAULT		General fault
 	EBUSY		Near end only: the underlying socket is busy, new service request may not be accepted
@@ -131,7 +128,7 @@ typedef ALFID_T	 ULTID_T;
 typedef enum _FSP_Session_State: char
 {
 	NON_EXISTENT = 0, 
-	// the passiver listener to folk new connection handle:
+	// the passive listener to folk new connection handle:
 	LISTENING,
 	// initiative, after sending initiator's check code, before getting responder's cookie
 	// timeout to retry or NON_EXISTENT:
@@ -175,7 +172,7 @@ typedef enum _FSP_Operation_Code : char
 	CONNECT_REQUEST,
 	ACK_CONNECT_REQ,	// may piggyback payload
 	RESET,
-	NULCOMMIT,	// Payloadless trasmit transaction commitment
+	NULCOMMIT,	// Payloadless transmit transaction commitment
 	PURE_DATA,	// Without any optional header
 	PERSIST,	// Start a new transmit transaction, while EoT flag make it transactional
 	ACK_FLUSH,
@@ -189,7 +186,7 @@ typedef enum _FSP_Operation_Code : char
 	PEER_SUBNETS = 16,
 	SELECTIVE_NACK,
 	ACK_START = NULCOMMIT,
-	//^Inband acknowledgement to CLONE or ACK_CONNECT_REQUEST if no data to send back.
+	//^In-band acknowledgement to CLONE or ACK_CONNECT_REQUEST if no data to send back.
 	LARGEST_OP_CODE = SELECTIVE_NACK
 } FSPOperationCode;
 
@@ -204,7 +201,8 @@ typedef enum: char
 	InitConnection,		// register an initiative socket
 	FSP_Accept,			// accept the connection, make SCB of LLS synchronized with DLL 
 	FSP_Reject,			// a forward command, explicitly reject some request
-	FSP_Send,			// send a packet/a group of packets
+	FSP_Start,
+	FSP_Urge = FSP_Start,
 	FSP_InstallKey,		// install the authenticated encryption key
 	FSP_Multiply,		// clone the connection, make SCB of LLS synchronized with DLL
 	// 16~23: LLS to DLL in the backlog
@@ -229,7 +227,7 @@ typedef enum: char
 
 
 
-// the number of microsecond elapsed since Midnight January 1, 1970 UTC (unix epoch)
+// the number of microsecond elapsed since Midnight January 1, 1970 UTC (Unix epoch)
 typedef uint64_t timestamp_t;
 
 // the typeof the subnets field of some structures

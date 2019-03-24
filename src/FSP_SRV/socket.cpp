@@ -31,7 +31,7 @@
 #include <assert.h>
 
 
-// Translation-Lookaside-Buffer of the Service Sockets, the constructor
+// Translation-Look-aside-Buffer of the Service Sockets, the constructor
 CSocketSrvTLB::CSocketSrvTLB()
 {
 	memset(listenerSlots, 0, sizeof(listenerSlots));
@@ -76,16 +76,19 @@ bool CSocketSrvTLB::PutToScavengeCache(CSocketItemEx *pSocket, timestamp_t tNow)
 CSocketItemEx * CSocketSrvTLB::AllocItem()
 {
 	CSocketItemEx *p;
-	register int i;
 
 	AcquireMutex();
 
 	if (headFreeSID != NULL && headFreeSID->TestSetInUse())
 		goto l_success;
-
+#if 1
+	ReleaseMutex();
+	return NULL;
 	// For a heavy duty server it might be beneficial to throttle the request by waiting for free socket
+#else
 	// as this is a prototype is not bothered to exploit hash table
 	// recycle all of the orphan sockets
+	register int i;
 	for (i = 0, p = itemStorage; i < MAX_CONNECTION_NUM; i++, p++)
 	{
 		if (!p->IsProcessAlive())
@@ -137,6 +140,7 @@ CSocketItemEx * CSocketSrvTLB::AllocItem()
 	p1->WaitUseMutex();		// it is throttling!
 	p1->AbortLLS(true);
 	assert(headFreeSID != NULL);
+#endif
 
 l_success:
 	p = headFreeSID;
@@ -152,7 +156,7 @@ l_success:
 
 
 
-// registeration of passive socket: it is assumed that performance is out of question for a conceptual prototype
+// registration of passive socket: it is assumed that performance is out of question for a conceptual prototype
 // allocate in the listeners' socket space
 CSocketItemEx * CSocketSrvTLB::AllocItem(ALFID_T idListener)
 {
@@ -208,7 +212,7 @@ CSocketItemEx * CSocketSrvTLB::AllocItem(ALFID_T idListener)
 
 // Given
 //	CSocketItemEx *		pointer to the socket item to be inserted, might be updated
-//	int					the'compressed' hash key for searching the socket item
+//	int					the 'compressed' hash key for searching the socket item
 // Do
 //	Insert the given socket item into the translation-look-aside buffer of listening sockets
 void CSocketSrvTLB::PutToListenTLB(CSocketItemEx * p, int k)
@@ -223,7 +227,7 @@ void CSocketSrvTLB::PutToListenTLB(CSocketItemEx * p, int k)
 		//
 		if (p->fidPair.source == p1->fidPair.source)
 		{
-			REPORT_ERRMSG_ON_TRACE("collision found when put sockt into sockets TLB");
+			REPORT_ERRMSG_ON_TRACE("collision found when putting socket into sockets TLB");
 			return;
 		}
 	}
@@ -323,7 +327,7 @@ CSocketItemEx * CSocketSrvTLB::AllocItem(const CommandNewSessionSrv & cmd)
 	CSocketItemEx *p = (*this)[cmd.fiberID];
 	if(p != NULL)
 	{
-		// We allow a socket slot waiting scavenge to be reused ealier than recycled. See also KeepAlive
+		// We allow a socket slot waiting scavenge to be reused earlier than recycled. See also KeepAlive
 		if(!p->TestSetInUse() && p->lowState != NON_EXISTENT)
 		{
 			p = NULL;
@@ -471,7 +475,7 @@ void CSocketItemEx::SetRemoteFiberID(ALFID_T id)
 // Clone the control block whose handle is passed by the command and bind the interfaces
 // Initialize near and remote fiber ID as well
 // Return
-//	true if suceeded
+//	true if succeeded
 //	false if failed
 bool CSocketItemEx::MapControlBlock(const CommandNewSessionSrv &cmd)
 {
@@ -626,12 +630,12 @@ int32_t LOCALAPI CSocketItemEx::GenerateSNACK(FSP_PreparedKEEP_ALIVE &buf, Contr
 	// built-in rule: an optional header MUST be 64-bit aligned
 	register FSP_SelectiveNACK *pSNACK = (FSP_SelectiveNACK *)(gaps + n);
 	// TODO: to minimize internal state to save
-	// record the receive time of the most recently receivd packet
-	register int32_t k = int32_t(seq0 - pControlBlock->recvWindowFirstSN) - 1;
+	// record the receive time of the most recently received packet
+	register int32_t k = int32_t(seq0 - GetRecvWindowFirstSN()) - 1;
 	if (k >= 0)
 	{
 		ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadRecv();
-		k += pControlBlock->recvWindowHeadPos;
+		k += GetRecvWindowHeadPos();
 		if (k - pControlBlock->recvBufferBlockN >= 0)
 			k -= pControlBlock->recvBufferBlockN;
 		if (k >= pControlBlock->recvBufferBlockN)
@@ -714,7 +718,7 @@ void CSocketItemEx::InitiateConnect()
 //	Because CONNECT_REQUEST overlays INIT_CONNECT these three fields are reused: timeStamp, initCheckCode, salt
 // It is assumed that exclusive access to the socket has been gained
 // Safely suppose that internal processing takes orders of magnitude less time than network propagation
-// TODO: UNRESOLVED! For FSP over IPv6, attach inititator's resource reservation...
+// TODO: UNRESOLVED! For FSP over IPv6, attach initiator's resource reservation...
 void CSocketItemEx::AffirmConnect(const SConnectParam & initState, ALFID_T idListener)
 {
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend(); // Reuse what's occupied by INIT_CONNECT
@@ -790,7 +794,7 @@ void CSocketItemEx::InitiateMultiply(CSocketItemEx *srcItem)
 	ALIGN(MAC_ALIGNMENT) FSP_InternalFixedHeader q;
 	lastOOBSN = 0;	// As the response from the peer, if any, is not an out-of-band packet
 
-	pControlBlock->SignHeaderWith(&q, MULTIPLY, sizeof(FSP_NormalPacketHeader), seq0, pControlBlock->recvWindowFirstSN);
+	pControlBlock->SignHeaderWith(&q, MULTIPLY, sizeof(FSP_NormalPacketHeader), seq0, GetRecvWindowFirstSN());
 	skb->CopyFlagsTo(& q);
 	// Do not mess with 'salt'. New value has to be set after ICC is got
 	void * paidLoad = SetIntegrityCheckCode(& q, payload, skb->len, salt);
@@ -865,7 +869,7 @@ bool CSocketItemEx::FinalizeMultiply()
 // See also OnGetMultiply(), @DLL::PrepareToAccept, ToWelcomeMultiply
 void CMultiplyBacklogItem::ResponseToMultiply()
 {
-	ControlBlock::PFSP_SocketBuf skb = pControlBlock->GetFirstReceived();
+	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadRecv() + GetRecvWindowHeadPos();
 	// if (!CheckMemoryBorder(skb)) throw -EFAULT;
 	// See also PlacePayload
 	BYTE *ubuf = GetRecvPtr(skb);
@@ -884,6 +888,7 @@ void CMultiplyBacklogItem::ResponseToMultiply()
 	// The receive buffer is eventually ready
 
 	ControlBlock::PFSP_SocketBuf skbOut = pControlBlock->GetLastBuffered();
+	// Hidden dependency: tLastRecv which is exploited in SendAckFlush in set OnGetMultiply
 	if (skb->GetFlag<TransactionEnded>())
 	{
 		SetState(skbOut->GetFlag<TransactionEnded>() ? COMMITTING2 : PEER_COMMIT);
@@ -896,7 +901,7 @@ void CMultiplyBacklogItem::ResponseToMultiply()
 		pControlBlock->notices.SetHead(FSP_NotifyDataReady);	// But do not signal until next packet is received
 	}
 
-	EmitQ();
+	RestartKeepAlive();
 }
 
 
@@ -946,8 +951,8 @@ void CSocketItemEx::SendReset()
 	// Make sure that the packet falls into the receive window
 	if (int32_t(pControlBlock->sendWindowNextSN - seqR) > 0)
 		seqR = pControlBlock->sendWindowNextSN - 1;
-	hdr.SetSequenceFlags(pControlBlock, seqR);
 	hdr.hs.Set<FSP_NormalPacketHeader, RESET>();
+	SetSequenceFlags(&hdr, seqR);
 	SetIntegrityCheckCode(& hdr);
 	SendPacket(1, ScatteredSendBuffers(&hdr, sizeof(hdr)));
 }
@@ -978,7 +983,7 @@ void CSocketItemEx::Destroy()
 #ifdef TRACE
 		printf_s("\nSCB of fiber#%u to be destroyed\n", fidPair.source);
 #endif
-		lowState = NON_EXISTENT;	// Donot [SetState(NON_EXISTENT);] as the ULA might do further cleanup
+		lowState = NON_EXISTENT;	// Do not [SetState(NON_EXISTENT);] as the ULA might do further cleanup
 		RemoveTimers();
 		CSocketItem::Destroy();
 		//

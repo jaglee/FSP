@@ -1,6 +1,6 @@
 /*
  * FSP lower-layer service program, handle command given by the upper layer application
- * This module meant to be platform-independent part while platform-dependent part
+ * This module meant to be platform-independent part
  *
     Copyright (c) 2012, Jason Gao
     All rights reserved.
@@ -41,12 +41,12 @@ static ConnectRequestQueue connectRequests;
 // Given
 //	CommandNewSessionSrv&	the command context given by ULA
 // Do
-//	Register a listening FSP socket at the specific applicatio layer fiberID
+//	Register a listening FSP socket at the specific application layer fiberID
 // Remark
 //	If the command context memory block cannot be mapped into the LLS's memory space the function fails
-//	The notice queue of the command context is prefilled with the FSP_IPC_CannotReturn notice
+//	The notice queue of the command context is preset to FSP_IPC_CannotReturn
 //	If 'Listen' succeeds the notice will be replaced by FSP_NotifyListening
-//	or else LLS triggers the upper layer DLL to handle the prefilled notice
+//	or else LLS triggers the upper layer DLL to handle the preset notice
 void LOCALAPI Listen(CommandNewSessionSrv &cmd)
 {
 	if(cmd.hEvent == NULL)
@@ -88,9 +88,9 @@ l_bailout1:
 //	LLS try to make the connection request to the remote end in the queued thread
 // Remark
 //	If the command context memory block cannot be mapped into LLS's memory space the function fails
-//	The notice queue of the command context is prefilled with an FSP_IPC_CannotReturn notice
+//	The notice queue of the command context is preset to FSP_IPC_CannotReturn
 //	If the function succeeds the notice will be replaced by FSP_NotifyListening
-//	or else LLS triggers the upper layer DLL to handle the prefilled notice
+//	or else LLS triggers the upper layer DLL to handle the preset notice
 void LOCALAPI Connect(CommandNewSessionSrv &cmd)
 {
 	if(cmd.hEvent == NULL)
@@ -217,7 +217,6 @@ l_return:
 //	CommandToLLS		The service command requested by ULA
 // Do
 //	Excute ULA's request
-// TODO: add it to the task queue to avoid head congestion
 void CSocketItemEx::ProcessCommand(CommandToLLS *pCmd)
 {
 	if (!WaitUseMutex())
@@ -228,7 +227,6 @@ void CSocketItemEx::ProcessCommand(CommandToLLS *pCmd)
 			, inUse, pControlBlock);
 		return;
 	}
-
 #if defined(TRACE) && (TRACE & TRACE_ULACALL)
 	printf_s(__FUNCTION__ " called (%s), LLS state: %s(%d) <== ULA state: %s(%d)\n"
 		, noticeNames[pCmd->opCode]
@@ -236,24 +234,12 @@ void CSocketItemEx::ProcessCommand(CommandToLLS *pCmd)
 		, stateNames[pControlBlock->state], pControlBlock->state);
 #endif
 
-	// synchronize the state in the 'cache' and the real state
-	char prevState = _InterlockedExchange8((char *)& lowState, pControlBlock->state);
-	if (prevState != lowState)
-	{
-		if (lowState == COMMITTING || lowState == COMMITTING2)
-			RestartKeepAlive();
-	}
-	if (lowState <= 0 || lowState > LARGEST_FSP_STATE)
-	{
-#ifdef TRACE
-		printf_s("Socket(%p) is in an absurd state %d\n", this, lowState);
-#endif
-		Destroy();
-		return;
-	}
-
 	switch(pCmd->opCode)
 	{
+	case FSP_Start:
+		RestartKeepAlive();	// If it happened to be stopped
+		DoEventLoop();
+		break;
 	case FSP_Reject:
 		if (IsPassive())
 		{
@@ -262,9 +248,6 @@ void CSocketItemEx::ProcessCommand(CommandToLLS *pCmd)
 			break;
 		}
 		Reject(((CommandRejectRequest *)pCmd)->reasonCode);
-		break;
-	case FSP_Send:			// send a packet/group of packets
-		EmitQ();
 		break;
 	case FSP_InstallKey:
 		InstallSessionKey((CommandInstallKey &)*pCmd);

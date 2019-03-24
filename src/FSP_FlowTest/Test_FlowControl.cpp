@@ -237,7 +237,7 @@ void FlowTestRetransmission()
 	PControlBlock pSCB;
 	
 	PrepareFlowTestResend(dbgSocket, pSCB);	// dbgSocket.tRoundTrip_us == 0;
-	dbgSocket.DoResend();
+	dbgSocket.DoEventLoop();
 
 	struct
 	{
@@ -275,7 +275,7 @@ void FlowTestRetransmission()
 
 	dbgSocket.AcceptSNACK(seq5, snack, n);
 	dbgSocket.TestSetInUse();
-	dbgSocket.DoResend();
+	dbgSocket.DoEventLoop();
 
 	ControlBlock::PFSP_SocketBuf skb = pSCB->HeadSend();
 	assert(skb->flags == 0);	// GetFlag<IS_ACKNOWLEDGED>()
@@ -324,7 +324,7 @@ void FlowTestRetransmission()
 
 	dbgSocket.AcceptSNACK(seq5, snack, n);
 	dbgSocket.TestSetInUse();
-	dbgSocket.DoResend();
+	dbgSocket.DoEventLoop();
 
 	// TODO: Test calculation of RTT and Keep alive timeout 
 }
@@ -360,11 +360,12 @@ void FlowTestRecvWinRoundRobin()
 	skb->len = MAX_BLOCK_SIZE;
 
 	// but eot? don't care it yet.
+	int32_t nB;
 	bool eot;
-	buf = pSCB->InquireRecvBuf(m, eot);
+	buf = pSCB->InquireRecvBuf(m, nB, eot);
 	printf_s("Should return the first two blocks:\n"
 		"InquireRecvBuf#1, buf = %p, size = %d, eot = %d\n", buf, m, eot);
-	pSCB->MarkReceivedFree();
+	pSCB->MarkReceivedFree(nB);
 
 	skb = pSCB->AllocRecvBuf(FIRST_SN + 2);	// used to be free
 	assert(skb != NULL);
@@ -385,10 +386,10 @@ void FlowTestRecvWinRoundRobin()
 	skb->len = MAX_BLOCK_SIZE;
 	skb->ReInitMarkComplete();
 
-	buf = pSCB->InquireRecvBuf(m, eot);
+	buf = pSCB->InquireRecvBuf(m, nB, eot);
 	printf_s("Should return the last two blocks:\n"
 		"InquireRecvBuf#3, buf = %p, size = %d, eot = %d\n", buf, m, eot);
-	pSCB->MarkReceivedFree();
+	pSCB->MarkReceivedFree(nB);
 
 	skb = pSCB->AllocRecvBuf(FIRST_SN + 6);
 	skb->opCode = PURE_DATA;
@@ -403,10 +404,10 @@ void FlowTestRecvWinRoundRobin()
 	skb = pSCB->AllocRecvBuf(FIRST_SN + 8);
 	assert(skb == NULL);
 
-	buf = pSCB->InquireRecvBuf(m, eot);
+	buf = pSCB->InquireRecvBuf(m, nB, eot);
 	printf_s("Should round-robin to the start, return the whole buffer space:\n"
 		"InquireRecvBuf - buf = %p, size = %d, eot = %d\n", buf, m, eot);
-	pSCB->MarkReceivedFree();
+	pSCB->MarkReceivedFree(nB);
 
 	skb = pSCB->AllocRecvBuf(FIRST_SN + 8);
 	skb->opCode = PURE_DATA;
@@ -424,10 +425,10 @@ void FlowTestRecvWinRoundRobin()
 	skb->len = MAX_BLOCK_SIZE;
 	skb->ReInitMarkComplete();
 
-	buf = pSCB->InquireRecvBuf(m, eot);
+	buf = pSCB->InquireRecvBuf(m, nB, eot);
 	printf_s("Should return the first block, with eot flag set:\n"
 		"InquireRecvBuf - buf = %p, size = %d, eot = %d\n", buf, m, eot);
-	pSCB->MarkReceivedFree();
+	pSCB->MarkReceivedFree(nB);
 
 	skb = pSCB->AllocRecvBuf(FIRST_SN + 11);
 	skb->opCode = PURE_DATA;
@@ -441,15 +442,15 @@ void FlowTestRecvWinRoundRobin()
 	skb->len = MAX_BLOCK_SIZE;
 	skb->ReInitMarkComplete();
 
-	buf = pSCB->InquireRecvBuf(m, eot);
+	buf = pSCB->InquireRecvBuf(m, nB, eot);
 	printf_s("Should return the 2nd, 3rd and 4th blocks:\n"
 		"InquireRecvBuf - buf = %p, size = %d, eot = %d\n", buf, m, eot);
-	pSCB->MarkReceivedFree();
+	pSCB->MarkReceivedFree(nB);
 
-	buf = pSCB->InquireRecvBuf(m, eot);
+	buf = pSCB->InquireRecvBuf(m, nB, eot);
 	printf_s("Should round-robin to the 1st block again:\n"
 		"InquireRecvBuf - buf = %p, size = %d, eot = %d\n", buf, m, eot);
-	pSCB->MarkReceivedFree();
+	pSCB->MarkReceivedFree(nB);
 
 	// Rare but possible case of a fulfilled payload with a payload-less EoT
 	skb = pSCB->AllocRecvBuf(FIRST_SN + 13);
@@ -465,8 +466,8 @@ void FlowTestRecvWinRoundRobin()
 	skb->SetFlag<TransactionEnded>();
 	skb->ReInitMarkComplete();
 
-	buf = pSCB->InquireRecvBuf(m, eot);
+	buf = pSCB->InquireRecvBuf(m, nB, eot);
 	printf_s("Should round-robin to the 2nd and 3rd blocks:\n"
 		"InquireRecvBuf - buf = %p, size = %d, eot = %d\n", buf, m, eot);
-	pSCB->MarkReceivedFree();
+	pSCB->MarkReceivedFree(nB);
 }

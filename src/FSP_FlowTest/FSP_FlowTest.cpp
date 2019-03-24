@@ -194,7 +194,7 @@ void UnitTestICC()
 
 	mp.hdr.hs.Set(KEEP_ALIVE, sizeof(FSP_NormalPacketHeader) + sizeSNACK);
 	// pSCB->SetSequenceFlags(& mp.hdr, FIRST_SN + FSP_REKEY_THRESHOLD);
-	mp.hdr.SetSequenceFlags(pSCB, FIRST_SN + 1);
+	socket.SetSequenceFlags(&mp.hdr, FIRST_SN + 1);
 	mp.hdr.expectedSN = htobe32(seq0);
 	//
 	socket.SetIntegrityCheckCode(& mp.hdr, NULL, 0, salt);
@@ -321,7 +321,7 @@ void UnitTestHMAC()
 	printf_s("Size of the SNACK header = %d, expected SN = %u, salt=0x%X\n", sizeSNACK, seq0, salt);
 
 	mp.hdr.hs.Set(KEEP_ALIVE, sizeof(FSP_NormalPacketHeader) + sizeSNACK);
-	mp.hdr.SetSequenceFlags(pSCB, pSCB->sendWindowNextSN);
+	socket.SetSequenceFlags(&mp.hdr, pSCB->sendWindowNextSN);
 	mp.hdr.expectedSN = htobe32(seq0);
 	//
 	socketR2.SetIntegrityCheckCode(&mp.hdr, NULL, 0, salt);
@@ -431,11 +431,16 @@ void UnitTestByteOrderDefinitin()
 	printf_s("Frews = %08x\n", *(uint32_t *)& fh.frews);	// 0x01000002
 }
 
+
+
 /**
  * 
  */
 int _tmain(int argc, _TCHAR* argv[])
 {
+	EvaluateTimerWheel();
+	EvaluateHPET();
+
 	FlowTestAcknowledge();
 	FlowTestRetransmission();
 	FlowTestRecvWinRoundRobin();

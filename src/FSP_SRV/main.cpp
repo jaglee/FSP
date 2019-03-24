@@ -1,9 +1,9 @@
 /*
- * FSP lower-layer service program, the entry point, the top-level control control,
+ * FSP lower-layer service program, the entry point, the top-level control,
  * AND the security related issues.
- * Platform-dependent / IPC-machanism-dependent
+ * Platform-dependent / IPC-mechanism-dependent
  * Garbage Collection is treated as a security-related issue.
- * The FSP Finite State Machine is splitted across command.cpp, remote.cpp and timers.cpp
+ * The FSP Finite State Machine is split across command.cpp, remote.cpp and timers.cpp
  *
     Copyright (c) 2012, Jason Gao
     All rights reserved.

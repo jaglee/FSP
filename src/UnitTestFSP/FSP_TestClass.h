@@ -60,6 +60,17 @@ public:
 	}
 	void SetPairOfFiberID(ALFID_T src, ALFID_T dst) { fidPair.source = src; fidPair.peer = dst; }
 
+	bool LOCALAPI AddAdhocTimer(uint32_t period, WAITORTIMERCALLBACK callback)
+	{
+		return (timer == NULL
+			&& ::CreateTimerQueueTimer(&timer, TimerWheel::Singleton()
+				, callback	// WAITORTIMERCALLBACK
+				, this		// LPParameter
+				, period
+				, period
+				, WT_EXECUTEINTIMERTHREAD));
+	}
+
 	friend void UnitTestSocketRTLB();
 	friend void UnitTestICC();
 	friend void UnitTestHMAC();

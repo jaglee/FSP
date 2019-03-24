@@ -64,12 +64,13 @@ void UnitTestSendRecvWnd()
 	skb4->SetFlag<TransactionEnded>();
 	skb4->ReInitMarkComplete();
 
-	int m2;	// onReturn it should == skb4->len, i.e. MAX_BLOCK_SIZE - 13
+	int32_t m2;	// onReturn it should == skb4->len, i.e. MAX_BLOCK_SIZE - 13
+	int32_t nB;	// number of blocks
 	bool b;
-	uint8_t *recvBuf2 = (uint8_t *)pSCB->InquireRecvBuf(m2, b);
+	uint8_t *recvBuf2 = (uint8_t *)pSCB->InquireRecvBuf(m2, nB, b);
 	Assert::IsTrue(recvBuf2 == recvBuf);
 	Assert::IsTrue(m2 == MAX_BLOCK_SIZE - 13);
-	pSCB->MarkReceivedFree();
+	pSCB->MarkReceivedFree(nB);
 	Assert::IsTrue(pSCB->recvWindowFirstSN == FIRST_SN + 1);
 
 	ControlBlock::PFSP_SocketBuf skb5 = pSCB->AllocRecvBuf(FIRST_SN);
@@ -242,11 +243,12 @@ void UnitTestGenerateSNACK()
 	r = pSCB->GetSelectiveNACK(seq0, gaps, MAX_GAPS_NUM);
 	Assert::IsTrue(r == 2 && seq0 == FIRST_SN + 1);
 
+	int32_t nB;
 	bool b;	// Used to be test for 'To be Continued', now for 'End of Transaction'
-	pSCB->InquireRecvBuf(r, b);
+	pSCB->InquireRecvBuf(r, nB, b);
 	Assert::IsTrue(r == 1);
 	Assert::IsTrue(b);
-	pSCB->MarkReceivedFree();
+	pSCB->MarkReceivedFree(nB);
 	Assert::IsTrue(pSCB->recvWindowHeadPos == 1 && pSCB->recvWindowFirstSN == (FIRST_SN + 1));
 	Assert::IsTrue(pSCB->recvWindowExpectedSN == FIRST_SN + 1);
 
@@ -260,9 +262,9 @@ void UnitTestGenerateSNACK()
 	(++p)->len = MAX_BLOCK_SIZE;
 	(++p)->len = MAX_BLOCK_SIZE;
 
-	pSCB->InquireRecvBuf(r, b);
-	pSCB->MarkReceivedFree();
-	Assert::IsTrue(!b && r == MAX_BLOCK_SIZE * 2);	// positon 0 skipped; position 3 is the gap
+	pSCB->InquireRecvBuf(r, nB, b);
+	pSCB->MarkReceivedFree(nB);
+	Assert::IsTrue(!b && r == MAX_BLOCK_SIZE * 2);	// position 0 skipped; position 3 is the gap
 
 	skb1 = socket.AllocRecvBuf(FIRST_SN + 3);
 	Assert::IsNotNull(skb1);
@@ -277,10 +279,10 @@ void UnitTestGenerateSNACK()
 	p->InitMarkLocked(); // partial delivery should work
 
 	int32_t m;
-	void * buf = pSCB->InquireRecvBuf(m, b);
+	void * buf = pSCB->InquireRecvBuf(m, nB, b);
 	Assert::IsNotNull(buf);
 	Assert::IsFalse(b);
-	pSCB->MarkReceivedFree();
+	pSCB->MarkReceivedFree(nB);
 	Assert::IsTrue(pSCB->recvWindowHeadPos == 0x10002 && pSCB->recvWindowFirstSN == (FIRST_SN + 0x10002));
 
 	//

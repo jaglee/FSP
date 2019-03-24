@@ -68,7 +68,7 @@ typedef struct FSP_SocketParameter *PFSP_Context;
 typedef enum
 {
 	FSP_GET_EXT_POINTER,		// Placeholder to store the pointer meant to access the extent of the socket
-	FSP_SET_EXT_POINTER,		// Value of the pointer meant to access the the extent of the socket
+	FSP_SET_EXT_POINTER,		// Value of the pointer meant to access the extent of the socket
 	FSP_SET_CALLBACK_ON_ERROR,	// NotifyOrReturn
 	FSP_SET_CALLBACK_ON_REQUEST,// CallbackRequested
 	FSP_SET_CALLBACK_ON_CONNECT,// CallbackConnected
@@ -120,7 +120,7 @@ typedef int (FSPAPI *CallbackConnected)(FSPHANDLE, PFSP_Context);
 //	FSPHANDLE		the handle of the FSP socket (the context)
 //	void *			the pointer to the (partial) message buffer
 //	int32_t			the length of the available (partial) message in bytes
-//	bool			whether the peer has committed the tansmit transaction
+//	bool			whether the peer has committed the transmit transaction
 // Return
 //	true if to continue applying this callback function to accept further data
 //	false if to discontinue
@@ -129,13 +129,13 @@ typedef int (FSPAPI *CallbackConnected)(FSPHANDLE, PFSP_Context);
 typedef bool (FSPAPI *CallbackPeeked)(FSPHANDLE, void *, int32_t, bool);
 
 
-// The pointer of the function callbacked when some inline send buffer is available
+// The pointer of the function call-backed when some inline send buffer is available
 // Given
 //	FSPHANDLE		the handle of the FSP socket (the context)
 //	void *			the start position pointer of the available send buffer
 //	int32_t			the capacity of the available send buffer in bytes
 // Return
-//	0 if no error and further availabililty of buffer should be reported
+//	0 if no error and further availability of buffer should be reported
 //	negative if to be discontinued
 // Remark
 //	the caller shall make the callback function thread-safe
@@ -174,7 +174,7 @@ struct FSP_SocketParameter
 	{
 		struct
 		{
-			unsigned short	milky:		1;	// Minimal-delay service prefered
+			unsigned short	milky:		1;	// Minimal-delay service preferred
 			unsigned short	noEncrypt:	1;	// do not encrypt the payload in the transport layer
 			unsigned short	RESERVED:	12;
 			unsigned short	passive:	1;	// internal use only, shall be ignored by ULA
@@ -203,7 +203,7 @@ struct FSP_SocketParameter
 //	NULL if it fails immediately, or else
 //	the handle of the passive FSP socket, whose properties might be peek and/or set later
 // remark
-//	The handle returned might be useless, if NotifyOrReturn report error laterly
+//	The handle returned might be useless, if NotifyOrReturn report error later
 DllSpec
 FSPHANDLE FSPAPI ListenAt(const PFSP_IN6_ADDR, PFSP_Context);
 
@@ -226,7 +226,7 @@ FSPHANDLE FSPAPI Accept1(FSPHANDLE);
 //	the handle of the new created socket
 //	or NULL if there is some immediate error, more information may be got from the flags set in the context parameter
 // remark
-//	The handle returned might be useless, if CallbackConnected report error laterly
+//	The handle returned might be useless, if CallbackConnected report error later
 DllSpec
 FSPHANDLE FSPAPI Connect2(const char *, PFSP_Context);
 
@@ -242,7 +242,7 @@ FSPHANDLE FSPAPI Connect2(const char *, PFSP_Context);
 //	the handle of the new created socket
 //	or NULL if there is some immediate error, more information may be got from the flags set in the context parameter
 // remark
-//	The handle returned might be useless, if CallbackConnected report error laterly
+//	The handle returned might be useless, if CallbackConnected report error later
 DllSpec
 FSPHANDLE FSPAPI MultiplyAndWrite(FSPHANDLE, PFSP_Context, int8_t, NotifyOrReturn);
 
@@ -255,7 +255,7 @@ FSPHANDLE FSPAPI MultiplyAndWrite(FSPHANDLE, PFSP_Context, int8_t, NotifyOrRetur
 //	the handle of the new created socket
 //	or NULL if there is some immediate error, more information may be got from the flags set in the context parameter
 // remark
-//	The handle returned might be useless, if CallbackConnected report error laterly
+//	The handle returned might be useless, if CallbackConnected report error later
 //	the capacity of immediately available buffer (might be 0) is outputted in the reference
 DllSpec
 FSPHANDLE FSPAPI MultiplyAndGetSendBuffer(FSPHANDLE, PFSP_Context, CallbackBufferReady);
@@ -351,7 +351,7 @@ int FSPAPI RecvInline(FSPHANDLE, CallbackPeeked);
 //	NotifyOrReturn might report error later even if ReadFrom itself return no error
 //	Return value passed in NotifyOrReturn is number of octets really received
 //	If NotifyOrReturn is NULL the function is blocking, i.e.
-//	waiting until either the buffer is fulfilled or the peer's transmit transactin has been committed
+//	waiting until either the buffer is fulfilled or the peer's transmit transaction has been committed
 //	In the blocking mode DLL MAY report that the transmit transaction has been committed
 //	before all data has been fetched
 //	ULA should check whether the transmit transaction is committed by calling FSPControl. See also WriteTo
@@ -359,7 +359,7 @@ DllSpec
 int FSPAPI ReadFrom(FSPHANDLE, void *, int, NotifyOrReturn);
 
 
-// Return whether previous ReadFrom has enncountered an end-of-transaction mark. DOES NOT work with ReadInline!
+// Return whether previous ReadFrom has encountered an end-of-transaction mark. DOES NOT work with ReadInline!
 // A shortcut for FSPControl(FSPHANDLE, FSP_GET_PEER_COMMITTED, ...);
 DllSpec
 bool FSPAPI HasReadEoT(FSPHANDLE);
@@ -376,7 +376,7 @@ bool FSPAPI HasReadEoT(FSPHANDLE);
 //	-EFAULT	if internal resource error encountered
 //	-EIO if the packet piggyback EoT flag cannot be sent
 // Remark
-//	Would block until the connetion is CLOSABLE, closed or reset if the function pointer is NULL
+//	Would block until the connection is CLOSABLE, closed or reset if the function pointer is NULL
 DllSpec
 int FSPAPI Commit(FSPHANDLE, NotifyOrReturn);
 

@@ -68,12 +68,12 @@ const char * CStringizeOpCode::names[LARGEST_OP_CODE + 1] =
 
 /**
 	Reflecting string representation of FSP_Session_State and FSP_ServiceCode, for debug purpose
-	Place here because value of the state or notice/servic code is stored in the control block
+	Place here because value of the state or notice/service code is stored in the control block
  */
 const char * CStringizeState::names[LARGEST_FSP_STATE + 1] =
 {
 	"NON_EXISTENT",
-	// the passiver listener to folk new connection handle:
+	// the passive listener to folk new connection handle:
 	"LISTENING",
 	// initiative, after sending initiator's check code, before getting responder's cookie
 	// timeout to retry or NON_EXISTENT:
@@ -96,7 +96,7 @@ const char * CStringizeState::names[LARGEST_FSP_STATE + 1] =
 	"PEER_COMMIT",
 	// after both receiving and sending FLUSH, before getting all packet-in-flight acknowledged
 	"COMMITTING2",
-	// after getting all packet-in-flight acknowledged and having received peer's FLUSH and the FLUSH is acknowledgable
+	// after getting all packet-in-flight acknowledged and having received peer's FLUSH and the FLUSH is acknowledgeable
 	"CLOSABLE",
 	// after ULA shutdown the connection in CLOSABLE state gracefully
 	// it isn't a pseudo-state alike TCP, but a physical, resumable/reusable state
@@ -115,7 +115,7 @@ const char * CStringizeNotice::names[LARGEST_FSP_NOTICE + 1] =
 	"InitConnection",	// register an initiative socket
 	"FSP_Accept",		// accept the connection, make SCB of LLS synchronized with DLL
 	"FSP_Reject",		// a forward command, explicitly reject some request
-	"FSP_Send",			// send a packet/a group of packets
+	"FSP_Start",		// start a new transmit transaction/urge to transmit
 	"FSP_InstallKey",	// install the authenticated encryption key
 	"FSP_Multiply",		// clone the connection, make SCB of LLS synchronized with DLL
 	// FSP_Start, obsolesced
@@ -472,8 +472,8 @@ ControlBlock::PFSP_SocketBuf ControlBlock::GetSendBuf()
 //	It is assumed that the caller have gain exclusive access on the control block among providers
 BYTE * LOCALAPI ControlBlock::InquireSendBuf(int32_t *p_m)
 {
+	register int32_t k = LCKREAD(sendWindowHeadPos);
 	register int32_t i = sendBufferNextPos;
-	register int32_t k = sendWindowHeadPos;
 
 	if(i == k && CountSendBuffered() != 0)
 	{
@@ -496,13 +496,13 @@ BYTE * LOCALAPI ControlBlock::InquireSendBuf(int32_t *p_m)
 // Remark
 //	It is assumed that it is unnecessary to worry about atomicity of (recvWindowNextSN, recvWindowNextPos)
 //  the caller should check and handle duplication of the received data packet
-//	asssume that the caller eventually calls ReInitMarkComplete() before calling the function next time
+//	assume that the caller eventually calls ReInitMarkComplete() before calling the function next time
 ControlBlock::PFSP_SocketBuf LOCALAPI ControlBlock::AllocRecvBuf(seq_t seq1)
 {
 	if(int(seq1 - recvWindowExpectedSN) < 0)
 		return NULL;	// an outdated packet received
 	//
-	if(int(seq1 - recvWindowFirstSN - recvBufferBlockN) >= 0)
+	if (int(seq1 - LCKREAD(recvWindowFirstSN) - recvBufferBlockN) >= 0)
 		return NULL;	// a packet right to the right edge of the receive window may not be accepted
 
 	register int32_t d = int32_t(seq1 - recvWindowNextSN);
@@ -548,7 +548,7 @@ ControlBlock::PFSP_SocketBuf LOCALAPI ControlBlock::AllocRecvBuf(seq_t seq1)
 	// now d is the maximum number of blocks that might be slided over
 
 	// Case 3 out-of-order packet received in a gap and it is the left-edge of the gap
-	// To slide left edge of the advertisable receive window
+	// To slide left edge of the receive window
 	register int32_t i = recvWindowNextPos - d;
 	if (i < 0)
 		i += recvBufferBlockN;
@@ -589,6 +589,7 @@ ControlBlock::PFSP_SocketBuf LOCALAPI ControlBlock::AllocRecvBuf(seq_t seq1)
 
 // Given
 //	int32_t & : [_Out_] place holder of the number of bytes [to be] peeked.
+//	int32_t & : [_Out_] place holder of the number of blocks peeked
 //	bool & :	[_Out_] place holder of the End of Transaction flag
 // Do
 //	Peek the receive buffer, figure out not only the start address but also the length of the next message
@@ -606,7 +607,7 @@ ControlBlock::PFSP_SocketBuf LOCALAPI ControlBlock::AllocRecvBuf(seq_t seq1)
 //				payload length of an intermediate packet of a message should be MAX_BLOCK_SIZE,
 //				payload length of any packet should be no less than 0 and no greater than MAX_BLOCK_SIZE)
 //	-EPERM		non-conforming to the protocol, shall be prohibited
-BYTE * LOCALAPI ControlBlock::InquireRecvBuf(int32_t & nIO, bool & eotFlag)
+BYTE * LOCALAPI ControlBlock::InquireRecvBuf(int32_t & nIO, int32_t & nBlock, bool & eotFlag)
 {
 	const int tail = recvWindowNextPos;
 	eotFlag = false;
@@ -616,6 +617,7 @@ BYTE * LOCALAPI ControlBlock::InquireRecvBuf(int32_t & nIO, bool & eotFlag)
 		return NULL;
 	}
 
+	nBlock = 0;
 	nIO = 0;
 	if(CountDeliverable() <= 0)
 		return NULL;
@@ -654,6 +656,7 @@ BYTE * LOCALAPI ControlBlock::InquireRecvBuf(int32_t & nIO, bool & eotFlag)
 			return NULL;
 		}
 		nIO += p->len;
+		nBlock++;
 		//
 		p->MarkDelivered();
 
@@ -680,42 +683,36 @@ BYTE * LOCALAPI ControlBlock::InquireRecvBuf(int32_t & nIO, bool & eotFlag)
 
 
 // Given
-//	PFSP_SocketBuf		the head packet that is expected to be free at first
+//	uint32_t			the number of blocks peeked and to be free
 // Do
 //	Free the packet buffer blocks that were marked as delivered by InquireRecvBuf
 // Return
-//	non-negative if the number of bytes be free
-//	negative if error:
+//	0 if no error occurred
+//	negative on error:
 //	-EPERM		non-conforming to the protocol, shall be prohibited
-//	-EFAULT		some packet descriptor is corrupted
-//	-EDOM		parameter error
-// Remark
-//	It would mark the buffer block descriptors even if error encountered.
-//	Only the number of the last error would be preserved and reported.
-int LOCALAPI ControlBlock::MarkReceivedFree(PFSP_SocketBuf p)
+//	-EDOM		parameter error (nBlock is non-positive)
+int LOCALAPI ControlBlock::MarkReceivedFree(int32_t nBlock)
 {
-	if (p != GetFirstReceived())
-		return -EPERM;
+	if (nBlock <= 0)
+		return -EDOM;
 
-	register int i, m;
-	if (recvWindowNextPos > recvWindowHeadPos)
-		m = recvWindowNextPos - recvWindowHeadPos;
-	else
+	register int32_t m = LCKREAD(recvWindowNextPos) - recvWindowHeadPos;
+	if (m <= 0)
 		m = recvBufferBlockN - recvWindowHeadPos;
+	if (m < nBlock)
+		return -EPERM;
+	m = nBlock;
 
-	int32_t nIO = 0;
-	for (i = 0; i < m && p->IsDelivered(); p++, i++)
+	PFSP_SocketBuf p = GetFirstReceived();
+	for (register int32_t i = 0; i < m; p++, i++)
 	{
-		if (p->len > MAX_BLOCK_SIZE || p->len < 0)
-			return -EFAULT;
-		nIO += p->len;
-		p->ReInitMarkDelivered();
-		// but preserve the packet flag for EoT detection, etc.
+		p->ReInitMarkAcked();
 	}
-	AddRoundRecvBlockN(recvWindowHeadPos, i);
-	InterlockedExchange((LONG *)&recvWindowFirstSN, recvWindowFirstSN + i);
-
-	return nIO;
+	// but preserve the packet flag for EoT detection, etc.
+	AddRoundRecvBlockN(recvWindowHeadPos, m);
+	_InterlockedExchangeAdd((LONG *)&recvWindowFirstSN, m);
+	//^Memory barrier is mandatory
+	return 0;
 }
 
 
@@ -730,13 +727,13 @@ int LOCALAPI ControlBlock::MarkReceivedFree(PFSP_SocketBuf p)
 //	-EFAULT		session control block is corrupted (e.g.illegal sequence number)
 // Remark
 //	the field values of the gap descriptors filled would be of host-byte-order
-//	return value may not exceed given capicity of the gaps buffer,
+//	return value may not exceed given capacity of the gaps buffer,
 //	so the sequence number of the mostly expected packet might be calibrated to a value less than recvWindowNextSN
 //	it is assumed that it is unnecessary to worry about atomicity of (recvWindowNextPos, recvWindowNextSN)
 // Acknowledged are
 //	[..., snExpect),
-//	[snExpect + gapWidth[0], snExpect + gapWidth[0] + datalength[0]), 
-//	[snExpect + gapWidth[0] + datalength[0] + gapWidth[1], snExpect + gapWidth[0] + datalength[0] + gapWidth[1] + datalength[1]) бнбн
+//	[snExpect + gapWidth[0], snExpect + gapWidth[0] + dataLength[0]), 
+//	[snExpect + gapWidth[0] + dataLength[0] + gapWidth[1], snExpect + gapWidth[0] + dataLength[0] + gapWidth[1] + dataLength[1]) бнбн
 int LOCALAPI ControlBlock::GetSelectiveNACK(seq_t & snExpect, FSP_SelectiveNACK::GapDescriptor * buf, int n)
 {
 	if(n <= 0)
@@ -831,7 +828,7 @@ int LOCALAPI ControlBlock::DealWithSNACK(seq_t expectedSN, FSP_SelectiveNACK::Ga
 			iHead -= sendBufferBlockN;
 		p = HeadSend() + iHead;
 		//
-		// Make acknowledgment
+		// Make acknowledgement
 		while (nAck-- > 0)
 		{
 			p->MarkAcked();	// might be redundant, but it is safe
@@ -862,7 +859,7 @@ bool ControlBlock::HasBeenCommitted()
 	if (d != 0)
 		return false;
 
-	d = int32_t(recvWindowNextSN - recvWindowFirstSN);
+	d = int32_t(recvWindowNextSN) - LCKREAD(recvWindowFirstSN);
 	if (d <= 0)
 		return false;
 

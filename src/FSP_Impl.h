@@ -3,7 +3,7 @@
 
 /*
  * Flexible Session Protocol, implementation-dependent definitions
- * shared between the service process and the upper layer application procoess
+ * shared between the service process and the upper layer application process
  *
     Copyright (c) 2012, Jason Gao
     All rights reserved.
@@ -49,6 +49,13 @@
 #include <stdio.h>
 
 #include "FSP.h"
+
+#pragma intrinsic(_InterlockedCompareExchange, _InterlockedCompareExchange8)
+#pragma intrinsic(_InterlockedExchange, _InterlockedExchange8)
+#pragma intrinsic(_InterlockedExchangeAdd, _InterlockedIncrement)
+#pragma intrinsic(_InterlockedOr, _InterlockedOr8)
+
+#define LCKREAD(dword) _InterlockedOr((volatile long *)&dword, 0)
 
 #define	MAC_ALIGNMENT	16
 
@@ -97,11 +104,9 @@ void TraceLastError(char * fileName, int lineNo, char *funcName, char *s1);
 
 #ifdef _DEBUG
 # define DEINIT_WAIT_TIMEOUT_ms		15000	// 15 seconds
-# define SCAVENGE_THRESHOLD_ms		180000	// 3 minutes
 # define BREAK_ON_DEBUG()			DebugBreak()
 #else
 # define DEINIT_WAIT_TIMEOUT_ms		5000	// 5 seconds
-# define SCAVENGE_THRESHOLD_ms		1800000	// 30 minutes
 # define BREAK_ON_DEBUG()
 #endif
 
@@ -122,7 +127,7 @@ void TraceLastError(char * fileName, int lineNo, char *funcName, char *s1);
  * Implemented system limit
  */
 #ifndef OVER_UDP_IPv4
-// IPv6 requires that every link in the internet have an MTU of 1280 octets or greater. 
+// IPv6 requires that every link in the Internet have an MTU of 1280 octets or greater. 
 # define MAX_BLOCK_SIZE		1024
 # define MAX_LLS_BLOCK_SIZE	(MAX_BLOCK_SIZE + sizeof(FSP_NormalPacketHeader))		// 1048
 #else
@@ -137,8 +142,6 @@ void TraceLastError(char * fileName, int lineNo, char *funcName, char *s1);
 #ifndef MAX_BUFFER_BLOCKS
 # define	MAX_BUFFER_BLOCKS	0x20000	// maximum buffer size is implementation specific. here about 128MB for FSP over IPv6
 #endif
-
-
 
 /**
  * Reflexing string representation of operation code, for debug purpose
@@ -279,7 +282,7 @@ struct FSP_ADDRINFO_EX : FSP_SINKINF
 
 struct SConnectParam	// MUST be aligned on 64-bit words!
 {
-	// the first 3 fields, together with initialSN, are to be initiaized with random value
+	// the first 3 fields, together with initialSN, are to be initialized with random value
 	uint64_t	initCheckCode;
 	uint64_t	cookie;
 	uint32_t	salt;
@@ -358,7 +361,7 @@ class LLSBackLog: public CLightMutex
 	ALIGN(8)
 	BackLogItem			q[MIN_QUEUED_INTR];
 	//
-	void InitSize() { capacity = MIN_QUEUED_INTR; }	// assume memory has been zeroized
+	void InitSize() { capacity = MIN_QUEUED_INTR; }	// assume memory has been zeroed
 	int	InitSize(int);
 
 public:
@@ -380,26 +383,25 @@ class CSocketItem;	// forward declaration for sake of declaring ControlBlock
  */
 
 // It heavily depends on Address Space Layout Randomization and user-space memory segment isolation
-// or similar measures to pretect sensive information, integrity and privacy, of user process
+// or similar measures to protect sensitive information, integrity and privacy, of user process
 struct ControlBlock
 {
 	ALIGN(8)
-		FSP_Session_State state;
-	char			_reserved1;
-	char			pendingEoT;			// EoT flag is pending to be added on a packet
+	FSP_Session_State	state;
 	char			milky : 1;		// by default 0: a normal wine-style payload assumed. FIFO
 	char			noEncrypt : 1;		// by default 0: if install session key, encrypt the payload
 	//
 	ALFID_T			idParent;
 
-	// 1, 2.
-	// Used to be the matched list of local and remote addresses.
-	// for security reason the remote addresses were moved to LLS
-	char			nearEndName[INET6_ADDRSTRLEN + 7];	// 72 bytes, in UTF-8
+	// 1, 2. 
+	// The matched list of local and remote addresses is cached in LLS
+	// canonical name of the near end and the remote end,
+	// the initial address and interface of the near end, and the dynamic addresses of the remote end
+	char			nearEndName[256];	// RFC1035, maximum length of a full domain name is 253 octets. Add padding zeroes
 	FSP_ADDRINFO_EX	nearEndInfo;
 	struct
 	{
-		char		name[INET6_ADDRSTRLEN + 7];	// 72 bytes
+		char		name[256];
 		struct
 		{
 			TSubnets	allowedPrefixes;
@@ -410,7 +412,7 @@ struct ControlBlock
 
 	// 3: The negotiated connection parameter
 	ALIGN(8)	// 64-bit alignment, make sure that the session key overlays 'initCheckCode' and 'cookie' only
-		SConnectParam connectParams;
+	SConnectParam connectParams;
 
 	// 4: The queue of returned notices
 	LLSNotice	notices;
@@ -423,7 +425,7 @@ struct ControlBlock
 	//
 	// BEGIN REGION: buffer descriptors 
 	//
-	// (head position, send window first sn), (send window next posistion, send window next sequence nuber)
+	// (head position, send window first sn), (send window next position, send window next sequence number)
 	// and (buffer next position, send buffer next sequence number) are managed independently
 	// for maximum parallelism in DLL and LLS
 	// the send queue is empty when sendWindowFirstSN == sendWindowNextSN
@@ -437,7 +439,7 @@ struct ControlBlock
 	seq_t		sendWindowLimitSN;	// the right edge of the send window
 
 	// (head position, receive window first sn) (next position, receive buffer maximum sn)
-	// are managed independently for maximum parallism in DLL and LLS
+	// are managed independently for maximum parallelism in DLL and LLS
 	// the receive queue is empty when recvWindowFirstSN == recvWindowNextSN
 	seq_t		recvWindowFirstSN;	// left-border of the receive window (receive queue), may be empty or may be filled but not delivered
 	int32_t		recvWindowHeadPos;	// the index number of the block with recvWindowFirstSN
@@ -480,14 +482,13 @@ struct ControlBlock
 		void InitMarkLocked() { _InterlockedExchange8(&marks, FSP_BUF_LOCKED); }
 		void ReInitMarkComplete() { _InterlockedExchange8(&marks, FSP_BUF_COMPLETE); }
 		void ReInitMarkAcked() { _InterlockedExchange8(&marks, FSP_BUF_ACKED); }
-		// Delivered is special in the sense that it is for receive only and it uses the same bit as Resent
-		void ReInitMarkDelivered() { _InterlockedExchange8(&marks, FSP_BUF_DELIVERED); }
 
 		void MarkSent() { _InterlockedOr8(&marks, FSP_BUF_SENT); }
 		void MarkAcked() { _InterlockedOr8(&marks, FSP_BUF_ACKED); }
 		void MarkResent() { _InterlockedOr8(&marks, FSP_BUF_RESENT); }
 		void MarkDelivered() { _InterlockedOr8(&marks, FSP_BUF_DELIVERED); }
 
+		bool InSending() { return (_InterlockedOr8(&marks, 0) & FSP_BUF_SENT) != 0; }
 		bool IsDelivered() { return (_InterlockedOr8(&marks, 0) & FSP_BUF_DELIVERED) != 0; }
 		bool IsComplete() { return (_InterlockedOr8(&marks, 0) & FSP_BUF_COMPLETE) != 0; }
 		bool IsAcked() { return (_InterlockedOr8(&marks, 0) & FSP_BUF_ACKED) != 0; }
@@ -537,19 +538,23 @@ struct ControlBlock
 	//
 	int32_t CountSendBuffered()
 	{
-		register int32_t a = _InterlockedOr((volatile LONG *)&sendBufferNextSN, 0);
-		return int32_t(a - sendWindowFirstSN);
+		register int32_t a = LCKREAD(sendBufferNextSN);
+		return int32_t(a - LCKREAD(sendWindowFirstSN));
 	}
 	int32_t CountSentInFlight()
 	{
-		register int32_t a = _InterlockedOr((volatile LONG *)&sendWindowNextSN, 0);
-		return int32_t(a - sendWindowFirstSN);
+		register int32_t a = LCKREAD(sendWindowNextSN);
+		return int32_t(a - LCKREAD(sendWindowFirstSN));
 	}
-	seq_t GetSendLimitSN() { return int(sendBufferNextSN - sendWindowLimitSN) > 0 ? sendWindowLimitSN : sendBufferNextSN; }
+	seq_t GetSendLimitSN()
+	{
+		register int32_t a = LCKREAD(sendBufferNextSN);
+		return int32_t(a - sendWindowLimitSN) > 0 ? sendWindowLimitSN : a;
+	}
 
 	int32_t CountDeliverable()
 	{
-		register int32_t a = _InterlockedOr((volatile LONG *)&recvWindowExpectedSN, 0);
+		register int32_t a = LCKREAD(recvWindowExpectedSN);
 		return int32_t(a - recvWindowFirstSN);
 	}
 #if defined(TRACE) && !defined(NDEBUG)
@@ -565,11 +570,13 @@ struct ControlBlock
 
 	// Return the head packet even if the send queue is empty
 	PFSP_SocketBuf GetSendQueueHead() { return HeadSend() + sendWindowHeadPos; }
+	// Return the head packet even if the receive buffer is thoroughly free
+	PFSP_SocketBuf GetFirstReceived() { return HeadRecv() + recvWindowHeadPos; }
 
 	// Given that the caller has made sure the queue is not empty, return the last packet of the send queue
 	PFSP_SocketBuf GetLastBuffered()
 	{
-		register int i = sendBufferNextPos - 1;
+		register int32_t i = LCKREAD(sendBufferNextPos) - 1;
 		return (HeadSend() + (i < 0 ? sendBufferBlockN - 1 : i));
 	}
 
@@ -596,18 +603,12 @@ struct ControlBlock
 	// Set the right edge of the send window after the very first packet of the queue is sent
 	void SetFirstSendWindowRightEdge()
 	{
-		register seq_t k = sendWindowFirstSN;
+		register seq_t k = LCKREAD(sendWindowFirstSN);
 		if (InterlockedCompareExchange(&sendWindowNextSN, k + 1, k) == k)
 			IncRoundSendBlockN(sendWindowNextPos);
 	}
 
 	BYTE * LOCALAPI InquireSendBuf(int32_t *);
-
-	PFSP_SocketBuf GetFirstReceived()
-	{
-		register int32_t a = _InterlockedOr((volatile LONG *)& recvWindowHeadPos, 0);
-		return HeadRecv() + a;
-	}
 
 	int LOCALAPI GetSelectiveNACK(seq_t &, FSP_SelectiveNACK::GapDescriptor *, int);
 	int LOCALAPI DealWithSNACK(seq_t, FSP_SelectiveNACK::GapDescriptor *, int);
@@ -624,20 +625,20 @@ struct ControlBlock
 
 	// Given
 	//	int32_t & : [_Out_] place holder of the number of bytes [to be] peeked
+	//	int32_t & : [_Out_] place holder of the number of blocks peeked
 	//	bool &: [_Out_] place holder of the End of Transaction flag
 	// Return
 	//	Start address of the received message
 	// Remark
 	//	Would automatically mark the packet peeked as delivered, but would not slide the receive window
-	BYTE * LOCALAPI InquireRecvBuf(int32_t &, bool &);
+	BYTE * LOCALAPI InquireRecvBuf(int32_t &, int32_t &, bool &);
 
 	// Given
-	//	PFSP_SocketBuf		the head packet that is expected to be free at first
+	//	int32_t				the number of blocks peeked and to be free
 	// Return
-	//	Number of bytes that were free, shall equal to what InquireRecvBuf has put into the output parameter
-	int	LOCALAPI MarkReceivedFree(PFSP_SocketBuf);
-	int	MarkReceivedFree() { return MarkReceivedFree(GetFirstReceived()); }
-
+	//	non-negative if succeeded,
+	//	negative if error occurred
+	int	LOCALAPI MarkReceivedFree(int32_t);
 
 	void SetRecvWindow(seq_t pktSeqNo)
 	{
@@ -683,13 +684,6 @@ struct ControlBlock
 		p->Set(code, hsp, seqThis, snExpected, int32_t(recvWindowFirstSN + recvBufferBlockN - snExpected));
 	}
 	// 
-	void SetExpectedSNof(FSP_FixedHeader *p) { SetExpectedSNof(p, recvWindowExpectedSN); }
-	void SetExpectedSNof(FSP_FixedHeader *p, seq_t snExpected)
-	{
-		p->expectedSN = htobe32(snExpected);
-		p->SetRecvWS(int32_t(recvWindowFirstSN + recvBufferBlockN - snExpected));
-	}
-
 
 	bool HasBacklog() const { return backLog.count > 0; }
 

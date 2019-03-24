@@ -81,7 +81,7 @@ FSPHANDLE FSPAPI MultiplyAndWrite(FSPHANDLE hFSP, PFSP_Context psp1, int8_t flag
 //	or NULL if there is some immediate error, more information may be got from the flags set in the context parameter
 // Remark
 //	The MULTIPLY request is sent to the remote peer only when following SendInplace was called
-//	The handle returned might be useless, if CallbackConnected report error laterly
+//	The handle returned might be useless, if CallbackConnected report error later
 //	the capacity of immediately available buffer (might be 0) is outputted in the reference
 //	As it is in CLONING state if onBufferReady is specified, it would be called but data would just be prebuffered
 //	See also InquireSendBuf, SendInplace, FinalizeSend
@@ -150,7 +150,7 @@ CSocketItemDl * LOCALAPI CSocketItemDl::ToPrepareMultiply(FSPHANDLE h, PFSP_Cont
 	{
 		socketItem->pControlBlock->connectParams = p->pControlBlock->connectParams;
 		socketItem->pControlBlock->idParent = p->fidPair.source;
-		socketItem->pControlBlock->SetSendWindow(p->pControlBlock->sendWindowNextSN - 1);
+		socketItem->pControlBlock->SetSendWindow(LCKREAD(p->pControlBlock->sendWindowNextSN) - 1);
 		//^The receive window would be initialized in LLS
 		// The MULTIPLY packet itself is sent in old key, while the packet next to MULTIPLY is send in derived key
 		socketItem->SetState(CLONING);
@@ -231,7 +231,7 @@ FSPHANDLE CSocketItemDl::CompleteMultiply(CommandCloneConnect & cmd)
 bool LOCALAPI CSocketItemDl::ToWelcomeMultiply(BackLogItem & backLog)
 {
 	PFSP_IN6_ADDR remoteAddr = (PFSP_IN6_ADDR) & pControlBlock->peerAddr.ipFSP.allowedPrefixes[MAX_PHY_INTERFACES - 1];
-	// Multiplcation is 0-RTT, it's allowed to prebuffer data to transmit
+	// Multiplication is 0-RTT, it's allowed to prebuffer data to transmit
 	SetState(CONNECT_AFFIRMING);
 	SetNewTransaction();
 	if (context.onAccepting != NULL	&& context.onAccepting(this, & backLog.acceptAddr, remoteAddr) < 0)

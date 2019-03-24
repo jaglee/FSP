@@ -102,7 +102,7 @@ bool CSocketItemEx::InStates(int n, ...)
 // TODO: UNRESOLVED! For FSP over IPv6, attach responder's resource reservation...
 void LOCALAPI CLowerInterface::OnGetInitConnect()
 {
-	// Silently discard connection request to blackhole, and avoid attacks alike 'port scan'
+	// Silently discard connection request to black hole, and avoid attacks alike 'port scan'
 	CSocketItemEx *pSocket = MapSocket();
 	if (pSocket == NULL || !pSocket->IsPassive())
 		return;
@@ -162,7 +162,7 @@ l_return:
 //CONNECT_BOOTSTRAP-->/ACK_INIT_CONNECT/
 //	-->CONNECT_AFFIRMING-->[Send CONNECT_REQUEST]
 // Do
-//	Check the inititiator's cookie, make the formal connection request towards the responder
+//	Check the initiator's cookie, make the formal connection request towards the responder
 // Remark
 //	It does not matter whether idListener == GetRemoteFiberID()
 // TODO: UNRESOLVED!? get resource reservation requirement from IPv6 extension header
@@ -187,7 +187,7 @@ void LOCALAPI CLowerInterface::OnInitConnectAck()
 		goto l_return;
 
 	pSocket->SetRemoteFiberID(initState.idRemote = this->GetRemoteFiberID());
-	//^ set to new peer fiber ID: to support multihome it is necessary even for IPv6
+	//^ set to new peer fiber ID: to support multi-home it is necessary even for IPv6
 	pSocket->SetNearEndInfo(nearInfo);
 
 	initState.timeDelta = be32toh(pkt->timeDelta);
@@ -204,7 +204,7 @@ l_return:
 
 /**
 	prepare the backlog, filling in the information about the remote fiber ID, the suggested local fiber ID,
-	the list of the remote address prefixes(for multihome support) and the half-connection parameters.
+	the list of the remote address prefixes(for multi-home support) and the half-connection parameters.
 	signal DLL (in the context of ULA) which polls the backlog and sets up the session context
 	[into 'CHALLENGING'] (allocate state space, including data buffers, command queue, etc).
 	it is tempting to acknowledge the connect request immediately to save some memory copy,
@@ -339,7 +339,7 @@ l_return:
 // PRE_CLOSED, CLONING}-->/RESET/
 //    -->NON_EXISTENT-->[Notify]
 //{NON_EXISTENT, LISTENING, CLOSED, Otherwise}<-->/RESET/{Ignore}
-// UNRESOLVED! Lost of RESET is siliently ignored?
+// UNRESOLVED! Lost of RESET is silently ignored?
 // TODO: put the RESET AND other meaningful packet on the stack/queue
 // The first RESET should be push onto the top. Repeated RESET should be append at the tail.
 void LOCALAPI CSocketItemEx::OnGetReset(FSP_RejectConnect & reject)
@@ -404,7 +404,7 @@ l_bailout:
 //	GapDescriptor * &			[_out_] the gap descriptor list
 //	int &						[_out_] number of gap descriptors in the list
 // Do
-//	Check wether KEEP_ALIVE or it special norm, ACK_FLUSH, is valid and output the gap descriptor list
+//	Check whether KEEP_ALIVE or it special norm, ACK_FLUSH, is valid and output the gap descriptor list
 // Return
 //	true if the header packet, which is assumed to be KEEP_ALIVE or ACK_FLUSH packet, is valid
 //	false if it is not
@@ -487,9 +487,9 @@ bool LOCALAPI CSocketItemEx::ValidateSNACK(ControlBlock::seq_t & ackSeqNo, FSP_S
 //	PktBufferBlock *	the packet buffer that holds ACK_CONNECT_REQ which might carry payload
 //	int					the content length of the packet buffer, which holds both the header and the optional payload
 // Do
-//	Check the validity of the ackowledgement to the CONNECT_REQUEST command and establish the ephemeral session key
+//	Check the validity of the acknowledgement to the CONNECT_REQUEST command and establish the ephemeral session key
 // CONNECT_AFFIRMING
-//	|--[Rcv.ACK_CONNECT_REQ]-->[Notifiy]
+//	|--[Rcv.ACK_CONNECT_REQ]-->[Notify]
 // See also @DLL::ToConcludeConnect()
 void CSocketItemEx::OnConnectRequestAck(PktBufferBlock *pktBuf, int lenData)
 {
@@ -530,7 +530,7 @@ void CSocketItemEx::OnConnectRequestAck(PktBufferBlock *pktBuf, int lenData)
 		goto l_return;
 	}
 
-	// ACK_CONNECT_REQ was not pushed into the queue so headpacket was not set
+	// ACK_CONNECT_REQ was not pushed into the queue so head packet was not set
 	// Put the payload (which might be empty) as if PlacePayload were called
 	BYTE *ubuf;
 	if (skb == NULL || !CheckMemoryBorder(skb) || (ubuf = GetRecvPtr(skb)) == NULL)
@@ -614,7 +614,7 @@ void CSocketItemEx::OnGetNulCommit()
 		// PEER_COMMIT, COMMITTING2, CLOSABLE: retransmit ACK_FLUSH on get ACK_START
 		if (OffsetToRecvWinLeftEdge(headPacket->pktSeqNo) < 0 || !isInitiativeState)
 		{
-			AddLazyAckTimer();
+			EnableDelayAck();	// It costs much less than to ValidateICC() or Notify()
 			return;
 		}
 		if (isInitiativeState && headPacket->pktSeqNo != pControlBlock->recvWindowExpectedSN)
@@ -648,9 +648,10 @@ void CSocketItemEx::OnGetNulCommit()
 	// ACK_START has nothing to deliver to ULA
 	if (isInitiativeState)
 	{
-		skb->ReInitMarkDelivered();
+		skb->ReInitMarkAcked();
 		pControlBlock->SlideRecvWindowByOne();
 	}
+	// Indirect dependency: tLastRecv which is exploited in SendAckFlush in TransitOnPeerCommit is set here
 	tLastRecv = NowUTC();
 	tRoundTrip_us = (uint32_t)min(UINT32_MAX, tLastRecv - tRecentSend);
 #if (TRACE & (TRACE_SLIDEWIN | TRACE_HEARTBEAT))
@@ -672,7 +673,6 @@ void CSocketItemEx::OnGetNulCommit()
 	if (isMultiplying)
 	{
 		SetState(_InterlockedExchange8(&transactional, 0) ? CLOSABLE : PEER_COMMIT);
-		StopKeepAlive();
 		SignalFirstEvent(FSP_NotifyMultiplied);
 	}
 	else // if (lowState == CHALLENGING)
@@ -681,6 +681,7 @@ void CSocketItemEx::OnGetNulCommit()
 		SignalFirstEvent(FSP_NotifyAccepted);
 	}
 	SendAckFlush();
+	RestartKeepAlive();
 }
 
 
@@ -728,13 +729,11 @@ void CSocketItemEx::OnGetPersist()
 	if (!isInitiativeState  && lowState < ESTABLISHED)
 		return;
 
-	if (headPacket->lenData < 0 || headPacket->lenData > MAX_BLOCK_SIZE)
-	{
 #ifdef TRACE
-		printf_s("Invalid payload length: %d\n", headPacket->lenData);
+	printf_s("Payload length: %d\n", headPacket->lenData);
 #endif
+	if (headPacket->lenData < 0 || headPacket->lenData > MAX_BLOCK_SIZE)
 		return;
-	}
 
 	FSP_NormalPacketHeader *p1 = headPacket->GetHeaderFSP();
 	ControlBlock::seq_t ackSeqNo = be32toh(p1->expectedSN);
@@ -755,7 +754,7 @@ void CSocketItemEx::OnGetPersist()
 		}
 		if (d < 0)
 		{
-			AddLazyAckTimer();	// It costs much less than to ValidateICC() or Notify()
+			EnableDelayAck();	// It costs much less than to ValidateICC() or Notify()
 			return;
 		}
 		if (!ValidateICC())
@@ -784,7 +783,7 @@ void CSocketItemEx::OnGetPersist()
 	// Make acknowledgement, in case previous acknowledgement is lost
 	if (countPlaced == -ENOENT || countPlaced == -EEXIST)
 	{
-		AddLazyAckTimer();
+		EnableDelayAck();
 		return;
 	}
 
@@ -817,11 +816,13 @@ void CSocketItemEx::OnGetPersist()
 	if (HasBeenCommitted())
 	{
 		if (TransitOnPeerCommit())
+		{
 			Notify(FSP_NotifyToCommit);
+			RestartKeepAlive();
+		}
 		return;
 	}
 
-	RestartKeepAlive();
 	switch (lowState)
 	{
 	case CHALLENGING:
@@ -846,6 +847,7 @@ void CSocketItemEx::OnGetPersist()
 	}
 	//
 	SendKeepAlive();
+	RestartKeepAlive();
 
 	if (isMultiplying)
 		SignalFirstEvent(FSP_NotifyMultiplied);
@@ -932,7 +934,7 @@ void CSocketItemEx::OnGetPureData()
 	}
 	if (d < 0)
 	{
-		AddLazyAckTimer();	// It costs much less than to ValidateICC() or Notify()
+		EnableDelayAck();	// It costs much less than to ValidateICC() or Notify()
 		return;
 	}
 
@@ -976,7 +978,7 @@ void CSocketItemEx::OnGetPureData()
 	}
 	if (r == -ENOENT || r == -EEXIST)
 	{
-		AddLazyAckTimer();
+		EnableDelayAck();
 		return;
 	}
 	// If r == 0 the EoT flag MUST be set. But we put such check at DLL level
@@ -997,9 +999,11 @@ void CSocketItemEx::OnGetPureData()
 	}
 	// PURE_DATA cannot start a transmit transaction, so in state like CLONING just prebuffer
 	if (!InState(CLONING) && !InState(PEER_COMMIT) && lowState < COMMITTING2)
-		AddLazyAckTimer();
+		EnableDelayAck();
+
+	// Did not exploit ControlBlock::CountDeliverable because of multi-thread shared memory synchronization problem
 	// Normally the ULA work in polling mode. Urge it to process the receive buffer if the buffer is full
-	if (pControlBlock->CountDeliverable() == pControlBlock->recvBufferBlockN)
+	if (int32_t(pControlBlock->recvWindowExpectedSN - GetRecvWindowFirstSN()) >= pControlBlock->recvBufferBlockN)
 		Notify(FSP_NotifyDataReady);
 	// See also OnGetPersist()
 }
@@ -1016,9 +1020,9 @@ bool CSocketItemEx::TransitOnPeerCommit()
 	pControlBlock->SnapshotReceiveWindowRightEdge();
 	if (hasAcceptedRELEASE)
 	{
+		ReplaceTimer(DEINIT_WAIT_TIMEOUT_ms);
 		Notify(FSP_NotifyToFinish);
 		lowState = CLOSED;
-		RecycleTimers();
 		SendAckFlush();
 		return false;
 	}
@@ -1036,16 +1040,14 @@ bool CSocketItemEx::TransitOnPeerCommit()
 		break;
 	case COMMITTED:
 		SetState(CLOSABLE);
-		StopKeepAlive();
 		break;
 	case CLONING:
 		SetState(_InterlockedExchange8(&transactional, 0) ? CLOSABLE : PEER_COMMIT);
-		StopKeepAlive();
 		break;
 		// default:	// case PEER_COMMIT: case COMMITTING2: case CLOSABLE:	// keep state
 	}
 	//
-	if(lazyAckTimer == NULL)
+	if (!delayAckPending)
 		SendAckFlush();
 	return true;
 }
@@ -1055,7 +1057,7 @@ bool CSocketItemEx::TransitOnPeerCommit()
 // ACK_FLUSH, now a pure out-of-band control packet. A special norm of KEEP_ALIVE
 //	COMMITTING-->/ACK_FLUSH/-->COMMITTED-->[Notify]
 //	COMMITTING2-->/ACK_FLUSH/-->CLOSABLE-->[Notify]
-//	PRE_CLOSED-->/ACK_FLUSH/-->CLOSED-->[Nofity]
+//	PRE_CLOSED-->/ACK_FLUSH/-->CLOSED-->[Notify]
 void CSocketItemEx::OnAckFlush()
 {
 	TRACE_SOCKET();
@@ -1079,21 +1081,16 @@ void CSocketItemEx::OnAckFlush()
 
 	if (InState(PRE_CLOSED))
 	{
+		ReplaceTimer(DEINIT_WAIT_TIMEOUT_ms);
 		SetState(CLOSED);
 		Notify(FSP_NotifyToFinish);
-		RecycleTimers();
 		return;
 	}
 
 	if (InState(COMMITTING2))
-	{
-		StopKeepAlive();
 		SetState(CLOSABLE);
-	}
 	else if(InState(COMMITTING))
-	{
 		SetState(COMMITTED);
-	}
 
 	Notify(FSP_NotifyFlushed);
 }
@@ -1134,12 +1131,13 @@ void CSocketItemEx::OnGetRelease()
 
 	if (!ValidateICC())
 	{
-		BREAK_ON_DEBUG();	//TRACE_HERE("Invalid intergrity check code!?");
+		BREAK_ON_DEBUG();	//TRACE_HERE("Invalid integrity check code!?");
 		return;
 	}
 
 	// Place a payloadless EoT packet into the receive queue,
 	// and the duplicate RELEASE packet would be rejected
+	// hidden dependency: tLastRecv which is exploited in SendAckFlush is set in PlacePayload
 	PlacePayload();
 	AcceptSNACK(pControlBlock->sendWindowNextSN, NULL, 0);
 
@@ -1149,9 +1147,9 @@ void CSocketItemEx::OnGetRelease()
 	if (InState(COMMITTED) && !HasBeenCommitted())
 		return;
 
-	RecycleTimers();
 	if (!InState(PRE_CLOSED))
 		SendAckFlush();
+	ReplaceTimer(DEINIT_WAIT_TIMEOUT_ms);
 	lowState = CLOSED;
 	Notify(FSP_NotifyToFinish);
 	//^Just to make internal recycling work. Let ULA do further state transition
@@ -1244,7 +1242,7 @@ void CSocketItemEx::OnGetMultiply()
 	newItem->idParent = idParent;
 	newItem->nextOOBSN = this->nextOOBSN;
 	newItem->lastOOBSN = this->lastOOBSN;
-	// place payload into the backlog, see also placepayload
+	// place payload into the backlog, see also PlacePayload
 	newItem->CopyInPlainText((BYTE *)pFH + be16toh(pFH->hs.hsp), headPacket->lenData);
 
 	ControlBlock::PFSP_SocketBuf skb = & newItem->skbRecvClone;

@@ -111,7 +111,7 @@ int FSPAPI SendInline(FSPHANDLE hFSPSocket, void * buffer, int32_t len, bool eot
 // Return
 //	non-negative if it is the number of octets put into the queue immediately
 //	-EBUSY if previous asynchronous Write operation has not completed
-//	-EFAULT if some ridiculous exception has arised
+//	-EFAULT if some ridiculous exception has arisen
 //	-EDEADLK if it cannot obtain mutual exclusive lock
 //	-EADDRINUSE if previous blocking Write operation has not completed
 //	-EIO if immediate sending operation failed
@@ -184,17 +184,11 @@ int32_t LOCALAPI CSocketItemDl::AcquireSendBuf()
 		return -EBUSY;
 	}
 
-	BYTE *buf = pControlBlock->InquireSendBuf(& pendingSendSize);
-	if (buf == NULL)
-	{
-		SetMutexFree();
-		return 0;
-	}
-	//
-	int32_t k = pendingSendSize;
-	EnablePolling();
-	ProcessPendingSend();
-	return k;
+	if (pControlBlock->InquireSendBuf(&pendingSendSize) != NULL)
+		EnablePolling();
+
+	SetMutexFree();
+	return pendingSendSize;
 }
 
 
@@ -222,7 +216,8 @@ int LOCALAPI CSocketItemDl::SendInplace(void * buffer, int32_t len, bool eot)
 		return -EBUSY;
 	}
 
-	int r = FinalizeSend(PrepareToSend(buffer, len, eot));
+	int r = PrepareToSend(buffer, len, eot);
+	SetMutexFree();
 	return (r < 0 ? r : bytesBuffered);
 }
 
@@ -280,18 +275,14 @@ int32_t LOCALAPI CSocketItemDl::SendStream(const void * buffer, int32_t len, boo
 	if (fpSent != NULL || fpCommitted != NULL)
 	{
 		EnablePolling();
-		return FinalizeSend(BufferData(len));	// pendingSendSize = len;
+		int r = BufferData(len);
+		return r;	// pendingSendSize = len;
 	}
 
 	// If it is blocking, wait until every byte has been put into the queue
 	while ((r = BufferData(len)) >= 0)
 	{
-		if (r > 0 && pControlBlock->state >= ESTABLISHED && !Call<FSP_Send>())
-		{
-			r = -EIO;
-			break;
-		}
-		//
+		// It used to urge LLS to send. Now (as at Feb.17, 2019) LLS works in polling mode
 		if (pendingSendSize <= 0)
 			break;
 		// Here wait LLS to free some send buffer block
@@ -354,7 +345,7 @@ int CSocketItemDl::LockAndCommit(NotifyOrReturn fp1)
 		SetMutexFree();
 		if (fp1 != NULL)
 			fp1(this, FSP_NotifyFlushed, EEXIST);
-		return 0;	// It is already in a state that the near end's last transmit transactio has been committed
+		return 0;	// It is already in a state that the near end's last transmit transaction has been committed
 	}
 
 	int r = Commit();
@@ -381,10 +372,8 @@ l_recursion:
 	{
 		if (HasDataToCommit())
 		{
-			int r = BufferData(pendingSendSize);
-			if (r > 0)
-				Call<FSP_Send>();
-			//
+			BufferData(pendingSendSize);
+			// It used to urge LLS to send. Now (as on Feb.17, 2019) LLS works in polling mode
 			if (HasDataToCommit())
 			{
 				SetMutexFree();
@@ -397,7 +386,7 @@ l_recursion:
 		if (fp2 != NULL)
 		{
 			SetMutexFree();
-			fp2(this, FSP_Send, bytesBuffered);
+			fp2(this, FSP_Urge, bytesBuffered);
 			return;
 		}
 		// Or else fall through to check whether it has intent to commit the transmit transaction
@@ -411,17 +400,10 @@ l_recursion:
 		return;
 	}
 
-	if (_InterlockedCompareExchange8(&chainingSend, 1, 0) != 0)
-	{
-		SetMutexFree();
-		return;
-	}
-
 	// Or else it's pending GetSendBuffer()
 	CallbackBufferReady fp2 = (CallbackBufferReady)InterlockedExchangePointer((PVOID volatile *)& fpSent, NULL);
 	if (fp2 == NULL)
 	{
-		chainingSend = 0;
 		SetMutexFree();
 		return;	// As there's no thread waiting free send buffer
 	}
@@ -432,7 +414,6 @@ l_recursion:
 	if (p == NULL)
 	{
 		TestSetSendReturn(fp2);
-		chainingSend = 0;
 		SetMutexFree();
 		BREAK_ON_DEBUG(); // race condition does exist, but shall be very rare!
 		return;
@@ -444,7 +425,6 @@ l_recursion:
 	bool b = (fp2(this, p, m) >= 0);
 	if (b)
 		TestSetSendReturn(fp2);
-	chainingSend = 0;
 	if (!WaitUseMutex())
 		return;	// It could be disposed in the callback function.
 
@@ -576,7 +556,7 @@ int LOCALAPI CSocketItemDl::BufferData(int m)
 			count++;
 		goto l_finalize;
 	}
-	// pStreamState != NULL, ie. To compress internal buffered
+	// pStreamState != NULL. To compress internal buffered
 	if (k > 0)
 	{
 		Compress(tgtBuf, k, NULL, 0);
@@ -693,9 +673,6 @@ int32_t LOCALAPI CSocketItemDl::PrepareToSend(void * buf, int32_t len, bool eot)
 		p->ClearFlags();
 	}
 	p->len = len - MAX_BLOCK_SIZE * m++;
-	pControlBlock->AddRoundSendBlockN(pControlBlock->sendBufferNextPos, m);
-	InterlockedAdd((LONG *)& pControlBlock->sendBufferNextSN, m);
-
 	bytesBuffered = len;
 
 	// When sending PERSIST packet is tightly packed, not right-aligned yet
@@ -707,6 +684,11 @@ int32_t LOCALAPI CSocketItemDl::PrepareToSend(void * buf, int32_t len, bool eot)
 	{
 		(p++)->ReInitMarkComplete();
 	}
+
+	// finally set the new tail of the send queue, and the let LLS detect the change
+	pControlBlock->AddRoundSendBlockN(pControlBlock->sendBufferNextPos, m);
+	_InterlockedExchangeAdd((LONG *)& pControlBlock->sendBufferNextSN, m);
+	//^here memory barrier is necessary
 	return m;
 }
 
@@ -783,7 +765,7 @@ int CSocketItemDl::Commit()
 		if (HasFreeSendBuffer())
 		{
 			BufferData(pendingSendSize);
-			r = Call<FSP_Send>();
+			Call<FSP_Urge>();
 		}
 		// else Case 4.1, the send queue is full and there is some payload to wait free buffer
 	}
@@ -794,12 +776,12 @@ int CSocketItemDl::Commit()
 		skbImcompleteToSend->ReInitMarkComplete();
 		skbImcompleteToSend = NULL;
 		MigrateToNewStateOnCommit();
-		r = Call<FSP_Send>();
+		Call<FSP_Urge>();
 	}
 	// Case 3, there is at least one idle slot to put an EoT packet
 	else if (AppendEoTPacket())
 	{
-		r = Call<FSP_Send>();
+		Call<FSP_Urge>();
 	}
 	// else Case 4.2, the send queue is full and is to append a NULCOMMIT
 	// Case 4: just to wait some buffer ready. See also ProcessPendingSend
@@ -829,7 +811,7 @@ int CSocketItemDl::Flush()
 	}
 
 	p->ReInitMarkComplete();
-	int r = Call<FSP_Send>() ? 0 : -EIO;
+	Call<FSP_Urge>();
 	SetMutexFree();
-	return r;
+	return 0;
 }

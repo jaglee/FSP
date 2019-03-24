@@ -43,16 +43,12 @@
 
 
 
-// Main purpose is to send the mandatory low-frequence KEEP_ALIVE
-/**
-  But the transaction commit time-out is handled in DLL, i.e. in ULA's work set.
-	{COMMITTING, COMMITTING2}-->NON_EXISTENT
- */
+// Now it is the polling timer. Unlike LockWithActiveULA(), here the socket is locked without wait
 void CSocketItemEx::KeepAlive()
 {
-	// Unlike LockWithActiveULA(), here is lock without wait
 	char c = _InterlockedCompareExchange8(&locked, 1, 0);
-	if (!IsProcessAlive())	// assume it takes little time to detect process life
+	// assume it takes little time to detect process life
+	if (!IsProcessAlive())
 	{
 		if (c == 0)
 		{
@@ -77,18 +73,11 @@ void CSocketItemEx::KeepAlive()
 		return;		// the socket has been released elsewhere
 	}
 
-	// If the lock could not be obtained this time, fire the timer a short while later
 	if (c != 0)
 	{
-		if (timer != NULL)
-			::ChangeTimerQueueTimer(TimerWheel::Singleton(), timer, TIMER_SLICE_ms, tKeepAlive_ms);
-#if (TRACE & TRACE_HEARTBEAT)
-		else
-			REPORT_ERRMSG_ON_TRACE("It could have found orphan timer handler for lazy garbage collection");
-		//
-		if (pControlBlock != NULL)
-			printf_s("\nFiber#%u's KeepAlive not executed due to lack of locks in state %s[%d]\n"
-				, fidPair.source, stateNames[lowState], pControlBlock->state);
+#ifndef NDEBUG
+		printf_s("\nFiber#%u's KeepAlive not executed due to lack of locks in state %s[%d]\n"
+			, fidPair.source, stateNames[lowState], lowState);
 #endif
 		return;
 	}
@@ -104,18 +93,6 @@ void CSocketItemEx::KeepAlive()
 		Destroy();
 		SetMutexFree();
 		return;
-	}
-
-	// To suppress unnecessary KEEP_ALIVE
-	bool keepAliveNeeded = (lazyAckTimer == NULL) && IsNearEndMoved();
-	if (keepAliveNeeded)
-	{
-		SendKeepAlive();	// No matter which state it is in
-		keepAliveNeeded = false;
-	}
-	else if(mobileNoticeInFlight != 0)
-	{
-		keepAliveNeeded = true;
 	}
 
 	timestamp_t t1 = NowUTC();
@@ -150,28 +127,26 @@ void CSocketItemEx::KeepAlive()
 #endif
 			TIMED_OUT();
 		}
-		if (keepAliveNeeded)
-			SendKeepAlive();
+		DoEventLoop();
 		break;
 	case CLOSABLE:
 		// CLOSABLE does NOT time out to CLOSED, and does NOT automatically recycled.
+		DoEventLoop();
 		break;
-	// assert: TRANSIENT_STATE_TIMEOUT_ms < RECYCLABLE_TIMEOUT_ms && RECYCLABLE_TIMEOUT_ms < MAXIMUM_SESSION_LIFE_ms
 	case PRE_CLOSED:
-		if (t1 - tMigrate > (CLOSING_TIME_WAIT_ms << 10))
+		// Automatically migrate to CLOSED state in TIME-WAIT state alike in TCP
+		if (t1 - tMigrate > (KEEP_ALIVE_TIMEOUT_ms << 10))
 		{
-			// Automatically migrate to CLOSED state in TIME-WAIT state alike in TCP
+			ReplaceTimer(DEINIT_WAIT_TIMEOUT_ms);
+			EmitStart();	// It shall be a RELEASE packet which is retransmitted at most once
 			SetState(CLOSED);
-			Notify(FSP_NotifyToFinish);
-		}
+		}	// ULA should have its own time-out clock enabled
+		DoEventLoop();
+		break;
 	case CLOSED:
-		if (t1 - tMigrate > (RECYCLABLE_TIMEOUT_ms << 10))
-		{
-#ifdef TRACE
-			printf_s("\nTransient state time out in the %s state\n", stateNames[lowState]);
-#endif
-			TIMED_OUT();
-		}
+		if (int64_t(t1 - tMigrate + 1024 - (UINT32_MAX << 10)) < 0)
+			ReplaceTimer(uint32_t((t1 - tMigrate) >> 10) + 1);
+		//^exponentially back off;  the socket is subjected to be recycled in LRU manner
 		break;
 	default:
 #ifndef NDEBUG
@@ -196,129 +171,17 @@ bool CSocketItemEx::AdjustRTT(int32_t k, uint64_t tDelay)
 		return false;
 
 	uint64_t rtt64_us = NowUTC() - skb->timeSent - tDelay;
-	// If ever the peer cheats by giving the acknowledgment delay value larger than the real value
+	// If ever the peer cheats by giving the acknowledgement delay value larger than the real value
 	// it would be eventually punished by a very large RTO!?
 	// Do not bother to guess delay caused by near-end task-scheduling
 	tRoundTrip_us = uint32_t(min((((rtt64_us + tRoundTrip_us) >> 1) + tRoundTrip_us) >> 1, UINT32_MAX));
 #if (TRACE & TRACE_HEARTBEAT)
-	printf_s("Round trip time calibrated: %u\n\tAcknowledgement delay: %llu\n", tRoundTrip_us, tDelay);
+	printf_s("Round trip time calibrated: %u\n\tacknowledgement delay: %llu\n", tRoundTrip_us, tDelay);
 #endif
 
 	// TODO: refresh the RTT of the bundle path [source net-prefix][target net-prefix][traffic class]
 	// congestion management
 	return true;
-}
-
-
-
-void CSocketItemEx::DoAcknowledge()
-{
-	lazyAckTimer = NULL;
-
-	if (!WaitUseMutex())
-	{
-#ifdef TRACE
-		printf_s("\nDoAcknowledge not executed due to lack of locks in state %s\n"
-			"#0x%X: InUse = %d, pSCB = %p\n"
-			, stateNames[lowState]
-			, fidPair.source, inUse, pControlBlock);
-#endif
-		if (IsInUse())
-			AddLazyAckTimer();
-		return;
-	}
-
-	SendKeepAlive();
-
-	SetMutexFree();
-}
-
-
-
-// UNRESOLVED! TODO: Retransmission should be subjected to quota control/rate control
-// Retransmission time-out handler
-void CSocketItemEx::DoResend()
-{
-	resendTimer = NULL;
-
-	if (!WaitUseMutex())
-	{
-#ifdef TRACE
-		printf_s("\n#0x%X's DoResend not executed due to lack of locks in state %s. InUse: %d\n"
-			, fidPair.source, stateNames[lowState], IsInUse());
-#endif
-		if(IsInUse())
-			AddResendTimer();
-		return;
-	}
-
-	// Make it ready for polling mode
-	SyncState();
-
-	// Because RemoveTimers() clear the isInUse flag before reset the handle resendTimer
-	// we assert that resendTimer != NULL and pControlBlock != NULL
-	// if the assertion failed, memory access exception might be raised.
-
-	// To minimize waste of network bandwidth, try to resend packet that was not acknowledged but sent earliest
-	const int32_t		N = pControlBlock->CountSentInFlight();
-	int32_t				i1 = pControlBlock->sendWindowHeadPos;
-	timestamp_t			tNow = NowUTC();
-	const int32_t		capacity = pControlBlock->sendBufferBlockN;
-
-	register ControlBlock::PFSP_SocketBuf p = pControlBlock->HeadSend() + i1;
-	register ControlBlock::seq_t seq1 = pControlBlock->sendWindowFirstSN;
-	bool furtherResendNeeded = false;
-	for (register int k = 0; k < N; k++)
-	{
-		// retransmission time-out is hard coded to 4RTT
-		if ((tNow - p->timeSent) < ((uint64_t)tRoundTrip_us << 2))
-		{
-			if (!p->IsAcked())
-			{
-				furtherResendNeeded = true;
-				break;
-			}
-#if defined(UNIT_TEST)
-			printf_s("Packet #%u has been acknowledged already\n", seq1);
-#endif
-		}
-		else if (!p->IsAcked())
-		{
-#if (TRACE & TRACE_HEARTBEAT)
-			printf_s("Fiber#%u, to retransmit packet #%u\n", fidPair.source, seq1);
-#endif
-#ifndef UNIT_TEST
-			if (EmitWithICC(p, seq1) <= 0)
-				break;
-#endif
-			p->MarkResent();
-			furtherResendNeeded = true;
-		}
-#if defined(UNIT_TEST)
-		else
-			printf_s("Packet #%u has been acknowledged already\n", seq1);
-#endif
-		//
-		++seq1;
-		if (++i1 - capacity >= 0)
-		{
-			i1 = 0;
-			p = pControlBlock->HeadSend();
-		}
-		else
-		{
-			p++;
-		}
-	}
-
-	if (furtherResendNeeded)
-		AddResendTimer();
-
-	// It is sub-optimal, but is safe to avoid starving of remote end's receive queue
-	// To further probe the receive window size.
-	EmitQ();
-
-	SetMutexFree();
 }
 
 
@@ -391,7 +254,7 @@ bool CSocketItemEx::SendAckFlush()
 	} ALIGN(MAC_ALIGNMENT) buf2;	// a buffer with two headers
 
 	InterlockedIncrement(& nextOOBSN);
-	buf2.snack.tLazyAck = 0;
+	buf2.snack.tLazyAck = htobe64(NowUTC() - tLastRecv);
 	buf2.snack.serialNo = htobe32(nextOOBSN);
 	buf2.snack.hs.Set(SELECTIVE_NACK, sizeof(buf2.hdr));
 
@@ -412,7 +275,7 @@ bool CSocketItemEx::SendAckFlush()
 
 
 // Given
-//	ControlBlock::seq_t		the accumulatedly acknowledged sequence number
+//	ControlBlock::seq_t		the accumulatively acknowledged sequence number
 //	GapDescriptor *			array of the gap descriptors
 //	int						number of gap descriptors
 // Do
@@ -425,7 +288,7 @@ bool CSocketItemEx::SendAckFlush()
 //	>=0		the number of packets accumulatively acknowledged
 // Remark
 //	Milky payload might be retransmitted on demand, but it isn't implemented here
-//  It is an accumulative acknowledgment if n == 0
+//  It is an accumulative acknowledgement if n == 0
 //	Memory integrity is checked here as well
 //	Side effect: the integer value in the gap descriptors are translated to host byte order here
 int LOCALAPI CSocketItemEx::AcceptSNACK(ControlBlock::seq_t expectedSN, FSP_SelectiveNACK::GapDescriptor *gaps, int n)
@@ -486,4 +349,139 @@ int LOCALAPI CSocketItemEx::AcceptSNACK(ControlBlock::seq_t expectedSN, FSP_Sele
 	InterlockedExchange((LONG *)&pControlBlock->sendWindowFirstSN, expectedSN);
 
 	return nAck;
+}
+
+
+
+// Assume it has got the mutex
+// 1. Resend one packet (if any)
+// 2. Send a new packet (if any)
+// 3. Delayed acknowledgement
+void CSocketItemEx::DoEventLoop()
+{
+	// Only need to synchronize the state in the 'cache' and the real state once because TCB is locked
+	_InterlockedExchange8((char *)& lowState, pControlBlock->state);
+	if (lowState <= NON_EXISTENT || lowState > LARGEST_FSP_STATE)
+	{
+		Destroy();
+		return;
+	}
+
+	// Used to loop header of DoResend
+	const int32_t	capacity = pControlBlock->sendBufferBlockN;
+	int32_t			i1 = pControlBlock->sendWindowHeadPos;
+	ControlBlock::seq_t seq1 = pControlBlock->sendWindowFirstSN;
+	ControlBlock::PFSP_SocketBuf p = pControlBlock->HeadSend() + i1;
+
+	timestamp_t		tNow = NowUTC();
+	bool toStopResend = false;
+	bool toStopEmitQ = false;
+
+loop_start:
+	// To minimize waste of network bandwidth, try to resend packet that was not acknowledged but sent earliest
+	toStopResend = toStopResend || (int32_t(seq1 - pControlBlock->sendWindowNextSN) >= 0);
+	if (!toStopResend)
+	{
+		// retransmission time-out is hard coded to 4RTT
+		if ((tNow - p->timeSent) < ((uint64_t)tRoundTrip_us << 2))
+		{
+			if (!p->IsAcked())
+			{
+				toStopResend = true;
+				goto l_step2;
+			}
+#if defined(UNIT_TEST)
+			printf_s("Packet #%u has been acknowledged already\n", seq1);
+#endif
+		}
+		else if (!p->IsAcked())
+		{
+#if (TRACE & TRACE_HEARTBEAT)
+			printf_s("Fiber#%u, to retransmit packet #%u\n", fidPair.source, seq1);
+#endif
+#ifndef UNIT_TEST
+			if (EmitWithICC(p, seq1) <= 0)
+			{
+				toStopResend = true;
+				goto l_step2;
+			}
+#endif
+			p->MarkResent();
+		}
+#if defined(UNIT_TEST)
+		else
+			printf_s("Packet #%u has been acknowledged already\n", seq1);
+#endif
+		//
+		++seq1;
+		if (++i1 - capacity >= 0)
+		{
+			i1 = 0;
+			p = pControlBlock->HeadSend();
+		}
+		else
+		{
+			p++;
+		}
+	}
+
+l_step2:
+	register ControlBlock::seq_t limitSN = pControlBlock->GetSendLimitSN();
+	register ControlBlock::PFSP_SocketBuf skb;
+	toStopEmitQ = toStopEmitQ || (int32_t(pControlBlock->sendWindowNextSN - limitSN) >= 0);
+	// Used to be loop-body of EmitQ:
+	if (!toStopEmitQ)
+	{
+		skb = pControlBlock->HeadSend() + pControlBlock->sendWindowNextPos;
+		if (!skb->IsComplete() || skb->InSending())
+		{
+			toStopEmitQ = true;
+			goto l_post_step3;	// ULA is still to fill the buffer
+		}
+#ifndef UNIT_TEST
+		if (EmitWithICC(skb, pControlBlock->sendWindowNextSN) <= 0)
+		{
+			toStopEmitQ = true;
+			goto l_post_step3;	// transmission failed
+		}
+#endif
+		skb->MarkSent();
+		if (++pControlBlock->sendWindowNextPos >= capacity)
+			pControlBlock->sendWindowNextPos = 0;
+		InterlockedIncrement(&pControlBlock->sendWindowNextSN);
+	}
+
+	// Zero window probing; although there's some code redundancy it keeps clarity
+	if (int32_t(pControlBlock->sendWindowNextSN - pControlBlock->sendWindowLimitSN) == 0
+	 && int32_t(pControlBlock->sendBufferNextSN - pControlBlock->sendWindowLimitSN) > 0)
+	{
+		skb = pControlBlock->HeadSend() + pControlBlock->sendWindowNextPos;
+		if (!skb->IsComplete() || skb->InSending())
+			goto l_post_step3;	// ULA is still to fill the buffer
+#ifndef UNIT_TEST
+		if (EmitWithICC(skb, pControlBlock->sendWindowNextSN) <= 0)
+			goto l_post_step3;	// transmission failed
+#endif
+		skb->MarkSent();
+		if (++pControlBlock->sendWindowNextPos >= capacity)
+			pControlBlock->sendWindowNextPos = 0;
+		InterlockedIncrement(&pControlBlock->sendWindowNextSN);
+	}
+
+l_post_step3:
+	if (int64_t(NowUTC() - tNow - TIMER_SLICE_ms * 1000) >= 0)
+		goto l_final;
+
+	if (!toStopResend)
+		goto loop_start;
+	if (!toStopEmitQ)
+		goto l_step2;
+
+l_final:
+	// Finally, (Really!) Lazy acknowledgement
+	if (delayAckPending || IsNearEndMoved() || mobileNoticeInFlight)
+	{
+		SendKeepAlive();
+		delayAckPending = 0;
+	}
 }

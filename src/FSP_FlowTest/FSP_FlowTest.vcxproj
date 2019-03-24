@@ -22,6 +22,7 @@
     <ProjectGuid>{F56F346F-658D-4837-ABE2-51DC53164753}</ProjectGuid>
     <Keyword>Win32Proj</Keyword>
     <RootNamespace>FSP_FlowTest</RootNamespace>
+    <WindowsTargetPlatformVersion>8.1</WindowsTargetPlatformVersion>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="Configuration">
@@ -178,6 +179,7 @@
     <ClCompile Include="..\FSP_SRV\timers.cpp" />
     <ClCompile Include="FSP_FlowTest.cpp" />
     <ClCompile Include="Test_FlowControl.cpp" />
+    <ClCompile Include="Test_Timers.cpp" />
     <ClCompile Include="Test_TryCHAKA.cpp" />
     <ClCompile Include="Test_TrySRP.cpp" />
     <ClCompile Include="Test_TryWideChar.cpp" />

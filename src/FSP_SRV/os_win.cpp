@@ -1,6 +1,6 @@
 /*
  * FSP lower-layer service program, collection of the platform-dependent
- * / IPC-machanism-dependent functions
+ * / IPC-mechanism-dependent functions
  *
     Copyright (c) 2012, Jason Gao
     All rights reserved.
@@ -62,7 +62,7 @@ static int LOCALAPI ReportWSAError(char * msg);
 // The function called directly or by ReportWSAError
 static void LOCALAPI ReportErrorAsMessage(int);
 
-// Forward declartion of the firewall manipulation function
+// Forward declaration of the firewall manipulation function
 static int CreateFWRules();
 
 /**
@@ -101,7 +101,7 @@ inline int GetPointerOfWSASendMsg(SOCKET sock)
 #endif
 
 
-// Forward declaration of the callback function for handling the event that some IPv6 inferface was changed
+// Forward declaration of the callback function for handling the event that some IPv6 interface was changed
 VOID NETIOAPI_API_ OnUnicastIpChanged(PVOID, PMIB_UNICASTIPADDRESS_ROW, MIB_NOTIFICATION_TYPE);
 
 
@@ -127,15 +127,15 @@ void CSocketSrvTLB::AcquireMutex()
 //	- Startup the socket service
 //	- Create rule entries in the firewall setting to enable FSP traffic
 //	- Bind the listening sockets besides the default sending socket
-//	- Pre-allocate Application Layer Fiber ID pool
-//	- Enable acception and processing of the remote FSP packets
+//	- Preallocate Application Layer Fiber ID pool
+//	- Enable accepting and processing of the remote FSP packets
 //	- Enable mobility detection
 bool CLowerInterface::Initialize()
 {
 	WSADATA wsaData;
 	int r;
 
-	// initializw windows socket support
+	// initialize windows socket support
 	if ((r = WSAStartup(0x202, &wsaData)) < 0)
 	{
 		BREAK_ON_DEBUG();
@@ -244,8 +244,8 @@ void CLowerInterface::Destroy()
 
 
 
-// Preallocate a pool of re-usable random ALFIDs. Prealloction would later make the lower network interface to preconfigure the corresponding IP addresses
-// This is a workaround as we cannot receive a unicasted packet whose destination IPv6 address does not match any known unicast IP address on an NIC
+// Preallocate a pool of re-usable random ALFIDs. Preallocation would later make the lower network interface to provision the corresponding IP addresses
+// This is a workaround as we cannot receive a unicast packet whose destination IPv6 address does not match any known unicast IP address on an NIC
 // even if it has been put to promiscuous mode
 inline void CLowerInterface::MakeALFIDsPool()
 {
@@ -275,7 +275,7 @@ inline void CLowerInterface::MakeALFIDsPool()
 
 
 
-// multihome/mobility/resilence(multipath) support is provided for non-NAT IPv6 network only
+// multi-home/mobility/resilience(multi-path) support is provided for non-NAT IPv6 network only
 // sockAddrTo[0] is the most preferred address (care of address)
 // sockAddrTo[3] is the home-address
 // while sockAddr[1], sockAddr[2] are backup-up/load-balance address (might be zero)
@@ -296,14 +296,14 @@ int LOCALAPI CLowerInterface::EnumEffectiveAddresses(uint64_t *prefixes)
 	for (register int i = 0; i < n; i++)
 	{
 		// binary prefix 000 MUST have its interface ID set to EUID, which is NOT compatible with FSP
-		// neithor the "IPv4-Compatible	IPv6 address" nor the "IPv4 - mapped IPv6 address"
+		// neither the "IPv4-Compatible	IPv6 address" nor the "IPv4 - mapped IPv6 address"
 		// is compatible with FSP
 		if ((addresses[i].sin6_addr.u.Byte[0] & 0xE0) == 0)
 			continue;
 		// RFC4193 unique local address might be NATed, which is NOT compatible with FSP
 		if ((addresses[i].sin6_addr.u.Byte[0] & 0xFE) == 0xFC)
 			continue;
-		// RFC4291 link-local address may not be utilized in resilence support, unless configured specially
+		// RFC4291 link-local address may not be utilized in resilience support, unless configured specially
 		if (*(uint64_t *)& addresses[i].sin6_addr.u == *(uint64_t *)& in6addr_linklocalprefix.u)
 			continue;
 		// other global routable address are supposed to be not-NATed, compatible with FSP
@@ -348,7 +348,7 @@ int	DisablePromiscuous()
 
 
 
-// There's the document glich when this code snippet was written: the output buffer MUST be specified
+// There's the document glitch when this code snippet was written: the output buffer MUST be specified
 // Given
 //	SOCKET		the socket that bind the interface to be set into promiscuous mode
 // Do
@@ -513,7 +513,7 @@ inline bool CLowerInterface::LearnAddresses()
 
 
 
-// For FSP over IPv6 raw-socket, preconfigure an IPv6 interface with ALFID pool
+// For FSP over IPv6 raw-socket, provision an IPv6 interface with ALFID pool
 // Given
 //	int		The index of the address entry
 // Do
@@ -813,7 +813,7 @@ inline void CLowerInterface::ProcessRemotePacket()
 
 
 
-// The handler's mainbody to accept and process one particular remote packet
+// The handler's main body to accept and process one particular remote packet
 // See also SendPacket
 int CLowerInterface::AcceptAndProcess(SOCKET sdRecv)
 {
@@ -846,7 +846,7 @@ int CLowerInterface::AcceptAndProcess(SOCKET sdRecv)
 
 	// From the receiver's point of view the local fiber id was stored in the peer fiber id field of the received packet
 #ifdef OVER_UDP_IPv4
-	countRecv -= sizeof(ALFIDPair);	// extra prefixed bytes are substracted
+	countRecv -= sizeof(ALFIDPair);	// extra prefixed bytes are subtracted
 	nearInfo.u.idALF = pktBuf->fidPair.peer;
 	SOCKADDR_ALFID(mesgInfo.name) = pktBuf->fidPair.source;
 #else
@@ -985,7 +985,7 @@ int LOCALAPI CLowerInterface::SendBack(char * buf, int len)
 //	uint32_t			reason code flags of reset (default zero)
 // Do
 //	Send back the echoed reset at the same interface of receiving
-//	in CHALLENGING, CONNECT_AFFIRMING, unresumable CLOSABLE and unrecoverable CLOSED state,
+//	in CHALLENGING, CONNECT_AFFIRMING, resumable CLOSABLE and unrecoverable CLOSED state,
 //	and of course, throttled LISTENING state
 void LOCALAPI CLowerInterface::SendPrematureReset(uint32_t reasons, CSocketItemEx *pSocket)
 {
@@ -1069,7 +1069,7 @@ void TraceLastError(char * fileName, int lineNo, char *funcName, char *s1)
 /**
  *	POSIX gettimeofday(); get current UTC time
  */
-// Return the number of microseconds elapsed since Jan 1, 1970 UTC (unix epoch)
+// Return the number of microseconds elapsed since Jan 1, 1970 UTC (Unix epoch)
 extern "C" timestamp_t NowUTC()
 {
 	// return the number of 100-nanosecond intervals since January 1, 1601 (UTC), in host byte order
@@ -1106,7 +1106,7 @@ TimerWheel::~TimerWheel()
 
 
 // Return
-//	Whether the ULA process assocated with the LLS socket is still alive
+//	Whether the ULA process associated with the LLS socket is still alive
 // Remark
 //	It is assumed that process ID is 'almost never' reused
 bool CSocketItemEx::IsProcessAlive()
@@ -1131,7 +1131,6 @@ bool CSocketItemEx::IsProcessAlive()
 //	true if the timer was set, false if it failed.
 bool LOCALAPI CSocketItemEx::ReplaceTimer(uint32_t period)
 {
-	tKeepAlive_ms = period;
 	return ( timer == NULL 
 		&&	::CreateTimerQueueTimer(& timer, TimerWheel::Singleton()
 			, KeepAlive	// WAITORTIMERCALLBACK
@@ -1145,93 +1144,36 @@ bool LOCALAPI CSocketItemEx::ReplaceTimer(uint32_t period)
 }
 
 
-
-// Return
-//	true if the timer was set, false if it failed.
-// Remark
-//	Make it a one-shot timer because we assume retransmission is sufficiently rare
-//  A retransmission timer is hard coded to 4 RTT. Do not retransmit in the same time slice.
-bool CSocketItemEx::AddResendTimer()
-{
-#if !defined(NDEBUG) || !(TRACE & TRACE_HEARTBEAT) || !(TRACE & (TRACE_PACKET || TRACE_OUTBAND))
-	DWORD tPeriod_ms = max(TIMER_SLICE_ms, tRoundTrip_us >> 8);	
-#else
-	DWORD tPeriod_ms = INIT_RETRANSMIT_TIMEOUT_ms / 3;
-#endif
-#if defined(UNIT_TEST)
-	return true;
-#else
-	return (resendTimer != NULL
-		|| ::CreateTimerQueueTimer(&resendTimer, TimerWheel::Singleton()
-			, DoResend
-			, this
-			, tPeriod_ms
-			, 0
-			, WT_EXECUTEINTIMERTHREAD));
-#endif
-}
-
-
-
-// Return
-//	true if the timer was set, false if it failed.
-// Remark
-//  A lazy acknowledgement timer is hard coded to 1 RTT.
-bool CSocketItemEx::AddLazyAckTimer()
-{
-#if !defined(NDEBUG) || !(TRACE & TRACE_HEARTBEAT) || !(TRACE & (TRACE_PACKET || TRACE_OUTBAND))
-	DWORD tPeriod_ms = max(TIMER_SLICE_ms, tRoundTrip_us >> 10);
-#else
-	DWORD tPeriod_ms = INIT_RETRANSMIT_TIMEOUT_ms / 3;
-#endif
-	return (lazyAckTimer != NULL
-		|| ::CreateTimerQueueTimer(& lazyAckTimer, TimerWheel::Singleton()
-			, DoAcknowledge
-			, this
-			, tPeriod_ms
-			, 0
-			, WT_EXECUTEINTIMERTHREAD));
-}
-
-
 // Assume a mutex has been obtained
 void CSocketItemEx::RemoveTimers()
 {
 	HANDLE h;
-	if ((h = (HANDLE)InterlockedExchangePointer(&lazyAckTimer, NULL)) != NULL)
-		::DeleteTimerQueueTimer(TimerWheel::Singleton(), h, NULL);
-
-	if ((h = (HANDLE)InterlockedExchangePointer(&resendTimer, NULL)) != NULL)
-		::DeleteTimerQueueTimer(TimerWheel::Singleton(), h, NULL);
-
 	if((h = (HANDLE)InterlockedExchangePointer(& timer, NULL)) != NULL)
 		::DeleteTimerQueueTimer(TimerWheel::Singleton(), h, NULL);
 }
 
 
 
-// Assume a mutex has been obtained
-void CSocketItemEx::RecycleTimers()
+// For ScheduleConnect
+DWORD WINAPI HandleConnect(LPVOID p)
 {
-	HANDLE h;
-	if ((h = (HANDLE)InterlockedExchangePointer(&lazyAckTimer, NULL)) != NULL)
-		::DeleteTimerQueueTimer(TimerWheel::Singleton(), h, NULL);
-
-	if ((h = (HANDLE)InterlockedExchangePointer(&resendTimer, NULL)) != NULL)
-		::DeleteTimerQueueTimer(TimerWheel::Singleton(), h, NULL);
-
-	if (timer != NULL)
-		::ChangeTimerQueueTimer(TimerWheel::Singleton(), timer, RECYCLABLE_TIMEOUT_ms, RECYCLABLE_TIMEOUT_ms);
+	try
+	{
+		((CommandNewSessionSrv *)p)->DoConnect();
+		return 1;
+	}
+	catch (...)
+	{
+		return 0;
+	}
 }
 
-
-// The OS-depending implementation of scheduling connection-request queue
+// The OS-dependent implementation of scheduling connection-request queue
 void CSocketItemEx::ScheduleConnect(CommandNewSessionSrv *pCmd)
 {
 	pCmd->pSocket = this;
 	QueueUserWorkItem(HandleConnect, pCmd, WT_EXECUTELONGFUNCTION);
 }
-
 
 
 // Given
@@ -1303,7 +1245,7 @@ l_return:
 
 
 
-// Return true if successed to obtain the mutex lock, false if waited but timed-out
+// Return true if succeeded in obtaining the mutex lock, false if waited but timed-out
 bool CSocketItemEx::WaitUseMutex()
 {
 	uint64_t t0 = GetTickCount64();
@@ -1326,7 +1268,7 @@ bool CSocketItemEx::WaitUseMutex()
 void CSocketItemEx::SetMutexFree()
 {
 	if(_InterlockedExchange8(& locked, 0) == 0)
-		printf_s("Warning: to release the spinlock of the socket#0x%p, but it was released\n", this);
+		printf_s("Warning: to release the spin-lock of the socket#0x%p, but it was released\n", this);
 }
 
 
@@ -1345,24 +1287,9 @@ CommandNewSessionSrv::CommandNewSessionSrv(const CommandToLLS *p1)
 
 
 
-// For ScheduleConnect
-DWORD WINAPI HandleConnect(LPVOID p)
-{
-	try
-	{
-		((CommandNewSessionSrv *)p)->DoConnect();
-		return 1;
-	}
-	catch(...)
-	{
-		return 0;
-	}
-}
-
-
 
 // UNRESOLVED! TODO: enforce rate-limit (and rate-limit based congestion avoidance/control)
-// TODO: UNRESOLVED! is it multi-home awared?
+// TODO: UNRESOLVED! is it multi-home aware?
 // Given
 //	ULONG	number of WSABUF descriptor to gathered in sending
 //	ScatteredSendBuffers
@@ -1764,7 +1691,6 @@ static int CreateFWRules()
 		goto l_bailout;
 	}
 
-
 l_bailout:
 	// Free BSTR's
 	SysFreeString(bstrRuleName);
@@ -1876,7 +1802,7 @@ bool LOCALAPI CLowerInterface::SelectPath(PFSP_SINKINF pNear, ALFID_T nearId, NE
 #endif
 
 	// Link-local first
-	if (*(int64_t *)& sockAddrTo->Ipv6.sin6_addr.u == *(int64_t *)& in6addr_linklocalprefix.u)	// hard coded 8 byte address prefix lenth
+	if (*(int64_t *)& sockAddrTo->Ipv6.sin6_addr.u == *(int64_t *)& in6addr_linklocalprefix.u)	// hard coded 8 byte address prefix length
 	{
 		for (i = 0; i < sdSet.fd_count; i++)
 		{
@@ -1885,7 +1811,7 @@ bool LOCALAPI CLowerInterface::SelectPath(PFSP_SINKINF pNear, ALFID_T nearId, NE
 		}
 	}
 	// then in6addr_6to4prefix
-	if (sockAddrTo->Ipv6.sin6_addr.u.Word[0] == in6addr_6to4prefix.u.Word[0])	// hard coded 2 byte address prefix lenth
+	if (sockAddrTo->Ipv6.sin6_addr.u.Word[0] == in6addr_6to4prefix.u.Word[0])	// hard coded 2 byte address prefix length
 	{
 		for (i = 0; i < sdSet.fd_count; i++)
 		{
@@ -1893,8 +1819,8 @@ bool LOCALAPI CLowerInterface::SelectPath(PFSP_SINKINF pNear, ALFID_T nearId, NE
 				goto l_matched;
 		}
 	}
-	// then match terodo tunnelling
-	if (*(int32_t *)& sockAddrTo->Ipv6.sin6_addr.u == *(int32_t *)& in6addr_teredoprefix.u)	// hard coded 4 byte address prefix lenth
+	// then match teredo tunneling
+	if (*(int32_t *)& sockAddrTo->Ipv6.sin6_addr.u == *(int32_t *)& in6addr_teredoprefix.u)	// hard coded 4 byte address prefix length
 	{
 		for (i = 0; i < sdSet.fd_count; i++)
 		{
@@ -2034,7 +1960,7 @@ inline void CLowerInterface::OnIPv6AddressMayAdded(NET_IFINDEX ifIndex, const SO
 		iRecvAddr = i;
 	//
 	SetLocalApplicationLayerFiberIDs(i);
-	// reenable the new socket. if unnecessary, little harm is done
+	// re-enable the new socket. if unnecessary, little harm is done
 	InterlockedCompareExchange(&sdSet.fd_count, i + 1, i);
 	sdSet.fd_array[i] = sdRecv;
 	InterlockedBitTestAndReset(& disableFlags, i);
@@ -2066,7 +1992,7 @@ inline void CLowerInterface::OnRemoveIPv6Address(NET_IFINDEX ifIndex, const IN6_
 				if (sdSet.fd_array[i] == sdPromiscuous)
 				{
 #if defined(TRACE) && (TRACE & TRACE_ADDRESS)
-					printf_s("To disable promiscous mode on IPv6 interface #%d\n", i);
+					printf_s("To disable promiscuous mode on IPv6 interface #%d\n", i);
 #endif
 					DisablePromiscuous();
 				}
@@ -2075,7 +2001,7 @@ inline void CLowerInterface::OnRemoveIPv6Address(NET_IFINDEX ifIndex, const IN6_
 			}
 			// See also CSocketItemEx::OnLocalAdressChanged. It is a special case for effective loop-back
 			// UNRESOLVED!
-			// When porting to Linux should implement a high-effiency local socket, transparently for ULA
+			// When porting to Linux should implement a high-efficiency local socket, transparently for ULA
 			for (register int j = 0; j < MAX_CONNECTION_NUM; j++)
 			{
 #if defined(TRACE) && (TRACE & TRACE_ADDRESS)

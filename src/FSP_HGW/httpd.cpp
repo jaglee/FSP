@@ -567,6 +567,8 @@ void SendRegFile(FSPHANDLE client, const char *filename)
 	int n;
 
 	char *buf = (char *)malloc(BUFFER_POOL_SIZE);
+	if (buf == NULL)
+		return;
 	buf[0] = 'A';
 	buf[1] = '\0';
 	while ((numchars > 0) && strcmp("\n", buf))  /* read & discard headers */

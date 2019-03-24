@@ -65,7 +65,7 @@ UnregisterWaitEx(
 
 #include "../FSP_Impl.h"
 
-// prepare pre-defined macros before including FSP_API.h
+// prepare predefined macros before including FSP_API.h
 // effectively avoid double-definition of API by customization
 typedef CSocketItem * PSocketItem;
 #define FSPHANDLE PSocketItem	// the pointer to some entry in the translate look-aside table
@@ -73,8 +73,7 @@ typedef CSocketItem * PSocketItem;
 #define DllExport extern "C" __declspec(dllexport)
 #define DllSpec DllExport
 
-// DllSpec and FSPHANDLE must be defined properly before FSP_API,
-// or else the includer is assumed as a caller, not an implementation
+// DllSpec and FSPHANDLE must be defined properly before FSP_API
 #include "../FSP_API.h"
 
 // per-session connection limit. theoretically any connectible socket might be listener
@@ -120,7 +119,6 @@ class CSocketItemDl : public CSocketItem
 	static	CSocketDLLTLB socketsTLB;
 	static	DWORD	idThisProcess;
 
-	SRWLOCK			rtSRWLock;
 	HANDLE			timer;
 	//
 	CSocketItemDl	*next;
@@ -142,16 +140,15 @@ protected:
 	ControlBlock::PFSP_SocketBuf skbImcompleteToSend;
 
 	char			inUse;
+	char			locked;
 	char			newTransaction;	// it may simultaneously start a transmit transaction and flush/commit it
-
-	char			chainingReceive;
-	char			chainingSend;
 
 	// Flags, in dictionary order
 	char			initiatingShutdown : 1;
 	char			lowerLayerRecycled : 1;
 	char			peerCommitPending : 1;
 	char			peerCommitted : 1;	// Only for conventional buffered, streamed read
+	char			pendingEoT : 1;		// EoT flag is pending to be added on a packet
 
 	HANDLE			pollingTimer;
 	ALIGN(8)		HANDLE theWaitObject;
@@ -280,8 +277,9 @@ public:
 		return pControlBlock->GetRecvPtr(skb);
 	}
 
+	ControlBlock::seq_t GetSendWindowFirstSN() { return (ControlBlock::seq_t)LCKREAD(pControlBlock->sendWindowFirstSN); }
 
-	FSP_Session_State GetState() { return (FSP_Session_State)InterlockedOr8((char *)& pControlBlock->state, 0); }
+	FSP_Session_State GetState() { return (FSP_Session_State)_InterlockedOr8((char *)& pControlBlock->state, 0); }
 	bool InState(FSP_Session_State s) { return GetState() == s; }
 	void SetState(FSP_Session_State s) { _InterlockedExchange8((char *)& pControlBlock->state, s); }
 
@@ -309,7 +307,7 @@ public:
 
 	bool InIllegalState()
 	{
-		register FSP_Session_State s = (FSP_Session_State)InterlockedOr8((char *)& pControlBlock->state, 0);
+		register FSP_Session_State s = (FSP_Session_State)_InterlockedOr8((char *)& pControlBlock->state, 0);
 		return (s <= 0 || s > LARGEST_FSP_STATE);
 	}
 
@@ -321,8 +319,10 @@ public:
 	bool HasPeerCommitted() { return peerCommitted != 0; }
 
 	bool WaitUseMutex();
-	void SetMutexFree() { ReleaseSRWLockExclusive(& rtSRWLock); }
-	bool IsInUse() { return (_InterlockedXor8(&inUse, 0) != 0) && (pControlBlock != NULL); }
+	void SetMutexFree() { _InterlockedExchange8(&locked, 0); }
+	bool TryMutexLock() { return _InterlockedCompareExchange8(&locked, 1, 0) == 0; }
+
+	bool IsInUse() { return (_InterlockedOr8(&inUse, 0) != 0) && (pControlBlock != NULL); }
 
 	void SetPeerName(const char *cName, size_t len)
 	{
@@ -395,22 +395,6 @@ public:
 		return InterlockedCompareExchangePointer((PVOID *) & fpSent, fp1, NULL) == NULL; 
 	}
 
-
-	int LOCALAPI FinalizeSend(int r)
-	{
-		// Prevent premature FSP_Send	// Just prebuffer.
-		if (r < 0 || pControlBlock->state < ESTABLISHED)
-		{
-			SetMutexFree();
-			return r;
-		}
-		//
-		if(r > 0 && !Call<FSP_Send>())
-			r = -EIO;
-		SetMutexFree();
-		return r;
-	}
-
 	CSocketItemDl * WaitingConnectAck();
 	//
 	int BlockOnCommit();
@@ -427,8 +411,8 @@ public:
 	void SetCallbackOnAccept(CallbackConnected fp1) { context.onAccepted = fp1; }
 
 	void SetNewTransaction() { newTransaction = 1; }
-	void SetEoTPending(bool v = true) { pControlBlock->pendingEoT = v ? 1 : 0; }
-	bool IsEoTPending() { return pControlBlock->pendingEoT != 0; }
+	void SetEoTPending(bool v = true) { pendingEoT = (v ? 1 : 0); }
+	bool IsEoTPending() { return pendingEoT != 0; }
 
 	int SelfNotify(FSP_ServiceCode c);
 	void SetCallbackOnError(NotifyOrReturn fp1) { context.onError = fp1; }

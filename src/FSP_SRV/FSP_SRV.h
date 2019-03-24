@@ -41,10 +41,6 @@
 
 #include "gcm-aes.h"
 
-#pragma intrinsic(_InterlockedCompareExchange, _InterlockedCompareExchange8)
-#pragma intrinsic(_InterlockedExchange, _InterlockedExchange8)
-#pragma intrinsic(_InterlockedIncrement, _InterlockedOr, _InterlockedOr8)
-
 #define COOKIE_KEY_LEN			20	// salt include, as in RFC4543 5.4
 #define MULTIPLY_BACKLOG_SIZE	8
 
@@ -178,20 +174,7 @@ public:
 
 typedef struct FSP_InternalFixedHeader : FSP_FixedHeader
 {
-	// Given
-	//	ControlBlock *			the context of the packet header to prepar
-	//	ControlBlock::seq_t		the intent sequence number of the packet
-	// Do
-	//	Set the sequence number, expected sequence number for accumulative acknowledgement,
-	//	flags and the advertised receive window size field of the FSP header 
-	void SetSequenceFlags(ControlBlock *pControlBlock, ControlBlock::seq_t seq1)
-	{
-		pControlBlock->SetExpectedSNof(this);
-		sequenceNo = htobe32(seq1);
-		ClearFlags();
-	}
-
-
+	friend class CSocketItemEx;	// for sake of accessing protected member of FSP_FixedHeader
 	// Get the first extension header
 	PFSP_HeaderSignature PFirstExtHeader() const
 	{
@@ -332,8 +315,8 @@ struct ICC_Context
 	void InitiateExternalKey(const void *, int);
 	// Given 0 for output (0 appears like o, send), 1 for input(1 appears like i, receive)
 	void ForcefulRekey(int);
-	// Given the sequence number, check wether it should rekey before send
-	// The caller should make sure that rekeying is not too frequent to 
+	// Given the sequence number, check whether it should re-key before send
+	// The caller should make sure that re-keying is not too frequent to 
 	// keep unacknowledged packets to be resent correctly
 	void CheckToRekeyBeforeSend(ControlBlock::seq_t seqNo)
 	{
@@ -347,8 +330,8 @@ struct ICC_Context
 		if (int32_t(seqNo - snFirstSendWithCurrKey - FSP_REKEY_THRESHOLD) >= 0)
 			ForcefulRekey(0);
 	}
-	// Before accepting packet, check wether it needs rekeying to validate it. If it does need, do rekey
-	// Assume every packet in the receive window is either encyrpted in the new re-keyed key
+	// Before accepting packet, check whether it needs re-keying to validate it. If it does need, do re-key
+	// Assume every packet in the receive window is either encrypted in the new re-keyed key
 	void CheckToRekeyAnteAccept(ControlBlock::seq_t seqNo)
 	{
 #if (TRACE & TRACE_PACKET)
@@ -358,7 +341,7 @@ struct ICC_Context
 			, snFirstRecvWithCurrKey);
 #endif
 		if (int32_t(seqNo - snFirstRecvWithCurrKey - FSP_REKEY_THRESHOLD) < 0
-		 || int32_t(seqNo - snFirstRecvWithCurrKey - FSP_REKEY_THRESHOLD - FSP_REKEY_THRESHOLD) >= 0)
+		 || int32_t(seqNo - snFirstRecvWithCurrKey - FSP_REKEY_THRESHOLD * 2) >= 0)
 		{
 			return;
 		}
@@ -411,9 +394,9 @@ protected:
 	//
 	ICC_Context	contextOfICC;
 	ALIGN(MAC_ALIGNMENT)
-		octet		cipherText[MAX_BLOCK_SIZE];
+	octet		cipherText[MAX_BLOCK_SIZE];
 
-	// multihome/mobility/resilence support (see also CInterface::EnumEffectiveAddresses):
+	// multi-home/mobility/resilience support (see also CInterface::EnumEffectiveAddresses):
 	// MAX_PHY_INTERFACES is hard-coded to 4
 	// sockAddrTo[0] is the most preferred address (care of address)
 	// sockAddrTo[3] is the home-address
@@ -424,7 +407,8 @@ protected:
 
 	char	hasAcceptedRELEASE : 1;
 	char	inUse : 1;
-	char	locked;	// emulate spinlock linux-kernel
+	char	delayAckPending : 1;
+	char	locked;
 	char	transactional;	// The cache value of the EoT flag of the very first packet
 	FSP_Session_State lowState;
 
@@ -438,10 +422,9 @@ protected:
 	CSocketItemEx * prevSame;
 
 	uint32_t	tRoundTrip_us;	// round trip time evaluated in microsecond
-	uint32_t	tKeepAlive_ms;	// keep-alive time-out limit in millisecond
+	//- There used to be tKeepAlive_ms here. now reserved
 	HANDLE		timer;			// the repeating timer
-	HANDLE		resendTimer;	// retransmission timer
-	HANDLE		lazyAckTimer;	// timer for lazy-acknowledgement
+	timestamp_t delayAckTime;
 
 	// As the first packet received in the clone(new) connection is actually received
 	// BEFORE the new connection's session begin to send the first packet
@@ -464,21 +447,13 @@ protected:
 
 	void AbortLLS(bool haveTLBLocked = false);
 
-	bool AddLazyAckTimer();
-	bool AddResendTimer();
-
-	void RecycleTimers();
+	void EnableDelayAck() { delayAckPending = 1; }
 	void RemoveTimers();
-
 	bool LOCALAPI ReplaceTimer(uint32_t);
 
 	// Given the index of the acknowledged packet and peer's delay to make the acknowledgement
 	// Adjust long-term round-trip-time
 	bool AdjustRTT(int32_t, uint64_t);
-
-	// KeepAlive interval in established mode is hard-coded to ~16RTT
-	void RestartKeepAlive() { ReplaceTimer(max(TIMER_SLICE_ms, uint32_t(tRoundTrip_us >> 6))); }
-	void StopKeepAlive() { ReplaceTimer(RECYCLABLE_TIMEOUT_ms); }
 
 	bool InState(FSP_Session_State s) { return lowState == s; }
 	bool InStates(int n, ...);
@@ -490,6 +465,15 @@ protected:
 			tMigrate = NowUTC();
 	}
 	void SetState(FSP_Session_State s) { _InterlockedExchange8((char *)& pControlBlock->state, s); SyncState(); }
+
+	void SetSequenceFlags(PFSP_InternalFixedHeader pHdr, ControlBlock::seq_t seq1)
+	{
+		ControlBlock::seq_t snExpected = pControlBlock->recvWindowExpectedSN;
+		pHdr->sequenceNo = htobe32(seq1);
+		pHdr->expectedSN = htobe32(snExpected);
+		pHdr->ClearFlags();
+		pHdr->SetRecvWS(int32_t(GetRecvWindowFirstSN() + pControlBlock->recvBufferBlockN - snExpected));
+	}
 
 	bool HasBeenCommitted() { return pControlBlock->HasBeenCommitted(); }
 	// Return true if really transit, false if the (half) connection is finised and to notify
@@ -509,15 +493,15 @@ protected:
 	bool IsNearEndMoved();
 	int	 EmitWithICC(ControlBlock::PFSP_SocketBuf, ControlBlock::seq_t);
 
-	void DoAcknowledge();
-	void DoResend();
 	void KeepAlive();
+	void DoEventLoop();
 
-	static VOID NTAPI DoAcknowledge(PVOID c, BOOLEAN) { ((CSocketItemEx *)c)->DoAcknowledge(); }
-	static VOID NTAPI DoResend(PVOID c, BOOLEAN) { ((CSocketItemEx *)c)->DoResend(); }
 	static VOID NTAPI KeepAlive(PVOID c, BOOLEAN) { ((CSocketItemEx *)c)->KeepAlive(); }
 	//
 public:
+#ifdef _DEBUG
+	void SetTouchTime(timestamp_t t) { tLastRecv = tRecentSend = t; }
+#endif
 	bool MapControlBlock(const CommandNewSessionSrv &);
 	void InitAssociation();
 	bool LockWithActiveULA();
@@ -554,6 +538,9 @@ public:
 		return (offset < sizeof(ControlBlock) || offset >= dwMemorySize) ? NULL : p;
 	}
 
+	ControlBlock::seq_t GetRecvWindowFirstSN() { return (ControlBlock::seq_t)LCKREAD(pControlBlock->recvWindowFirstSN); }
+	int32_t GetRecvWindowHeadPos() { return LCKREAD(pControlBlock->recvWindowHeadPos); }
+
 	void SetNearEndInfo(const CtrlMsgHdr & nearInfo)
 	{
 		pControlBlock->nearEndInfo.cmsg_level = nearInfo.pktHdr.cmsg_level;
@@ -584,7 +571,7 @@ public:
 	// Calculate offset of the given sequence number to the left edge of the receive window
 	int32_t OffsetToRecvWinLeftEdge(ControlBlock::seq_t seq1)
 	{
-		return int32_t(seq1 - _InterlockedOr((LONG *)& pControlBlock->recvWindowFirstSN, 0));
+		return int32_t(seq1 - LCKREAD(pControlBlock->recvWindowFirstSN));
 	}
 
 	// Given
@@ -612,12 +599,10 @@ public:
 	// Check whether previous KEEP_ALIVE is implicitly acknowledged on getting a validated packet
 	inline void CheckAckToKeepAlive();
 
-	int	EmitNextToSend();
-	// Normally those pended on the queue would be eventually sent if the send window size is greater than 0
-	// retry to probe the advertised receive window size of the peer to adjust the send window size.
-	void EmitQ();
-
 	void ScheduleConnect(CommandNewSessionSrv *);
+	// On Feb.17, 2019 Semantics of KeepAlive was fundamentally changed. Now it is the heartbeat of the local side
+	// Send-pacing is a yet-to-implement feature of the rate-control based congestion control sublayer/manager
+	void RestartKeepAlive() { ReplaceTimer(TIMER_SLICE_ms * 2); }
 
 	// Command of ULA
 	void ProcessCommand(CommandToLLS *);
@@ -654,7 +639,7 @@ public:
 	void	CopyInPlainText(const uint8_t *buf, int32_t n) { skbRecvClone.len = n; if(n > 0) memcpy(cipherText, buf, n); }
 	// copy out the flag, version and opcode fields. assume 32-bit alignment
 	void	CopyOutFVO(ControlBlock::PFSP_SocketBuf skb) { *(int32_t *)&skb->marks = *(int32_t *)& skbRecvClone.marks; }
-	// copy out fhe payload, make it right-aligned in the target buffer
+	// copy out the payload, make it right-aligned in the target buffer
 	int		CopyOutPlainText(uint8_t *buf)
 	{
 		int32_t n = skbRecvClone.len;
@@ -834,9 +819,6 @@ public:
 	~TimerWheel();
 };
 
-
-// OS-specific thread-pool related, for Windows LPTHREAD_START_ROUTINE function
-DWORD WINAPI HandleConnect(LPVOID);
 
 // defined in socket.cpp
 void LOCALAPI DumpHexical(const void *, int);

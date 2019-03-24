@@ -457,12 +457,13 @@ void UnitTestAllocSocket()
 	{
 		p = tlb.AllocItem();
 		Assert::IsNotNull(p);
+		p->SetTouchTime(NowUTC());
 	}
 	CSocketItemEx *p0 = p;
 
 	Logger::WriteMessage("All slots allocated.");
 	p = tlb.AllocItem();
-	//Assert::IsNull(p);
+	Assert::IsNull(p);
 	//^As AllocItem automatically free the slot whose ULA process is not alive, this assertion would fail
 
 	tlb.FreeItem(p0);

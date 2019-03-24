@@ -90,13 +90,10 @@ int CSocketItemDl::RecvInline(CallbackPeeked fp1)
 		printf_s("\nFiber#%u, warning: Receive-inline called before previous RecvInline called back\n", fidPair.source);
 #endif
 	}
-	//
-	bool b = HasDataToDeliver();
+
+	// Let's the polling timer to call ProcessReceiveBuffer
 	EnablePolling();
-	if (! b)
-		SetMutexFree();
-	else
-		ProcessReceiveBuffer();
+	SetMutexFree();
 	return 0;
 }
 
@@ -114,6 +111,7 @@ int CSocketItemDl::RecvInline(CallbackPeeked fp1)
 //	negative on error
 // See ::RecvFrom()
 // TODO: check whether the buffer overlapped?
+// TODO: make read idle (waiting some data available) time-out configurable? 
 int LOCALAPI CSocketItemDl::ReadFrom(void * buffer, int capacity, NotifyOrReturn fp1)
 {
 	if (!WaitUseMutex())
@@ -143,15 +141,11 @@ int LOCALAPI CSocketItemDl::ReadFrom(void * buffer, int capacity, NotifyOrReturn
 	}
 	peerCommitted = 0;	// See also ProcessReceiveBuffer
 
+	// Let's the polling timer to call ProcessReceiveBuffer
 	if (fpReceived != NULL)
 	{
-		bool b = HasDataToDeliver();
 		EnablePolling();
-		// Let's the polling timer to call ProcessReceiveBuffer if nested
-		if (!b)
-			SetMutexFree();
-		else
-			ProcessReceiveBuffer();
+		SetMutexFree();
 		return 0;
 	}
 
@@ -167,7 +161,7 @@ int LOCALAPI CSocketItemDl::ReadFrom(void * buffer, int capacity, NotifyOrReturn
 				goto l_postloop;
 			SetMutexFree();
 			Sleep(TIMER_SLICE_ms);
-			if (GetTickCount64() - t0 > COMMITTING_TIMEOUT_ms)
+			if (GetTickCount64() - t0 > KEEP_ALIVE_TIMEOUT_ms)
 				return -EDEADLK;
 			if (!WaitUseMutex())
 				return (IsInUse() ? -EDEADLK : -EINTR);
@@ -186,7 +180,7 @@ l_postloop:
 
 
 // Return
-//	-EDOM	(-33)	if the PERSIST packet of the size of some packet does not comform to the protocol
+//	-EDOM	(-33)	if the PERSIST packet of the size of some packet does not conform to the protocol
 //	-EFAULT (-14)	if the packet buffer was broken
 //	-ENOMEM (-12)	if it is to decompress, but there is no enough memory for internal buffer
 //	non-negative: number of octets fetched. might be zero
@@ -261,7 +255,7 @@ int32_t CSocketItemDl::FetchReceived()
 		offsetInLastRecvBlock = 0;
 
 		bool b = p->GetFlag<TransactionEnded>();
-		p->ReInitMarkDelivered();
+		p->ReInitMarkAcked();
 		// but preserve the packet flag for EoT detection, etc.
 		nPacket++;
 		//
@@ -286,7 +280,8 @@ int32_t CSocketItemDl::FetchReceived()
 	}
 	//
 	pControlBlock->AddRoundRecvBlockN(pControlBlock->recvWindowHeadPos, nPacket);
-	InterlockedAdd((LONG *)&pControlBlock->recvWindowFirstSN, nPacket);
+	_InterlockedExchangeAdd((LONG *)&pControlBlock->recvWindowFirstSN, nPacket);
+	//^memory barrier is mandatory
 	return sum;
 }
 
@@ -335,16 +330,9 @@ l_recursion:
 		return;
 	}
 
-	if (_InterlockedCompareExchange8(&chainingReceive, 1, 0) != 0)
-	{
-		SetMutexFree();
-		return;
-	}
-
 	CallbackPeeked fp1 = (CallbackPeeked)InterlockedExchangePointer((PVOID *)& fpPeeked, NULL);
 	if (fp1 == NULL)
 	{
-		chainingReceive = 0;
 		SetMutexFree();
 		return;
 	}
@@ -352,16 +340,16 @@ l_recursion:
 	// First received block of a clone connection or a new transmit transaction is right-aligned
 	// See also @LLS::PlacePayload and @LLS::CopyOutPlainText
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->GetFirstReceived();
+	int32_t nBlock;
 	bool eot;
-	BYTE *p = pControlBlock->InquireRecvBuf(n, eot);
+	BYTE *p = pControlBlock->InquireRecvBuf(n, nBlock, eot);
 	if(p != NULL && (skb->opCode == PERSIST || skb->opCode == MULTIPLY))
 		p += MAX_BLOCK_SIZE - skb->len;	// See also FetchReceived()
 #ifdef TRACE
-	printf_s("RecvInline, data to deliver@%p, length = %d, eot = %d\n", p, n, (int)eot);
+	printf_s("RecvInline, data to deliver@%p, length = %d, eot = %d; %d blocks scanned\n", p, n, (int)eot, nBlock);
 #endif
 	if (!eot && n == 0)	// Redundant soft-interrupt shall be simply ignored
 	{
-		chainingReceive = 0;
 		fpPeeked = fp1;
 		SetMutexFree();
 		return;
@@ -369,27 +357,31 @@ l_recursion:
 
 	SetMutexFree();
 	// It is possible that no meaningful payload is received but an EoT flag is got.
-	// The callback function should work in such senario
+	// The callback function should work in such scenario
 	// It is also possible that p == NULL while n is the error code. The callback function MUST handle such scenario
 	// If the callback function happens to be updated, prefer the new one
 	if (fp1(this, p, n, eot))
 		InterlockedCompareExchangePointer((PVOID *)&fpPeeked, fp1, NULL);
-	chainingReceive = 0;
 	if (!WaitUseMutex())
 		return;	// it could be disposed in the callback function
 	// Assume the call-back function did not mess up the receive queue
-	int m = pControlBlock->MarkReceivedFree(skb);
-#ifndef NDEBUG
-	if (m != n)
+	if (pControlBlock->GetFirstReceived() != skb)
 	{
-		printf_s("MarkReceivedFree returned %d, expected %d: the receive queue was messed up?!\n", m, n);
+		printf_s("The receive queue was messed up? Head of the receive queue was moved!\n");
 		BREAK_ON_DEBUG();
 	}
-#endif
+	int m = pControlBlock->MarkReceivedFree(nBlock);
+	if (m < 0)
+	{
+		printf_s("MarkReceivedFree returned %d: the receive queue was messed up?!\n", m);
+		BREAK_ON_DEBUG();
+	}
+
 	offsetInLastRecvBlock = 0;
 	// If (n < 0) some unrecoverable error has occur. Should avoid the risk of dead-loop.
-	if (n >= 0 && m == n && HasDataToDeliver())
+	if (n >= 0 && HasDataToDeliver())
 		goto l_recursion;
+	//^former condition equals (n > 0 || n == 0 && eot) because (!eot && n == 0) has been excluded
 
 	SetMutexFree();
 }

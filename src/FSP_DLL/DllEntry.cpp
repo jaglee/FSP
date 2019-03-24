@@ -6,7 +6,7 @@
  * - emulate hardware interrupt vector mechanism
  * - For Windows:
  * -- When LLS is created the global shared FSP mailslot is created
- * -- When DLL is attached, a handle to the global FSP mailslot is obstained
+ * -- When DLL is attached, a handle to the global FSP mailslot is obtained
  * -- For each FSP socket a block of shared memory is allocated by DLL
  *    preferably with address space layout randomization applied
  * -- When ULA calls an FSP function the corresponding API module construct a command structure object
@@ -111,7 +111,7 @@ BOOL WINAPI DllMain(HINSTANCE hInstance, DWORD dwReason, LPVOID lpvReserved)
 /**
  *	POSIX gettimeofday(); get current UTC time
  */
-// Return the number of microseconds elapsed since Jan 1, 1970 UTC (unix epoch)
+// Return the number of microseconds elapsed since Jan 1, 1970 UTC (Unix epoch)
 DllSpec
 timestamp_t NowUTC()
 {
@@ -159,7 +159,7 @@ bool CLightMutex::WaitSetMutex()
 bool CSocketItemDl::WaitUseMutex()
 {
 	uint64_t t0 = GetTickCount64();
-	while(!TryAcquireSRWLockExclusive(& rtSRWLock))
+	while(!TryMutexLock())
 	{
 		// possible dead lock: should trace the error in debug mode!
 		if(GetTickCount64() - t0 > MAX_LOCK_WAIT_ms)
@@ -212,7 +212,7 @@ int CSocketItemDl::SelfNotify(FSP_ServiceCode c)
 //	PFSP_Context
 //	char []		the buffer to hold the name of the event
 // Do
-//	Create and initialize the shared memory struction of the Session Control Block
+//	Create and initialize the shared memory structure of the Session Control Block
 // Return
 //	0 if no error, negative is the error code
 int LOCALAPI CSocketItemDl::Initialize(PFSP_Context psp1, char szEventName[MAX_NAME_LENGTH])
@@ -264,10 +264,10 @@ int LOCALAPI CSocketItemDl::Initialize(PFSP_Context psp1, char szEventName[MAX_N
 
 	// make the event name. the control block address, together with the process id, uniquely identify the event
 	sprintf_s(szEventName, MAX_NAME_LENGTH, REVERSE_EVENT_PREFIX "%08X%p", idThisProcess, pControlBlock);
-	// system automatically resets the event state to nonsignaled after a single waiting thread has been released
+	// system automatically resets the event state to non-signaled after a single waiting thread has been released
 	hEvent = CreateEventA(& attrSecurity
 		, FALSE // not manual-reset
-		, FALSE // the initial state of the event object is nonsignaled
+		, FALSE // the initial state of the event object is non-signaled
 		, szEventName);	// (LPCTSTR)
 
 #ifdef TRACE
@@ -292,7 +292,7 @@ int LOCALAPI CSocketItemDl::Initialize(PFSP_Context psp1, char szEventName[MAX_N
 	pControlBlock->notices.SetHead(FSP_IPC_CannotReturn);
 	//^only after the control block is successfully mapped into the memory space of LLS may it be cleared by LLS
 
-	// could be exploited by ULA to make distinguishment of services
+	// could be exploited by ULA to make services distinguishable
 	memcpy(&context, psp1, sizeof(FSP_SocketParameter));
 	pendingSendBuf = (BYTE *)psp1->welcome;
 	pendingSendSize = psp1->len;
@@ -385,7 +385,7 @@ void CSocketItemDl::WaitEventToDispatch()
 			break;
 		case FSP_NotifyAccepted:
 			CancelTimeout();		// If any
-			// Asychronous return of Connect2, where the initiator may cancel data transmission
+			// Asynchronous return of Connect2, where the initiator may cancel data transmission
 			if(InState(CONNECT_AFFIRMING))
 			{
 				ToConcludeConnect();// SetMutexFree();
@@ -395,15 +395,18 @@ void CSocketItemDl::WaitEventToDispatch()
 			SetMutexFree();
 			if(fp1 != NULL)
 				((CallbackConnected)fp1)(this, &context);
+			if (!LockAndValidate())
+				return;
+			ProcessReceiveBuffer();	// SetMutexFree();
 			break;
 		case FSP_NotifyMultiplied:	// See also @LLS::Connect()
 			CancelTimeout();		// If any
 			fidPair.source = pControlBlock->nearEndInfo.idALF;
-			ProcessReceiveBuffer();
+			ProcessReceiveBuffer();	// SetMutexFree();
 			if (!LockAndValidate())
 				return;
 			// To inherently chain WriteTo/SendInline with Multiply
-			ProcessPendingSend();
+			ProcessPendingSend();	// SetMutexFree();
 			break;
 		case FSP_NotifyDataReady:
 			ProcessReceiveBuffer();	// SetMutexFree();
@@ -412,7 +415,7 @@ void CSocketItemDl::WaitEventToDispatch()
 			ProcessPendingSend();	// SetMutexFree();
 			break;
 		case FSP_NotifyToCommit:
-			// See also FSP_NotifyDataReady, FSP_NotifyFlushed and CSocketItemDl::Shutdown()
+			// See also FSP_NotifyDataReady, compare with FSP_NotifyFlushed
 			ProcessReceiveBuffer();	// SetMutexFree();
 			if (!LockAndValidate())
 				return;
@@ -425,7 +428,7 @@ void CSocketItemDl::WaitEventToDispatch()
 			{
 				SetState(PRE_CLOSED);
 				AppendEoTPacket();
-				Call<FSP_Send>();
+				Call<FSP_Urge>();
 			}
 			SetMutexFree();
 			break;
@@ -438,7 +441,7 @@ void CSocketItemDl::WaitEventToDispatch()
 			{
 				SetState(PRE_CLOSED);
 				AppendEoTPacket();
-				Call<FSP_Send>();
+				Call<FSP_Urge>();
 				SetMutexFree();
 			}
 			else
@@ -570,7 +573,7 @@ bool LOCALAPI CSocketItemDl::Call(const CommandToLLS & cmd, int size)
 
 
 // Given
-//	uint32_t		number of milli-seconds to wait till the timer shoot
+//	uint32_t		number of milliseconds to wait till the timer shoot
 // Return
 //	true if the one-shot timer is registered successfully
 //	false if it failed
@@ -590,7 +593,7 @@ bool LOCALAPI CSocketItemDl::AddOneShotTimer(uint32_t dueTime)
 
 
 // Return
-//	true if the repeative timer is registered successfully
+//	true if the repetitive timer is registered successfully
 //	false if it failed
 bool CSocketItemDl::EnablePolling()
 {
@@ -642,7 +645,7 @@ bool CSocketItemDl::CancelTimeout()
 // Suppose that the lower layer recycle LRU
 void CSocketItemDl::TimeOut()
 {
-	BOOLEAN b = TryAcquireSRWLockExclusive(&rtSRWLock);
+	BOOLEAN b = TryMutexLock();
 	if (!IsInUse())
 	{
 		if(b)
@@ -665,11 +668,14 @@ void CSocketItemDl::TimeOut()
 
 void CSocketItemDl::PollingTimedout()
 {
-	if (!TryAcquireSRWLockExclusive(&rtSRWLock))
+	if (!TryMutexLock())
 		return;	// Patiently wait the next time slice instead to spin here
 
 	if (!IsInUse() || InIllegalState())
+	{
+		SetMutexFree();
 		return;
+	}
 
 #if (TRACE & TRACE_SLIDEWIN)
 	printf_s("FSPSocket %p, Receive window: \n"
@@ -688,7 +694,7 @@ void CSocketItemDl::PollingTimedout()
 	if ((fpReceived != NULL || fpPeeked != NULL) && HasDataToDeliver())
 	{
 		ProcessReceiveBuffer();
-		if (!TryAcquireSRWLockExclusive(&rtSRWLock))
+		if (!TryMutexLock())
 			return;
 	}
 	//
@@ -715,7 +721,7 @@ CSocketItemDl *	CSocketDLLTLB::HandleToRegisteredSocket(FSPHANDLE h)
 
 
 
-// The contructor of the Translation Look-aside Buffer of the DLL FSP socket items
+// The constructor of the Translation Look-aside Buffer of the DLL FSP socket items
 CSocketDLLTLB::CSocketDLLTLB()
 {
 	InitializeSRWLock(& srwLock);
@@ -781,9 +787,6 @@ CSocketItemDl * CSocketDLLTLB::AllocItem()
 	memset((BYTE *)item + sizeof(CSocketItem)
 		, 0
 		, sizeof(CSocketItemDl) - sizeof(CSocketItem));
-	InitializeSRWLock(&item->rtSRWLock);
-	// Are we confident that RTL_SRWLOCK_INIT is all zero
-	// so assign to SRWLOCK_INIT is unneccessary?
 	pSockets[sizeOfWorkSet++] = item;
 	_InterlockedExchange8(& item->inUse, 1);
 
@@ -821,7 +824,7 @@ void CSocketDLLTLB::FreeItem(CSocketItemDl *r)
 
 
 // Given
-//	ALFID_T		the application layer fiber ID of the connectio to find
+//	ALFID_T		the application layer fiber ID of the connection to find
 // Return
 //	The pointer to the FSP socket that matches the given ID
 // Remark

@@ -48,6 +48,8 @@ static void FSPAPI onError(FSPHANDLE h, FSP_ServiceCode code, int value)
 {
 	printf_s("Notify: socket %p, service code = %d, return %d\n", h, code, value);
 	r2finish = finished = true;
+	if (hFinished != NULL)
+		SetEvent(hFinished);
 	return;
 }
 
@@ -106,12 +108,22 @@ l_bailout:
 // On this client side we test blocking mode while on server side we test asynchronous mode
 int StartConnection(char *urlRemote)
 {
-	static size_t	arrayTestSizes[] = { 511, 512, 513
-		, 1023, 1024, 1025
-		, 1536, 2048, 4095
-		, 4096, 4097, 4608
-		, 4609, 1000000, 10000000	// 1MB, 10MB
-		, 100000000, 1000000000		// 100MB, 1GB
+	static size_t	arrayTestSizes[] = { 511
+		//, 512
+		//, 513
+		//, 1024
+		//, 1536
+		//, 2048
+		//, 2560
+		//, 3072
+		//, 3584
+		//, 4095
+		//, 4096
+		//, 4097
+		//, 1000000	// 1MB
+		, 10000000	// 10MB
+		, 100000000	// 100MB
+		, 1000000000// 1GB
 	};
 	static int		indexOfSizeArray;	// start from zero
 
@@ -148,7 +160,7 @@ l_nextSize:
 	if (ctx->len <= 0 || mLen >= ctx->len)
 	{
 		printf_s("Security context is not fulfilled: the peer did not provide the public key.\n");
-		printf_s("To read the memory pattern directly...\t");
+		printf_s("To read the memory pattern directly.\n");
 		//
 		int r = BeginReceiveMemoryPattern(h, arrayTestSizes[indexOfSizeArray]);
 		if (r < 0)
@@ -159,6 +171,9 @@ l_nextSize:
 		HANDLE h = InterlockedExchangePointer((PVOID *)& hFile, NULL);
 		if (h != NULL)
 			CloseHandle(h);
+
+		if(finished && r2finish)
+			return 0;
 		//
 		if (++indexOfSizeArray >= sizeof(arrayTestSizes) / sizeof(size_t))
 			return 0;

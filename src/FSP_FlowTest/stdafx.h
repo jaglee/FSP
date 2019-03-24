@@ -34,6 +34,9 @@ void UnitTestICC();
 void UnitTestHMAC();
 void UnitTestTweetNacl();
 
+void EvaluateTimerWheel();
+void EvaluateHPET();
+
 void FlowTestAcknowledge();
 void FlowTestRetransmission();
 void FlowTestRecvWinRoundRobin();

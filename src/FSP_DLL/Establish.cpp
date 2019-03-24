@@ -42,8 +42,8 @@
 //	NULL if it fails immediately, or else 
 //  the handle of the passive FSP socket whose properties might be peek and/or set later
 // Remark
-//	FSP over UDP/IPv4 address SHALL be converted to 'cannonical' FSP-aligned IPv6 address
-//	The handle returned might be unusable, if PFSP_Context::onError() report error laterly
+//	FSP over UDP/IPv4 address SHALL be converted to 'canonical' FSP-aligned IPv6 address
+//	The handle returned might be unusable, if PFSP_Context::onError() report error later
 DllSpec
 FSPHANDLE FSPAPI ListenAt(const PFSP_IN6_ADDR listenOn, PFSP_Context psp1)
 { 
@@ -206,7 +206,7 @@ FSPHANDLE FSPAPI Connect2(const char *peerName, PFSP_Context psp1)
 //	BackLogItem *	the fetched backlog item of the listening socket
 // Do
 //	create new socket, prepare the acknowledgement
-//	and call LLS to send the acknowledgement to the connnection request or multiplication request
+//	and call LLS to send the acknowledgement to the connection request or multiplication request
 // Return
 //	true if success
 //	false if failed.
@@ -245,7 +245,7 @@ CSocketItemDl *CSocketItemDl::ProcessOneBackLog(BackLogItem	*pLogItem)
 
 
 // Fetch each of the backlog item in the listening socket, create new socket, prepare the acknowledgement
-// and call LLS to send the acknowledgement to the connnection request or multiplication request
+// and call LLS to send the acknowledgement to the connection request or multiplication request
 void CSocketItemDl::ProcessBacklogs()
 {
 	BackLogItem		*pLogItem;
@@ -257,7 +257,7 @@ void CSocketItemDl::ProcessBacklogs()
 
 
 // Given
-//	BackLogItem &		the reference to the acception backlog item
+//	BackLogItem &		the reference to the accepting backlog item
 //	CommandNewSession & the command context of the backlog
 // Return
 //	The pointer to the socket created for the new connection requested
@@ -312,7 +312,7 @@ CSocketItemDl * CSocketItemDl::PrepareToAccept(BackLogItem & backLog, CommandNew
 //		| -->[API:Accept]
 //			-->{new context}CHALLENGING-->[Send ACK_CONNECT_REQ]
 // Given
-//	BackLogItem &	the reference to the acception backlog item
+//	BackLogItem &	the reference to the accepting backlog item
 // Do
 //	(ACK_CONNECT_REQ, Initial SN, Expected SN, Timestamp, Receive Window[, responder's half-connection parameter[, payload])
 // Return
@@ -339,7 +339,7 @@ bool LOCALAPI CSocketItemDl::ToWelcomeConnect(BackLogItem & backLog)
 		return false;
 	}
 
-	pControlBlock->sendBufferNextSN = pControlBlock->sendWindowFirstSN + 1;
+	pControlBlock->sendBufferNextSN = GetSendWindowFirstSN() + 1;
 	pControlBlock->sendBufferNextPos = 1;	// reserve the head packet
 	//
 	memcpy(&pControlBlock->connectParams, &backLog, FSP_MAX_KEY_SIZE);
@@ -369,7 +369,7 @@ bool LOCALAPI CSocketItemDl::ToWelcomeConnect(BackLogItem & backLog)
 
 // Auxiliary function that is called when a new connection request is acknowledged by the responder
 // CONNECT_AFFIRMING
-//	|--[Rcv.ACK_CONNECT_REQ]-->[Notifiy]
+//	|--[Rcv.ACK_CONNECT_REQ]-->[Notify]
 //		|-->{Callback return to accept}
 //			|-->{No Payload}-->COMMITTING2-->[Send ACK_START]
 //			|-->{Has Payload}
@@ -394,12 +394,13 @@ void CSocketItemDl::ToConcludeConnect()
 	context.welcome = payload;
 	context.len = skb->len;
 
-	skb->ReInitMarkDelivered();
+	skb->ReInitMarkAcked();
 	// but preserve the packet flag for EoT detection, etc.
 	pControlBlock->SlideRecvWindowByOne();	// ACK_CONNECT_REQ, which may carry welcome
 	// But // CONNECT_REQUEST does NOT consume a sequence number
 	// See @LLS::OnGetConnectRequest
 
+	// Only after context has been updated may the state be migrated. See also WaitConnectAck
 	ControlBlock::seq_t seq0 = pControlBlock->sendBufferNextSN;
 	SetState(ESTABLISHED);
 	SetNewTransaction();
@@ -411,13 +412,15 @@ void CSocketItemDl::ToConcludeConnect()
 		return;
 	}
 
-	if (pControlBlock->sendBufferNextSN != seq0)
-		return;
+	if (pControlBlock->sendBufferNextSN == seq0)
+	{
+		SetHeadPacketIfEmpty(ACK_START);
+		SetState(COMMITTING2);
+
+	}
 	//^it works as pControlBlock->sendBufferBlockN <= INT32_MAX
 	// ACK_START implies to Commit. See also ToWelcomeMultiply:
-	SetHeadPacketIfEmpty(ACK_START);
-	SetState(COMMITTING2);
-	Call<FSP_Send>();
+	Call<FSP_Start>();
 }
 
 
@@ -432,7 +435,7 @@ void CSocketItemDl::ToConcludeConnect()
 ControlBlock::PFSP_SocketBuf LOCALAPI CSocketItemDl::SetHeadPacketIfEmpty(FSPOperationCode c)
 {
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend();
-	ControlBlock::seq_t k = pControlBlock->sendWindowFirstSN;
+	ControlBlock::seq_t k = GetSendWindowFirstSN();
 	if(_InterlockedCompareExchange((LONG *)& pControlBlock->sendBufferNextSN, k + 1, k) != k)
 		return skb;
 
@@ -512,7 +515,7 @@ int FSPAPI InstallMasterKey(FSPHANDLE h, octet * key, int32_t keyBytes)
 //	might be called in the callback function before the right state migration
 //	Take the snapshot of sendBufferNextSN and pass the snapshot as the parameter
 //	because it is perfectly possible that installation of new session key is followed by
-//	sending new data so tight that LLS has not yet excute FSP_InstallKey before the send queue changed.
+//	sending new data so tight that LLS has not yet executed FSP_InstallKey before the send queue changed.
 //	the input key material would be truncated if it exceeds the internal command buffer capacity
 int LOCALAPI CSocketItemDl::InstallRawKey(octet *key, int32_t keyBits, uint64_t keyLife)
 {

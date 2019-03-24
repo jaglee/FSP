@@ -46,16 +46,29 @@ int FSPAPI Dispose(FSPHANDLE hFSPSocket)
 //	0 if no error
 //	negative if it is the error number
 // Remark
-//	For active/initiative socket the LLS TCB cache is kept
+//	For active/initiative socket the LLS TCB cache is kept if it is not aborted
 //	For passive/listening socket it releases LLS TCB as well, and to expect NotifyRecycled
 int  CSocketItemDl::Dispose()
 {
-	if (InState(LISTENING))
-		return Call<FSP_Reject>() ? 0 : -EIO;
-	//^refuse to accept further connection request, do not send back anything (including reason code)
-	if (!WaitUseMutex())
-		return (IsInUse() ? -EDEADLK : 0);
-	return RecycLocked();
+	if (InState(NON_EXISTENT))
+		return 0;
+
+	uint64_t t0 = GetTickCount64();
+	inUse = 0;	
+	//^So that WaitUseMutex of other thread could be interrupted
+	// Expanding and tuning WaitUseMutex():
+	while (!TryMutexLock())
+	{
+		if (GetTickCount64() - t0 > MAX_LOCK_WAIT_ms)
+			return -EDEADLK;
+		//
+		Sleep(TIMER_SLICE_ms);
+	}
+	if(pControlBlock == NULL || pControlBlock->state >= CLOSABLE)
+		return RecycLocked();
+	//
+	SetMutexFree();
+	return Call<FSP_Reject>() ? 0 : -EIO;
 }
 
 
@@ -154,12 +167,6 @@ int CSocketItemDl::Shutdown()
 		return -EDOM;	// Wait for the peer to commit a transmit transaction first before shutdown!
 	}
 	//
-	if (fpFinished != NULL)
-	{
-		SetMutexFree();
-		return 0;		// asynchronous mode
-	}
-	//
 	if(s == PEER_COMMIT)
 	{
 		SetEoTPending();
@@ -169,8 +176,7 @@ int CSocketItemDl::Shutdown()
 			if (HasFreeSendBuffer())
 			{
 				BufferData(pendingSendSize);
-				if(!Call<FSP_Send>())
-					released = -EIO;
+				Call<FSP_Urge>();
 			}
 			// else Case 4.1, the send queue is full and there is some payload to wait free buffer
 		}
@@ -182,17 +188,15 @@ int CSocketItemDl::Shutdown()
 			skbImcompleteToSend = NULL;
 			MigrateToNewStateOnCommit();
 			// No, RELEASE packet may not carry payload.
-			if(AppendEoTPacket())
-				released = Call<FSP_Send>() ? 1 : -EIO;
-			else if(! Call<FSP_Send>())
-				released = -EIO;
+			AppendEoTPacket();
+			Call<FSP_Urge>();
 			//^It may or may not be success, but it does not matter
 		}
 		// Case 3, there is at least one idle slot to put an EoT packet
 		// Where RELEASE shall be merged with NULCOMMIT
 		else if (AppendEoTPacket(RELEASE))
 		{
-			released = Call<FSP_Send>() ? 1 : -EIO;
+			Call<FSP_Urge>();
 		}
 		// else Case 4.2, the send queue is full and is to append a RELEASE
 		// Case 4: just to wait some buffer ready. See also ProcessPendingSend
@@ -206,6 +210,12 @@ int CSocketItemDl::Shutdown()
 	//
 	if (s == COMMITTING2)
 	{
+		if (fpFinished != NULL)
+		{
+			SetMutexFree();
+			return 0;		// asynchronous mode
+		}
+		//
 		int r = BlockOnCommit();
 		if (r < 0)
 			return r;
@@ -218,11 +228,9 @@ int CSocketItemDl::Shutdown()
 		if (s == CLOSABLE)
 		{
 			SetState(PRE_CLOSED);
-			if (released <= 0 && AppendEoTPacket() && !Call<FSP_Send>())
-			{
-				SetMutexFree();
-				return -EIO;
-			}
+			if (released <= 0 && AppendEoTPacket())
+				Call<FSP_Urge>();
+			//
 			if (fpFinished != NULL)
 			{
 				SetMutexFree();
@@ -230,6 +238,9 @@ int CSocketItemDl::Shutdown()
 			}
 		}
 		SetMutexFree();
+		if (fpFinished != NULL)
+			return 0;		// asynchronous mode
+		//
 		Sleep(TIMER_SLICE_ms);
 		//
 		if (s >= CLOSABLE)

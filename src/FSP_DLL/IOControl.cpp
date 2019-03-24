@@ -519,7 +519,7 @@ int	CSocketItemDl::Decompress(void *pOut, int &tgtSize, const void *pIn, int src
 
 
 // Return true if the internal buffer is empty, false if it is not.
-// Temporily unset peerCommitted in case premature report of
+// Temporarily unset peerCommitted in case premature report of
 // commitment of peer's transmit transaction. See also ReadFrom()
 bool CSocketItemDl::FlushDecodeBuffer()
 {
