@@ -26,7 +26,7 @@
     ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
     POSSIBILITY OF SUCH DAMAGE.
  */
-// *S --> C, [in FSP's ACK_CONNECT_REQUEST]: /Welcome and identity of S/Public Key_S
+// *S --> C, [in FSP's ACK_CONNECT_REQ]: /Welcome and identity of S/Public Key_S
 // *C --> S, [in FSP's PERSIST, had better with EoT]: /Public Key_C/Timestamp_C/Greeting and identity of C
 //	S --> C, [PERSIST]: the salt, Timestamp_S, Random_S, S's response to the C's challenge
 //		Suppose salted_password = HASH(salt | registered password)

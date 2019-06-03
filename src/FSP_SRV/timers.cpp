@@ -46,7 +46,7 @@
 // Now it is the polling timer. Unlike LockWithActiveULA(), here the socket is locked without wait
 void CSocketItemEx::KeepAlive()
 {
-	char c = _InterlockedCompareExchange8(&locked, 1, 0);
+	const char *c = (char *)_InterlockedCompareExchangePointer((void**)&lockedAt, (void*)__func__, 0);
 	// assume it takes little time to detect process life
 	if (!IsProcessAlive())
 	{
@@ -76,8 +76,10 @@ void CSocketItemEx::KeepAlive()
 	if (c != 0)
 	{
 #ifndef NDEBUG
-		printf_s("\nFiber#%u's KeepAlive not executed due to lack of locks in state %s[%d]\n"
-			, fidPair.source, stateNames[lowState], lowState);
+		printf_s("\nFiber#%u's KeepAlive not executed,\n"
+			"locked at %s in state %s[%d].\n"
+			, fidPair.source
+			, c, stateNames[lowState], lowState);
 #endif
 		return;
 	}
@@ -135,7 +137,7 @@ void CSocketItemEx::KeepAlive()
 		break;
 	case PRE_CLOSED:
 		// Automatically migrate to CLOSED state in TIME-WAIT state alike in TCP
-		if (t1 - tMigrate > (KEEP_ALIVE_TIMEOUT_ms << 10))
+		if (t1 - tMigrate > (CLOSING_TIME_WAIT_ms * 1000))
 		{
 			ReplaceTimer(DEINIT_WAIT_TIMEOUT_ms);
 			EmitStart();	// It shall be a RELEASE packet which is retransmitted at most once
@@ -147,6 +149,7 @@ void CSocketItemEx::KeepAlive()
 		if (int64_t(t1 - tMigrate + 1024 - (UINT32_MAX << 10)) < 0)
 			ReplaceTimer(uint32_t((t1 - tMigrate) >> 10) + 1);
 		//^exponentially back off;  the socket is subjected to be recycled in LRU manner
+		DoEventLoop();
 		break;
 	default:
 #ifndef NDEBUG
@@ -160,28 +163,28 @@ void CSocketItemEx::KeepAlive()
 }
 
 
-
-// Given the index of the acknowledged packet and peer's delay to make the acknowledgement
-// Adjust long-term round-trip-time
-bool CSocketItemEx::AdjustRTT(int32_t k, uint64_t tDelay)
+// Given
+//	int64_t		the round trip time of the packet due
+// Do
+//	Update the smoothed RTT
+// TODO: refresh the RTT of the bundle path [source net-prefix][target net-prefix][traffic class]
+//	for sake of congestion management
+// The caller must make sure that the control block shared between LLS and DLL is available
+void CSocketItemEx::UpdateRTT(int64_t rtt64_us)
 {
-	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend() + k;
-	// Resent packet is simply excluded from calculating RTT with
-	if (skb->IsResent())
-		return false;
-
-	uint64_t rtt64_us = NowUTC() - skb->timeSent - tDelay;
-	// If ever the peer cheats by giving the acknowledgement delay value larger than the real value
-	// it would be eventually punished by a very large RTO!?
-	// Do not bother to guess delay caused by near-end task-scheduling
+	if (rtt64_us < 0)
+		rtt64_us = UINT32_MAX;
+	else if (rtt64_us == 0)
+		rtt64_us = 1;
+	// we donot set rtt64_us = UINT32_MAX else if(rtt64_us > UINT32_MAX), however.
+	if (rtt64_us > COMMITTING_TIMEOUT_ms * 1000)
+	{
+		printf_s("New round trip time is ridiculously large: %lld\nSmoothed RTT is %u\n", rtt64_us, tRoundTrip_us);
+		BREAK_ON_DEBUG();
+	}
+	//
+	pControlBlock->perfCounts.PushJitter(rtt64_us - tRoundTrip_us);
 	tRoundTrip_us = uint32_t(min((((rtt64_us + tRoundTrip_us) >> 1) + tRoundTrip_us) >> 1, UINT32_MAX));
-#if (TRACE & TRACE_HEARTBEAT)
-	printf_s("Round trip time calibrated: %u\n\tacknowledgement delay: %llu\n", tRoundTrip_us, tDelay);
-#endif
-
-	// TODO: refresh the RTT of the bundle path [source net-prefix][target net-prefix][traffic class]
-	// congestion management
-	return true;
 }
 
 
@@ -193,12 +196,16 @@ bool CSocketItemEx::AdjustRTT(int32_t k, uint64_t tDelay)
 //	false if send was failed
 bool CSocketItemEx::SendKeepAlive()
 {
-	if (lowState == PEER_COMMIT || lowState == COMMITTING2 || lowState == CLOSABLE)
+	if (lowState == PEER_COMMIT || lowState == COMMITTING2 || lowState >= CLOSABLE)
 		return SendAckFlush();
-	if (lowState > CLOSABLE)
-		return false;
 
-	SKeepAliveCache buf3;
+	struct
+	{
+		FSP_InternalFixedHeader	hdr;
+		FSP_ConnectParam		mp;
+		FSP_PreparedKEEP_ALIVE	snack;
+		void SetHostID(PSOCKADDR_IN6 ipi6) { mp.idListener = SOCKADDR_HOSTID(ipi6); }
+	} buf3;
 
 	memcpy(buf3.mp.subnets, savedPathsToNearEnd, sizeof(TSubnets));
 	buf3.SetHostID(CLowerInterface::Singleton.addresses);
@@ -247,11 +254,11 @@ bool CSocketItemEx::SendKeepAlive()
 //	or resent as the heartbeat where the delay shall be ignored as well
 bool CSocketItemEx::SendAckFlush()
 {
-	struct
-	{
-		FSP_InternalFixedHeader	hdr;
-		FSP_SelectiveNACK		snack;
-	} ALIGN(MAC_ALIGNMENT) buf2;	// a buffer with two headers
+#define buf2 cacheAckFlush
+	//if (savedAckedSN == pControlBlock->recvWindowNextSN && savedSendSN == pControlBlock->sendWindowNextSN)
+	//	return (SendPacket(1, ScatteredSendBuffers(&buf2, sizeof(buf2))) > 0);
+	//savedAckedSN = pControlBlock->recvWindowNextSN;
+	//savedSendSN = pControlBlock->sendWindowNextSN;
 
 	InterlockedIncrement(& nextOOBSN);
 	buf2.snack.tLazyAck = htobe64(NowUTC() - tLastRecv);
@@ -270,6 +277,7 @@ bool CSocketItemEx::SendAckFlush()
 	);
 	SetIntegrityCheckCode(&buf2.hdr, NULL, 0, buf2.snack.serialNo);
 	return SendPacket(1, ScatteredSendBuffers(&buf2, sizeof(buf2))) > 0;
+#undef buf2
 }
 
 
@@ -329,21 +337,6 @@ int LOCALAPI CSocketItemEx::AcceptSNACK(ControlBlock::seq_t expectedSN, FSP_Sele
 
 	if (nAck == 0)
 		return nAck;
-
-	// Calibrate RTT ONLY if left edge of the send window is to be advanced
-	// new = ((current + old) / 2 + old) / 2 = current/4 + old * 3/4
-	if (gaps != NULL)
-	{
-		FSP_SelectiveNACK *pSNACK = (FSP_SelectiveNACK *)(void *)& gaps[n];
-		uint64_t tDelay = be64toh(pSNACK->tLazyAck);
-		int32_t k = nAck - 1;
-		// assert(k >= 0);
-		if (k >= capacity)
-			return -EACCES;	// memory access error!
-		pControlBlock->AddRoundSendBlockN(k, pControlBlock->sendWindowHeadPos);
-
-		AdjustRTT(k, tDelay);
-	}
 
 	pControlBlock->AddRoundSendBlockN(pControlBlock->sendWindowHeadPos, nAck);
 	InterlockedExchange((LONG *)&pControlBlock->sendWindowFirstSN, expectedSN);
@@ -407,6 +400,7 @@ loop_start:
 			}
 #endif
 			p->MarkResent();
+			pControlBlock->perfCounts.countPacketSent++;
 		}
 #if defined(UNIT_TEST)
 		else
@@ -446,26 +440,44 @@ l_step2:
 		}
 #endif
 		skb->MarkSent();
+		pControlBlock->perfCounts.countPacketSent++;
+		//
 		if (++pControlBlock->sendWindowNextPos >= capacity)
 			pControlBlock->sendWindowNextPos = 0;
 		InterlockedIncrement(&pControlBlock->sendWindowNextSN);
 	}
-
-	// Zero window probing; although there's some code redundancy it keeps clarity
-	if (int32_t(pControlBlock->sendWindowNextSN - pControlBlock->sendWindowLimitSN) == 0
-	 && int32_t(pControlBlock->sendBufferNextSN - pControlBlock->sendWindowLimitSN) > 0)
+	else if (int32_t(LCKREAD(pControlBlock->sendBufferNextSN) - pControlBlock->sendWindowNextSN) > 0)
 	{
+		// Zero window probing; although there's some code redundancy it keeps clarity
 		skb = pControlBlock->HeadSend() + pControlBlock->sendWindowNextPos;
 		if (!skb->IsComplete() || skb->InSending())
 			goto l_post_step3;	// ULA is still to fill the buffer
+		//
+		if (int32_t(pControlBlock->sendWindowNextSN - pControlBlock->sendWindowLimitSN) == 0)
+		{
 #ifndef UNIT_TEST
-		if (EmitWithICC(skb, pControlBlock->sendWindowNextSN) <= 0)
-			goto l_post_step3;	// transmission failed
+			if (EmitWithICC(skb, pControlBlock->sendWindowNextSN) <= 0)
+				goto l_post_step3;	// transmission failed
 #endif
-		skb->MarkSent();
-		if (++pControlBlock->sendWindowNextPos >= capacity)
-			pControlBlock->sendWindowNextPos = 0;
-		InterlockedIncrement(&pControlBlock->sendWindowNextSN);
+			skb->MarkSent();
+			tZeroWinProbe = tRecentSend;
+			pControlBlock->perfCounts.countZWPsent++;
+			pControlBlock->perfCounts.countPacketSent++;
+			//
+			if (++pControlBlock->sendWindowNextPos >= capacity)
+				pControlBlock->sendWindowNextPos = 0;
+			InterlockedIncrement(&pControlBlock->sendWindowNextSN);
+		}
+		// ZWP timeout is hard-coded to 32RTT, without exponential back-off
+		// Retransmit the last packet for ZWP, to urge SNACK.
+		else if (int32_t(pControlBlock->sendWindowNextSN - pControlBlock->sendWindowLimitSN) > 0
+			&& int64_t(tNow - tZeroWinProbe) > ((tRoundTrip_us + 1) << 5))
+		{
+			EmitWithICC(skb, pControlBlock->sendWindowNextSN);
+			tZeroWinProbe = tRecentSend;
+			pControlBlock->perfCounts.countZWPresent++;
+			pControlBlock->perfCounts.countPacketResent++;
+		}
 	}
 
 l_post_step3:

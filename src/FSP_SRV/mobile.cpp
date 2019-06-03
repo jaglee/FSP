@@ -858,7 +858,7 @@ bool LOCALAPI CSocketItemEx::ValidateICC(FSP_NormalPacketHeader *p1, int32_t ctL
 	INIT_CONNECT		payload buffer	/ temporary: initiator may retransmit it actively/stateless for responder
 	ACK_INIT_CONNECT	temporary		/ temporary: stateless for responder/transient for initiator
 	CONNECT_REQUEST		payload buffer	/ temporary: initiator may retransmit it actively/stateless for responder
-	ACK_CONNECT_REQ		separate payload/ temporary: responder may retransmit it passively/transient for initiator
+	ACK_CONNECT_REQ		separate payload/ separate : responder may retransmit it passively/transient for initiator
 	RESET				temporary		/ temporary: one-shot only
 	ACK_START			payload buffer	/ payload buffer
 							Initiator of CONNECT REQUEST may retransmit it actively
@@ -874,6 +874,7 @@ bool LOCALAPI CSocketItemEx::ValidateICC(FSP_NormalPacketHeader *p1, int32_t ctL
 // Do
 //	Transmit the head packet in the send queue to the remote end
 // Remark
+//	Starting packets are NOT counted when sending. See also DoEventLoop()
 //  The IP address of the near end may change dynamically
 //	The function shall be idempotent
 //	And it may only be exploited to send packet whose sequence number is the first in the send queue
@@ -887,23 +888,14 @@ bool CSocketItemEx::EmitStart()
 		AbortLLS();			// Used to be HandleMemoryCorruption();
 		return false;
 	}
+	skb->timeSent = NowUTC();
+	//^This make the initial RTT including the near end's send delay, including timer slice jitter
 
-	register PFSP_InternalFixedHeader pHdr;
 	int result;
-	skb->timeSent = NowUTC();	// This make the initial RTT including the near end's send delay, including timer slice jitter
 	switch (skb->opCode)
 	{
 	case ACK_CONNECT_REQ:
-		pHdr = (PFSP_InternalFixedHeader)payload;
-		pHdr->integrity.code = htobe64(skb->timeSent);
-		SetSequenceFlags(pHdr, pControlBlock->sendWindowFirstSN);
-
-		CLowerInterface::Singleton.EnumEffectiveAddresses(pControlBlock->connectParams.allowedPrefixes);
-		memcpy(pHdr + 1, pControlBlock->connectParams.allowedPrefixes, sizeof(TSubnets));
-		pHdr->hs.Set<FSP_AckConnectRequest, ACK_CONNECT_REQ>();
-
-		result = SendPacket(1, ScatteredSendBuffers(payload, skb->len));
-		break;
+		// ACK_CONNECT_REQ is an in-band packet to start a transmit transaction for the responder
 	case NULCOMMIT:
 		// NULCOMMIT is an in-band payload-less packet that commits a transmit transaction
 		// NULCOMMIT is alias to ACK_START to confirm ACK_CONNECT_REQ or MULTIPLY as well
@@ -914,7 +906,8 @@ bool CSocketItemEx::EmitStart()
 		result = EmitWithICC(skb, pControlBlock->sendWindowFirstSN);
 		skb->MarkSent();
 		break;
-	case MULTIPLY:	// The MULTIPLY command head is stored in the queue while the encrypted payload is buffered in cipherText
+	case MULTIPLY:
+		// The MULTIPLY command head is stored in the queue while the encrypted payload is buffered in cipherText
 		result = SendPacket(2, ScatteredSendBuffers(payload, sizeof(FSP_NormalPacketHeader), this->cipherText, skb->len));
 		// Only possible for retransmission
 		break;
@@ -964,7 +957,7 @@ int CSocketItemEx::EmitWithICC(ControlBlock::PFSP_SocketBuf skb, ControlBlock::s
 	}
 #endif
 #ifdef _DEBUG
-	if(skb->opCode == INIT_CONNECT || skb->opCode == ACK_INIT_CONNECT || skb->opCode == CONNECT_REQUEST || skb->opCode == ACK_CONNECT_REQ)
+	if(skb->opCode == INIT_CONNECT || skb->opCode == ACK_INIT_CONNECT || skb->opCode == CONNECT_REQUEST)
 	{
 		printf_s("Assertion failed! %s (opcode: %d) has no ICC field\n", opCodeStrings[skb->opCode], skb->opCode);
 		return -EDOM;

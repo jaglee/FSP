@@ -26,7 +26,7 @@
     ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
     POSSIBILITY OF SUCH DAMAGE.
  */
-// *S --> C, [in FSP's ACK_CONNECT_REQUEST]: /Welcome and identity of S/Public Key_S
+// *S --> C, [in FSP's ACK_CONNECT_REQ]: /Welcome and identity of S/Public Key_S
 // *C --> S, [in FSP's PERSIST, had better with EoT]: /Public Key_C/Timestamp_C/Greeting and identity of C
 //	S --> C, [PERSIST]: the salt, Timestamp_S, Random_S, S's response to the C's challenge
 //		Suppose salted_password = HASH(salt | registered password)
@@ -131,12 +131,21 @@ static int	FSPAPI  onConnected(FSPHANDLE h, PFSP_Context ctx)
 		return -1;
 	}
 
-	int mLen = (int)strlen((const char *)ctx->welcome) + 1;
-	printf_s("\tWelcome message length: %d\n", ctx->len);
-	printf_s("%s\n", (char *)ctx->welcome);
+	int32_t mLen;
+	bool flag;
+	const char* msg = (char*)TryRecvInline(h, &mLen, &flag);
+	if (msg == NULL)
+	{
+		printf_s("\n\tProtocol broken.\n");
+		finalize();
+		return -1;
+	}
+	printf_s("\tWelcome message length: %d\n", mLen);
+	printf_s("%s\n", msg);
+	mLen = (int32_t)strlen(msg) + 1;
 
 	InitCHAKAClient(chakaPubInfo, bufPrivateKey);
-	memcpy(chakaPubInfo.peerPublicKey, (const char *)ctx->welcome + mLen, CRYPTO_NACL_KEYBYTES);
+	memcpy(chakaPubInfo.peerPublicKey, msg + mLen, CRYPTO_NACL_KEYBYTES);
 
 	WriteTo(h, chakaPubInfo.selfPublicKey, sizeof(chakaPubInfo.selfPublicKey), 0, NULL);
 	WriteTo(h, & chakaPubInfo.clientNonce, sizeof(chakaPubInfo.clientNonce), 0, NULL);

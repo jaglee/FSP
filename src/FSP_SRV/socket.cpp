@@ -549,22 +549,6 @@ l_bailout:
 
 
 
-// Lock the session context if the process of upper layer application is still active
-// Abort the FSP session if ULA is not active
-// Return true if the session context is locked, false if not
-bool CSocketItemEx::LockWithActiveULA()
-{
-	char c = _InterlockedCompareExchange8(&locked, 1, 0);
-	if (IsProcessAlive())
-		return (c == 0 || WaitUseMutex());
-	//
-	AbortLLS();
-	locked = 0;
-	return false;
-}
-
-
-
 // Given
 //	FSP_ServiceCode		the code of the notification to alert DLL
 // Do
@@ -729,13 +713,7 @@ void CSocketItemEx::AffirmConnect(const SConnectParam & initState, ALFID_T idLis
 		return;
 	}
 
-	int64_t tDiff = int64_t(NowUTC() - skb->timeSent);
-	if (tDiff <= 0)
-		tRoundTrip_us = 1;	// The minimum round-trip time allowable depends on timer resolution
-	else if (tDiff > UINT32_MAX)
-		tRoundTrip_us = UINT32_MAX;
-	else
-		tRoundTrip_us = (uint32_t)tDiff;
+	SetFirstRTT(int64_t(NowUTC() - skb->timeSent));
 
 	pkt->initialSN = htobe32(initState.initialSN);
 	pkt->timeDelta = htobe32(initState.timeDelta);
@@ -879,8 +857,10 @@ void CMultiplyBacklogItem::ResponseToMultiply()
 		return;
 	}
 
+	// The opCode field is overriden to PERSIST for sake of clearer transmit transaction management
 	skb->len = CopyOutPlainText(ubuf);
 	CopyOutFVO(skb);
+	skb->opCode = PERSIST;
 	skb->ReInitMarkComplete();
 
 	pControlBlock->recvWindowExpectedSN = ++pControlBlock->recvWindowNextSN;
@@ -910,7 +890,7 @@ void CMultiplyBacklogItem::ResponseToMultiply()
 //	Acknowledge the connection/multiplication of connection request by sending the head packet in the send queue
 // Remark
 //	Send the first packet in the send queue only, for sake of congestion control
-//	ACK_CONNECT_REQUEST is resent on requested only.
+//	ACK_CONNECT_REQ is resent on requested only.
 //	bind to the interface as soon as the control block mapped into server's memory space
 // See also
 //	CSocketItemEx::OnConnectRequestAck(); CSocketItemDl::ToWelcomeConnect(), ToWelcomeMultiply()

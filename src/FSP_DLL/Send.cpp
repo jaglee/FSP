@@ -76,6 +76,35 @@ int32_t FSPAPI GetSendBuffer(FSPHANDLE hFSPSocket, CallbackBufferReady fp1)
 
 
 // Given
+//	FSPHANDLE			the socket handle
+//	placeholder of the pointer to the capacity available
+// Return
+//	NULL if no immediately available buffer
+//	or the pointer to the free send buffer
+// Remark
+//	the capacity might be negative if error occurred, or 0 if no immediately available buffer
+DllExport
+void* FSPAPI TryGetSendBuffer(FSPHANDLE hFSPSocket, int32_t* pSize)
+{
+	CSocketItemDl* p = CSocketDLLTLB::HandleToRegisteredSocket(hFSPSocket);
+	if (p == NULL)
+	{
+		*pSize = -EFAULT;
+		return NULL;
+	}
+	
+	if (!p->TestSetSendReturn(NULL))
+	{
+		*pSize = -EBUSY;
+		return NULL;
+	}
+
+	return p->TryAcquireSendBuf(*pSize);
+}
+
+
+
+// Given
 //	FSPHANDLE	the socket handle
 //	void *		the buffer pointer
 //	int32_t		the number of octets to send
@@ -90,7 +119,7 @@ int32_t FSPAPI GetSendBuffer(FSPHANDLE hFSPSocket, CallbackBufferReady fp1)
 //	may not exceed the capacity that the callback function of GetSendBuffer has returned
 //	if the buffer is to be continued, its size MUST be multiplier of MAX_BLOCK_SIZE
 DllExport
-int FSPAPI SendInline(FSPHANDLE hFSPSocket, void * buffer, int32_t len, bool eotFlag, NotifyOrReturn fp1)
+int32_t FSPAPI SendInline(FSPHANDLE hFSPSocket, void * buffer, int32_t len, bool eotFlag, NotifyOrReturn fp1)
 {
 	CSocketItemDl *p = CSocketDLLTLB::HandleToRegisteredSocket(hFSPSocket);
 	if(p == NULL)
@@ -171,14 +200,42 @@ int FSPAPI Commit(FSPHANDLE hFSPSocket, NotifyOrReturn fp1)
 
 
 
+// Given
+//	int32_t&	[out] reference to the size of the send buffer obtained
+// Return
+//	NULL if no immediatelyly available free send buffer
+//	or the pointer to the send buffer obtained
+void* CSocketItemDl::TryAcquireSendBuf(int32_t& size)
+{
+	if (!WaitUseMutex())
+	{
+		size = (IsInUse() ? -EDEADLK : -EINTR);
+		return NULL;
+	}
+
+	if (pendingSendBuf != NULL)
+	{
+		SetMutexFree();
+		size = -EBUSY;
+		return NULL;
+	}
+
+	void* p = pControlBlock->InquireSendBuf(&pendingSendSize);
+	size = pendingSendSize;
+	SetMutexFree();
+	return p;
+}
+
+
+
 // Return
 //	Size of currently available free send buffer
-int32_t LOCALAPI CSocketItemDl::AcquireSendBuf()
+int32_t CSocketItemDl::AcquireSendBuf()
 {
 	if (!WaitUseMutex())
 		return (IsInUse() ? -EDEADLK : -EINTR);
 
-	if(pendingSendBuf != NULL)
+	if (pendingSendBuf != NULL)
 	{
 		SetMutexFree();
 		return -EBUSY;
@@ -201,8 +258,8 @@ int32_t LOCALAPI CSocketItemDl::AcquireSendBuf()
 //	number of payload octets in the send queue
 //	negative if it is the error number
 // Remark
-//	SendInplace works in tandem with AcquireSendBuf
-int LOCALAPI CSocketItemDl::SendInplace(void * buffer, int32_t len, bool eot)
+//	SendInplace works in tandem with AcquireSendBuf or TryAcquireSendBuf
+int32_t LOCALAPI CSocketItemDl::SendInplace(void * buffer, int32_t len, bool eot)
 {
 	if (len <= 0)
 		return -EDOM;
@@ -672,7 +729,7 @@ int32_t LOCALAPI CSocketItemDl::PrepareToSend(void * buf, int32_t len, bool eot)
 	{
 		p->ClearFlags();
 	}
-	p->len = len - MAX_BLOCK_SIZE * m++;
+	p->len = len - MAX_BLOCK_SIZE * m;
 	bytesBuffered = len;
 
 	// When sending PERSIST packet is tightly packed, not right-aligned yet
@@ -680,6 +737,7 @@ int32_t LOCALAPI CSocketItemDl::PrepareToSend(void * buf, int32_t len, bool eot)
 	if (_InterlockedCompareExchange8(&newTransaction, 0, 1) != 0)
 		p->opCode = PERSIST;
 	// unlock them in a batch
+	m++;
 	for(register int j = 0; j < m; j++)
 	{
 		(p++)->ReInitMarkComplete();

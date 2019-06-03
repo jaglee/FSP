@@ -878,19 +878,14 @@ int CLowerInterface::AcceptAndProcess(SOCKET sdRecv)
 	case CONNECT_REQUEST:
 		OnGetConnectRequest();
 		break;
-	case ACK_CONNECT_REQ:	// connect request acknowledged
-		pSocket = MapSocket();
-		if (pSocket == NULL)
-			break;
-		pSocket->OnConnectRequestAck(pktBuf, countRecv);
-		break;
 	case RESET:
 		pSocket = MapSocket();
 		if (pSocket == NULL || !pSocket->IsInUse())
 			break;
 		pSocket->OnGetReset(*FSP_OperationHeader<FSP_RejectConnect>());
 		break;
-		// TODO: get hint of explicit congest notification
+	//
+	case ACK_CONNECT_REQ:
 	case ACK_START:
 	case PURE_DATA:
 	case PERSIST:
@@ -916,7 +911,7 @@ int CLowerInterface::AcceptAndProcess(SOCKET sdRecv)
 			, opCodeStrings[opCode], opCode, pktBuf->pktSeqNo, pktBuf->lenData);
 #endif
 		memcpy(& pSocket->tempAddrAccept, & nearInfo.u, sizeof(FSP_SINKINF));
-		// save the source address temporarily as it is not necessariy legitimate
+		// save the source address temporarily as it is not necessarily legitimate
 		pSocket->sockAddrTo[MAX_PHY_INTERFACES] = addrFrom;
 		pSocket->HandleFullICC(pktBuf, opCode);
 		break;
@@ -1194,29 +1189,31 @@ void CSocketItemEx::HandleFullICC(PktBufferBlock *pktBuf, FSPOperationCode opCod
 	if (lowState <= 0 || lowState > LARGEST_FSP_STATE)
 		goto l_return;
 
-#if (TRACE & (TRACE_HEARTBEAT | TRACE_OUTBAND | TRACE_SLIDEWIN | TRACE_PACKET))
+#if (TRACE & (TRACE_HEARTBEAT | TRACE_OUTBAND | TRACE_SLIDEWIN)) && (TRACE & TRACE_PACKET)
 	printf_s(__FUNCTION__ ": local fiber#%u(_%X_) in state %s\n"
 		"\t%s(%d) received, seq#%u\n"
 		, fidPair.source, be32toh(fidPair.source), stateNames[lowState]
 		, opCodeStrings[opCode], opCode, pktBuf->pktSeqNo
 	);
 #endif
+	pControlBlock->perfCounts.countPacketReceived++;
+	// but not all received are legitimate, and PacketAccepted count in-band packet only.
 
 	// MULTIPLY is semi-out-of-band COMMAND starting from a fresh new ALFID. Note that pktBuf is the received
 	// In the CLONING state ACK_START or PERSIST is the legitimate acknowledgement to MULTIPLY,
 	// while the acknowledgement itself shall typically originate from some new ALFID.
 	if (fidPair.peer != pktBuf->fidPair.source	// it should be rare
-		&& opCode != MULTIPLY && (lowState != CLONING || opCode != ACK_START && opCode != PERSIST) )
+	 && opCode != MULTIPLY && (lowState != CLONING || opCode != ACK_START && opCode != PERSIST) )
 	{
-#ifdef TRACE
-		printf_s("Source fiber ID #%u the packet does not matched context\n", pktBuf->fidPair.source);
-#endif
 		goto l_return;
 	}
 	//
 	headPacket = pktBuf;
 	switch (opCode)
 	{
+	case ACK_CONNECT_REQ:
+		OnConnectRequestAck();
+		break;
 	case ACK_START:
 		OnGetNulCommit();
 		break;
@@ -1246,30 +1243,39 @@ l_return:
 
 
 // Return true if succeeded in obtaining the mutex lock, false if waited but timed-out
-bool CSocketItemEx::WaitUseMutex()
+bool CSocketItemEx::WaitUseMutexAt(const char* funcName)
 {
 	uint64_t t0 = GetTickCount64();
-	while (_InterlockedCompareExchange8(& locked, 1, 0) != 0)
+	while (_InterlockedCompareExchangePointer((void**)& lockedAt, (void*)funcName, 0) != 0)
 	{
-		if (! IsInUse() || GetTickCount64() - t0 > MAX_LOCK_WAIT_ms)
+		if (!IsInUse() || GetTickCount64() - t0 > MAX_LOCK_WAIT_ms)
 			return false;
 		Sleep(TIMER_SLICE_ms);	// if there is some thread that has exclusive access on the lock, wait patiently
 	}
 
-	if(IsInUse())
+	if (IsInUse())
 		return true;
 	//
-	locked = 0;
+	lockedAt = 0;
 	return false;
 }
 
 
 
-void CSocketItemEx::SetMutexFree()
+// Lock the session context if the process of upper layer application is still active
+// Abort the FSP session if ULA is not active
+// Return true if the session context is locked, false if not
+bool CSocketItemEx::LockWithActiveULAt(const char* funcName)
 {
-	if(_InterlockedExchange8(& locked, 0) == 0)
-		printf_s("Warning: to release the spin-lock of the socket#0x%p, but it was released\n", this);
+	void* c = _InterlockedCompareExchangePointer((void**)& lockedAt, (void*)funcName, 0);
+	if (IsProcessAlive())
+		return (c == 0 || WaitUseMutexAt(funcName));
+	//
+	AbortLLS();
+	lockedAt = 0;
+	return false;
 }
+
 
 
 

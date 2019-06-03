@@ -607,11 +607,12 @@ ControlBlock::PFSP_SocketBuf LOCALAPI ControlBlock::AllocRecvBuf(seq_t seq1)
 //				payload length of an intermediate packet of a message should be MAX_BLOCK_SIZE,
 //				payload length of any packet should be no less than 0 and no greater than MAX_BLOCK_SIZE)
 //	-EPERM		non-conforming to the protocol, shall be prohibited
-BYTE * LOCALAPI ControlBlock::InquireRecvBuf(int32_t & nIO, int32_t & nBlock, bool & eotFlag)
+octet* LOCALAPI ControlBlock::InquireRecvBuf(int32_t& nIO, int32_t& nBlock, bool& eotFlag)
 {
 	const int tail = recvWindowNextPos;
+	register int i, m;
 	eotFlag = false;
-	if(tail > recvBufferBlockN)
+	if (tail > recvBufferBlockN)
 	{
 		nIO = -EACCES;	// -13
 		return NULL;
@@ -619,26 +620,29 @@ BYTE * LOCALAPI ControlBlock::InquireRecvBuf(int32_t & nIO, int32_t & nBlock, bo
 
 	nBlock = 0;
 	nIO = 0;
-	if(CountDeliverable() <= 0)
+	if (CountDeliverable() <= 0)
 		return NULL;
 	assert(int32_t(recvWindowNextSN - recvWindowFirstSN) > 0);
 
 	PFSP_SocketBuf p = GetFirstReceived();
-	if(p->GetFlag<Compressed>())
+	if (p->GetFlag<Compressed>())
 	{
 		nIO = -EPIPE;	// -33
 		return NULL;
 	}
+	// First block of a new received transmit transaction is right-aligned
+	// See also @LLS::PlacePayload and @LLS::CopyOutPlainText
+	BYTE* pMsg = GetRecvPtr(p);
+	if (p->opCode == PERSIST)
+		pMsg += MAX_BLOCK_SIZE - p->len;
 
-	BYTE *pMsg = GetRecvPtr(p);
-	register int i, m;
 	if (tail > recvWindowHeadPos)
 		m = tail - recvWindowHeadPos;
 	else
 		m = recvBufferBlockN - recvWindowHeadPos;
 
 #ifndef NDEBUG
-	if(m == 0) 
+	if (m == 0)
 	{
 		printf_s("\nShould not occur! When InquireRecvBuf recvWindowHeadPos has run to the right edge?\n");
 		BREAK_ON_DEBUG();
@@ -657,8 +661,6 @@ BYTE * LOCALAPI ControlBlock::InquireRecvBuf(int32_t & nIO, int32_t & nBlock, bo
 		}
 		nIO += p->len;
 		nBlock++;
-		//
-		p->MarkDelivered();
 
 		if (p->GetFlag<TransactionEnded>())
 		{
@@ -706,7 +708,7 @@ int LOCALAPI ControlBlock::MarkReceivedFree(int32_t nBlock)
 	PFSP_SocketBuf p = GetFirstReceived();
 	for (register int32_t i = 0; i < m; p++, i++)
 	{
-		p->ReInitMarkAcked();
+		p->ReInitMarkDelivered();
 	}
 	// but preserve the packet flag for EoT detection, etc.
 	AddRoundRecvBlockN(recvWindowHeadPos, m);

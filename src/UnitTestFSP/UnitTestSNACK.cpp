@@ -136,7 +136,7 @@ void UnitTestSendRecvWnd()
 	while(p->IsComplete() && _InterlockedExchange8((char *)& p->opCode, 0) != 0)
 	{
 		pSCB->SlideRecvWindowByOne();
-		p->ReInitMarkAcked();
+		p->ReInitMarkDelivered();
 		if(p->GetFlag<TransactionEnded>())
 			break;
 		p = pSCB->GetFirstReceived();

@@ -242,16 +242,6 @@ struct FSP_PreparedKEEP_ALIVE
 
 
 
-struct SKeepAliveCache
-{
-	FSP_InternalFixedHeader	hdr;
-	FSP_ConnectParam		mp;
-	FSP_PreparedKEEP_ALIVE	snack;
-	void SetHostID(PSOCKADDR_IN6 ipi6) { mp.idListener = SOCKADDR_HOSTID(ipi6); }
-};
-
-
-
 // Context management of integrity check code
 struct ICC_Context
 {
@@ -405,10 +395,11 @@ protected:
 	SOCKADDR_INET	sockAddrTo[MAX_PHY_INTERFACES + 1];
 	FSP_ADDRINFO_EX	tempAddrAccept;
 
+	const char *lockedAt;	// == NULL if not locked, or else the function name that locked the socket
+
 	char	hasAcceptedRELEASE : 1;
 	char	inUse : 1;
 	char	delayAckPending : 1;
-	char	locked;
 	char	transactional;	// The cache value of the EoT flag of the very first packet
 	FSP_Session_State lowState;
 
@@ -424,12 +415,8 @@ protected:
 	uint32_t	tRoundTrip_us;	// round trip time evaluated in microsecond
 	//- There used to be tKeepAlive_ms here. now reserved
 	HANDLE		timer;			// the repeating timer
-	timestamp_t delayAckTime;
 
-	// As the first packet received in the clone(new) connection is actually received
-	// BEFORE the new connection's session begin to send the first packet
-	// the temporary socket buffer descriptor for the first packet
-	// may overlap tRecentSend and tSessionBegin
+	timestamp_t	tSessionBegin;
 	timestamp_t	tLastRecv;
 	timestamp_t tMigrate;
 	union
@@ -437,13 +424,21 @@ protected:
 		struct ControlBlock::FSP_SocketBuf skbRecvClone;
 		struct
 		{
+			timestamp_t tZeroWinProbe;
 			timestamp_t tRecentSend;
-			timestamp_t	tSessionBegin;
 		};
 	};
 
 	uint32_t	nextOOBSN;	// host byte order for near end. if it overflow the session MUST be terminated
 	uint32_t	lastOOBSN;	// host byte order, the serial number of peer's last out-of-band packet
+
+	ControlBlock::seq_t		savedAckedSN;	// Peer's SN acknowedged by the near end
+	ControlBlock::seq_t		savedSendSN;	// SN of the packet carrying SNACK
+	struct SAckFlushCache
+	{
+		FSP_InternalFixedHeader	hdr;
+		FSP_SelectiveNACK		snack;
+	} ALIGN(MAC_ALIGNMENT) cacheAckFlush;
 
 	void AbortLLS(bool haveTLBLocked = false);
 
@@ -451,9 +446,22 @@ protected:
 	void RemoveTimers();
 	bool LOCALAPI ReplaceTimer(uint32_t);
 
-	// Given the index of the acknowledged packet and peer's delay to make the acknowledgement
-	// Adjust long-term round-trip-time
-	bool AdjustRTT(int32_t, uint64_t);
+	// The minimum round-trip time allowable depends on timer resolution,
+	// but do not bother to guess delay caused by near-end task-scheduling
+	void SetFirstRTT(int64_t tDiff)
+	{
+		if (tDiff <= 0)
+			tRoundTrip_us = 1;
+		else if (tDiff > UINT32_MAX)
+			tRoundTrip_us = UINT32_MAX;
+		else
+			tRoundTrip_us = (uint32_t)tDiff;
+	}
+	// Given
+	//	int64_t		the round trip time of the packet due
+	// Do
+	//	Update the smoothed RTT
+	void UpdateRTT(int64_t);
 
 	bool InState(FSP_Session_State s) { return lowState == s; }
 	bool InStates(int n, ...);
@@ -504,10 +512,13 @@ public:
 #endif
 	bool MapControlBlock(const CommandNewSessionSrv &);
 	void InitAssociation();
-	bool LockWithActiveULA();
-	//
-	bool WaitUseMutex();
-	void SetMutexFree();
+
+#define LockWithActiveULA() LockWithActiveULAt(__func__)
+#define WaitUseMutex()		WaitUseMutexAt(__func__)
+	bool WaitUseMutexAt(const char *);
+	bool LockWithActiveULAt(const char *);
+	void SetMutexFree() { lockedAt = NULL; }
+
 	bool IsInUse() { return inUse != 0 && pControlBlock != NULL; }
 	void ClearInUse() { inUse = 0; }
 	bool TestSetInUse() { if (inUse != 0) { return false; } else { inUse = 1; return true; } }
@@ -611,7 +622,7 @@ public:
 	void Accept();
 
 	// Event triggered by the remote peer
-	void OnConnectRequestAck(PktBufferBlock *, int);
+	void OnConnectRequestAck();
 	void OnGetNulCommit();
 	void OnGetPersist();
 	void OnGetPureData();	// PURE_DATA

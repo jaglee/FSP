@@ -377,6 +377,7 @@ public:
 class CSocketItem;	// forward declaration for sake of declaring ControlBlock
 
 
+
 /**
  * Session Control Block is meant to be shared by LLS and DLL.
  * Shall be prefixed with 'volatile' if LLS is implemented in hardware
@@ -389,7 +390,7 @@ struct ControlBlock
 	ALIGN(8)
 	FSP_Session_State	state;
 	char			milky : 1;		// by default 0: a normal wine-style payload assumed. FIFO
-	char			noEncrypt : 1;		// by default 0: if install session key, encrypt the payload
+	char			noEncrypt : 1;	// by default 0; 1 if session key installed, encrypt the payload
 	//
 	ALFID_T			idParent;
 
@@ -413,6 +414,9 @@ struct ControlBlock
 	// 3: The negotiated connection parameter
 	ALIGN(8)	// 64-bit alignment, make sure that the session key overlays 'initCheckCode' and 'cookie' only
 	SConnectParam connectParams;
+
+	// 3+: Performance profiling counts
+	CSocketPerformance perfCounts;
 
 	// 4: The queue of returned notices
 	LLSNotice	notices;
@@ -456,6 +460,7 @@ struct ControlBlock
 	int32_t		sendBuffer;			// relative to start of the control block
 	int32_t		recvBuffer;			// relative to start of the control block
 
+	// note that we reuse ACKED (for send), hidden DELIVERED (for receive) 
 	enum FSP_SocketBufMark : char
 	{
 		FSP_BUF_LOCKED = 1,
@@ -463,7 +468,6 @@ struct ControlBlock
 		FSP_BUF_SENT = 4,
 		FSP_BUF_ACKED = 8,
 		FSP_BUF_RESENT = 16,
-		FSP_BUF_DELIVERED = 32
 	};
 	// Total size of FSP_SocketBuf (descriptor): 8 bytes (a 64-bit word)
 	typedef struct FSP_SocketBuf
@@ -482,16 +486,16 @@ struct ControlBlock
 		void InitMarkLocked() { _InterlockedExchange8(&marks, FSP_BUF_LOCKED); }
 		void ReInitMarkComplete() { _InterlockedExchange8(&marks, FSP_BUF_COMPLETE); }
 		void ReInitMarkAcked() { _InterlockedExchange8(&marks, FSP_BUF_ACKED); }
+		void ReInitMarkDelivered() { ReInitMarkAcked(); }
 
 		void MarkSent() { _InterlockedOr8(&marks, FSP_BUF_SENT); }
 		void MarkAcked() { _InterlockedOr8(&marks, FSP_BUF_ACKED); }
 		void MarkResent() { _InterlockedOr8(&marks, FSP_BUF_RESENT); }
-		void MarkDelivered() { _InterlockedOr8(&marks, FSP_BUF_DELIVERED); }
 
 		bool InSending() { return (_InterlockedOr8(&marks, 0) & FSP_BUF_SENT) != 0; }
-		bool IsDelivered() { return (_InterlockedOr8(&marks, 0) & FSP_BUF_DELIVERED) != 0; }
 		bool IsComplete() { return (_InterlockedOr8(&marks, 0) & FSP_BUF_COMPLETE) != 0; }
 		bool IsAcked() { return (_InterlockedOr8(&marks, 0) & FSP_BUF_ACKED) != 0; }
+		bool IsDelivered() { return IsAcked(); }
 		bool IsResent() { return (_InterlockedOr8(&marks, 0) & FSP_BUF_RESENT) != 0; }
 		//
 		void ClearFlags() { _InterlockedExchange8((char *)&flags, 0); }
@@ -631,7 +635,7 @@ struct ControlBlock
 	//	Start address of the received message
 	// Remark
 	//	Would automatically mark the packet peeked as delivered, but would not slide the receive window
-	BYTE * LOCALAPI InquireRecvBuf(int32_t &, int32_t &, bool &);
+	octet* LOCALAPI InquireRecvBuf(int32_t&, int32_t&, bool&);
 
 	// Given
 	//	int32_t				the number of blocks peeked and to be free

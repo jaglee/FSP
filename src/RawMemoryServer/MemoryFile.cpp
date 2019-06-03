@@ -3,35 +3,22 @@
  * to the remote end a large memory block filled with some certern pattern.
  */
 #include "stdafx.h"
-#include "defs.h"
+
+extern const char* defaultWelcome;
+extern unsigned char	bufPeerPublicKey[CRYPTO_NACL_KEYBYTES];
+extern unsigned char	bufPrivateKey[CRYPTO_NACL_KEYBYTES];
+
+extern volatile bool	toMultiply;
+extern volatile bool	finished;
+extern volatile	bool	r2Finish;
+
+extern FSPHANDLE		hFspListen;
+extern char				linebuf[80];
+
 
 // Following file scope variables and functions have limited access border 
 static uint64_t nRequested;
 static uint64_t nPrepared;
-
-// Request send buffer to send the content of the large memory block
-// when it is acknowledged that the filename has been sent.
-// We insisted on sending even if only a small buffer of 1 octet is available
-// And we expected success acknowledgement on the application layer
-static void FSPAPI onRequestedSizeReceived(FSPHANDLE h, FSP_ServiceCode c, int r)
-{
-	if(r < 0)
-	{
-		Dispose(h);
-		return;
-	}
-
-	// No needs to preallocate memory! Arbitrarily long stream might be sent
-	printf_s("To send memory segment of %llu octets.\n", nRequested);
-	//
-	r = GetSendBuffer(h, toSendNextBlock);
-	if(r < 0)
-	{
-		printf_s("Cannot get send buffer onFileNameSent, error code: %d\n", r);
-		Dispose(h);
-		return;
-	}
-}
 
 
 
@@ -66,6 +53,32 @@ static int FSPAPI toSendNextBlock(FSPHANDLE h, void * batchBuffer, int32_t capac
 	nPrepared += nToSend;
 
 	return SendInline(h, batchBuffer, nToSend, (nPrepared >= nRequested), NULL);
+}
+
+
+
+// Request send buffer to send the content of the large memory block
+// when it is acknowledged that the filename has been sent.
+// We insisted on sending even if only a small buffer of 1 octet is available
+// And we expected success acknowledgement on the application layer
+static void FSPAPI onRequestedSizeReceived(FSPHANDLE h, FSP_ServiceCode c, int r)
+{
+	if (r < 0)
+	{
+		Dispose(h);
+		return;
+	}
+
+	// No needs to preallocate memory! Arbitrarily long stream might be sent
+	printf_s("To send memory segment of %llu octets.\n", nRequested);
+	//
+	r = GetSendBuffer(h, toSendNextBlock);
+	if (r < 0)
+	{
+		printf_s("Cannot get send buffer onFileNameSent, error code: %d\n", r);
+		Dispose(h);
+		return;
+	}
 }
 
 

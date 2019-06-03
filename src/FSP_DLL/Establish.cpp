@@ -47,14 +47,6 @@
 DllSpec
 FSPHANDLE FSPAPI ListenAt(const PFSP_IN6_ADDR listenOn, PFSP_Context psp1)
 { 
-	// TODO: The welcome message CAN be larger
-	if(psp1->len > MAX_BLOCK_SIZE - sizeof(FSP_AckConnectRequest))
-	{
-		psp1->flags = -EDOM;
-		// UNRESOLVED! Set last error?
-		return NULL;
-	}
-
 	psp1->passive = 1;	// override what is provided by ULA
 	CommandNewSession objCommand;
 	//
@@ -163,8 +155,6 @@ FSPHANDLE FSPAPI Connect2(const char *peerName, PFSP_Context psp1)
 	CommandNewSession objCommand;
 
 	psp1->passive = 0;		// override what is provided by ULA
-	psp1->welcome = NULL;	// an active connection request shall have no welcome message
-	psp1->len = 0;			// or else memory access exception may occur
 
 	CSocketItemDl * socketItem = CSocketItemDl::CreateControlBlock((PFSP_IN6_ADDR) & addrAny, psp1, objCommand);
 	if(socketItem == NULL)
@@ -183,18 +173,20 @@ FSPHANDLE FSPAPI Connect2(const char *peerName, PFSP_Context psp1)
 	socketItem->SetPeerName(peerName, strlen(peerName));
 	socketItem->SetState(CONNECT_BOOTSTRAP);
 
+	// could be exploited by ULA to make services distinguishable
+	memcpy(&socketItem->context, psp1, sizeof(FSP_SocketParameter));
+	socketItem->pendingSendBuf = (BYTE*)psp1->welcome;
+	socketItem->pendingSendSize = psp1->len;
+
 	CSocketItemDl *p = socketItem->CallCreate(objCommand, InitConnection);
 	if (p == NULL)
 	{
 		REPORT_ERRMSG_ON_TRACE("Cannot create the LLS socket to request connection establishment");
 		socketItem->FreeAndDisable();
 	}
-
-	if (psp1->onAccepted == NULL)
+	else if (psp1->onAccepted == NULL)
 	{
 		p = socketItem->WaitingConnectAck();
-		if (p != NULL)
-			p->CopyOutContext(psp1);
 	}
 
 	return p;
@@ -314,52 +306,79 @@ CSocketItemDl * CSocketItemDl::PrepareToAccept(BackLogItem & backLog, CommandNew
 // Given
 //	BackLogItem &	the reference to the accepting backlog item
 // Do
-//	(ACK_CONNECT_REQ, Initial SN, Expected SN, Timestamp, Receive Window[, responder's half-connection parameter[, payload])
+//	(ACK_CONNECT_REQ, Initial SN, Expected SN, Timestamp, Receive Window[, payload])
 // Return
 //	true if to accept the connection
 //	false if to reject
 // Remark
 //	As the connection context is yet to be prepared further, context.onAccepting MAYNOT read or write anything
+//	Here there is not a protocol limitation but an API enforced limitation:
+//	prepared welcome message MUST fit into the preallcated send buffer
+//	See also PrepareToSend
+//	Attention please! ULA MAY NOT send data onAccepting!
 bool LOCALAPI CSocketItemDl::ToWelcomeConnect(BackLogItem & backLog)
 {
 	PFSP_IN6_ADDR p = (PFSP_IN6_ADDR) & pControlBlock->peerAddr.ipFSP.allowedPrefixes[MAX_PHY_INTERFACES - 1];
 	//
 	SetState(CHALLENGING);
-	SetNewTransaction();
-	// ACK_CONNECT_REQ is a singleton transmit transaction
 	// Ask ULA whether to accept the connection
 	if(context.onAccepting != NULL && context.onAccepting(this, & backLog.acceptAddr, p) < 0)
 	{
 		// UNRESOLVED! report that the upper layer application reject it?
 		return false;
 	}
-	if(pendingSendBuf != NULL && pendingSendSize + sizeof(FSP_AckConnectRequest) > MAX_BLOCK_SIZE)
-	{
-		// UNRESOLVED! report that ULA should not piggyback too large payload on ACK_CONNECT_REQ?
-		return false;
-	}
-
-	pControlBlock->sendBufferNextSN = GetSendWindowFirstSN() + 1;
-	pControlBlock->sendBufferNextPos = 1;	// reserve the head packet
 	//
 	memcpy(&pControlBlock->connectParams, &backLog, FSP_MAX_KEY_SIZE);
 	//^following fields are filled later
 	//
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend();
-	skb->version = THIS_FSP_VERSION;
-	skb->opCode = ACK_CONNECT_REQ;
-	skb->len = sizeof(FSP_AckConnectRequest);
-	// And the content of the header is generated on the fly
-	if(pendingSendBuf != NULL)
+	if (pendingSendBuf != NULL)
 	{
-		memcpy(GetSendPtr(skb) + skb->len, pendingSendBuf, pendingSendSize);
-		skb->len += pendingSendSize;
+		register ControlBlock::PFSP_SocketBuf p = skb;
+		int32_t capacity;
+		void* tgt = pControlBlock->InquireSendBuf(&capacity);
+		if (capacity < pendingSendSize)
+			return false; // UNRESOLVED! tell to ULA that it does not conform to implement protocol?
+		memcpy(tgt, pendingSendBuf, pendingSendSize);
 		//
+		octet cFlag = this->context.precompress ? (1 << Compressed) : 0;
+		int32_t m = (pendingSendSize - 1) / MAX_BLOCK_SIZE;
+		for (register int j = 0; j < m; j++)
+		{
+			p->version = THIS_FSP_VERSION;
+			p->opCode = PURE_DATA;
+			p->flags = cFlag;
+			p->len = MAX_BLOCK_SIZE;
+			p++;
+		}
+		// it might be redundant to set the opCode of the first packet, but it do little harm and is safer and quicker
+		p->version = THIS_FSP_VERSION;
+		p->opCode = PURE_DATA;
+		p->flags = cFlag | (1 << TransactionEnded);
+		p->len = pendingSendSize - MAX_BLOCK_SIZE * m;
+		// unlock them in a batch
+		m++;
+		for (register int j = 1; j < m; j++)
+		{
+			(p++)->ReInitMarkComplete();
+		}
+		//^the header packet is still locked
+		// 
 		pendingSendBuf = NULL;
 		pendingSendSize = 0;
+		pControlBlock->sendBufferNextPos = m;
+		pControlBlock->sendBufferNextSN = GetSendWindowFirstSN() + m;
 	}
-	// else let ProcessPendingSend eventually transmit the welcome message, if any
-	skb->InitFlags<TransactionEnded>();
+	else
+	{
+		skb->version = THIS_FSP_VERSION;
+		skb->len = 0;
+		skb->InitFlags<TransactionEnded>();
+		// Mark the reserved head packet ready
+		pControlBlock->sendBufferNextPos = 1;
+		pControlBlock->sendBufferNextSN = GetSendWindowFirstSN() + 1;
+	}
+	skb->opCode = ACK_CONNECT_REQ;
 	skb->ReInitMarkComplete();
 
 	return true;
@@ -369,40 +388,38 @@ bool LOCALAPI CSocketItemDl::ToWelcomeConnect(BackLogItem & backLog)
 
 // Auxiliary function that is called when a new connection request is acknowledged by the responder
 // CONNECT_AFFIRMING
-//	|--[Rcv.ACK_CONNECT_REQ]-->[Notify]
-//		|-->{Callback return to accept}
-//			|-->{No Payload}-->COMMITTING2-->[Send ACK_START]
-//			|-->{Has Payload}
-//				|-->{EOT}-->COMMITTING2-->[Send PERSIST with EoT]
-//				|-->{Not EOT}-->PEER_COMMIT-->[Send PERSIST]
-//		|-->{Callback return to reject]-->NON_EXISTENT-->[Send RESET]
+//|--[Rcv.ACK_CONNECT_REQ]-->[Notify]
+//   |-->{Callback return to accept}
+//	  |-->{EOT}
+//		 |-->{No Payload to Send}-->COMMITTING2-->[Send ACK_START]
+//		 |-->{Has Payload to Send}
+//			|-->{ULA-flushing}-->COMMITTING2
+//				-->[Send PERSIST with EoT]
+//			|-->{Not ULA-flushing}-->PEER_COMMIT-->[Send PERSIST]
+//	  |-->{Not EOT}
+//		 |-->{No Payload to Send}-->COMMITTING-->[Send ACK_START]
+//		 |-->{Has Payload to Send}
+//			|-->{ULA-flushing}-->COMMITTING
+//				-->[Send PERSIST with EoT]
+//			|-->{Not ULA-flushing}-->ESTABLISHED-->[Send PERSIST]
+//   |-->{Callback return to reject]-->NON_EXISTENT-->[Send RESET]
 // Remark
 //	Unlike ToWelcomeMultiply, 0RTT connection establishment is forbidden
 //	for the end-to-end negotiation of the "root" session
 // See also @LLS::OnConnectRequestAck
 void CSocketItemDl::ToConcludeConnect()
 {
-	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadRecv();
-	BYTE *payload = GetRecvPtr(skb);
-
-	// See also FSP_LLS$$CSocketItemEx::Connect()
+	ControlBlock::seq_t seq0 = pControlBlock->sendBufferNextSN;
+	FSP_Session_State s0;
 	fidPair.source = pControlBlock->nearEndInfo.idALF;
 	//^As by default Connect2 set the cached fiber ID in the DLL SocketItem to 0
-
-	// Deliver the optional payload and skip the ACK_CONNECT_REQ packet
-	// See also ControlBlock::InquireRecvBuf()
-	context.welcome = payload;
-	context.len = skb->len;
-
-	skb->ReInitMarkAcked();
-	// but preserve the packet flag for EoT detection, etc.
-	pControlBlock->SlideRecvWindowByOne();	// ACK_CONNECT_REQ, which may carry welcome
-	// But // CONNECT_REQUEST does NOT consume a sequence number
-	// See @LLS::OnGetConnectRequest
-
-	// Only after context has been updated may the state be migrated. See also WaitConnectAck
-	ControlBlock::seq_t seq0 = pControlBlock->sendBufferNextSN;
-	SetState(ESTABLISHED);
+	// Prepare for install master session key
+	peerCommitted = pControlBlock->GetFirstReceived()->GetFlag<TransactionEnded>();
+	s0 = peerCommitted ? PEER_COMMIT : ESTABLISHED;
+	SetState(s0);
+	if (peerCommitted)
+		pControlBlock->SnapshotReceiveWindowRightEdge();
+	// Prepare for immediate send onAccepted
 	SetNewTransaction();
 	SetMutexFree();
 	if(context.onAccepted != NULL && context.onAccepted(this, &context) < 0)
@@ -412,11 +429,11 @@ void CSocketItemDl::ToConcludeConnect()
 		return;
 	}
 
+	// If it has not sent anything onAccepted, send an immediate acknowledgement to ACK_CONNECT_REQ
 	if (pControlBlock->sendBufferNextSN == seq0)
 	{
 		SetHeadPacketIfEmpty(ACK_START);
-		SetState(COMMITTING2);
-
+		SetState(s0 == ESTABLISHED ? COMMITTING : COMMITTING2);
 	}
 	//^it works as pControlBlock->sendBufferBlockN <= INT32_MAX
 	// ACK_START implies to Commit. See also ToWelcomeMultiply:
@@ -432,7 +449,7 @@ void CSocketItemDl::ToConcludeConnect()
 // Return
 //	The pointer to the descriptor of the original header packet, or
 //	NULL if the send queue used to be empty
-ControlBlock::PFSP_SocketBuf LOCALAPI CSocketItemDl::SetHeadPacketIfEmpty(FSPOperationCode c)
+ControlBlock::PFSP_SocketBuf CSocketItemDl::SetHeadPacketIfEmpty(FSPOperationCode c)
 {
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend();
 	ControlBlock::seq_t k = GetSendWindowFirstSN();
@@ -535,6 +552,7 @@ int LOCALAPI CSocketItemDl::InstallRawKey(octet *key, int32_t keyBits, uint64_t 
 
 
 
+// TODO: Exploit a flag instead of internal state which might be premature because of data race between LLS and DLL
 // For blocking mode Connect2. See also ToConcludeConnect() and WaitEventToDispatch()
 CSocketItemDl * CSocketItemDl::WaitingConnectAck()
 {

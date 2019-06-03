@@ -98,7 +98,6 @@ typedef ALFID_T	 ULTID_T;
 //^time-out for committing a transmit transaction starting from last acknowledgement,
 // not from start of the transaction. Should be larger than the Maximum Segment Life
 #define CLOSING_TIME_WAIT_ms			120000	// 2 minutes
-#define KEEP_ALIVE_TIMEOUT_ms			600000	// 10 minutes
 #define SESSION_IDLE_TIMEOUT_us			(4*3600*1000000ULL)	// 4 hours
 
 /**
@@ -348,19 +347,7 @@ struct FSP_InitiateRequest
 // Optional payload: domain name of the remote peer, less than 512 - sizeof(FSP_InitiateRequest) = 488 octets
 
 
-// acknowledgement to the connect bootstrap request, works as a challenge against the initiator
-// to be followed by the certificate optional header
-struct FSP_Challenge
-{
-	uint64_t	cookie;
-	uint64_t	initCheckCode;
-	int32_t		timeDelta;
-	$FSP_HeaderSignature hs;
-};
-// Optional payload: canonical name of the near end, less than 512 - sizeof(FSP_Challenge) = 488 octets
-
-
-// FSP_ConnectParam specifies the parent connection in a MULTIPLY or CONNECT_REQUEST packet
+// FSP_ConnectParam specifies the parent connection in a MULTIPLY, ACK_CONNECT_INIT or CONNECT_REQUEST packet
 // while alias as the mobile parameters
 // PEER_SUBNETS used to be CONNECT_PARAM and it is perfect OK to treat the latter as the canonical alias of the former
 struct FSP_ConnectParam
@@ -370,6 +357,19 @@ struct FSP_ConnectParam
 	$FSP_HeaderSignature hs;
 };	// Totally 5 QWORDs, 40 octets
 
+
+
+// acknowledgement to the connect bootstrap request, works as a challenge against the initiator
+// to be followed by the certificate optional header
+struct FSP_Challenge
+{
+	uint64_t	cookie;
+	uint64_t	initCheckCode;
+	int32_t		timeDelta;
+	$FSP_HeaderSignature hs;
+	FSP_ConnectParam params;
+};
+// Totally 8 QWORDs, 64 octets
 
 
 #ifdef __cplusplus
@@ -387,19 +387,6 @@ struct FSP_ConnectRequest
 	FSP_ConnectParam params;
 };	// Totally 11 QWORDs, 88 octets
 // Optional payload: canonical name of the near end, less than 512 - sizeof(FSP_ConnectRequest) = 424 octets
-
-
-#ifdef __cplusplus
-struct FSP_AckConnectRequest : FSP_NormalPacketHeader
-{
-#else
-struct FSP_AckConnectRequest
-{
-	struct FSP_NormalPacketHeader _h;
-#endif
-	TSubnets	subnets;
-};
-// Attention Please! the optional payload of ACK_CONNECT_REQ is prefixed with the array of reachable subnets
 
 
 
@@ -442,6 +429,36 @@ struct FSP_RejectConnect
 	uint32_t reasons;	// bit field(?)
 	$FSP_HeaderSignature hs;
 };
+
+
+
+// To profile the performance of the socket
+typedef struct CSocketPerformance
+{
+#define	RTT_LOG_CAPACITY 256
+	int64_t		countPacketReceived;
+	int64_t		countPacketAccepted;
+	int64_t		countPacketSent;
+	int64_t		countPacketResent;
+	int64_t		countZWPsent;
+	int64_t		countZWPresent;
+	int64_t		countKeepAliveLockFail;
+	// round-log of RTT jitter
+	int64_t		rttJitters[RTT_LOG_CAPACITY];
+	uint64_t	jlogCount;
+	int32_t		jlogTail;
+	// possibility of the real log count exceed 2^64 but jlogCount is less than RTT_LOG_CAPACITY
+	// is (RTT_LOG_CAPACITY/2^64), almost computational impossible
+#ifdef __cplusplus
+	void		PushJitter(int64_t jitter)
+	{
+		rttJitters[jlogTail++] = jitter;
+		if (jlogTail >= RTT_LOG_CAPACITY)
+			jlogTail = 0;
+		jlogCount++;
+	}
+#endif
+} *PSocketProfile;
 
 
 #include <poppack.h>

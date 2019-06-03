@@ -20,10 +20,13 @@ extern char				linebuf[80];
 // Branch controllers
 extern void StartToSendSignature(FSPHANDLE h);
 
+extern int	FSPAPI WeakSecurity_onAccepted(FSPHANDLE, PFSP_Context);
 extern int	FSPAPI ServiceSAWS_onAccepted(FSPHANDLE, PFSP_Context);
+extern int	FSPAPI SendMemory_onAccepted(FSPHANDLE, PFSP_Context);
 extern int	FSPAPI SendOneFile_onAccepted(FSPHANDLE, PFSP_Context);
 
 // Branch auxilary functions
+extern bool PrepareMemoryPattern(size_t);
 extern bool	PrepareServiceSAWS(LPCTSTR);
 
 // Shared call-backs

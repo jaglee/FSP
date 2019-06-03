@@ -180,13 +180,10 @@
     <ClCompile Include="..\Crypto\tweetnacl.c" />
     <ClCompile Include="FileSyncClient.cpp" />
     <ClCompile Include="FSP_CHAKA.cpp" />
-    <ClCompile Include="MemoryFile.cpp" />
     <ClCompile Include="ReceiveOOB.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\Crypto\CHAKA.h" />
-    <ClInclude Include="..\Crypto\CryptoStub.h" />
-    <ClInclude Include="..\Crypto\tweetnacl.h" />
     <ClInclude Include="stdafx.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

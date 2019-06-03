@@ -176,6 +176,8 @@ protected:
 	int32_t			pendingStreamingSize;
 	int32_t			offsetInLastRecvBlock;
 
+	int32_t			pendingPeekedBlocks;	// TryRecvInline called, number of the peeked buffers yet to be unlocked
+
 	// Pair of functions meant to mimic hardware vector interrupt. It is yet OS-dependent, however
 	static VOID NTAPI WaitOrTimeOutCallBack(PVOID param, BOOLEAN isTimeout)
 	{
@@ -215,7 +217,7 @@ protected:
 	CSocketItemDl * PrepareToAccept(BackLogItem &, CommandNewSession &);
 	bool LOCALAPI ToWelcomeConnect(BackLogItem &);
 	void ToConcludeConnect();
-	ControlBlock::PFSP_SocketBuf LOCALAPI SetHeadPacketIfEmpty(FSPOperationCode c);
+	ControlBlock::PFSP_SocketBuf SetHeadPacketIfEmpty(FSPOperationCode);
 
 	// In Multiplex.cpp
 	static CSocketItemDl * LOCALAPI CSocketItemDl::ToPrepareMultiply(FSPHANDLE, PFSP_Context, CommandCloneConnect &);
@@ -311,8 +313,6 @@ public:
 		return (s <= 0 || s > LARGEST_FSP_STATE);
 	}
 
-	void CopyOutContext(PFSP_Context pCtx) { memcpy(pCtx, &context, sizeof(FSP_SocketParameter)); }
-
 	uint64_t GetExtentOfULA() { return context.extentI64ULA; }
 	void SetExtentOfULA(uint64_t value) { context.extentI64ULA = value; }
 
@@ -362,7 +362,8 @@ public:
 
 	int LOCALAPI InstallRawKey(octet *, int32_t, uint64_t);
 
-	int32_t LOCALAPI AcquireSendBuf();
+	void*	TryAcquireSendBuf(int32_t&);
+	int32_t AcquireSendBuf();
 	int32_t LOCALAPI SendInplace(void *, int32_t, bool);
 
 	ControlBlock::PFSP_SocketBuf GetSendBuf() { return pControlBlock->GetSendBuf(); }
@@ -401,8 +402,10 @@ public:
 	int Commit();
 	int LockAndCommit(NotifyOrReturn);
 
+	void* LOCALAPI TryRecvInline(int32_t&, bool&);
 	int	LOCALAPI RecvInline(CallbackPeeked);
 	int LOCALAPI ReadFrom(void *, int, NotifyOrReturn);
+	int TryUnlockPeeked();
 
 	int Shutdown();
 	int Shutdown(NotifyOrReturn fp1) { fpFinished = fp1; return Shutdown(); }
@@ -417,6 +420,10 @@ public:
 	int SelfNotify(FSP_ServiceCode c);
 	void SetCallbackOnError(NotifyOrReturn fp1) { context.onError = fp1; }
 	void NotifyError(FSP_ServiceCode c, int e = 0) { if (context.onError != NULL) context.onError(this, c, e); }
+
+	// Defined in IOControl.cpp
+	int GetProfilingCounts(PSocketProfile);
+
 
 	// defined in DllEntry.cpp:
 	static CSocketItemDl * LOCALAPI CreateControlBlock(const PFSP_IN6_ADDR, PFSP_Context, CommandNewSession &);

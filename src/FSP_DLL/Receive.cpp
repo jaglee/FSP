@@ -45,6 +45,26 @@ int FSPAPI RecvInline(FSPHANDLE hFSPSocket, CallbackPeeked fp1)
 
 
 /// Commented in FSP_API.h
+DllSpec
+void* FSPAPI TryRecvInline(FSPHANDLE hFSPSocket, int32_t* pSize, bool* pFlag)
+{
+	CSocketItemDl* p = CSocketDLLTLB::HandleToRegisteredSocket(hFSPSocket);
+	if (p == NULL)
+	{
+		*pSize = -EFAULT;
+		return NULL;
+	}
+	if (pFlag == NULL)
+	{
+		*pSize = -EDOM;
+		return NULL;
+	}
+	return p->TryRecvInline(*pSize, *pFlag);
+}
+
+
+
+/// Commented in FSP_API.h
 DllExport
 int FSPAPI ReadFrom(FSPHANDLE hFSPSocket, void *buf, int capacity, NotifyOrReturn fp1)
 {
@@ -54,6 +74,22 @@ int FSPAPI ReadFrom(FSPHANDLE hFSPSocket, void *buf, int capacity, NotifyOrRetur
 	return p->ReadFrom(buf, capacity, fp1);
 }
 
+
+
+// Return
+//	positive number if some warning
+//	0 if no error
+//	negative if error occurred
+inline
+int CSocketItemDl::TryUnlockPeeked()
+{
+	int32_t nBlock = _InterlockedExchange((LONG*)& pendingPeekedBlocks, 0);
+	if (nBlock == 0)
+		return 1;
+	if (nBlock < 0)
+		return -EFAULT;
+	return pControlBlock->MarkReceivedFree(nBlock);
+}
 
 
 
@@ -72,12 +108,23 @@ int CSocketItemDl::RecvInline(CallbackPeeked fp1)
 	if (!WaitUseMutex())
 		return (IsInUse() ? -EDEADLK : -EINTR);
 
+	int r = TryUnlockPeeked();
+	if (r < 0)
+	{
+		SetMutexFree();
+		return r;
+	}
+
 	if (waitingRecvBuf != NULL)
 	{
 		SetMutexFree();
 		return -EADDRINUSE;
 	}
-
+	if (offsetInLastRecvBlock != 0)
+	{
+		SetMutexFree();
+		return -EDOM;	// May not call RecvInline if previous ReadFrom unfinished
+	}
 	if (peerCommitPending)
 	{
 		SetMutexFree();
@@ -100,6 +147,55 @@ int CSocketItemDl::RecvInline(CallbackPeeked fp1)
 
 
 // Given
+//	int32_t &	Placeholder to store the length of octet stream peeked
+//	bool &		Placeholder to store the EoT flag value
+// Return
+//	NULL if no data available or error, where the error number is stored in the placeholder meant to store the length
+//	non-NULL if it points to the start address of the inline receive buffer,
+//	where the length of the octet stream available is stored in its placeholder,
+//	and the value of the EoT flag is stored in its placeholder, respectively
+void* LOCALAPI CSocketItemDl::TryRecvInline(int32_t &size, bool &flag)
+{
+	if (!WaitUseMutex())
+	{
+		size = (IsInUse() ? -EDEADLK : -EINTR);
+		return NULL;
+	}
+
+	size = TryUnlockPeeked();
+	if (size < 0)
+	{
+		SetMutexFree();
+		return NULL;
+	}
+
+	if (waitingRecvBuf != NULL)
+	{
+		SetMutexFree();
+		size = -EADDRINUSE;
+		return NULL;
+	}
+	if (offsetInLastRecvBlock != 0)
+	{
+		SetMutexFree();
+		size = -EDOM;
+		return NULL;	// May not call RecvInline if previous ReadFrom unfinished
+	}
+	if (peerCommitPending)
+	{
+		SetMutexFree();
+		size = -EDOM;	// May not call RecvInline if previous ReadFrom with decompression unfinished
+		return NULL;
+	}
+
+	octet* p = pControlBlock->InquireRecvBuf(size, pendingPeekedBlocks, flag);
+	SetMutexFree();
+	return p;
+}
+
+
+
+// Given
 //	void *			the start pointer of the receive buffer
 //	int				the capacity in byte of the receive buffer
 //	NotifyOrReturn	the pointer of the function called back
@@ -116,6 +212,13 @@ int LOCALAPI CSocketItemDl::ReadFrom(void * buffer, int capacity, NotifyOrReturn
 {
 	if (!WaitUseMutex())
 		return (IsInUse() ? -EDEADLK : -EINTR);
+
+	int32_t r = TryUnlockPeeked();
+	if (r < 0)
+	{
+		SetMutexFree();
+		return r;
+	}
 	//
 	if (InterlockedCompareExchangePointer((PVOID *)& fpReceived, fp1, NULL) != NULL)
 	{
@@ -151,7 +254,6 @@ int LOCALAPI CSocketItemDl::ReadFrom(void * buffer, int capacity, NotifyOrReturn
 
 	// If it is blocking, wait until every slot in the receive buffer has been filled
 	// or the peer has committed the transmit transaction
-	int32_t r;
 	while ((r = FetchReceived()) >= 0 && _InterlockedOr((LONG *)&bytesReceived, 0) < capacity)
 	{
 		uint64_t t0 = GetTickCount64();
@@ -161,7 +263,7 @@ int LOCALAPI CSocketItemDl::ReadFrom(void * buffer, int capacity, NotifyOrReturn
 				goto l_postloop;
 			SetMutexFree();
 			Sleep(TIMER_SLICE_ms);
-			if (GetTickCount64() - t0 > KEEP_ALIVE_TIMEOUT_ms)
+			if (GetTickCount64() - t0 > COMMITTING_TIMEOUT_ms)
 				return -EDEADLK;
 			if (!WaitUseMutex())
 				return (IsInUse() ? -EDEADLK : -EINTR);
@@ -205,9 +307,9 @@ int32_t CSocketItemDl::FetchReceived()
 	if(p->GetFlag<Compressed>() && pDecodeState == NULL && !AllocDecodeState())
 		return -ENOMEM;
 
-	// First received block of a clone connection or a new transmit transaction is right-aligned
+	// First block of a new received transmit transaction is right-aligned
 	// See also @LLS::PlacePayload and @LLS::CopyOutPlainText
-	if ((p->opCode == MULTIPLY || p->opCode == PERSIST) && p->len > 0 && offsetInLastRecvBlock == 0)
+	if (p->opCode == PERSIST && offsetInLastRecvBlock == 0)
 	{
 		offsetInLastRecvBlock = MAX_BLOCK_SIZE - p->len;
 		p->len = MAX_BLOCK_SIZE;	// make sure it is right-aligned
@@ -255,7 +357,7 @@ int32_t CSocketItemDl::FetchReceived()
 		offsetInLastRecvBlock = 0;
 
 		bool b = p->GetFlag<TransactionEnded>();
-		p->ReInitMarkAcked();
+		p->ReInitMarkDelivered();
 		// but preserve the packet flag for EoT detection, etc.
 		nPacket++;
 		//
@@ -330,6 +432,13 @@ l_recursion:
 		return;
 	}
 
+	// To avoid phantomly double delivery of the payload
+	if (pendingPeekedBlocks != 0)
+	{
+		SetMutexFree();
+		return;
+	}
+
 	CallbackPeeked fp1 = (CallbackPeeked)InterlockedExchangePointer((PVOID *)& fpPeeked, NULL);
 	if (fp1 == NULL)
 	{
@@ -337,14 +446,10 @@ l_recursion:
 		return;
 	}
 
-	// First received block of a clone connection or a new transmit transaction is right-aligned
-	// See also @LLS::PlacePayload and @LLS::CopyOutPlainText
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->GetFirstReceived();
 	int32_t nBlock;
 	bool eot;
-	BYTE *p = pControlBlock->InquireRecvBuf(n, nBlock, eot);
-	if(p != NULL && (skb->opCode == PERSIST || skb->opCode == MULTIPLY))
-		p += MAX_BLOCK_SIZE - skb->len;	// See also FetchReceived()
+	octet* p = pControlBlock->InquireRecvBuf(n, nBlock, eot);
 #ifdef TRACE
 	printf_s("RecvInline, data to deliver@%p, length = %d, eot = %d; %d blocks scanned\n", p, n, (int)eot, nBlock);
 #endif

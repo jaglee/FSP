@@ -146,15 +146,6 @@ int CSocketItemDl::Shutdown()
 	}
 	initiatingShutdown = 1;
 
-#ifndef _NO_LLS_CALLABLE
-	if(! AddOneShotTimer(CLOSING_TIME_WAIT_ms))
-	{
-		REPORT_ERRMSG_ON_TRACE("Cannot set time-out clock for shutdown");
-		SetMutexFree();
-		return -EFAULT;
-	}
-#endif
-
 	// Send RELEASE and wait echoed RELEASE. LLS to signal FSP_NotifyToFinish, NotifyReset or NotifyTimeout
 #ifndef _NO_LLS_CALLABLE
 	int32_t deinitWait = DEINIT_WAIT_TIMEOUT_ms;

@@ -228,6 +228,7 @@ void UnitTestBufferData()
 }
 
 
+
 static int ParseBlock(octet *utf8str, int32_t len)
 {
 	static char partialFileName[sizeof(TCHAR) * MAX_PATH + 4];	// buffered partial file name
@@ -432,6 +433,23 @@ void UnitTestPrepareToSend()
 		, pSCB->sendBufferNextSN
 		, opCodeStrings[skb->opCode]
 		, stateNames[pSocketItem->GetState()]);
+}
+
+
+
+//
+void UnitTestTryGetSendBuffer()
+{
+	CSocketItemDbg *pSocketItem = GetPreparedSocket();
+	ControlBlock *pSCB = pSocketItem->GetControlBlock();
+	//
+	pSCB->state = ESTABLISHED;
+	pSCB->SetRecvWindow(FIRST_SN);
+	pSCB->SetSendWindow(FIRST_SN);
+
+	int32_t size;
+	void *p = TryGetSendBuffer(pSocketItem, &size);
+	printf_s("Send buffer pointer returned: %p, buffer size = %d\n", p, size);
 }
 
 
@@ -685,7 +703,7 @@ void UnitTestInquireRecvBuf()
 	printf_s("Expected SN of the receive window after query the whole block = %u\n", pSCB->recvWindowExpectedSN);
 
 	// Free the first block only
-	pSCB->MarkReceivedFree(nB);
+	pSCB->MarkReceivedFree(1);
 	skb = pSCB->GetFirstReceived();
 	buf = pSCB->InquireRecvBuf(nIO, nB, eot);
 	assert(buf == pSCB->GetRecvPtr(skb));
@@ -713,6 +731,41 @@ void UnitTestInquireRecvBuf()
 	assert(nIO == MAX_BLOCK_SIZE);
 }
 
+
+
+void UnitTestTryRecvInline()
+{
+	const int RECV_BUFFER_SIZE = MAX_BLOCK_SIZE * 2;	// Limit the receive buffer to 2 blocks
+	CSocketItemDbg* pSocketItem = GetPreparedSocket(MAX_FSP_SHM_SIZE - RECV_BUFFER_SIZE);
+	ControlBlock * pSCB = pSocketItem->GetControlBlock();
+	pSCB->state = ESTABLISHED;
+	pSCB->SetRecvWindow(FIRST_SN);
+	pSCB->SetSendWindow(FIRST_SN);
+
+	// prepare the receive buffer
+	ControlBlock::PFSP_SocketBuf skb = pSCB->HeadRecv();
+	BYTE * preparedTestData = pSocketItem->GetRecvPtr(skb);
+	for (register int i = 0; i < RECV_BUFFER_SIZE; i += sizeof(int))
+	{
+		*(int*)(preparedTestData + i) = i;
+	}
+
+	while ((skb = pSCB->AllocRecvBuf(pSCB->recvWindowNextSN)) != NULL)
+	{
+		skb->len = MAX_BLOCK_SIZE;
+		skb->opCode = PURE_DATA;
+		skb->ReInitMarkComplete();
+	}
+
+	int32_t size;
+	bool flag;
+	void* p = TryRecvInline(pSocketItem, &size, &flag);
+	printf_s("Receive buffer pointer returned: %p, size = %d, flagEoT: %d\n", p, size, flag);
+
+	//void *buffer = _alloca(RECV_BUFFER_SIZE);
+	//// Should hang:
+	//ReadFrom(pSocketItem, buffer, RECV_BUFFER_SIZE, NULL);
+}
 
 
 
@@ -956,17 +1009,21 @@ int _tmain(int argc, _TCHAR* argv[])
 	FUZ_unitTests();
 	UnitTestCompressAndDecode();
 
-	UnitTestBufferData();
+	//UnitTestBufferData();
 
-	UnitTestAllocRecvBuf();
+	//UnitTestAllocRecvBuf();
 
-	UnitTestFetchReceived();
+	//UnitTestFetchReceived();
 
-	LogicTestPackedSend();
+	//LogicTestPackedSend();
 
-	UnitTestPrepareToSend();
+	//UnitTestPrepareToSend();
 
-	UnitTestInquireRecvBuf();
+	//UnitTestInquireRecvBuf();
+
+	//UnitTestTryRecvInline();
+
+	UnitTestTryGetSendBuffer();
 
 	return 0;
 }

@@ -102,7 +102,7 @@ int BeginReceiveMemoryPattern(FSPHANDLE h, size_t testSize)
 // "$memory.^";
 int CompareMemoryPattern(TCHAR *fileName)
 {
-	static	uint8_t	buf[0x20000];	// 128KB
+	static	octet buf[0x20000];	// 128KB
 
 	int fd;
 	errno_t	err = _tsopen_s(& fd
@@ -126,6 +126,7 @@ int CompareMemoryPattern(TCHAR *fileName)
 		return -EDOM;
 
 	for(register int i = 0; i < int(bytesRead / sizeof(uint32_t)); i++)
+
 	{
 		if(* (uint32_t *) & buf[i * sizeof(uint32_t)] != htobe32(i))
 			__debugbreak();

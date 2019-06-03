@@ -167,22 +167,24 @@ struct FSP_SocketParameter
 	CallbackRequested	onAccepting;	// NULL if synchronous accepting, non-NULL if asynchronous
 	CallbackConnected	onAccepted;		// SHOULD be non-NULL for sake of piggybacking payload
 	NotifyOrReturn		onError;		// SHOULD be non-NULL
-										//
-	const void *	welcome;		// default welcome message, may be NULL
-	unsigned short	len;			// length of the default welcome message
+
+	const void *		welcome;		// default welcome message, may be NULL
+	int32_t				len;			// length of the default welcome message
+
 	union
 	{
 		struct
 		{
 			unsigned short	milky:		1;	// Minimal-delay service preferred
 			unsigned short	noEncrypt:	1;	// do not encrypt the payload in the transport layer
-			unsigned short	RESERVED:	12;
+			unsigned short	precompress:1;	// data to send on connect ready were pre-compressed
+			unsigned short	RESERVED:	11;
 			unsigned short	passive:	1;	// internal use only, shall be ignored by ULA
 			unsigned short	isError:	1;	// if set, 'flags' is the error reason
 		};
 		short flags;	// [_In_: >= 0] the requested features [_Out_: might < 0] the error reason
 	};
-	int32_t		ifDefault;	// default interface, only for send
+	short		ifDefault;	// default interface, only for send
 	//
 	int32_t		recvSize;	// [_In_] default size of the receive window [_Out] size of the allocated receive buffer segment
 	int32_t		sendSize;	// [_In_] default size of the send window	 [_Out] size of the allocated send buffer segment
@@ -281,7 +283,20 @@ int FSPAPI InstallMasterKey(FSPHANDLE, octet *, int32_t);
 // return
 //	negative if error, or the capacity of immediately available buffer (might be 0)
 DllSpec
-int FSPAPI GetSendBuffer(FSPHANDLE, CallbackBufferReady);
+int32_t FSPAPI GetSendBuffer(FSPHANDLE, CallbackBufferReady);
+
+
+// given
+//	the handle of the FSP socket to request send buffer for,
+//	placeholder of the pointer to the capacity available
+// return
+//	NULL if no immediately available buffer
+//	or the pointer to the free send buffer
+// remark
+//	the capacity might be negative if error occurred, or 0 if no immediately available buffer
+DllSpec
+void* FSPAPI TryGetSendBuffer(FSPHANDLE, int32_t*);
+
 
 
 // Given
@@ -303,7 +318,7 @@ int FSPAPI GetSendBuffer(FSPHANDLE, CallbackBufferReady);
 //	MUST be multiple of MAX_BLOCK_SIZE
 //	SendInline could be chained in tandem with GetSendBuffer
 DllSpec
-int FSPAPI SendInline(FSPHANDLE, void *, int32_t, bool, NotifyOrReturn);
+int32_t FSPAPI SendInline(FSPHANDLE, void *, int32_t, bool, NotifyOrReturn);
 
 
 // Given
@@ -334,6 +349,20 @@ int32_t FSPAPI WriteTo(FSPHANDLE, const void *, int32_t, unsigned, NotifyOrRetur
 //	each calling of the function should accept one and only one transmit transaction from the peer
 DllSpec
 int FSPAPI RecvInline(FSPHANDLE, CallbackPeeked);
+
+
+// given
+//	the socket handle
+//	the placeholder of the length of data received, in octets
+//	the placeholder of the boolean variable, EoT flag
+// return
+//	NULL if error occurred, and the length of the data shall be set to negative number as the error number
+//	the pointer to the start position of the received data, while the length of the data is either zero or positive
+// remark
+//	the EoT flag may be set even if the return value is zero, which is not an error
+//	to accept further data following reading function would automatically unlock the buffer returned by this function
+DllSpec
+void* FSPAPI TryRecvInline(FSPHANDLE, int32_t*, bool*);
 
 
 // Given
@@ -399,14 +428,13 @@ int FSPAPI Flush(FSPHANDLE);
 //	FSPHANDLE		the FSP socket
 //	NotifyOrReturn	the function pointer for call back
 // Return
-//	EDOM warning if the connection is to shutdown prematurely, i.e. it is a RESET actually
-//	EBUSY warning if it is COMMITTING
 //	EAGAIN warning if the connection is already in the progress of shutdown
+//	ETIMEOUT warning if the connection is already CLOSABLE but fails to migrate to CLOSED state timely
 //	0 if no error
+//	-EBUSY if it is still committting while the function is called in blocking mode
 //	-EDEADLK if no mutual-exclusive lock available
+//	-EDOM if the peer has not committed the transmit transaction at first
 //	-EFAULT if internal resource error encountered, typical time-out clock unavailable
-//	-EBUSY if it is still sending asynchronously
-//	-EIO if the shutdown packet cannot be sent
 // Remark
 //	If the pointer of the callback function is null,
 //	it would block the caller until the connection is closed or reset
@@ -442,13 +470,8 @@ DllSpec
 void * FSPAPI GetExtPointer(FSPHANDLE);
 
 
-// Given
-//	FSPHANDLE		The handle of the FSP socket
-//	PFSP_Context	The pointer to the placeholder of context copy
-// Return
-//	the pointer to the copy of ULA context
 DllSpec
-PFSP_Context FSPAPI GetFSPContext(FSPHANDLE, PFSP_Context);
+int FSPAPI GetProfilingCounts(FSPHANDLE, PSocketProfile);
 
 
 // Exported by the DLL

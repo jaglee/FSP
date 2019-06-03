@@ -196,7 +196,7 @@ FSPHANDLE LOCALAPI CSocketItemDl::WriteOnMultiplied(CommandCloneConnect &objComm
 FSPHANDLE CSocketItemDl::CompleteMultiply(CommandCloneConnect & cmd)
 {
 	ControlBlock::PFSP_SocketBuf skb = SetHeadPacketIfEmpty(MULTIPLY);
-	if(skb != NULL)
+	if (skb != NULL)
 	{
 		skb->opCode = MULTIPLY;
 		skb->ReInitMarkComplete();

@@ -110,8 +110,7 @@ void GCM_AES_SetKey(GCM_AES_CTX *ctx, const octet *K, int bytesK)
 	bzero(ctx->X, GCM_BLOCK_LEN);
 	rijndaelEncrypt(ctx->K, ctx->rounds, ctx->X, ctx->H);
 
-	if ((bytesK & 7))
-		*(uint32_t *)ctx->J = *(uint32_t *)(K + (bytesK & 0xF8));
+	*(uint32_t *)ctx->J = (bytesK & 7) == 0 ? 0 : *(uint32_t *)(K + (bytesK & 0xF8));
 }
 
 

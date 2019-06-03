@@ -119,7 +119,7 @@ void InitCHAKAServer(SCHAKAPublicInfo &chakaPubInfo, const octet bufPublicKey[CR
 	chakaPubInfo.serverNonce = htobe64(NowUTC());
 }
 
-// *S --> C, [in FSP's ACK_CONNECT_REQUEST]: /Welcome and identity of S/Public Key_S
+// *S --> C, [in FSP's ACK_CONNECT_REQ]: /Welcome and identity of S/Public Key_S
 
 
 SINLINE

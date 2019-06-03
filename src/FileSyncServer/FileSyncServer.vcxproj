@@ -186,16 +186,12 @@
     <ClCompile Include="..\Crypto\CryptoStub.c" />
     <ClCompile Include="..\Crypto\sha256.c" />
     <ClCompile Include="..\Crypto\tweetnacl.c" />
-    <ClCompile Include="EncryptedMemory.cpp" />
     <ClCompile Include="FileSyncServer.cpp" />
-    <ClCompile Include="MemoryFile.cpp" />
     <ClCompile Include="SignatureOOB.cpp" />
     <ClCompile Include="SimpleAWS.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\Crypto\CHAKA.h" />
-    <ClInclude Include="..\Crypto\CryptoStub.h" />
-    <ClInclude Include="..\Crypto\tweetnacl.h" />
     <ClInclude Include="defs.h" />
     <ClInclude Include="stdafx.h" />
   </ItemGroup>

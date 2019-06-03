@@ -19,7 +19,7 @@
 
 typedef uint32_t U32;
 
-class CSocketItemDbg: CSocketItemDl
+class CSocketItemDbg: public CSocketItemDl
 {
 public:
 	ControlBlock * GetControlBlock() const { return pControlBlock; }
