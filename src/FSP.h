@@ -281,27 +281,22 @@ struct ALFIDPair
 
 
 
-typedef	struct $FSP_HeaderSignature
+typedef struct FSP$PacketHeader
 {
-	uint16_t			hsp;	// header stack pointer
-	uint8_t				major;
 	FSPOperationCode	opCode;
-	//
-#ifdef __cplusplus
-	template<typename THdr, FSPOperationCode opCode1> void Set()
-	{
-		major = THIS_FSP_VERSION;
-		opCode = opCode1;
-		hsp = htobe16(sizeof(THdr));
-	}
-	void Set(FSPOperationCode opCode1, int len1)
-	{
-		major = THIS_FSP_VERSION;
-		opCode = opCode1;
-		hsp = htobe16(len1);
-	}
-#endif
-} *PFSP_HeaderSignature;
+	uint8_t				major;
+	uint16_t			offset;
+} *PFSP_FixedHeader;
+
+
+
+// The minor version of the optional header is NOT necessarily THIS_FSP_VERSION
+typedef	struct FSP$OptionalHeader
+{
+	FSPOperationCode	opCode;
+	uint8_t				mark;
+	uint16_t			length;
+} *PFSP_OptionalHeader;
 
 
 
@@ -316,9 +311,62 @@ enum FSP_FlagPosition : uint8_t
 
 
 
-// more detail implementation of FSP_NormalPacketHeader is defined later
+// CONNECT_INIT, the first 32-bit word is the header signature
+struct FSP_InitiateRequest
+{
+	struct FSP$PacketHeader hs;
+	uint32_t	salt;
+	timestamp_t timeStamp;
+	uint64_t	initCheckCode;
+};
+// Optional payload: domain name of the remote peer, less than 512 - sizeof(FSP_InitiateRequest) = 488 octets
+
+
+
+// FSP_ConnectParam specifies the parent connection in an ACK_CONNECT_INIT, CONNECT_REQUEST or MULTIPLY packet
+// the opcode used to be CONNECT_PARAM while alias as the mobile parameters
+// and it is perfect OK to treat it as the canonical alias of PEER_SUBNETS
+struct FSP_ConnectParam
+{
+	struct FSP$OptionalHeader _h;
+	ALFID_T		idListener;
+	TSubnets	subnets;
+};	// Totally 5 QWORDs, 40 octets
+
+
+
+// ACK_CONNECT_INIT, acknowledgement to the connect bootstrap request, works as a challenge against the initiator
+struct FSP_Challenge
+{
+	struct FSP$PacketHeader hs;
+	int32_t		timeDelta;
+	uint64_t	cookie;
+	uint64_t	initCheckCode;
+	FSP_ConnectParam params;
+};
+// Totally 8 QWORDs, 64 octets
+
+
+
+// CONNECT_REQUEST, overlay the CONNECT_INIT packet practically
+struct FSP_ConnectRequest
+{
+	struct FSP_InitiateRequest _init;
+	struct FSP_ConnectParam params;
+	uint32_t	initialSN;		// initial sequence number, I->R, for this session segment
+	int32_t		timeDelta;
+	uint64_t	cookie;
+};	// Totally 11 QWORDs, 88 octets
+// Optional payload: canonical name of the near end, less than 512 - sizeof(FSP_ConnectRequest) = 424 octets
+
+
+
+// A normal packet since ACK_CONNECT_REQ, the first 32-bit word is the header signature
+// Trick that must be kept: the sequence number field MUST be align with the timestamp or cookie field
 struct FSP_NormalPacketHeader
 {
+	struct FSP$PacketHeader hs;
+	octet	flags_ws[4];
 	uint32_t sequenceNo;
 	uint32_t expectedSN;
 	union
@@ -327,8 +375,6 @@ struct FSP_NormalPacketHeader
 		ALFIDPair	id;
 	} integrity;
 	//
-	octet	flags_ws[4];
-	$FSP_HeaderSignature hs;
 #ifdef __cplusplus
 	// A brute-force but safe method of set or retrieve receive window size, with byte order translation
 	int32_t GetRecvWS()	const { return ((int32_t)flags_ws[1] << 16) + ((unsigned)flags_ws[2] << 8) + flags_ws[3]; }
@@ -337,77 +383,27 @@ struct FSP_NormalPacketHeader
 
 
 
-struct FSP_InitiateRequest
-{
-	timestamp_t timeStamp;
-	uint64_t	initCheckCode;
-	uint32_t	salt;
-	$FSP_HeaderSignature hs;
-};
-// Optional payload: domain name of the remote peer, less than 512 - sizeof(FSP_InitiateRequest) = 488 octets
-
-
-// FSP_ConnectParam specifies the parent connection in a MULTIPLY, ACK_CONNECT_INIT or CONNECT_REQUEST packet
-// while alias as the mobile parameters
-// PEER_SUBNETS used to be CONNECT_PARAM and it is perfect OK to treat the latter as the canonical alias of the former
-struct FSP_ConnectParam
-{
-	TSubnets	subnets;
-	ALFID_T		idListener;
-	$FSP_HeaderSignature hs;
-};	// Totally 5 QWORDs, 40 octets
-
-
-
-// acknowledgement to the connect bootstrap request, works as a challenge against the initiator
-// to be followed by the certificate optional header
-struct FSP_Challenge
-{
-	uint64_t	cookie;
-	uint64_t	initCheckCode;
-	int32_t		timeDelta;
-	$FSP_HeaderSignature hs;
-	FSP_ConnectParam params;
-};
-// Totally 8 QWORDs, 64 octets
-
-
-#ifdef __cplusplus
-struct FSP_ConnectRequest : FSP_InitiateRequest
-{
-#else
-struct FSP_ConnectRequest
-{
-	struct FSP_InitiateRequest _h;
-#endif
-	uint32_t	initialSN;		// initial sequence number, I->R, for this session segment
-	int32_t		timeDelta;
-	uint64_t	cookie;
-	//
-	FSP_ConnectParam params;
-};	// Totally 11 QWORDs, 88 octets
-// Optional payload: canonical name of the near end, less than 512 - sizeof(FSP_ConnectRequest) = 424 octets
-
-
-
 // Mandatory additional header for KEEP_ALIVE
 // minimum constituent of a SNACK header
 struct FSP_SelectiveNACK
 {
+	struct FSP$OptionalHeader _h;
+	uint32_t		serialNo;
+	uint64_t		tLazyAck;	// delay time of the lazy acknowledgement, in microseconds
 	struct GapDescriptor
 	{
 		uint32_t	gapWidth;	// in packets
 		uint32_t	dataLength;	// in packets
 	};
-	uint64_t		tLazyAck;	// delay time of the lazy acknowledgement, in microseconds
-	uint32_t		serialNo;
-	$FSP_HeaderSignature hs;
 };
 
 
 
+// FSP_RESET, the reset reason should be bit fields.
 struct FSP_RejectConnect
 {
+	struct FSP$PacketHeader hs;
+	uint32_t reasons;
 	union
 	{
 		timestamp_t timeStamp;
@@ -425,9 +421,6 @@ struct FSP_RejectConnect
 		uint64_t initCheckCode;
 		ALFIDPair fidPair;
 	};
-	//
-	uint32_t reasons;	// bit field(?)
-	$FSP_HeaderSignature hs;
 };
 
 

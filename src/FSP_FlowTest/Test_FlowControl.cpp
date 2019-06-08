@@ -178,18 +178,22 @@ void PrepareFlowTestResend(CSocketItemExDbg & dbgSocket, PControlBlock & pSCB)
 
 	ControlBlock::PFSP_SocketBuf skb = pSCB->GetSendBuf();
 	skb->ReInitMarkComplete();
+	skb->timeSent = NowUTC();
 	assert(pSCB->sendBufferNextSN == FIRST_SN + 1);
 
 	skb = pSCB->GetSendBuf();
 	skb->ReInitMarkComplete();
+	skb->timeSent = NowUTC();
 	assert(pSCB->sendBufferNextSN == FIRST_SN + 2);
 
 	skb = pSCB->GetSendBuf();
 	skb->ReInitMarkComplete();
+	skb->timeSent = NowUTC();
 	assert(pSCB->sendBufferNextSN == FIRST_SN + 3);
 
 	skb = pSCB->GetSendBuf();
 	skb->ReInitMarkComplete();
+	skb->timeSent = NowUTC();
 	assert(pSCB->sendBufferNextSN == FIRST_SN + 4);
 
 	skb = pSCB->GetSendBuf();
@@ -205,19 +209,23 @@ void PrepareFlowTestResend(CSocketItemExDbg & dbgSocket, PControlBlock & pSCB)
 
 	ControlBlock::PFSP_SocketBuf skb5 = pSCB->AllocRecvBuf(FIRST_SN);
 	assert(skb5 != NULL);
+
 	skb5->ReInitMarkComplete();
+	skb5->timeRecv = NowUTC();
 
 	skb5 = pSCB->AllocRecvBuf(FIRST_SN + 1);
 	assert(skb5 != NULL);
 	assert(pSCB->recvWindowNextSN == FIRST_SN + 2);
 
 	skb5->ReInitMarkComplete();
+	skb5->timeRecv = NowUTC();
 
 	skb5 = pSCB->AllocRecvBuf(FIRST_SN + 3);
 	assert(skb5 != NULL);
 	assert(pSCB->recvWindowNextSN == FIRST_SN + 4);
 
 	skb5->ReInitMarkComplete();
+	skb5->timeRecv = NowUTC();
 
 	skb5 = pSCB->AllocRecvBuf(FIRST_SN + 4);
 	assert(skb5 == NULL);	// No more space in the receive buffer
@@ -247,7 +255,7 @@ void FlowTestRetransmission()
 	//
 	struct _KEEP_ALIVE
 	{
-		FSP_InternalFixedHeader hdr;
+		FSP_FixedHeader			hdr;
 		FSP_PreparedKEEP_ALIVE	ext;
 	} *p = (_KEEP_ALIVE *)& placeholder.pktBuffer.hdr;
 	//
@@ -257,7 +265,7 @@ void FlowTestRetransmission()
 	int32_t len = dbgSocket.GenerateSNACK(p->ext, seq4, sizeof(FSP_NormalPacketHeader));
 
 	pSCB->SignHeaderWith(& p->hdr, KEEP_ALIVE, uint16_t(len), pSCB->sendWindowNextSN - 1, seq4);
-	dbgSocket.SetIntegrityCheckCode(& p->hdr, NULL, 0, p->ext.GetSaltValue());
+	dbgSocket.SetIntegrityCheckCode(& p->hdr, NULL, 0, p->ext.sentinel.serialNo);
 
 	// Firstly emulate receive the packet before emulate OnGetKeepAlive
 	dbgSocket.headPacket = & placeholder.pktBuffer;
@@ -315,7 +323,7 @@ void FlowTestRetransmission()
 
 	len = dbgSocket.GenerateSNACK(p->ext, seq4, sizeof(FSP_NormalPacketHeader));
 	pSCB->SignHeaderWith(& p->hdr, KEEP_ALIVE, uint16_t(len), pSCB->sendWindowNextSN - 1, seq4);
-	dbgSocket.SetIntegrityCheckCode(&p->hdr, NULL, 0, p->ext.GetSaltValue());
+	dbgSocket.SetIntegrityCheckCode(&p->hdr, NULL, 0, p->ext.sentinel.serialNo);
 	// as it is an out-of-band packet, assume pre-set values are kept
 	dbgSocket.tRecentSend = NowUTC() + 3;
 	dbgSocket.ValidateSNACK(seq5, snack, n);

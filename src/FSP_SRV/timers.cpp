@@ -201,15 +201,15 @@ bool CSocketItemEx::SendKeepAlive()
 
 	struct
 	{
-		FSP_InternalFixedHeader	hdr;
+		FSP_FixedHeader			hdr;
 		FSP_ConnectParam		mp;
 		FSP_PreparedKEEP_ALIVE	snack;
 		void SetHostID(PSOCKADDR_IN6 ipi6) { mp.idListener = SOCKADDR_HOSTID(ipi6); }
 	} buf3;
 
-	memcpy(buf3.mp.subnets, savedPathsToNearEnd, sizeof(TSubnets));
+	SetConnectParamPrefix(buf3.mp);
 	buf3.SetHostID(CLowerInterface::Singleton.addresses);
-	buf3.mp.hs.Set(PEER_SUBNETS, sizeof(FSP_NormalPacketHeader));
+	memcpy(buf3.mp.subnets, savedPathsToNearEnd, sizeof(TSubnets));
 
 	ControlBlock::seq_t	snKeepAliveExp;
 	LONG len = GenerateSNACK(buf3.snack, snKeepAliveExp, sizeof(FSP_NormalPacketHeader) + sizeof(FSP_ConnectParam));
@@ -229,7 +229,7 @@ bool CSocketItemEx::SendKeepAlive()
 	pControlBlock->SignHeaderWith(&buf3.hdr, KEEP_ALIVE, (uint16_t)len
 		, pControlBlock->sendWindowNextSN - 1
 		, snKeepAliveExp);
-	SetIntegrityCheckCode(&buf3.hdr, NULL, 0, buf3.snack.GetSaltValue());
+	SetIntegrityCheckCode(&buf3.hdr, NULL, 0, buf3.snack.sentinel.serialNo);
 #if (TRACE & (TRACE_HEARTBEAT | TRACE_PACKET | TRACE_SLIDEWIN))
 	printf_s("To send KEEP_ALIVE seq #%u, acknowledge #%u\n\tsource ALFID = %u\n"
 		, be32toh(buf3.hdr.sequenceNo)
@@ -261,9 +261,11 @@ bool CSocketItemEx::SendAckFlush()
 	//savedSendSN = pControlBlock->sendWindowNextSN;
 
 	InterlockedIncrement(& nextOOBSN);
-	buf2.snack.tLazyAck = htobe64(NowUTC() - tLastRecv);
+	buf2.snack._h.opCode = SELECTIVE_NACK;
+	buf2.snack._h.mark = 0;
+	buf2.snack._h.length = htobe16(sizeof(FSP_SelectiveNACK));
 	buf2.snack.serialNo = htobe32(nextOOBSN);
-	buf2.snack.hs.Set(SELECTIVE_NACK, sizeof(buf2.hdr));
+	buf2.snack.tLazyAck = htobe64(NowUTC() - tLastRecv);
 
 #if (TRACE & (TRACE_HEARTBEAT | TRACE_PACKET | TRACE_SLIDEWIN))
 	printf_s("Acknowledge flush: local fiber#%u, peer's fiber#%u\n\tAcknowledged seq#%u\n"

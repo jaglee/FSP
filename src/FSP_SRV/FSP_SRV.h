@@ -172,43 +172,14 @@ public:
 
 
 
-typedef struct FSP_InternalFixedHeader : FSP_FixedHeader
-{
-	friend class CSocketItemEx;	// for sake of accessing protected member of FSP_FixedHeader
-	// Get the first extension header
-	PFSP_HeaderSignature PFirstExtHeader() const
-	{
-		return (PFSP_HeaderSignature)((uint8_t *)this + be16toh(hs.hsp) - sizeof($FSP_HeaderSignature));
-	}
-
-	// Get next extension header
-	// Given
-	//	The pointer to the current extension header
-	// Return
-	//	The pointer to the next optional header, NULL if it is illegal
-	// Remark
-	//	The caller should check that pStackPointer does not fall into dead-loop
-	template<typename THdr>	PFSP_HeaderSignature PHeaderNextTo(void *p0) const
-	{
-		uint16_t sp = be16toh(((THdr *)p0)->hs.hsp);
-		if (sp < sizeof(FSP_NormalPacketHeader) || sp >(uint8_t *)p0 - (uint8_t *)this)
-			return NULL;
-		return (PFSP_HeaderSignature)((uint8_t *)this + sp - sizeof($FSP_HeaderSignature));
-	}
-} *PFSP_InternalFixedHeader;
-
-
-
 struct PktBufferBlock
 {
 	ALIGN(MAC_ALIGNMENT)
 	int32_t	lenData;
 	ControlBlock::seq_t	pktSeqNo;	// in host byte-order
 	ALFIDPair	fidPair;
-	FSP_InternalFixedHeader hdr;
-	BYTE	payload[MAX_BLOCK_SIZE];
-	//
-	PFSP_InternalFixedHeader GetHeaderFSP() { return &(this->hdr); }
+	FSP_FixedHeader hdr;
+	octet	payload[MAX_BLOCK_SIZE];
 };
 
 
@@ -232,12 +203,11 @@ struct ScatteredSendBuffers
 // Applier should make sure together with the optional header it would be fit in one IPv6 or UDP packet
 struct FSP_PreparedKEEP_ALIVE
 {
+	FSP_SelectiveNACK sentinel;
 	FSP_SelectiveNACK::GapDescriptor gaps
 		[(MAX_BLOCK_SIZE - sizeof(FSP_SelectiveNACK)) / sizeof(FSP_SelectiveNACK::GapDescriptor)];
-	FSP_SelectiveNACK sentinel;
 	//
 	uint32_t		n;	// n >= 0, number of (gapWidth, dataLength) tuples
-	uint32_t		GetSaltValue() const { return gaps[n].gapWidth; }	// it overlays on serialNo
 };
 
 
@@ -436,8 +406,8 @@ protected:
 	ControlBlock::seq_t		savedSendSN;	// SN of the packet carrying SNACK
 	struct SAckFlushCache
 	{
-		FSP_InternalFixedHeader	hdr;
-		FSP_SelectiveNACK		snack;
+		FSP_FixedHeader		hdr;
+		FSP_SelectiveNACK	snack;
 	} ALIGN(MAC_ALIGNMENT) cacheAckFlush;
 
 	void AbortLLS(bool haveTLBLocked = false);
@@ -474,12 +444,11 @@ protected:
 	}
 	void SetState(FSP_Session_State s) { _InterlockedExchange8((char *)& pControlBlock->state, s); SyncState(); }
 
-	void SetSequenceFlags(PFSP_InternalFixedHeader pHdr, ControlBlock::seq_t seq1)
+	void SetSequenceAndWS(struct FSP_FixedHeader* pHdr, ControlBlock::seq_t seq1)
 	{
 		ControlBlock::seq_t snExpected = pControlBlock->recvWindowExpectedSN;
 		pHdr->sequenceNo = htobe32(seq1);
 		pHdr->expectedSN = htobe32(snExpected);
-		pHdr->ClearFlags();
 		pHdr->SetRecvWS(int32_t(GetRecvWindowFirstSN() + pControlBlock->recvBufferBlockN - snExpected));
 	}
 
@@ -487,7 +456,7 @@ protected:
 	// Return true if really transit, false if the (half) connection is finised and to notify
 	inline bool TransitOnPeerCommit();
 
-	bool HandlePeerSubnets(PFSP_HeaderSignature);
+	bool HandlePeerSubnets(struct FSP_ConnectParam*);
 
 	// return -EEXIST if overridden, -EFAULT if memory error, or payload effectively placed
 	int	PlacePayload();
@@ -602,7 +571,7 @@ public:
 
 	// Solid input,  the payload, if any, is copied later
 	bool LOCALAPI ValidateICC(FSP_NormalPacketHeader *, int32_t, ALFID_T, uint32_t);
-	bool ValidateICC() { return ValidateICC(headPacket->GetHeaderFSP(), headPacket->lenData, fidPair.peer, 0); }
+	bool ValidateICC() { return ValidateICC(&headPacket->hdr, headPacket->lenData, fidPair.peer, 0); }
 
 	bool LOCALAPI ValidateSNACK(ControlBlock::seq_t &, FSP_SelectiveNACK::GapDescriptor * &, int &);
 	// Register source IPv6 address of a validated received packet as the favorite returning IP address

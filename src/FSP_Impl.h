@@ -189,22 +189,40 @@ extern CStringizeNotice noticeNames;
  */
 #include <pshpack1.h>
 
-class FSP_FixedHeader : public FSP_NormalPacketHeader
+struct FSP_FixedHeader : public FSP_NormalPacketHeader
 {
-	friend struct ControlBlock;
-protected:
 	void Set(FSPOperationCode code, uint16_t hsp, uint32_t seqThis, uint32_t seqExpected, int32_t advRecvWinSize)
 	{
-		hs.Set(code, hsp);
-		expectedSN = htobe32(seqExpected);
+		hs.opCode = code;
+		hs.major = THIS_FSP_VERSION;
+		hs.offset = htobe16(hsp);
 		sequenceNo = htobe32(seqThis);
 		ClearFlags();
 		SetRecvWS(advRecvWinSize);
+		expectedSN = htobe32(seqExpected);
 	}
 	//
 	void ClearFlags() { flags_ws[0] = 0; }
 	void SetRecvWS(int32_t v) { flags_ws[1] = (octet)(v >> 16); flags_ws[2] = (octet)(v >> 8); flags_ws[3] = (octet)v; }
 };
+
+// Network byte order of the length of the fixed header, where host byte order is little-endian
+#define CONNECT_PARAM_LENGTH_BE16 0x2800
+#define	FIXED_HEADER_SIZE_BE16 0x1800
+
+// Set the prefix of FSP_ConnectParam content
+#define SetConnectParamPrefix(hdr)	{	\
+	(hdr)._h.opCode = PEER_SUBNETS;		\
+	(hdr)._h.mark = 0;					\
+	(hdr)._h.length = CONNECT_PARAM_LENGTH_BE16; \
+}
+
+#define SetHeaderSignature(hdr, code) {	\
+	(hdr).hs.opCode = (code);			\
+	(hdr).hs.major = THIS_FSP_VERSION;	\
+	(hdr).hs.offset = FIXED_HEADER_SIZE_BE16;	\
+	}
+
 
 /**
  * Command to lower layer service
@@ -286,7 +304,7 @@ struct SConnectParam	// MUST be aligned on 64-bit words!
 	uint64_t	initCheckCode;
 	uint64_t	cookie;
 	uint32_t	salt;
-	int32_t		timeDelta;	// delay of peer to peer timestamp, delta of clock 
+	int32_t		timeDelta; 
 	timestamp_t nboTimeStamp;
 	//^ Timestamp in network byte order, together with the first four fields, totally 256 bits could be overlaid
 	//
@@ -668,6 +686,9 @@ struct ControlBlock
 		IncRoundSendBlockN(sendWindowHeadPos);
 		InterlockedIncrement(&sendWindowFirstSN);
 	}
+
+	// Return the advertisable size of the receive window
+	int32_t GetAdvertisableRecvWin() { return int32_t(LCKREAD(recvWindowFirstSN) + recvBufferBlockN - recvWindowExpectedSN); }
 
 	// Given
 	//	ControlBlock::seq_t	The sequence number of the packet that mostly expected by the remote end

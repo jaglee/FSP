@@ -679,7 +679,7 @@ inline void CSocketItemEx::CheckAckToKeepAlive()
 //	Retransmission DOES consume the key life of authenticated encryption
 void * LOCALAPI CSocketItemEx::SetIntegrityCheckCode(FSP_NormalPacketHeader *p1, void *content, int32_t ptLen, uint32_t salt)
 {
-	uint32_t byteA = be16toh(p1->hs.hsp);	// number of octets that 'additional data' in Galois Counter Mode
+	uint32_t byteA = be16toh(p1->hs.offset);	// number of octets that 'additional data' in Galois Counter Mode
 	if (byteA < sizeof(FSP_NormalPacketHeader) || byteA > MAX_LLS_BLOCK_SIZE || (byteA & (sizeof(uint64_t) - 1)) != 0)
 		return NULL;
 	//
@@ -775,7 +775,7 @@ void * LOCALAPI CSocketItemEx::SetIntegrityCheckCode(FSP_NormalPacketHeader *p1,
 bool LOCALAPI CSocketItemEx::ValidateICC(FSP_NormalPacketHeader *p1, int32_t ctLen, ALFID_T idSource, uint32_t salt)
 {
 	ALIGN(MAC_ALIGNMENT) uint64_t tag[FSP_TAG_SIZE / sizeof(uint64_t)];
-	uint32_t byteA = be16toh(p1->hs.hsp);
+	uint32_t byteA = be16toh(p1->hs.offset);
 	if (byteA < sizeof(FSP_NormalPacketHeader) || byteA > MAX_LLS_BLOCK_SIZE || (byteA & (sizeof(uint64_t) - 1)) != 0)
 		return false;
 
@@ -813,7 +813,7 @@ bool LOCALAPI CSocketItemEx::ValidateICC(FSP_NormalPacketHeader *p1, int32_t ctL
 		GCM_AES_CTX *pCtx = int32_t(seqNo - contextOfICC.snFirstRecvWithCurrKey) < 0
 			? & contextOfICC.prev.gcm_aes
 			: & contextOfICC.curr.gcm_aes;
-		uint32_t byteA = be16toh(p1->hs.hsp);
+		uint32_t byteA = be16toh(p1->hs.offset);
 		if(byteA < sizeof(FSP_NormalPacketHeader) || byteA > MAX_LLS_BLOCK_SIZE || (byteA & (sizeof(uint64_t) - 1)) != 0)
 			return false;
 
@@ -942,7 +942,7 @@ bool CSocketItemEx::EmitStart()
 //	ICC, if required, is always set just before being sent
 int CSocketItemEx::EmitWithICC(ControlBlock::PFSP_SocketBuf skb, ControlBlock::seq_t seq)
 {
-	ALIGN(MAC_ALIGNMENT) FSP_InternalFixedHeader hdr;
+	ALIGN(MAC_ALIGNMENT) FSP_FixedHeader hdr;
 #ifdef EMULATE_LOSS
 	volatile unsigned int vRand = 0;
 	if (rand_s((unsigned int *)&vRand) == 0 && vRand > (UINT_MAX >> 2) + (UINT_MAX >> 1))
@@ -971,9 +971,9 @@ int CSocketItemEx::EmitWithICC(ControlBlock::PFSP_SocketBuf skb, ControlBlock::s
 		return -EFAULT;
 	}
 
-	SetSequenceFlags(&hdr, seq);	// MUST be put before CopyFlagsTo or else the flag fields are cleared
+	SetHeaderSignature(hdr, skb->opCode);
 	skb->CopyFlagsTo(&hdr);
-	hdr.hs.Set(skb->opCode, sizeof(FSP_NormalPacketHeader));
+	SetSequenceAndWS(&hdr, seq);
 
 	// here we needn't check memory corruption as misbehavior only harms himself
 	void * paidLoad = SetIntegrityCheckCode(&hdr, (BYTE *)payload, skb->len);
@@ -1062,19 +1062,17 @@ bool CSocketItemEx::IsNearEndMoved()
 
 
 // Given
-//	PFSP_HeaderSignature	point to the signature part of the PEER_SUBNETS header
+//	FSP_ConnectParam *	pointer to the PEER_SUBNETS header
 // Do
 //	Process the getting remote address event
 // Remark
 //	Although the subnet that the host belong to could be mobile, the hostID should be stable
-//	PEER_SUBNETS used to be MOBILE_PARAM
-bool CSocketItemEx::HandlePeerSubnets(PFSP_HeaderSignature optHdr)
+bool CSocketItemEx::HandlePeerSubnets(FSP_ConnectParam* pMobileParam)
 {
-	if (optHdr == NULL || optHdr->opCode != PEER_SUBNETS)
+	if (pMobileParam == NULL || pMobileParam->_h.opCode != PEER_SUBNETS)
 		return false;
 	//
 #ifndef OVER_UDP_IPv4
-	FSP_ConnectParam *pMobileParam = (FSP_ConnectParam *)((uint8_t *)optHdr + sizeof($FSP_HeaderSignature) - sizeof(FSP_ConnectParam));
 	// loop roll-out
 	SOCKADDR_SUBNET(&sockAddrTo[0]) = pMobileParam->subnets[0];
 	SOCKADDR_SUBNET(&sockAddrTo[1]) = pMobileParam->subnets[1];

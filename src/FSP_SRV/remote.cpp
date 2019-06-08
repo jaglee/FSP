@@ -140,20 +140,20 @@ void LOCALAPI CLowerInterface::OnGetInitConnect()
 	// the remote address is not changed
 	timestamp_t t0 = be64toh(q->timeStamp);
 	timestamp_t t1 = NowUTC();
-
-	challenge.initCheckCode = q->initCheckCode;
+	cm.salt = q->salt;
 	cm.idALF = fiberID;
 	cm.idListener = GetLocalFiberID();
 	// the cookie depends on the listening fiber ID AND the responding fiber ID
-	cm.salt = q->salt;
-	challenge.cookie = CalculateCookie(& cm, sizeof(cm), t1);
+
+	SetHeaderSignature(challenge, ACK_INIT_CONNECT);
 	challenge.timeDelta = htobe32((u_long)(t1 - t0));
-	challenge.hs.Set<FSP_Challenge, ACK_INIT_CONNECT>();
+	challenge.cookie = CalculateCookie(& cm, sizeof(cm), t1);
+	challenge.initCheckCode = q->initCheckCode;
 
 	// To support mobility to the maximum extent the effective listening addresses are enumerated on the fly
 	CLowerInterface::Singleton.EnumEffectiveAddresses(challenge.params.subnets);
+	SetConnectParamPrefix(challenge.params);
 	challenge.params.idListener = cm.idListener;
-	challenge.params.hs.Set(PEER_SUBNETS, sizeof(FSP_NormalPacketHeader));
 
 	SetLocalFiberID(fiberID);
 	SendBack((char *) & challenge, sizeof(challenge));
@@ -259,13 +259,15 @@ void LOCALAPI CLowerInterface::OnGetConnectRequest()
 	// cf. OnInitConnectAck() and SocketItemEx::AffirmConnect()
 	ALFID_T fiberID = GetLocalFiberID();
 	struct _CookieMaterial cm;
-	cm.idListener = q->params.idListener;
+	cm.salt = q->_init.salt;
 	cm.idALF = fiberID;
-	cm.salt = q->salt;
+	cm.idListener = q->params.idListener;
+	// Attention please! Granity of the time delta can be designated arbitrarily by the responder,
+	// provided it is consistent between OnGetInitConnect and OnGetConnectRequest
 	// UNRESOLVED! TODO: search the cookie blacklist at first
 	if(q->cookie != CalculateCookie(& cm
 			, sizeof(cm)
-			, be64toh(q->timeStamp) + (INT32)be32toh(q->timeDelta)) )
+			, be64toh(q->_init.timeStamp) + (int32_t)be32toh(q->timeDelta)) )
 	{
 #ifdef TRACE
 		printf_s("UNRESOLVED! TODO: put the cookie into the blacklist to fight against DDoS attack!?\n");
@@ -275,7 +277,7 @@ void LOCALAPI CLowerInterface::OnGetConnectRequest()
 
 #pragma warning(disable:4533)	// initialization of backlogItem is skipped by 'goto l_return'
 	// Simply ignore the duplicated request
-	BackLogItem backlogItem(GetRemoteFiberID(), q->salt);
+	BackLogItem backlogItem(GetRemoteFiberID(), q->_init.salt);
 	if(pSocket->pControlBlock->backLog.Has(& backlogItem))
 		goto l_return;
 
@@ -316,10 +318,10 @@ void LOCALAPI CLowerInterface::OnGetConnectRequest()
 		backlogItem.acceptAddr.ipi6_ifindex = pHdr->u.ipi_ifindex;
 	}
 	// Ephemeral key materials(together with salt):
-	backlogItem.initCheckCode = q->initCheckCode;
+	backlogItem.initCheckCode = q->_init.initCheckCode;
+	backlogItem.nboTimeStamp = q->_init.timeStamp;
 	backlogItem.cookie = q->cookie;
 	backlogItem.timeDelta = be32toh(q->timeDelta);
-	backlogItem.nboTimeStamp = q->timeStamp;
 	//
 	backlogItem.remoteHostID = nearInfo.IsIPv6() ? SOCKADDR_HOSTID(mesgInfo.name) : 0;
 	//^See also GetRemoteFiberID()
@@ -423,7 +425,8 @@ l_bailout:
 //	If it is valid the gap descriptors are transformed to the host byte order
 bool LOCALAPI CSocketItemEx::ValidateSNACK(ControlBlock::seq_t & ackSeqNo, FSP_SelectiveNACK::GapDescriptor * & gaps, int & n)
 {
-	register FSP_NormalPacketHeader *p1 = headPacket->GetHeaderFSP();	// defined a little earlier for debug/trace purpose
+	register FSP_NormalPacketHeader* p1 = (FSP_NormalPacketHeader*)& headPacket->hdr;
+	// defined a little earlier for debug/trace purpose
 	if (headPacket->lenData != 0)
 	{
 #ifdef TRACE
@@ -433,8 +436,8 @@ bool LOCALAPI CSocketItemEx::ValidateSNACK(ControlBlock::seq_t & ackSeqNo, FSP_S
 	}
 
 	// Get the offset of payload against the start of the FSP header
-	int32_t offset = be16toh(p1->hs.hsp);
-	FSP_SelectiveNACK *pSNACK = (FSP_SelectiveNACK *)((uint8_t *)p1 + offset - sizeof(FSP_SelectiveNACK));
+	int32_t offset = be16toh(p1->hs.offset);
+	FSP_SelectiveNACK *pSNACK = (FSP_SelectiveNACK *)(p1 + 1);
 	uint32_t salt = pSNACK->serialNo;
 	uint32_t sn = be32toh(salt);
 
@@ -470,23 +473,21 @@ bool LOCALAPI CSocketItemEx::ValidateSNACK(ControlBlock::seq_t & ackSeqNo, FSP_S
 		return false;
 	}
 
-	n = offset - be16toh(pSNACK->hs.hsp) - sizeof(FSP_SelectiveNACK);
+	n = offset - sizeof(FSP_FixedHeader) - sizeof(FSP_SelectiveNACK);
 	if (n < 0 || n % sizeof(FSP_SelectiveNACK::GapDescriptor) != 0)
 	{
 		BREAK_ON_DEBUG();	//TRACE_HERE("This is a malformed SNACK packet");
 		return false;
 	}
-
-	pControlBlock->ResizeSendWindow(ackSeqNo, p1->GetRecvWS());
-
-	gaps = (FSP_SelectiveNACK::GapDescriptor *)((BYTE *)pSNACK - n);
 	n /= sizeof(FSP_SelectiveNACK::GapDescriptor);
+	gaps = ((FSP_PreparedKEEP_ALIVE*)pSNACK)->gaps;
 #if defined(TRACE) && (TRACE & (TRACE_PACKET | TRACE_SLIDEWIN))
 	printf_s("%s sequence number: %u^|^%u\n"
 		"\taccumulatively acknowledged %u with %d gap(s)\n"
 		, opCodeStrings[p1->hs.opCode], headPacket->pktSeqNo, sn
 		, ackSeqNo, n);
 #endif
+	pControlBlock->ResizeSendWindow(ackSeqNo, p1->GetRecvWS());
 
 	// Calibrate RTT ONLY if left edge of the send window is to be advanced
 	// new = ((current + old) / 2 + old) / 2 = current/4 + old * 3/4
@@ -583,7 +584,7 @@ void CSocketItemEx::OnGetNulCommit()
 	if (! isInitiativeState && lowState < ESTABLISHED)
 		return;
 
-	FSP_NormalPacketHeader *p1 = headPacket->GetHeaderFSP();
+	FSP_NormalPacketHeader* p1 = &headPacket->hdr;
 	ControlBlock::seq_t ackSeqNo = be32toh(p1->expectedSN);
 	if (!IsAckExpected(ackSeqNo))
 		return;
@@ -716,7 +717,7 @@ void CSocketItemEx::OnGetPersist()
 	if (headPacket->lenData < 0 || headPacket->lenData > MAX_BLOCK_SIZE)
 		return;
 
-	FSP_NormalPacketHeader *p1 = headPacket->GetHeaderFSP();
+	FSP_NormalPacketHeader* p1 = &headPacket->hdr;
 	ControlBlock::seq_t ackSeqNo = be32toh(p1->expectedSN);
 	if (!IsAckExpected(ackSeqNo))
 		return;
@@ -880,9 +881,8 @@ void CSocketItemEx::OnGetKeepAlive()
 #endif		// UNRESOLVED?! Should log this very unexpected case
 	}
 
-	PFSP_HeaderSignature phs = headPacket->GetHeaderFSP()->PHeaderNextTo<FSP_SelectiveNACK>(& gaps[n]);
-	if(phs != NULL)
-		HandlePeerSubnets(phs);
+	// For this FSP version the mobile paramater is mandatory in KEEP_ALIVE
+	HandlePeerSubnets((FSP_ConnectParam*)((octet*)& headPacket->hdr + sizeof(FSP_FixedHeader)));
 }
 
 
@@ -938,7 +938,7 @@ void CSocketItemEx::OnGetPureData()
 		return;
 	}
 
-	FSP_NormalPacketHeader *p1 = headPacket->GetHeaderFSP();
+	FSP_NormalPacketHeader* p1 = &headPacket->hdr;
 	ControlBlock::seq_t ackSeqNo = be32toh(p1->expectedSN);
 	if (!IsAckExpected(ackSeqNo))
 		return;
@@ -1172,7 +1172,7 @@ void CSocketItemEx::OnGetMultiply()
 
 	// The out-of-band serial number is stored in p1->expectedSN
 	// Check whether it is a collision OR a replay-attack
-	PFSP_InternalFixedHeader pFH = headPacket->GetHeaderFSP();
+	FSP_FixedHeader* pFH = &headPacket->hdr;
 	uint32_t salt = _InterlockedExchange((LONG *) & pFH->expectedSN, 0);
 	uint32_t sn = be32toh(salt);
 	if (int32_t(sn - lastOOBSN) <= 0)
@@ -1242,7 +1242,7 @@ void CSocketItemEx::OnGetMultiply()
 	newItem->nextOOBSN = this->nextOOBSN;
 	newItem->lastOOBSN = this->lastOOBSN;
 	// place payload into the backlog, see also PlacePayload
-	newItem->CopyInPlainText((BYTE *)pFH + be16toh(pFH->hs.hsp), headPacket->lenData);
+	newItem->CopyInPlainText((octet *)pFH + be16toh(pFH->hs.offset), headPacket->lenData);
 
 	ControlBlock::PFSP_SocketBuf skb = & newItem->skbRecvClone;
 	skb->version = pFH->hs.major;
@@ -1302,7 +1302,7 @@ int CSocketItemEx::PlacePayload()
 	if (skb->IsComplete())
 		return -EEXIST;
 
-	FSP_NormalPacketHeader *pHdr = headPacket->GetHeaderFSP();
+	FSP_NormalPacketHeader* pHdr = &headPacket->hdr;
 	int len = headPacket->lenData;
 	if (len > 0)
 	{
@@ -1313,7 +1313,7 @@ int CSocketItemEx::PlacePayload()
 		// Assume payload length has been checked
 		if (pHdr->hs.opCode == PERSIST)
 			ubuf += MAX_BLOCK_SIZE - len;
-		memcpy(ubuf, (BYTE *)pHdr + be16toh(pHdr->hs.hsp), len);
+		memcpy(ubuf, (BYTE *)pHdr + be16toh(pHdr->hs.offset), len);
 	}
 	// Or else might be zero for ACK_START or MULTIPLY packet
 	skb->timeRecv = tLastRecv = NowUTC();

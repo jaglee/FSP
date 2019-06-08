@@ -594,13 +594,14 @@ bool CSocketItemEx::Notify(FSP_ServiceCode n)
 //	seq_t &						the placeholder for the returned maximum expected sequence number
 //	int							the number of bytes that prefix the SNACK header
 // Return
-//	Number of bytes taken by the gap descriptors, including the suffix fields of the SNACK header and the prefix of the given length
+//	Number of bytes taken till the end of the gap descriptors, including the SNACK header and the prefix of the given length
 //	negative indicates that some error occurred
 // Remark
 //	For milky payload this function should never be called
 int32_t LOCALAPI CSocketItemEx::GenerateSNACK(FSP_PreparedKEEP_ALIVE &buf, ControlBlock::seq_t &seq0, int nPrefix)
 {
 	register int n = (sizeof(buf.gaps) - nPrefix + sizeof(FSP_NormalPacketHeader)) / sizeof(buf.gaps[0]);
+	//^ keep the unerlying IP packet from segmentation
 	register FSP_SelectiveNACK::GapDescriptor *gaps = buf.gaps;
 	n = pControlBlock->GetSelectiveNACK(seq0, gaps, n);
 	if (n < 0)
@@ -612,7 +613,7 @@ int32_t LOCALAPI CSocketItemEx::GenerateSNACK(FSP_PreparedKEEP_ALIVE &buf, Contr
 	}
 	// Suffix the effective gap descriptors block with the FSP_SelectiveNACK struct
 	// built-in rule: an optional header MUST be 64-bit aligned
-	register FSP_SelectiveNACK *pSNACK = (FSP_SelectiveNACK *)(gaps + n);
+	register FSP_SelectiveNACK* pSNACK = &buf.sentinel;
 	// TODO: to minimize internal state to save
 	// record the receive time of the most recently received packet
 	register int32_t k = int32_t(seq0 - GetRecvWindowFirstSN()) - 1;
@@ -643,9 +644,12 @@ int32_t LOCALAPI CSocketItemEx::GenerateSNACK(FSP_PreparedKEEP_ALIVE &buf, Contr
 	}
 
 	InterlockedIncrement(& nextOOBSN);	// Because lastOOBSN start from zero as well. See ValidateSNACK
+	int32_t lenSNACK = int32_t(sizeof(FSP_SelectiveNACK) + sizeof(buf.gaps[0]) * buf.n);
+	pSNACK->_h.opCode = SELECTIVE_NACK;
+	pSNACK->_h.mark = 0;
+	pSNACK->_h.length = htobe16(lenSNACK);
 	pSNACK->serialNo = htobe32(nextOOBSN);
-	pSNACK->hs.Set(SELECTIVE_NACK, nPrefix);
-	return int32_t((uint8_t *)pSNACK + sizeof(FSP_SelectiveNACK) - (uint8_t *)gaps) + nPrefix;
+	return nPrefix + lenSNACK;
 }
 
 
@@ -670,18 +674,18 @@ void CSocketItemEx::InitiateConnect()
 	skb->opCode = INIT_CONNECT;
 	skb->len = sizeof(FSP_InitiateRequest);
 	//
-	// Overlay INIT_CONNECT and CONNECT_REQUEST
-	FSP_ConnectRequest *q = (FSP_ConnectRequest *)GetSendPtr(skb);
+	FSP_InitiateRequest* q = (FSP_InitiateRequest*)GetSendPtr(skb);
 	if(q == NULL)
 	{
 		BREAK_ON_DEBUG();	//TRACE_HERE("Memory corruption!");
 		return;
 	}
-	q->initCheckCode = initState.initCheckCode;
+	SetHeaderSignature(*q, INIT_CONNECT);
 	q->salt = initState.salt;
-	q->hs.Set<FSP_InitiateRequest, INIT_CONNECT>();	// See also AffirmConnect()
-
 	q->timeStamp = initState.nboTimeStamp;
+	q->initCheckCode = initState.initCheckCode;
+	// See also AffirmConnect()
+
 	skb->ReInitMarkComplete();
 	SendPacket(1, ScatteredSendBuffers(q, sizeof(FSP_InitiateRequest)));
 	skb->timeSent = tRecentSend;
@@ -715,14 +719,16 @@ void CSocketItemEx::AffirmConnect(const SConnectParam & initState, ALFID_T idLis
 
 	SetFirstRTT(int64_t(NowUTC() - skb->timeSent));
 
+	pkt->_init.hs.opCode = CONNECT_REQUEST;
+	// The major version MUST be kept
+	pkt->_init.hs.offset = htobe16(sizeof(FSP_ConnectRequest));
+	SetConnectParamPrefix(pkt->params);
+	pkt->params.idListener = idListener;
+	// assert(sizeof(initState.allowedPrefixes) >= sizeof(varParams.subnets));
+	memcpy(pkt->params.subnets, initState.allowedPrefixes, sizeof(pkt->params.subnets));
 	pkt->initialSN = htobe32(initState.initialSN);
 	pkt->timeDelta = htobe32(initState.timeDelta);
 	pkt->cookie = initState.cookie;
-	// assert(sizeof(initState.allowedPrefixes) >= sizeof(varParams.subnets));
-	memcpy(pkt->params.subnets , initState.allowedPrefixes, sizeof(pkt->params.subnets));
-	pkt->params.idListener = idListener;
-	pkt->params.hs.Set(PEER_SUBNETS, sizeof(FSP_ConnectRequest) - sizeof(FSP_ConnectParam));
-	pkt->hs.Set<FSP_ConnectRequest, CONNECT_REQUEST>();
 
 	// while version remains as the same as the very beginning INIT_CONNECT
 	skb->opCode = CONNECT_REQUEST;
@@ -769,7 +775,7 @@ void CSocketItemEx::InitiateMultiply(CSocketItemEx *srcItem)
 	// MULTIPLY can only be the very first packet
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend();
 	void * payload = GetSendPtr(skb);
-	ALIGN(MAC_ALIGNMENT) FSP_InternalFixedHeader q;
+	ALIGN(MAC_ALIGNMENT) FSP_FixedHeader q;
 	lastOOBSN = 0;	// As the response from the peer, if any, is not an out-of-band packet
 
 	pControlBlock->SignHeaderWith(&q, MULTIPLY, sizeof(FSP_NormalPacketHeader), seq0, GetRecvWindowFirstSN());
@@ -927,12 +933,14 @@ void CSocketItemEx::Accept()
 void CSocketItemEx::SendReset()
 {
 	ControlBlock::seq_t seqR = pControlBlock->sendWindowFirstSN;
-	ALIGN(MAC_ALIGNMENT) FSP_InternalFixedHeader hdr;
+	ALIGN(MAC_ALIGNMENT) FSP_FixedHeader hdr;
 	// Make sure that the packet falls into the receive window
 	if (int32_t(pControlBlock->sendWindowNextSN - seqR) > 0)
 		seqR = pControlBlock->sendWindowNextSN - 1;
-	hdr.hs.Set<FSP_NormalPacketHeader, RESET>();
-	SetSequenceFlags(&hdr, seqR);
+	SetHeaderSignature(hdr, RESET);
+	// To confuse the attacker?! The reason field is obfuscated by zero flags and receive window size
+	hdr.ClearFlags();
+	SetSequenceAndWS(&hdr, seqR);
 	SetIntegrityCheckCode(& hdr);
 	SendPacket(1, ScatteredSendBuffers(&hdr, sizeof(hdr)));
 }

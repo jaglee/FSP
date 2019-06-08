@@ -31,7 +31,7 @@ void UnitTestCRC()
 	//
 	socket.SetPairOfFiberID(nearFID, htobe32(LAST_WELL_KNOWN_ALFID));
 	socketR2.SetPairOfFiberID(htobe32(LAST_WELL_KNOWN_ALFID), nearFID);
-	storage.hdr.hs.hsp = htobe16(sizeof(FSP_NormalPacketHeader));
+	storage.hdr.hs.offset = htobe16(sizeof(FSP_NormalPacketHeader));
 	socket.SetIntegrityCheckCode(& storage.hdr);
 
 	storage2 = storage;
@@ -108,7 +108,7 @@ void UnitTestICC()
 	// firstly, test recorded CRC mode
 	// packet with sequence number less than FIRST_SN should be applied with CRC64
 	FSP_NormalPacketHeader &request = storage.hdr;
-	request.hs.Set<FSP_NormalPacketHeader, PURE_DATA>();
+	SetHeaderSignature(request, PURE_DATA);
 
 	request.sequenceNo = htobe32(FIRST_SN);
 	socket.SetIntegrityCheckCode(& request);
@@ -185,18 +185,16 @@ void UnitTestICC()
 	ControlBlock::seq_t seq0;
 	struct
 	{
-		FSP_InternalFixedHeader hdr;
+		FSP_FixedHeader			hdr;
 		FSP_PreparedKEEP_ALIVE	buf;
 	} mp;
 	int sizeSNACK = socketR2.GenerateSNACK(mp.buf, seq0, sizeof(FSP_NormalPacketHeader));
 	uint32_t salt = mp.buf.sentinel.serialNo;
 	printf_s("Size of the SNACK header = %d, expected SN = %u, salt=0x%X\n", sizeSNACK, seq0, salt);
 
-	mp.hdr.hs.Set(KEEP_ALIVE, sizeof(FSP_NormalPacketHeader) + sizeSNACK);
-	// pSCB->SetSequenceFlags(& mp.hdr, FIRST_SN + FSP_REKEY_THRESHOLD);
-	socket.SetSequenceFlags(&mp.hdr, FIRST_SN + 1);
-	mp.hdr.expectedSN = htobe32(seq0);
-	//
+	mp.hdr.Set(KEEP_ALIVE, sizeSNACK, FIRST_SN + 1, seq0, 0);
+	mp.hdr.ClearFlags();
+	mp.hdr.SetRecvWS(socket.pControlBlock->GetAdvertisableRecvWin());
 	socket.SetIntegrityCheckCode(& mp.hdr, NULL, 0, salt);
 
 	checked = socketR2.ValidateICC(& mp.hdr, 0, socket.fidPair.source, salt);
@@ -251,7 +249,7 @@ void UnitTestHMAC()
 	// firstly, test recorded CRC mode
 	// packet with sequence number less than FIRST_SN should be applied with CRC64
 	FSP_NormalPacketHeader &request = storage.hdr;
-	request.hs.Set<FSP_NormalPacketHeader, PURE_DATA>();
+	SetHeaderSignature(request, PURE_DATA);
 
 	request.sequenceNo = FIRST_SN;
 	socket.SetIntegrityCheckCode(&request);
@@ -313,16 +311,18 @@ void UnitTestHMAC()
 	ControlBlock::seq_t seq0;
 	struct
 	{
-		FSP_InternalFixedHeader hdr;
+		FSP_FixedHeader			hdr;
 		FSP_PreparedKEEP_ALIVE	buf;
 	} mp;
 	int sizeSNACK = socketR2.GenerateSNACK(mp.buf, seq0, sizeof(FSP_NormalPacketHeader));
 	uint32_t salt = mp.buf.sentinel.serialNo;
 	printf_s("Size of the SNACK header = %d, expected SN = %u, salt=0x%X\n", sizeSNACK, seq0, salt);
 
-	mp.hdr.hs.Set(KEEP_ALIVE, sizeof(FSP_NormalPacketHeader) + sizeSNACK);
-	socket.SetSequenceFlags(&mp.hdr, pSCB->sendWindowNextSN);
-	mp.hdr.expectedSN = htobe32(seq0);
+	mp.hdr.hs.opCode = KEEP_ALIVE;
+	mp.hdr.hs.major = THIS_FSP_VERSION;
+	mp.hdr.hs.offset = htobe16(sizeof(FSP_NormalPacketHeader) + sizeSNACK);
+	mp.hdr.ClearFlags();
+	socket.SetSequenceAndWS(&mp.hdr, pSCB->sendWindowNextSN);
 	//
 	socketR2.SetIntegrityCheckCode(&mp.hdr, NULL, 0, salt);
 
@@ -380,12 +380,16 @@ void UnitTestTweetNacl()
 
 struct $FREWS
 {
-	uint32_t	adRecvWS : 24;
 	uint32_t	flags : 8;
+	uint32_t	adRecvWS : 24;
 };
 
 struct $FSP_FixedHeader
 {
+	uint8_t		opCode;		// Operation Code
+	uint8_t		major;
+	uint16_t	offset;
+	struct $FREWS	frews;
 	uint32_t		sequenceNo;
 	uint32_t		expectedSN;
 	union
@@ -397,29 +401,23 @@ struct $FSP_FixedHeader
 			uint32_t peer;
 		} id;
 	} integrity;
-	//
-	struct $FREWS frews;
-	//
-	uint8_t		version;
-	uint8_t		opCode;		// Operation Code
-	uint16_t	hsp;		// Header Stack Pointer
 };
 #include <poppack.h>
 
 void UnitTestByteOrderDefinitin()
 {
-	$FSP_HeaderSignature fhs;
+	FSP$PacketHeader fhs;
 	uint32_t & rFHS = *(uint32_t *)& fhs;
 
 	fhs.opCode = _FSP_Operation_Code(1);
 	fhs.major = 0;
-	fhs.hsp = 0;
+	fhs.offset = 0;
 
 	printf_s("FHS = %08x\n", rFHS);	// 01 00 00 00 
 
 	fhs.opCode = (_FSP_Operation_Code)2;
 	fhs.major = 1;
-	fhs.hsp = 0x303;
+	fhs.offset = 0x303;
 
 	printf_s("FHS = %08x\n", rFHS);	// 02 01 03 03
 
@@ -438,8 +436,8 @@ void UnitTestByteOrderDefinitin()
  */
 int _tmain(int argc, _TCHAR* argv[])
 {
-	EvaluateTimerWheel();
-	EvaluateHPET();
+	//EvaluateTimerWheel();
+	//EvaluateHPET();
 
 	FlowTestAcknowledge();
 	FlowTestRetransmission();

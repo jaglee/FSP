@@ -901,11 +901,11 @@ int CLowerInterface::AcceptAndProcess(SOCKET sdRecv)
 #endif
 			break;
 		}
-		pktBuf->lenData = countRecv - be16toh(pktBuf->GetHeaderFSP()->hs.hsp);
+		pktBuf->lenData = countRecv - be16toh(pktBuf->hdr.hs.offset);
 		if (pktBuf->lenData < 0 || pktBuf->lenData > MAX_BLOCK_SIZE)
 			break;
 		// illegal packet is simply discarded!
-		pktBuf->pktSeqNo = be32toh(pktBuf->GetHeaderFSP()->sequenceNo);
+		pktBuf->pktSeqNo = be32toh(pktBuf->hdr.sequenceNo);
 #if defined(TRACE) && (TRACE & TRACE_PACKET)
 		printf_s("%s[%d] packet #%u\n\tpayload length %d, to put onto the queue\n"
 			, opCodeStrings[opCode], opCode, pktBuf->pktSeqNo, pktBuf->lenData);
@@ -985,8 +985,8 @@ int LOCALAPI CLowerInterface::SendBack(char * buf, int len)
 void LOCALAPI CLowerInterface::SendPrematureReset(uint32_t reasons, CSocketItemEx *pSocket)
 {
 	struct FSP_RejectConnect reject;
+	SetHeaderSignature(reject, RESET);
 	reject.reasons = reasons;
-	reject.hs.Set<FSP_RejectConnect, RESET>();
 	if(pSocket)
 	{
 		// In CHALLENGING, CONNECT_AFFIRMING where the peer address is known
@@ -997,7 +997,7 @@ void LOCALAPI CLowerInterface::SendPrematureReset(uint32_t reasons, CSocketItemE
 	}
 	else
 	{
-		memcpy(& reject, pktBuf->GetHeaderFSP(), sizeof(reject.sn) + sizeof(reject.fidPair));
+		memcpy(& reject.sn, &pktBuf->hdr.sequenceNo, sizeof(reject.sn) + sizeof(reject.fidPair));
 		SendBack((char *) & reject, sizeof(reject));
 	}
 }
