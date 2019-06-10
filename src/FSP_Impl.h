@@ -189,26 +189,9 @@ extern CStringizeNotice noticeNames;
  */
 #include <pshpack1.h>
 
-struct FSP_FixedHeader : public FSP_NormalPacketHeader
-{
-	void Set(FSPOperationCode code, uint16_t hsp, uint32_t seqThis, uint32_t seqExpected, int32_t advRecvWinSize)
-	{
-		hs.opCode = code;
-		hs.major = THIS_FSP_VERSION;
-		hs.offset = htobe16(hsp);
-		sequenceNo = htobe32(seqThis);
-		ClearFlags();
-		SetRecvWS(advRecvWinSize);
-		expectedSN = htobe32(seqExpected);
-	}
-	//
-	void ClearFlags() { flags_ws[0] = 0; }
-	void SetRecvWS(int32_t v) { flags_ws[1] = (octet)(v >> 16); flags_ws[2] = (octet)(v >> 8); flags_ws[3] = (octet)v; }
-};
-
 // Network byte order of the length of the fixed header, where host byte order is little-endian
-#define CONNECT_PARAM_LENGTH_BE16 0x2800
-#define	FIXED_HEADER_SIZE_BE16 0x1800
+#define CONNECT_PARAM_LENGTH_BE16	0x2800
+#define	FIXED_HEADER_SIZE_BE16		0x1800
 
 // Set the prefix of FSP_ConnectParam content
 #define SetConnectParamPrefix(hdr)	{	\
@@ -703,12 +686,6 @@ struct ControlBlock
 		if (int32_t(seqL - sendWindowLimitSN) > 0)
 			sendWindowLimitSN = seqL;
 	}
-
-	void SignHeaderWith(FSP_FixedHeader *p, FSPOperationCode code, uint16_t hsp, uint32_t seqThis, uint32_t snExpected)
-	{
-		p->Set(code, hsp, seqThis, snExpected, int32_t(recvWindowFirstSN + recvBufferBlockN - snExpected));
-	}
-	// 
 
 	bool HasBacklog() const { return backLog.count > 0; }
 

@@ -19,7 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "gcm-aes.h"
-
+#include "../endian.h"
 
 #ifndef bcopy
 #define bcopy(src, tgt, size) memcpy((tgt), (src), (size))

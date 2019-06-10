@@ -51,6 +51,9 @@
 #define DllSpec
 #endif
 
+#include "endian.h"
+
+
 #ifdef NDEBUG	// Run-time default for release version
 # define MAX_FSP_SHM_SIZE		0x4000000	// 64MB
 #elif !defined(MAX_FSP_SHM_SIZE)

@@ -645,7 +645,6 @@ int LOCALAPI CSocketItemDl::BufferData(int m)
 	FreeStreamState();
 	//
 l_finalize:
-	// When sending PERSIST packet is tightly packed, not right-aligned yet
 	p = skb0;
 	if (_InterlockedCompareExchange8(&newTransaction, 0, 1) != 0)
 		p->opCode = PERSIST;
@@ -732,7 +731,6 @@ int32_t LOCALAPI CSocketItemDl::PrepareToSend(void * buf, int32_t len, bool eot)
 	p->len = len - MAX_BLOCK_SIZE * m;
 	bytesBuffered = len;
 
-	// When sending PERSIST packet is tightly packed, not right-aligned yet
 	p = p0;
 	if (_InterlockedCompareExchange8(&newTransaction, 0, 1) != 0)
 		p->opCode = PERSIST;

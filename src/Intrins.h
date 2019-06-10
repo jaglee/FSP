@@ -37,66 +37,9 @@ typedef uint8_t octet;
 #define ALIGN(n)
 #endif
 
-// assume the compiler support 64-bit integer. and it is assumed that the operand is properly aligned
-#ifndef htobe64
-
-#if !defined(_MSC_VER) || !defined(_M_IA64) && !defined(_M_X64) && (!defined(_M_IX86) || _MSC_VER < 1400)
-#define _DWORD_SWAP(l)                \
-        ( ( ((l) >> 24) & 0x000000FFL ) |       \
-            ( ((l) >>  8) & 0x0000FF00L ) |       \
-            ( ((l) <<  8) & 0x00FF0000L ) |       \
-            ( ((l) << 24) & 0xFF000000L ) )
-
-#define _QWORD_SWAP(l)            \
-        ( ( ((l) >> 56) & 0x00000000000000FFLL ) |       \
-            ( ((l) >> 40) & 0x000000000000FF00LL ) |       \
-            ( ((l) >> 24) & 0x0000000000FF0000LL ) |       \
-            ( ((l) >>  8) & 0x00000000FF000000LL ) |       \
-            ( ((l) <<  8) & 0x000000FF00000000LL ) |       \
-            ( ((l) << 24) & 0x0000FF0000000000LL ) |       \
-            ( ((l) << 40) & 0x00FF000000000000LL ) |       \
-            ( ((l) << 56) & 0xFF00000000000000LL ) )
-
-__inline uint32_t be32toh(uint32_t v) 
-{ 
-	return _DWORD_SWAP(v);
-}
-
-__inline uint32_t htobe32(uint32_t v)
-{ 
-	return _DWORD_SWAP(v);
-}
-
-
-__inline uint64_t be64toh(uint64_t v) 
-{ 
-	return _QWORD_SWAP(v);
-}
-
-__inline uint64_t htobe64(uint64_t v) 
-{ 
-	return _QWORD_SWAP(v);
-}
-
-#else
-
 #include <memory.h>
 #include <intrin.h>
 #pragma intrinsic(memset, memcpy)
-#pragma intrinsic(_byteswap_ushort, _byteswap_ulong, _byteswap_uint64)
-
-#define be16toh(v) _byteswap_ushort(v)
-#define htobe16(v) _byteswap_ushort(v)
-#define be32toh(v) _byteswap_ulong(v)
-#define htobe32(v) _byteswap_ulong(v)
-#define be64toh(v) _byteswap_uint64(v)
-#define htobe64(v) _byteswap_uint64(v)
-
-#endif
-
-#endif
-
-
 
 #if (_MSC_VER >= 1600)
 #pragma intrinsic(_InterlockedCompareExchange8, _InterlockedExchange8)

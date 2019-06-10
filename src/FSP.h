@@ -281,22 +281,21 @@ struct ALFIDPair
 
 
 
-typedef struct FSP$PacketHeader
+struct FSP$PacketHeader
 {
 	FSPOperationCode	opCode;
 	uint8_t				major;
 	uint16_t			offset;
-} *PFSP_FixedHeader;
+};
 
 
 
-// The minor version of the optional header is NOT necessarily THIS_FSP_VERSION
-typedef	struct FSP$OptionalHeader
+struct FSP$OptionalHeader
 {
 	FSPOperationCode	opCode;
 	uint8_t				mark;
 	uint16_t			length;
-} *PFSP_OptionalHeader;
+};
 
 
 

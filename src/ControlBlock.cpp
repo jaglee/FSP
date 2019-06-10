@@ -630,11 +630,8 @@ octet* LOCALAPI ControlBlock::InquireRecvBuf(int32_t& nIO, int32_t& nBlock, bool
 		nIO = -EPIPE;	// -33
 		return NULL;
 	}
-	// First block of a new received transmit transaction is right-aligned
-	// See also @LLS::PlacePayload and @LLS::CopyOutPlainText
+
 	BYTE* pMsg = GetRecvPtr(p);
-	if (p->opCode == PERSIST)
-		pMsg += MAX_BLOCK_SIZE - p->len;
 
 	if (tail > recvWindowHeadPos)
 		m = tail - recvWindowHeadPos;
@@ -808,8 +805,7 @@ int LOCALAPI ControlBlock::GetSelectiveNACK(seq_t & snExpect, FSP_SelectiveNACK:
 //	the number of packets that are accumulatively acknowledged
 // Remark
 //	Delay sliding the send window till the caller requires the sliding
-//	It's destructive! Endian conversion is also destructive.
-//	UNRESOLVED!? For big endian architecture it is unnecessary to transform the descriptor: let's the compiler/optimizer handle it
+//	Assume integers in the gap descriptor have already been of host byte order
 int LOCALAPI ControlBlock::DealWithSNACK(seq_t expectedSN, FSP_SelectiveNACK::GapDescriptor *gaps, int n)
 {
 	int	accumuAcks = int(expectedSN - sendWindowFirstSN);
@@ -822,12 +818,19 @@ int LOCALAPI ControlBlock::DealWithSNACK(seq_t expectedSN, FSP_SelectiveNACK::Ga
 	PFSP_SocketBuf p = HeadSend() + iHead;
 	for(int	k = 0; k < n; k++)
 	{
-		register int32_t nAck = gaps[k].dataLength = be32toh(gaps[k].dataLength);
+		register int32_t nAck = gaps[k].dataLength;
 		//
-		gaps[k].gapWidth = be32toh(gaps[k].gapWidth);
 		iHead += gaps[k].gapWidth;
 		if (iHead - sendBufferBlockN >= 0)
+		{
 			iHead -= sendBufferBlockN;
+			if (iHead - sendBufferBlockN >= 0)
+				return -EPERM;	// failed to conform with the protocol
+		}
+		else if (iHead < 0)
+		{
+			return -EPERM;		// failed to conform with the protocol
+		}
 		p = HeadSend() + iHead;
 		//
 		// Make acknowledgement

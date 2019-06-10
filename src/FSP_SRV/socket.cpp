@@ -637,11 +637,6 @@ int32_t LOCALAPI CSocketItemEx::GenerateSNACK(FSP_PreparedKEEP_ALIVE &buf, Contr
 		pSNACK->tLazyAck = 0;
 	}
 	buf.n = n;
-	while(--n >= 0)
-	{
-		gaps[n].dataLength = htobe32(gaps[n].dataLength);
-		gaps[n].gapWidth = htobe32(gaps[n].gapWidth);
-	}
 
 	InterlockedIncrement(& nextOOBSN);	// Because lastOOBSN start from zero as well. See ValidateSNACK
 	int32_t lenSNACK = int32_t(sizeof(FSP_SelectiveNACK) + sizeof(buf.gaps[0]) * buf.n);
@@ -649,6 +644,13 @@ int32_t LOCALAPI CSocketItemEx::GenerateSNACK(FSP_PreparedKEEP_ALIVE &buf, Contr
 	pSNACK->_h.mark = 0;
 	pSNACK->_h.length = htobe16(lenSNACK);
 	pSNACK->serialNo = htobe32(nextOOBSN);
+#if BYTE_ORDER != LITTLE_ENDIAN
+	while (--n >= 0)
+	{
+		gaps[n].dataLength = htole32(gaps[n].dataLength);
+		gaps[n].gapWidth = htole32(gaps[n].gapWidth);
+	}
+#endif
 	return nPrefix + lenSNACK;
 }
 
@@ -778,7 +780,7 @@ void CSocketItemEx::InitiateMultiply(CSocketItemEx *srcItem)
 	ALIGN(MAC_ALIGNMENT) FSP_FixedHeader q;
 	lastOOBSN = 0;	// As the response from the peer, if any, is not an out-of-band packet
 
-	pControlBlock->SignHeaderWith(&q, MULTIPLY, sizeof(FSP_NormalPacketHeader), seq0, GetRecvWindowFirstSN());
+	SignHeaderWith(&q, MULTIPLY, sizeof(FSP_NormalPacketHeader), seq0, GetRecvWindowFirstSN());
 	skb->CopyFlagsTo(& q);
 	// Do not mess with 'salt'. New value has to be set after ICC is got
 	void * paidLoad = SetIntegrityCheckCode(& q, payload, skb->len, salt);

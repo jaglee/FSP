@@ -679,9 +679,8 @@ inline void CSocketItemEx::CheckAckToKeepAlive()
 //	Retransmission DOES consume the key life of authenticated encryption
 void * LOCALAPI CSocketItemEx::SetIntegrityCheckCode(FSP_NormalPacketHeader *p1, void *content, int32_t ptLen, uint32_t salt)
 {
-	uint32_t byteA = be16toh(p1->hs.offset);	// number of octets that 'additional data' in Galois Counter Mode
-	if (byteA < sizeof(FSP_NormalPacketHeader) || byteA > MAX_LLS_BLOCK_SIZE || (byteA & (sizeof(uint64_t) - 1)) != 0)
-		return NULL;
+	// number of octets that 'additional data' in Galois Counter Mode
+	const uint32_t byteA = sizeof(FSP_NormalPacketHeader);
 	//
 	uint32_t seqNo = be32toh(p1->sequenceNo);
 	void * buf = content;
@@ -740,7 +739,7 @@ void * LOCALAPI CSocketItemEx::SetIntegrityCheckCode(FSP_NormalPacketHeader *p1,
 		GCM_AES_XorSalt(pCtx, salt);
 		if(GCM_AES_AuthenticatedEncrypt(pCtx, *(uint64_t *)p1
 			, (const uint8_t *)content, ptLen
-			, (const uint64_t *)p1 + 1, byteA - sizeof(uint64_t)
+			, (const uint64_t *)p1, byteA
 			, (uint64_t *)this->cipherText
 			, (uint8_t *)tag, FSP_TAG_SIZE)
 			!= 0)
@@ -768,10 +767,9 @@ void * LOCALAPI CSocketItemEx::SetIntegrityCheckCode(FSP_NormalPacketHeader *p1,
 //	ALFID_T						The source ALFID of the received packet
 //	uint32_t					The xor'ed salt
 // Return
-//	true if all of the headers passed authentication and the optional payload successfully decrypted
+//	true if packet authentication passed and the optional payload successfully decrypted
 // Remark
 //	Assume the headers are 64-bit aligned
-//	UNRESOLVED!? Is it meaningless to recover the ICC field?	// p1->integrity.code = *(uint64_t *)tag;
 bool LOCALAPI CSocketItemEx::ValidateICC(FSP_NormalPacketHeader *p1, int32_t ctLen, ALFID_T idSource, uint32_t salt)
 {
 	ALIGN(MAC_ALIGNMENT) uint64_t tag[FSP_TAG_SIZE / sizeof(uint64_t)];
@@ -813,9 +811,6 @@ bool LOCALAPI CSocketItemEx::ValidateICC(FSP_NormalPacketHeader *p1, int32_t ctL
 		GCM_AES_CTX *pCtx = int32_t(seqNo - contextOfICC.snFirstRecvWithCurrKey) < 0
 			? & contextOfICC.prev.gcm_aes
 			: & contextOfICC.curr.gcm_aes;
-		uint32_t byteA = be16toh(p1->hs.offset);
-		if(byteA < sizeof(FSP_NormalPacketHeader) || byteA > MAX_LLS_BLOCK_SIZE || (byteA & (sizeof(uint64_t) - 1)) != 0)
-			return false;
 
 		p1->integrity.id.source = idSource;
 		p1->integrity.id.peer = fidPair.source;
@@ -829,10 +824,10 @@ bool LOCALAPI CSocketItemEx::ValidateICC(FSP_NormalPacketHeader *p1, int32_t ctL
 #endif
 		GCM_AES_XorSalt(pCtx, salt);
 		r = (GCM_AES_AuthenticateAndDecrypt(pCtx, *(uint64_t *)p1
-			, (const uint8_t *)p1 + byteA, ctLen
-			, (const uint64_t *)p1 + 1, byteA - sizeof(uint64_t)
+			, (const uint8_t *)p1 + sizeof(FSP_FixedHeader), ctLen + byteA - sizeof(FSP_FixedHeader)
+			, (const uint64_t *)p1, sizeof(FSP_FixedHeader)
 			, (const uint8_t *)tag, FSP_TAG_SIZE
-			, (uint64_t *)p1 + byteA / sizeof(uint64_t))
+			, (uint64_t *)p1 + sizeof(FSP_FixedHeader) / sizeof(uint64_t))
 			== 0);
 		GCM_AES_XorSalt(pCtx, salt);
 	}

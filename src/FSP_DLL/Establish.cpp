@@ -470,7 +470,7 @@ ControlBlock::PFSP_SocketBuf CSocketItemDl::SetHeadPacketIfEmpty(FSPOperationCod
 // Given
 //	PFSP_IN6_ADDR	the place holder of the output FSP/IPv6 address
 //	uint32_t		the 32-bit integer representation of the IPv4 address to be translated
-//	uint32_t		the fiber ID, in host byte order
+//	uint32_t		the fiber ID, in no particular byte order
 // Return
 //	the pointer to the place holder of host-id which might be set/updated later
 // Remark
@@ -481,7 +481,7 @@ uint32_t * FSPAPI TranslateFSPoverIPv4(PFSP_IN6_ADDR p, uint32_t dwIPv4, uint32_
 	p->_6to4.prefix = PREFIX_FSP_IP6to4;
 	p->_6to4.ipv4 = dwIPv4;
 	p->_6to4.port = DEFAULT_FSP_UDPPORT;
-	p->idALF = htobe32(fiberID);
+	p->idALF = fiberID;
 	return & p->idHost;
 }
 

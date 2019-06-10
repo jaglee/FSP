@@ -77,7 +77,7 @@ void FSPAPI WaitConnection(const char *thisWelcome, unsigned short mLen, Callbac
 	params.recvSize = 0;	// minimal receiving for download server
 
 #ifdef _DEBUG
-	TranslateFSPoverIPv4(& atAddress, 0, 80);	//INADDR_ANY
+	TranslateFSPoverIPv4(& atAddress, 0, htobe32(80));	//INADDR_ANY
 #else
 	atAddress.subnet = 0xAAAA00E0;	// 0xE0 00 AA AA	// shall be learned
 	atAddress.idHost = 0;
@@ -155,8 +155,10 @@ static int	FSPAPI onAccepting(FSPHANDLE h, PFSP_SINKINF p, PFSP_IN6_ADDR remoteA
 {
 	printf_s("\nTo accept handle of FSP session: %p\n", h);
 	printf_s("Interface#%d, fiber#%u\n", p->ipi6_ifindex, p->idALF);
-	// no be32toh() for local; note that for IPv6 network, little-endian CPU, the peer's remoteAddr->idALF wouldn't match it
-	printf_s("Remote address: 0x%llX::%X::%X\n", be64toh(remoteAddr->subnet), be32toh(remoteAddr->idHost), be32toh(remoteAddr->idALF));
+	printf_s("Remote address: 0x%X::%X::%X::%X\n"
+		, be32toh(*(u_long*)& remoteAddr->subnet)
+		, be32toh(*((u_long*)& remoteAddr->subnet + 1))
+		, be32toh(remoteAddr->idHost), be32toh(remoteAddr->idALF));
 	return 0;	// no opposition
 }
 

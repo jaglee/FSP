@@ -37,6 +37,7 @@
 #include <stdio.h>
 #include <time.h>
 
+#include "../endian.h"
 #include "../FSP_Impl.h"
 
 #include "gcm-aes.h"
@@ -55,6 +56,23 @@ void rand_w32(uint32_t *p, int n) { for (register int i = 0; i < min(n, 32); i++
 extern "C" timestamp_t NowUTC();
 
 
+struct FSP_FixedHeader : public FSP_NormalPacketHeader
+{
+	void Set(FSPOperationCode code, uint16_t hsp, uint32_t seqThis, uint32_t seqExpected, int32_t advRecvWinSize)
+	{
+		hs.opCode = code;
+		hs.major = THIS_FSP_VERSION;
+		hs.offset = htobe16(hsp);
+		sequenceNo = htobe32(seqThis);
+		ClearFlags();
+		SetRecvWS(advRecvWinSize);
+		expectedSN = htobe32(seqExpected);
+	}
+	//
+	void ClearFlags() { flags_ws[0] = 0; }
+	void SetRecvWS(int32_t v) { flags_ws[1] = (octet)(v >> 16); flags_ws[2] = (octet)(v >> 8); flags_ws[3] = (octet)v; }
+};
+
 
 /**
 * It requires Advanced IPv6 API support to get the application layer thread ID from the IP packet control structure
@@ -72,28 +90,6 @@ struct CtrlMsgHdr
 
 	bool IsIPv6() const { return (pktHdr.cmsg_level == IPPROTO_IPV6); }
 };
-
-
-
-#if _WIN32_WINNT < 0x0602
-/**
- * Windows 8/Server 2012, with support of Visual Studio 2012, provide native support of htonll and ntohll
- */
-inline uint64_t htonll(uint64_t u) 
-{
-	register uint64_t L = (uint64_t)htonl(*(uint32_t *)&u) << 32;
-	return L | htonl(*((uint32_t *)&u + 1));
-}
-
-inline uint64_t ntohll(uint64_t h)
-{
-	register uint64_t L = (uint64_t)ntohl(*(uint32_t *)&h) << 32;
-	return L | ntohl(*((uint32_t *)&h + 1));
-}
-/*
- *
- */
-#endif
 
 
 /**
@@ -449,8 +445,14 @@ protected:
 		ControlBlock::seq_t snExpected = pControlBlock->recvWindowExpectedSN;
 		pHdr->sequenceNo = htobe32(seq1);
 		pHdr->expectedSN = htobe32(snExpected);
-		pHdr->SetRecvWS(int32_t(GetRecvWindowFirstSN() + pControlBlock->recvBufferBlockN - snExpected));
+		pHdr->SetRecvWS(int32_t(GetRecvWindowLastSN() - snExpected));
 	}
+
+	void SignHeaderWith(FSP_FixedHeader* p, FSPOperationCode code, uint16_t hsp, uint32_t seqThis, uint32_t snExpected)
+	{
+		p->Set(code, hsp, seqThis, snExpected, int32_t(GetRecvWindowLastSN() - snExpected));
+	}
+ 
 
 	bool HasBeenCommitted() { return pControlBlock->HasBeenCommitted(); }
 	// Return true if really transit, false if the (half) connection is finised and to notify
@@ -519,6 +521,10 @@ public:
 	}
 
 	ControlBlock::seq_t GetRecvWindowFirstSN() { return (ControlBlock::seq_t)LCKREAD(pControlBlock->recvWindowFirstSN); }
+	ControlBlock::seq_t GetRecvWindowLastSN()
+	{
+		return (ControlBlock::seq_t)LCKREAD(pControlBlock->recvWindowFirstSN) + pControlBlock->recvBufferBlockN;
+	}
 	int32_t GetRecvWindowHeadPos() { return LCKREAD(pControlBlock->recvWindowHeadPos); }
 
 	void SetNearEndInfo(const CtrlMsgHdr & nearInfo)
@@ -619,12 +625,14 @@ public:
 	void	CopyInPlainText(const uint8_t *buf, int32_t n) { skbRecvClone.len = n; if(n > 0) memcpy(cipherText, buf, n); }
 	// copy out the flag, version and opcode fields. assume 32-bit alignment
 	void	CopyOutFVO(ControlBlock::PFSP_SocketBuf skb) { *(int32_t *)&skb->marks = *(int32_t *)& skbRecvClone.marks; }
-	// copy out the payload, make it right-aligned in the target buffer
+	// copy out the payload
 	int		CopyOutPlainText(uint8_t *buf)
 	{
 		int32_t n = skbRecvClone.len;
-		if (n > 0 && n <= MAX_BLOCK_SIZE)
-			memcpy(buf + MAX_BLOCK_SIZE - n, cipherText, n);
+		if (n < 0 || n > MAX_BLOCK_SIZE)
+			return -EPERM;
+		if (n > 0)
+			memcpy(buf, cipherText, n);
 		return n;
 	}
 	//

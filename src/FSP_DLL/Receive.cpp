@@ -307,15 +307,6 @@ int32_t CSocketItemDl::FetchReceived()
 	if(p->GetFlag<Compressed>() && pDecodeState == NULL && !AllocDecodeState())
 		return -ENOMEM;
 
-	// First block of a new received transmit transaction is right-aligned
-	// See also @LLS::PlacePayload and @LLS::CopyOutPlainText
-	if (p->opCode == PERSIST && offsetInLastRecvBlock == 0)
-	{
-		offsetInLastRecvBlock = MAX_BLOCK_SIZE - p->len;
-		p->len = MAX_BLOCK_SIZE;	// make sure it is right-aligned
-	}
-	// Note that decompression may make offsetInLastRecvBlock > MAX_BLOCK_SIZE - p->len
-
 	int nPacket = 0;
 	int sum = 0;
 	int n;

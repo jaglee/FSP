@@ -195,8 +195,8 @@ int CSocketItemDl::SelfNotify(FSP_ServiceCode c)
 		Sleep(TIMER_SLICE_ms);
 	}
 #ifdef TRACE
-	printf_s("Self notice %s[%d] in local fiber#%u(_%X_), state %s\t\n", noticeNames[c], c
-		, fidPair.source, be32toh(fidPair.source), stateNames[pControlBlock->state]);
+	printf_s("Self notice %s[%d] in local fiber#%u, state %s\t\n"
+		, noticeNames[c], c, fidPair.source, stateNames[pControlBlock->state]);
 	if(r > 0)
 		printf_s("--- merged ---\n");
 #endif
@@ -363,9 +363,8 @@ void CSocketItemDl::WaitEventToDispatch()
 		}
 
 #ifdef TRACE
-		printf_s("\nIn local fiber#%u(_%X_), state %s\tnotice: %s\n"
-			, fidPair.source, be32toh(fidPair.source)
-			, stateNames[pControlBlock->state], noticeNames[notice]);
+		printf_s("\nIn local fiber#%u, state %s\tnotice: %s\n"
+			, fidPair.source, stateNames[pControlBlock->state], noticeNames[notice]);
 #endif
 		if(notice > FSP_NotifyToFinish)
 			lowerLayerRecycled = 1;

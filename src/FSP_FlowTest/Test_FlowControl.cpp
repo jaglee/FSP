@@ -74,8 +74,8 @@ void FlowTestAcknowledge()
 	assert(skb == NULL);
 
 	// assume the third is a gap...
-	gaps[0].dataLength = htobe32(1);
-	gaps[0].gapWidth = htobe32(1);
+	gaps[0].dataLength = htole32(1);
+	gaps[0].gapWidth = htole32(1);
 	//// this is an illegal one	// now it is perfectly OK
 	//r = socket.AcceptSNACK(FIRST_SN, gaps, 1);
 	//assert(r == -EBADF && pSCB->sendWindowFirstSN == FIRST_SN + 2);
@@ -91,38 +91,38 @@ void FlowTestAcknowledge()
 	assert(pSCB->CountSentInFlight() >= 0);
 
 	// this is a legal but one gap is redundant, one is additional
-	gaps[0].dataLength = htobe32(1);
-	gaps[0].gapWidth = htobe32(1);
-	gaps[1].dataLength = htobe32(1);
-	gaps[1].gapWidth = htobe32(1);
+	gaps[0].dataLength = htole32(1);
+	gaps[0].gapWidth = htole32(1);
+	gaps[1].dataLength = htole32(1);
+	gaps[1].gapWidth = htole32(1);
 	r = socket.AcceptSNACK(FIRST_SN + 3, gaps, 2);
 	assert(r == 0 && pSCB->sendWindowFirstSN == FIRST_SN + 3);	// used to be r == 1
 	assert(pSCB->CountSentInFlight() >= 0);
 
 	// two gaps, overlap with previous one [only to urge retransmission of those negatively acknowledged]
-	gaps[0].dataLength = htobe32(1);
-	gaps[0].gapWidth = htobe32(1);
-	gaps[1].dataLength = htobe32(1);
-	gaps[1].gapWidth = htobe32(1);
+	gaps[0].dataLength = htole32(1);
+	gaps[0].gapWidth = htole32(1);
+	gaps[1].dataLength = htole32(1);
+	gaps[1].gapWidth = htole32(1);
 	r = socket.AcceptSNACK(FIRST_SN + 3, gaps, 2);
 	assert(r == 0 && pSCB->sendWindowFirstSN == FIRST_SN + 3);
 	assert(pSCB->CountSentInFlight() >= 0);
 
 	// two gaps, do real new acknowledgement: the 4th (the 5th has been acknowledged) and the 7th
-	gaps[0].dataLength = htobe32(1);
-	gaps[0].gapWidth = htobe32(1);
-	gaps[1].dataLength = htobe32(1);
-	gaps[1].gapWidth = htobe32(1);
+	gaps[0].dataLength = htole32(1);
+	gaps[0].gapWidth = htole32(1);
+	gaps[1].dataLength = htole32(1);
+	gaps[1].gapWidth = htole32(1);
 	r = socket.AcceptSNACK(FIRST_SN + 5, gaps, 2);
 	assert(r == 2 && pSCB->sendWindowFirstSN == FIRST_SN + 5);
 	assert(pSCB->CountSentInFlight() >= 0);
 
 	static const int MAX_BLOCK_NUM_L = 0x20000;	// 65536 * 2
 	// a very large continuous data segment is acknowledged
-	gaps[0].dataLength = htobe32(1);
-	gaps[0].gapWidth = htobe32(1);
-	gaps[1].dataLength = htobe32(1);
-	gaps[1].gapWidth = htobe32(1);
+	gaps[0].dataLength = htole32(1);
+	gaps[0].gapWidth = htole32(1);
+	gaps[1].dataLength = htole32(1);
+	gaps[1].gapWidth = htole32(1);
 	r = socket.AcceptSNACK(FIRST_SN + 0x1000A, gaps, 2);	
 	//^ but the expectedSN is impossible for the small sending window!
 	printf_s("AcceptSNACK(FIRST_SN + 0x1000A, gaps, 2):\n"
@@ -143,10 +143,10 @@ void FlowTestAcknowledge()
 	pSCB->sendWindowLimitSN = pSCB->sendWindowNextSN + MAX_BLOCK_NUM;
 
 	// an even larger continuous data segment is acknowledged
-	gaps[0].dataLength = htobe32(1);
-	gaps[0].gapWidth = htobe32(1);
-	gaps[1].dataLength = htobe32(1);
-	gaps[1].gapWidth = htobe32(1);
+	gaps[0].dataLength = htole32(1);
+	gaps[0].gapWidth = htole32(1);
+	gaps[1].dataLength = htole32(1);
+	gaps[1].gapWidth = htole32(1);
 	r = socket.AcceptSNACK(FIRST_SN + MAX_BLOCK_NUM_L + 0xF000, gaps, 2);
 	printf_s("AcceptSNACK(FIRST_SN + MAX_BLOCK_NUM_L + 0xF000, gaps, 2):\n"
 		"\tnAck = %d, CountSentInFlight() = %d\n"
@@ -264,7 +264,7 @@ void FlowTestRetransmission()
 	memset(& placeholder, 0, sizeof(placeholder));
 	int32_t len = dbgSocket.GenerateSNACK(p->ext, seq4, sizeof(FSP_NormalPacketHeader));
 
-	pSCB->SignHeaderWith(& p->hdr, KEEP_ALIVE, uint16_t(len), pSCB->sendWindowNextSN - 1, seq4);
+	dbgSocket.SignHeaderWith(& p->hdr, KEEP_ALIVE, uint16_t(len), pSCB->sendWindowNextSN - 1, seq4);
 	dbgSocket.SetIntegrityCheckCode(& p->hdr, NULL, 0, p->ext.sentinel.serialNo);
 
 	// Firstly emulate receive the packet before emulate OnGetKeepAlive
@@ -322,7 +322,7 @@ void FlowTestRetransmission()
 	//skb->ReInitMarkComplete();
 
 	len = dbgSocket.GenerateSNACK(p->ext, seq4, sizeof(FSP_NormalPacketHeader));
-	pSCB->SignHeaderWith(& p->hdr, KEEP_ALIVE, uint16_t(len), pSCB->sendWindowNextSN - 1, seq4);
+	dbgSocket.SignHeaderWith(& p->hdr, KEEP_ALIVE, uint16_t(len), pSCB->sendWindowNextSN - 1, seq4);
 	dbgSocket.SetIntegrityCheckCode(&p->hdr, NULL, 0, p->ext.sentinel.serialNo);
 	// as it is an out-of-band packet, assume pre-set values are kept
 	dbgSocket.tRecentSend = NowUTC() + 3;

@@ -989,7 +989,7 @@ void CSocketItemEx::OnGetPureData()
 
 	// Did not exploit ControlBlock::CountDeliverable because of multi-thread shared memory synchronization problem
 	// Normally the ULA work in polling mode. Urge it to process the receive buffer if the buffer is full
-	if (int32_t(pControlBlock->recvWindowExpectedSN - GetRecvWindowFirstSN()) >= pControlBlock->recvBufferBlockN)
+	if (int32_t(pControlBlock->recvWindowExpectedSN - GetRecvWindowLastSN()) >= 0)
 		Notify(FSP_NotifyDataReady);
 	// See also OnGetPersist()
 }
@@ -1309,10 +1309,7 @@ int CSocketItemEx::PlacePayload()
 		BYTE *ubuf = GetRecvPtr(skb);
 		if (ubuf == NULL)
 			return -EFAULT;
-		// Right align the payload part of the first packet of the receive buffer of a new transmit transaction
 		// Assume payload length has been checked
-		if (pHdr->hs.opCode == PERSIST)
-			ubuf += MAX_BLOCK_SIZE - len;
 		memcpy(ubuf, (BYTE *)pHdr + be16toh(pHdr->hs.offset), len);
 	}
 	// Or else might be zero for ACK_START or MULTIPLY packet

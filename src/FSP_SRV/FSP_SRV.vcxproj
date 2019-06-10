@@ -97,7 +97,7 @@
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
       <Optimization>Disabled</Optimization>
-      <PreprocessorDefinitions>OVER_UDP_IPv4;WIN32;_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>FSP_REKEY_THRESHOLD=8;OVER_UDP_IPv4;WIN32;_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <BasicRuntimeChecks>EnableFastChecks</BasicRuntimeChecks>
       <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
       <PrecompiledHeader>
@@ -197,9 +197,9 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\FSP.h" />
-    <ClInclude Include="..\FSP_API.h" />
     <ClInclude Include="..\FSP_Impl.h" />
     <ClInclude Include="..\Intrins.h" />
+    <ClInclude Include="endian.h" />
     <ClInclude Include="gcm-aes.h" />
     <ClInclude Include="blake2b.h" />
     <ClInclude Include="fsp_srv.h" />

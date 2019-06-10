@@ -226,10 +226,10 @@ bool CSocketItemEx::SendKeepAlive()
 		, len);
 #endif
 
-	pControlBlock->SignHeaderWith(&buf3.hdr, KEEP_ALIVE, (uint16_t)len
+	SignHeaderWith(&buf3.hdr, KEEP_ALIVE, (uint16_t)len
 		, pControlBlock->sendWindowNextSN - 1
 		, snKeepAliveExp);
-	SetIntegrityCheckCode(&buf3.hdr, NULL, 0, buf3.snack.sentinel.serialNo);
+	SetIntegrityCheckCode(&buf3.hdr, &buf3.mp, len - sizeof(FSP_FixedHeader), buf3.snack.sentinel.serialNo);
 #if (TRACE & (TRACE_HEARTBEAT | TRACE_PACKET | TRACE_SLIDEWIN))
 	printf_s("To send KEEP_ALIVE seq #%u, acknowledge #%u\n\tsource ALFID = %u\n"
 		, be32toh(buf3.hdr.sequenceNo)
@@ -273,11 +273,11 @@ bool CSocketItemEx::SendAckFlush()
 		, pControlBlock->recvWindowNextSN);
 #endif
 	assert(pControlBlock->recvWindowExpectedSN == pControlBlock->recvWindowNextSN);
-	pControlBlock->SignHeaderWith(&buf2.hdr, ACK_FLUSH, (uint16_t)sizeof(buf2)
+	SignHeaderWith(&buf2.hdr, ACK_FLUSH, (uint16_t)sizeof(buf2)
 		, pControlBlock->sendWindowNextSN - 1
 		, pControlBlock->recvWindowNextSN
 	);
-	SetIntegrityCheckCode(&buf2.hdr, NULL, 0, buf2.snack.serialNo);
+	SetIntegrityCheckCode(&buf2.hdr, &buf2.snack, sizeof(buf2.snack), buf2.snack.serialNo);
 	return SendPacket(1, ScatteredSendBuffers(&buf2, sizeof(buf2))) > 0;
 #undef buf2
 }
@@ -327,6 +327,13 @@ int LOCALAPI CSocketItemEx::AcceptSNACK(ControlBlock::seq_t expectedSN, FSP_Sele
 	if(sentWidth == 0)
 		return 0;	// there is nothing to be acknowledged
 
+#if BYTE_ORDER != LITTLE_ENDIAN
+	for (register int32_t i = n - 1;  i >= 0; i++)
+	{
+		gaps[i].dataLength = htole32(gaps[n].dataLength);
+		gaps[i].gapWidth = htole32(gaps[n].gapWidth);
+	}
+#endif
 	// Note that the returned value is the number of packets accumulatively acknowledged
 	const int32_t nAck = pControlBlock->DealWithSNACK(expectedSN, gaps, n);
 	if (nAck < 0)
