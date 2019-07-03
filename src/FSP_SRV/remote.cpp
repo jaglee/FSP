@@ -353,7 +353,7 @@ l_return:
 // UNRESOLVED! Lost of RESET is silently ignored?
 // TODO: put the RESET AND other meaningful packet on the stack/queue
 // The first RESET should be push onto the top. Repeated RESET should be append at the tail.
-void LOCALAPI CSocketItemEx::OnGetReset(FSP_RejectConnect & reject)
+void LOCALAPI CSocketItemEx::OnGetReset(FSP_RejectConnect& reject)
 {
 #ifdef TRACE
 	printf_s("\nRESET got, in state %s\n\n", stateNames[lowState]);
@@ -364,38 +364,38 @@ void LOCALAPI CSocketItemEx::OnGetReset(FSP_RejectConnect & reject)
 	if (pControlBlock == NULL)
 		goto l_bailout;
 
-	if(InState(CONNECT_BOOTSTRAP))
+	if (InState(CONNECT_BOOTSTRAP))
 	{
-		if(reject.timeStamp == pControlBlock->connectParams.nboTimeStamp
-		&& reject.initCheckCode == pControlBlock->connectParams.initCheckCode)
+		if (reject.timeStamp == pControlBlock->connectParams.nboTimeStamp
+			&& reject.initCheckCode == pControlBlock->connectParams.initCheckCode)
 		{
 			DisposeOnReset();
 		}
 		// otherwise simply ignore
 	}
-	else if(InState(CONNECT_AFFIRMING))
+	else if (InState(CONNECT_AFFIRMING))
 	{
-		if(reject.timeStamp == pControlBlock->connectParams.nboTimeStamp
-		&& reject.cookie == pControlBlock->connectParams.cookie)
+		if (reject.timeStamp == pControlBlock->connectParams.nboTimeStamp
+			&& reject.cookie == pControlBlock->connectParams.cookie)
 		{
 			DisposeOnReset();
 		}
 		// otherwise simply ignore
 	}
-	else if(InState(CHALLENGING))
+	else if (InState(CHALLENGING))
 	{
-		if(reject.sn.initial == htobe32(pControlBlock->connectParams.initialSN)
-		&& reject.cookie == pControlBlock->connectParams.cookie)
+		if (reject.sn.initial == htobe32(pControlBlock->connectParams.initialSN)
+			&& reject.cookie == pControlBlock->connectParams.cookie)
 		{
 			DisposeOnReset();
 		}
 		// otherwise simply ignore
 	}
-	else if(! InState(LISTENING) && ! InState(CLOSED))
+	else if (!InState(LISTENING) && !InState(CLOSED))
 	{
 		int32_t offset = OffsetToRecvWinLeftEdge(be32toh(reject.sn.initial));
-		if(-1 <= offset && offset < pControlBlock->recvBufferBlockN
-		&& ValidateICC((FSP_NormalPacketHeader *)& reject, 0, fidPair.peer, 0))
+		if (-1 <= offset && offset < pControlBlock->recvBufferBlockN
+			&& ValidateICC((FSP_NormalPacketHeader*)& reject, 0, fidPair.peer, 0))
 		{
 			DisposeOnReset();
 		}
@@ -411,33 +411,53 @@ l_bailout:
 
 
 // Given
-//	ControlBlock::seq_t &		the accumulative acknowledgement
-//	GapDescriptor * &			[_out_] the gap descriptor list
-//	int &						[_out_] number of gap descriptors in the list
+//	ControlBlock::seq_t &		[_out_] the accumulative acknowledgement
+//	FSP_SelectiveNACK *			[_in_]  pointer to the SNACK header
 // Do
-//	Check whether KEEP_ALIVE or it special norm, ACK_FLUSH, is valid and output the gap descriptor list
+//	Check whether KEEP_ALIVE or it special norm, ACK_FLUSH, is valid
 // Return
-//	true if the header packet, which is assumed to be KEEP_ALIVE or ACK_FLUSH packet, is valid
-//	false if it is not
+//	Number of entries in the gap descriptor list (may be 0) if it is valid
+//	negative if the packt is invalid
 // Remark
 //	DoS attack against long-term sessions by replaying KEEP_ALVIE is possible but mitigated
-// Side Effect Existed!
-//	If it is valid the gap descriptors are transformed to the host byte order
-bool LOCALAPI CSocketItemEx::ValidateSNACK(ControlBlock::seq_t & ackSeqNo, FSP_SelectiveNACK::GapDescriptor * & gaps, int & n)
+int CSocketItemEx::ValidateSNACK(ControlBlock::seq_t& ackSeqNo, FSP_SelectiveNACK* pSNACK)
 {
 	register FSP_NormalPacketHeader* p1 = (FSP_NormalPacketHeader*)& headPacket->hdr;
+	int n = be16toh(pSNACK->_h.length);
 	// defined a little earlier for debug/trace purpose
+#if defined(TRACE) && (TRACE & (TRACE_PACKET | TRACE_SLIDEWIN))
+	printf_s("%s data length: %d, header length: %d, peer ALFID = %u\n"
+		, opCodeStrings[p1->hs.opCode]
+		, headPacket->lenData
+		, n
+		, fidPair.peer);
+	DumpNetworkUInt16((uint16_t*)((FSP_PreparedKEEP_ALIVE*)pSNACK)->gaps, n / 2);
+#endif
 	if (headPacket->lenData != 0)
 	{
 #ifdef TRACE
 		printf_s("%s is out-of-band and CANNOT carry data: %d\n", opCodeStrings[p1->hs.opCode], headPacket->lenData);
 #endif
-		return false;
+		return -EBADF;
 	}
-
-	// Get the offset of payload against the start of the FSP header
-	int32_t offset = be16toh(p1->hs.offset);
-	FSP_SelectiveNACK *pSNACK = (FSP_SelectiveNACK *)(p1 + 1);
+	int32_t len = be16toh(p1->hs.offset);
+	// To defend against memory access (out-of-boundary) attack:
+	if ((octet*)pSNACK - (octet*)p1 + n != len)
+	{
+		return -EACCES;
+	}
+	n -= sizeof(FSP_SelectiveNACK);
+	if (n < 0)
+		return -EBADF;
+#ifndef NDEBUG
+	if (n % sizeof(FSP_SelectiveNACK::GapDescriptor) != 0)
+	{
+		BREAK_ON_DEBUG();	//TRACE_HERE("This is a malformed SNACK packet");
+		return -EBADF;
+	}
+#endif
+	n /= sizeof(FSP_SelectiveNACK::GapDescriptor);
+	//
 	uint32_t salt = pSNACK->serialNo;
 	uint32_t sn = be32toh(salt);
 
@@ -447,40 +467,24 @@ bool LOCALAPI CSocketItemEx::ValidateSNACK(ControlBlock::seq_t & ackSeqNo, FSP_S
 		printf_s("%s has encountered replay attack? Sequence number:\n\tinband %u, oob %u - %u\n"
 			, opCodeStrings[p1->hs.opCode], headPacket->pktSeqNo, sn, lastOOBSN);
 #endif
-		return false;
+		return -EAGAIN;
 	}
 	lastOOBSN = sn;
 
-#if defined(TRACE) && (TRACE & (TRACE_PACKET | TRACE_SLIDEWIN))
-	printf_s("%s data length: %d, header length: %d, peer ALFID = %u\n"
-		, opCodeStrings[p1->hs.opCode]
-		, headPacket->lenData
-		, offset
-		, fidPair.peer);
-	DumpNetworkUInt16((uint16_t *)p1, offset / 2);
-#endif
-
 	ackSeqNo = be32toh(p1->expectedSN);
 	if (!IsAckExpected(ackSeqNo))
-		return false;
+		return -ENOENT;
 
-	if(! ValidateICC(p1, 0, fidPair.peer, salt))	// No! Extension header is not encrypted!
+	// Note that extension header is encrypted as well. See also SendKeepAlive, SendAckFlush
+	if (!ValidateICC(p1, len - sizeof(FSP_FixedHeader), fidPair.peer, salt))
 	{
 #ifdef TRACE
 		printf_s("Invalid integrity check code of %s for fiber#%u!?\n"
-				 "Acknowledged sequence number: %u\n" , opCodeStrings[p1->hs.opCode], fidPair.source, ackSeqNo);
+			"Acknowledged sequence number: %u\n", opCodeStrings[p1->hs.opCode], fidPair.source, ackSeqNo);
 #endif
-		return false;
+		return -EPERM;
 	}
 
-	n = offset - sizeof(FSP_FixedHeader) - sizeof(FSP_SelectiveNACK);
-	if (n < 0 || n % sizeof(FSP_SelectiveNACK::GapDescriptor) != 0)
-	{
-		BREAK_ON_DEBUG();	//TRACE_HERE("This is a malformed SNACK packet");
-		return false;
-	}
-	n /= sizeof(FSP_SelectiveNACK::GapDescriptor);
-	gaps = ((FSP_PreparedKEEP_ALIVE*)pSNACK)->gaps;
 #if defined(TRACE) && (TRACE & (TRACE_PACKET | TRACE_SLIDEWIN))
 	printf_s("%s sequence number: %u^|^%u\n"
 		"\taccumulatively acknowledged %u with %d gap(s)\n"
@@ -497,7 +501,7 @@ bool LOCALAPI CSocketItemEx::ValidateSNACK(ControlBlock::seq_t & ackSeqNo, FSP_S
 	// If ever the peer cheats by giving the acknowledgement delay value larger than the real value
 	// it would be eventually punished by a very large RTO!?
 	// Acknowledged or resent packet is simply excluded from calculating RTT with
-	if(k-- > 0)
+	if (k-- > 0)
 	{
 		uint64_t tDelay = be64toh(pSNACK->tLazyAck);
 		pControlBlock->AddRoundSendBlockN(k, pControlBlock->sendWindowHeadPos);
@@ -507,9 +511,12 @@ bool LOCALAPI CSocketItemEx::ValidateSNACK(ControlBlock::seq_t & ackSeqNo, FSP_S
 		ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend() + k;
 		if (!skb->IsResent() && !skb->IsAcked())
 			UpdateRTT(int64_t(NowUTC() - skb->timeSent - tDelay));
+		// A simple TCP-friendly AIMD congestion control in slow-start phase
+		if (!increaSlow)
+			sendRate_Bpus += double(int64_t(k + 1) * MAX_BLOCK_SIZE) / tRoundTrip_us;
 	}
 
-	return true;
+	return n;
 }
 
 
@@ -548,6 +555,7 @@ void CSocketItemEx::OnConnectRequestAck()
 
 	// Ignore granularity of OS time-slice here, which may slightly affect calculation of RTT
 	tSessionBegin = tMigrate = tLastRecv;
+	tPreviousTimeSlot = tRecentSend;
 	UpdateRTT(int64_t(tLastRecv - tRecentSend));
 
 	pControlBlock->peerAddr.ipFSP.fiberID = headPacket->fidPair.source;
@@ -860,11 +868,16 @@ void CSocketItemEx::OnGetKeepAlive()
 		return;
 	}
 
-	FSP_SelectiveNACK::GapDescriptor *gaps;
-	int n;
+	FSP_PreparedKEEP_ALIVE* pSNACK = &((FSP_KeepAliveExtension*) & (headPacket->hdr))->snack;
 	ControlBlock::seq_t ackSeqNo;
-	if(!ValidateSNACK(ackSeqNo, gaps, n))
+	int n = ValidateSNACK(ackSeqNo, &pSNACK->sentinel);
+	if (n < 0)
+	{
+#ifndef NDEBUG
+		printf_s("OnGetKeepAlive ValidateSNACK got (%d) returned\n", n);
+#endif
 		return;
+	}
 #if (TRACE & (TRACE_HEARTBEAT | TRACE_PACKET | TRACE_SLIDEWIN))
 	printf_s("Fiber#%u: SNACK packet with %d gap(s) advertised received\n", fidPair.source, n);
 #endif
@@ -872,7 +885,7 @@ void CSocketItemEx::OnGetKeepAlive()
 	if (acknowledgible)
 	{
 		ControlBlock::seq_t seq0 = pControlBlock->sendWindowFirstSN;
-		int r = AcceptSNACK(ackSeqNo, gaps, n);
+		int r = AcceptSNACK(ackSeqNo, pSNACK->gaps, n);
 		if (r > 0 && pControlBlock->CountSendBuffered() == 0)
 			Notify(FSP_NotifyBufferReady);
 #ifndef NDEBUG
@@ -882,7 +895,7 @@ void CSocketItemEx::OnGetKeepAlive()
 	}
 
 	// For this FSP version the mobile paramater is mandatory in KEEP_ALIVE
-	HandlePeerSubnets((FSP_ConnectParam*)((octet*)& headPacket->hdr + sizeof(FSP_FixedHeader)));
+	HandlePeerSubnets(&((FSP_KeepAliveExtension*) & (headPacket->hdr))->mp);
 }
 
 
@@ -1051,11 +1064,15 @@ void CSocketItemEx::OnAckFlush()
 	if (!InState(COMMITTING) && !InState(COMMITTING2) && !InState(PRE_CLOSED))
 		return;
 
-	FSP_SelectiveNACK::GapDescriptor *gaps;
-	int n;
 	ControlBlock::seq_t ackSeqNo;
-	if(!ValidateSNACK(ackSeqNo, gaps, n))
+	int n = ValidateSNACK(ackSeqNo, &((SAckFlushCache*)& headPacket->hdr)->snack);
+	if (n < 0)
+	{
+#ifndef NDEBUG
+		printf_s("OnAckFlush ValidateSNACK got (%d) returned\n", n);
+#endif
 		return;
+	}
 #ifndef NDEBUG
 	if(n != 0)
 	{
@@ -1269,6 +1286,9 @@ void CSocketItemEx::OnGetMultiply()
 
 	newItem->tLastRecv = tLastRecv;	// inherit the time when the MULTIPLY packet was received
 	newItem->tRoundTrip_us = tRoundTrip_us;	// inherit the value of the parent as the initial
+	newItem->rttVar_us = rttVar_us;
+	newItem->tRTO_us = tRTO_us;
+	newItem->sendRate_Bpus = sendRate_Bpus;	// UNRESOLVED! TODO: check congestion management state inheritance state! 
 	newItem->lowState = NON_EXISTENT;		// so that when timeout it is scavenged
 	newItem->ReplaceTimer(TRANSIENT_STATE_TIMEOUT_ms);
 

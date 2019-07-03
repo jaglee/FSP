@@ -167,9 +167,24 @@ void CSocketItemEx::KeepAlive()
 //	int64_t		the round trip time of the packet due
 // Do
 //	Update the smoothed RTT
-// TODO: refresh the RTT of the bundle path [source net-prefix][target net-prefix][traffic class]
-//	for sake of congestion management
+// Remark
+//	Implement a simple heuristic congestion management: delay-derived multiplicative decrease of send rate
 // The caller must make sure that the control block shared between LLS and DLL is available
+/**
+  Initially:
+	SRTT <- R
+	RTTVAR <- R/2
+	RTO <- 1 second.
+
+  Refreshing:
+	RTTVAR <- (1 - beta) * RTTVAR + beta * |SRTT - R'|
+	SRTT <- (1 - alpha) * SRTT + alpha * R'
+	RTO <- SRTT + max (G, K*RTTVAR)
+
+	where K = 4.
+
+	Whenever RTO is computed, if it is less than 1 second, then the RTO SHOULD be rounded up to 1 second.
+	*/
 void CSocketItemEx::UpdateRTT(int64_t rtt64_us)
 {
 	if (rtt64_us < 0)
@@ -184,7 +199,27 @@ void CSocketItemEx::UpdateRTT(int64_t rtt64_us)
 	}
 	//
 	pControlBlock->perfCounts.PushJitter(rtt64_us - tRoundTrip_us);
-	tRoundTrip_us = uint32_t(min((((rtt64_us + tRoundTrip_us) >> 1) + tRoundTrip_us) >> 1, UINT32_MAX));
+	// Built-in rule: if current RTT exceeds smoothed RTT 'considerably' in 5 successive accumulative SNACKs,
+	// assume congestion occurred. 'Considerably' is 1 sigma
+	// Selection of '5' depends on 'alpha' and 'beta' which are built-in as well.
+	if (rtt64_us - tRoundTrip_us - rttVar_us > 0 && ++countRTTincreasement >= 5)
+	{
+		increaSlow = true;
+		sendRate_Bpus /= 2.0;
+		countRTTincreasement = 0;
+	}
+	else if (rtt64_us - tRoundTrip_us + rttVar_us < 0)
+	{
+		countRTTincreasement = 0;
+	}
+	// If it happens to fell in the delta range, do not update the state
+	//
+	int64_t rttVar64_us = int64_t(rttVar_us) - (rttVar_us >> 2) + (abs(rtt64_us - tRoundTrip_us) >> 2);
+	int64_t srtt64_us = tRoundTrip_us + ((rtt64_us - tRoundTrip_us) >> 3);
+	tRTO_us = max(RETRANSMIT_MIN_TIMEOUT_us, uint32_t(srtt64_us + max(TIMER_SLICE_ms * 1000, rttVar64_us * 4)));
+	tRTO_us = min(RETRANSMIT_MAX_TIMEOUT_us, tRTO_us);
+	tRoundTrip_us = uint32_t(min(srtt64_us, UINT32_MAX));
+	rttVar_us = uint32_t(min(rttVar64_us, UINT32_MAX));
 }
 
 
@@ -199,20 +234,14 @@ bool CSocketItemEx::SendKeepAlive()
 	if (lowState == PEER_COMMIT || lowState == COMMITTING2 || lowState >= CLOSABLE)
 		return SendAckFlush();
 
-	struct
-	{
-		FSP_FixedHeader			hdr;
-		FSP_ConnectParam		mp;
-		FSP_PreparedKEEP_ALIVE	snack;
-		void SetHostID(PSOCKADDR_IN6 ipi6) { mp.idListener = SOCKADDR_HOSTID(ipi6); }
-	} buf3;
+	FSP_KeepAliveExtension buf3;
 
 	SetConnectParamPrefix(buf3.mp);
 	buf3.SetHostID(CLowerInterface::Singleton.addresses);
 	memcpy(buf3.mp.subnets, savedPathsToNearEnd, sizeof(TSubnets));
 
 	ControlBlock::seq_t	snKeepAliveExp;
-	LONG len = GenerateSNACK(buf3.snack, snKeepAliveExp, sizeof(FSP_NormalPacketHeader) + sizeof(FSP_ConnectParam));
+	LONG len = GenerateSNACK(buf3.snack, snKeepAliveExp, sizeof(FSP_FixedHeader) + sizeof(FSP_ConnectParam));
 	if (len < 0)
 	{
 		printf_s("Fatal error %d encountered when generate SNACK\n", len);
@@ -263,7 +292,7 @@ bool CSocketItemEx::SendAckFlush()
 	InterlockedIncrement(& nextOOBSN);
 	buf2.snack._h.opCode = SELECTIVE_NACK;
 	buf2.snack._h.mark = 0;
-	buf2.snack._h.length = htobe16(sizeof(FSP_SelectiveNACK));
+	buf2.snack._h.length = SNACK_HEADER_SIZE_BE16;
 	buf2.snack.serialNo = htobe32(nextOOBSN);
 	buf2.snack.tLazyAck = htobe64(NowUTC() - tLastRecv);
 
@@ -354,7 +383,22 @@ int LOCALAPI CSocketItemEx::AcceptSNACK(ControlBlock::seq_t expectedSN, FSP_Sele
 }
 
 
+/**
+-  A packet is never retransmitted less than one RTO after the previous transmission of that packet.
+-  Every time an in-band packet is sent (including a retransmission), if the timer is not running,
+   start it running so that it will expire after RTO seconds (for the current value of RTO).
+-  When all outstanding data has been acknowledged, turn off the retransmission timer.
+-  When the retransmission timer expires, retransmit the packets that have not been acknowledged by the receiver,
+   but limit the send rate by throttling mechanism.
 
+-  Rate of retransmission MUST be throttled in a way that packet retransmission SHALL be subjected to congestion control as well.
+-  However, at least one packet MAY be retransmitted in one clock interval,
+   provide that the retransmission timer expires for the first packet that has not been acknowledged yet.
+
+ */
+//
+// A simple quota-based AIMD congestion avoidance algorithm is implemenented here
+//
 // Assume it has got the mutex
 // 1. Resend one packet (if any)
 // 2. Send a new packet (if any)
@@ -362,7 +406,7 @@ int LOCALAPI CSocketItemEx::AcceptSNACK(ControlBlock::seq_t expectedSN, FSP_Sele
 void CSocketItemEx::DoEventLoop()
 {
 	// Only need to synchronize the state in the 'cache' and the real state once because TCB is locked
-	_InterlockedExchange8((char *)& lowState, pControlBlock->state);
+	_InterlockedExchange8((char*)& lowState, pControlBlock->state);
 	if (lowState <= NON_EXISTENT || lowState > LARGEST_FSP_STATE)
 	{
 		Destroy();
@@ -374,20 +418,28 @@ void CSocketItemEx::DoEventLoop()
 	int32_t			i1 = pControlBlock->sendWindowHeadPos;
 	ControlBlock::seq_t seq1 = pControlBlock->sendWindowFirstSN;
 	ControlBlock::PFSP_SocketBuf p = pControlBlock->HeadSend() + i1;
-
+	ControlBlock::PFSP_SocketBuf skb;	// for send new packet.
+	ControlBlock::seq_t limitSN = pControlBlock->GetSendLimitSN();
 	timestamp_t		tNow = NowUTC();
-	bool toStopResend = false;
-	bool toStopEmitQ = false;
+	bool somePacketResent = false;
+	bool toStopEmitQ = (int32_t(pControlBlock->sendWindowNextSN - limitSN) >= 0);
+	bool toStopResend = (int32_t(seq1 - pControlBlock->sendWindowNextSN) >= 0);
+	double quotaForThisTick = sendRate_Bpus * (tNow - tPreviousTimeSlot);	// quota is added on demand, however
+
+	if (!toStopEmitQ)
+		quotaLeft += quotaForThisTick;
+
+	// Additive increasement of the send rate
+	if (increaSlow)
+		sendRate_Bpus += MAX_BLOCK_SIZE / double(max(tRoundTrip_us, TIMER_SLICE_ms * 1000));
 
 loop_start:
 	// To minimize waste of network bandwidth, try to resend packet that was not acknowledged but sent earliest
-	toStopResend = toStopResend || (int32_t(seq1 - pControlBlock->sendWindowNextSN) >= 0);
 	if (!toStopResend)
 	{
-		// retransmission time-out is hard coded to 4RTT
-		if ((tNow - p->timeSent) < ((uint64_t)tRoundTrip_us << 2))
+		if (int64_t(tNow - p->timeSent) - tRTO_us < 0)
 		{
-			if (!p->IsAcked())
+			if (!p->IsAcked() && !p->IsResent())
 			{
 				toStopResend = true;
 				goto l_step2;
@@ -402,12 +454,24 @@ loop_start:
 			printf_s("Fiber#%u, to retransmit packet #%u\n", fidPair.source, seq1);
 #endif
 #ifndef UNIT_TEST
+			// To avoid both starvation and double increasement of the quota 
+			if (toStopEmitQ)
+				quotaLeft += quotaForThisTick;
+			if (quotaLeft - (p->len + sizeof(FSP_NormalPacketHeader)) < 0)
+				goto l_final;	// No quota left for send or resend
 			if (EmitWithICC(p, seq1) <= 0)
+				goto l_final;
+			quotaLeft -= (p->len + sizeof(FSP_NormalPacketHeader));
+			// Built-in rule: if a packet is to be resent again, it is assumed that congestion was encounterred
+			// However, the send rate should not be cut continuously
+			if (p->IsResent() && !somePacketResent)
 			{
-				toStopResend = true;
-				goto l_step2;
+				sendRate_Bpus /= 2;
+				quotaLeft /= 2;
+				increaSlow = true;
 			}
 #endif
+			somePacketResent = true;
 			p->MarkResent();
 			pControlBlock->perfCounts.countPacketSent++;
 		}
@@ -427,11 +491,9 @@ loop_start:
 			p++;
 		}
 	}
+	toStopResend = (int32_t(seq1 - pControlBlock->sendWindowNextSN) >= 0);
 
 l_step2:
-	register ControlBlock::seq_t limitSN = pControlBlock->GetSendLimitSN();
-	register ControlBlock::PFSP_SocketBuf skb;
-	toStopEmitQ = toStopEmitQ || (int32_t(pControlBlock->sendWindowNextSN - limitSN) >= 0);
 	// Used to be loop-body of EmitQ:
 	if (!toStopEmitQ)
 	{
@@ -442,11 +504,11 @@ l_step2:
 			goto l_post_step3;	// ULA is still to fill the buffer
 		}
 #ifndef UNIT_TEST
+		if (quotaLeft - (skb->len + sizeof(FSP_NormalPacketHeader)) < 0)
+			goto l_final;	// No quota left for send or resend
 		if (EmitWithICC(skb, pControlBlock->sendWindowNextSN) <= 0)
-		{
-			toStopEmitQ = true;
-			goto l_post_step3;	// transmission failed
-		}
+			goto l_final;
+		quotaLeft -= (skb->len + sizeof(FSP_NormalPacketHeader));
 #endif
 		skb->MarkSent();
 		pControlBlock->perfCounts.countPacketSent++;
@@ -455,39 +517,34 @@ l_step2:
 			pControlBlock->sendWindowNextPos = 0;
 		InterlockedIncrement(&pControlBlock->sendWindowNextSN);
 	}
-	else if (int32_t(LCKREAD(pControlBlock->sendBufferNextSN) - pControlBlock->sendWindowNextSN) > 0)
+	// Zero window probing; although there's some code redundancy it keeps clarity
+	else if (pControlBlock->CountSentInFlight() == 0 && pControlBlock->CountSendBuffered() > 0)
 	{
-		// Zero window probing; although there's some code redundancy it keeps clarity
 		skb = pControlBlock->HeadSend() + pControlBlock->sendWindowNextPos;
 		if (!skb->IsComplete() || skb->InSending())
+		{
+			toStopEmitQ = true;
 			goto l_post_step3;	// ULA is still to fill the buffer
+		}
 		//
-		if (int32_t(pControlBlock->sendWindowNextSN - pControlBlock->sendWindowLimitSN) == 0)
-		{
 #ifndef UNIT_TEST
-			if (EmitWithICC(skb, pControlBlock->sendWindowNextSN) <= 0)
-				goto l_post_step3;	// transmission failed
+		if (quotaLeft - (skb->len + sizeof(FSP_NormalPacketHeader)) < 0)
+			goto l_final;	// No quota left for zero window probe
+		if (EmitWithICC(skb, pControlBlock->sendWindowNextSN) <= 0)
+			goto l_final;
+		quotaLeft -= (skb->len + sizeof(FSP_NormalPacketHeader));
 #endif
-			skb->MarkSent();
-			tZeroWinProbe = tRecentSend;
-			pControlBlock->perfCounts.countZWPsent++;
-			pControlBlock->perfCounts.countPacketSent++;
-			//
-			if (++pControlBlock->sendWindowNextPos >= capacity)
-				pControlBlock->sendWindowNextPos = 0;
-			InterlockedIncrement(&pControlBlock->sendWindowNextSN);
-		}
-		// ZWP timeout is hard-coded to 32RTT, without exponential back-off
-		// Retransmit the last packet for ZWP, to urge SNACK.
-		else if (int32_t(pControlBlock->sendWindowNextSN - pControlBlock->sendWindowLimitSN) > 0
-			&& int64_t(tNow - tZeroWinProbe) > ((tRoundTrip_us + 1) << 5))
-		{
-			EmitWithICC(skb, pControlBlock->sendWindowNextSN);
-			tZeroWinProbe = tRecentSend;
-			pControlBlock->perfCounts.countZWPresent++;
-			pControlBlock->perfCounts.countPacketResent++;
-		}
+		pControlBlock->perfCounts.countZWPsent++;
+		//
+		skb->MarkSent();
+		pControlBlock->perfCounts.countPacketSent++;
+		//
+		if (++pControlBlock->sendWindowNextPos >= capacity)
+			pControlBlock->sendWindowNextPos = 0;
+		InterlockedIncrement(&pControlBlock->sendWindowNextSN);
 	}
+	// For sake of stability do not raise limitSN in this very clock click
+	toStopEmitQ = (int32_t(pControlBlock->sendWindowNextSN - limitSN) >= 0);
 
 l_post_step3:
 	if (int64_t(NowUTC() - tNow - TIMER_SLICE_ms * 1000) >= 0)
@@ -500,9 +557,15 @@ l_post_step3:
 
 l_final:
 	// Finally, (Really!) Lazy acknowledgement
-	if (delayAckPending || IsNearEndMoved() || mobileNoticeInFlight)
+	if ((delayAckPending || IsNearEndMoved() || mobileNoticeInFlight)
+		&& SendKeepAlive())
 	{
-		SendKeepAlive();
 		delayAckPending = 0;
 	}
+	tPreviousTimeSlot = tNow;
 }
+/**
+  When interface changed
+	startedSlow = true.
+	send_rate = (negotiated send rate!)(1 / 2 available, or quota - based)
+ */

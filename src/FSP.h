@@ -94,6 +94,9 @@ typedef ALFID_T	 ULTID_T;
 # define TRANSIENT_STATE_TIMEOUT_ms		60000	// 1 minute
 #endif
 
+#define RETRANSMIT_MIN_TIMEOUT_us	1000000		// 1 second
+#define RETRANSMIT_MAX_TIMEOUT_us	60000000	// 60 seconds
+
 #define COMMITTING_TIMEOUT_ms			90000	// one and a half minutes
 //^time-out for committing a transmit transaction starting from last acknowledgement,
 // not from start of the transaction. Should be larger than the Maximum Segment Life

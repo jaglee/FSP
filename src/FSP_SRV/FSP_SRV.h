@@ -207,6 +207,16 @@ struct FSP_PreparedKEEP_ALIVE
 };
 
 
+struct FSP_KeepAliveExtension
+{
+	FSP_FixedHeader			hdr;
+	FSP_ConnectParam		mp;
+	FSP_PreparedKEEP_ALIVE	snack;
+	void SetHostID(PSOCKADDR_IN6 ipi6) { mp.idListener = SOCKADDR_HOSTID(ipi6); }
+};
+
+
+
 
 // Context management of integrity check code
 struct ICC_Context
@@ -379,21 +389,23 @@ protected:
 	CSocketItemEx * prevSame;
 
 	uint32_t	tRoundTrip_us;	// round trip time evaluated in microsecond
+	uint32_t	rttVar_us;		// Variance of RTT
+	uint32_t	tRTO_us;		// Retransmission time out value in microsecond. SHOULD be shorter than 60 seconds
+
+	bool		increaSlow;		// Whether in it is started in a slow rate which is to be incremented exponentially, default false
+	int8_t		countRTTincreasement;
+	double		sendRate_Bpus;	// current send rate, byte per microsecond (!)
+	double		quotaLeft;		// in bytes
+	timestamp_t tPreviousTimeSlot;
+
 	//- There used to be tKeepAlive_ms here. now reserved
 	HANDLE		timer;			// the repeating timer
 
 	timestamp_t	tSessionBegin;
 	timestamp_t	tLastRecv;
 	timestamp_t tMigrate;
-	union
-	{
-		struct ControlBlock::FSP_SocketBuf skbRecvClone;
-		struct
-		{
-			timestamp_t tZeroWinProbe;
-			timestamp_t tRecentSend;
-		};
-	};
+	timestamp_t tRecentSend;
+	ControlBlock::FSP_SocketBuf skbRecvClone;
 
 	uint32_t	nextOOBSN;	// host byte order for near end. if it overflow the session MUST be terminated
 	uint32_t	lastOOBSN;	// host byte order, the serial number of peer's last out-of-band packet
@@ -422,6 +434,9 @@ protected:
 			tRoundTrip_us = UINT32_MAX;
 		else
 			tRoundTrip_us = (uint32_t)tDiff;
+		rttVar_us = tRoundTrip_us >> 1;
+		sendRate_Bpus = double(MAX_BLOCK_SIZE * SLOW_START_WINDOW_SIZE) / tRoundTrip_us;
+		// TODO: to check: initially quotaPerTick is zero, and noQuotaAlloc is false.
 	}
 	// Given
 	//	int64_t		the round trip time of the packet due
@@ -579,7 +594,7 @@ public:
 	bool LOCALAPI ValidateICC(FSP_NormalPacketHeader *, int32_t, ALFID_T, uint32_t);
 	bool ValidateICC() { return ValidateICC(&headPacket->hdr, headPacket->lenData, fidPair.peer, 0); }
 
-	bool LOCALAPI ValidateSNACK(ControlBlock::seq_t &, FSP_SelectiveNACK::GapDescriptor * &, int &);
+	int ValidateSNACK(ControlBlock::seq_t&, FSP_SelectiveNACK*);
 	// Register source IPv6 address of a validated received packet as the favorite returning IP address
 	inline void ChangeRemoteValidatedIP();
 	// Check whether previous KEEP_ALIVE is implicitly acknowledged on getting a validated packet

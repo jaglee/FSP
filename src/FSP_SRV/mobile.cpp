@@ -773,9 +773,8 @@ void * LOCALAPI CSocketItemEx::SetIntegrityCheckCode(FSP_NormalPacketHeader *p1,
 bool LOCALAPI CSocketItemEx::ValidateICC(FSP_NormalPacketHeader *p1, int32_t ctLen, ALFID_T idSource, uint32_t salt)
 {
 	ALIGN(MAC_ALIGNMENT) uint64_t tag[FSP_TAG_SIZE / sizeof(uint64_t)];
-	uint32_t byteA = be16toh(p1->hs.offset);
-	if (byteA < sizeof(FSP_NormalPacketHeader) || byteA > MAX_LLS_BLOCK_SIZE || (byteA & (sizeof(uint64_t) - 1)) != 0)
-		return false;
+	// number of octets that 'additional data' in Galois Counter Mode
+	const uint32_t byteA = sizeof(FSP_NormalPacketHeader);
 
 	tag[0] = p1->integrity.code;
 
@@ -823,11 +822,12 @@ bool LOCALAPI CSocketItemEx::ValidateICC(FSP_NormalPacketHeader *p1, int32_t ctL
 		DumpNetworkUInt16((uint16_t *)p1, byteA / 2 + min(4, ctLen / 2));
 #endif
 		GCM_AES_XorSalt(pCtx, salt);
+		// assert(byteA) == sizeof(FSP_FixedHeader)
 		r = (GCM_AES_AuthenticateAndDecrypt(pCtx, *(uint64_t *)p1
-			, (const uint8_t *)p1 + sizeof(FSP_FixedHeader), ctLen + byteA - sizeof(FSP_FixedHeader)
-			, (const uint64_t *)p1, sizeof(FSP_FixedHeader)
+			, (const uint8_t *)p1 + byteA, ctLen
+			, (const uint64_t *)p1, byteA
 			, (const uint8_t *)tag, FSP_TAG_SIZE
-			, (uint64_t *)p1 + sizeof(FSP_FixedHeader) / sizeof(uint64_t))
+			, (uint64_t *)p1 + byteA / sizeof(uint64_t))
 			== 0);
 		GCM_AES_XorSalt(pCtx, salt);
 	}
@@ -978,10 +978,7 @@ int CSocketItemEx::EmitWithICC(ControlBlock::PFSP_SocketBuf skb, ControlBlock::s
 	int r = skb->len > 0
 		? SendPacket(2, ScatteredSendBuffers(&hdr, sizeof(FSP_NormalPacketHeader), paidLoad, skb->len))
 		: SendPacket(1, ScatteredSendBuffers(&hdr, sizeof(FSP_NormalPacketHeader)));
-	// Time of resent is lost. However it makes selective retransmission a more efficients
-	// by avoiding transpass the whole send queue. See also DoResend
-	if (!skb->IsResent())
-		skb->timeSent = tRecentSend;
+	skb->timeSent = tRecentSend;
 	return r;
 }
 

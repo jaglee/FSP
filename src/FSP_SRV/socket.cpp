@@ -600,7 +600,7 @@ bool CSocketItemEx::Notify(FSP_ServiceCode n)
 //	For milky payload this function should never be called
 int32_t LOCALAPI CSocketItemEx::GenerateSNACK(FSP_PreparedKEEP_ALIVE &buf, ControlBlock::seq_t &seq0, int nPrefix)
 {
-	register int n = (sizeof(buf.gaps) - nPrefix + sizeof(FSP_NormalPacketHeader)) / sizeof(buf.gaps[0]);
+	register int n = (sizeof(buf.gaps) + sizeof(FSP_FixedHeader) - nPrefix) / sizeof(buf.gaps[0]);
 	//^ keep the unerlying IP packet from segmentation
 	register FSP_SelectiveNACK::GapDescriptor *gaps = buf.gaps;
 	n = pControlBlock->GetSelectiveNACK(seq0, gaps, n);
@@ -639,7 +639,7 @@ int32_t LOCALAPI CSocketItemEx::GenerateSNACK(FSP_PreparedKEEP_ALIVE &buf, Contr
 	buf.n = n;
 
 	InterlockedIncrement(& nextOOBSN);	// Because lastOOBSN start from zero as well. See ValidateSNACK
-	int32_t lenSNACK = int32_t(sizeof(FSP_SelectiveNACK) + sizeof(buf.gaps[0]) * buf.n);
+	uint16_t lenSNACK = uint16_t(sizeof(FSP_SelectiveNACK) + sizeof(buf.gaps[0]) * n);
 	pSNACK->_h.opCode = SELECTIVE_NACK;
 	pSNACK->_h.mark = 0;
 	pSNACK->_h.length = htobe16(lenSNACK);
@@ -801,6 +801,7 @@ void CSocketItemEx::InitiateMultiply(CSocketItemEx *srcItem)
 	skb->MarkSent();
 	//
 	tSessionBegin = skb->timeSent = tRecentSend;	// UNRESOLVED!? But if SendPacket failed?
+	tPreviousTimeSlot = tRecentSend;
 	// tRoundTrip_us would be calculated when PERSIST is got, when tLastRecv is set as well
 	ReplaceTimer(INIT_RETRANSMIT_TIMEOUT_ms);
 }
@@ -925,6 +926,7 @@ void CSocketItemEx::Accept()
 		((CMultiplyBacklogItem *)this)->ResponseToMultiply();
 	}
 	//
+	tPreviousTimeSlot = tRecentSend;
 	tSessionBegin = tRecentSend;
 	SetMutexFree();
 }

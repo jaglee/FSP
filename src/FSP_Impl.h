@@ -113,8 +113,8 @@ void TraceLastError(char * fileName, int lineNo, char *funcName, char *s1);
 
 #define MAX_LOCK_WAIT_ms			60000	// one minute
 #define TIMER_SLICE_ms				50		// 1/20 second
-#define	TIMEOUT_RETRY_MAX_COUNT		5
-
+#define	MAX_IDLE_QUOTA_TICKS		6		// Refuse to add quota if sending is idle more than this threshold
+#define SLOW_START_WINDOW_SIZE		4		// in packet
 
 #if defined(_MSC_VER) || defined(_MSC_EXTENSIONS)
   #define DELTA_EPOCH_IN_MICROSECS  11644473600000000Ui64
@@ -192,6 +192,7 @@ extern CStringizeNotice noticeNames;
 // Network byte order of the length of the fixed header, where host byte order is little-endian
 #define CONNECT_PARAM_LENGTH_BE16	0x2800
 #define	FIXED_HEADER_SIZE_BE16		0x1800
+#define SNACK_HEADER_SIZE_BE16		0x1000
 
 // Set the prefix of FSP_ConnectParam content
 #define SetConnectParamPrefix(hdr)	{	\
