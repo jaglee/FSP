@@ -44,9 +44,10 @@
 
 
 // Now it is the polling timer. Unlike LockWithActiveULA(), here the socket is locked without wait
+// TODO: recycle SHUT_REQUESTED or CLOSED socket in LRU manner
 void CSocketItemEx::KeepAlive()
 {
-	const char *c = (char *)_InterlockedCompareExchangePointer((void**)&lockedAt, (void*)__func__, 0);
+	const char *c = (char *)InterlockedCompareExchangePointer((void**)&lockedAt, (void*)__FUNCTION__, 0);
 	// assume it takes little time to detect process life
 	if (!IsProcessAlive())
 	{
@@ -135,6 +136,11 @@ void CSocketItemEx::KeepAlive()
 		// CLOSABLE does NOT time out to CLOSED, and does NOT automatically recycled.
 		DoEventLoop();
 		break;
+	case SHUT_REQUESTED:
+		// As if CLOSED, only might have to send lazy ACK_FLUSH. See also OnGetRelease()
+		if (delayAckPending && SendAckFlush())
+			delayAckPending = 0;
+		break;
 	case PRE_CLOSED:
 		// Automatically migrate to CLOSED state in TIME-WAIT state alike in TCP
 		if (t1 - tMigrate > (CLOSING_TIME_WAIT_ms * 1000))
@@ -149,7 +155,6 @@ void CSocketItemEx::KeepAlive()
 		if (int64_t(t1 - tMigrate + 1024 - (UINT32_MAX << 10)) < 0)
 			ReplaceTimer(uint32_t((t1 - tMigrate) >> 10) + 1);
 		//^exponentially back off;  the socket is subjected to be recycled in LRU manner
-		DoEventLoop();
 		break;
 	default:
 #ifndef NDEBUG
@@ -163,13 +168,16 @@ void CSocketItemEx::KeepAlive()
 }
 
 
+
 // Given
-//	int64_t		the round trip time of the packet due
+//	ControlBlock::seq_t		the sequence number of the packet that the acknowledgement delay was reported
+//	uint32_t				the acknowledgement delay in microseconds (SHOULD be less than 200,000)
 // Do
 //	Update the smoothed RTT
 // Remark
 //	Implement a simple heuristic congestion management: delay-derived multiplicative decrease of send rate
-// The caller must make sure that the control block shared between LLS and DLL is available
+//  The caller must make sure that the control block shared between LLS and DLL is available
+//	This implementation does not support ultra-delay(sub-microsecond) network
 /**
   Initially:
 	SRTT <- R
@@ -185,19 +193,34 @@ void CSocketItemEx::KeepAlive()
 
 	Whenever RTO is computed, if it is less than 1 second, then the RTO SHOULD be rounded up to 1 second.
 	*/
-void CSocketItemEx::UpdateRTT(int64_t rtt64_us)
+void CSocketItemEx::UpdateRTT(ControlBlock::seq_t snAck, uint32_t tDelay)
 {
-	if (rtt64_us < 0)
-		rtt64_us = UINT32_MAX;
-	else if (rtt64_us == 0)
-		rtt64_us = 1;
-	// we donot set rtt64_us = UINT32_MAX else if(rtt64_us > UINT32_MAX), however.
-	if (rtt64_us > COMMITTING_TIMEOUT_ms * 1000)
+	int32_t k = int32_t(snAck - pControlBlock->sendWindowFirstSN);
+	if (k < 0 || k >= pControlBlock->sendBufferBlockN)
+		return;
+
+#if (TRACE & (TRACE_HEARTBEAT | TRACE_SLIDEWIN | TRACE_OUTBAND))
+	printf_s("Round trip time to calibrate: %u\n\tacknowledgement delay: %u\n", tRoundTrip_us, tDelay);
+#endif
+	pControlBlock->AddRoundSendBlockN(k, pControlBlock->sendWindowHeadPos);
+	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend() + k;
+	if ((skb->marks & (ControlBlock::FSP_BUF_SENT | ControlBlock::FSP_BUF_ACKED | ControlBlock::FSP_BUF_RESENT))
+		!= ControlBlock::FSP_BUF_SENT)
 	{
-		printf_s("New round trip time is ridiculously large: %lld\nSmoothed RTT is %u\n", rtt64_us, tRoundTrip_us);
-		BREAK_ON_DEBUG();
+		return;
 	}
-	//
+
+	int64_t rtt64_us = int64_t(NowUTC() - skb->timeSent - tDelay);
+	if (rtt64_us < 0)
+	{
+		printf_s("Is the peer to cheat by report a ridiculously delay (%u)?\n"
+			"Smoothed RTT is %u microseconds\n"
+			, tDelay
+			, tRoundTrip_us);
+		BREAK_ON_DEBUG();
+		return;
+	}
+
 	pControlBlock->perfCounts.PushJitter(rtt64_us - tRoundTrip_us);
 	// Built-in rule: if current RTT exceeds smoothed RTT 'considerably' in 5 successive accumulative SNACKs,
 	// assume congestion occurred. 'Considerably' is 1 sigma
@@ -219,7 +242,13 @@ void CSocketItemEx::UpdateRTT(int64_t rtt64_us)
 	tRTO_us = max(RETRANSMIT_MIN_TIMEOUT_us, uint32_t(srtt64_us + max(TIMER_SLICE_ms * 1000, rttVar64_us * 4)));
 	tRTO_us = min(RETRANSMIT_MAX_TIMEOUT_us, tRTO_us);
 	tRoundTrip_us = uint32_t(min(srtt64_us, UINT32_MAX));
+	if (tRoundTrip_us == 0)
+		tRoundTrip_us = 1;
 	rttVar_us = uint32_t(min(rttVar64_us, UINT32_MAX));
+
+	// A simple TCP-friendly AIMD congestion control in slow-start phase
+	if (!increaSlow)
+		sendRate_Bpus += double(int64_t(k + 1) * MAX_BLOCK_SIZE) / tRoundTrip_us;
 }
 
 
@@ -240,31 +269,57 @@ bool CSocketItemEx::SendKeepAlive()
 	buf3.SetHostID(CLowerInterface::Singleton.addresses);
 	memcpy(buf3.mp.subnets, savedPathsToNearEnd, sizeof(TSubnets));
 
-	ControlBlock::seq_t	snKeepAliveExp;
-	LONG len = GenerateSNACK(buf3.snack, snKeepAliveExp, sizeof(FSP_FixedHeader) + sizeof(FSP_ConnectParam));
-	if (len < 0)
+	InterlockedIncrement(&nextOOBSN);	// Because lastOOBSN start from zero as well. See ValidateSNACK
+
+	register int n = (sizeof(buf3.snack.gaps) - sizeof(buf3.mp)) / sizeof(FSP_SelectiveNACK::GapDescriptor);
+	//^ keep the underlying IP packet from segmentation
+	register FSP_SelectiveNACK::GapDescriptor* gaps = buf3.snack.gaps;
+	ControlBlock::seq_t seq0;
+	n = pControlBlock->GetSelectiveNACK(seq0, gaps, n);
+	if (n < 0)
 	{
-		printf_s("Fatal error %d encountered when generate SNACK\n", len);
+#ifdef TRACE
+		printf_s("GetSelectiveNACK return -0x%X\n", -n);
+#endif
 		return false;
 	}
-#if (TRACE & (TRACE_HEARTBEAT | TRACE_PACKET | TRACE_SLIDEWIN))
-	printf_s("Keep-alive: local fiber#%u, peer's fiber#%u\n"
-		"\tAcknowledged seq#%u, keep-alive header size = %d\n"
-		, fidPair.source, fidPair.peer
-		, snKeepAliveExp
-		, len);
+	// buf3.snack.nEntries = n;
+
+	// Suffix the effective gap descriptors block with the FSP_SelectiveNACK
+	// built-in rule: an optional header MUST be 64-bit aligned
+	int len = int(sizeof(FSP_SelectiveNACK) + sizeof(buf3.snack.gaps[0]) * n);
+	FSP_SelectiveNACK* pSNACK = &buf3.snack.sentinel;
+	pSNACK->_h.opCode = SELECTIVE_NACK;
+	pSNACK->_h.mark = 0;
+	pSNACK->_h.length = htole16(uint16_t(len));
+	pSNACK->ackSeqNo = htole32(seq0);
+	pSNACK->latestSN = htole32(snLastRecv);
+	pSNACK->tLazyAck = htole32(uint32_t(NowUTC() - tLastRecv));
+#if BYTE_ORDER != LITTLE_ENDIAN
+	while (--n >= 0)
+	{
+		gaps[n].dataLength = htole32(gaps[n].dataLength);
+		gaps[n].gapWidth = htole32(gaps[n].gapWidth);
+	}
 #endif
 
-	SignHeaderWith(&buf3.hdr, KEEP_ALIVE, (uint16_t)len
+	len += sizeof(buf3.mp);
+	SignHeaderWith(&buf3.hdr, KEEP_ALIVE, (uint16_t)(len + sizeof(FSP_FixedHeader))
 		, pControlBlock->sendWindowNextSN - 1
-		, snKeepAliveExp);
-	SetIntegrityCheckCode(&buf3.hdr, &buf3.mp, len - sizeof(FSP_FixedHeader), buf3.snack.sentinel.serialNo);
+		, nextOOBSN);
+	void* c = SetIntegrityCheckCode(&buf3.hdr, &buf3.mp, len, GetSalt(buf3.hdr));
+	if (c == NULL)
+		return false;
+	memcpy(&buf3.mp, c, len);
+
+	len += sizeof(FSP_FixedHeader);
 #if (TRACE & (TRACE_HEARTBEAT | TRACE_PACKET | TRACE_SLIDEWIN))
-	printf_s("To send KEEP_ALIVE seq #%u, acknowledge #%u\n\tsource ALFID = %u\n"
+	printf_s("To send KEEP_ALIVE seq #%u, OOBSN#%u\n\tpeer's fiber#%u, source ALFID = %u\n"
 		, be32toh(buf3.hdr.sequenceNo)
-		, snKeepAliveExp
+		, nextOOBSN
+		, fidPair.peer
 		, fidPair.source);
-	printf_s("KEEP_ALIVE total header length: %d, should be payloadless\n", len);
+	printf_s("KEEP_ALIVE total header length: %d, should be payload-less\n", len);
 	DumpNetworkUInt16((uint16_t *)& buf3, len / 2);
 #endif
 	return SendPacket(1, ScatteredSendBuffers(&buf3, len)) > 0;
@@ -292,10 +347,10 @@ bool CSocketItemEx::SendAckFlush()
 	InterlockedIncrement(& nextOOBSN);
 	buf2.snack._h.opCode = SELECTIVE_NACK;
 	buf2.snack._h.mark = 0;
-	buf2.snack._h.length = SNACK_HEADER_SIZE_BE16;
-	buf2.snack.serialNo = htobe32(nextOOBSN);
-	buf2.snack.tLazyAck = htobe64(NowUTC() - tLastRecv);
-
+	buf2.snack._h.length = SNACK_HEADER_SIZE_LE16;
+	buf2.snack.ackSeqNo = htole32(pControlBlock->recvWindowNextSN);
+	buf2.snack.latestSN = htole32(snLastRecv);
+	buf2.snack.tLazyAck = htole32(uint32_t(NowUTC() - tLastRecv));
 #if (TRACE & (TRACE_HEARTBEAT | TRACE_PACKET | TRACE_SLIDEWIN))
 	printf_s("Acknowledge flush: local fiber#%u, peer's fiber#%u\n\tAcknowledged seq#%u\n"
 		, fidPair.source, fidPair.peer
@@ -304,9 +359,12 @@ bool CSocketItemEx::SendAckFlush()
 	assert(pControlBlock->recvWindowExpectedSN == pControlBlock->recvWindowNextSN);
 	SignHeaderWith(&buf2.hdr, ACK_FLUSH, (uint16_t)sizeof(buf2)
 		, pControlBlock->sendWindowNextSN - 1
-		, pControlBlock->recvWindowNextSN
+		, nextOOBSN
 	);
-	SetIntegrityCheckCode(&buf2.hdr, &buf2.snack, sizeof(buf2.snack), buf2.snack.serialNo);
+	void* c = SetIntegrityCheckCode(&buf2.hdr, &buf2.snack, sizeof(buf2.snack), GetSalt(buf2.hdr));
+	if (c == NULL)
+		return false;
+	memcpy(&buf2.snack, c, sizeof(buf2.snack));
 	return SendPacket(1, ScatteredSendBuffers(&buf2, sizeof(buf2))) > 0;
 #undef buf2
 }
@@ -368,7 +426,7 @@ int LOCALAPI CSocketItemEx::AcceptSNACK(ControlBlock::seq_t expectedSN, FSP_Sele
 	if (nAck < 0)
 	{
 #ifdef TRACE
-		printf_s("DealWithSNACK error, erro code: %d\n", nAck);
+		printf_s("DealWithSNACK error, error code: %d\n", nAck);
 #endif
 		return nAck;
 	}
@@ -429,7 +487,7 @@ void CSocketItemEx::DoEventLoop()
 	if (!toStopEmitQ)
 		quotaLeft += quotaForThisTick;
 
-	// Additive increasement of the send rate
+	// Additive increment of the send rate
 	if (increaSlow)
 		sendRate_Bpus += MAX_BLOCK_SIZE / double(max(tRoundTrip_us, TIMER_SLICE_ms * 1000));
 
@@ -439,7 +497,7 @@ loop_start:
 	{
 		if (int64_t(tNow - p->timeSent) - tRTO_us < 0)
 		{
-			if (!p->IsAcked() && !p->IsResent())
+			if ((p->marks & (ControlBlock::FSP_BUF_ACKED | ControlBlock::FSP_BUF_RESENT)) == 0)
 			{
 				toStopResend = true;
 				goto l_step2;
@@ -448,7 +506,7 @@ loop_start:
 			printf_s("Packet #%u has been acknowledged already\n", seq1);
 #endif
 		}
-		else if (!p->IsAcked())
+		else if ((p->marks & ControlBlock::FSP_BUF_ACKED) == 0)
 		{
 #if (TRACE & TRACE_HEARTBEAT)
 			printf_s("Fiber#%u, to retransmit packet #%u\n", fidPair.source, seq1);
@@ -464,7 +522,7 @@ loop_start:
 			quotaLeft -= (p->len + sizeof(FSP_NormalPacketHeader));
 			// Built-in rule: if a packet is to be resent again, it is assumed that congestion was encounterred
 			// However, the send rate should not be cut continuously
-			if (p->IsResent() && !somePacketResent)
+			if (!somePacketResent && (p->marks & ControlBlock::FSP_BUF_RESENT) != 0)
 			{
 				sendRate_Bpus /= 2;
 				quotaLeft /= 2;
@@ -498,7 +556,7 @@ l_step2:
 	if (!toStopEmitQ)
 	{
 		skb = pControlBlock->HeadSend() + pControlBlock->sendWindowNextPos;
-		if (!skb->IsComplete() || skb->InSending())
+		if (skb->MayNotSend())
 		{
 			toStopEmitQ = true;
 			goto l_post_step3;	// ULA is still to fill the buffer
@@ -521,7 +579,7 @@ l_step2:
 	else if (pControlBlock->CountSentInFlight() == 0 && pControlBlock->CountSendBuffered() > 0)
 	{
 		skb = pControlBlock->HeadSend() + pControlBlock->sendWindowNextPos;
-		if (!skb->IsComplete() || skb->InSending())
+		if (skb->MayNotSend())
 		{
 			toStopEmitQ = true;
 			goto l_post_step3;	// ULA is still to fill the buffer

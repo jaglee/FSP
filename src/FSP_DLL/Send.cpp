@@ -183,12 +183,8 @@ int FSPAPI Flush(FSPHANDLE hFSPSocket)
 
 
 
-// [API:Commit]
-//	{COMMITTED, CLOSABLE, PRE_CLOSED, CLOSED}-->{keep state}
-//	ESTABLISHED-->COMMITTING
-//	PEER_COMMIT-->COMMITTING2
-//	{COMMITTING, COMMITTING2}-->{keep state}
-//	{otherwise: failed}
+// Internal API for committing/flushing a transmit transaction
+// Try to commit current transmit transaction
 DllSpec
 int FSPAPI Commit(FSPHANDLE hFSPSocket, NotifyOrReturn fp1)
 {
@@ -203,7 +199,7 @@ int FSPAPI Commit(FSPHANDLE hFSPSocket, NotifyOrReturn fp1)
 // Given
 //	int32_t&	[out] reference to the size of the send buffer obtained
 // Return
-//	NULL if no immediatelyly available free send buffer
+//	NULL if no immediately available free send buffer
 //	or the pointer to the send buffer obtained
 void* CSocketItemDl::TryAcquireSendBuf(int32_t& size)
 {
@@ -333,6 +329,7 @@ int32_t LOCALAPI CSocketItemDl::SendStream(const void * buffer, int32_t len, boo
 	{
 		EnablePolling();
 		int r = BufferData(len);
+		SetMutexFree();
 		return r;	// pendingSendSize = len;
 	}
 
@@ -367,8 +364,13 @@ int32_t LOCALAPI CSocketItemDl::SendStream(const void * buffer, int32_t len, boo
 
 
 
-// Internal API for committing/flushing a transmit transaction
-// Try to commit current transmit transaction
+// [API:Commit]
+//	{SHUT_REQUESTED, PRE_CLOSED, CLOSED}-->{warning}
+//	{COMMITTED, CLOSABLE}-->{keep state}
+//	ESTABLISHED-->COMMITTING
+//	PEER_COMMIT-->COMMITTING2
+//	{COMMITTING, COMMITTING2}-->{keep state}
+//	{otherwise: failed}
 int CSocketItemDl::LockAndCommit(NotifyOrReturn fp1)
 {
 	if (!WaitUseMutex())

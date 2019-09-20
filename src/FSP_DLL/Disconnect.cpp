@@ -101,6 +101,18 @@ void CSocketItemDl::Disable()
 
 
 
+// Set the function to be called back on passively shutdown by the remote end
+DllSpec
+int FSPAPI SetOnRelease(FSPHANDLE hFSPSocket, NotifyOrReturn fp1)
+{
+	CSocketItemDl* p = CSocketDLLTLB::HandleToRegisteredSocket(hFSPSocket);
+	if (p == NULL)
+		return -EFAULT;
+	return p->SetOnRelease(fp1);
+}
+
+
+
 // Try to terminate the session gracefully provided that the peer has commit the transmit transaction
 // Return 0 if no immediate error, or else the error number
 // The callback function might return code of delayed error
@@ -119,6 +131,7 @@ int FSPAPI Shutdown(FSPHANDLE hFSPSocket, NotifyOrReturn fp1)
 //	PEER_COMMIT-->COMMITTING2-->{try to commit first}CLOSABLE-->PRE_CLOSED-->[Send RELEASE]
 //	COMMITTING2-->{try to commit first}CLOSABLE-->PRE_CLOSED-->[Send RELEASE]
 //	CLOSABLE-->PRE_CLOSED-->[Send RELEASE]
+//	SHUT_REQUESTED-->CLOSED
 //	PRE_CLOSED<-->{keep state with warning}
 //	CLOSED<-->{keep state with warning}
 //	{otherwise: illegal to Shutdown. May abort the connection by calling Dispose instead}
@@ -130,12 +143,12 @@ int CSocketItemDl::Shutdown()
 	if (!WaitUseMutex())
 		return (IsInUse() ? -EDEADLK : 0);
 
-	if (lowerLayerRecycled || InState(CLOSED))
+	if (lowerLayerRecycled || InState(SHUT_REQUESTED) || InState(CLOSED))
 	{
-		NotifyOrReturn fp1 = (NotifyOrReturn)InterlockedExchangePointer((PVOID *)&fpFinished, NULL);
+		NotifyOrReturn fp1 = (NotifyOrReturn)InterlockedExchangePointer((PVOID*)& fpFinished, NULL);
 		RecycLocked();		// CancelTimer(); SetMutexFree();
 		if (fp1 != NULL)
-			fp1(this, FSP_NotifyRecycled, EAGAIN);
+			fp1(this, FSP_NotifyRecycled, InState(SHUT_REQUESTED) ? 0 : EAGAIN);
 		return 0;
 	}
 
@@ -146,21 +159,18 @@ int CSocketItemDl::Shutdown()
 	}
 	initiatingShutdown = 1;
 
-	// Send RELEASE and wait echoed RELEASE. LLS to signal FSP_NotifyToFinish, NotifyReset or NotifyTimeout
 #ifndef _NO_LLS_CALLABLE
 	int32_t deinitWait = DEINIT_WAIT_TIMEOUT_ms;
 	FSP_Session_State s = GetState();
-	int released = 0;
-	//^handle race condition of migrating to CLOSABLE or CLOSED (race between ACK_FLUSH and RELEASE)
 	if (s <= ESTABLISHED || s == COMMITTING || s == COMMITTED)
 	{
 		SetMutexFree();
 		return -EDOM;	// Wait for the peer to commit a transmit transaction first before shutdown!
 	}
 	//
+	SetEoTPending();
 	if(s == PEER_COMMIT)
 	{
-		SetEoTPending();
 		if (HasDataToCommit())
 		{
 			// flush internal buffer for compression, if it is non-empty
@@ -169,7 +179,6 @@ int CSocketItemDl::Shutdown()
 				BufferData(pendingSendSize);
 				Call<FSP_Urge>();
 			}
-			// else Case 4.1, the send queue is full and there is some payload to wait free buffer
 		}
 		else if (skbImcompleteToSend != NULL)
 		{
@@ -179,22 +188,13 @@ int CSocketItemDl::Shutdown()
 			skbImcompleteToSend = NULL;
 			MigrateToNewStateOnCommit();
 			// No, RELEASE packet may not carry payload.
-			AppendEoTPacket();
+			AppendEoTPacket(RELEASE);
 			Call<FSP_Urge>();
 			//^It may or may not be success, but it does not matter
 		}
-		// Case 3, there is at least one idle slot to put an EoT packet
-		// Where RELEASE shall be merged with NULCOMMIT
 		else if (AppendEoTPacket(RELEASE))
 		{
 			Call<FSP_Urge>();
-		}
-		// else Case 4.2, the send queue is full and is to append a RELEASE
-		// Case 4: just to wait some buffer ready. See also ProcessPendingSend
-		if (released < 0)
-		{
-			SetMutexFree();
-			return released;
 		}
 		s = GetState();	// it may be in COMMITTING2 or still in PEER_COMMIT state
 	}
@@ -214,12 +214,12 @@ int CSocketItemDl::Shutdown()
 		s = GetState();
 	}
 	//
-	for(; s != CLOSED && s != NON_EXISTENT; s = GetState())
+	for (; s != CLOSED && s != NON_EXISTENT; s = GetState())
 	{
 		if (s == CLOSABLE)
 		{
 			SetState(PRE_CLOSED);
-			if (released <= 0 && AppendEoTPacket())
+			if (IsEoTPending() && AppendEoTPacket(RELEASE))
 				Call<FSP_Urge>();
 			//
 			if (fpFinished != NULL)
@@ -241,7 +241,7 @@ int CSocketItemDl::Shutdown()
 				return ETIMEDOUT;		// Warning, not fatal error
 		}
 		//
-		if(! WaitUseMutex())
+		if (!WaitUseMutex())
 			return (IsInUse() ? -EDEADLK : 0);
 	}
 #endif

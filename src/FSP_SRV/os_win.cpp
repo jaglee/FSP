@@ -901,14 +901,14 @@ int CLowerInterface::AcceptAndProcess(SOCKET sdRecv)
 #endif
 			break;
 		}
-		pktBuf->lenData = countRecv - be16toh(pktBuf->hdr.hs.offset);
-		if (pktBuf->lenData < 0 || pktBuf->lenData > MAX_BLOCK_SIZE)
+		pSocket->lenPktData = countRecv - be16toh(pktBuf->hdr.hs.offset);
+		if (pSocket->lenPktData < 0 || pSocket->lenPktData > MAX_BLOCK_SIZE)
 			break;
 		// illegal packet is simply discarded!
-		pktBuf->pktSeqNo = be32toh(pktBuf->hdr.sequenceNo);
+		pSocket->pktSeqNo = be32toh(pktBuf->hdr.sequenceNo);
 #if defined(TRACE) && (TRACE & TRACE_PACKET)
 		printf_s("%s[%d] packet #%u\n\tpayload length %d, to put onto the queue\n"
-			, opCodeStrings[opCode], opCode, pktBuf->pktSeqNo, pktBuf->lenData);
+			, opCodeStrings[opCode], opCode, pSocket->pktSeqNo, pSocket->lenPktData);
 #endif
 		memcpy(& pSocket->tempAddrAccept, & nearInfo.u, sizeof(FSP_SINKINF));
 		// save the source address temporarily as it is not necessarily legitimate
@@ -1193,7 +1193,7 @@ void CSocketItemEx::HandleFullICC(PktBufferBlock *pktBuf, FSPOperationCode opCod
 	printf_s(__FUNCTION__ ": local fiber#%u(_%X_) in state %s\n"
 		"\t%s(%d) received, seq#%u\n"
 		, fidPair.source, be32toh(fidPair.source), stateNames[lowState]
-		, opCodeStrings[opCode], opCode, pktBuf->pktSeqNo
+		, opCodeStrings[opCode], opCode, pktSeqNo
 	);
 #endif
 	pControlBlock->perfCounts.countPacketReceived++;
@@ -1246,7 +1246,7 @@ l_return:
 bool CSocketItemEx::WaitUseMutexAt(const char* funcName)
 {
 	uint64_t t0 = GetTickCount64();
-	while (_InterlockedCompareExchangePointer((void**)& lockedAt, (void*)funcName, 0) != 0)
+	while (InterlockedCompareExchangePointer((void**)& lockedAt, (void*)funcName, 0) != 0)
 	{
 		if (!IsInUse() || GetTickCount64() - t0 > MAX_LOCK_WAIT_ms)
 			return false;
@@ -1267,7 +1267,7 @@ bool CSocketItemEx::WaitUseMutexAt(const char* funcName)
 // Return true if the session context is locked, false if not
 bool CSocketItemEx::LockWithActiveULAt(const char* funcName)
 {
-	void* c = _InterlockedCompareExchangePointer((void**)& lockedAt, (void*)funcName, 0);
+	void* c = InterlockedCompareExchangePointer((void**)& lockedAt, (void*)funcName, 0);
 	if (IsProcessAlive())
 		return (c == 0 || WaitUseMutexAt(funcName));
 	//
@@ -1349,6 +1349,7 @@ int CSocketItemEx::SendPacket(register ULONG n1, ScatteredSendBuffers s)
 	printf_s("\nPeer socket address:\n");
 	DumpNetworkUInt16((uint16_t *)sockAddrTo, sizeof(SOCKADDR_IN6) / 2);
 #endif
+	timestamp_t t = NowUTC();
 	r = WSASendTo(CLowerInterface::Singleton.sdSend
 		, s.scattered, n1
 		, &n
@@ -1359,12 +1360,12 @@ int CSocketItemEx::SendPacket(register ULONG n1, ScatteredSendBuffers s)
 		, NULL);
 #endif
 
-	tRecentSend = NowUTC();
 	if (r != 0)
 	{
 		ReportWSAError("CSocketItemEx::SendPacket");
 		return 0;
 	}
+	tRecentSend = t;
 #if defined(TRACE) && (TRACE & TRACE_PACKET)
 	printf_s("\n#%u(Near end's ALFID): %d bytes sent.\n", fidPair.source, n);
 #endif

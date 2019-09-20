@@ -253,7 +253,7 @@ void StartHTTPoverFSP()
 	params.recvSize = BUFFER_POOL_SIZE;	
 
 #ifdef _DEBUG
-	TranslateFSPoverIPv4(&atAddress, 0, 80);	//INADDR_ANY
+	TranslateFSPoverIPv4(&atAddress, 0, htobe32(80));	//INADDR_ANY
 #else
 	atAddress.subnet = 0xAAAA00E0;	// 0xE0 00 AA AA	// shall be learned
 	atAddress.idHost = 0;
@@ -286,7 +286,7 @@ static void FSPAPI onNotice(FSPHANDLE h, FSP_ServiceCode code, int value)
 		return;	// waring is simply ignored
 	//
 	if (h == hListener)
-		Abort("Fatal error occured in the main loop, to abort.\n");
+		Abort("Fatal error occurred in the main loop, to abort.\n");
 	else
 		FreeExtent(h);
 }
@@ -338,7 +338,7 @@ static void FSPAPI onPublicKeyReceived(FSPHANDLE h, FSP_ServiceCode c, int r)
 		Abort("Protocol is broken: length of client's id should not exceed MAX_PATH\n");
 	}
 
-	// TODO: map the client's id to its salt and password hash value
+	printf_s("TODO: map the client's id to its salt and password hash value\n");
 	MakeSaltedPassword(pdFSA->passwordHash, sampleSalt, samplePassword);
 	memcpy(pdFSA->chakaPubInfo.salt, sampleSalt, sizeof(sampleSalt));
 

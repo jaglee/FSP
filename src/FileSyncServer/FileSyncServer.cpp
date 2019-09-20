@@ -1,8 +1,8 @@
 /**
   Usage: <FileSyncServer> [pathname]
-  Act as the prototyped file server for the Simple Artcrafted Web Site in the given work path
+  Act as the prototyped file server for the Simple Art-crafted Web Site in the given work path
   If the pathname is a valid normal file, the file is transfered.
-  If the pathname is ommitted, current work directory is transfered
+  If the pathname is omitted, current work directory is transfered
 **/
 // If compiled in Debug mode with the '_DEBUG' macro predefined by default, it tests FSP over UDP/IPv4
 // If compiled in Release mode, or anyway without the '_DEBUG' macro predefined, it tests FSP over IPv6
@@ -246,7 +246,7 @@ static int FSPAPI toSendNextBlock(FSPHANDLE h, void * batchBuffer, int32_t capac
 	int r = _eof(fd);	// re-use the formal parameter. again, negative means error
 	if(r < 0)
 	{
-		printf_s("Internal errror: cannot guess whether the file reaches the end?\n");
+		printf_s("Internal error: cannot guess whether the file reaches the end?\n");
 		Dispose(h);
 		return -1;
 	}

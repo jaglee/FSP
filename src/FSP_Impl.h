@@ -190,15 +190,18 @@ extern CStringizeNotice noticeNames;
 #include <pshpack1.h>
 
 // Network byte order of the length of the fixed header, where host byte order is little-endian
-#define CONNECT_PARAM_LENGTH_BE16	0x2800
 #define	FIXED_HEADER_SIZE_BE16		0x1800
-#define SNACK_HEADER_SIZE_BE16		0x1000
+
+// ARM/x86 byte order of the length of the extension header, where host byte order is little-endian
+#define CONNECT_PARAM_LENGTH_LE16	0x0028
+#define SNACK_HEADER_SIZE_LE16		0x0010
+
 
 // Set the prefix of FSP_ConnectParam content
 #define SetConnectParamPrefix(hdr)	{	\
 	(hdr)._h.opCode = PEER_SUBNETS;		\
 	(hdr)._h.mark = 0;					\
-	(hdr)._h.length = CONNECT_PARAM_LENGTH_BE16; \
+	(hdr)._h.length = CONNECT_PARAM_LENGTH_LE16; \
 }
 
 #define SetHeaderSignature(hdr, code) {	\
@@ -292,7 +295,13 @@ struct SConnectParam	// MUST be aligned on 64-bit words!
 	timestamp_t nboTimeStamp;
 	//^ Timestamp in network byte order, together with the first four fields, totally 256 bits could be overlaid
 	//
+	union
+	{
 	octet		padding[8];	// allow maximum key length of 384-bit, padding the structure to 64 bytes/512bits
+		octet	tag[FSP_TAG_SIZE];
+		int64_t	tDiff;
+	};
+
 	int32_t		keyBits;	// by default 128
 	union
 	{
@@ -462,7 +471,6 @@ struct ControlBlock
 	int32_t		sendBuffer;			// relative to start of the control block
 	int32_t		recvBuffer;			// relative to start of the control block
 
-	// note that we reuse ACKED (for send), hidden DELIVERED (for receive) 
 	enum FSP_SocketBufMark : char
 	{
 		FSP_BUF_LOCKED = 1,
@@ -470,6 +478,7 @@ struct ControlBlock
 		FSP_BUF_SENT = 4,
 		FSP_BUF_ACKED = 8,
 		FSP_BUF_RESENT = 16,
+		FSP_BUF_DELIVERED = 8,	// FSP_BUF_ACKED reused for single send and receive
 	};
 	// Total size of FSP_SocketBuf (descriptor): 8 bytes (a 64-bit word)
 	typedef struct FSP_SocketBuf
@@ -488,18 +497,16 @@ struct ControlBlock
 		void InitMarkLocked() { _InterlockedExchange8(&marks, FSP_BUF_LOCKED); }
 		void ReInitMarkComplete() { _InterlockedExchange8(&marks, FSP_BUF_COMPLETE); }
 		void ReInitMarkAcked() { _InterlockedExchange8(&marks, FSP_BUF_ACKED); }
-		void ReInitMarkDelivered() { ReInitMarkAcked(); }
+		void ReInitMarkDelivered() { _InterlockedExchange8(&marks, FSP_BUF_DELIVERED); }
 
 		void MarkSent() { _InterlockedOr8(&marks, FSP_BUF_SENT); }
-		void MarkAcked() { _InterlockedOr8(&marks, FSP_BUF_ACKED); }
 		void MarkResent() { _InterlockedOr8(&marks, FSP_BUF_RESENT); }
 
-		bool InSending() { return (_InterlockedOr8(&marks, 0) & FSP_BUF_SENT) != 0; }
 		bool IsComplete() { return (_InterlockedOr8(&marks, 0) & FSP_BUF_COMPLETE) != 0; }
-		bool IsAcked() { return (_InterlockedOr8(&marks, 0) & FSP_BUF_ACKED) != 0; }
-		bool IsDelivered() { return IsAcked(); }
-		bool IsResent() { return (_InterlockedOr8(&marks, 0) & FSP_BUF_RESENT) != 0; }
-		//
+		bool IsDelivered() { return (_InterlockedOr8(&marks, 0) & FSP_BUF_DELIVERED) != 0; }
+
+		bool MayNotSend() { return (_InterlockedOr8(&marks, 0) & (FSP_BUF_COMPLETE | FSP_BUF_SENT)) != FSP_BUF_COMPLETE; }
+
 		void ClearFlags() { _InterlockedExchange8((char *)&flags, 0); }
 		template<FSP_FlagPosition pos> void InitFlags() { _InterlockedExchange8((char *)&flags, (char)(1 << pos)); }
 		template<FSP_FlagPosition pos> void SetFlag() { _InterlockedExchange8((char *)&flags, flags | (char)(1 << pos)); }

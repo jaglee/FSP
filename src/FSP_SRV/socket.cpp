@@ -589,73 +589,6 @@ bool CSocketItemEx::Notify(FSP_ServiceCode n)
 
 
 
-// Given
-//	FSP_PreparedKEEP_ALIVE& 	the placeholder for the returned gap descriptors, shall be of at least MAX_BLOCK_SIZE bytes
-//	seq_t &						the placeholder for the returned maximum expected sequence number
-//	int							the number of bytes that prefix the SNACK header
-// Return
-//	Number of bytes taken till the end of the gap descriptors, including the SNACK header and the prefix of the given length
-//	negative indicates that some error occurred
-// Remark
-//	For milky payload this function should never be called
-int32_t LOCALAPI CSocketItemEx::GenerateSNACK(FSP_PreparedKEEP_ALIVE &buf, ControlBlock::seq_t &seq0, int nPrefix)
-{
-	register int n = (sizeof(buf.gaps) + sizeof(FSP_FixedHeader) - nPrefix) / sizeof(buf.gaps[0]);
-	//^ keep the unerlying IP packet from segmentation
-	register FSP_SelectiveNACK::GapDescriptor *gaps = buf.gaps;
-	n = pControlBlock->GetSelectiveNACK(seq0, gaps, n);
-	if (n < 0)
-	{
-#ifdef TRACE
-		printf_s("GetSelectiveNACK return -0x%X\n", -n);
-#endif
-		return n;
-	}
-	// Suffix the effective gap descriptors block with the FSP_SelectiveNACK struct
-	// built-in rule: an optional header MUST be 64-bit aligned
-	register FSP_SelectiveNACK* pSNACK = &buf.sentinel;
-	// TODO: to minimize internal state to save
-	// record the receive time of the most recently received packet
-	register int32_t k = int32_t(seq0 - GetRecvWindowFirstSN()) - 1;
-	if (k >= 0)
-	{
-		ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadRecv();
-		k += GetRecvWindowHeadPos();
-		if (k - pControlBlock->recvBufferBlockN >= 0)
-			k -= pControlBlock->recvBufferBlockN;
-		if (k >= pControlBlock->recvBufferBlockN)
-			return -EACCES;	// memory access error!
-		skb += k;
-		pSNACK->tLazyAck = htobe64(NowUTC() - skb->timeRecv);
-#if (TRACE & TRACE_HEARTBEAT)
-		printf_s("GetSelectiveNACK reported there were %d gap blocks.\n"
-			"\tLazy acknowledgement delay = %lluus\n", n, be64toh(pSNACK->tLazyAck));
-#endif
-	}
-	else
-	{
-		pSNACK->tLazyAck = 0;
-	}
-	buf.n = n;
-
-	InterlockedIncrement(& nextOOBSN);	// Because lastOOBSN start from zero as well. See ValidateSNACK
-	uint16_t lenSNACK = uint16_t(sizeof(FSP_SelectiveNACK) + sizeof(buf.gaps[0]) * n);
-	pSNACK->_h.opCode = SELECTIVE_NACK;
-	pSNACK->_h.mark = 0;
-	pSNACK->_h.length = htobe16(lenSNACK);
-	pSNACK->serialNo = htobe32(nextOOBSN);
-#if BYTE_ORDER != LITTLE_ENDIAN
-	while (--n >= 0)
-	{
-		gaps[n].dataLength = htole32(gaps[n].dataLength);
-		gaps[n].gapWidth = htole32(gaps[n].gapWidth);
-	}
-#endif
-	return nPrefix + lenSNACK;
-}
-
-
-
 // INIT_CONNECT, timestamp, Cookie, Salt, ephemeral-key, half-connection parameters [, resource requirement]
 void CSocketItemEx::InitiateConnect()
 {
@@ -729,7 +662,8 @@ void CSocketItemEx::AffirmConnect(const SConnectParam & initState, ALFID_T idLis
 	// assert(sizeof(initState.allowedPrefixes) >= sizeof(varParams.subnets));
 	memcpy(pkt->params.subnets, initState.allowedPrefixes, sizeof(pkt->params.subnets));
 	pkt->initialSN = htobe32(initState.initialSN);
-	pkt->timeDelta = htobe32(initState.timeDelta);
+	// only the responder may care about the granularity and byte order of the time delta
+	pkt->timeDelta = initState.timeDelta;
 	pkt->cookie = initState.cookie;
 
 	// while version remains as the same as the very beginning INIT_CONNECT
@@ -762,7 +696,7 @@ void CSocketItemEx::InitiateMultiply(CSocketItemEx *srcItem)
 	assert(fidPair.peer == srcItem->fidPair.peer);	// Set in InitAssociation
 
 	ControlBlock::seq_t seq0 = pControlBlock->sendWindowNextSN;	// See also @DLL::ToPrepareMultiply
-	uint32_t salt = htobe32(nextOOBSN = ++srcItem->nextOOBSN);
+	nextOOBSN = ++srcItem->nextOOBSN;
 	contextOfICC.InheritS0(srcItem->contextOfICC, seq0);
 #if defined(TRACE) && (TRACE & TRACE_OUTBAND)
 	printf_s("\nTo send MULTIPLY in LLS, ICC context:\n"
@@ -778,21 +712,21 @@ void CSocketItemEx::InitiateMultiply(CSocketItemEx *srcItem)
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend();
 	void * payload = GetSendPtr(skb);
 	ALIGN(MAC_ALIGNMENT) FSP_FixedHeader q;
+	void* paidLoad;
 	lastOOBSN = 0;	// As the response from the peer, if any, is not an out-of-band packet
 
-	SignHeaderWith(&q, MULTIPLY, sizeof(FSP_NormalPacketHeader), seq0, GetRecvWindowFirstSN());
+	SignHeaderWith(&q, MULTIPLY, sizeof(FSP_NormalPacketHeader), seq0, nextOOBSN);
 	skb->CopyFlagsTo(& q);
-	// Do not mess with 'salt'. New value has to be set after ICC is got
-	void * paidLoad = SetIntegrityCheckCode(& q, payload, skb->len, salt);
-	q.expectedSN = salt;
+
+	paidLoad = SetIntegrityCheckCode(&q, payload, skb->len, GetSalt(q));
 	if (paidLoad == NULL || skb->len > sizeof(this->cipherText))
 	{
 		BREAK_ON_DEBUG();	//TRACE_HERE("Cannot set ICC for the new MULTIPLY command");
 		return;	// but it's an exception!
 	}
+	assert(paidLoad == this->cipherText);
+
 	// Buffer the header in the queue for sake of retransmission on time-out. See also EmitStart() and KeepAlive()
-	if (paidLoad != this->cipherText)
-		memcpy(this->cipherText, paidLoad, skb->len);
 	memcpy(payload, &q, sizeof(FSP_NormalPacketHeader));
 
 	pControlBlock->SetFirstSendWindowRightEdge();
@@ -802,7 +736,7 @@ void CSocketItemEx::InitiateMultiply(CSocketItemEx *srcItem)
 	//
 	tSessionBegin = skb->timeSent = tRecentSend;	// UNRESOLVED!? But if SendPacket failed?
 	tPreviousTimeSlot = tRecentSend;
-	// tRoundTrip_us would be calculated when PERSIST is got, when tLastRecv is set as well
+	SetFirstRTT(srcItem->tRoundTrip_us);
 	ReplaceTimer(INIT_RETRANSMIT_TIMEOUT_ms);
 }
 
@@ -818,7 +752,7 @@ void CSocketItemEx::InitiateMultiply(CSocketItemEx *srcItem)
 bool CSocketItemEx::FinalizeMultiply()
 {
 	pControlBlock->peerAddr.ipFSP.fiberID = headPacket->fidPair.source;
-	contextOfICC.snFirstRecvWithCurrKey = headPacket->pktSeqNo;
+	contextOfICC.snFirstRecvWithCurrKey = pktSeqNo;
 	//^See also ResponseToMultiply()
 	InitAssociation();	// reinitialize with new peer's ALFID
 	assert(fidPair.peer == headPacket->fidPair.source);
@@ -837,7 +771,7 @@ bool CSocketItemEx::FinalizeMultiply()
 #endif
 	RestartKeepAlive();
 	// And continue to accept the payload in the caller
-	pControlBlock->SetRecvWindow(headPacket->pktSeqNo);
+	pControlBlock->SetRecvWindow(pktSeqNo);
 	return CLowerInterface::Singleton.PutToRemoteTLB((CMultiplyBacklogItem *)this);
 }
 
@@ -854,7 +788,7 @@ bool CSocketItemEx::FinalizeMultiply()
 //				|{Peer's MULTIPLY was EoT}-->PEER_COMMIT
 // Congest the peer's MULTIPLY payload and make response designated by ULA transmitted
 // See also OnGetMultiply(), @DLL::PrepareToAccept, ToWelcomeMultiply
-void CMultiplyBacklogItem::ResponseToMultiply()
+void CMultiplyBacklogItem::RespondToMultiply()
 {
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadRecv() + GetRecvWindowHeadPos();
 	// if (!CheckMemoryBorder(skb)) throw -EFAULT;
@@ -871,6 +805,7 @@ void CMultiplyBacklogItem::ResponseToMultiply()
 	CopyOutFVO(skb);
 	skb->opCode = PERSIST;
 	skb->ReInitMarkComplete();
+	skb->timeRecv = tLastRecv;	// so that delay of acknowledgement can be calculated more precisely
 
 	pControlBlock->recvWindowExpectedSN = ++pControlBlock->recvWindowNextSN;
 	_InterlockedIncrement((LONG *)&pControlBlock->recvWindowNextPos);
@@ -915,6 +850,7 @@ void CSocketItemEx::Accept()
 	{
 		InstallEphemeralKey();
 		//^ ephemeral session key material was ready when CSocketItemDl::PrepareToAccept
+		SetFirstRTT(pControlBlock->connectParams.tDiff);
 		EmitStart();
 		pControlBlock->notices.SetHead(NullCommand);
 		//^ The success or failure signal is delayed until ACK_START, PERSIST or RESET received
@@ -923,7 +859,7 @@ void CSocketItemEx::Accept()
 	else
 	{
 		// Timer has been set when the socket slot was prepared on getting MULTIPLY
-		((CMultiplyBacklogItem *)this)->ResponseToMultiply();
+		((CMultiplyBacklogItem *)this)->RespondToMultiply();
 	}
 	//
 	tPreviousTimeSlot = tRecentSend;

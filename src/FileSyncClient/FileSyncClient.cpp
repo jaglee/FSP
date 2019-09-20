@@ -28,7 +28,7 @@ static unsigned char bufPrivateKey[CRYPTO_NACL_KEYBYTES];
 
 static char fileName[sizeof(TCHAR) * MAX_PATH + 4];
 
-// The signal that the mainloop is finished
+// The signal that the main loop is finished
 static bool finished;
 
 // Forward declarations
@@ -104,7 +104,7 @@ static void FSPAPI onReceiveFileNameReturn(FSPHANDLE h, FSP_ServiceCode resultCo
 #endif
 	// try to create a new file of the same name. if failed on error file already exists, 
 	// try to change the filename by append a 'C'[if it does not have suffix].
-	// if the new filename exceed MAX_PATH, confuscate the last character
+	// if the new filename exceed MAX_PATH, obfuscate the last character
 	_tprintf_s(_T("done.\nRemote filename: %s\n"), finalFileName);
 	try
 	{
@@ -218,7 +218,7 @@ static void FSPAPI onAcknowledgeSent(FSPHANDLE h, FSP_ServiceCode c, int r)
 
 
 
-// A auxilary function
+// A auxiliary function
 int ReportLastError()
 {
 	int	err = GetLastError();

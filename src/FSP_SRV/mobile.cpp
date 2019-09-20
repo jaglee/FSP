@@ -876,6 +876,8 @@ bool LOCALAPI CSocketItemEx::ValidateICC(FSP_NormalPacketHeader *p1, int32_t ctL
 bool CSocketItemEx::EmitStart()
 {
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->GetSendQueueHead();
+	if (!skb->IsComplete())
+		return false;
 	BYTE *payload = GetSendPtr(skb);
 	if(payload == NULL)
 	{

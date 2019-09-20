@@ -27,7 +27,7 @@ static unsigned char bufPrivateKey[CRYPTO_NACL_KEYBYTES];
 static char fileName[sizeof(TCHAR) * MAX_PATH + 4];
 static TCHAR finalFileName[MAX_PATH];
 
-// The signal that the mainloop is finished
+// The signal that the main loop is finished
 static bool finished;
 
 // Forward declarations
@@ -63,9 +63,9 @@ static void FSPAPI onError2(FSPHANDLE h, FSP_ServiceCode code, int value)
 int _tmain(int argc, TCHAR* argv[])
 {
 	int result = -1;
-	if (argc > 3 || argc == 3 && (argv[2][0] != _T('.') || _tcslen(argv[2]) > 1))
+	if (argc > 2)
 	{
-		_tprintf_s(_T("Usage: %s [<remote_fsp_url> [. ]]\n"), argv[0]);
+		_tprintf_s(_T("Usage: %s [<remote_fsp_url>]\n"), argv[0]);
 		goto l_bailout;
 	}
 
@@ -244,9 +244,6 @@ static void FSPAPI onReceiveFileNameReturn(FSPHANDLE h, FSP_ServiceCode resultCo
 #else
 	UTF8ToWideChars(finalFileName, MAX_PATH, fileName, strlen(fileName) + 1);
 #endif
-	// try to create a new file of the same name. if failed on error file already exists, 
-	// try to change the filename by append a 'C'[if it does not have suffix].
-	// if the new filename exceed MAX_PATH, confuscate the last character
 	_tprintf_s(_T("done.\nRemote filename: %s\n"), finalFileName);
 	try
 	{
@@ -361,7 +358,7 @@ static void FSPAPI onAcknowledgeSent(FSPHANDLE h, FSP_ServiceCode c, int r)
 
 
 
-// A auxilary function
+// A auxiliary function
 int ReportLastError()
 {
 	int	err = GetLastError();

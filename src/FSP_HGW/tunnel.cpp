@@ -52,7 +52,7 @@
   FSP tunnel request is directly passes via a clone connection
   The response is sent back via the clone connection of course.
 
-  The master connection is utilised to
+  The master connection is utilized to
   1.shutdown the clone connection gracefully
   2.accounting/report statistics
 
@@ -61,6 +61,8 @@
 RequestPool	requestPool;
 
 static bool FSPAPI onRequestArrived(FSPHANDLE, void *, int32_t, bool);
+
+static int ReportWSAError(char *);
 
 
 
@@ -120,7 +122,6 @@ bool FSPAPI onFSPDataAvailable(FSPHANDLE h, void * buf, int32_t len, bool eot)
 	if (pReq == NULL)
 	{
 		printf_s("Broken protocol pipe! Cannot get the request state related to the FSP socket.\n");
-		FreeRequestItem(pReq);
 		return false;
 	}
 	if (len < 0)
@@ -129,28 +130,23 @@ bool FSPAPI onFSPDataAvailable(FSPHANDLE h, void * buf, int32_t len, bool eot)
 		FreeRequestItem(pReq);
 		return false;
 	}
-	if (len == 0 && !eot)
-	{
-		printf_s("Broken protocol pipe! Payloadless block without EoT flag set is delivered?");
-		FreeRequestItem(pReq);
-		return false;
-	}
 
 #ifndef NDEBUG
 	printf_s("%d bytes received from the remote FSP peer\n", len);
 #endif
-	if (len == 0 && eot)
+	if (len == 0)
 		return true;
+
 #ifndef NDEBUG
 	if (pReq->countFSPreceived == 0)
-		printf_s("%.60s\n", (char *)buf);
+		printf_s("%.300s\n", (char *)buf);
 #endif
 	pReq->countFSPreceived += len;
 
 	int r = send(pReq->hSocket, (char *)buf, len, 0);
 	if (r < 0)
 	{
-		printf_s("Proxy transfer request failed with error number: %d\n", WSAGetLastError());
+		ReportWSAError("TCP side send error");
 		FreeRequestItem(pReq);
 		return false;
 	}
@@ -169,11 +165,13 @@ int FSPAPI toReadTCPData(FSPHANDLE h, void *buf, int32_t capacity)
 		return 0;
 
 	int n = recv(pReq->hSocket, (char *)buf, capacity, 0);
-	int r = WSAGetLastError();
-	if(n <= 0)
+	if (n <= 0)
 	{
 #ifndef NDEBUG
-		printf_s("Proxy TCP recv() returned %d\n", r);
+		if (n < 0)
+			ReportWSAError("TCP side receive error");
+		else
+			printf("TCP side: no further data available.\n");
 #endif
 		Shutdown(h, NULL);
 		FreeRequestItem(pReq, (n == 0));
@@ -181,12 +179,13 @@ int FSPAPI toReadTCPData(FSPHANDLE h, void *buf, int32_t capacity)
 	}
 
 #ifndef NDEBUG
-	printf_s("%d bytes read from the TCP end\n", n);
-	if(pReq->countTCPreceived == 0)
-		printf_s("%.60s\n", (char *)buf);
+	printf_s("%d bytes read from the TCP end, first 300 chars:\n", n);
+	if (pReq->countTCPreceived == 0)
+		printf_s("%.300s\n", (char*)buf);
 #endif
-	pReq->countTCPreceived += n;
 
+	pReq->countTCPreceived += n;
+	int r;
 	do
 	{
 		r = SendInline(h, buf, n, true, NULL);
@@ -311,4 +310,37 @@ static bool FSPAPI onRequestArrived(FSPHANDLE h, void *buf, int32_t len, bool eo
 	GetSendBuffer(h, toReadTCPData);
 
 	return false;	// do not chain the previous call-back function
+}
+
+
+
+// Given
+//	char *		The error message prefix string in multi-byte character set
+// Do
+//	Print the system message mapped to the last error to the standard output, prefixed by the given message prefix
+// Return
+//	the WSA error number, which is greater than zero. may be zero if no error at all.
+static int ReportWSAError(char * msg)
+{
+	int	err = WSAGetLastError();
+
+	printf("%s, error code = %d:\n", msg, err);
+
+	LPVOID lpMsgBuf;
+	if (FormatMessage(
+		FORMAT_MESSAGE_ALLOCATE_BUFFER |
+		FORMAT_MESSAGE_FROM_SYSTEM |
+		FORMAT_MESSAGE_IGNORE_INSERTS,
+		NULL,
+		err,
+		MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), // Default language
+		(LPTSTR)&lpMsgBuf,
+		0,
+		NULL))
+	{
+		printf("%s\n", (char *)lpMsgBuf);
+		LocalFree(lpMsgBuf);
+	}
+
+	return err;
 }

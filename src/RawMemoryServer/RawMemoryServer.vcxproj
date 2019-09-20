@@ -190,7 +190,6 @@
     <ClCompile Include="MemoryFile.cpp" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="defs.h" />
     <ClInclude Include="stdafx.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

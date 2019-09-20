@@ -327,7 +327,7 @@ void CSocketItemEx::Connect()
 
 // Send RESET to the remote peer to reject some request in pre-active state.
 // The RESET packet is not guaranteed to be received.
-// See also DisposeOnReset, Recycle
+// See also DisposeOnReset
 void CSocketItemEx::Reject(uint32_t reasonCode)
 {
 	CLowerInterface::Singleton.SendPrematureReset(reasonCode, this);

@@ -3,6 +3,33 @@
 
 #include "stdafx.h"
 
+// For test algorithm for generating KEEP_ALIVE packet in timer.cpp
+int32_t LOCALAPI CSocketItemExDbg::GenerateSNACK(FSP_KeepAliveExtension& buf3)
+{
+	register int n = (sizeof(buf3.snack.gaps) - sizeof(buf3.mp)) / sizeof(FSP_SelectiveNACK::GapDescriptor);
+	//^ keep the underlying IP packet from segmentation
+	register FSP_SelectiveNACK::GapDescriptor* gaps = buf3.snack.gaps;
+	ControlBlock::seq_t seq0;
+	n = pControlBlock->GetSelectiveNACK(seq0, gaps, n);
+	if (n < 0)
+		return n;
+	// buf3.snack.nEntries = n;
+
+	// Suffix the effective gap descriptors block with the FSP_SelectiveNACK
+	// built-in rule: an optional header MUST be 64-bit aligned
+	int len = int(sizeof(FSP_SelectiveNACK) + sizeof(buf3.snack.gaps[0]) * n);
+	FSP_SelectiveNACK* pSNACK = &buf3.snack.sentinel;
+	pSNACK->_h.opCode = SELECTIVE_NACK;
+	pSNACK->_h.mark = 0;
+	pSNACK->_h.length = htole16(uint16_t(len));
+	pSNACK->ackSeqNo = htole32(seq0);
+	pSNACK->latestSN = htole32(snLastRecv);
+	pSNACK->tLazyAck = htole32(uint32_t(NowUTC() - tLastRecv));
+
+	return (sizeof(buf3.hdr) + sizeof(buf3.mp) + len);
+}
+
+
 void UnitTestCRC()
 {
 	const ALFID_T nearFID = 4321;
@@ -96,12 +123,12 @@ void UnitTestICC()
 
 	pSCB->SetSendWindow(FIRST_SN);
 	socket.SetPairOfFiberID(nearFID, htobe32(LAST_WELL_KNOWN_ALFID));
-	socket.InstallEphemeralKey();	// initializtion
+	socket.InstallEphemeralKey();	// initialization
 	socket.InstallSessionKey(samplekey);
 
 	pCBR->SetRecvWindow(FIRST_SN);
 	socketR2.SetPairOfFiberID(htobe32(LAST_WELL_KNOWN_ALFID), nearFID);
-	socketR2.InstallEphemeralKey();	// initializtion
+	socketR2.InstallEphemeralKey();	// initialization
 	socketR2.InstallSessionKey(samplekey);
 
 	// So, the packet with FIRST_SN shall be calculated with CRC64
@@ -182,22 +209,22 @@ void UnitTestICC()
 	pCBR->recvWindowNextSN++;		// == FIRST_SN + 1
 
 	// See also: timer.cpp::KeepAlive
-	ControlBlock::seq_t seq0;
-	struct
-	{
-		FSP_FixedHeader			hdr;
-		FSP_PreparedKEEP_ALIVE	buf;
-	} mp;
-	int sizeSNACK = socketR2.GenerateSNACK(mp.buf, seq0, sizeof(FSP_NormalPacketHeader));
-	uint32_t salt = mp.buf.sentinel.serialNo;
-	printf_s("Size of the SNACK header = %d, expected SN = %u, salt=0x%X\n", sizeSNACK, seq0, salt);
+	FSP_KeepAliveExtension mp;
+	int offset = socket.GenerateSNACK(mp);
 
-	mp.hdr.Set(KEEP_ALIVE, sizeSNACK, FIRST_SN + 1, seq0, 0);
+	mp.hdr.Set(KEEP_ALIVE, offset, FIRST_SN + 1, ++socket.nextOOBSN, 0);
 	mp.hdr.ClearFlags();
 	mp.hdr.SetRecvWS(socket.pControlBlock->GetAdvertisableRecvWin());
-	socket.SetIntegrityCheckCode(& mp.hdr, NULL, 0, salt);
 
-	checked = socketR2.ValidateICC(& mp.hdr, 0, socket.fidPair.source, salt);
+	uint32_t salt = socket.GetSalt(mp.hdr);
+	printf_s("Size of all the headers = %d, salt=0x%X\n", offset, salt);
+
+	int extLen = offset - sizeof(mp.hdr);
+	void* buf = socket.SetIntegrityCheckCode(&mp.hdr, &mp.mp, extLen, salt);
+	assert(buf != NULL);
+	// test in-place decipher of the extension header
+	memcpy(&mp.mp, buf, extLen);
+	checked = socketR2.ValidateICC(&mp.hdr, extLen, socket.fidPair.source, salt);
 	assert(checked);
 	// assert(socket.fidPair.source == socketR2.fidPair.peer);
 }
@@ -236,12 +263,12 @@ void UnitTestHMAC()
 
 	pSCB->SetSendWindow(FIRST_SN);
 	socket.SetPairOfFiberID(nearFID, htobe32(LAST_WELL_KNOWN_ALFID));
-	socket.InstallEphemeralKey();	// initializtion
+	socket.InstallEphemeralKey();	// initialization
 	socket.InstallSessionKey(samplekey);
 
 	pCBR->SetRecvWindow(FIRST_SN);
 	socketR2.SetPairOfFiberID(htobe32(LAST_WELL_KNOWN_ALFID), nearFID);
-	socketR2.InstallEphemeralKey();	// initializtion
+	socketR2.InstallEphemeralKey();	// initialization
 	pCBR->recvWindowNextSN++;		// == FIRST_SN + 1
 	socketR2.InstallSessionKey(samplekey);
 
@@ -308,28 +335,27 @@ void UnitTestHMAC()
 	skb1->ReInitMarkComplete();
 
 	// See also: timer.cpp::KeepAlive
-	ControlBlock::seq_t seq0;
-	struct
-	{
-		FSP_FixedHeader			hdr;
-		FSP_PreparedKEEP_ALIVE	buf;
-	} mp;
-	int sizeSNACK = socketR2.GenerateSNACK(mp.buf, seq0, sizeof(FSP_NormalPacketHeader));
-	uint32_t salt = mp.buf.sentinel.serialNo;
-	printf_s("Size of the SNACK header = %d, expected SN = %u, salt=0x%X\n", sizeSNACK, seq0, salt);
+	FSP_KeepAliveExtension mp;
+	int offset = socketR2.GenerateSNACK(mp);
 
 	mp.hdr.hs.opCode = KEEP_ALIVE;
 	mp.hdr.hs.major = THIS_FSP_VERSION;
-	mp.hdr.hs.offset = htobe16(sizeof(FSP_NormalPacketHeader) + sizeSNACK);
+	mp.hdr.hs.offset = htobe16(offset);
 	mp.hdr.ClearFlags();
-	socket.SetSequenceAndWS(&mp.hdr, pSCB->sendWindowNextSN);
-	//
-	socketR2.SetIntegrityCheckCode(&mp.hdr, NULL, 0, salt);
+	socketR2.SetSequenceAndWS(&mp.hdr, pSCB->sendWindowNextSN);
+	mp.hdr.expectedSN = htobe32(++socket.nextOOBSN);
 
-	checked = socket.ValidateICC(&mp.hdr, 0, socketR2.fidPair.source, salt);
+	uint32_t salt = socketR2.GetSalt(mp.hdr);
+	printf_s("Size of all the headers = %d, salt=0x%X\n", offset, salt);
+	//
+	int extLen = offset - sizeof(mp.hdr);
+	buf = socketR2.SetIntegrityCheckCode(&mp.hdr, &mp.mp, extLen, salt);
+	assert(buf != NULL);
+
+	checked = socket.ValidateICC(&mp.hdr, extLen, socketR2.fidPair.source, salt);
 	assert(checked);
 
-	checked = socket.ValidateICC(&mp.hdr, 0, socket.fidPair.peer, salt);
+	checked = socket.ValidateICC(&mp.hdr, extLen, socket.fidPair.peer, salt);
 	assert(checked);
 }
 

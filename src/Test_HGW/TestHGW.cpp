@@ -67,14 +67,22 @@ int main()
 	}
 
 	// char *getURI = "OPTIONS * HTTP/1.1\r\n" // Not supported by the remote end?
-	//char *getURI = "GET / HTTP/1.1\r\n"
+	char *getURI = "GET / HTTP/1.1\r\n"
+		"Accept: text/html, application/xhtml+xml, image/jxr\r\n"
+		"Accept-Encoding: gzip, deflate\r\n"
+		"Accept-Language: en-US, en; q=0.8, zh-Hans-CN; q=0.5, zh-Hans; q=0.3\n"
+		"Connection: Keep-Alive\r\n"
+		"DNT: 1\r\n"
+		"Host: news.qq.com\r\n"
+		"User-Agent: Mozilla/5.0 (compatible; MSIE 10.0; Windows NT 6.2; Trident/6.0)\r\n"
+		"\r\n";
 	//	"Host: news.qq.com\r\n"
 	//	"\r\n";
-	char *getURI = "GET /cdn_djl.js HTTP/1.1\r\n"
-		"Host: jsqmt.qq.com\r\n"
-		"Accept: application/javascript,*/*;q=0.8\r\n"
-		"Referer:http://news.qq.com\r\n"
-		"\r\n";
+	//char *getURI = "GET /cdn_djl.js HTTP/1.1\r\n"
+	//	"Host: jsqmt.qq.com\r\n"
+	//	"Accept: application/javascript,*/*;q=0.8\r\n"
+	//	"Referer:http://news.qq.com\r\n"
+	//	"\r\n";
 	// Cookie, User-Agent, Accept-Language were not sent
 	r = send(h, getURI, strlen(getURI), 0);
 	if(r == SOCKET_ERROR)

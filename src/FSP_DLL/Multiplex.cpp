@@ -45,7 +45,7 @@
 //	which indicate some error has happened.
 //	See also SendStream, FinalizeSend
 DllExport
-FSPHANDLE FSPAPI MultiplyAndWrite(FSPHANDLE hFSP, PFSP_Context psp1, int8_t flag, NotifyOrReturn fp1)
+FSPHANDLE FSPAPI MultiplyAndWrite(FSPHANDLE hFSP, PFSP_Context psp1, unsigned flag, NotifyOrReturn fp1)
 {
 	CommandCloneConnect objCommand;
 	CSocketItemDl *p = CSocketItemDl::ToPrepareMultiply(hFSP, psp1, objCommand);
@@ -168,7 +168,7 @@ CSocketItemDl * LOCALAPI CSocketItemDl::ToPrepareMultiply(FSPHANDLE h, PFSP_Cont
 
 
 inline
-FSPHANDLE LOCALAPI CSocketItemDl::WriteOnMultiplied(CommandCloneConnect &objCommand, PFSP_Context psp1, int8_t flag, NotifyOrReturn fp1)
+FSPHANDLE LOCALAPI CSocketItemDl::WriteOnMultiplied(CommandCloneConnect &objCommand, PFSP_Context psp1, unsigned flag, NotifyOrReturn fp1)
 {
 	TestSetSendReturn(fp1);
 	if (psp1->welcome != NULL)

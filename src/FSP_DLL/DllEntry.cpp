@@ -448,16 +448,14 @@ void CSocketItemDl::WaitEventToDispatch()
 				fp1 = NULL;
 				if (InState(COMMITTED) || GetState() >= CLOSABLE)
 					fp1 = (NotifyOrReturn)InterlockedExchangePointer((PVOID *)& fpCommitted, fp1);
-				CancelTimeout();// If any
 				SetMutexFree();
 				if (fp1 != NULL)
 					fp1(this, FSP_NotifyFlushed, 0);
 			}
 			break;
 		case FSP_NotifyToFinish:
+			// RELEASE implies both NULCOMMIT and ACK_FLUSH, any way call back of shutdown takes precedence 
 			// See also @LLS::OnGetRelease
-			s0 = GetState();
-			SetState(CLOSED);
 			if(initiatingShutdown)
 			{
 				fp1 = fpFinished;
@@ -467,15 +465,12 @@ void CSocketItemDl::WaitEventToDispatch()
 			}
 			else
 			{
-#ifndef NDEBUG
-				printf_s("Fiber#%u, reactive shutdown pended in state %s[%d]\n"
-					, this->fidPair.source, stateNames[s0], s0);
-				// ULA shall eventually call shutdown or dispose
-#endif
-				if (s0 == COMMITTING || s0 == COMMITTED)
-					ProcessReceiveBuffer();	// SetMutexFree();
-				else
-					SetMutexFree();
+				fp1 = fpFinished;
+				if(fp1 == NULL)
+					fp1 = (NotifyOrReturn)InterlockedExchangePointer((PVOID*)& fpCommitted, NULL);
+				ProcessReceiveBuffer();	// SetMutexFree();
+				if (fp1 != NULL)
+					fp1(this, FSP_NotifyToFinish, 0);
 			}
 			break;
 		case FSP_NotifyRecycled:
@@ -724,7 +719,6 @@ CSocketItemDl *	CSocketDLLTLB::HandleToRegisteredSocket(FSPHANDLE h)
 CSocketDLLTLB::CSocketDLLTLB()
 {
 	InitializeSRWLock(& srwLock);
-	countAllItems = 0;
 	sizeOfWorkSet = 0;
 	head = tail = NULL;
 }
@@ -740,50 +734,57 @@ CSocketItemDl * CSocketDLLTLB::AllocItem()
 	AcquireSRWLockExclusive(& srwLock);
 
 	CSocketItemDl * item = NULL;
-	// Firstly, make it easy to be searched linearly
-	if(sizeOfWorkSet >= MAX_CONNECTION_NUM)
+	// Compress the array of pointers of allocated sockets
+	if (sizeOfWorkSet >= MAX_CONNECTION_NUM)
 	{
-		for(register int i = 0; i < sizeOfWorkSet; i++)
-		{
-			register int j = 0;
-			while(! pSockets[i + j]->inUse)	// UNRESOLVED!?
-				j++;
-			if(j == 0)
-				continue;
-			//
-			sizeOfWorkSet -= j;
-			for(register int k = i; k < sizeOfWorkSet; k++)
-			{
-				pSockets[k] = pSockets[k + j];
-			}
-		}
-		//
-		if(sizeOfWorkSet >= MAX_CONNECTION_NUM)
+		register int n = sizeOfWorkSet;
+		register int i, j, k;
+
+		for (i = 0; i < n && pSockets[i]->inUse; i++)
+			;
+		if (i >= n)
 			goto l_bailout;
+		// 0 to i, left inclusively, right exclusively, index socket in use, compressively
+		for (j = i + 1; ; j = k + 1)
+		{
+			for (; j < n && !pSockets[j]->inUse; j++)
+				;
+			// i to j, left inclusively, right exclusively, index socket free
+			if (j >= n)
+				break;
+			//
+			for (k = j + 1; k < n && pSockets[k]->inUse; k++)
+				;
+			// j to k, left inclusively, right exclusively, index socket in use
+			memmove(pSockets + i, pSockets + j, sizeof(pSockets[0]) * (k - j));
+			i += k - j;
+			// on exit the loop totally at most (n - 1) items were moved 
+			if (k >= n)
+				break;
+		}
+		sizeOfWorkSet = i;
 	}
 
-	if(countAllItems < MAX_CONNECTION_NUM * 3)
+	if (countAllItems < MAX_CONNECTION_NUM)
 	{
 		item = new CSocketItemDl();
-		if(item == NULL)
-			goto l_bailout;	// return NULL; // assert: header == NULL);
-		//
+		if (item == NULL)
+			goto l_bailout;	// return NULL;
 		countAllItems++;
 	}
 	else
 	{
 		item = head;
-		if(item == NULL)
-			goto l_bailout;	// return NULL; // assert: header == NULL);
-		//
+		if (item == NULL)
+			goto l_bailout;	// return NULL;
 		head = item->next;
-		if(head != NULL)
+		if (head != NULL)
 			head->prev = NULL;
 		else
 			tail = NULL;
 	}
 
-	memset((BYTE *)item + sizeof(CSocketItem)
+	memset((octet *)item + sizeof(CSocketItem)
 		, 0
 		, sizeof(CSocketItemDl) - sizeof(CSocketItem));
 	pSockets[sizeOfWorkSet++] = item;

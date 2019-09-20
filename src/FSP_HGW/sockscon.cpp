@@ -53,12 +53,12 @@
 
 /*
  *
- *	TODO: download the whitelist
+ *	TODO: download the white list
  *
 	Process
-	### IPv4: check ruleset
-	white - list : direct FSP / IPv6 access(TCP / IPv4->FSP / IPv6, transmit via SOCKS)
-	not in the white - list: FSP - relay
+	### IPv4: check rule set
+	white list : direct FSP / IPv6 access(TCP / IPv4->FSP / IPv6, transmit via SOCKS)
+	not in the white list: FSP - relay
 	{ /// UNRESOLVED! As a transit method:
 	if not in white - list, try search PTR, [DnsQuery], if get the _FSP exception - list: direct connect
 	}
@@ -108,6 +108,7 @@ static void FSPAPI onCHAKASRReceived(FSPHANDLE, FSP_ServiceCode, int);
 static bool	FSPAPI onResponseReceived(FSPHANDLE, void *, int32_t, bool);
 
 // for child connection
+static void FSPAPI onRelease(FSPHANDLE, FSP_ServiceCode, int);
 static void FSPAPI onSubrequestSent(FSPHANDLE, FSP_ServiceCode, int);
 
 // Client-to SOCKS4 service interface
@@ -187,7 +188,7 @@ void ToServeSOCKS(char *nameAppLayer, int port)
 	int len = sprintf_s(tunnelRequest, sizeof(tunnelRequest), "TUNNEL %s HTTP/1.0\r\n", nameAppLayer);
 	if(len < 0)
 	{
-		printf_s("Invalid name of remote tunnel server end-poine: %s\n", nameAppLayer);
+		printf_s("Invalid name of remote tunnel server end-point: %s\n", nameAppLayer);
 		return;
 	}
 	Sleep(2000);	// wait for the remote tunnel end ready
@@ -208,7 +209,7 @@ void ToServeSOCKS(char *nameAppLayer, int port)
 
 	// synchronous mode
 	if (parms.onAccepted == NULL)
-		onConnected(hClientMaster, GetFSPContext(hClientMaster, &parms));
+		onConnected(hClientMaster, GetFSPContext(hClientMaster));
 
 	//
 	if(! requestPool.Init(MAX_WORKING_THREADS))
@@ -378,17 +379,17 @@ TpWorkCallBack(PTP_CALLBACK_INSTANCE Instance, PVOID parameter, PTP_WORK Work)
         return;
     }
 
-	// the implicit ruleset says that only socks version 4a supported
+	// the implicit rule says that only socks version 4a supported
 	if(req.version != SOCKS_VERSION)
 	{
-        printf_s("%d: unsupport version\n", req.version);
+        printf_s("%d: unsupported version\n", req.version);
 		requestPool.FreeItem(p);
 		ReportErrorToClient(client, REP_REJECTED);
 		return;
 	}
 	if(req.cmd != SOCKS_CMD_CONNECT)
 	{
-        printf_s("%d: unsupport command\n", req.version);
+        printf_s("%d: unsupported command\n", req.version);
 		requestPool.FreeItem(p);
 		ReportErrorToClient(client, REP_REJECTED);
 		return;
@@ -481,7 +482,6 @@ static void FSPAPI onError(FSPHANDLE h, FSP_ServiceCode code, int value)
 		printf_s("Fatal IPC %d, error %d encountered in the session with the tunnel server.\n", code, value);
 		closesocket(hListener);	// And thus the main loop would be aborted
 	}
-	return;
 }
 
 
@@ -493,17 +493,40 @@ static int	FSPAPI  onConnected(FSPHANDLE h, PFSP_Context ctx)
 {
 	printf_s("\nConnecting to remote FSP SOCKS tunnel server...");
 	if (h == NULL)
+	{
 		Abort("\n\tConnection failed.\n");
-	printf_s("Handle of FSP session : %p\n", h);
+		return -1;
+	}
+	printf_s("Handle of FSP session : %p, error flag: %X\n", h, ctx->flags);
 
-	int mLen = strlen((const char *)ctx->welcome) + 1;
-	printf_s("Welcome message received: %s\n", (const char *)ctx->welcome);
+	int32_t recvSize;
+	bool eot;
+	char* msg = (char*)TryRecvInline(h, &recvSize, &eot);
+
+	if (msg == NULL || !eot)
+	{
+		Abort("\nApplication Protocol Broken: server does not welcome new connection?!\n");
+		return -1;
+	}
+
+	register int i = 0;
+	while (i < recvSize)
+	{
+		if (msg[i++] == 0)
+			break;
+	}
+	if (recvSize - i != CRYPTO_NACL_KEYBYTES)
+	{
+		Abort("\nApplication Protocol Broken: server does not provide public key.\n");
+		return -1;
+	}
+	printf_s("Welcome message received: %s\n", msg);
 
 	InitCHAKAClient(chakaPubInfo, bufPrivateKey);
-	memcpy(chakaPubInfo.peerPublicKey, (const char *)ctx->welcome + mLen, CRYPTO_NACL_KEYBYTES);
+	memcpy(chakaPubInfo.peerPublicKey, msg + i, CRYPTO_NACL_KEYBYTES);
 
 	WriteTo(h, chakaPubInfo.selfPublicKey, sizeof(chakaPubInfo.selfPublicKey), 0, NULL);
-	WriteTo(h, & chakaPubInfo.clientNonce, sizeof(chakaPubInfo.clientNonce), 0, NULL);
+	WriteTo(h, &chakaPubInfo.clientNonce, sizeof(chakaPubInfo.clientNonce), 0, NULL);
 	// And suffixed with the client's identity
 
 	char userName[80];
@@ -518,7 +541,7 @@ static int	FSPAPI  onConnected(FSPHANDLE h, PFSP_Context ctx)
 	octet buf[MAX_PATH];
 	// assert(strlen(theUserId) + 1 <= sizeof(buf));
 	CryptoNaClGetSharedSecret(bufSharedKey, chakaPubInfo.peerPublicKey, bufPrivateKey);
-	ChakaStreamcrypt(buf, (octet *)userName, nBytes, chakaPubInfo.clientNonce, bufSharedKey);
+	ChakaStreamcrypt(buf, (octet*)userName, nBytes, chakaPubInfo.clientNonce, bufSharedKey);
 	WriteTo(h, buf, nBytes, TO_END_TRANSACTION, NULL);
 
 	ReadFrom(h, chakaPubInfo.salt, sizeof(chakaPubInfo.salt), onCHAKASRReceived);
@@ -547,7 +570,7 @@ static void FSPAPI onCHAKASRReceived(FSPHANDLE h, FSP_ServiceCode c, int r)
 	if(! CHAKAResponseByClient(chakaPubInfo, clientInputHash, clientResponse))
 	{
 		Dispose(h);
-		Abort("Server authencation error.\n");
+		Abort("Server authentication error.\n");
 	}
 
 	WriteTo(h, clientResponse, sizeof(clientResponse), TO_END_TRANSACTION, NULL);
@@ -619,8 +642,31 @@ static void FSPAPI onSubrequestSent(FSPHANDLE h, FSP_ServiceCode c, int value)
 	}
 	//
 	p->hFSP = h;
+	SetOnRelease(h, onRelease);
 	RecvInline(h, onFSPDataAvailable);
 	GetSendBuffer(h, toReadTCPData);
+}
+
+
+
+// The call back function on passive shutdown of the connection
+static void FSPAPI onRelease(FSPHANDLE h, FSP_ServiceCode code, int value)
+{
+	PRequestPoolItem p = (PRequestPoolItem)GetExtPointer(h);
+	if (p == NULL)
+	{
+		Dispose(h);
+		return;
+	}
+	if (p->hSocket == INVALID_SOCKET)
+	{
+		requestPool.FreeItem(p);
+		Dispose(h);
+		return;
+	}
+	CloseGracefully(p->hSocket);
+	requestPool.FreeItem(p);
+	Dispose(h);
 }
 
 

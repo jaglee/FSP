@@ -79,11 +79,11 @@ typedef enum
 } FSP_ControlCode;
 
 
-typedef enum: uint8_t
+enum FSP_SendOption
 {
 	TO_END_TRANSACTION = 0x80,
 	TO_COMPRESS_STREAM = 0x40,
-} FSP_SendOption;
+};
 
 
 #ifdef __cplusplus
@@ -239,9 +239,7 @@ FSPHANDLE FSPAPI Connect2(const char *, PFSP_Context);
 // given
 //	the handle of the FSP socket whose connection is to be duplicated,
 //	the pointer to the socket parameter
-//	int8_t	
-//		0:		do not terminate the transmit transaction
-//		EOF:	terminate the transaction
+//	the send options (TO_END_TRANSACTION, TO_COMPRESS_STREAM)
 //	NotifyOrReturn	the callback function pointer
 // return
 //	the handle of the new created socket
@@ -249,7 +247,7 @@ FSPHANDLE FSPAPI Connect2(const char *, PFSP_Context);
 // remark
 //	The handle returned might be useless, if CallbackConnected report error later
 DllSpec
-FSPHANDLE FSPAPI MultiplyAndWrite(FSPHANDLE, PFSP_Context, int8_t, NotifyOrReturn);
+FSPHANDLE FSPAPI MultiplyAndWrite(FSPHANDLE, PFSP_Context, unsigned, NotifyOrReturn);
 
 
 // given
@@ -427,6 +425,22 @@ DllSpec
 int FSPAPI Flush(FSPHANDLE);
 
 
+
+// Given
+//	FSPHANDLE		the FSP socket
+//	NotifyOrReturn	the function pointer for call back
+// Do
+//	Set the function to be called back on passively shutdown by the remote end
+// Return
+//	0 if no error
+//	EAGAIN if the socket has already been shut down
+// Remark
+//	The pointer of the callback function CANNOT be null
+DllSpec
+int FSPAPI SetOnRelease(FSPHANDLE, NotifyOrReturn);
+
+
+
 // Given
 //	FSPHANDLE		the FSP socket
 //	NotifyOrReturn	the function pointer for call back
@@ -434,7 +448,7 @@ int FSPAPI Flush(FSPHANDLE);
 //	EAGAIN warning if the connection is already in the progress of shutdown
 //	ETIMEOUT warning if the connection is already CLOSABLE but fails to migrate to CLOSED state timely
 //	0 if no error
-//	-EBUSY if it is still committting while the function is called in blocking mode
+//	-EBUSY if it is still committing while the function is called in blocking mode
 //	-EDEADLK if no mutual-exclusive lock available
 //	-EDOM if the peer has not committed the transmit transaction at first
 //	-EFAULT if internal resource error encountered, typical time-out clock unavailable
@@ -446,6 +460,7 @@ int FSPAPI Shutdown(FSPHANDLE, NotifyOrReturn);
 
 
 // return 0 if no zero, negative if error, positive if warning
+// expect to call back onError(), to facilitate error handling
 DllSpec
 int FSPAPI Dispose(FSPHANDLE hFSPSocket);
 
@@ -453,7 +468,7 @@ int FSPAPI Dispose(FSPHANDLE hFSPSocket);
 // Given
 //	PFSP_IN6_ADDR	the place holder of the output FSP/IPv6 address
 //	uint32_t		the 32-bit integer representation of the IPv4 address to be translated
-//	ULTID_T			the upper layer thread ID/application layer fiber ID, in neutral byte order
+//	ULTID_T			the upper layer thread ID/application layer fiber ID, in network byte order
 // Return
 //	the pointer to the place holder of host-id which might be set/updated later
 // Remark
@@ -471,6 +486,10 @@ int FSPAPI FSPControl(FSPHANDLE, FSP_ControlCode, ulong_ptr);
 // A shortcut for FSPControl(FSPHANDLE, FSP_GET_EXT_POINTER, ...);
 DllSpec
 void * FSPAPI GetExtPointer(FSPHANDLE);
+
+
+DllSpec
+PFSP_Context FSPAPI GetFSPContext(FSPHANDLE);
 
 
 DllSpec

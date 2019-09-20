@@ -42,7 +42,7 @@ static void FSPAPI onSignatureSent(FSPHANDLE hRev, FSP_ServiceCode c, int r)
 
 
 
-// The sub-toplevel function that inaugurate connection multipliction
+// The sub-top level function that inaugurate connection multiplication
 void StartToSendSignature(FSPHANDLE h)
 {
 	r2Finish = false;	// there IS a reverse socket so we may not assume it is finished

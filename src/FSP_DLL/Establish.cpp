@@ -313,7 +313,7 @@ CSocketItemDl * CSocketItemDl::PrepareToAccept(BackLogItem & backLog, CommandNew
 // Remark
 //	As the connection context is yet to be prepared further, context.onAccepting MAYNOT read or write anything
 //	Here there is not a protocol limitation but an API enforced limitation:
-//	prepared welcome message MUST fit into the preallcated send buffer
+//	prepared welcome message MUST fit into the preallocated send buffer
 //	See also PrepareToSend
 //	Attention please! ULA MAY NOT send data onAccepting!
 bool LOCALAPI CSocketItemDl::ToWelcomeConnect(BackLogItem & backLog)
@@ -328,7 +328,7 @@ bool LOCALAPI CSocketItemDl::ToWelcomeConnect(BackLogItem & backLog)
 		return false;
 	}
 	//
-	memcpy(&pControlBlock->connectParams, &backLog, FSP_MAX_KEY_SIZE);
+	memcpy(&pControlBlock->connectParams, &backLog, FSP_MAX_KEY_SIZE + FSP_TAG_SIZE);
 	//^following fields are filled later
 	//
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend();

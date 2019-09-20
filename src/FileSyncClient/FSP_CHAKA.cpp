@@ -32,9 +32,9 @@
 //		Suppose salted_password = HASH(salt | registered password)
 //		Response: HASH(salted_password | HASH((C's public key, C's timestamp) XOR S's random(repeated))))
 //	[C get the shared secret][hmac_sm3(salted_password, Curve25519-shared secret)]
-//	C --> S, [PERSIST]: C's reponse to the S's challenge
+//	C --> S, [PERSIST]: C's response to the S's challenge
 //		Let salted_input_password = HASH(salt | inputted password)
-//		Reponse: HASH(salted_input_password | HASH((S's public key, S's timestamp) XOR S's random(repeated)))
+//		Response: HASH(salted_input_password | HASH((S's public key, S's timestamp) XOR S's random(repeated)))
 //	[S get the shared secret][hmac_sm3(salted_password, Curve25519-shared secret)]
 // UNERSOLVED! Put client's identity for hashing? [/Signature: certificate is out-of-band]
 // Not bothered to apply RFC8018 PKCS #5: Password-Based Cryptography Specification
@@ -50,7 +50,7 @@
 #include "../FSP_API.h"
 #include "../Crypto/CHAKA.h"
 
-// Forward declaration of an auxilary function
+// Forward declaration of an auxiliary function
 int ReportLastError();
 
 const char *	theUserId = "FSP_Sciter";
@@ -131,18 +131,29 @@ static int	FSPAPI  onConnected(FSPHANDLE h, PFSP_Context ctx)
 		return -1;
 	}
 
-	int32_t mLen;
+	int32_t count;
 	bool flag;
-	const char* msg = (char*)TryRecvInline(h, &mLen, &flag);
+	const char* msg = (char*)TryRecvInline(h, &count, &flag);
 	if (msg == NULL)
 	{
 		printf_s("\n\tProtocol broken.\n");
 		finalize();
 		return -1;
 	}
-	printf_s("\tWelcome message length: %d\n", mLen);
+	printf_s("\tWelcome message size: %d\n", count);
+
+	// protect against buffer overflow attack which may take the service crash
+	int32_t mLen = 0;
+	while (mLen < count && msg[mLen++] != 0)
+		;
+	// mLen = (int32_t)strlen(msg) + 1;
+	if(mLen + CRYPTO_NACL_KEYBYTES != count)
+	{
+		printf_s("\n\tProtocol broken: public key does not follow the welcome.\n");
+		finalize();
+		return -1;
+	}
 	printf_s("%s\n", msg);
-	mLen = (int32_t)strlen(msg) + 1;
 
 	InitCHAKAClient(chakaPubInfo, bufPrivateKey);
 	memcpy(chakaPubInfo.peerPublicKey, msg + mLen, CRYPTO_NACL_KEYBYTES);
@@ -377,4 +388,5 @@ static void FSPAPI onAcknowledgeSent(FSPHANDLE h, FSP_ServiceCode c, int r)
 		printf_s("Cannot shutdown gracefully in the final stage, error#: %d\n", r);
 		Dispose(h);
 	}
+	finalize();
 }

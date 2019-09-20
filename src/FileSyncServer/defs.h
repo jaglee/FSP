@@ -1,6 +1,6 @@
 /**
  * Predefinitions of the callback functions in FileSyncServer.
- * Shared configurational globals are defined here as well
+ * Shared configuration globals are defined here as well
  */
 #include <tchar.h>
 #include "../FSP_API.h"
@@ -23,7 +23,7 @@ extern void StartToSendSignature(FSPHANDLE h);
 extern int	FSPAPI ServiceSAWS_onAccepted(FSPHANDLE, PFSP_Context);
 extern int	FSPAPI SendOneFile_onAccepted(FSPHANDLE, PFSP_Context);
 
-// Branch auxilary functions
+// Branch auxiliary functions
 extern bool	PrepareServiceSAWS(LPCTSTR);
 
 // Shared call-backs

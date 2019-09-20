@@ -8,7 +8,6 @@ extern const char* defaultWelcome;
 extern unsigned char	bufPeerPublicKey[CRYPTO_NACL_KEYBYTES];
 extern unsigned char	bufPrivateKey[CRYPTO_NACL_KEYBYTES];
 
-extern volatile bool	toMultiply;
 extern volatile bool	finished;
 extern volatile	bool	r2Finish;
 
@@ -52,7 +51,10 @@ static int FSPAPI toSendNextBlock(FSPHANDLE h, void * batchBuffer, int32_t capac
 	printf_s("To send %d bytes to the remote end. %llu bytes have been sent before.\n", nToSend, nPrepared);
 	nPrepared += nToSend;
 
-	return SendInline(h, batchBuffer, nToSend, (nPrepared >= nRequested), NULL);
+	int r = SendInline(h, batchBuffer, nToSend, (nPrepared >= nRequested), NULL);
+	if (nPrepared >= nRequested)
+		Shutdown(h, NULL);
+	return r;
 }
 
 

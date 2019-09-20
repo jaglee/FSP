@@ -67,7 +67,7 @@ typedef ALFID_T	 ULTID_T;
 
 #define MAX_PHY_INTERFACES	4	// maximum number of physical interfaces that might be multihomed
 
-//	As recommmended in NIST SP800-38d, if maximum combined length of the ciphertext and AAD in a single packet
+//	As recommended in NIST SP800-38d, if maximum combined length of the ciphertext and AAD in a single packet
 //	is 2^15 octets, maximum invocations of authenticated decryption function shall be limited to 2^32
 //	if a single packet size limit is 2^17, invocations shall be limited to 2^29 for 64 bit tags
 //	As an FSP packet may not exceed 2^16 octets, and because out-of-band packet consume invocation space as well
@@ -155,6 +155,8 @@ typedef enum _FSP_Session_State: char
 	COMMITTING2,
 	// after getting the peer's EoT flag in the COMMITTED state, or ACK_FLUSH in the COMMITTING2 state
 	CLOSABLE,
+	// passive close of connection
+	SHUT_REQUESTED,
 	// asymmetrically shutdown
 	PRE_CLOSED,
 	// after ULA shutdown the connection in CLOSABLE state gracefully
@@ -390,8 +392,9 @@ struct FSP_NormalPacketHeader
 struct FSP_SelectiveNACK
 {
 	struct FSP$OptionalHeader _h;
-	uint32_t		serialNo;
-	uint64_t		tLazyAck;	// delay time of the lazy acknowledgement, in microseconds
+	uint32_t		ackSeqNo;
+	uint32_t		latestSN;
+	uint32_t		tLazyAck;	// delay time of the lazy acknowledgement, in microseconds
 	struct GapDescriptor
 	{
 		uint32_t	gapWidth;	// in packets

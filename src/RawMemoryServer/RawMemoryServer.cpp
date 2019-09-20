@@ -1,8 +1,6 @@
 /**
-  Usage 1, transfer non-encrypted memory patterns to the remote end on request: <FileSyncServer>
-  Usage 2, transfer an encrypted memory pattern to the remot end: <FileSyncServer> $memory.^ [length-of-memory-pattern]
-  Usage 3, transfer the name and content of a given file: <FileSyncServer> filename
-  Usage 4, act as the prototyped file server for the Simple Artcrafted Web Site in the given work path: <FileSyncServer> pathname 
+  Usage 1, transfer non-encrypted memory patterns to the remote end on request: <RawMemoryServer>
+  Usage 2, transfer encrypted memory pattern to the remote end: <RawMemoryServer> $memory.^ [length-of-memory-pattern]
  **/
 // If compiled in Debug mode with the '_DEBUG' macro predefined by default, it tests FSP over UDP/IPv4
 // If compiled in Release mode, or anyway without the '_DEBUG' macro predefined, it tests FSP over IPv6
@@ -120,7 +118,7 @@ int _tmain(int argc, TCHAR * argv[])
 	memcpy(thisWelcome, defaultWelcome, mLen);
 	CryptoNaClKeyPair(bufPublicKey, bufPrivateKey);
 
-	if(argc == 2)
+	if(argc == 3)
 	{
 		size_t sizeOfBuffer = (size_t)_ttoi64(argv[2]);
 		if(sizeOfBuffer < 4)

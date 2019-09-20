@@ -139,6 +139,23 @@ bool FSPAPI HasReadEoT(FSPHANDLE hFSPSocket)
 }
 
 
+
+DllSpec
+PFSP_Context FSPAPI GetFSPContext(FSPHANDLE hFSPSocket)
+{
+	try
+	{
+		CSocketItemDl* pSocket = (CSocketItemDl*)hFSPSocket;
+		return pSocket->GetFSPContext();
+	}
+	catch (...)
+	{
+		return false;
+	}
+}
+
+
+
 DllSpec
 int FSPAPI GetProfilingCounts(FSPHANDLE hFSPSocket, PSocketProfile pSnap)
 {

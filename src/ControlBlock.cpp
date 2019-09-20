@@ -98,8 +98,9 @@ const char * CStringizeState::names[LARGEST_FSP_STATE + 1] =
 	"COMMITTING2",
 	// after getting all packet-in-flight acknowledged and having received peer's FLUSH and the FLUSH is acknowledgeable
 	"CLOSABLE",
-	// after ULA shutdown the connection in CLOSABLE state gracefully
-	// it isn't a pseudo-state alike TCP, but a physical, resumable/reusable state
+	// passive close of connection
+	"SHUT_REQUESTED",
+	// asymmetric initiative shutdown
 	"PRE_CLOSED",
 	// after ULA shutdown the connection in CLOSABLE state gracefully
 	// it isn't a pseudo-state alike TCP, but a physical, resumable/reusable state
@@ -836,7 +837,7 @@ int LOCALAPI ControlBlock::DealWithSNACK(seq_t expectedSN, FSP_SelectiveNACK::Ga
 		// Make acknowledgement
 		while (nAck-- > 0)
 		{
-			p->MarkAcked();	// might be redundant, but it is safe
+			p->marks |= FSP_BUF_ACKED;	// might be redundant, but it is safe
 			//
 			if (++iHead - sendBufferBlockN >= 0)
 			{

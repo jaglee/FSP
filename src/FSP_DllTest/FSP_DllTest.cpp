@@ -1004,8 +1004,55 @@ void UnitTestCompressAndDecode()
 
 
 
+void UnitTestAllocAndFreeItem()
+{
+	CSocketItemDl *p, *p1, *p2;
+	register int i;
+	for (i = 0; i < MAX_CONNECTION_NUM / 3; i++)
+	{
+		p = CSocketItemDl::socketsTLB.AllocItem();
+		assert(p != NULL);
+	}
+	p1 = p;
+	for (; i < MAX_CONNECTION_NUM * 2 / 3; i++)
+	{
+		p = CSocketItemDl::socketsTLB.AllocItem();
+		assert(p != NULL);
+	}
+	p2 = p;
+	for(; i < MAX_CONNECTION_NUM; i++)
+	{
+		p = CSocketItemDl::socketsTLB.AllocItem();
+		assert(p != NULL);
+	}
+	//
+	p = CSocketItemDl::socketsTLB.AllocItem();
+	assert(p == NULL);
+
+	CSocketItemDl::socketsTLB.FreeItem(p1);
+	CSocketItemDl::socketsTLB.FreeItem(p2);
+
+	p = CSocketItemDl::socketsTLB.AllocItem();
+	assert(p != NULL);
+
+	p = CSocketItemDl::socketsTLB.AllocItem();
+	assert(p != NULL);
+
+	p = CSocketItemDl::socketsTLB.AllocItem();
+	assert(p == NULL);
+
+	for (i = 0; i < MAX_CONNECTION_NUM; i++)
+	{
+		CSocketItemDl::socketsTLB.FreeItem(CSocketItemDl::socketsTLB[i]);
+	}
+}
+
+
+
 int _tmain(int argc, _TCHAR* argv[])
 {
+	UnitTestAllocAndFreeItem();
+
 	FUZ_unitTests();
 	UnitTestCompressAndDecode();
 

@@ -146,7 +146,7 @@ void LOCALAPI CLowerInterface::OnGetInitConnect()
 	// the cookie depends on the listening fiber ID AND the responding fiber ID
 
 	SetHeaderSignature(challenge, ACK_INIT_CONNECT);
-	challenge.timeDelta = htobe32((u_long)(t1 - t0));
+	challenge.timeDelta = int32_t(t1 - t0);
 	challenge.cookie = CalculateCookie(& cm, sizeof(cm), t1);
 	challenge.initCheckCode = q->initCheckCode;
 
@@ -199,7 +199,7 @@ void LOCALAPI CLowerInterface::OnInitConnectAck()
 	//^ set to new peer fiber ID: to support multi-home it is necessary even for IPv6
 	pSocket->SetNearEndInfo(nearInfo);
 
-	initState.timeDelta = be32toh(pkt->timeDelta);
+	initState.timeDelta = pkt->timeDelta;
 	initState.cookie = pkt->cookie;
 	EnumEffectiveAddresses(initState.allowedPrefixes);
 
@@ -262,12 +262,11 @@ void LOCALAPI CLowerInterface::OnGetConnectRequest()
 	cm.salt = q->_init.salt;
 	cm.idALF = fiberID;
 	cm.idListener = q->params.idListener;
-	// Attention please! Granity of the time delta can be designated arbitrarily by the responder,
+	// Attention please! Granularity of the time delta can be designated arbitrarily by the responder,
 	// provided it is consistent between OnGetInitConnect and OnGetConnectRequest
 	// UNRESOLVED! TODO: search the cookie blacklist at first
-	if(q->cookie != CalculateCookie(& cm
-			, sizeof(cm)
-			, be64toh(q->_init.timeStamp) + (int32_t)be32toh(q->timeDelta)) )
+	timestamp_t tRecvInit = be64toh(q->_init.timeStamp) + q->timeDelta;
+	if (q->cookie != CalculateCookie(&cm, sizeof(cm), tRecvInit))
 	{
 #ifdef TRACE
 		printf_s("UNRESOLVED! TODO: put the cookie into the blacklist to fight against DDoS attack!?\n");
@@ -321,8 +320,9 @@ void LOCALAPI CLowerInterface::OnGetConnectRequest()
 	backlogItem.initCheckCode = q->_init.initCheckCode;
 	backlogItem.nboTimeStamp = q->_init.timeStamp;
 	backlogItem.cookie = q->cookie;
-	backlogItem.timeDelta = be32toh(q->timeDelta);
-	//
+	backlogItem.timeDelta = q->timeDelta;
+	backlogItem.tDiff = NowUTC() - tRecvInit;
+	//^SetFirstRTT can only be called when the connection context is fully established
 	backlogItem.remoteHostID = nearInfo.IsIPv6() ? SOCKADDR_HOSTID(mesgInfo.name) : 0;
 	//^See also GetRemoteFiberID()
 	backlogItem.idParent = 0;
@@ -347,7 +347,7 @@ l_return:
 
 //{CONNECT_BOOTSTRAP, CONNECT_AFFIRMING, CHALLENGING, ACTIVE,
 // COMMITTING, PEER_COMMIT, COMMITTING2, COMMITTED, CLOSABLE,
-// PRE_CLOSED, CLONING}-->/RESET/
+// SHUT_REQUESTED, PRE_CLOSED, CLONING}-->/RESET/
 //    -->NON_EXISTENT-->[Notify]
 //{NON_EXISTENT, LISTENING, CLOSED, Otherwise}<-->/RESET/{Ignore}
 // UNRESOLVED! Lost of RESET is silently ignored?
@@ -401,6 +401,7 @@ void LOCALAPI CSocketItemEx::OnGetReset(FSP_RejectConnect& reject)
 		}
 		// otherwise simply ignore.
 	}
+	// ^SHUT_REQUESTED (passive shutdown) or 
 	// InStates ESTABLISHED, COMMITTING, PEER_COMMIT, COMMITTING2, COMMITTED, CLOSABLE, PRE_CLOSED, CLONING
 	// besides, those states are recoverable.
 	// LISTENING state is not affected by reset signal
@@ -417,30 +418,53 @@ l_bailout:
 //	Check whether KEEP_ALIVE or it special norm, ACK_FLUSH, is valid
 // Return
 //	Number of entries in the gap descriptor list (may be 0) if it is valid
-//	negative if the packt is invalid
+//	negative if the packet is invalid
 // Remark
 //	DoS attack against long-term sessions by replaying KEEP_ALVIE is possible but mitigated
+//	On enter the function, the SNACK header is encrypted; on leave, it has been decrypted
 int CSocketItemEx::ValidateSNACK(ControlBlock::seq_t& ackSeqNo, FSP_SelectiveNACK* pSNACK)
 {
-	register FSP_NormalPacketHeader* p1 = (FSP_NormalPacketHeader*)& headPacket->hdr;
-	int n = be16toh(pSNACK->_h.length);
+	register FSP_FixedHeader* p1 = & headPacket->hdr;
+	uint32_t sn = be32toh(p1->expectedSN);
+
+	if (int32_t(sn - lastOOBSN) <= 0)
+	{
+#ifdef TRACE
+		printf_s("%s has encountered replay attack? Sequence number:\n\tinband %u, oob %u - %u\n"
+			, opCodeStrings[p1->hs.opCode], pktSeqNo, sn, lastOOBSN);
+#endif
+		return -EAGAIN;
+	}
+
+	if (lenPktData != 0)
+	{
+#ifdef TRACE
+		printf_s("%s is out-of-band and CANNOT carry data: %d\n", opCodeStrings[p1->hs.opCode], lenPktData);
+#endif
+		return -EBADF;
+	}
+
+	int32_t len = be16toh(p1->hs.offset);
+	// Note that extension header is encrypted as well. See also SendKeepAlive, SendAckFlush
+	if (!ValidateICC(p1, len - sizeof(FSP_FixedHeader), fidPair.peer, GetSalt(*p1)))
+	{
+#ifdef TRACE
+		printf_s("Invalid integrity check code of %s for fiber#%u!?\n"
+			"Acknowledged sequence number: %u\n", opCodeStrings[p1->hs.opCode], fidPair.source, ackSeqNo);
+#endif
+		return -EPERM;
+	}
+
+	int n = le16toh(pSNACK->_h.length);
 	// defined a little earlier for debug/trace purpose
 #if defined(TRACE) && (TRACE & (TRACE_PACKET | TRACE_SLIDEWIN))
 	printf_s("%s data length: %d, header length: %d, peer ALFID = %u\n"
 		, opCodeStrings[p1->hs.opCode]
-		, headPacket->lenData
+		, lenPktData
 		, n
 		, fidPair.peer);
 	DumpNetworkUInt16((uint16_t*)((FSP_PreparedKEEP_ALIVE*)pSNACK)->gaps, n / 2);
 #endif
-	if (headPacket->lenData != 0)
-	{
-#ifdef TRACE
-		printf_s("%s is out-of-band and CANNOT carry data: %d\n", opCodeStrings[p1->hs.opCode], headPacket->lenData);
-#endif
-		return -EBADF;
-	}
-	int32_t len = be16toh(p1->hs.offset);
 	// To defend against memory access (out-of-boundary) attack:
 	if ((octet*)pSNACK - (octet*)p1 + n != len)
 	{
@@ -458,64 +482,24 @@ int CSocketItemEx::ValidateSNACK(ControlBlock::seq_t& ackSeqNo, FSP_SelectiveNAC
 #endif
 	n /= sizeof(FSP_SelectiveNACK::GapDescriptor);
 	//
-	uint32_t salt = pSNACK->serialNo;
-	uint32_t sn = be32toh(salt);
 
-	if (int32_t(sn - lastOOBSN) <= 0)
-	{
-#ifdef TRACE
-		printf_s("%s has encountered replay attack? Sequence number:\n\tinband %u, oob %u - %u\n"
-			, opCodeStrings[p1->hs.opCode], headPacket->pktSeqNo, sn, lastOOBSN);
-#endif
-		return -EAGAIN;
-	}
-	lastOOBSN = sn;
-
-	ackSeqNo = be32toh(p1->expectedSN);
+	ackSeqNo = le32toh(pSNACK->ackSeqNo);
 	if (!IsAckExpected(ackSeqNo))
 		return -ENOENT;
 
-	// Note that extension header is encrypted as well. See also SendKeepAlive, SendAckFlush
-	if (!ValidateICC(p1, len - sizeof(FSP_FixedHeader), fidPair.peer, salt))
-	{
-#ifdef TRACE
-		printf_s("Invalid integrity check code of %s for fiber#%u!?\n"
-			"Acknowledged sequence number: %u\n", opCodeStrings[p1->hs.opCode], fidPair.source, ackSeqNo);
-#endif
-		return -EPERM;
-	}
-
-#if defined(TRACE) && (TRACE & (TRACE_PACKET | TRACE_SLIDEWIN))
-	printf_s("%s sequence number: %u^|^%u\n"
-		"\taccumulatively acknowledged %u with %d gap(s)\n"
-		, opCodeStrings[p1->hs.opCode], headPacket->pktSeqNo, sn
-		, ackSeqNo, n);
-#endif
 	pControlBlock->ResizeSendWindow(ackSeqNo, p1->GetRecvWS());
 
 	// Calibrate RTT ONLY if left edge of the send window is to be advanced
-	// new = ((current + old) / 2 + old) / 2 = current/4 + old * 3/4
-	// See also AcceptSNACK, DealWithSNACK
-	int32_t k = int32_t(ackSeqNo - pControlBlock->sendWindowFirstSN);
-	// Validation of k is already done in IsAckExpected() indirectly, assume that the send window is valid
-	// If ever the peer cheats by giving the acknowledgement delay value larger than the real value
-	// it would be eventually punished by a very large RTO!?
-	// Acknowledged or resent packet is simply excluded from calculating RTT with
-	if (k-- > 0)
-	{
-		uint64_t tDelay = be64toh(pSNACK->tLazyAck);
-		pControlBlock->AddRoundSendBlockN(k, pControlBlock->sendWindowHeadPos);
-#if (TRACE & (TRACE_HEARTBEAT | TRACE_SLIDEWIN | TRACE_OUTBAND))
-		printf_s("Round trip time to calibrate: %u\n\tacknowledgement delay: %llu\n", tRoundTrip_us, tDelay);
-#endif
-		ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend() + k;
-		if (!skb->IsResent() && !skb->IsAcked())
-			UpdateRTT(int64_t(NowUTC() - skb->timeSent - tDelay));
-		// A simple TCP-friendly AIMD congestion control in slow-start phase
-		if (!increaSlow)
-			sendRate_Bpus += double(int64_t(k + 1) * MAX_BLOCK_SIZE) / tRoundTrip_us;
-	}
+	if(ackSeqNo - pControlBlock->sendWindowFirstSN > 0)
+		UpdateRTT(le32toh(pSNACK->latestSN), le32toh(pSNACK->tLazyAck));
 
+	lastOOBSN = sn;
+#if defined(TRACE) && (TRACE & (TRACE_PACKET | TRACE_SLIDEWIN))
+	printf_s("%s sequence number: %u^|^%u\n"
+		"\taccumulatively acknowledged %u with %d gap(s)\n"
+		, opCodeStrings[p1->hs.opCode], pktSeqNo, sn
+		, ackSeqNo, n);
+#endif
 	return n;
 }
 
@@ -542,7 +526,7 @@ void CSocketItemEx::OnConnectRequestAck()
 	}	// See also OnGetConnectRequest
 
 	// Must prepare the receive window before allocate any receive buffer
-	pControlBlock->SetRecvWindow(headPacket->pktSeqNo);
+	pControlBlock->SetRecvWindow(pktSeqNo);
 	TRACE_SOCKET();
 	// We change operation code of ACK_CONNECT_REQ to PERSIST because it starts a new transmit transaction
 	response.hs.opCode = PERSIST;
@@ -553,10 +537,9 @@ void CSocketItemEx::OnConnectRequestAck()
 	}
 	pControlBlock->perfCounts.countPacketAccepted++;
 
-	// Ignore granularity of OS time-slice here, which may slightly affect calculation of RTT
+	// Do not update RTT here, because there's undetermined delay due to backlog processing/calling back ULA
 	tSessionBegin = tMigrate = tLastRecv;
 	tPreviousTimeSlot = tRecentSend;
-	UpdateRTT(int64_t(tLastRecv - tRecentSend));
 
 	pControlBlock->peerAddr.ipFSP.fiberID = headPacket->fidPair.source;
 	pControlBlock->sendWindowLimitSN
@@ -602,12 +585,12 @@ void CSocketItemEx::OnGetNulCommit()
 	{
 		// It costs much less to make lazy acknowledgement than to ValidateICC() or Notify()
 		// PEER_COMMIT, COMMITTING2, CLOSABLE: retransmit ACK_FLUSH on get NULCOMMIT
-		if (OffsetToRecvWinLeftEdge(headPacket->pktSeqNo) < 0 || !isInitiativeState)
+		if (OffsetToRecvWinLeftEdge(pktSeqNo) < 0 || !isInitiativeState)
 		{
 			EnableDelayAck();	// It costs much less than to ValidateICC() or Notify()
 			return;
 		}
-		if (isInitiativeState && headPacket->pktSeqNo != pControlBlock->recvWindowExpectedSN)
+		if (isInitiativeState && pktSeqNo != pControlBlock->recvWindowExpectedSN)
 		{
 #if (TRACE & TRACE_SLIDEWIN)
 			printf_s("ACK_START should have the very sequence number awaited to receive.\n");
@@ -633,7 +616,7 @@ void CSocketItemEx::OnGetNulCommit()
 	pControlBlock->ResizeSendWindow(ackSeqNo, p1->GetRecvWS());
 
 	// ACK_START/NULCOMMIT has nothing to deliver to ULA, however it consumes a slot of receive queue
-	ControlBlock::PFSP_SocketBuf skb = pControlBlock->AllocRecvBuf(headPacket->pktSeqNo);
+	ControlBlock::PFSP_SocketBuf skb = pControlBlock->AllocRecvBuf(pktSeqNo);
 	if (skb == NULL)
 		return;
 	if (isInitiativeState)
@@ -643,7 +626,8 @@ void CSocketItemEx::OnGetNulCommit()
 	}
 	// Indirect dependency: tLastRecv which is exploited in SendAckFlush in TransitOnPeerCommit is set here
 	tLastRecv = NowUTC();
-	SetFirstRTT(int64_t(tLastRecv - tRecentSend));
+	snLastRecv = pktSeqNo;
+	// Network RTT may not be refreshed here as there is undetermined delay caused by application processing
 #if (TRACE & (TRACE_SLIDEWIN | TRACE_HEARTBEAT))
 	printf_s("\nACK_START received, acknowledged SN = %u\n\tThe responder calculate RTT: %uus\n", ackSeqNo, tRoundTrip_us);
 #endif
@@ -716,13 +700,13 @@ void CSocketItemEx::OnGetPersist()
 	TRACE_SOCKET();
 
 	bool isInitiativeState = InState(CHALLENGING) || InState(CLONING);
-	if (!isInitiativeState  && lowState < ESTABLISHED)
+	if (!isInitiativeState && lowState < ESTABLISHED)
 		return;
 
 #ifdef TRACE
-	printf_s("Payload length: %d\n", headPacket->lenData);
+	printf_s("Payload length: %d\n", lenPktData);
 #endif
-	if (headPacket->lenData < 0 || headPacket->lenData > MAX_BLOCK_SIZE)
+	if (lenPktData < 0 || lenPktData > MAX_BLOCK_SIZE)
 		return;
 
 	FSP_NormalPacketHeader* p1 = &headPacket->hdr;
@@ -733,12 +717,12 @@ void CSocketItemEx::OnGetPersist()
 	bool isMultiplying = InState(CLONING);
 	if (!isMultiplying)	// the normality
 	{
-		int32_t d = OffsetToRecvWinLeftEdge(headPacket->pktSeqNo);
+		int32_t d = OffsetToRecvWinLeftEdge(pktSeqNo);
 		if (d > pControlBlock->recvBufferBlockN)
 		{
 #if (TRACE & (TRACE_HEARTBEAT | TRACE_SLIDEWIN))
 			printf_s("@%s: invalid sequence number: %u, distance to the receive window: %d\n"
-				, __FUNCTION__, headPacket->pktSeqNo, d);
+				, __FUNCTION__, pktSeqNo, d);
 #endif
 			return;		// DoS attack OR a premature start of new transmit transaction
 		}
@@ -780,38 +764,41 @@ void CSocketItemEx::OnGetPersist()
 	}
 
 #if defined(_DEBUG) && defined(TRACE)
-	if(countPlaced < 0)
+	if (countPlaced < 0)
 	{
 		printf_s("Place PERSIST failed: error number = %d\n", countPlaced);
 		return;
 	}
 #else
-	if(countPlaced < 0)
+	if (countPlaced < 0)
 		return;
 #endif
 
 	// PERSIST is always the accumulative acknowledgement to ACK_CONNECT_REQ or MULTIPLY
 	// ULA slide the receive window, no matter whether the packet has payload
 	// The timer was already started for transient state management when Accept(), Multiply() or sending MULTIPLY
+	// Network RTT may not be refreshed here as there is undetermined delay caused by application processing
 	if (isInitiativeState)
 	{
 		ControlBlock::PFSP_SocketBuf skb = pControlBlock->GetSendQueueHead();
 		skb->ReInitMarkAcked();
 		pControlBlock->SlideSendWindowByOne();	// See also AcceptSNACK
-		SetFirstRTT(int64_t(tLastRecv - tRecentSend));
-#if (TRACE & (TRACE_SLIDEWIN | TRACE_HEARTBEAT))
-		printf_s("\nPERSIST received, acknowledged SN = %u\n\tThe responder calculate RTT: %uus\n", ackSeqNo, tRoundTrip_us);
-#endif
 	}
 
 	// Note that TransitOnPeerCommit may SendAckFlush which relies on correctness of tLastRecv
 	if (HasBeenCommitted())
 	{
-		if (TransitOnPeerCommit())
-		{
+		if (!TransitOnPeerCommit())
+			return;
+		// TransitOnPeerCommit has called SendAckFlush on success
+		RestartKeepAlive();
+		//
+		if (isMultiplying)
+			SignalFirstEvent(FSP_NotifyMultiplied);
+		else if (isInitiativeState)
+			SignalFirstEvent(FSP_NotifyAccepted);
+		else	// countPlaced >= 0
 			Notify(FSP_NotifyToCommit);
-			RestartKeepAlive();
-		}
 		return;
 	}
 
@@ -853,14 +840,16 @@ void CSocketItemEx::OnGetPersist()
 
 // KEEP_ALIVE is out-of-band and may carry a special optional header for multi-homed mobility support
 //	{ACTIVE, COMMITTING, PEER_COMMIT, COMMITTING2}-->/KEEP_ALIVE/<-->{keep state}[Notify]
-//	{COMMITTED, CLOSABLE, PRE_CLOSED}-->/KEEP_ALIVE/<-->{keep state}{Update Peer's Authorized Addresses}
+//	{COMMITTED, CLOSABLE}-->/KEEP_ALIVE/<-->{keep state}
+//	{Update Peer's Authorized Addresses}
+//	Assert: in SHUT_REQUESTED or PRE_CLOSED state it needn't care about KEEP_ALIVE
 void CSocketItemEx::OnGetKeepAlive()
 {
 #if defined(TRACE) && (TRACE & (TRACE_HEARTBEAT | TRACE_PACKET | TRACE_SLIDEWIN))
 	TRACE_SOCKET();
 #endif
 	bool acknowledgible = InStates(4, ESTABLISHED, COMMITTING, PEER_COMMIT, COMMITTING2);
-	if (!acknowledgible && !InState(COMMITTED) && !InState(CLOSABLE) && !InState(PRE_CLOSED))
+	if (!acknowledgible && !InState(COMMITTED) && !InState(CLOSABLE))
 	{
 #ifdef TRACE
 		printf_s("Got KEEP_ALIVE unexpectedly in state %s(%d)\n", stateNames[lowState], lowState);
@@ -919,12 +908,12 @@ void CSocketItemEx::OnGetPureData()
 #if (TRACE & TRACE_PACKET) || (TRACE & TRACE_SLIDEWIN)
 	TRACE_SOCKET();
 #endif
-	int32_t d = OffsetToRecvWinLeftEdge(headPacket->pktSeqNo);
+	int32_t d = OffsetToRecvWinLeftEdge(pktSeqNo);
 	if (d > pControlBlock->recvBufferBlockN)
 	{
 #if (TRACE & (TRACE_HEARTBEAT | TRACE_SLIDEWIN))
 		printf_s("@%s: invalid sequence number: %u, distance to the receive window: %d\n"
-			, __FUNCTION__, headPacket->pktSeqNo, d);
+			, __FUNCTION__, pktSeqNo, d);
 #endif
 		return;		// DoS attack OR a premature start of new transmit transaction
 	}
@@ -966,6 +955,7 @@ void CSocketItemEx::OnGetPureData()
 	}
 
 	pControlBlock->ResizeSendWindow(ackSeqNo, p1->GetRecvWS());
+	AcceptSNACK(ackSeqNo, NULL, 0);
 
 	int r = PlacePayload();
 	if (r == -EFAULT)
@@ -1102,22 +1092,23 @@ void CSocketItemEx::OnAckFlush()
 
 // {COMMITTING, COMMITTED}-->/RELEASE/
 //	 |--{Whole transaction not finished yet]-->{buffer it first}		
-//	 |--{Whole transaction finished}-->[Send ACK_FLUSH]
-//		|-->[Notify]-->CLOSED
-// {COMMITTING2, CLOSABLE}-->/RELEASE-->[Send ACK_FLUSH]
-//	 -->[Notify]-->CLOSED
+//	 |--{Whole transaction finished}
+//		-->[Send ACK_FLUSH]-->SHUT_REQUESTED-->[Notify]
+// {COMMITTING2, CLOSABLE}-->/RELEASE/
+//	 -->[Send ACK_FLUSH]-->SHUT_REQUESTED-->[Notify]
+// SHUT_REQUESTED-->/RELEASE/
+//	 -->[Send ACK_FLUSH]{lazily, to defend against replay DoS attack}
 // PRE_CLOSED-->/RELEASE/-->CLOSED-->[Notify]
 // Remark
+//	Send ACK_FLUSH: instead of SendAckFlush() instantly, call EnableDelayAck to defend against DoS attack
 //	RELEASE implies NULCOMMIT
-//	RELEASE implies ACK_FLUSH as well so a lost ACK_FLUSH does not prevent it to shutdown gracefully
+//	RELEASE implies ACK_FLUSH as well so a lost ACK_FLUSH does not prevent it shutdown gracefully
 //	There's a race condition that
 //	while NotifiedToFinsh immediately follows a NotifyToCommit, RELEASE may arrive before ACK_FLUSH
 //	And accept RELEASE in PRE_CLOSED state because ACK_FLUSH may race with RELEASE in some scenario
-// UNRESOLVED!? Could a validated RELEASE packet be exploited to render DoS attack by replaying it excessively?
 void CSocketItemEx::OnGetRelease()
 {
-	// An illegitimate CLOSE packet may render reflective attack, levitate it:
-	if (InState(CLOSED))
+	if (InState(SHUT_REQUESTED))
 	{
 		EnableDelayAck();
 		return;
@@ -1126,16 +1117,16 @@ void CSocketItemEx::OnGetRelease()
 	if (!InStates(5, COMMITTING, COMMITTED, COMMITTING2, CLOSABLE, PRE_CLOSED))
 		return;
 
-	if (headPacket->lenData != 0)
+	if (lenPktData != 0)
 		return;
 
-	if (headPacket->pktSeqNo != pControlBlock->recvWindowNextSN)
+	if (pktSeqNo != pControlBlock->recvWindowNextSN)
 	{
 #if defined(TRACE) && (TRACE & TRACE_PACKET)
 		printf_s("\nThe RELEASE packet to %u is valid only if it is the last expected\n"
 			"\tSequence number of this packet = %u, right edge of receive window is %u\n"
 			, fidPair.source
-			, headPacket->pktSeqNo, pControlBlock->recvWindowNextSN);
+			, pktSeqNo, pControlBlock->recvWindowNextSN);
 #endif
 		return;
 	}
@@ -1146,7 +1137,12 @@ void CSocketItemEx::OnGetRelease()
 		return;
 	}
 
-	// Place a payloadless EoT packet into the receive queue,
+#ifndef NDEBUG
+	printf_s("Fiber#%u, reactive shutdown pended in state %s[%d]\n"
+		, this->fidPair.source, stateNames[lowState], lowState);
+#endif
+
+	// Place a payload-less EoT packet into the receive queue,
 	// and the duplicate RELEASE packet would be rejected
 	// hidden dependency: tLastRecv which is exploited in SendAckFlush is set in PlacePayload
 	int r = PlacePayload();
@@ -1162,12 +1158,16 @@ void CSocketItemEx::OnGetRelease()
 	if (InState(COMMITTED) && !HasBeenCommitted())
 		return;
 
-	if (!InState(PRE_CLOSED))
-		EnableDelayAck();	// Instead of SendAckFlush() instantly to mitigate DoS attack
-	// Note that passive CLOSED has different timeout against initiative PRE_CLOSED
-	lowState = CLOSED;
+	if (InState(PRE_CLOSED))
+	{
+		SetState(CLOSED);
+	}
+	else
+	{
+		SendAckFlush();
+		SetState(SHUT_REQUESTED);
+	}
 	Notify(FSP_NotifyToFinish);
-	//^Just to make internal recycling work. Let ULA do further state transition
 }
 
 
@@ -1190,13 +1190,12 @@ void CSocketItemEx::OnGetMultiply()
 	// The out-of-band serial number is stored in p1->expectedSN
 	// Check whether it is a collision OR a replay-attack
 	FSP_FixedHeader* pFH = &headPacket->hdr;
-	uint32_t salt = _InterlockedExchange((LONG *) & pFH->expectedSN, 0);
-	uint32_t sn = be32toh(salt);
+	uint32_t sn = be32toh(pFH->expectedSN);
 	if (int32_t(sn - lastOOBSN) <= 0)
 	{
 #ifdef TRACE
 		printf_s("MULTIPLY has encountered replay attack? Sequence number:\n\tinband %u, oob %u - %u\n"
-			, headPacket->pktSeqNo, sn, lastOOBSN);
+			, pktSeqNo, sn, lastOOBSN);
 #endif
 		return;
 	}
@@ -1215,11 +1214,10 @@ void CSocketItemEx::OnGetMultiply()
 		return;
 	}
 
-	if (!ValidateICC(pFH, headPacket->lenData, idSource, salt))
+	if (!ValidateICC(pFH, lenPktData, idSource, GetSalt(*pFH)))
 	{
 #if defined(TRACE) && (TRACE & TRACE_OUTBAND)
-		printf_s("Invalid integrity check code of MULTIPLY\n"
-				 "  might be in the race condition that MULTIPLY received before ULA installed new key\n");
+		printf_s("Invalid integrity check code of MULTIPLY\n");
 #endif
 		return;
 	}
@@ -1243,7 +1241,7 @@ void CSocketItemEx::OnGetMultiply()
 	}
 	pControlBlock->perfCounts.countPacketAccepted++;
 
-	backlogItem.expectedSN = headPacket->pktSeqNo;
+	backlogItem.expectedSN = pktSeqNo;
 	rand_w32(&backlogItem.initialSN, 1);
 	// Inherit the parent's session key:
 	backlogItem.idParent = idParent;
@@ -1259,7 +1257,7 @@ void CSocketItemEx::OnGetMultiply()
 	newItem->nextOOBSN = this->nextOOBSN;
 	newItem->lastOOBSN = this->lastOOBSN;
 	// place payload into the backlog, see also PlacePayload
-	newItem->CopyInPlainText((octet *)pFH + be16toh(pFH->hs.offset), headPacket->lenData);
+	newItem->CopyInPlainText((octet *)pFH + be16toh(pFH->hs.offset), lenPktData);
 
 	ControlBlock::PFSP_SocketBuf skb = & newItem->skbRecvClone;
 	skb->version = pFH->hs.major;
@@ -1285,10 +1283,7 @@ void CSocketItemEx::OnGetMultiply()
 		newItem->DeriveKey(idSource, idParent);
 
 	newItem->tLastRecv = tLastRecv;	// inherit the time when the MULTIPLY packet was received
-	newItem->tRoundTrip_us = tRoundTrip_us;	// inherit the value of the parent as the initial
-	newItem->rttVar_us = rttVar_us;
-	newItem->tRTO_us = tRTO_us;
-	newItem->sendRate_Bpus = sendRate_Bpus;	// UNRESOLVED! TODO: check congestion management state inheritance state! 
+	newItem->SetFirstRTT(tRoundTrip_us);
 	newItem->lowState = NON_EXISTENT;		// so that when timeout it is scavenged
 	newItem->ReplaceTimer(TRANSIENT_STATE_TIMEOUT_ms);
 
@@ -1312,7 +1307,7 @@ void CSocketItemEx::OnGetMultiply()
 //	-EFAULT	on memory fault
 int CSocketItemEx::PlacePayload()
 {
-	ControlBlock::PFSP_SocketBuf skb = pControlBlock->AllocRecvBuf(headPacket->pktSeqNo);
+	ControlBlock::PFSP_SocketBuf skb = pControlBlock->AllocRecvBuf(pktSeqNo);
 	if(skb == NULL)
 		return -ENOENT;
 
@@ -1323,7 +1318,7 @@ int CSocketItemEx::PlacePayload()
 		return -EEXIST;
 
 	FSP_NormalPacketHeader* pHdr = &headPacket->hdr;
-	int len = headPacket->lenData;
+	int len = lenPktData;
 	if (len > 0)
 	{
 		BYTE *ubuf = GetRecvPtr(skb);
@@ -1334,6 +1329,7 @@ int CSocketItemEx::PlacePayload()
 	}
 	// Or else might be zero for ACK_START or MULTIPLY packet
 	skb->timeRecv = tLastRecv = NowUTC();
+	snLastRecv = pktSeqNo;
 
 	skb->version = pHdr->hs.major;
 	skb->opCode = pHdr->hs.opCode;

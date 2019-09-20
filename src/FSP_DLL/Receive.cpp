@@ -423,7 +423,7 @@ l_recursion:
 		return;
 	}
 
-	// To avoid phantomly double delivery of the payload
+	// To avoid phantom double delivery of the payload
 	if (pendingPeekedBlocks != 0)
 	{
 		SetMutexFree();
@@ -437,15 +437,14 @@ l_recursion:
 		return;
 	}
 
-	ControlBlock::PFSP_SocketBuf skb = pControlBlock->GetFirstReceived();
-	int32_t nBlock;
 	bool eot;
-	octet* p = pControlBlock->InquireRecvBuf(n, nBlock, eot);
+	octet* p = pControlBlock->InquireRecvBuf(n, pendingPeekedBlocks, eot);
 #ifdef TRACE
-	printf_s("RecvInline, data to deliver@%p, length = %d, eot = %d; %d blocks scanned\n", p, n, (int)eot, nBlock);
+	printf_s("RecvInline, data to deliver@%p, length = %d, eot = %d; %d blocks scanned\n", p, n, (int)eot, pendingPeekedBlocks);
 #endif
 	if (!eot && n == 0)	// Redundant soft-interrupt shall be simply ignored
 	{
+		// assert(pendingPeekedBlocks == 0);
 		fpPeeked = fp1;
 		SetMutexFree();
 		return;
@@ -458,19 +457,26 @@ l_recursion:
 	// If the callback function happens to be updated, prefer the new one
 	if (fp1(this, p, n, eot))
 		InterlockedCompareExchangePointer((PVOID *)&fpPeeked, fp1, NULL);
+	if (n < 0)
+		return;
+
 	if (!WaitUseMutex())
 		return;	// it could be disposed in the callback function
-	// Assume the call-back function did not mess up the receive queue
-	if (pControlBlock->GetFirstReceived() != skb)
+
+	if (GetState() >= CLOSED)
 	{
-		printf_s("The receive queue was messed up? Head of the receive queue was moved!\n");
-		BREAK_ON_DEBUG();
+		SetMutexFree();
+		return;	// it could be shutdown gracefully in the callback function
 	}
-	int m = pControlBlock->MarkReceivedFree(nBlock);
-	if (m < 0)
+
+	int r = TryUnlockPeeked();
+	if (r < 0)
 	{
-		printf_s("MarkReceivedFree returned %d: the receive queue was messed up?!\n", m);
-		BREAK_ON_DEBUG();
+#ifdef TRACE
+		printf_s("The receive queue was messed up? TryUnlockPeeked return %d\n", r);
+#endif
+		SetMutexFree();
+		return;	// protected it from dead loop caused by receive queue messed up
 	}
 
 	offsetInLastRecvBlock = 0;

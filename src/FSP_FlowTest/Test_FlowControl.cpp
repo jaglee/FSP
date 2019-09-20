@@ -253,42 +253,37 @@ void FlowTestRetransmission()
 		int32_t			n;
 	} placeholder;
 	//
-	struct _KEEP_ALIVE
-	{
-		FSP_FixedHeader			hdr;
-		FSP_PreparedKEEP_ALIVE	ext;
-	} *p = (_KEEP_ALIVE *)& placeholder.pktBuffer.hdr;
-	//
-	ControlBlock::seq_t seq4;
+	FSP_KeepAliveExtension* p = (FSP_KeepAliveExtension*)&placeholder.pktBuffer.hdr;
 
 	memset(& placeholder, 0, sizeof(placeholder));
-	int32_t len = dbgSocket.GenerateSNACK(p->ext, seq4, sizeof(FSP_NormalPacketHeader));
 
-	dbgSocket.SignHeaderWith(& p->hdr, KEEP_ALIVE, uint16_t(len), pSCB->sendWindowNextSN - 1, seq4);
-	dbgSocket.SetIntegrityCheckCode(& p->hdr, NULL, 0, p->ext.sentinel.serialNo);
+	int32_t len = dbgSocket.GenerateSNACK(*p);
+
+	dbgSocket.SignHeaderWith(&p->hdr, KEEP_ALIVE, uint16_t(len), pSCB->sendWindowNextSN - 1, ++dbgSocket.nextOOBSN);
+	dbgSocket.SetIntegrityCheckCode(&p->hdr, &p->mp, len - sizeof(p->hdr), dbgSocket.GetSalt(p->hdr));
 
 	// Firstly emulate receive the packet before emulate OnGetKeepAlive
 	dbgSocket.headPacket = & placeholder.pktBuffer;
-	dbgSocket.headPacket->pktSeqNo = FIRST_SN + 3;
-	dbgSocket.headPacket->lenData = 0;
+	dbgSocket.pktSeqNo = FIRST_SN + 3;
+	dbgSocket.lenPktData = 0;
 	dbgSocket.tRoundTrip_us = 1;
 	dbgSocket.tRecentSend = NowUTC() + 1;
 	// See also CSocketItemEx::OnGetKeepAlive
-	FSP_SelectiveNACK::GapDescriptor *snack;
-	int n;
+	FSP_SelectiveNACK* snack = &p->snack.sentinel;
+
+	// there used to be seq4 to record the expected sequence number
 	ControlBlock::seq_t seq5;
-	dbgSocket.ValidateSNACK(seq5, snack, n);
+	int n = dbgSocket.ValidateSNACK(seq5, snack);
+	assert(seq5 == FIRST_SN + 2 && n == 1);
 
-	assert(seq5 == seq4 && n == 1);
-
-	dbgSocket.AcceptSNACK(seq5, snack, n);
+	dbgSocket.AcceptSNACK(seq5, p->snack.gaps, n);
 	dbgSocket.TestSetInUse();
 	dbgSocket.DoEventLoop();
 
 	ControlBlock::PFSP_SocketBuf skb = pSCB->HeadSend();
-	assert(skb->flags == 0);	// GetFlag<IS_ACKNOWLEDGED>()
-	assert((skb + 1)->flags == 0);	// GetFlag<IS_ACKNOWLEDGED>()
-	assert((skb + 3)->IsAcked());
+	assert(skb->flags == 0);
+	assert((skb + 1)->flags == 0);
+	assert((skb + 3)->marks & ControlBlock::FSP_BUF_ACKED);
 	assert(dbgSocket.GetControlBlock()->sendWindowFirstSN == FIRST_SN + 2);
 
 	//
@@ -321,16 +316,17 @@ void FlowTestRetransmission()
 	assert(skb == NULL);
 	//skb->ReInitMarkComplete();
 
-	len = dbgSocket.GenerateSNACK(p->ext, seq4, sizeof(FSP_NormalPacketHeader));
-	dbgSocket.SignHeaderWith(& p->hdr, KEEP_ALIVE, uint16_t(len), pSCB->sendWindowNextSN - 1, seq4);
-	dbgSocket.SetIntegrityCheckCode(&p->hdr, NULL, 0, p->ext.sentinel.serialNo);
-	// as it is an out-of-band packet, assume pre-set values are kept
+	len = dbgSocket.GenerateSNACK(*p);
+
+	dbgSocket.SignHeaderWith(& p->hdr, KEEP_ALIVE, uint16_t(len), pSCB->sendWindowNextSN - 1, ++dbgSocket.nextOOBSN);
+	dbgSocket.SetIntegrityCheckCode(&p->hdr, &p->mp, len - sizeof(p->hdr), dbgSocket.GetSalt(p->hdr));
+	// as it is an out-of-band packet, assume preset values are kept
 	dbgSocket.tRecentSend = NowUTC() + 3;
-	dbgSocket.ValidateSNACK(seq5, snack, n);
 
-	assert(seq5 == seq4 && n == 1);
+	n = dbgSocket.ValidateSNACK(seq5, snack);
+	assert(seq5 == FIRST_SN + 2 && n == 1);
 
-	dbgSocket.AcceptSNACK(seq5, snack, n);
+	dbgSocket.AcceptSNACK(seq5, p->snack.gaps, n);
 	dbgSocket.TestSetInUse();
 	dbgSocket.DoEventLoop();
 

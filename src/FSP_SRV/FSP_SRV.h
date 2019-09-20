@@ -171,8 +171,6 @@ public:
 struct PktBufferBlock
 {
 	ALIGN(MAC_ALIGNMENT)
-	int32_t	lenData;
-	ControlBlock::seq_t	pktSeqNo;	// in host byte-order
 	ALFIDPair	fidPair;
 	FSP_FixedHeader hdr;
 	octet	payload[MAX_BLOCK_SIZE];
@@ -203,7 +201,7 @@ struct FSP_PreparedKEEP_ALIVE
 	FSP_SelectiveNACK::GapDescriptor gaps
 		[(MAX_BLOCK_SIZE - sizeof(FSP_SelectiveNACK)) / sizeof(FSP_SelectiveNACK::GapDescriptor)];
 	//
-	uint32_t		n;	// n >= 0, number of (gapWidth, dataLength) tuples
+	// uint32_t		nEntries;	// n >= 0, number of (gapWidth, dataLength) tuples
 };
 
 
@@ -340,7 +338,7 @@ class CSocketItemEx : public CSocketItem
 	friend class CLowerInterface;
 	friend class CSocketSrvTLB;
 
-	friend void Multiply(CommandCloneSessionSrv &);
+	friend void Multiply(CommandCloneSessionSrv&);
 
 	HANDLE	hSrcMemory;
 	DWORD	idSrcProcess;
@@ -352,12 +350,25 @@ class CSocketItemEx : public CSocketItem
 	bool IsProcessAlive();
 	//
 protected:
-	PktBufferBlock * headPacket;	// But UNRESOLVED! There used to be an independent packet queue for each SCB for sake of fairness
+	PktBufferBlock* headPacket;	// But UNRESOLVED! There used to be an independent packet queue for each SCB for sake of fairness
+	int32_t			lenPktData;
+	ControlBlock::seq_t	pktSeqNo;	// in host byte-order
+
+	// chained list on the collision entry of the remote ALFID TLB
+	CSocketItemEx* prevRemote;
+
+	// chained list on the collision entry of the near ALFID TLB
+	CSocketItemEx* next;
+	CSocketItemEx* prevSame;
+
+	// temporary state for mobile management
 	TSubnets	savedPathsToNearEnd;
 	TSubnets	newPathsToNearEnd;
 	char		isNearEndHandedOver;
 	char		mobileNoticeInFlight;
-	//
+
+	ALFID_T		idParent;
+
 	ICC_Context	contextOfICC;
 	ALIGN(MAC_ALIGNMENT)
 	octet		cipherText[MAX_BLOCK_SIZE];
@@ -371,22 +382,17 @@ protected:
 	SOCKADDR_INET	sockAddrTo[MAX_PHY_INTERFACES + 1];
 	FSP_ADDRINFO_EX	tempAddrAccept;
 
-	const char *lockedAt;	// == NULL if not locked, or else the function name that locked the socket
+	const char* lockedAt;	// == NULL if not locked, or else the function name that locked the socket
 
+	// Cached 'trunk' state
 	char	hasAcceptedRELEASE : 1;
 	char	inUse : 1;
 	char	delayAckPending : 1;
 	char	transactional;	// The cache value of the EoT flag of the very first packet
 	FSP_Session_State lowState;
 
-	ALFID_T		idParent;
-
-	// chainlist on the collision entry of the remote ALFID TLB
-	CSocketItemEx * prevRemote;
-
-	// chainlist on the collision entry of the near ALFID TLB
-	CSocketItemEx * next;
-	CSocketItemEx * prevSame;
+	// State variables for RTT and rate management
+	ControlBlock::seq_t snLastRecv;
 
 	uint32_t	tRoundTrip_us;	// round trip time evaluated in microsecond
 	uint32_t	rttVar_us;		// Variance of RTT
@@ -394,6 +400,7 @@ protected:
 
 	bool		increaSlow;		// Whether in it is started in a slow rate which is to be incremented exponentially, default false
 	int8_t		countRTTincreasement;
+
 	double		sendRate_Bpus;	// current send rate, byte per microsecond (!)
 	double		quotaLeft;		// in bytes
 	timestamp_t tPreviousTimeSlot;
@@ -410,7 +417,8 @@ protected:
 	uint32_t	nextOOBSN;	// host byte order for near end. if it overflow the session MUST be terminated
 	uint32_t	lastOOBSN;	// host byte order, the serial number of peer's last out-of-band packet
 
-	ControlBlock::seq_t		savedAckedSN;	// Peer's SN acknowedged by the near end
+	// State variables for ACK_FLUSH cache management
+	ControlBlock::seq_t		savedAckedSN;	// Peer's SN acknowledged by the near end
 	ControlBlock::seq_t		savedSendSN;	// SN of the packet carrying SNACK
 	struct SAckFlushCache
 	{
@@ -435,14 +443,18 @@ protected:
 		else
 			tRoundTrip_us = (uint32_t)tDiff;
 		rttVar_us = tRoundTrip_us >> 1;
+		tRTO_us = max(RETRANSMIT_MIN_TIMEOUT_us, uint32_t(tDiff + max(TIMER_SLICE_ms * 1000, tDiff * 4)));
+		tRTO_us = min(RETRANSMIT_MAX_TIMEOUT_us, tRTO_us);
 		sendRate_Bpus = double(MAX_BLOCK_SIZE * SLOW_START_WINDOW_SIZE) / tRoundTrip_us;
 		// TODO: to check: initially quotaPerTick is zero, and noQuotaAlloc is false.
 	}
+
 	// Given
-	//	int64_t		the round trip time of the packet due
+	//	ControlBlock::seq_t		the sequence number of the packet that the acknowledgement delay was reported
+	//	uint32_t				the acknowledgement delay in microseconds (SHOULD be less than 200,000)
 	// Do
 	//	Update the smoothed RTT
-	void UpdateRTT(int64_t);
+	void UpdateRTT(ControlBlock::seq_t, uint32_t);
 
 	bool InState(FSP_Session_State s) { return lowState == s; }
 	bool InStates(int n, ...);
@@ -463,14 +475,13 @@ protected:
 		pHdr->SetRecvWS(int32_t(GetRecvWindowLastSN() - snExpected));
 	}
 
-	void SignHeaderWith(FSP_FixedHeader* p, FSPOperationCode code, uint16_t hsp, uint32_t seqThis, uint32_t snExpected)
+	void SignHeaderWith(FSP_FixedHeader* p, FSPOperationCode code, uint16_t hsp, uint32_t seqThis, uint32_t snAckOrOOB)
 	{
-		p->Set(code, hsp, seqThis, snExpected, int32_t(GetRecvWindowLastSN() - snExpected));
+		p->Set(code, hsp, seqThis, snAckOrOOB, int32_t(GetRecvWindowLastSN() - pControlBlock->recvWindowExpectedSN));
 	}
- 
 
 	bool HasBeenCommitted() { return pControlBlock->HasBeenCommitted(); }
-	// Return true if really transit, false if the (half) connection is finised and to notify
+	// Return true if really transit, false if the (half) connection is finished and to notify
 	inline bool TransitOnPeerCommit();
 
 	bool HandlePeerSubnets(struct FSP_ConnectParam*);
@@ -491,6 +502,8 @@ protected:
 	void DoEventLoop();
 
 	static VOID NTAPI KeepAlive(PVOID c, BOOLEAN) { ((CSocketItemEx *)c)->KeepAlive(); }
+
+	static uint32_t GetSalt(const FSP_FixedHeader& h) { return *(uint32_t*)& h; }
 	//
 public:
 #ifdef _DEBUG
@@ -499,8 +512,8 @@ public:
 	bool MapControlBlock(const CommandNewSessionSrv &);
 	void InitAssociation();
 
-#define LockWithActiveULA() LockWithActiveULAt(__func__)
-#define WaitUseMutex()		WaitUseMutexAt(__func__)
+#define LockWithActiveULA() LockWithActiveULAt(__FUNCTION__)	//  __func__
+#define WaitUseMutex()		WaitUseMutexAt(__FUNCTION__)		//  __func__
 	bool WaitUseMutexAt(const char *);
 	bool LockWithActiveULAt(const char *);
 	void SetMutexFree() { lockedAt = NULL; }
@@ -559,7 +572,6 @@ public:
 	void SignalFirstEvent(FSP_ServiceCode code) { pControlBlock->notices.SetHead(code); ::SetEvent(hEvent); }
 	//
 	int LOCALAPI AcceptSNACK(ControlBlock::seq_t, FSP_SelectiveNACK::GapDescriptor *, int);
-	int32_t LOCALAPI GenerateSNACK(FSP_PreparedKEEP_ALIVE &, ControlBlock::seq_t &, int);
 	//
 	void InitiateConnect();
 	void DisposeOnReset();
@@ -592,7 +604,7 @@ public:
 
 	// Solid input,  the payload, if any, is copied later
 	bool LOCALAPI ValidateICC(FSP_NormalPacketHeader *, int32_t, ALFID_T, uint32_t);
-	bool ValidateICC() { return ValidateICC(&headPacket->hdr, headPacket->lenData, fidPair.peer, 0); }
+	bool ValidateICC() { return ValidateICC(&headPacket->hdr, lenPktData, fidPair.peer, 0); }
 
 	int ValidateSNACK(ControlBlock::seq_t&, FSP_SelectiveNACK*);
 	// Register source IPv6 address of a validated received packet as the favorite returning IP address
@@ -651,7 +663,7 @@ public:
 		return n;
 	}
 	//
-	void	ResponseToMultiply();
+	void	RespondToMultiply();
 };
 
 

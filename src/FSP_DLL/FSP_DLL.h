@@ -76,8 +76,7 @@ typedef CSocketItem * PSocketItem;
 // DllSpec and FSPHANDLE must be defined properly before FSP_API
 #include "../FSP_API.h"
 
-// per-session connection limit. theoretically any connectible socket might be listener
-#define MAX_CONNECTION_NUM	16	// 256	// must be some power value of 2
+#define MAX_CONNECTION_NUM	256	// must be some power value of 2
 
 
 // A internal class of CSocketItemDl, it should be
@@ -113,8 +112,10 @@ class CSocketItemDl : public CSocketItem
 	friend FSPHANDLE FSPAPI ListenAt(const PFSP_IN6_ADDR, PFSP_Context);
 	friend FSPHANDLE FSPAPI Accept1(FSPHANDLE);
 	friend FSPHANDLE FSPAPI Connect2(const char *, PFSP_Context);
-	friend FSPHANDLE FSPAPI MultiplyAndWrite(FSPHANDLE, PFSP_Context, int8_t, NotifyOrReturn);
+	friend FSPHANDLE FSPAPI MultiplyAndWrite(FSPHANDLE, PFSP_Context, unsigned, NotifyOrReturn);
 	friend FSPHANDLE FSPAPI MultiplyAndGetSendBuffer(FSPHANDLE, PFSP_Context, CallbackBufferReady);
+
+	friend void UnitTestAllocAndFreeItem();
 
 	static	CSocketDLLTLB socketsTLB;
 	static	DWORD	idThisProcess;
@@ -221,7 +222,7 @@ protected:
 
 	// In Multiplex.cpp
 	static CSocketItemDl * LOCALAPI CSocketItemDl::ToPrepareMultiply(FSPHANDLE, PFSP_Context, CommandCloneConnect &);
-	FSPHANDLE LOCALAPI WriteOnMultiplied(CommandCloneConnect &, PFSP_Context, int8_t, NotifyOrReturn);
+	FSPHANDLE LOCALAPI WriteOnMultiplied(CommandCloneConnect &, PFSP_Context, unsigned, NotifyOrReturn);
 	FSPHANDLE CompleteMultiply(CommandCloneConnect &);
 	bool LOCALAPI ToWelcomeMultiply(BackLogItem &);
 
@@ -357,6 +358,7 @@ public:
 	{
 		CommandRejectRequest objCommand(id1, rc);
 		objCommand.idProcess = idThisProcess;
+		initiatingShutdown = 1;
 		Call(objCommand, sizeof(objCommand));
 	}
 
@@ -390,7 +392,7 @@ public:
 	{
 		return InterlockedCompareExchangePointer((PVOID *)& fpCommitted, fp1, NULL) == NULL;
 	}
-	//
+
 	bool TestSetSendReturn(PVOID fp1)
 	{
 		return InterlockedCompareExchangePointer((PVOID *) & fpSent, fp1, NULL) == NULL; 
@@ -406,6 +408,16 @@ public:
 	int	LOCALAPI RecvInline(CallbackPeeked);
 	int LOCALAPI ReadFrom(void *, int, NotifyOrReturn);
 	int TryUnlockPeeked();
+
+	int SetOnRelease(PVOID fp1)
+	{
+		if (InState(NON_EXISTENT))
+			return -EBADF;
+		bool b = (InterlockedCompareExchangePointer((PVOID*)& fpFinished, fp1, NULL) == NULL);
+		if (b || InState(SHUT_REQUESTED) || InState(CLOSED))
+			return EAGAIN;
+		return 0;
+	}
 
 	int Shutdown();
 	int Shutdown(NotifyOrReturn fp1) { fpFinished = fp1; return Shutdown(); }
@@ -423,7 +435,7 @@ public:
 
 	// Defined in IOControl.cpp
 	int GetProfilingCounts(PSocketProfile);
-
+	PFSP_Context GetFSPContext() { return &this->context; }
 
 	// defined in DllEntry.cpp:
 	static CSocketItemDl * LOCALAPI CreateControlBlock(const PFSP_IN6_ADDR, PFSP_Context, CommandNewSession &);

@@ -71,6 +71,9 @@ public:
 				, WT_EXECUTEINTIMERTHREAD));
 	}
 
+	// For test algorithm for generating KEEP_ALIVE packet in timer.cpp
+	int32_t LOCALAPI GenerateSNACK(FSP_KeepAliveExtension&);
+
 	friend void UnitTestSocketRTLB();
 	friend void UnitTestICC();
 	friend void UnitTestHMAC();
