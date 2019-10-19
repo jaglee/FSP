@@ -89,7 +89,7 @@ l_bailout:
 // here 'inline' means ULA shares buffer memory with LLS
 static void FSPAPI onReceiveFileNameReturn(FSPHANDLE h, FSP_ServiceCode resultCode, int resultValue)
 {
-	if(resultCode != FSP_NotifyDataReady)
+	if(resultCode != FSP_Receive || resultValue < 0)
 	{
 		printf_s("\nUnknown result code %d returned by FSP LLS, returned = %d\n", resultCode, resultValue);
 		Dispose(h);

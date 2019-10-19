@@ -57,7 +57,7 @@ FSPHANDLE FSPAPI ListenAt(const PFSP_IN6_ADDR listenOn, PFSP_Context psp1)
 	if(! socketItem->AddOneShotTimer(TRANSIENT_STATE_TIMEOUT_ms))
 	{
 		REPORT_ERRMSG_ON_TRACE("Cannot set time-out clock for listen");
-		socketItem->FreeAndDisable();
+		socketItem->Free();
 		return NULL;
 	}
 
@@ -68,7 +68,7 @@ FSPHANDLE FSPAPI ListenAt(const PFSP_IN6_ADDR listenOn, PFSP_Context psp1)
 	if (p == NULL)
 	{
 		REPORT_ERRMSG_ON_TRACE("Cannot create the LLS socket to listen");
-		socketItem->FreeAndDisable();
+		socketItem->Free();
 	}
 	return p;
 }
@@ -166,7 +166,7 @@ FSPHANDLE FSPAPI Connect2(const char *peerName, PFSP_Context psp1)
 	if(! socketItem->AddOneShotTimer(TRANSIENT_STATE_TIMEOUT_ms))
 	{
 		REPORT_ERRMSG_ON_TRACE("Cannot set time-out clock for connect");
-		socketItem->FreeAndDisable();
+		socketItem->Free();
 		return NULL;
 	}
 
@@ -182,7 +182,7 @@ FSPHANDLE FSPAPI Connect2(const char *peerName, PFSP_Context psp1)
 	if (p == NULL)
 	{
 		REPORT_ERRMSG_ON_TRACE("Cannot create the LLS socket to request connection establishment");
-		socketItem->FreeAndDisable();
+		socketItem->Free();
 	}
 	else if (psp1->onAccepted == NULL)
 	{
@@ -220,7 +220,7 @@ CSocketItemDl *CSocketItemDl::ProcessOneBackLog(BackLogItem	*pLogItem)
 	|| pLogItem->idParent != 0 && !socketItem->ToWelcomeMultiply(*pLogItem))
 	{
 		RejectRequest(pLogItem->acceptAddr.idALF, EPERM);
-		socketsTLB.FreeItem(socketItem);
+		socketItem->Free();
 		return NULL;
 	}
 	//
@@ -323,10 +323,7 @@ bool LOCALAPI CSocketItemDl::ToWelcomeConnect(BackLogItem & backLog)
 	SetState(CHALLENGING);
 	// Ask ULA whether to accept the connection
 	if(context.onAccepting != NULL && context.onAccepting(this, & backLog.acceptAddr, p) < 0)
-	{
-		// UNRESOLVED! report that the upper layer application reject it?
 		return false;
-	}
 	//
 	memcpy(&pControlBlock->connectParams, &backLog, FSP_MAX_KEY_SIZE + FSP_TAG_SIZE);
 	//^following fields are filled later
@@ -425,7 +422,7 @@ void CSocketItemDl::ToConcludeConnect()
 	if(context.onAccepted != NULL && context.onAccepted(this, &context) < 0)
 	{
 		if(WaitUseMutex())	// in case of memory access error
-			RecycLocked();
+			Free();
 		return;
 	}
 
@@ -563,7 +560,7 @@ CSocketItemDl * CSocketItemDl::WaitingConnectAck()
 		if (GetTickCount64() - t0 > TRANSIENT_STATE_TIMEOUT_ms)
 		{
 			context.flags = -ETIMEDOUT;
-			FreeAndDisable();
+			Free();
 			return NULL;
 		}
 		SetMutexFree();
@@ -573,7 +570,7 @@ CSocketItemDl * CSocketItemDl::WaitingConnectAck()
 	if (s < ESTABLISHED)
 	{
 		context.flags = -ECONNRESET;
-		FreeAndDisable();
+		Free();
 		return NULL;
 	}
 

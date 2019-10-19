@@ -48,9 +48,15 @@
 void CSocketItemEx::KeepAlive()
 {
 	const char *c = (char *)InterlockedCompareExchangePointer((void**)&lockedAt, (void*)__FUNCTION__, 0);
-	// assume it takes little time to detect process life
-	if (!IsProcessAlive())
+	timestamp_t t1 = NowUTC();
+	// assume it takes little time to get system clock
+	while (t1 - tPreviousLifeDetection > (MAX_LOCK_WAIT_ms << 10))
 	{
+		if (IsProcessAlive())
+		{
+			tPreviousLifeDetection = t1;
+			break;
+		}
 		if (c == 0)
 		{
 			// If the time-out handler took the lock, it may abort the session safely
@@ -58,39 +64,35 @@ void CSocketItemEx::KeepAlive()
 		}
 		else if(IsInUse())
 		{
-			inUse = 0;		// So that any WaitUseMutex() would be forcefully aborted
+			ClearInUse();
+			//^So that any WaitUseMutex() would be forcefully aborted
 			ReplaceTimer(TIMER_SLICE_ms);
 			// Assume there is no dead loop, eventually the socket would be unlocked
 			// and the time-out handler would safely abort the session
 		}
-		// Or else it MUST be already in clean-up phase
+		else
+		{
+			Destroy();	// The subroutine itself prevents double-entering
+		}
 		return;
 	}
 
+	callbackTimerPending = 0;
 	if (!IsInUse())
 	{
 		if (c == 0)
 			SetMutexFree();
 		return;		// the socket has been released elsewhere
 	}
-
 	if (c != 0)
 	{
-#ifndef NDEBUG
-		printf_s("\nFiber#%u's KeepAlive not executed,\n"
-			"locked at %s in state %s[%d].\n"
-			, fidPair.source
-			, c, stateNames[lowState], lowState);
-#endif
+		callbackTimerPending = 1;
 		return;
 	}
 
+	// See also TIMEDOUT(); DEINIT_WAIT_TIMEOUT_ms
 	if (lowState == NON_EXISTENT)
 	{
-		assert(pControlBlock != NULL);
-#if (TRACE & TRACE_HEARTBEAT)
-		printf_s("\nFiber#%u's session control block is released in a delayed timer handler.\n", fidPair.source);
-#endif
 		if (pControlBlock->state >= ESTABLISHED)
 			SendReset();
 		Destroy();
@@ -98,14 +100,13 @@ void CSocketItemEx::KeepAlive()
 		return;
 	}
 
-	timestamp_t t1 = NowUTC();
 	switch(lowState)
 	{
 	case CONNECT_BOOTSTRAP:
 	case CONNECT_AFFIRMING:
 	case CHALLENGING:
 	case CLONING:
-		if (t1 - tMigrate > (TRANSIENT_STATE_TIMEOUT_ms << 10))
+		if (t1 - tMigrate > (TRANSIENT_STATE_TIMEOUT_ms * 1000))
 		{
 #ifdef TRACE
 			printf_s("\nTransient state time out in state %s\n", stateNames[lowState]);
@@ -113,8 +114,11 @@ void CSocketItemEx::KeepAlive()
 			TIMED_OUT();
 		}
 		// CONNECT_BOOTSTRAP and CONNECT_AFFIRMING are counted into one transient period
-		if(lowState != CHALLENGING)
+		if (lowState != CHALLENGING)
+		{
 			EmitStart();
+			ReplaceTimer(uint32_t((t1 - tMigrate) >> 10) + 1);
+		}	// effectively exponentially back off
 		break;
 	//
 	case ESTABLISHED:
@@ -153,7 +157,7 @@ void CSocketItemEx::KeepAlive()
 		break;
 	case CLOSED:
 		if (int64_t(t1 - tMigrate + 1024 - (UINT32_MAX << 10)) < 0)
-			ReplaceTimer(uint32_t((t1 - tMigrate) >> 10) + 1);
+			ReplaceTimer(uint32_t((t1 - tMigrate) >> 10) + MAX_LOCK_WAIT_ms);
 		//^exponentially back off;  the socket is subjected to be recycled in LRU manner
 		break;
 	default:
@@ -209,27 +213,35 @@ void CSocketItemEx::UpdateRTT(ControlBlock::seq_t snAck, uint32_t tDelay)
 	{
 		return;
 	}
-
-	int64_t rtt64_us = int64_t(NowUTC() - skb->timeSent - tDelay);
+	
+	timestamp_t tNow = NowUTC();
+	int64_t rtt64_us = int64_t(tNow - skb->timeSent - tDelay);
 	if (rtt64_us < 0)
 	{
 		printf_s("Is the peer to cheat by report a ridiculously delay (%u)?\n"
 			"Smoothed RTT is %u microseconds\n"
+			"Adjusted latest packet delay is %lld\n"
 			, tDelay
-			, tRoundTrip_us);
+			, tRoundTrip_us
+			, rtt64_us);
 		BREAK_ON_DEBUG();
 		return;
 	}
 
 	pControlBlock->perfCounts.PushJitter(rtt64_us - tRoundTrip_us);
 	// Built-in rule: if current RTT exceeds smoothed RTT 'considerably' in 5 successive accumulative SNACKs,
-	// assume congestion occurred. 'Considerably' is 1 sigma
+	// assume congestion pending. 'Considerably' is 1 sigma
 	// Selection of '5' depends on 'alpha' and 'beta' which are built-in as well.
+	// However, the send rate is NOT decreased multiplicatively for sake of fairness against TFRC
+	// Decrease rate is set considerably faster than increase rate although both change are linear.
 	if (rtt64_us - tRoundTrip_us - rttVar_us > 0 && ++countRTTincreasement >= 5)
 	{
 		increaSlow = true;
-		sendRate_Bpus /= 2.0;
 		countRTTincreasement = 0;
+		sendRate_Bpus = max(
+			sendRate_Bpus - MAX_BLOCK_SIZE * 8 / double(tRoundTrip_us),
+			MAX_BLOCK_SIZE * SLOW_START_WINDOW_SIZE / double(tRoundTrip_us)
+		);
 	}
 	else if (rtt64_us - tRoundTrip_us + rttVar_us < 0)
 	{
@@ -249,6 +261,9 @@ void CSocketItemEx::UpdateRTT(ControlBlock::seq_t snAck, uint32_t tDelay)
 	// A simple TCP-friendly AIMD congestion control in slow-start phase
 	if (!increaSlow)
 		sendRate_Bpus += double(int64_t(k + 1) * MAX_BLOCK_SIZE) / tRoundTrip_us;
+#if (TRACE & TRACE_HEARTBEAT)
+	fprintf(stderr, "%llu, %u\n", tNow, tRoundTrip_us);
+#endif
 }
 
 
@@ -461,6 +476,7 @@ int LOCALAPI CSocketItemEx::AcceptSNACK(ControlBlock::seq_t expectedSN, FSP_Sele
 // 1. Resend one packet (if any)
 // 2. Send a new packet (if any)
 // 3. Delayed acknowledgement
+// TODO: UNRESOLVED! milky payload SHOULD never be resent?
 void CSocketItemEx::DoEventLoop()
 {
 	// Only need to synchronize the state in the 'cache' and the real state once because TCB is locked
@@ -482,10 +498,9 @@ void CSocketItemEx::DoEventLoop()
 	bool somePacketResent = false;
 	bool toStopEmitQ = (int32_t(pControlBlock->sendWindowNextSN - limitSN) >= 0);
 	bool toStopResend = (int32_t(seq1 - pControlBlock->sendWindowNextSN) >= 0);
-	double quotaForThisTick = sendRate_Bpus * (tNow - tPreviousTimeSlot);	// quota is added on demand, however
 
-	if (!toStopEmitQ)
-		quotaLeft += quotaForThisTick;
+	if (!toStopEmitQ || !toStopResend)
+		quotaLeft += sendRate_Bpus * (tNow - tPreviousTimeSlot);
 
 	// Additive increment of the send rate
 	if (increaSlow)
@@ -512,17 +527,14 @@ loop_start:
 			printf_s("Fiber#%u, to retransmit packet #%u\n", fidPair.source, seq1);
 #endif
 #ifndef UNIT_TEST
-			// To avoid both starvation and double increasement of the quota 
-			if (toStopEmitQ)
-				quotaLeft += quotaForThisTick;
 			if (quotaLeft - (p->len + sizeof(FSP_NormalPacketHeader)) < 0)
 				goto l_final;	// No quota left for send or resend
 			if (EmitWithICC(p, seq1) <= 0)
 				goto l_final;
 			quotaLeft -= (p->len + sizeof(FSP_NormalPacketHeader));
-			// Built-in rule: if a packet is to be resent again, it is assumed that congestion was encounterred
-			// However, the send rate should not be cut continuously
-			if (!somePacketResent && (p->marks & ControlBlock::FSP_BUF_RESENT) != 0)
+			// For TCP-friendly congestion control, loss of packet means congestion encountered
+			if (!somePacketResent && (p->marks & ControlBlock::FSP_BUF_RESENT) != 0
+			 && pControlBlock->tfrc)	// TODO: detect ECN
 			{
 				sendRate_Bpus /= 2;
 				quotaLeft /= 2;
@@ -550,7 +562,7 @@ loop_start:
 		}
 	}
 	toStopResend = (int32_t(seq1 - pControlBlock->sendWindowNextSN) >= 0);
-
+	
 l_step2:
 	// Used to be loop-body of EmitQ:
 	if (!toStopEmitQ)

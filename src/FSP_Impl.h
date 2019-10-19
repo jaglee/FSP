@@ -112,7 +112,7 @@ void TraceLastError(char * fileName, int lineNo, char *funcName, char *s1);
 
 
 #define MAX_LOCK_WAIT_ms			60000	// one minute
-#define TIMER_SLICE_ms				50		// 1/20 second
+#define TIMER_SLICE_ms				1		// For HPET
 #define	MAX_IDLE_QUOTA_TICKS		6		// Refuse to add quota if sending is idle more than this threshold
 #define SLOW_START_WINDOW_SIZE		4		// in packet
 
@@ -341,20 +341,14 @@ public:
 
 
 
-class LLSNotice: public CLightMutex
+// 4: The soft interrupt vector of returned notices
+struct LLSNotice
 {
-	friend struct ControlBlock;
-	// volatile char	mutex;	// in CLightMutex
-protected:
-	// 4: The (very short, roll-out) queue of returned notices
-	FSP_ServiceCode q[FSP_MAX_NUM_NOTICE];
-public:
-	void SetHead(FSP_ServiceCode c) { q[0] = c; }
-	FSP_ServiceCode GetHead() { return q[0]; }
-	// put a new notice at the tail of the queue
-	int LOCALAPI	Put(FSP_ServiceCode);
-	// pop the notice from the top
-	FSP_ServiceCode Pop();
+	volatile char 	nmi;
+	long			vector;
+	void SetHead(FSP_NoticeCode c) { nmi = (char )c; }
+	// It is inline in the LLS to set the soft interrupt signal, for sake of performance
+	// It is inline in the DLL to fetch the soft interrupt signal, for sake of performance and balance
 };
 
 
@@ -400,9 +394,9 @@ struct ControlBlock
 {
 	ALIGN(8)
 	FSP_Session_State	state;
+	char			tfrc : 1;		// TCP friendly rate control. By default ECN-friendly
 	char			milky : 1;		// by default 0: a normal wine-style payload assumed. FIFO
 	char			noEncrypt : 1;	// by default 0; 1 if session key installed, encrypt the payload
-	//
 	ALFID_T			idParent;
 
 	// 1, 2. 

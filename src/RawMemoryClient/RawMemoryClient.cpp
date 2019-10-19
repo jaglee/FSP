@@ -83,10 +83,14 @@ int _tmain(int argc, TCHAR* argv[])
 
 	result = StartConnection(urlRemote);
 	if (result < 0)
-		printf("Failed to initialize the connection in the very beginning\n");
+	{
+		printf_s("StartConnection returned %d\n", result);
+		if (result == -EPERM)
+			printf_s("(The end user does not permit further operation)\n");
+	}
 
 l_bailout:
-	printf("\n\nPress Enter to exit...");
+	printf_s("\n\nPress Enter to exit...");
 	getchar();
 	// handles are automatically closed on exit
 	exit(result);
@@ -232,7 +236,7 @@ static void FSPAPI onPublicKeySent(FSPHANDLE h, FSP_ServiceCode c, int r)
 // here 'inline' means ULA shares buffer memory with LLS
 static void FSPAPI onReceiveFileNameReturn(FSPHANDLE h, FSP_ServiceCode resultCode, int resultValue)
 {
-	if (resultCode != FSP_NotifyDataReady)
+	if (resultCode != FSP_Receive || resultValue < 0)
 	{
 		printf_s("\nUnknown result code %d returned by FSP LLS, returned = %d\n", resultCode, resultValue);
 		Dispose(h);

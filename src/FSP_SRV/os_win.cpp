@@ -1278,6 +1278,100 @@ bool CSocketItemEx::LockWithActiveULAt(const char* funcName)
 
 
 
+// Given
+//	CommandNewSessionSrv	the command context
+// Clone the control block whose handle is passed by the command and bind the interfaces
+// Initialize near and remote fiber ID as well
+// Return
+//	true if succeeded
+//	false if failed
+bool CSocketItemEx::MapControlBlock(const CommandNewSessionSrv &cmd)
+{
+#ifndef NDEBUG
+	printf_s(__FUNCDNAME__ " called, source process id = %d, size of the shared memory = 0x%X\n", cmd.idProcess, cmd.dwMemorySize);
+#endif
+	// TODO: UNRESOLVED! To be reviewed: is it safe to reuse the shared memory?
+	if(idSrcProcess == cmd.idProcess && hSrcMemory == cmd.hMemoryMap)
+		return true;
+
+	if(hMemoryMap != NULL)
+		Destroy();
+
+	HANDLE hThatProcess = OpenProcess(PROCESS_DUP_HANDLE
+		, false
+		, cmd.idProcess);
+	if(hThatProcess == NULL)
+	{
+		REPORT_ERROR_ON_TRACE();
+		return false;
+	}
+#if (TRACE & TRACE_ULACALL)
+	printf_s("Handle of the source process is %I64X, handle of the shared memory in the source process is %I64X\n"
+		, (long long)hThatProcess
+		, (long long)cmd.hMemoryMap);
+#endif
+
+	// get the near-end shared memory handle
+	if(! DuplicateHandle(hThatProcess
+		, cmd.hMemoryMap
+		, GetCurrentProcess()
+		, & hMemoryMap
+		, 0	// ignored, because of the duplicate same access option
+		, FALSE
+		, DUPLICATE_SAME_ACCESS))
+	{
+		REPORT_ERROR_ON_TRACE();
+		goto l_bailout;
+	}
+
+#if (TRACE & TRACE_ULACALL)
+	printf_s("Handle of the mapped memory in current process is %I64X\n", (long long)hMemoryMap);
+#endif
+
+	dwMemorySize = cmd.dwMemorySize;
+	pControlBlock = (ControlBlock *)MapViewOfFile(hMemoryMap
+		, FILE_MAP_ALL_ACCESS
+		, 0, 0, dwMemorySize);
+	if(pControlBlock == NULL)
+	{
+		REPORT_ERROR_ON_TRACE();
+		goto l_bailout1;
+	}
+#if (TRACE & TRACE_ULACALL)
+	printf_s("Successfully take use of the shared memory object.\r\n");
+#endif
+
+	CloseHandle(hThatProcess);
+	// this->fiberID == cmd.fiberID, provided it is a passive/welcome socket, not a initiative socket
+	// assert: the queue of the returned value has been initialized by the caller already
+	idSrcProcess = cmd.idProcess;
+	hEvent = cmd.hEvent;
+	return true;
+
+l_bailout1:
+	CloseHandle(hMemoryMap);
+l_bailout:
+	CloseHandle(hThatProcess);
+	return false;
+}
+
+
+
+// See also CSocketItem::Destroy();
+void CSocketItemEx::ClearInUse()
+{
+	register HANDLE h;
+	if ((h = InterlockedExchangePointer((PVOID *)& pControlBlock, NULL)) != NULL)
+		::UnmapViewOfFile(h);
+}
+
+
+bool CSocketItemEx::TestSetInUse()
+{
+	return (InterlockedCompareExchangePointer((PVOID *)& pControlBlock, (void *)(-1), NULL) == NULL);
+}
+
+
 
 /*
  * The OS-dependent CommandNewSessionSrv constructor
@@ -1340,6 +1434,7 @@ int CSocketItemEx::SendPacket(register ULONG n1, ScatteredSendBuffers s)
 	printf_s("Target address:\n\t");
 	DumpNetworkUInt16((uint16_t *)wsaMsg.name, wsaMsg.namelen / 2);
 # endif
+	timestamp_t t = NowUTC();
 	r = WSASendMsg(CLowerInterface::Singleton.sdSend, & wsaMsg, 0, &n, NULL, NULL);
 #else
 	s.scattered[0].buf = (CHAR *)& fidPair;

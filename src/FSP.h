@@ -87,10 +87,8 @@ typedef ALFID_T	 ULTID_T;
 */
 // In debug mode we allow pre-definition via compiler's command-line option
 #ifdef _DEBUG
-# define INIT_RETRANSMIT_TIMEOUT_ms		60000	// 1 minute
 # define TRANSIENT_STATE_TIMEOUT_ms		300000	// 5 minutes
 #else
-# define INIT_RETRANSMIT_TIMEOUT_ms		15000	// 15 seconds
 # define TRANSIENT_STATE_TIMEOUT_ms		60000	// 1 minute
 #endif
 
@@ -197,44 +195,56 @@ typedef enum _FSP_Operation_Code : char
 
 
 // Somewhat 'paravirtualization' protocol for DLL to 'hyper-call' LLS and vice-versa
-typedef enum: char
+typedef enum : char
 {
 	NullCommand = 0,
-	// 1~15: DLL to LLS
 	FSP_Listen = 1,		// register a passive socket
 	InitConnection,		// register an initiative socket
 	FSP_Accept,			// accept the connection, make SCB of LLS synchronized with DLL 
 	FSP_Reject,			// a forward command, explicitly reject some request
+	FSP_Reset = FSP_Reject,
 	FSP_Start,
 	FSP_Urge = FSP_Start,
+	FSP_Send,			// Here it is not a command to LLS, but as a context indicator to ULA
+	FSP_Receive,		// Here it is not a command to LLS, but as a context indicator to ULA
 	FSP_InstallKey,		// install the authenticated encryption key
 	FSP_Multiply,		// clone the connection, make SCB of LLS synchronized with DLL
-	// 16~23: LLS to DLL in the backlog
-	FSP_NotifyListening = FSP_Listen,		// a reverse command to signal success execution of FSP_Listen
-	FSP_NotifyAccepting = FSP_Accept,		// a reverse command to make context ready
-	FSP_NotifyMultiplied = FSP_Multiply,	// a reverse command to inform DLL to accept a multiply request
-	FSP_NotifyAccepted = 16,
+	FSP_Shutdown		// Here it is not a command to LLS, but as a context indicator to ULA
+} FSP_ServiceCode;
+
+
+
+typedef enum
+{
+	NullNotice = 0,
+	// 1~7
+	FSP_NotifyListening,		// a reverse command to signal success execution of FSP_Listen
+	FSP_NotifyAccepting,		// a reverse command to make context ready
+	FSP_NotifyMultiplied,		// a reverse command to inform DLL to accept a multiply request
+	FSP_NotifyAccepted,
 	FSP_NotifyDataReady,
 	FSP_NotifyBufferReady,
 	FSP_NotifyToCommit,
+	// 8~11
 	FSP_NotifyFlushed,
 	FSP_NotifyToFinish,
-	FSP_NotifyReset,	// 22: used to be FSP_Dispose
-	FSP_NotifyRecycled,	// 23: used to be reserved; a reverse command to inform DLL to release resource
-	FSP_IPC_CannotReturn = 24,
+	// built-in rule: notification after FSP_NotifyToFinish implies the LLS socket has been released already
+	FSP_NotifyRecycled,
+	FSP_NameResolutionFailed,
+	// 12~16: exceptions, soft NMI
+	FSP_IPC_CannotReach,
 	FSP_MemoryCorruption,
-	FSP_NotifyOverflow,
+	FSP_NotifyReset,
 	FSP_NotifyTimeout,
-	FSP_NotifyNameResolutionFailed,
-	LARGEST_FSP_NOTICE = FSP_NotifyNameResolutionFailed
-} FSP_ServiceCode;
+	SMALLEST_FSP_NMI = FSP_IPC_CannotReach,
+	LARGEST_FSP_NOTICE = FSP_NotifyTimeout,
+} FSP_NoticeCode;
 
 
 
 // the number of microsecond elapsed since Midnight January 1, 1970 UTC (Unix epoch)
 typedef uint64_t timestamp_t;
 
-// the typeof the subnets field of some structures
 typedef uint64_t TSubnets[MAX_PHY_INTERFACES];
 
 

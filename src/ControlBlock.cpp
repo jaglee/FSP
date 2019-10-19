@@ -110,46 +110,27 @@ const char * CStringizeState::names[LARGEST_FSP_STATE + 1] =
 
 const char * CStringizeNotice::names[LARGEST_FSP_NOTICE + 1] =
 {
-	"NullCommand",
-	// 1~15: DLL to LLS
-	"FSP_Listen",		// register a passive socket
-	"InitConnection",	// register an initiative socket
-	"FSP_Accept",		// accept the connection, make SCB of LLS synchronized with DLL
-	"FSP_Reject",		// a forward command, explicitly reject some request
-	"FSP_Start",		// start a new transmit transaction/urge to transmit
-	"FSP_InstallKey",	// install the authenticated encryption key
-	"FSP_Multiply",		// clone the connection, make SCB of LLS synchronized with DLL
-	// FSP_Start, obsolesced
-	// FSP_Commit, obsolesced
-	// FSP_Shutdown, obsolesced
-	"Reserved8",
-	"Reserved9",
-	"Reserved10",
-	"Reserved11",
-	// 12-15, 4 reserved
-	"Reserved12",
-	"Reserved13",
-	"Reserved14",
-	"Reserved15",
-	// 16~23: LLS to DLL in the backlog
-	//FSP_NotifyListening = FSP_Listen,		// a reverse command to signal success execution of FSP_Listen
-	//FSP_NotifyAccepting = FSP_Accept,		// a reverse command to make context ready
-	//FSP_NotifyMultiplied = FSP_Multiply,	// a reverse command to inform DLL to accept a multiply request
+	"NullNotice",
+	// 1~7
+	"FSP_NotifyListening",	// a reverse command to signal success execution of FSP_Listen
+	"FSP_NotifyAccepting",	// a reverse command to make context ready
+	"FSP_NotifyMultiplied",	// a reverse command to inform DLL to accept a multiply request
 	"FSP_NotifyAccepted",
 	"FSP_NotifyDataReady",
 	"FSP_NotifyBufferReady",
 	"FSP_NotifyToCommit",
+	// 8~11
 	"FSP_NotifyFlushed",
 	"FSP_NotifyToFinish",
-	"FSP_NotifyReset",		// used to be FSP_Dispose or Reserved22
-	"FSP_NotifyRecycled",	// used to be "Reserved23"
-	// 24~31: near end error status
-	"FSP_IPC_CannotReturn",	// LLS cannot return to DLL for some reason
+	"FSP_NotifyRecycled",
+	"FSP_NameResolutionFailed",
+	// 12~16
+	"FSP_IPC_CannotReach",
 	"FSP_MemoryCorruption",
-	"FSP_NotifyOverflow",
+	"FSP_NotifyReset",
 	"FSP_NotifyTimeout",
-	"FSP_NotifyNameResolutionFailed"
 };
+
 
 
 // assume it is atomic (the assumption might be broken!)
@@ -312,71 +293,6 @@ BackLogItem * LLSBackLog::FindByRemoteId(ALFID_T idRemote, uint32_t salt)
 	//
 	SetMutexFree();
 	return NULL;
-}
-
-
-
-// Given
-//	FSP_ServiceCode	the notice code, shall not be NullCommand(0)
-// Return
-//	position of new inserted notice, 0
-//	negative if failed, most likely because of overflow
-// Remark
-//	Duplicate tail notice is merged, return FSP_MAX_NUM_NOTICE
-//	NullCommand cannot be put
-int LOCALAPI LLSNotice::Put(FSP_ServiceCode c)
-{
-	if (!WaitSetMutex())
-		return -EDEADLK;
-	//
-	register char *p = (char *) & q[FSP_MAX_NUM_NOTICE - 1];
-	if(*p != NullCommand)
-	{
-		SetMutexFree();
-		return -ENOMEM;
-	}
-
-	if(c == NullCommand)
-	{
-		SetMutexFree();
-		return -EDOM;
-	}
-
-	--p;
-	//
-	do
-	{
-		if(*p == c)
-		{
-			SetMutexFree();
-			return FSP_MAX_NUM_NOTICE;
-		}
-	} while(*p == NullCommand && --p - (char *)q >= 0);
-	_InterlockedExchange8(p + 1, c);
-	//
-	SetMutexFree();
-	return int(p + 1 - (char *)q);
-}
-
-
-
-// Return the notice code on success, or NullCommand(0) on empty
-// Remark
-//	ULA should know that notices are out-of-band, emergent messages which might be processed out-of-order
-FSP_ServiceCode LLSNotice::Pop()
-{
-	if (!WaitSetMutex())
-		throw - EINTR;
-	//
-	register char *p = (char *) & q[FSP_MAX_NUM_NOTICE - 1];
-	register char c = NullCommand;
-	do
-	{
-		c = _InterlockedExchange8(p, c);
-	} while(--p - (char *)q >= 0);
-	//
-	SetMutexFree();
-	return FSP_ServiceCode(c);
 }
 
 

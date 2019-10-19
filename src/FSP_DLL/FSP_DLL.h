@@ -151,7 +151,6 @@ protected:
 	char			peerCommitted : 1;	// Only for conventional buffered, streamed read
 	char			pendingEoT : 1;		// EoT flag is pending to be added on a packet
 
-	HANDLE			pollingTimer;
 	ALIGN(8)		HANDLE theWaitObject;
 
 	// to support full-duplex send and receive does not share the same call back function
@@ -188,8 +187,6 @@ protected:
 			((CSocketItemDl *)param)->WaitEventToDispatch();
 	}
 
-	static VOID NTAPI PollingTimedoutCallBack(PVOID param, BOOLEAN) { ((CSocketItemDl *)param)->PollingTimedout(); }
-
 	BOOL RegisterDrivingEvent()
 	{
 		return RegisterWaitForSingleObject(&theWaitObject
@@ -201,11 +198,8 @@ protected:
 	}
 
 	bool LOCALAPI AddOneShotTimer(uint32_t);
-	bool EnablePolling();
-	bool CancelPolling();
 	bool CancelTimeout();
 	void TimeOut();
-	void PollingTimedout();
 
 	void WaitEventToDispatch();
 	bool LockAndValidate();
@@ -249,22 +243,15 @@ protected:
 	bool HasDataToDeliver() { return (pControlBlock->CountDeliverable() > 0 || HasInternalBufferedToDeliver()); }
 
 public:
-	void Disable();
-	void DisableAndNotify(FSP_ServiceCode c, int v)
+	void Free();
+	void FreeAndNotify(FSP_ServiceCode c, int v)
 	{
 		NotifyOrReturn fp1 = context.onError;
-		Disable();
-		SetMutexFree();
-		socketsTLB.FreeItem(this);
+		Free();
 		if (fp1 != NULL)
 			fp1(this, c, -v);
 	}
 	//^The error handler need not and should not do further clean-up work
-	void FreeAndDisable()
-	{
-		socketsTLB.FreeItem(this);
-		Disable();
-	}
 
 	int LOCALAPI Initialize(PFSP_Context, char[MAX_NAME_LENGTH]);
 	int Dispose();
@@ -322,7 +309,31 @@ public:
 	bool WaitUseMutex();
 	void SetMutexFree() { _InterlockedExchange8(&locked, 0); }
 	bool TryMutexLock() { return _InterlockedCompareExchange8(&locked, 1, 0) == 0; }
-
+	// Given
+	//	int		the value meant to be returned
+	// Do
+	//	Process the receive buffer and send queue, then free the mutex and return the value
+	// Remark
+	//	ULA function may be called back on processing the receive buffer or send queue,
+	//	and this function SHALL be called as the 'parameter' of the return statement
+	//	Processing the receive buffer takes precedence because receiving is to free resource
+	int  TailFreeMutexAndReturn(int r)
+	{
+		if (HasDataToDeliver() && (fpReceived != NULL || fpPeeked != NULL))
+		{
+			ProcessReceiveBuffer();
+			if (!TryMutexLock())
+				return r;
+		}
+		//
+		if (HasFreeSendBuffer() && (fpSent != NULL || pendingSendBuf != NULL))
+			ProcessPendingSend();
+		else
+			SetMutexFree();
+		//
+		return r;
+	}
+	void EnableLLSInterrupt() { _bittestandreset(&pControlBlock->notices.vector, 0); }
 	bool IsInUse() { return (_InterlockedOr8(&inUse, 0) != 0) && (pControlBlock != NULL); }
 
 	void SetPeerName(const char *cName, size_t len)
@@ -429,7 +440,6 @@ public:
 	void SetEoTPending(bool v = true) { pendingEoT = (v ? 1 : 0); }
 	bool IsEoTPending() { return pendingEoT != 0; }
 
-	int SelfNotify(FSP_ServiceCode c);
 	void SetCallbackOnError(NotifyOrReturn fp1) { context.onError = fp1; }
 	void NotifyError(FSP_ServiceCode c, int e = 0) { if (context.onError != NULL) context.onError(this, c, e); }
 

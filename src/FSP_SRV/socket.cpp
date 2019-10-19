@@ -81,66 +81,53 @@ CSocketItemEx * CSocketSrvTLB::AllocItem()
 
 	if (headFreeSID != NULL && headFreeSID->TestSetInUse())
 		goto l_success;
-#if 1
-	ReleaseMutex();
-	return NULL;
-	// For a heavy duty server it might be beneficial to throttle the request by waiting for free socket
-#else
+
 	// as this is a prototype is not bothered to exploit hash table
 	// recycle all of the orphan sockets
 	register int i;
+#if !(TRACE & (TRACE_ADDRESS | TRACE_ULACALL))
 	for (i = 0, p = itemStorage; i < MAX_CONNECTION_NUM; i++, p++)
 	{
 		if (!p->IsProcessAlive())
 			p->AbortLLS(true);
 	}
+#endif
 	if (headFreeSID != NULL)
+	{
+		headFreeSID->TestSetInUse();
 		goto l_success;
+	}
 
 	timestamp_t tNow = NowUTC();
 	CSocketItemEx *p1 = NULL;
-	uint64_t tDiff0;
 	// Reserved: a 'CLOSED' socket might be resurrected,
 	// provides it is the original ULA process that is to reuse the socket
 	if (topOfSC == 0)
 	{
 		for (i = 0, p = itemStorage; i < MAX_CONNECTION_NUM; i++, p++)
 		{
-			if (p->lowState == CLOSED)
+			if (p->lowState == CLOSED || !p->IsInUse())
 				PutToScavengeCache(p, tNow);
 		}
 	}
-	//
-	if (topOfSC == 0)
+
+	if (topOfSC <= 0)
 	{
-		// Found the least recent used socket
-		for (i = 0, p = itemStorage; i < MAX_CONNECTION_NUM; i++, p++)
-		{
-			uint64_t tDiff = min(tNow - p->tLastRecv, tNow - p->tRecentSend);
-			if ( (tDiff > KEEP_ALIVE_TIMEOUT_ms) && (p1 == NULL || tDiff > tDiff0))
-				p1 = p, tDiff0 = tDiff;
-		}
-		//
-		if (p1 == NULL)
-		{
-			ReleaseMutex();
-			return NULL;
-		}
+		ReleaseMutex();
+		return NULL;
 	}
-	else
+
+	p1 = scavengeCache[0].pSocket;
+	topOfSC--;
+	for (i = 0; i < topOfSC; i++)
 	{
-		p1 = scavengeCache[0].pSocket;
-		topOfSC--;
-		for (i = 0; i < topOfSC; i++)
-		{
-			scavengeCache[i] = scavengeCache[i++];
-		}
+		scavengeCache[i] = scavengeCache[i++];
 	}
 
 	p1->WaitUseMutex();		// it is throttling!
 	p1->AbortLLS(true);
 	assert(headFreeSID != NULL);
-#endif
+	headFreeSID->TestSetInUse();
 
 l_success:
 	p = headFreeSID;
@@ -150,7 +137,6 @@ l_success:
 	ReleaseMutex();
 	//
 	p->next = NULL;
-	p->TestSetInUse();
 	return p;
 }
 
@@ -246,8 +232,6 @@ void CSocketSrvTLB::PutToListenTLB(CSocketItemEx * p, int k)
 //	Assume having obtained the lock of TLB. Will free the lock in the end.
 void CSocketSrvTLB::FreeItemDonotCareLock(CSocketItemEx *p)
 {
-	p->inUse = 0;
-
 	// if it is allocated by AllocItem(ALFID_T idListener):
 	if(p->IsPassive())
 	{
@@ -470,125 +454,6 @@ void CSocketItemEx::SetRemoteFiberID(ALFID_T id)
 
 
 
-// Given
-//	CommandNewSessionSrv	the command context
-// Clone the control block whose handle is passed by the command and bind the interfaces
-// Initialize near and remote fiber ID as well
-// Return
-//	true if succeeded
-//	false if failed
-bool CSocketItemEx::MapControlBlock(const CommandNewSessionSrv &cmd)
-{
-#ifndef NDEBUG
-	printf_s(__FUNCDNAME__ " called, source process id = %d, size of the shared memory = 0x%X\n", cmd.idProcess, cmd.dwMemorySize);
-#endif
-	// TODO: UNRESOLVED! To be reviewed: is it safe to reuse the shared memory?
-	if(idSrcProcess == cmd.idProcess && hSrcMemory == cmd.hMemoryMap)
-		return true;
-
-	if(hMemoryMap != NULL)
-		Destroy();
-
-	HANDLE hThatProcess = OpenProcess(PROCESS_DUP_HANDLE
-		, false
-		, cmd.idProcess);
-	if(hThatProcess == NULL)
-	{
-		REPORT_ERROR_ON_TRACE();
-		return false;
-	}
-#if (TRACE & TRACE_ULACALL)
-	printf_s("Handle of the source process is %I64X, handle of the shared memory in the source process is %I64X\n"
-		, (long long)hThatProcess
-		, (long long)cmd.hMemoryMap);
-#endif
-
-	// get the near-end shared memory handle
-	if(! DuplicateHandle(hThatProcess
-		, cmd.hMemoryMap
-		, GetCurrentProcess()
-		, & hMemoryMap
-		, 0	// ignored, because of the duplicate same access option
-		, FALSE
-		, DUPLICATE_SAME_ACCESS))
-	{
-		REPORT_ERROR_ON_TRACE();
-		goto l_bailout;
-	}
-
-#if (TRACE & TRACE_ULACALL)
-	printf_s("Handle of the mapped memory in current process is %I64X\n", (long long)hMemoryMap);
-#endif
-
-	dwMemorySize = cmd.dwMemorySize;
-	pControlBlock = (ControlBlock *)MapViewOfFile(hMemoryMap
-		, FILE_MAP_ALL_ACCESS
-		, 0, 0, dwMemorySize);
-	if(pControlBlock == NULL)
-	{
-		REPORT_ERROR_ON_TRACE();
-		goto l_bailout1;
-	}
-#if (TRACE & TRACE_ULACALL)
-	printf_s("Successfully take use of the shared memory object.\r\n");
-#endif
-
-	CloseHandle(hThatProcess);
-	// this->fiberID == cmd.fiberID, provided it is a passive/welcome socket, not a initiative socket
-	// assert: the queue of the returned value has been initialized by the caller already
-	idSrcProcess = cmd.idProcess;
-	hEvent = cmd.hEvent;
-	return true;
-
-l_bailout1:
-	CloseHandle(hMemoryMap);
-l_bailout:
-	CloseHandle(hThatProcess);
-	return false;
-}
-
-
-
-// Given
-//	FSP_ServiceCode		the code of the notification to alert DLL
-// Do
-//	Put the notification code into the notice queue
-// Return
-//	true if the notification was put into the queue successfully
-//	false if it failed
-// Remark
-//	Successive notifications of the same code are automatically merged
-bool CSocketItemEx::Notify(FSP_ServiceCode n)
-{
-	int r = pControlBlock->notices.Put(n);
-	if (r < 0)
-	{
-#ifdef TRACE
-		printf_s("\nSession #%u, cannot put soft interrupt %s(%d) into the queue.\n", fidPair.source, noticeNames[n], n);
-#endif
-		return false;
-	}
-	//
-	if (r > 0)
-	{
-#if (TRACE & TRACE_ULACALL)
-		if (r == FSP_MAX_NUM_NOTICE)
-			printf_s("\nSession #%u, duplicate soft interrupt %s(%d) eliminated.\n", fidPair.source, noticeNames[n], n);
-		else
-			printf_s("\nSession #%u append soft interrupt %s(%d)\n", fidPair.source, noticeNames[n], n);
-#endif
-		return true;
-	}
-	//
-	SignalEvent();
-#if (TRACE & TRACE_ULACALL)
-	printf_s("\nSession #%u raise soft interrupt %s(%d)\n", fidPair.source, noticeNames[n], n);
-#endif
-	return true;
-}
-
-
-
 // INIT_CONNECT, timestamp, Cookie, Salt, ephemeral-key, half-connection parameters [, resource requirement]
 void CSocketItemEx::InitiateConnect()
 {
@@ -626,7 +491,7 @@ void CSocketItemEx::InitiateConnect()
 	skb->timeSent = tRecentSend;
 
 	SyncState();
-	ReplaceTimer(INIT_RETRANSMIT_TIMEOUT_ms);
+	ReplaceTimer(RETRANSMIT_MIN_TIMEOUT_us);
 }
 
 
@@ -671,6 +536,7 @@ void CSocketItemEx::AffirmConnect(const SConnectParam & initState, ALFID_T idLis
 	skb->len = sizeof(FSP_ConnectRequest);
 
 	SetState(CONNECT_AFFIRMING);
+	ReplaceTimer(RETRANSMIT_MIN_TIMEOUT_us);
 	SendPacket(1, ScatteredSendBuffers(pkt, skb->len));	// it would set tRecentSend
 }
 
@@ -700,9 +566,9 @@ void CSocketItemEx::InitiateMultiply(CSocketItemEx *srcItem)
 	contextOfICC.InheritS0(srcItem->contextOfICC, seq0);
 #if defined(TRACE) && (TRACE & TRACE_OUTBAND)
 	printf_s("\nTo send MULTIPLY in LLS, ICC context:\n"
-		"\tSN of MULTIPLY to send = %09u, salt = %09u\n"
+		"\tSN of MULTIPLY to send = %09u\n"
 		"\tALFID of near end's branch = %u, ALFID of peer's parent = %u\n"
-		, seq0, salt
+		, seq0
 		, fidPair.source, fidPair.peer);
 #endif
 	if (contextOfICC.keyLifeRemain != 0)
@@ -733,11 +599,12 @@ void CSocketItemEx::InitiateMultiply(CSocketItemEx *srcItem)
 	SyncState();
 	SendPacket(2, ScatteredSendBuffers(payload, sizeof(FSP_NormalPacketHeader), this->cipherText, skb->len));
 	skb->MarkSent();
-	//
-	tSessionBegin = skb->timeSent = tRecentSend;	// UNRESOLVED!? But if SendPacket failed?
-	tPreviousTimeSlot = tRecentSend;
+	skb->timeSent = NowUTC();
 	SetFirstRTT(srcItem->tRoundTrip_us);
-	ReplaceTimer(INIT_RETRANSMIT_TIMEOUT_ms);
+	tSessionBegin = skb->timeSent;
+	tPreviousTimeSlot = skb->timeSent;
+	tPreviousLifeDetection = tSessionBegin;
+	ReplaceTimer(RETRANSMIT_MIN_TIMEOUT_us);
 }
 
 
@@ -852,7 +719,8 @@ void CSocketItemEx::Accept()
 		//^ ephemeral session key material was ready when CSocketItemDl::PrepareToAccept
 		SetFirstRTT(pControlBlock->connectParams.tDiff);
 		EmitStart();
-		pControlBlock->notices.SetHead(NullCommand);
+		tSessionBegin = tRecentSend;
+		pControlBlock->notices.SetHead(NullNotice);
 		//^ The success or failure signal is delayed until ACK_START, PERSIST or RESET received
 		ReplaceTimer(TRANSIENT_STATE_TIMEOUT_ms);	// The socket slot might be a reused one
 	}
@@ -860,10 +728,10 @@ void CSocketItemEx::Accept()
 	{
 		// Timer has been set when the socket slot was prepared on getting MULTIPLY
 		((CMultiplyBacklogItem *)this)->RespondToMultiply();
+		tSessionBegin = NowUTC();
 	}
 	//
-	tPreviousTimeSlot = tRecentSend;
-	tSessionBegin = tRecentSend;
+	tPreviousLifeDetection = tPreviousTimeSlot = tSessionBegin;
 	SetMutexFree();
 }
 

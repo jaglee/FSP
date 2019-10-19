@@ -150,7 +150,7 @@ typedef int (FSPAPI *CallbackBufferReady)(FSPHANDLE, void *, int32_t);
 // remote message received, or the return value of previous function call
 // Given
 //	FSPHANDLE		the handle of the FSP socket (the context)
-//	FSP_ServiceCode	the command code of the function call or notice code of the FSP service notification
+//	FSP_ServiceCode	the command code of the function call
 //	int				the intent returned value
 typedef void (FSPAPI *NotifyOrReturn)(FSPHANDLE, FSP_ServiceCode, int);
 
@@ -181,7 +181,8 @@ struct FSP_SocketParameter
 			unsigned short	milky:		1;	// Minimal-delay service preferred
 			unsigned short	noEncrypt:	1;	// do not encrypt the payload in the transport layer
 			unsigned short	precompress:1;	// data to send on connect ready were pre-compressed
-			unsigned short	RESERVED:	11;
+			unsigned short	tfrc:		1;	// TCP friendly rate control. By default ECN-friendly
+			unsigned short	RESERVED:	10;
 			unsigned short	passive:	1;	// internal use only, shall be ignored by ULA
 			unsigned short	isError:	1;	// if set, 'flags' is the error reason
 		};

@@ -237,11 +237,9 @@ int32_t CSocketItemDl::AcquireSendBuf()
 		return -EBUSY;
 	}
 
-	if (pControlBlock->InquireSendBuf(&pendingSendSize) != NULL)
-		EnablePolling();
+	pControlBlock->InquireSendBuf(&pendingSendSize);
 
-	SetMutexFree();
-	return pendingSendSize;
+	return TailFreeMutexAndReturn(pendingSendSize);
 }
 
 
@@ -270,8 +268,7 @@ int32_t LOCALAPI CSocketItemDl::SendInplace(void * buffer, int32_t len, bool eot
 	}
 
 	int r = PrepareToSend(buffer, len, eot);
-	SetMutexFree();
-	return (r < 0 ? r : bytesBuffered);
+	return TailFreeMutexAndReturn(r < 0 ? r : bytesBuffered);
 }
 
 
@@ -285,7 +282,7 @@ int32_t LOCALAPI CSocketItemDl::SendInplace(void * buffer, int32_t len, bool eot
 //	negative if it is the error number
 // Remark
 //	It is blocking if to commit the data but previous transaction commitment has not been acknowledged
-int32_t LOCALAPI CSocketItemDl::SendStream(const void * buffer, int32_t len, bool eot, bool toCompress)
+int32_t LOCALAPI CSocketItemDl::SendStream(const void* buffer, int32_t len, bool eot, bool toCompress)
 {
 	int r;
 
@@ -311,29 +308,25 @@ int32_t LOCALAPI CSocketItemDl::SendStream(const void * buffer, int32_t len, boo
 			newTransaction = 1;
 	}
 
-	if(InterlockedCompareExchangePointer((PVOID *) & pendingSendBuf, (PVOID)buffer, NULL) != NULL)
+	if (InterlockedCompareExchangePointer((PVOID*)&pendingSendBuf, (PVOID)buffer, NULL) != NULL)
 	{
 		SetMutexFree();
-		return -EADDRINUSE;  
+		return -EADDRINUSE;
 	}
 	bytesBuffered = 0;
 
-	if(toCompress && newTransaction && ! AllocStreamState())
+	if (toCompress && newTransaction && !AllocStreamState())
 	{
 		SetMutexFree();
-		return -ENOMEM;  
+		return -ENOMEM;
 	}
 
 	// By default it should be asynchronous:
 	if (fpSent != NULL || fpCommitted != NULL)
-	{
-		EnablePolling();
-		int r = BufferData(len);
-		SetMutexFree();
-		return r;	// pendingSendSize = len;
-	}
+		return TailFreeMutexAndReturn(BufferData(len));
+	// assert(pendingSendSize == len);
 
-	// If it is blocking, wait until every byte has been put into the queue
+// If it is blocking, wait until every byte has been put into the queue
 	while ((r = BufferData(len)) >= 0)
 	{
 		// It used to urge LLS to send. Now (as at Feb.17, 2019) LLS works in polling mode
@@ -354,12 +347,8 @@ int32_t LOCALAPI CSocketItemDl::SendStream(const void * buffer, int32_t len, boo
 		len = pendingSendSize;
 	}
 	pendingSendBuf = NULL;
-	SetMutexFree();
-	//
-	if (r < 0)
-		return r;
 
-	return bytesBuffered;
+	return TailFreeMutexAndReturn(r < 0 ? r : bytesBuffered);
 }
 
 
@@ -403,13 +392,11 @@ int CSocketItemDl::LockAndCommit(NotifyOrReturn fp1)
 		fpCommitted = NULL;
 		SetMutexFree();
 		if (fp1 != NULL)
-			fp1(this, FSP_NotifyFlushed, EEXIST);
+			fp1(this, FSP_Urge, EEXIST);
 		return 0;	// It is already in a state that the near end's last transmit transaction has been committed
 	}
 
-	int r = Commit();
-	SetMutexFree();
-	return r;
+	return TailFreeMutexAndReturn(Commit());
 }
 
 
@@ -445,7 +432,7 @@ l_recursion:
 		if (fp2 != NULL)
 		{
 			SetMutexFree();
-			fp2(this, FSP_Urge, bytesBuffered);
+			fp2(this, FSP_Send, bytesBuffered);
 			return;
 		}
 		// Or else fall through to check whether it has intent to commit the transmit transaction
@@ -467,14 +454,14 @@ l_recursion:
 		return;	// As there's no thread waiting free send buffer
 	}
 
-	int32_t k = pControlBlock->CountSendBuffered();
+	ControlBlock::seq_t seqN = pControlBlock->sendBufferNextSN;
 	int32_t m;
 	BYTE *p = pControlBlock->InquireSendBuf(& m);
 	if (p == NULL)
 	{
 		TestSetSendReturn(fp2);
 		SetMutexFree();
-		BREAK_ON_DEBUG(); // race condition does exist, but shall be very rare!
+		// BREAK_ON_DEBUG(); // race condition does exist, but shall be very rare!
 		return;
 	}
 
@@ -488,7 +475,7 @@ l_recursion:
 		return;	// It could be disposed in the callback function.
 
 	// The callback function should consume at least one buffer block to avoid dead-loop
-	if (b && (pControlBlock->CountSendBuffered() > k) && HasFreeSendBuffer())
+	if (b && (int32_t(pControlBlock->sendBufferNextSN - seqN) > 0) && HasFreeSendBuffer())
 		goto l_recursion;
 	//
 	SetMutexFree();

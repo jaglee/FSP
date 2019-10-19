@@ -156,7 +156,6 @@ public:
 // Implemented in os_....cpp because light-weight IPC mutual-locks are OS-dependent
 class ConnectRequestQueue : public CLightMutex
 {
-	// volatile char mutex;	// in CLightMutex
 	char mayFull;
 	int	head;
 	int tail;
@@ -386,8 +385,8 @@ protected:
 
 	// Cached 'trunk' state
 	char	hasAcceptedRELEASE : 1;
-	char	inUse : 1;
 	char	delayAckPending : 1;
+	char	callbackTimerPending : 1;
 	char	transactional;	// The cache value of the EoT flag of the very first packet
 	FSP_Session_State lowState;
 
@@ -404,6 +403,7 @@ protected:
 	double		sendRate_Bpus;	// current send rate, byte per microsecond (!)
 	double		quotaLeft;		// in bytes
 	timestamp_t tPreviousTimeSlot;
+	timestamp_t tPreviousLifeDetection;
 
 	//- There used to be tKeepAlive_ms here. now reserved
 	HANDLE		timer;			// the repeating timer
@@ -516,12 +516,11 @@ public:
 #define WaitUseMutex()		WaitUseMutexAt(__FUNCTION__)		//  __func__
 	bool WaitUseMutexAt(const char *);
 	bool LockWithActiveULAt(const char *);
-	void SetMutexFree() { lockedAt = NULL; }
+	void SetMutexFree() { lockedAt = NULL; if(callbackTimerPending) KeepAlive(); }
 
-	bool IsInUse() { return inUse != 0 && pControlBlock != NULL; }
-	void ClearInUse() { inUse = 0; }
-	bool TestSetInUse() { if (inUse != 0) { return false; } else { inUse = 1; return true; } }
-	//^We need no interlocked bitfield operation because the whole TLB is locked on allocating the socket
+	bool IsInUse() { return (pControlBlock != NULL); }
+	void ClearInUse();
+	bool TestSetInUse();
 
 	void InstallEphemeralKey();
 	void InstallSessionKey(const CommandInstallKey &);
@@ -567,15 +566,46 @@ public:
 	int ResolveToIPv6(const char *);
 	int ResolveToFSPoverIPv4(const char *, const char *);
 
-	bool Notify(FSP_ServiceCode);
-	void SignalEvent() { ::SetEvent(hEvent); }
-	void SignalFirstEvent(FSP_ServiceCode code) { pControlBlock->notices.SetHead(code); ::SetEvent(hEvent); }
+	// Given
+	//	FSP_NoticeCode		the code of the notification to alert DLL
+	// Do
+	//	Set into the soft interrupt vector according to the code
+	// Remark
+	//	Successive notifications of the same code are automatically merged
+	//	'Non-Mask-able-Interrupt' is not merged, and soft NMI is raised immediately 
+	void Notify(FSP_NoticeCode n)
+	{
+		if ((unsigned long)n >= SMALLEST_FSP_NMI)
+		{
+			_InterlockedExchange8(&pControlBlock->notices.nmi, (char)n);
+			::SetEvent(hEvent);
+			return;
+		}
+		unsigned char	b = _interlockedbittestandset((long *)&pControlBlock->notices.vector, n);
+		long			v = pControlBlock->notices.vector & 1;
+#if (TRACE & TRACE_ULACALL)
+		if (b)
+		{
+			printf_s("\nSession #%u, duplicate soft interrupt %s(%d) eliminated.\n", fidPair.source, noticeNames[n], n);
+			return;
+		}
+		if (v != 0)
+		{
+			printf_s("\nSession #%u, soft interrupt %s(%d) suppressed.\n", fidPair.source, noticeNames[n], n);
+			return;
+		}
+		printf_s("\nSession #%u raise soft interrupt %s(%d)\n", fidPair.source, noticeNames[n], n);
+#endif
+		if (b == 0 && v == 0)
+			::SetEvent(hEvent);
+	}
+	void SignalFirstEvent(FSP_NoticeCode code) { pControlBlock->notices.SetHead(code); ::SetEvent(hEvent); }
 	//
 	int LOCALAPI AcceptSNACK(ControlBlock::seq_t, FSP_SelectiveNACK::GapDescriptor *, int);
 	//
 	void InitiateConnect();
 	void DisposeOnReset();
-	void Reject(uint32_t);
+	void RejectOrReset(uint32_t);
 	void InitiateMultiply(CSocketItemEx *);
 	bool FinalizeMultiply();
 

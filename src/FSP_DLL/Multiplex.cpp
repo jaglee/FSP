@@ -55,14 +55,14 @@ FSPHANDLE FSPAPI MultiplyAndWrite(FSPHANDLE hFSP, PFSP_Context psp1, unsigned fl
 	if (!p->AddOneShotTimer(TRANSIENT_STATE_TIMEOUT_ms))
 	{
 		REPORT_ERRMSG_ON_TRACE("Cannot set time-out clock for MultiplyAndWrite");
-		p->FreeAndDisable();
+		p->Free();
 		return NULL;
 	}
 
 	FSPHANDLE h = p->WriteOnMultiplied(objCommand, psp1, flag, fp1);
 	if (h == NULL)
 	{
-		p->FreeAndDisable();
+		p->Free();
 		return NULL;
 	}
 	return h;
@@ -96,7 +96,7 @@ FSPHANDLE FSPAPI MultiplyAndGetSendBuffer(FSPHANDLE hFSP, PFSP_Context psp1, Cal
 	if (!p->AddOneShotTimer(TRANSIENT_STATE_TIMEOUT_ms))
 	{
 		REPORT_ERRMSG_ON_TRACE("Cannot set time-out clock for MultiplyAndGetSendBuffer");
-		p->FreeAndDisable();
+		p->Free();
 		return NULL;
 	}
 
@@ -106,7 +106,7 @@ FSPHANDLE FSPAPI MultiplyAndGetSendBuffer(FSPHANDLE hFSP, PFSP_Context psp1, Cal
 		BYTE *buf = p->pControlBlock->InquireSendBuf(& m);
 		if(buf == NULL)
 		{
-			p->FreeAndDisable();
+			p->Free();
 			return NULL;
 		}
 		//
@@ -235,10 +235,7 @@ bool LOCALAPI CSocketItemDl::ToWelcomeMultiply(BackLogItem & backLog)
 	SetState(CONNECT_AFFIRMING);
 	SetNewTransaction();
 	if (context.onAccepting != NULL	&& context.onAccepting(this, & backLog.acceptAddr, remoteAddr) < 0)
-	{
-		RecycLocked();
 		return false;
-	}
 
 	SetHeadPacketIfEmpty(ACK_START);
 	return true;

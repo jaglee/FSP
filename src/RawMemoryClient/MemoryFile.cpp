@@ -53,7 +53,7 @@ static bool FSPAPI onReceiveNextBlock(FSPHANDLE h, void *buf, int32_t len, bool 
 // return negative if it is the error number
 int BeginReceiveMemoryPattern(FSPHANDLE h, size_t testSize)
 {
-	printf("To request %d otets from the remote end\n", (int32_t)testSize);
+	printf("To request %d octets from the remote end\n", (int32_t)testSize);
 	hFile = CreateFile(MEMORY_PATTERN_FILE_NAME
 		, GENERIC_WRITE
 		, 0	// shared none

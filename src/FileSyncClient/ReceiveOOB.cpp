@@ -10,9 +10,6 @@ extern bool r2finish;
 static void FSPAPI onShutdown(FSPHANDLE hRev, FSP_ServiceCode code, int value)
 {
 	printf_s("Clone session, socket %p has been shutdown.\n", hRev);
-	if(code != FSP_NotifyRecycled)
-		printf_s("Should got ON_RECYCLED, but service code = %d, return %d\n", code, value);
-	//
 	r2finish = true;
 	return;
 }

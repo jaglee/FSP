@@ -53,31 +53,47 @@ int  CSocketItemDl::Dispose()
 	if (InState(NON_EXISTENT))
 		return 0;
 
-	uint64_t t0 = GetTickCount64();
 	inUse = 0;	
 	//^So that WaitUseMutex of other thread could be interrupted
-	// Expanding and tuning WaitUseMutex():
-	while (!TryMutexLock())
+	if (!TryMutexLock())
 	{
-		if (GetTickCount64() - t0 > MAX_LOCK_WAIT_ms)
+		Sleep(TIMER_SLICE_ms * 2);
+		if (!TryMutexLock())
 			return -EDEADLK;
-		//
-		Sleep(TIMER_SLICE_ms);
 	}
-	if(pControlBlock == NULL || pControlBlock->state >= CLOSABLE)
-		return RecycLocked();
-	//
+
+	if (pControlBlock == NULL)
+	{
+		Free();	// might be redundant, but it does little harm
+		return 0;
+	}
+
+	// A gracefully shutdown socket is resurrect-able
+	if (pControlBlock->state == CLOSED)
+	{
+		socketsTLB.FreeItem(this);
+		return 0;
+	}
+
+	EnableLLSInterrupt();
 	SetMutexFree();
-	return Call<FSP_Reject>() ? 0 : -EIO;
+	return Call<FSP_Reset>() ? 0 : -EIO;
 }
 
 
 
-// UNRESOLVED!? Implement LRU for better performance
+// Unlike Free, Recycle-locked does not destroy the control block
+// so that the DLL socket may be reused on connection resumption
 // assume the socket has been locked
 int CSocketItemDl::RecycLocked()
 {
-	FreeAndDisable();
+	register HANDLE h;
+	CancelTimeout();
+	if ((h = InterlockedExchangePointer((PVOID*)&theWaitObject, NULL)) != NULL)
+		UnregisterWaitEx(h, NULL);
+
+	socketsTLB.FreeItem(this);
+
 	SetMutexFree();
 	return 0;
 }
@@ -87,14 +103,15 @@ int CSocketItemDl::RecycLocked()
 // Make sure resource is kept until other threads leave critical section
 // Does NOT waits for all callback functions to complete before returning
 // in case of deadlock when the function itself is called in some call-back function
-void CSocketItemDl::Disable()
+void CSocketItemDl::Free()
 {
 	register HANDLE h;
-	CancelPolling();
 	CancelTimeout();
 	if((h = InterlockedExchangePointer((PVOID *) & theWaitObject, NULL)) != NULL)
 		UnregisterWaitEx(h, NULL);
-	//
+
+	socketsTLB.FreeItem(this);
+
 	CSocketItem::Destroy();
 	memset((octet *)this + sizeof(CSocketItem), 0, sizeof(CSocketItemDl) - sizeof(CSocketItem));
 }
@@ -143,25 +160,31 @@ int CSocketItemDl::Shutdown()
 	if (!WaitUseMutex())
 		return (IsInUse() ? -EDEADLK : 0);
 
-	if (lowerLayerRecycled || InState(SHUT_REQUESTED) || InState(CLOSED))
-	{
-		NotifyOrReturn fp1 = (NotifyOrReturn)InterlockedExchangePointer((PVOID*)& fpFinished, NULL);
-		RecycLocked();		// CancelTimer(); SetMutexFree();
-		if (fp1 != NULL)
-			fp1(this, FSP_NotifyRecycled, InState(SHUT_REQUESTED) ? 0 : EAGAIN);
-		return 0;
-	}
-
-	if (initiatingShutdown != 0)
+	if (lowerLayerRecycled || initiatingShutdown != 0)
 	{
 		SetMutexFree();
 		return EAGAIN;	// A warning saying that the socket is already in graceful shutdown process
 	}
 	initiatingShutdown = 1;
 
-#ifndef _NO_LLS_CALLABLE
-	int32_t deinitWait = DEINIT_WAIT_TIMEOUT_ms;
+	if (InState(CLOSED))
+	{
+		RecycLocked();
+		return 0;
+	}
+
+	if (InState(SHUT_REQUESTED))
+	{
+		NotifyOrReturn fp1 = (NotifyOrReturn)InterlockedExchangePointer((PVOID*)&fpFinished, NULL);
+		SetState(CLOSED);
+		RecycLocked();
+		if (fp1 != NULL)
+			fp1(this, FSP_Shutdown, 0);
+		return 0;
+	}	// assert: FSP_NotifyToFinish has been received and processed. See also WaitEventToDispatch
+
 	FSP_Session_State s = GetState();
+#ifndef _NO_LLS_CALLABLE
 	if (s <= ESTABLISHED || s == COMMITTING || s == COMMITTED)
 	{
 		SetMutexFree();
@@ -169,7 +192,7 @@ int CSocketItemDl::Shutdown()
 	}
 	//
 	SetEoTPending();
-	if(s == PEER_COMMIT)
+	if (s == PEER_COMMIT)
 	{
 		if (HasDataToCommit())
 		{
@@ -214,7 +237,8 @@ int CSocketItemDl::Shutdown()
 		s = GetState();
 	}
 	//
-	for (; s != CLOSED && s != NON_EXISTENT; s = GetState())
+	int32_t deinitWait = DEINIT_WAIT_TIMEOUT_ms;
+	for (; s != SHUT_REQUESTED && s != CLOSED && s != NON_EXISTENT; s = GetState())
 	{
 		if (s == CLOSABLE)
 		{
@@ -245,6 +269,11 @@ int CSocketItemDl::Shutdown()
 			return (IsInUse() ? -EDEADLK : 0);
 	}
 #endif
-	SetMutexFree();
+	if (s == SHUT_REQUESTED)
+		SetState(s = CLOSED);
+	if (s == CLOSED)
+		RecycLocked();
+	else
+		SetMutexFree();
 	return 0;
 }

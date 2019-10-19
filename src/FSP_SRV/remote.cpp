@@ -540,6 +540,7 @@ void CSocketItemEx::OnConnectRequestAck()
 	// Do not update RTT here, because there's undetermined delay due to backlog processing/calling back ULA
 	tSessionBegin = tMigrate = tLastRecv;
 	tPreviousTimeSlot = tRecentSend;
+	tPreviousLifeDetection = tSessionBegin;
 
 	pControlBlock->peerAddr.ipFSP.fiberID = headPacket->fidPair.source;
 	pControlBlock->sendWindowLimitSN
@@ -752,8 +753,7 @@ void CSocketItemEx::OnGetPersist()
 	int countPlaced = PlacePayload();
 	if (countPlaced == -EFAULT)
 	{
-		BREAK_ON_DEBUG();	//TRACE_HERE("how on earth no buffer in the receive window?!");
-		Notify(FSP_NotifyOverflow);
+		Notify(FSP_MemoryCorruption);
 		return;
 	}
 	// Make acknowledgement, in case previous acknowledgement is lost
@@ -960,8 +960,7 @@ void CSocketItemEx::OnGetPureData()
 	int r = PlacePayload();
 	if (r == -EFAULT)
 	{
-		BREAK_ON_DEBUG();	//TRACE_HERE("No buffer when the receive window is not closed?");
-		Notify(FSP_NotifyOverflow);
+		Notify(FSP_MemoryCorruption);
 		return;
 	}
 	if (r == -ENOENT || r == -EEXIST)
@@ -990,11 +989,7 @@ void CSocketItemEx::OnGetPureData()
 	if (!InState(CLONING) && !InState(PEER_COMMIT) && lowState < COMMITTING2)
 		EnableDelayAck();
 
-	// Did not exploit ControlBlock::CountDeliverable because of multi-thread shared memory synchronization problem
-	// Normally the ULA work in polling mode. Urge it to process the receive buffer if the buffer is full
-	if (int32_t(pControlBlock->recvWindowExpectedSN - GetRecvWindowLastSN()) >= 0)
-		Notify(FSP_NotifyDataReady);
-	// See also OnGetPersist()
+	Notify(FSP_NotifyDataReady);
 }
 
 
@@ -1273,9 +1268,9 @@ void CSocketItemEx::OnGetMultiply()
 	// Assume DoS attacks or replay attacks have been filtered out
 #if defined(TRACE) && (TRACE & TRACE_OUTBAND)
 	printf_s("\nTo acknowledge MULTIPLY/send a PERSIST in LLS, ICC context:\n"
-		"\tSN of MULTIPLY received = %09u, salt = %09u\n"
+		"\tSN of MULTIPLY received = %09u\n"
 		"\tALFID of peer's branch = %u, ALFID of near end's parent = %u\n"
-		, backlogItem.expectedSN, salt
+		, backlogItem.expectedSN
 		, idSource, idParent);
 #endif
 	// note that the responder's key material mirrors the initiator's

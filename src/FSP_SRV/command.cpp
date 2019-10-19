@@ -110,7 +110,6 @@ void LOCALAPI Connect(CommandNewSessionSrv &cmd)
 	return;
 
 l_bailout3:
-	socketItem->ClearInUse();
 	CLowerInterface::Singleton.FreeItem(socketItem);
 l_bailout2:
 	connectRequests.Remove(cmd.index);
@@ -222,9 +221,11 @@ void CSocketItemEx::ProcessCommand(CommandToLLS *pCmd)
 	if (!WaitUseMutex())
 	{
 		printf_s("Socket %p[fiber#%u] in state %s: process command %s[%d]\n"
-			"probably encountered dead-lock: inUse = %d, pSCB: %p\n"
+			"probably encountered dead-lock: pSCB: %p\n"
 			, this, fidPair.source, stateNames[lowState], noticeNames[pCmd->opCode], pCmd->opCode
-			, inUse, pControlBlock);
+			, pControlBlock);
+		if(lockedAt != NULL)
+			printf_s("Lastly called by %s\n", lockedAt);
 		return;
 	}
 #if defined(TRACE) && (TRACE & TRACE_ULACALL)
@@ -240,14 +241,8 @@ void CSocketItemEx::ProcessCommand(CommandToLLS *pCmd)
 		RestartKeepAlive();	// If it happened to be stopped
 		DoEventLoop();
 		break;
-	case FSP_Reject:
-		if (IsPassive())
-		{
-			SignalFirstEvent(FSP_NotifyRecycled);
-			Destroy();
-			break;
-		}
-		Reject(((CommandRejectRequest *)pCmd)->reasonCode);
+	case FSP_Reject:		// FSP_Reset as well
+		RejectOrReset(((CommandRejectRequest *)pCmd)->reasonCode);
 		break;
 	case FSP_InstallKey:
 		InstallSessionKey((CommandInstallKey &)*pCmd);
@@ -298,7 +293,7 @@ void CSocketItemEx::Connect()
 		r = ResolveToFSPoverIPv4(peerName, serviceName);
 		if(r <=  0)
 		{
-			Notify(FSP_NotifyNameResolutionFailed);
+			Notify(FSP_NameResolutionFailed);
 			Destroy();
 			return;
 		}
@@ -328,9 +323,12 @@ void CSocketItemEx::Connect()
 // Send RESET to the remote peer to reject some request in pre-active state.
 // The RESET packet is not guaranteed to be received.
 // See also DisposeOnReset
-void CSocketItemEx::Reject(uint32_t reasonCode)
+void CSocketItemEx::RejectOrReset(uint32_t reasonCode)
 {
-	CLowerInterface::Singleton.SendPrematureReset(reasonCode, this);
+	if (lowState >= ESTABLISHED)
+		SendReset();
+	else if (!IsPassive())
+		CLowerInterface::Singleton.SendPrematureReset(reasonCode, this);
 	SignalFirstEvent(FSP_NotifyRecycled);
 	Destroy();	// MUST signal event before Destroy
 }

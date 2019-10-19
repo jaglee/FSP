@@ -131,17 +131,13 @@ int CSocketItemDl::RecvInline(CallbackPeeked fp1)
 		return -EDOM;	// May not call RecvInline if previous ReadFrom with decompression unfinished
 	}
 
-	if (InterlockedExchangePointer((PVOID *)& fpPeeked, fp1) != NULL)
-	{
-#ifdef TRACE
+#ifndef NDEBUG
+	if (InterlockedExchangePointer((PVOID*)&fpPeeked, fp1) != NULL)
 		printf_s("\nFiber#%u, warning: Receive-inline called before previous RecvInline called back\n", fidPair.source);
+#else
+	InterlockedExchangePointer((PVOID*)&fpPeeked, fp1);
 #endif
-	}
-
-	// Let's the polling timer to call ProcessReceiveBuffer
-	EnablePolling();
-	SetMutexFree();
-	return 0;
+	return TailFreeMutexAndReturn(0);
 }
 
 
@@ -208,7 +204,7 @@ void* LOCALAPI CSocketItemDl::TryRecvInline(int32_t &size, bool &flag)
 // See ::RecvFrom()
 // TODO: check whether the buffer overlapped?
 // TODO: make read idle (waiting some data available) time-out configurable? 
-int LOCALAPI CSocketItemDl::ReadFrom(void * buffer, int capacity, NotifyOrReturn fp1)
+int LOCALAPI CSocketItemDl::ReadFrom(void* buffer, int capacity, NotifyOrReturn fp1)
 {
 	if (!WaitUseMutex())
 		return (IsInUse() ? -EDEADLK : -EINTR);
@@ -220,14 +216,14 @@ int LOCALAPI CSocketItemDl::ReadFrom(void * buffer, int capacity, NotifyOrReturn
 		return r;
 	}
 	//
-	if (InterlockedCompareExchangePointer((PVOID *)& fpReceived, fp1, NULL) != NULL)
+	if (InterlockedCompareExchangePointer((PVOID*)&fpReceived, fp1, NULL) != NULL)
 	{
 		SetMutexFree();
 		return -EBUSY;
 	}
 
 	// Check whether previous ReadFrom finished (no waitingRecvBuf), effectively serialize receiving
-	if (InterlockedCompareExchangePointer((PVOID *)& waitingRecvBuf, buffer, NULL) != NULL)
+	if (InterlockedCompareExchangePointer((PVOID*)&waitingRecvBuf, buffer, NULL) != NULL)
 	{
 		SetMutexFree();
 		return -EADDRINUSE;
@@ -238,23 +234,16 @@ int LOCALAPI CSocketItemDl::ReadFrom(void * buffer, int capacity, NotifyOrReturn
 
 	// We do not reset fpPeeked. RecvInline() just takes precedence over ReadFrom()
 	if (fpPeeked != NULL)
-	{
-		SetMutexFree();
-		return 0;
-	}
+		return TailFreeMutexAndReturn(0);
+
 	peerCommitted = 0;	// See also ProcessReceiveBuffer
 
-	// Let's the polling timer to call ProcessReceiveBuffer
 	if (fpReceived != NULL)
-	{
-		EnablePolling();
-		SetMutexFree();
-		return 0;
-	}
+		return TailFreeMutexAndReturn(0);
 
 	// If it is blocking, wait until every slot in the receive buffer has been filled
 	// or the peer has committed the transmit transaction
-	while ((r = FetchReceived()) >= 0 && _InterlockedOr((LONG *)&bytesReceived, 0) < capacity)
+	while ((r = FetchReceived()) >= 0 && _InterlockedOr((LONG*)&bytesReceived, 0) < capacity)
 	{
 		uint64_t t0 = GetTickCount64();
 		do
@@ -263,7 +252,7 @@ int LOCALAPI CSocketItemDl::ReadFrom(void * buffer, int capacity, NotifyOrReturn
 				goto l_postloop;
 			SetMutexFree();
 			Sleep(TIMER_SLICE_ms);
-			if (GetTickCount64() - t0 > COMMITTING_TIMEOUT_ms)
+			if (GetTickCount64() - t0 > SESSION_IDLE_TIMEOUT_us/1000)
 				return -EDEADLK;
 			if (!WaitUseMutex())
 				return (IsInUse() ? -EDEADLK : -EINTR);
@@ -272,11 +261,8 @@ int LOCALAPI CSocketItemDl::ReadFrom(void * buffer, int capacity, NotifyOrReturn
 	// Assert: if(peerCommitted) the decode buffer MUST have been flushed. See also FlushDecodeBuffer()
 l_postloop:
 	waitingRecvBuf = NULL;
-	SetMutexFree();
-	//
-	if (r < 0)
-		return r;
-	return bytesReceived;
+
+	return TailFreeMutexAndReturn(r < 0 ? r : bytesReceived);
 }
 
 
@@ -400,9 +386,9 @@ l_recursion:
 			printf_s("FetchReceived() return %d when ProcessReceiveBuffer\n", n);
 #endif		
 			if (fpReceived != NULL)
-				fpReceived(this, FSP_NotifyDataReady, n);
+				fpReceived(this, FSP_Receive, n);
 			else
-				NotifyError(FSP_NotifyDataReady, n);
+				NotifyError(FSP_Receive, n);
 			return;
 		}
 
@@ -413,7 +399,7 @@ l_recursion:
 			SetMutexFree();
 			// due to multi-task nature it could be already reset in the caller although fpReceived has been checked here
 			if (fp1 != NULL)
-				fp1(this, FSP_NotifyDataReady, bytesReceived);
+				fp1(this, FSP_Receive, bytesReceived);
 		}
 		else
 		{

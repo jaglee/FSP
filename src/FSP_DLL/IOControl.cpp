@@ -46,7 +46,7 @@ FSPHANDLE FSPAPI CreateFSPHandle()
 DllExport
 void FSPAPI FreeFSPHandle(FSPHANDLE h)
 {
-	((CSocketItemDl *)h)->FreeAndDisable();
+	((CSocketItemDl *)h)->Free();
 }
 
 

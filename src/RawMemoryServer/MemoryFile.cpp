@@ -42,7 +42,7 @@ static int FSPAPI toSendNextBlock(FSPHANDLE h, void * batchBuffer, int32_t capac
 	{
 		((uint32_t *)batchBuffer)[i] = htobe32(uint32_t(nPrepared + i));
 	}
-	// to make life easier just apply zero padding; let the optimizer make the code effecient 
+	// to make life easier just apply zero padding; let the optimizer make the code efficient 
 	for (register int i = 0; i < nToSend - (int)sizeof(uint32_t) * nDWord; i++)
 	{
 		((octet *)batchBuffer)[sizeof(uint32_t) * nDWord + i] = 0;
