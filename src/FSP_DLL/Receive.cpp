@@ -382,7 +382,7 @@ l_recursion:
 		if (n < 0)
 		{
 			SetMutexFree();
-#ifdef TRACE
+#ifndef NDEBUG
 			printf_s("FetchReceived() return %d when ProcessReceiveBuffer\n", n);
 #endif		
 			if (fpReceived != NULL)
@@ -425,7 +425,7 @@ l_recursion:
 
 	bool eot;
 	octet* p = pControlBlock->InquireRecvBuf(n, pendingPeekedBlocks, eot);
-#ifdef TRACE
+#if defined(TRACE) && defined(TRACE_VERBOSE)
 	printf_s("RecvInline, data to deliver@%p, length = %d, eot = %d; %d blocks scanned\n", p, n, (int)eot, pendingPeekedBlocks);
 #endif
 	if (!eot && n == 0)	// Redundant soft-interrupt shall be simply ignored

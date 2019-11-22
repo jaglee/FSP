@@ -178,7 +178,7 @@ int FSPAPI toReadTCPData(FSPHANDLE h, void *buf, int32_t capacity)
 		return 0;
 	}
 
-#ifndef NDEBUG
+#if defined(_DEBUG_PEEK)
 	printf_s("%d bytes read from the TCP end, first 300 chars:\n", n);
 	if (pReq->countTCPreceived == 0)
 		printf_s("%.300s\n", (char*)buf);

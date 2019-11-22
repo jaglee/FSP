@@ -1366,12 +1366,6 @@ void CSocketItemEx::ClearInUse()
 }
 
 
-bool CSocketItemEx::TestSetInUse()
-{
-	return (InterlockedCompareExchangePointer((PVOID *)& pControlBlock, (void *)(-1), NULL) == NULL);
-}
-
-
 
 /*
  * The OS-dependent CommandNewSessionSrv constructor

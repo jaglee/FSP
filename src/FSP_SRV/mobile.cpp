@@ -218,7 +218,7 @@ void CSocketItemEx::InstallEphemeralKey()
 	recvFIDPair.source = fidPair.peer;
 	contextOfICC.curr.precomputedCRCR1
 		=  CalculateCRC64(* (uint64_t *) & recvFIDPair, (uint8_t *) & pControlBlock->connectParams, FSP_MAX_KEY_SIZE);
-#if defined(TRACE) && (TRACE & (TRACE_SLIDEWIN | TRACE_ULACALL))
+#if defined(TRACE) && (TRACE & TRACE_SLIDEWIN)
 	printf_s("Precomputed ICC 0:");
 	DumpNetworkUInt16((uint16_t *)  & contextOfICC.curr.precomputedCRCS0, 4);
 	printf_s("Precomputed ICC 1:");

@@ -520,7 +520,7 @@ public:
 
 	bool IsInUse() { return (pControlBlock != NULL); }
 	void ClearInUse();
-	bool TestSetInUse();
+	bool TestSetState(FSP_Session_State s0) { return (_InterlockedCompareExchange8((char*)&lowState, s0, 0) == 0); }
 
 	void InstallEphemeralKey();
 	void InstallSessionKey(const CommandInstallKey &);

@@ -79,13 +79,13 @@ CSocketItemEx * CSocketSrvTLB::AllocItem()
 
 	AcquireMutex();
 
-	if (headFreeSID != NULL && headFreeSID->TestSetInUse())
+	if (headFreeSID != NULL && headFreeSID->TestSetState(CONNECT_BOOTSTRAP))
 		goto l_success;
 
 	// as this is a prototype is not bothered to exploit hash table
 	// recycle all of the orphan sockets
 	register int i;
-#if !(TRACE & (TRACE_ADDRESS | TRACE_ULACALL))
+#if !(TRACE & TRACE_HEARTBEAT)
 	for (i = 0, p = itemStorage; i < MAX_CONNECTION_NUM; i++, p++)
 	{
 		if (!p->IsProcessAlive())
@@ -94,7 +94,7 @@ CSocketItemEx * CSocketSrvTLB::AllocItem()
 #endif
 	if (headFreeSID != NULL)
 	{
-		headFreeSID->TestSetInUse();
+		headFreeSID->TestSetState(CONNECT_BOOTSTRAP);
 		goto l_success;
 	}
 
@@ -106,7 +106,7 @@ CSocketItemEx * CSocketSrvTLB::AllocItem()
 	{
 		for (i = 0, p = itemStorage; i < MAX_CONNECTION_NUM; i++, p++)
 		{
-			if (p->lowState == CLOSED || !p->IsInUse())
+			if (p->lowState == CLOSED)
 				PutToScavengeCache(p, tNow);
 		}
 	}
@@ -127,7 +127,7 @@ CSocketItemEx * CSocketSrvTLB::AllocItem()
 	p1->WaitUseMutex();		// it is throttling!
 	p1->AbortLLS(true);
 	assert(headFreeSID != NULL);
-	headFreeSID->TestSetInUse();
+	headFreeSID->TestSetState(CONNECT_BOOTSTRAP);
 
 l_success:
 	p = headFreeSID;
@@ -152,7 +152,7 @@ CSocketItemEx * CSocketSrvTLB::AllocItem(ALFID_T idListener)
 	// detect duplication fiber ID, remove 'brain-dead' socket
 	for(register int i = 0; i < MAX_LISTENER_NUM; i++)
 	{
-		if (listenerSlots[i].TestSetInUse())
+		if (listenerSlots[i].TestSetState(LISTENING))
 		{
 			if (p != NULL)
 				p->ClearInUse();
@@ -166,7 +166,7 @@ CSocketItemEx * CSocketSrvTLB::AllocItem(ALFID_T idListener)
 				p->ClearInUse();
 			p = &listenerSlots[i];
 			p->AbortLLS(true);
-			p->TestSetInUse();
+			p->TestSetState(LISTENING);
 			// do not break, for purpose of duplicate allocation detection
 		}
 		else if (listenerSlots[i].fidPair.source == idListener)
@@ -304,6 +304,7 @@ CSocketItemEx * CSocketSrvTLB::operator[](ALFID_T id)
 //	CommandNewSessionSrv	The 'new session' command
 // Return
 //	The new socket item, with control block memory mapped
+// We allow a socket slot waiting scavenge to be reused earlier than recycled. See also KeepAlive
 CSocketItemEx * CSocketSrvTLB::AllocItem(const CommandNewSessionSrv & cmd)
 {
 	AcquireMutex();
@@ -311,8 +312,7 @@ CSocketItemEx * CSocketSrvTLB::AllocItem(const CommandNewSessionSrv & cmd)
 	CSocketItemEx *p = (*this)[cmd.fiberID];
 	if(p != NULL)
 	{
-		// We allow a socket slot waiting scavenge to be reused earlier than recycled. See also KeepAlive
-		if(!p->TestSetInUse() && p->lowState != NON_EXISTENT)
+		if (!p->TestSetState(CHALLENGING))
 		{
 			p = NULL;
 			goto l_return;
@@ -599,7 +599,7 @@ void CSocketItemEx::InitiateMultiply(CSocketItemEx *srcItem)
 	SyncState();
 	SendPacket(2, ScatteredSendBuffers(payload, sizeof(FSP_NormalPacketHeader), this->cipherText, skb->len));
 	skb->MarkSent();
-	skb->timeSent = NowUTC();
+	skb->timeSent = tRecentSend;
 	SetFirstRTT(srcItem->tRoundTrip_us);
 	tSessionBegin = skb->timeSent;
 	tPreviousTimeSlot = skb->timeSent;
@@ -667,7 +667,7 @@ void CMultiplyBacklogItem::RespondToMultiply()
 		return;
 	}
 
-	// The opCode field is overriden to PERSIST for sake of clearer transmit transaction management
+	// The opCode field is overridden to PERSIST for sake of clearer transmit transaction management
 	skb->len = CopyOutPlainText(ubuf);
 	CopyOutFVO(skb);
 	skb->opCode = PERSIST;

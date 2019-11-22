@@ -34,6 +34,10 @@
 #define THIS_FSP_VERSION	0	// current version
 #define IPPROTO_FSP			144	// value of protocol field for FSP over IPv6
 
+#ifdef OVERLAY_DNS
+# define OVER_UDP_IPv4
+#endif
+
 #define ARCH_BIG_ENDIAN		0	// by default it works for little-endian architecture
 
 // Application Layer Fiber ID, the equivalent phrase is Upper Layer Thread ID
@@ -46,14 +50,21 @@ typedef ALFID_T	 ULTID_T;
 // in network byte order on a big-endian host
 #define PORT2ALFID(port)	((ALFID_T)(unsigned short)(port))
 #define PREFIX_FSP_IP6to4	0x2002		// prefix of 6to4 overloaded
-#define DEFAULT_FSP_UDPPORT	(((unsigned short)'F' << 8) + (unsigned short)'S')
+# ifndef OVERLAY_DNS
+# define DEFAULT_FSP_UDPPORT	(((unsigned short)'F' << 8) + (unsigned short)'S')
+# else
+# define DEFAULT_FSP_UDPPORT	53
+# endif
 #else
 // __X86__
 // in network byte order on a little-endian host
 #define PORT2ALFID(port)	((ALFID_T)(port) << 16)
 #define PREFIX_FSP_IP6to4	0x0220		// prefix of 6to4 overloaded
-// #define DEFAULT_FSP_UDPPORT 13568
-#define DEFAULT_FSP_UDPPORT	((unsigned short)'F' + ((unsigned short)'S' << 8))
+# ifndef OVERLAY_DNS
+# define DEFAULT_FSP_UDPPORT	((unsigned short)'F' + ((unsigned short)'S' << 8))
+# else
+# define DEFAULT_FSP_UDPPORT	(53 << 8)
+# endif
 #endif
 
 

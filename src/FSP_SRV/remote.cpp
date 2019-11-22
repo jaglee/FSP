@@ -49,7 +49,7 @@ struct _CookieMaterial
 		, fidPair.source, be32toh(fidPair.source)		\
 		, stateNames[lowState])	\
 	&& pControlBlock->DumpSendRecvWindowInfo())
-#elif (TRACE & (TRACE_ULACALL | TRACE_SLIDEWIN))
+#elif (TRACE & TRACE_SLIDEWIN)
 #define TRACE_SOCKET()	\
 	(printf_s(__FUNCTION__ ": local fiber#%u(_%X_) in state %s\n"	\
 		, fidPair.source, be32toh(fidPair.source)		\
@@ -626,7 +626,7 @@ void CSocketItemEx::OnGetNulCommit()
 		pControlBlock->SlideRecvWindowByOne();
 	}
 	// Indirect dependency: tLastRecv which is exploited in SendAckFlush in TransitOnPeerCommit is set here
-	tLastRecv = NowUTC();
+	skb->timeRecv = tLastRecv = NowUTC();
 	snLastRecv = pktSeqNo;
 	// Network RTT may not be refreshed here as there is undetermined delay caused by application processing
 #if (TRACE & (TRACE_SLIDEWIN | TRACE_HEARTBEAT))
@@ -1223,6 +1223,8 @@ void CSocketItemEx::OnGetMultiply()
 		REPORT_ERRMSG_ON_TRACE("Cannot allocate new socket slot for multiplication");
 		return;		// for security reason silently ignore the exception
 	}
+	newItem->tLastRecv = NowUTC();
+	newItem->snLastRecv = pktSeqNo;
 
 	BackLogItem backlogItem(pControlBlock->connectParams);
 	backlogItem.idRemote = idSource;
@@ -1277,7 +1279,6 @@ void CSocketItemEx::OnGetMultiply()
 	if (newItem->contextOfICC.keyLifeRemain != 0)
 		newItem->DeriveKey(idSource, idParent);
 
-	newItem->tLastRecv = tLastRecv;	// inherit the time when the MULTIPLY packet was received
 	newItem->SetFirstRTT(tRoundTrip_us);
 	newItem->lowState = NON_EXISTENT;		// so that when timeout it is scavenged
 	newItem->ReplaceTimer(TRANSIENT_STATE_TIMEOUT_ms);
