@@ -27,17 +27,7 @@
     POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include <stdio.h>
-#include <ctype.h>
-#include <string.h>
-#include <stdlib.h>
-#include <malloc.h>
-#include <fcntl.h>
-#include <io.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-
-#include "defs.h"
+#include "fsp_http.h"
 
 /**
   How does it work:
@@ -62,8 +52,11 @@ RequestPool	requestPool;
 
 static bool FSPAPI onRequestArrived(FSPHANDLE, void *, int32_t, bool);
 
-static int ReportWSAError(char *);
-
+#ifdef _WIN32
+static int ReportWSAError(const char *);
+#else
+# define ReportWSAError(msg) perror(msg)
+#endif
 
 
 // Given
@@ -77,7 +70,7 @@ void CloseGracefully(SOCKET client)
 	timeout.tv_usec = 0;
 	setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, sizeof(timeout));
 	//
-	shutdown(client, SD_SEND);
+	shutdown(client, SD_SEND); 
 	int r;
 	do
 	{
@@ -212,7 +205,7 @@ void ReportSuccessViaFSP(PRequestPoolItem p)
 {
 	SRequestResponse rep;
 	SOCKADDR_IN boundAddr;
-	int namelen = sizeof(boundAddr);
+	socklen_t	namelen = sizeof(boundAddr);
 
 	int r = getsockname(p->hSocket, (SOCKADDR *)& boundAddr, &namelen);
 	if (r < 0)
@@ -252,8 +245,8 @@ int	FSPAPI onMultiplying(FSPHANDLE hSrv, PFSP_SINKINF p, PFSP_IN6_ADDR remoteAdd
 	printf_s("\nTo accept multiplied handle of FSP session: %p\n", hSrv);
 	printf_s("Interface#%d, fiber#%u\n", p->ipi6_ifindex, p->idALF);
 	// no be32toh() for local; note that for IPv6 network, little-endian CPU, the peer's remoteAddr->idALF wouldn't match it
-	printf_s("Remote address: 0x%llX::%X::%X\n"
-		, be64toh(remoteAddr->subnet)
+	printf_s("Remote address: 0x%" PRIx64 "::%X::%X\n"
+		, (uint64_t)be64toh(remoteAddr->subnet)	// but in cygwin64 __bswap_64 return unsigned long long which is not PRIx64
 		, be32toh(remoteAddr->idHost)
 		, be32toh(remoteAddr->idALF));
 #endif
@@ -271,24 +264,24 @@ static bool FSPAPI onRequestArrived(FSPHANDLE h, void *buf, int32_t len, bool eo
 	PRequestPoolItem p = requestPool.FindItem(h);
 	if(p == NULL)
 		return false;	// but it may be deadlocked!?
-	if(! eot || len < sizeof(SRequestResponse))
+	if(! eot || len < (int)sizeof(SRequestResponse))
 		return false;	// to report break of protocol!
 
 	// following code should be put in the remote end point
 	p->hSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 	if(p->hSocket == SOCKET_ERROR)
 	{
-        printf_s("remote socket() failed with error: %d\n", WSAGetLastError());
+		ReportWSAError("Remote socket() failed");
 		ReportToRemoteClient(p, REP_REJECTED);
 		return false;
 	}
 
 	sockaddr_in remoteEnd;
 	SRequestResponse *q = (SRequestResponse *)buf;
+	memset(&remoteEnd, 0, sizeof(sockaddr_in));
 	remoteEnd.sin_addr = q->inet4Addr;
 	remoteEnd.sin_family = AF_INET;
 	remoteEnd.sin_port = q->nboPort;
-
 #ifndef NDEBUG
 	printf_s("Version %d, command code %d, try to connect to %s:%d\n"
 		, q->version
@@ -300,7 +293,7 @@ static bool FSPAPI onRequestArrived(FSPHANDLE h, void *buf, int32_t len, bool eo
 	int r = connect(p->hSocket, (PSOCKADDR) & remoteEnd, sizeof(remoteEnd));
 	if(r != 0)
 	{
-        printf_s("connect() failed with error: %d\n", WSAGetLastError());
+		ReportWSAError("Remote connect() failed");
 		ReportToRemoteClient(p, REP_REJECTED);
 		return false;
 	}
@@ -313,14 +306,14 @@ static bool FSPAPI onRequestArrived(FSPHANDLE h, void *buf, int32_t len, bool eo
 }
 
 
-
+#ifdef _WIN32
 // Given
 //	char *		The error message prefix string in multi-byte character set
 // Do
 //	Print the system message mapped to the last error to the standard output, prefixed by the given message prefix
 // Return
 //	the WSA error number, which is greater than zero. may be zero if no error at all.
-static int ReportWSAError(char * msg)
+static int ReportWSAError(const char * msg)
 {
 	int	err = WSAGetLastError();
 
@@ -344,3 +337,4 @@ static int ReportWSAError(char * msg)
 
 	return err;
 }
+#endif

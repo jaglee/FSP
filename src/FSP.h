@@ -259,7 +259,12 @@ typedef uint64_t timestamp_t;
 typedef uint64_t TSubnets[MAX_PHY_INTERFACES];
 
 
-#include <pshpack1.h>
+#if defined(_MSC_VER)
+# include <pshpack1.h>
+#else
+# pragma pack(push)
+# pragma pack(1)
+#endif
 
 /**
  * struct FSP_IN6_ADDR * may be converted to struct in6_addr *
@@ -268,7 +273,7 @@ typedef uint64_t TSubnets[MAX_PHY_INTERFACES];
 typedef struct FSP_IN4_ADDR_PREFIX
 {
 	uint16_t	prefix;
-	uint32_t	ipv4;	//IN_ADDR
+	u32	ipv4;	/* IN_ADDR */
 	uint16_t	port;
 } *PFSP_IN4_ADDR_PREFIX;
 
@@ -480,7 +485,10 @@ typedef struct CSocketPerformance
 } *PSocketProfile;
 
 
-#include <poppack.h>
-
+#if defined(_MSC_VER)
+# include <poppack.h>
+#else
+# pragma pack(pop)
 #endif
 
+#endif

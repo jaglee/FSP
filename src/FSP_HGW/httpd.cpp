@@ -2,7 +2,7 @@
  * Simple HTTP 1.0 server over FSP version 0. SOCKS gateway and tunnel server as well
  *
  * Usage 1: as the SOCKSv4 proxy: fsp_socks -p <port number> [Remote FSP address]
- * Usage 2: as the HTTP server (and tunnel responder)£º fsp_http -d <local web root>
+ * Usage 2: as the HTTP server (and tunnel responder)ï¿½ï¿½ fsp_http -d <local web root>
     Copyright (c) 2017, Jason Gao
     All rights reserved.
 
@@ -29,37 +29,17 @@
     POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include <stdio.h>
-#include <ctype.h>
-#include <string.h>
-#include <stdlib.h>
-#include <malloc.h>
-#include <fcntl.h>
-#include <io.h>
-#include <share.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-
 #define SERVER_STRING	"Server: fspgated/0.1\r\n"
 #include "errstrs.hpp"
 #include "fsp_http.h"
-
-#ifdef WIN32
-#include <WinSock2.h>
-#else
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <unistd.h>
-#include <strings.h>
-#include <pthread.h>
-#include <sys/wait.h>
-#define _strcmpi strcasecmp
-#endif
+#include <assert.h>
 
 /**
  * The key agreement block
  */
+
+static const octet sampleSalt[CRYPTO_SALT_LENGTH] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
+static const char* samplePassword = "Passw0rd";
 
 // assume that address space layout randomization keep the secret hard to find
 static octet longTermPublicKey[CRYPTO_NACL_KEYBYTES];
@@ -67,7 +47,6 @@ static octet bufASLRPrivateKey[CRYPTO_NACL_KEYBYTES];
 
 static void FSPAPI onPublicKeyReceived(FSPHANDLE, FSP_ServiceCode, int);
 static void FSPAPI onServerResponseSent(FSPHANDLE h, FSP_ServiceCode c, int r);
-static void FSPAPI onClientResponseReceived(FSPHANDLE h, FSP_ServiceCode c, int r);
 
 // The FSP handle that listens for tunnel service request
 static FSPHANDLE hListener; 
@@ -84,43 +63,7 @@ static void FSPAPI onFurtherTunnelRequest(FSPHANDLE, FSP_ServiceCode, int);
 void	StartHTTPoverFSP();
 
 // Forward declaration of the toplevel function that implements service interface for SOCKS gateway
-void	ToServeSOCKS(char *, int);
-
-// Given
-//	const *		the error message meant to be put on system console (and should be logged)
-// Do
-//	Exit the program abruptly for some fatal reason
-void	Abort(const char *);
-
-// Given
-//	FSPHANDLE		The handle of the FSP connection that was made towards the browser
-//					that supports HTTP over FSP, or the tunnel service client
-//	const char *	path of the executable
-//	const char *	invoke HTTP method of the executable. 'GET' or 'POST' only for this version
-//	const char *	the query string in the original URL that was meant to pass to the executable
-// Do
-//	Execute the CGI executable that subjected to *FCGI* management
-void	execute_cgi(FSPHANDLE, const char *, const char *, const char *);
-
-// Given
-//	FSPHANDLE	The handle of the FSP connection that was made towards the browser
-//	char *		The buffer to hold the request line
-//	int			The capacity of the buffer which should be more than 80, less than 32767
-// Return
-//	Non-negative:	number of octets read,
-//	Negative:		the error number
-// Remark
-//	Request byte stream is further buffered internally
-int		ReadLine(FSPHANDLE, char *, int);
-
-// Given
-//	FSPHANDLE		The handle of the FSP connection that was made towards the browser
-//	const char *	the name of the file whose content is meant to be sent to the browser
-// Do
-//	Read the content of file and send the binary stream to the remote end
-// Remark
-//	For this version assume only the html content type is supported
-void	SendRegFile(FSPHANDLE, const char *);
+void	ToServeSOCKS(const char *, int);
 
 
 inline void WriteErrStr(FSPHANDLE client, const char *buf)
@@ -150,20 +93,27 @@ inline void FreeExtent(FSPHANDLE h, bool disposing = false)
 // If the command line specifies the local web root, it is the remote end point of the tunnel
 int main(int argc, char *argv[])
 {
-	WSADATA wsaData;
 	int r = -1;
-	//
+
+#ifdef _WIN32
+	WSADATA wsaData;
 	if (WSAStartup(0x202, &wsaData) < 0)
 	{
 		printf_s("Cannot start up Windows socket service provider.\n");
 		return r;
 	}
+#endif
 
 	if(argc <= 1)
 	{
+#ifdef _WIN32
 		printf_s("To serve SOCKS v4 request at port %d\n", DEFAULT_SOCKS_PORT);
 		ToServeSOCKS("localhost:80", DEFAULT_SOCKS_PORT);
 		r = 0;
+#else
+		printf_s("SOCKS server end of the FSP-HTTP tunnel is not yet implemented in Linux.\n");
+		goto l_return;
+#endif
 	}
 	else if (strcmp(argv[1], "-p") == 0)
 	{
@@ -180,10 +130,15 @@ int main(int argc, char *argv[])
 			goto l_return;
 		}
 
-		char *nameAppLayer = (argc == 4 ? argv[3] : "localhost:80");
+#ifdef _WIN32
+		const char *nameAppLayer = (argc == 4 ? argv[3] : "localhost:80");
 		printf_s("To serve SOCKS v4 request at port %d\n", port);
 		ToServeSOCKS(nameAppLayer, port);
 		r = 0;
+#else
+		printf_s("SOCKS server end of the FSP-HTTP tunnel is not yet implemented in Linux.\n");
+		goto l_return;
+#endif
 	}
 	else if (strcmp(argv[1], "-d") == 0)
 	{
@@ -193,7 +148,7 @@ int main(int argc, char *argv[])
 			goto l_return;
 		}
 		//
-		strcpy_s(DEFAULT_ROOT, sizeof(DEFAULT_ROOT), argv[2]);
+		strncpy(DEFAULT_ROOT, argv[2], sizeof(DEFAULT_ROOT) - 1);
 		DEFAULT_ROOT[sizeof(DEFAULT_ROOT) - 1] = 0;
 		//
 		struct stat st;
@@ -224,7 +179,9 @@ int main(int argc, char *argv[])
 	getchar();
 
 l_return:
+#ifdef _WIN32
 	WSACleanup();
+#endif
 	exit(r);
 }
 
@@ -237,7 +194,9 @@ void StartHTTPoverFSP()
 	FSP_IN6_ADDR atAddress;
 
 	unsigned short mLen = (unsigned short)strlen(SERVER_STRING) + 1;
-	char *thisWelcome = (char *)_alloca(mLen + CRYPTO_NACL_KEYBYTES);
+	assert(mLen <= 40);
+	char thisWelcome[40 + CRYPTO_NACL_KEYBYTES];
+
 	CryptoNaClKeyPair(longTermPublicKey, bufASLRPrivateKey);
 	memcpy(thisWelcome, SERVER_STRING, mLen);
 	memcpy(thisWelcome + mLen, longTermPublicKey, CRYPTO_NACL_KEYBYTES);
@@ -252,7 +211,7 @@ void StartHTTPoverFSP()
 	params.sendSize = BUFFER_POOL_SIZE;
 	params.recvSize = BUFFER_POOL_SIZE;	
 
-#ifdef _DEBUG
+#if defined(_DEBUG) || defined(OVER_UDP_IPv4)
 	TranslateFSPoverIPv4(&atAddress, 0, htobe32(80));	//INADDR_ANY
 #else
 	atAddress.subnet = 0xAAAA00E0;	// 0xE0 00 AA AA	// shall be learned
@@ -270,7 +229,7 @@ void StartHTTPoverFSP()
 	FSPHANDLE hService;
 	while((hService = Accept1(hListener)) != NULL)
 	{
-		FSPControl(hService, FSP_SET_CALLBACK_ON_REQUEST, (ulong_ptr)onMultiplying);
+		FSPControl(hService, FSP_SET_CALLBACK_ON_REQUEST, (ULONG_PTR)onMultiplying);
 	}
 
 	if (hListener != NULL)
@@ -303,7 +262,7 @@ static int	FSPAPI onAccepted(FSPHANDLE client, PFSP_Context ctx)
 		printf_s("Fatal! No enough memory.\n");
 		return -1;
 	}
-	FSPControl(client, FSP_SET_EXT_POINTER, (ulong_ptr)pdFSA);
+	FSPControl(client, FSP_SET_EXT_POINTER, (ULONG_PTR)pdFSA);
 
 	pdFSA->firstOffset = pdFSA->lastOffset = 0;
 	InitCHAKAServer(pdFSA->chakaPubInfo, longTermPublicKey);
@@ -324,7 +283,7 @@ static void FSPAPI onPublicKeyReceived(FSPHANDLE h, FSP_ServiceCode c, int r)
 
 	PFSAData pdFSA = (PFSAData)GetExtPointer(h);
 	ReadFrom(h, & pdFSA->chakaPubInfo.clientNonce, sizeof(timestamp_t), NULL);
-	octet buf[_MAX_PATH];
+	octet buf[MAX_PATH];
 	int nBytes = ReadFrom(h, buf, sizeof(buf), NULL);
 
 	// assert(nBytes <= sizeof(sessionClientIdString));
@@ -412,7 +371,7 @@ static void FSPAPI onFirstLineRead(FSPHANDLE client, FSP_ServiceCode c, int r)
 		printf_s("Cannot ReadLine in MasterService(), error number: %d\n", numchars);
 		return;
 	}
-	for(i = 0, j = 0; j < numchars && !isspace(buf[j]) && (i < sizeof(method) - 1); i++, j++)
+	for(i = 0, j = 0; j < numchars && !isspace(buf[j]) && (i < (int)sizeof(method) - 1); i++, j++)
 	{
 		method[i] = buf[j];
 	}
@@ -435,9 +394,9 @@ static void FSPAPI onFirstLineRead(FSPHANDLE client, FSP_ServiceCode c, int r)
 	}
 
 	i = 0;
-	while (isspace(buf[j]) && (j < sizeof(buf)))
+	while (isspace(buf[j]) && (j < (int)sizeof(buf)))
 		j++;
-	for(; !isspace(buf[j]) && (i < sizeof(url) - 1) && (j < sizeof(buf)); i++, j++)
+	for(; !isspace(buf[j]) && (i < (int)sizeof(url) - 1) && (j < (int)sizeof(buf)); i++, j++)
 	{
 		url[i] = buf[j];
 	}
@@ -447,7 +406,7 @@ static void FSPAPI onFirstLineRead(FSPHANDLE client, FSP_ServiceCode c, int r)
 	{
 		printf_s("To serve tunnel request target at %s\n", url);
 		//
-		char *okStr = HTTP_SUCCESS_HEADER;
+		const char *okStr = HTTP_SUCCESS_HEADER;
 		WriteTo(client, okStr, strlen(okStr) + 1, TO_END_TRANSACTION, NULL);
 		//
 		lineBuf->firstOffset = lineBuf->lastOffset = 0;
@@ -469,9 +428,9 @@ static void FSPAPI onFirstLineRead(FSPHANDLE client, FSP_ServiceCode c, int r)
 		}
 	}
 
-	sprintf_s(path, sizeof(path), "%s%s", DEFAULT_ROOT, url);
+	snprintf(path, sizeof(path), "%s%s", DEFAULT_ROOT, url);
 	if (path[strlen(path) - 1] == '/')
-		strcat_s(path, sizeof(path), DEFAULT_FILE);
+		strncat(path, DEFAULT_FILE, sizeof(path) - 1);
 
 	if (stat(path, &st) == -1)
 	{
@@ -483,8 +442,8 @@ static void FSPAPI onFirstLineRead(FSPHANDLE client, FSP_ServiceCode c, int r)
 	{
 		if ((st.st_mode & S_IFMT) == S_IFDIR)
 		{
-			strcat_s(path, sizeof(path), "/");
-			strcat_s(path, sizeof(path), DEFAULT_FILE);
+			strncat(path, "/", sizeof(path) - 1);
+			strncat(path, DEFAULT_FILE, sizeof(path) - 1);
 		}
 		//
 		// TODO: built-in PHP fast-cgi support
@@ -559,9 +518,9 @@ int ReadLine(FSPHANDLE h, char *buf, int size)
 
 // Send a regular file to the client.
 // built in rules: .htm, .html: 
-// TODO! stat the file, and return the content accordingly
 void SendRegFile(FSPHANDLE client, const char *filename)
 {
+#ifdef _WIN32
 	int numchars = 1;
 	int fd;
 	int n;
@@ -610,6 +569,9 @@ void SendRegFile(FSPHANDLE client, const char *filename)
 	Commit(client, NULL);
 
 	_close(fd);
+#else
+	// TODO! stat the file, and return the content accordingly
+#endif
 }
 
 

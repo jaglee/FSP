@@ -1,5 +1,5 @@
 /*
- * DLL to service FSP upper layer application
+ * DLL to service FSP upper layer application, mutual exclusive locks for I/O operation
  * I/O control functions to get/set session parameters
  *
     Copyright (c) 2012, Jason Gao
@@ -80,7 +80,7 @@ int FSPAPI FSPControl(FSPHANDLE hFSPSocket, FSP_ControlCode controlCode, ULONG_P
 			*(ULONG_PTR *)value = (ULONG_PTR)pSocket->GetExtentOfULA();
 			break;
 		case FSP_SET_EXT_POINTER:
-			pSocket->SetExtentOfULA(value);
+			pSocket->SetExtentOfULA((uint64_t)value);
 			break;
 		case FSP_SET_CALLBACK_ON_ERROR:
 			pSocket->SetCallbackOnError((NotifyOrReturn)value);
@@ -150,7 +150,7 @@ PFSP_Context FSPAPI GetFSPContext(FSPHANDLE hFSPSocket)
 	}
 	catch (...)
 	{
-		return false;
+		return NULL;
 	}
 }
 
@@ -171,6 +171,7 @@ int FSPAPI GetProfilingCounts(FSPHANDLE hFSPSocket, PSocketProfile pSnap)
 }
 
 
+
 int CSocketItemDl::GetProfilingCounts(PSocketProfile pSnap)
 {
 	if (!WaitUseMutex())
@@ -189,413 +190,274 @@ int CSocketItemDl::GetProfilingCounts(PSocketProfile pSnap)
 }
 
 
-/*
- * FSP LZ4 frame format
- * Start of the first frame MUST be aligned with start of the transmit transaction
- * each block depends on previous ones (up to LZ4 window size, which is 64KB)
- * it's necessary to decode all blocks in sequence
- * block max size is fixed in each version
- * no header checksum
- * Little endian
- * Data blocks: block size [4 bytes], data
- */
-
-#define FSP_MAX_SEGMENT_SIZE (1 << 17)	// 128KB
-#define LZ4_DICTIONARY_SIZE (1 << 16)
-
-#include <pshpack1.h>
-struct CSocketItemDl::SStreamState
-{
-	LZ4_stream_t	streamState;
-	//
-	ALIGN(8)
-	int32_t		rNext;		// buffered but not compressed, the ring buffer
-	int32_t		dstNext;	// first available byte in the target buffer, following the ring buffer
-	int32_t		srcDstNext;	// the target buffer as source - to copy out
-	int32_t		outSize;	// number of bytes output by compression
-	int8_t		rHeader;	// number of header bytes that remains to be output
-	int32_t		limit;		// capacity of the output buffer
-	//
-	octet		dictBuf[LZ4_DICTIONARY_SIZE];
-	octet		inBuf[FSP_MAX_SEGMENT_SIZE];
-	// The output buffer follows inBuf, its capacity is dynamically calculated
-
-	// Return number of octets actually copied
-	int32_t CopyIn(const void *srcBuf, int32_t n)
-	{
-		n = min(n, int32_t(sizeof(inBuf) - rNext));
-		memcpy(inBuf + rNext, srcBuf, n);
-		rNext += n;
-		return n;
-	}
-	// Return number of octets actually copied. Should equal to tgtSize
-	int32_t CopyOut(void *tgtBuf, int32_t tgtSize)
-	{
-		register int32_t n = tgtSize;
-		if(rHeader > 0)
-		{
-			register int32_t m = min(rHeader, n);
-			memcpy(tgtBuf, (octet *) & outSize + sizeof(outSize) - rHeader, m);
-			if((rHeader -= m) > 0)
-				return m;	// assert: m == tgtSize
-			//
-			n -= m;
-			tgtBuf = (octet *)tgtBuf + m;
-		}
-		memcpy(tgtBuf, inBuf + sizeof(inBuf) + srcDstNext, n);
-		srcDstNext += n;
-		return tgtSize;
-	}
-	//
-	int32_t ForcefullyCompress();
-};
 
 
-
-struct CSocketItemDl::SDecodeState
-{
-	LZ4_streamDecode_t decodeState;
-	//
-	ALIGN(8)
-	int32_t		dNext;		// data buffer, the ring buffer
-	int8_t		nbHeader;	// number of header bytes that had been read
-	int8_t		needData;
-	int8_t		isDictFull;
-	int32_t		dstNext;	// the compressed source, copy-in
-	int32_t		srcDstNext;	// the source to be decoded
-	int32_t		compressedSize;
-	int32_t		limit;
-	//
-	octet		dictBuf[LZ4_DICTIONARY_SIZE];
-	octet		outBuf[LZ4_DICTIONARY_SIZE + FSP_MAX_SEGMENT_SIZE];
-	// The input buffer follows outBuf, its size is dynamically calculated
-
-	// Assume it is little-endian, needn't transform uint32_t for x86/amd64/IA64 CPU
-	// return number of octets actually consumed
-	int32_t GetMetadata(const void *srcBuf, int32_t n)
-	{
-		n = min(n, (int32_t)sizeof(compressedSize) - nbHeader);
-		memcpy((octet *)& compressedSize + nbHeader, srcBuf, n);
-		//
-		nbHeader += n;
-		if(nbHeader < sizeof(compressedSize))
-			return n;
-		//
-		if (compressedSize <= 0 || compressedSize > limit)
-			return -EFAULT;
-		//
-		needData = 1;
-		return n;
-	}
-	// return number of octets actually copied
-	int32_t CopyIn(const void *srcBuf, int32_t n)
-	{
-		n = min(n, limit - dNext);
-		if(n <= 0)
-			return -EFAULT;
-		memcpy(outBuf + sizeof(outBuf) + dNext, srcBuf, n);
-		dNext += n;
-		if(dNext >= compressedSize)
-			needData = 0;
-		return n;
-	}
-	// return number of octets actually copied
-	int32_t	CopyOut(void *tgtBuf, int32_t tgtSize)
-	{
-		tgtSize = min(dstNext - srcDstNext, tgtSize);
-		memcpy(tgtBuf, outBuf + srcDstNext, tgtSize);
-		srcDstNext += tgtSize;
-		return tgtSize;
-	}
-	//
-	int32_t Decompress();
-};
-#include <poppack.h>
-
-
-// return number of output octets
-int32_t CSocketItemDl::SStreamState::ForcefullyCompress()
-{
-	int	messageSize = min(rNext, FSP_MAX_SEGMENT_SIZE);
-	if(messageSize == 0)
-		return 0;
-
-	// Make the output buffer leave room for new result
-	// assert: srcDstNext == dstNext
-	if(dstNext > 0)
-	{
-		LZ4_saveDict(& streamState, (char *)dictBuf, sizeof(dictBuf));
-		srcDstNext = dstNext = 0;
-	}
-	//
-	outSize = LZ4_compress_fast_continue(& streamState, (char *)inBuf
-			, (char *)inBuf + sizeof(inBuf)
-			, messageSize
-			, limit
-			, 1);
-	rNext = 0;
-	if(outSize <= 0)
-		return outSize;
-	rHeader = sizeof(outSize);
-	dstNext += outSize;
-	return outSize + rHeader;
-}
-
-
-
-// assert: pCtx->srcDstNext == pCtx->dstNext && needData == 0
-// return number of output octets
-int32_t CSocketItemDl::SDecodeState::Decompress()
-{
-	if(dstNext > LZ4_DICTIONARY_SIZE)
-	{
-		memcpy(dictBuf, outBuf + dstNext - LZ4_DICTIONARY_SIZE, LZ4_DICTIONARY_SIZE); 
-		LZ4_setStreamDecode(& decodeState, (char *)dictBuf, LZ4_DICTIONARY_SIZE);
-		srcDstNext = dstNext = 0;
-		isDictFull = 1;
-	}
-	else if(isDictFull && dstNext > 0)
-	{
-		memmove(dictBuf, dictBuf + LZ4_DICTIONARY_SIZE - dstNext, LZ4_DICTIONARY_SIZE - dstNext);
-		memcpy(dictBuf + LZ4_DICTIONARY_SIZE - dstNext, outBuf, dstNext);
-		LZ4_setStreamDecode(& decodeState, (char *)dictBuf, LZ4_DICTIONARY_SIZE);
-	}
-
-	// here the input buffer instantly follows outBuf
-	dNext -= compressedSize;
-	if(dNext < 0)
-		return -EFAULT;
-	int k = LZ4_decompress_safe_continue(& decodeState
-		, (char *) & outBuf + sizeof(outBuf)
-		, (char *) & outBuf + dstNext
-		, compressedSize
-		, limit - dstNext);
-	if(k <= 0)
-		return k;
-	//
-	octet *pNext = outBuf + sizeof(outBuf) + compressedSize;
-	// needData = 0;
-	if(0 < dNext && dNext < sizeof(compressedSize))
-	{
-		memcpy(& compressedSize, pNext, nbHeader = dNext);
-		dNext = 0;
-	}
-	else if(0 < dNext)
-	{
-		memcpy(& compressedSize, pNext, nbHeader = sizeof(compressedSize));
-		dNext -= sizeof(compressedSize);
-		needData = 1;
-		memmove(outBuf + sizeof(outBuf), pNext + sizeof(compressedSize), dNext);
-	}
-	//
-	dstNext += k;
-	return k;
-}
-
-
-
+// Do
+//	Try to obtain the slim-read-write mutual-exclusive lock of the FSP socket
 // Return
-//	true if the internal streaming buffer for on-the-wire compression has been prepared
-//	false if no memory
+//	true if obtained the mutual-exclusive lock
+//	false if timed out
 // Remark
-//	The buffer shall be free as soon as the transmit transaction is committed by the near end
-bool CSocketItemDl::AllocStreamState()
+//	if there is some thread that has exclusive access on the lock, wait patiently
+bool CSocketItemDl::WaitUseMutex()
 {
-	if(pStreamState != NULL)
-		return true;
-
-	int n = LZ4_compressBound(FSP_MAX_SEGMENT_SIZE);
-	pStreamState = (CSocketItemDl::SStreamState *)
-		malloc(sizeof(CSocketItemDl::SStreamState) + sizeof(uint32_t) + n);
-	if(pStreamState == NULL)
-		return false;
-	//
-	pStreamState->limit = n;
-	memset(& pStreamState->rNext, 0, (octet *) & pStreamState->limit - (octet *) & pStreamState->rNext);
-	LZ4_resetStream(& pStreamState->streamState);
-	return true;
-}
-
-
-
-// Return
-//	true if the internal decoding buffer for on-the-wire decompression has been prepared
-//	false if no memory
-// Remark
-//	The buffer shall be free as soon as the transmit transaction is committed by the remote end
-bool CSocketItemDl::AllocDecodeState()
-{
-	if(pDecodeState != NULL)
-		return true;
-
-	int n = LZ4_compressBound(FSP_MAX_SEGMENT_SIZE);
-	pDecodeState = (CSocketItemDl::SDecodeState *)
-		malloc(sizeof(CSocketItemDl::SDecodeState) + n);
-	if(pDecodeState == NULL)
-		return false;
-
-	memset(& pDecodeState->dNext, 0, (octet *) & pDecodeState->limit - (octet *) & pDecodeState->dNext);
-	LZ4_setStreamDecode(& pDecodeState->decodeState, NULL, 0);
-	pDecodeState->limit = n;
-	return true;
-}
-
-
-
-// Given
-//	void *			Target buffer
-//	int &			[_InOut_] In: the capacity of the target buffer, Out: number of bytes occupied
-//	const void *	Source buffer
-//	int				length of the source octet string
-// Return
-//	Number of octets consumed from the source
-// Remark
-//	The source octet string is automatically segmented
-//	If the given length of the source octet string is zero,
-//	the source buffer should be null and the internal buffer is meant to be flushed.
-int	CSocketItemDl::Compress(void *pOut, int &tgtSize, const void *pIn, int srcLen)
-{
-	register SStreamState *pCtx = pStreamState;
-	if(tgtSize <= 0)
-		return 0;
-	// Firstly, check whether the buffered compressed data has more data to deliver. If it does, return the data
-	if (pendingStreamingSize > 0)
+	uint64_t t0 = GetTickCount64();
+	while(!TryMutexLock())
 	{
-		tgtSize = pCtx->CopyOut(pOut, min(tgtSize, pendingStreamingSize));
-		pendingStreamingSize -= tgtSize;
-		return 0;	// the uncompressed data is not consumed.
-	}
-
-	// now pendingStreamingSize == 0, pCtx->dstNext == pCtx->srcDstNext
-	// firstly, try to copy in more data
-	int nbCopyIn = srcLen;
-	if (nbCopyIn > 0)
-		nbCopyIn = pCtx->CopyIn(pIn, nbCopyIn);
-
-	// The last segment of the transaction, or the one has been fulfilled should be compressed
-	if(srcLen == 0 || pCtx->rNext >= FSP_MAX_SEGMENT_SIZE)
-	{
-		pendingStreamingSize = pCtx->ForcefullyCompress();
-		if(pendingStreamingSize <= 0)
-		{
-			tgtSize = 0;
-			return pendingStreamingSize;
-		}		
-	}
-
-	tgtSize = min(tgtSize, pendingStreamingSize);
-	if(tgtSize > 0)
-		pendingStreamingSize -= pCtx->CopyOut(pOut, tgtSize);
-
-	return nbCopyIn;
-}
-
-
-// Return whether internal buffer for compression contains data
-bool CSocketItemDl::HasInternalBufferedToSend()
-{
-	return (pStreamState != NULL && (pendingStreamingSize > 0 || pStreamState->rNext > 0));
-}
-
-
-// Given
-//	void *			Target buffer
-//	int &			[_InOut_] In: the capacity of the target buffer, Out: number of bytes occupied
-//	const void *	Source buffer
-//	int				length of the source octet string
-// Remark
-//	The frame border of the source octet string [the compressed result] is automatically detected
-//	Previously decoded blocks *must* remain available at the memory position where they were decoded (up to 64 KB)
-int	CSocketItemDl::Decompress(void *pOut, int &tgtSize, const void *pIn, int srcLen)
-{
-	register CSocketItemDl::SDecodeState *pCtx = pDecodeState;
-	// Firstly, check whether the buffered decompressed data has more data to deliver. If it does, return the data
-	if (pCtx->dstNext - pCtx->srcDstNext > 0)
-	{
-		if (tgtSize > 0)
-			tgtSize = pCtx->CopyOut(pOut, tgtSize);
-		return 0;	// the uncompressed data is not consumed.
-	}
-
-	if(srcLen <= 0)
-	{
-		tgtSize = 0;
-		return 0;	// both the source and the internal buffer is empty
-	}
-
-	int overhead = 0;
-	if (! pCtx->needData)
-	{
-		overhead = pCtx->GetMetadata(pIn, srcLen);
-		if(overhead < 0 || ! pCtx->needData)
-		{
-			tgtSize = 0;
-			return overhead;
-		}
-		//
-		pIn = (octet *)pIn + overhead;
-		srcLen -= overhead;
-	}
-
-	// Now pCtx->nToCopyIn > 0 && srcLen > 0
-	int n = pCtx->CopyIn(pIn, srcLen);
-	if (pCtx->needData)
-	{
-		tgtSize = 0;
-		return n + overhead;
-	}
-
-	// Now it's time to decompress
-	int k = pCtx->Decompress();
-	if(k < 0)
-		return k;
-
-	if(tgtSize > 0)
-		tgtSize = pCtx->CopyOut(pOut, tgtSize);
-	return n + overhead;
-}
-
-
-
-// Return true if the internal buffer is empty, false if it is not.
-// Temporarily unset peerCommitted in case premature report of
-// commitment of peer's transmit transaction. See also ReadFrom()
-bool CSocketItemDl::FlushDecodeBuffer()
-{
-	for(int k = waitingRecvSize; k > 0; k = waitingRecvSize)
-	{
-		Decompress(waitingRecvBuf, k, NULL, 0);
-		if(k < 0)
+		// possible dead lock: should trace the error in debug mode!
+		if(GetTickCount64() - t0 > SESSION_IDLE_TIMEOUT_us/1000)
 			return false;
-		if (k == 0)
-			break;
-		bytesReceived += k;
-		waitingRecvBuf += k;
-		waitingRecvSize -= k;
+		if(!IsInUse())
+			return false;
+		//
+		Sleep(TIMER_SLICE_ms);
 	}
-	// it is both safe and more reliable to check the internal buffer directly
-	if(pDecodeState->dstNext - pDecodeState->srcDstNext > 0)
+	//
+	return IsInUse();
+}
+
+
+
+// Return
+//	true if having obtained the mutual-exclusive lock and having the session control block validated
+//	false if either timed out in obtaining the lock or found that the session control block invalid
+// Remark
+//	Dispose the DLL FSP socket resource if to return false
+bool CSocketItemDl::LockAndValidate()
+{
+	if (!WaitUseMutex())
+		return false;
+
+	if(InIllegalState())
 	{
-		peerCommitPending |= peerCommitted;
-		peerCommitted = 0;
+#ifndef NDEBUG
+		printf_s(
+			"\nDescriptor#%p, event to be processed, but the socket is in state %s[%d]?\n"
+			, this
+			, stateNames[pControlBlock->state], pControlBlock->state);
+#endif
+		Free();
 		return false;
 	}
 
-	peerCommitted |= peerCommitPending;
-	peerCommitPending = 0;
-	if(peerCommitted)
-	{
-		free(pDecodeState);
-		pDecodeState = NULL;
-	}
 	return true;
 }
 
 
 
-// Return whether internal buffer for decompression contains data
-bool CSocketItemDl::HasInternalBufferedToDeliver()
+// The asynchronous, multi-thread friendly soft interrupt handler
+void CSocketItemDl::WaitEventToDispatch()
 {
-	return (pDecodeState != NULL
-		&& (pDecodeState->dNext > 0 || pDecodeState->dstNext - pDecodeState->srcDstNext > 0));
+	register long vector = 0;
+	while (LockAndValidate())
+	{
+		register FSP_NoticeCode notice = (FSP_NoticeCode)_InterlockedExchange8(&pControlBlock->notices.nmi, NullNotice);
+		// data race does occur, so we have to double-test to avoid lost of suppressed soft interrupts
+		// built-in rule: bit 0 of the soft interrupt vector is the flag for DLL being in event loop
+		if (notice == NullNotice)
+		{
+			if (vector == 0)
+			{
+				vector = _InterlockedExchange(&pControlBlock->notices.vector, 1) & ((1 << SMALLEST_FSP_NMI) - 2);
+				if (vector == 0)
+				{
+					vector = _InterlockedExchange(&pControlBlock->notices.vector, 0) & ((1 << SMALLEST_FSP_NMI) - 2);
+					if (vector == 0)
+					{
+						SetMutexFree();
+						break;
+					}
+					//
+					_InterlockedOr(&pControlBlock->notices.vector, 1);
+				}
+			}
+			notice = NullNotice;
+			for (register int i = 1; i <= LARGEST_FSP_NOTICE; i++)
+			{
+				if (vector & (1 << i))
+				{
+					notice = (FSP_NoticeCode)i;
+					vector ^= 1 << i;
+					break;
+				}
+			}
+			assert(notice != NullNotice);
+		}
+#ifdef TRACE
+		printf_s("\nIn local fiber#%u, state %s\tnotice: %s\n"
+			, fidPair.source, stateNames[pControlBlock->state], noticeNames[notice]);
+#endif
+		if (notice > FSP_NotifyToFinish)
+			lowerLayerRecycled = 1;
+		//
+		FSP_Session_State s0;
+		NotifyOrReturn fp1;
+		switch (notice)
+		{
+		case FSP_NotifyListening:
+			CancelTimeout();		// See also ::ListenAt
+			SetMutexFree();
+			break;
+		case FSP_NotifyAccepting:	// overloaded callback for either CONNECT_REQUEST or MULTIPLY
+			if (context.onAccepting != NULL && pControlBlock->HasBacklog())
+				ProcessBacklogs();
+			SetMutexFree();
+			break;
+		case FSP_NotifyAccepted:
+			CancelTimeout();		// If any
+			// Asynchronous return of Connect2, where the initiator may cancel data transmission
+			if (InState(CONNECT_AFFIRMING))
+			{
+				ToConcludeConnect();// SetMutexFree();
+				break;
+			}
+			fp1 = (NotifyOrReturn)context.onAccepted;
+			SetMutexFree();
+			if (fp1 != NULL)
+				((CallbackConnected)fp1)(this, &context);
+			if (!LockAndValidate())
+				return;
+			ProcessReceiveBuffer();	// SetMutexFree();
+			break;
+		case FSP_NotifyMultiplied:	// See also @LLS::Connect()
+			CancelTimeout();		// If any
+			fidPair.source = pControlBlock->nearEndInfo.idALF;
+			ProcessReceiveBuffer();	// SetMutexFree();
+			if (!LockAndValidate())
+				return;
+			// To inherently chain WriteTo/SendInline with Multiply
+			ProcessPendingSend();	// SetMutexFree();
+			break;
+		case FSP_NotifyDataReady:
+			ProcessReceiveBuffer();	// SetMutexFree();
+			break;
+		case FSP_NotifyBufferReady:
+			ProcessPendingSend();	// SetMutexFree();
+			break;
+		case FSP_NotifyToCommit:
+			// See also FSP_NotifyDataReady, compare with FSP_NotifyFlushed
+			ProcessReceiveBuffer();	// SetMutexFree();
+			if (!LockAndValidate())
+				return;
+			// Even if there's no callback function to accept data/flags (as in blocking receive mode)
+			// the peerCommitted flag can be set if no further data to deliver
+			if (!HasDataToDeliver())
+				peerCommitted = 1;
+			//
+			if (InState(CLOSABLE) && initiatingShutdown)
+			{
+				SetState(PRE_CLOSED);
+				AppendEoTPacket();
+				Call<FSP_Urge>();
+			}
+			SetMutexFree();
+			break;
+		case FSP_NotifyFlushed:
+			ProcessPendingSend();	// SetMutexFree();
+			if (!LockAndValidate())
+				return;
+			//
+			s0 = GetState();
+			if (!initiatingShutdown || s0 < CLOSABLE)
+			{
+				fp1 = NULL;
+				if (s0 == COMMITTED || s0 >= CLOSABLE)
+					fp1 = (NotifyOrReturn)_InterlockedExchangePointer((PVOID*)&fpCommitted, fp1);
+				SetMutexFree();
+				if (fp1 != NULL)
+					fp1(this, FSP_Send, 0);
+			}
+			else if (s0 == CLOSABLE)
+			{
+				SetState(PRE_CLOSED);
+				AppendEoTPacket();
+				Call<FSP_Urge>();
+				SetMutexFree();
+			}
+#ifndef NDEBUG
+			else
+			{
+				printf_s("Protocol implementation error?\n"
+					"Should not get FSP_NotifyFlushed in state later than CLOSABLE after graceful shutdown.\n");
+			}
+#endif
+			break;
+		case FSP_NotifyToFinish:
+			// RELEASE implies both NULCOMMIT and ACK_FLUSH, any way call back of shutdown takes precedence 
+			// See also @LLS::OnGetRelease
+			if (initiatingShutdown)
+			{
+				fp1 = fpFinished;
+				RecycLocked();		// CancelTimer(); SetMutexFree();
+				if (fp1 != NULL)
+					fp1(this, FSP_Shutdown, 0);
+			}
+			else
+			{
+				fp1 = fpFinished;
+				if (fp1 == NULL)
+					fp1 = (NotifyOrReturn)_InterlockedExchangePointer((PVOID*)&fpCommitted, NULL);
+				ProcessReceiveBuffer();	// SetMutexFree();
+				if (fp1 != NULL)
+					fp1(this, FSP_Shutdown, 0);		// passive shutdown
+			}
+			break;
+		case FSP_NotifyRecycled:
+			fp1 = context.onError;
+			EnableLLSInterrupt();
+			RecycLocked();		// CancelTimer(); SetMutexFree();
+			if (!initiatingShutdown && fp1 != NULL)
+				fp1(this, FSP_Shutdown, ENXIO);		// a warning for unexpected shutdown
+			return;
+		case FSP_NameResolutionFailed:
+			FreeAndNotify(InitConnection, (int)notice);
+			// UNRESOLVED!? There could be some remedy if name resolution failed?
+			return;
+		case FSP_IPC_CannotReach:
+			fp1 = context.onError;
+			s0 = GetState();
+			Free();
+			if (fp1 == NULL)
+				return;
+			//
+			if (s0 == LISTENING)
+				fp1(this, FSP_Listen, -EIO);
+			else if (s0 != CHALLENGING)
+				fp1(this, (s0 == CLONING ? FSP_Multiply : InitConnection), -EIO);
+			return;
+		case FSP_MemoryCorruption:
+		case FSP_NotifyTimeout:
+		case FSP_NotifyReset:
+			FreeAndNotify(NullCommand, (int)notice);
+			return;
+		default:
+			;	// But NullNotice is impossible
+		}
+	}
+	if (pControlBlock == NULL)
+		Free();
+}
+
+
+
+// The function called back as soon as the one-shot timer counts down to 0
+// Suppose that the lower layer recycle LRU
+void CSocketItemDl::TimeOut()
+{
+	bool b = TryMutexLock();
+	if (!IsInUse())
+	{
+		if (b)
+			SetMutexFree();
+		return;
+	}
+
+	if (!b)
+	{
+		AddOneShotTimer(TIMER_SLICE_ms);
+		inUse = 0;	// Force WaitUseMutex to abort
+		return;
+	}
+
+	FreeAndNotify(NullCommand, (int)FSP_NotifyTimeout);
 }

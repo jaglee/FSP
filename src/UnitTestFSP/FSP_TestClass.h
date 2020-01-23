@@ -33,7 +33,6 @@ public:
 	}
 
 	void SetState(FSP_Session_State s) { CSocketItemEx::SetState(s); }
-
 	bool NotInStates(FSP_Session_State first, FSP_Session_State second)
 	{
 		return lowState != first && lowState != second;
@@ -59,17 +58,7 @@ public:
 		CSocketItemEx::InstallSessionKey(cmd);
 	}
 	void SetPairOfFiberID(ALFID_T src, ALFID_T dst) { fidPair.source = src; fidPair.peer = dst; }
-
-	bool LOCALAPI AddAdhocTimer(uint32_t period, WAITORTIMERCALLBACK callback)
-	{
-		return (timer == NULL
-			&& ::CreateTimerQueueTimer(&timer, TimerWheel::Singleton()
-				, callback	// WAITORTIMERCALLBACK
-				, this		// LPParameter
-				, period
-				, period
-				, WT_EXECUTEINTIMERTHREAD));
-	}
+	void SetParentProcess() { idSrcProcess = GetCurrentProcessId(); }
 
 	// For test algorithm for generating KEEP_ALIVE packet in timer.cpp
 	int32_t LOCALAPI GenerateSNACK(FSP_KeepAliveExtension&);

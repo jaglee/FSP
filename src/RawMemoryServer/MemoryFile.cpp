@@ -32,8 +32,10 @@ static int FSPAPI toSendNextBlock(FSPHANDLE h, void * batchBuffer, int32_t capac
 		return -ENOMEM;
 	}
 
-	int32_t nToSend = (int32_t)__min(nRequested - nPrepared, capacity);
-	if (nToSend <= 0)
+	int32_t nToSend = (int32_t) (nRequested - nPrepared);
+	if (nToSend >= capacity)
+		nToSend = capacity;
+	else if (nToSend <= 0)
 		return EOF;
 
 	// Set the memory pattern on fly; very long stream (whose length may be up to 2^64 -1 ) is possible
@@ -48,7 +50,7 @@ static int FSPAPI toSendNextBlock(FSPHANDLE h, void * batchBuffer, int32_t capac
 		((octet *)batchBuffer)[sizeof(uint32_t) * nDWord + i] = 0;
 	}
 
-	printf_s("To send %d bytes to the remote end. %llu bytes have been sent before.\n", nToSend, nPrepared);
+	printf_s("To send %d bytes to the remote end. %" PRIu64 " bytes have been sent before.\n", nToSend, nPrepared);
 	nPrepared += nToSend;
 
 	int r = SendInline(h, batchBuffer, nToSend, (nPrepared >= nRequested), NULL);
@@ -72,7 +74,7 @@ static void FSPAPI onRequestedSizeReceived(FSPHANDLE h, FSP_ServiceCode c, int r
 	}
 
 	// No needs to preallocate memory! Arbitrarily long stream might be sent
-	printf_s("To send memory segment of %llu octets.\n", nRequested);
+	printf_s("To send memory segment of %" PRIu64 " octets.\n", nRequested);
 	//
 	r = GetSendBuffer(h, toSendNextBlock);
 	if (r < 0)

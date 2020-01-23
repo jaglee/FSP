@@ -277,7 +277,6 @@ void FlowTestRetransmission()
 	assert(seq5 == FIRST_SN + 2 && n == 1);
 
 	dbgSocket.AcceptSNACK(seq5, p->snack.gaps, n);
-	dbgSocket.TestSetInUse();
 	dbgSocket.DoEventLoop();
 
 	ControlBlock::PFSP_SocketBuf skb = pSCB->HeadSend();
@@ -327,7 +326,6 @@ void FlowTestRetransmission()
 	assert(seq5 == FIRST_SN + 2 && n == 1);
 
 	dbgSocket.AcceptSNACK(seq5, p->snack.gaps, n);
-	dbgSocket.TestSetInUse();
 	dbgSocket.DoEventLoop();
 
 	// TODO: Test calculation of RTT and Keep alive timeout 

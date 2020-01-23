@@ -36,7 +36,7 @@ ALFID_T CLowerInterface::SetLocalFiberID(ALFID_T value)
 {
 	if(nearInfo.IsIPv6())
 		nearInfo.u.idALF = value;
-	return _InterlockedExchange((volatile LONG *) & pktBuf->fidPair.peer, value);
+	return _InterlockedExchange((u32*)&pktBuf->fidPair.peer, value);
 }
 
 
@@ -60,33 +60,22 @@ ALFID_T LOCALAPI CLowerInterface::RandALFID(PIN6_ADDR hintAddr)
 		return 0;
 	}
 
-	register BYTE *s = hintAddr->u.Byte;
-	if(*(uint64_t *)s != 0)
+	// by default exploit the first interface configured
+	if (*(uint64_t*)hintAddr == 0)
 	{
-		bool isEffective = false;
-		for(register u_int j = 0; j < sdSet.fd_count; j++)
-		{
-			if(*(uint64_t *)s == *(uint64_t *)addresses[j].sin6_addr.u.Byte)
-			{
-				*(ALFID_T *)(s + 12) = p->fidPair.source;
-				ifIndex = interfaces[j];
-				isEffective = true;
-				break;
-			}
-		}
-		if(! isEffective)
+		*(ALFID_T*)((octet *)hintAddr + 12) = p->fidPair.source;
+		memcpy(hintAddr, &addresses[0].sin6_addr, 12);
+		ifIndex = interfaces[0];
+	}
+	else
+	{
+		ifIndex = SetEffectiveALFID(hintAddr, p->fidPair.source);
+		if (ifIndex < 0)
 		{
 			// it is weired if it failed
 			REPORT_ERROR_ON_TRACE();
 			return 0;
 		}
-	}
-	else
-	{
-		// by default exploit the first interface configured
-		*(ALFID_T *)(s + 12) = p->fidPair.source;
-		memcpy(s, addresses[0].sin6_addr.u.Byte, 12);
-		ifIndex = interfaces[0];
 	}
 	// circle the entry
 	tailFreeSID->next = p;	// if it is the only entry, p->next is assigned p
@@ -124,6 +113,147 @@ ALFID_T LOCALAPI CLowerInterface::RandALFID()
 
 
 // Given
+//	CSocketItemEx *	the pointer to the premature socket (default NULL)
+//	uint32_t			reason code flags of reset (default zero)
+// Do
+//	Send back the echoed reset at the same interface of receiving
+//	in CHALLENGING, CONNECT_AFFIRMING, resumable CLOSABLE and unrecoverable CLOSED state,
+//	and of course, throttled LISTENING state
+void LOCALAPI CLowerInterface::SendPrematureReset(uint32_t reasons, CSocketItemEx *pSocket)
+{
+	struct FSP_RejectConnect reject;
+	SetHeaderSignature(reject, RESET);
+	reject.reasons = reasons;
+	if(pSocket)
+	{
+		// In CHALLENGING, CONNECT_AFFIRMING where the peer address is known
+		reject.timeStamp = htobe64(NowUTC());
+		// See also CSocketItemEx::Emit() and SetIntegrityCheckCode():
+		reject.fidPair = pSocket->fidPair;
+		pSocket->SendPacket(1, ScatteredSendBuffers(&reject, sizeof(reject)));
+	}
+	else
+	{
+		memcpy(& reject.sn, &pktBuf->hdr.sequenceNo, sizeof(reject.sn) + sizeof(reject.fidPair));
+		SendBack((char *) & reject, sizeof(reject));
+	}
+}
+
+
+#ifndef OVER_UDP_IPv4
+// Given
+//	PFSP_SINKINF 		[out] pointer to the local 'sink' info to be filled
+//	ALFID_T				the intent ALFID
+//	int					the send-out interface
+//	const SOCKADDR_INET * the destination address
+// Do
+//	Fill in the IPv6 header's source and destination IP address by select the proper path
+//	A path is proper if the source IP is on the designated interface, or
+//	if there's no interface match try to match the scope.
+//	The last resort is the last enabled interface
+// Return
+//	true if there exists some path
+//	false if no path exists, typically because all interfaces were disabled
+/**
+ * Remark
+	Prefix/Precedence/Label/Usage
+	::1/128			50 0 Localhost (not compatible with FSP)
+	::/0			40 1 Default unicast
+	::ffff:0:0/96	35 4 IPv4-mapped IPv6 address (not compatible with FSP)
+	2002::/16		30 2 6to4
+	2001::/32		5  5 Teredo tunneling
+	fc00::/7		3 13 Unique local address
+	::/96 			1  3 IPv4-compatible addresses (deprecated)
+	fec0::/10		1 11 Site-local address (deprecated)
+	3ffe::/16		1 12 6bone (returned)
+ */
+bool LOCALAPI CLowerInterface::SelectPath(PFSP_SINKINF pNear, ALFID_T nearId, u32 ifIndex, const SOCKADDR_INET* sockAddrTo)
+{
+#if defined(TRACE) && (TRACE & TRACE_ADDRESS)
+	printf_s("%s fiberId#0x%X, ifIndex = %d\n", __FUNCTION__, nearId, ifIndex);
+#endif
+	int found = -1;
+	// RFC 4291, link-local first
+	if (*(int64_t*)&sockAddrTo->Ipv6.sin6_addr == *(int64_t*)&in6addr_linklocalprefix)
+	{
+		LOOP_FOR_ENABLED_INTERFACE
+		(
+			if (*(int64_t*)&addresses[i].sin6_addr == *(int64_t*)&in6addr_linklocalprefix)
+			{
+				found = i;
+				goto l_matched;
+			}
+		)
+	}
+	// RFC 3056 then in6addr_6to4prefix
+	if (*(int16_t*)&sockAddrTo->Ipv6.sin6_addr == *(int16_t*)&in6addr_6to4prefix)
+	{
+		LOOP_FOR_ENABLED_INTERFACE
+		(
+			if (*(int16_t*)&addresses[i].sin6_addr == *(int16_t*)&in6addr_6to4prefix)
+			{
+				found = i;
+				goto l_matched;
+			}
+		)
+	}
+	// RFC 4380 then match teredo tunneling
+	if (*(int32_t*)&sockAddrTo->Ipv6.sin6_addr == *(int32_t*)&in6addr_teredoprefix)
+	{
+		LOOP_FOR_ENABLED_INTERFACE
+		(
+			if (*(int32_t*)&addresses[i].sin6_addr == *(int32_t*)&in6addr_teredoprefix)
+			{
+				found = i;
+				goto l_matched;
+			}
+		)
+	}
+	// RFC4193 then a ULA (but site-local is obsolete)
+	if ((*(int8_t*)&sockAddrTo->Ipv6.sin6_addr & 0xFE) == 0xFC)
+	{
+		LOOP_FOR_ENABLED_INTERFACE
+		(
+			if ((*(int8_t*)&addresses[i].sin6_addr & 0xFE) == 0xFC)
+			{
+				found = i;
+				goto l_matched;
+			}
+		)
+	}
+	// user-defined scope matching is the last resort (v4mapped, or arbitrary global IPv6 address)
+	LOOP_FOR_ENABLED_INTERFACE
+	(
+		{
+		found = i;	// which is the last resource
+		if (addresses[i].sin6_scope_id == sockAddrTo->Ipv6.sin6_scope_id
+			&& (ifIndex == 0 || interfaces[i] == ifIndex)
+			&& *(int64_t*)&addresses[i].sin6_addr != *(int64_t*)&in6addr_linklocalprefix
+			&& *(int16_t*)&addresses[i].sin6_addr != *(int16_t*)&in6addr_6to4prefix
+			&& *(int32_t*)&addresses[i].sin6_addr != *(int32_t*)&in6addr_teredoprefix
+			&& (*(int8_t*)&addresses[i].sin6_addr & 0xFE) != 0xFC	// ULA
+			)
+			goto l_matched;
+		}
+	)
+	// By default the last enabled interface is selected as the last resort for out-going interface
+	if (found < 0)
+		return false;
+	//
+l_matched:
+	// memcpy(& pNear->ipi_addr, addresses[i].sin6_addr.u.Byte, 12);	// hard-coded network prefix length, including the host id
+	*(uint64_t*)&pNear->ipi_addr = SOCKADDR_SUBNET(addresses + found);
+	pNear->idHost = SOCKADDR_HOSTID(addresses + found);
+	pNear->idALF = nearId;
+	pNear->ipi6_ifindex = 0;	// pNear->ipi6_ifindex = ifIndex;
+	//^always send out from the default interface so that underlying routing service can do optimization
+	//
+	return true;
+}
+#endif
+
+
+// Given
 //	const void *pointer to the byte string of cookie material for the calculation
 //	int			the length of the cookie material
 //	timestamp_t	the time associated with the cookie, to deduce the life-span of the cookie
@@ -140,27 +270,27 @@ uint64_t LOCALAPI CalculateCookie(const void *header, int sizeHdr, timestamp_t t
 		GCM_AES_CTX	ctx;
 	} prevCookieContext, cookieContext;
 	//
-	ALIGN(MAC_ALIGNMENT) BYTE m[sizeof(FSP_InitiateRequest)];
+	ALIGN(FSP_ALIGNMENT) octet m[sizeof(FSP_InitiateRequest)];
 	timestamp_t t1 = NowUTC();
 
 #if defined(TRACE) && (TRACE & TRACE_PACKET)
 	printf("\n**** Cookie Context Time-stamp ****\n");
-	printf("Previous = 0x%016I64X\n", prevCookieContext.timeStamp);
-	printf("Current  = 0x%016I64X\n", cookieContext.timeStamp);
-	printf("Packet   = 0x%016I64X\n", t0);
-	printf("JustNow  = 0x%016I64X\n", t1);
+	printf("Previous = 0x%016" PRIx64 "\n", prevCookieContext.timeStamp);
+	printf("Current  = 0x%016" PRIx64 "\n", cookieContext.timeStamp);
+	printf("Packet   = 0x%016" PRIx64 "\n", t0);
+	printf("JustNow  = 0x%016" PRIx64 "\n", t1);
 #endif
 
 	// public information included in cookie calculation should be as little as possible
-	if(sizeHdr < 0 || sizeHdr > sizeof(m))
+	if(sizeHdr < 0 || sizeHdr > (int)sizeof(m))
 		return 0;
 	memcpy(m, header, sizeHdr);
 	memset(m + sizeHdr, 0, sizeof(m) - sizeHdr);
 
 	if(t1 - cookieContext.timeStamp > INT_MAX)
 	{
-		ALIGN(MAC_ALIGNMENT)
-		BYTE	st[COOKIE_KEY_LEN];	// in bytes
+		ALIGN(FSP_ALIGNMENT)
+		octet	st[COOKIE_KEY_LEN];
 		memcpy(& prevCookieContext, & cookieContext, sizeof(cookieContext));
 		//
 		cookieContext.timeStamp = t1;
@@ -203,7 +333,8 @@ uint64_t LOCALAPI CalculateCookie(const void *header, int sizeHdr, timestamp_t t
 void CSocketItemEx::InstallEphemeralKey()
 {
 #if defined(TRACE) && (TRACE & (TRACE_SLIDEWIN | TRACE_ULACALL))
-	printf_s("\n" __FUNCDNAME__ "\n\tsendBufferSN =  %u, recvWindowNextSN = %u\n"
+	printf_s("\n%s\n\tsendBufferSN =  %u, recvWindowNextSN = %u\n"
+		, __FUNCTION__
 		, pControlBlock->sendBufferNextSN
 		, pControlBlock->recvWindowNextSN);
 	//
@@ -212,12 +343,14 @@ void CSocketItemEx::InstallEphemeralKey()
 #endif
 	contextOfICC.keyLifeRemain = 0;
 	contextOfICC.curr.precomputedCRCS0 
-		=  CalculateCRC64(* (uint64_t *) & fidPair, (uint8_t *) & pControlBlock->connectParams, FSP_MAX_KEY_SIZE);
+		=  CalculateCRC64(* (uint64_t *) & fidPair, & pControlBlock->connectParams, FSP_MAX_KEY_SIZE);
+
+	ALIGN(FSP_ALIGNMENT)
 	ALFIDPair recvFIDPair;
 	recvFIDPair.peer = fidPair.source;
 	recvFIDPair.source = fidPair.peer;
 	contextOfICC.curr.precomputedCRCR1
-		=  CalculateCRC64(* (uint64_t *) & recvFIDPair, (uint8_t *) & pControlBlock->connectParams, FSP_MAX_KEY_SIZE);
+		=  CalculateCRC64(* (uint64_t *) & recvFIDPair, & pControlBlock->connectParams, FSP_MAX_KEY_SIZE);
 #if defined(TRACE) && (TRACE & TRACE_SLIDEWIN)
 	printf_s("Precomputed ICC 0:");
 	DumpNetworkUInt16((uint16_t *)  & contextOfICC.curr.precomputedCRCS0, 4);
@@ -240,9 +373,10 @@ void CSocketItemEx::InstallEphemeralKey()
 void CSocketItemEx::InstallSessionKey(const CommandInstallKey & cmd)
 {
 #if defined(TRACE) && (TRACE & (TRACE_SLIDEWIN | TRACE_ULACALL))
-	printf_s("\n" __FUNCDNAME__ "\tsendWindowNextSN = %u\n"
-		"  sendBufferNextSN = %09u, \trecvWindowNextSN = %09u\n"
-		"command.nextSendSN = %09u, \t RecvRE snapshot = %09u\n"
+	printf_s("\n%s\n\tsendWindowNextSN = %u\n"
+		"\tsendBufferNextSN = %09u, \trecvWindowNextSN = %09u\n"
+		"\tcommand.nextSendSN = %09u, \t RecvRE snapshot = %09u\n"
+		, __FUNCTION__
 		, pControlBlock->sendWindowNextSN
 		, pControlBlock->sendBufferNextSN, pControlBlock->recvWindowNextSN
 		, cmd.nextSendSN, pControlBlock->connectParams.nextKey$initialSN);
@@ -250,7 +384,7 @@ void CSocketItemEx::InstallSessionKey(const CommandInstallKey & cmd)
 	DumpHexical(cmd.ikm, pControlBlock->connectParams.keyBits / 8);
 #endif
 	contextOfICC.isPrevSendCRC = contextOfICC.isPrevRecvCRC
-		= (InterlockedExchange64((LONGLONG *)&contextOfICC.keyLifeRemain, cmd.keyLife) == 0);
+		= (_InterlockedExchange64((int64_t *)&contextOfICC.keyLifeRemain, cmd.keyLife) == 0);
 	contextOfICC.noEncrypt = (pControlBlock->noEncrypt != 0);
 	contextOfICC.snFirstSendWithCurrKey = cmd.nextSendSN;
 	contextOfICC.snFirstRecvWithCurrKey = pControlBlock->connectParams.nextKey$initialSN;
@@ -297,7 +431,7 @@ void ICC_Context::InitiateExternalKey(const void *ikm, int n)
 	blake2b_ctx ctx;
 
 	originalKeyLength = (n > FSP_MIN_KEY_SIZE ? FSP_MAX_KEY_SIZE : FSP_MIN_KEY_SIZE);
-	if (n > sizeof(SConnectParam))
+	if (n > (int)sizeof(SConnectParam))
 		n = sizeof(SConnectParam);
 	
 	bzero(zeros, FSP_MAX_KEY_SIZE);
@@ -568,7 +702,7 @@ void ICC_Context::Derive(const octet *info, int LEN)
 //  Set the session key for the packet next sent and the next received. 
 //	K_out = PRF(K, [d] || Label || 0x00 || Context || L)
 //	[d]		- Depth. It is alike the KDF counter mode as the NIST SP800-108 (not the feedback mode)
-//	Label	¨C A string that identifies the purpose for the derived keying material,
+//	Label	ï¿½C A string that identifies the purpose for the derived keying material,
 //	          here we set to "Multiply an FSP connection"
 //	Context	- idInitiator, idResponder
 //	Length	- An integer specifying the length (in bits) of the derived keying material K-output
@@ -700,7 +834,7 @@ void * LOCALAPI CSocketItemEx::SetIntegrityCheckCode(FSP_NormalPacketHeader *p1,
 		p1->integrity.id = fidPair;
 		//
 		blake2b_ctx ctx;
-		memset(& ctx, sizeof(ctx), 0);
+		memset(& ctx, 0, sizeof(ctx));
 		blake2b_init(&ctx, sizeof(p1->integrity), contextOfICC.curr.rawKey, contextOfICC.curr.keyLength);
 		blake2b_update(&ctx, p1, byteA);
 		blake2b_update(&ctx, content, ptLen);
@@ -733,8 +867,9 @@ void * LOCALAPI CSocketItemEx::SetIntegrityCheckCode(FSP_NormalPacketHeader *p1,
 		printf_s("Context selected: ");
 		DumpNetworkUInt16((uint16_t *)pCtx->H, 8);
 		DumpNetworkUInt16((uint16_t *)pCtx->J, 8);
-		printf_s("Header, len = %d, and at most 8 octets of payload:\n", byteA);
-		DumpNetworkUInt16((uint16_t *)p1, byteA / 2 + min(4, ptLen / 2));
+		printf_s("Header len = %d:\n", byteA);
+		DumpNetworkUInt16((uint16_t *)p1, byteA / 2);
+		DumpNetworkUInt16((uint16_t*)buf, ptLen / 2);
 #endif
 		GCM_AES_XorSalt(pCtx, salt);
 		if(GCM_AES_AuthenticatedEncrypt(pCtx, *(uint64_t *)p1
@@ -754,7 +889,8 @@ void * LOCALAPI CSocketItemEx::SetIntegrityCheckCode(FSP_NormalPacketHeader *p1,
 
 #ifdef DEBUG_ICC
 	printf_s("After SetIntegrityCheckCode:\n");
-	DumpNetworkUInt16((uint16_t *)p1, byteA / 2 + min(4, ptLen / 2));
+	DumpNetworkUInt16((uint16_t *)p1, byteA / 2);
+	DumpNetworkUInt16((uint16_t*)buf, ptLen / 2);
 #endif
 	return buf;
 }
@@ -878,7 +1014,7 @@ bool CSocketItemEx::EmitStart()
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->GetSendQueueHead();
 	if (!skb->IsComplete())
 		return false;
-	BYTE *payload = GetSendPtr(skb);
+	octet*payload = GetSendPtr(skb);
 	if(payload == NULL)
 	{
 		REPORT_ERRMSG_ON_TRACE("TODO: debug log memory corruption error");
@@ -918,7 +1054,7 @@ bool CSocketItemEx::EmitStart()
 		return false;
 	}
 #if defined(TRACE) && (TRACE & TRACE_PACKET)
-	printf_s("Session#%u emit %s, result = %d, time : 0x%016llX\n"
+	printf_s("Session#%u emit %s, result = %d, time : 0x%016" PRIx64 "\n"
 		, fidPair.source, opCodeStrings[skb->opCode], result, skb->timeSent);
 #endif
 	return (result >= 0);
@@ -939,7 +1075,7 @@ bool CSocketItemEx::EmitStart()
 //	ICC, if required, is always set just before being sent
 int CSocketItemEx::EmitWithICC(ControlBlock::PFSP_SocketBuf skb, ControlBlock::seq_t seq)
 {
-	ALIGN(MAC_ALIGNMENT) FSP_FixedHeader hdr;
+	ALIGN(FSP_ALIGNMENT) FSP_FixedHeader hdr;
 #ifdef EMULATE_LOSS
 	volatile unsigned int vRand = 0;
 	if (rand_s((unsigned int *)&vRand) == 0 && vRand > (UINT_MAX >> 2) + (UINT_MAX >> 1))
@@ -973,7 +1109,7 @@ int CSocketItemEx::EmitWithICC(ControlBlock::PFSP_SocketBuf skb, ControlBlock::s
 	SetSequenceAndWS(&hdr, seq);
 
 	// here we needn't check memory corruption as misbehavior only harms himself
-	void * paidLoad = SetIntegrityCheckCode(&hdr, (BYTE *)payload, skb->len);
+	void * paidLoad = SetIntegrityCheckCode(&hdr, (octet*)payload, skb->len);
 	if(paidLoad == NULL)
 		return -EPERM;
 	//
@@ -986,19 +1122,6 @@ int CSocketItemEx::EmitWithICC(ControlBlock::PFSP_SocketBuf skb, ControlBlock::s
 
 
 
-// Let the compiler do loop-unrolling and embedding
-bool LOCALAPI IsInSubnetSet(uint64_t prefix, TSubnets subnets)
-{
-	for (register int i = 0; i < MAX_PHY_INTERFACES; i++)
-	{
-		if (subnets[i] == prefix)
-			return true;
-	}
-	return false;
-}
-
-
-
 // Check whether local address of the near end is changed because of, say, reconfiguration or hand-over
 // It is conservative in the sense that
 // it would not suppress overwhelming KEEP_ALIVE if the change is only removal of some subnet entry
@@ -1007,27 +1130,8 @@ bool CSocketItemEx::IsNearEndMoved()
 	if (_InterlockedExchange8(&isNearEndHandedOver, 0) == 0)
 		return false;
 
-	u_int k = CLowerInterface::Singleton.sdSet.fd_count;
-	u_int j = 0;
-	LONG & w = CLowerInterface::Singleton.disableFlags;
 	TSubnets subnets;
-	register u_int i;
-	register uint64_t prefix;
-
-	memset(subnets, 0, sizeof(TSubnets));
-	for (i = 0; i < k; i++)
-	{
-		if (!BitTest(&w, i))
-		{
-			prefix = SOCKADDR_SUBNET(&CLowerInterface::Singleton.addresses[i]);
-			if (!IsInSubnetSet(prefix, subnets))
-			{
-				subnets[j++] = prefix;
-				if (j >= MAX_PHY_INTERFACES)
-					break;
-			}
-		}
-	}
+	int j = CLowerInterface::Singleton.GetSubnets(subnets, savedPathsToNearEnd);
 	if (j <= 0)
 	{
 #if (TRACE & TRACE_HEARTBEAT)
@@ -1041,8 +1145,8 @@ bool CSocketItemEx::IsNearEndMoved()
 
 	// Scan and find out the really new entry
 	memset(newPathsToNearEnd, 0, sizeof(TSubnets));
-	k = 0;
-	for (i = 0; i < j; i++)
+	int k = 0;
+	for (register int i = 0; i < j; i++)
 	{
 		if(! IsInSubnetSet(subnets[i], savedPathsToNearEnd))
 			newPathsToNearEnd[k++] = subnets[i];

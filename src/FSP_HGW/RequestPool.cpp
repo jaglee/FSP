@@ -55,7 +55,7 @@ PRequestPoolItem RequestPool::AllocItem(FSPHANDLE h)
 	{
 		if(items[i].hFSP == NULL)
 		{
-			FSPControl(h, FSP_SET_EXT_POINTER, ulong_ptr(items + i));
+			FSPControl(h, FSP_SET_EXT_POINTER, ULONG_PTR(items + i));
 			items[i].hFSP = h;
 			return (items + i);
 		}
@@ -97,7 +97,7 @@ PRequestPoolItem RequestPool::FindItem(FSPHANDLE h)
 // See also AllocItem
 bool RequestPool::FreeItem(PRequestPoolItem p)
 {
-	int offset = (octet *)p - (octet *)this->items;
+	int offset = int((octet *)p - (octet *)this->items);
 	if(offset % sizeof(SRequestPoolItem) != 0)
 		return false;
 

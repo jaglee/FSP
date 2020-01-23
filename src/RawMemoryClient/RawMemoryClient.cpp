@@ -5,8 +5,7 @@
 #include "tchar.h"
 
 // If compiled in Debug mode with the '_DEBUG' macro predefined by default, it tests FSP over UDP/IPv4
-// If compiled in Release mode, or anyway without the '_DEBUG' macro predefined, it tests FSP over IPv6
-#ifdef _DEBUG
+#if defined(_DEBUG) || defined(OVER_UDP_IPv4)
 # define REMOTE_APPLAYER_NAME "localhost:80"
 #else
 # define REMOTE_APPLAYER_NAME "E000:AAAA::1"
@@ -194,7 +193,7 @@ l_nextSize:
 	CryptoNaClKeyPair(bufPublicKey, bufPrivateKey);
 	CryptoNaClGetSharedSecret(bufSharedKey, bufPeersKey, bufPrivateKey);
 
-	FSPControl(h, FSP_SET_CALLBACK_ON_ERROR, (ulong_ptr)onError2);
+	FSPControl(h, FSP_SET_CALLBACK_ON_ERROR, (ULONG_PTR)onError2);
 	printf_s("\nTo send the key material for shared key agreement...\n");
 	WriteTo(h, bufPublicKey, CRYPTO_NACL_KEYBYTES, TO_END_TRANSACTION, onPublicKeySent);
 
@@ -207,7 +206,6 @@ l_nextSize:
 
 	return (ticksToWait > 0 ? 0 : -ETIMEDOUT);
 }
-
 
 
 

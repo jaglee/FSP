@@ -83,7 +83,7 @@ int FSPAPI ReadFrom(FSPHANDLE hFSPSocket, void *buf, int capacity, NotifyOrRetur
 inline
 int CSocketItemDl::TryUnlockPeeked()
 {
-	int32_t nBlock = _InterlockedExchange((LONG*)& pendingPeekedBlocks, 0);
+	int32_t nBlock = _InterlockedExchange((DWORD*)& pendingPeekedBlocks, 0);
 	if (nBlock == 0)
 		return 1;
 	if (nBlock < 0)
@@ -132,10 +132,10 @@ int CSocketItemDl::RecvInline(CallbackPeeked fp1)
 	}
 
 #ifndef NDEBUG
-	if (InterlockedExchangePointer((PVOID*)&fpPeeked, fp1) != NULL)
+	if (_InterlockedExchangePointer((PVOID*)&fpPeeked, fp1) != NULL)
 		printf_s("\nFiber#%u, warning: Receive-inline called before previous RecvInline called back\n", fidPair.source);
 #else
-	InterlockedExchangePointer((PVOID*)&fpPeeked, fp1);
+	_InterlockedExchangePointer((PVOID*)&fpPeeked, fp1);
 #endif
 	return TailFreeMutexAndReturn(0);
 }
@@ -216,14 +216,14 @@ int LOCALAPI CSocketItemDl::ReadFrom(void* buffer, int capacity, NotifyOrReturn 
 		return r;
 	}
 	//
-	if (InterlockedCompareExchangePointer((PVOID*)&fpReceived, fp1, NULL) != NULL)
+	if (_InterlockedCompareExchangePointer((PVOID*)&fpReceived, fp1, NULL) != NULL)
 	{
 		SetMutexFree();
 		return -EBUSY;
 	}
 
 	// Check whether previous ReadFrom finished (no waitingRecvBuf), effectively serialize receiving
-	if (InterlockedCompareExchangePointer((PVOID*)&waitingRecvBuf, buffer, NULL) != NULL)
+	if (_InterlockedCompareExchangePointer((PVOID*)&waitingRecvBuf, buffer, NULL) != NULL)
 	{
 		SetMutexFree();
 		return -EADDRINUSE;
@@ -243,7 +243,7 @@ int LOCALAPI CSocketItemDl::ReadFrom(void* buffer, int capacity, NotifyOrReturn 
 
 	// If it is blocking, wait until every slot in the receive buffer has been filled
 	// or the peer has committed the transmit transaction
-	while ((r = FetchReceived()) >= 0 && _InterlockedOr((LONG*)&bytesReceived, 0) < capacity)
+	while ((r = FetchReceived()) >= 0 && LCKREAD(bytesReceived) < capacity)
 	{
 		uint64_t t0 = GetTickCount64();
 		do
@@ -359,7 +359,7 @@ int32_t CSocketItemDl::FetchReceived()
 	}
 	//
 	pControlBlock->AddRoundRecvBlockN(pControlBlock->recvWindowHeadPos, nPacket);
-	_InterlockedExchangeAdd((LONG *)&pControlBlock->recvWindowFirstSN, nPacket);
+	_InterlockedExchangeAdd((u32 *)&pControlBlock->recvWindowFirstSN, nPacket);
 	//^memory barrier is mandatory
 	return sum;
 }
@@ -394,7 +394,7 @@ l_recursion:
 
 		if (peerCommitted || waitingRecvSize <= 0)
 		{
-			NotifyOrReturn fp1 = (NotifyOrReturn)InterlockedExchangePointer((PVOID *)& fpReceived, NULL);
+			NotifyOrReturn fp1 = (NotifyOrReturn)_InterlockedExchangePointer((PVOID *)& fpReceived, NULL);
 			waitingRecvBuf = NULL;
 			SetMutexFree();
 			// due to multi-task nature it could be already reset in the caller although fpReceived has been checked here
@@ -416,7 +416,7 @@ l_recursion:
 		return;
 	}
 
-	CallbackPeeked fp1 = (CallbackPeeked)InterlockedExchangePointer((PVOID *)& fpPeeked, NULL);
+	CallbackPeeked fp1 = (CallbackPeeked)_InterlockedExchangePointer((PVOID *)& fpPeeked, NULL);
 	if (fp1 == NULL)
 	{
 		SetMutexFree();
@@ -442,7 +442,7 @@ l_recursion:
 	// It is also possible that p == NULL while n is the error code. The callback function MUST handle such scenario
 	// If the callback function happens to be updated, prefer the new one
 	if (fp1(this, p, n, eot))
-		InterlockedCompareExchangePointer((PVOID *)&fpPeeked, fp1, NULL);
+		_InterlockedCompareExchangePointer((PVOID *)&fpPeeked, fp1, NULL);
 	if (n < 0)
 		return;
 

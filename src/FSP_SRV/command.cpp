@@ -29,12 +29,9 @@
  */
 #include "fsp_srv.h"
 
-
-/**
- * Detail implementation of connect request queue is OS-specific
- */
-static ConnectRequestQueue connectRequests;
-
+#ifdef _MSC_VER
+# pragma warning(disable:4996)	//#define _CRT_SECURE_NO_WARNINGS
+#endif
 
 
 // Register a passive FSP socket
@@ -47,16 +44,10 @@ static ConnectRequestQueue connectRequests;
 //	The notice queue of the command context is preset to FSP_IPC_CannotReturn
 //	If 'Listen' succeeds the notice will be replaced by FSP_NotifyListening
 //	or else LLS triggers the upper layer DLL to handle the preset notice
-void LOCALAPI Listen(CommandNewSessionSrv &cmd)
+void LOCALAPI Listen(const CommandNewSessionSrv& cmd)
 {
-	if(cmd.hEvent == NULL)
-	{
-		REPORT_ERROR_ON_TRACE();
-		return;
-	}
-
-	CSocketItemEx *socketItem = CLowerInterface::Singleton.AllocItem(cmd.fiberID);
-	if(socketItem == NULL)
+	CSocketItemEx* socketItem = CLowerInterface::Singleton.AllocItem(cmd.fiberID);
+	if (socketItem == NULL)
 	{
 		REPORT_ERRMSG_ON_TRACE("Multiple call to listen on the same local fiber ID?");
 		goto l_bailout1;
@@ -74,7 +65,7 @@ void LOCALAPI Listen(CommandNewSessionSrv &cmd)
 l_bailout2:
 	CLowerInterface::Singleton.FreeItem(socketItem);
 l_bailout1:
-	::SetEvent(cmd.hEvent);
+	cmd.TriggerULA();
 	return;
 }
 
@@ -91,30 +82,30 @@ l_bailout1:
 //	The notice queue of the command context is preset to FSP_IPC_CannotReturn
 //	If the function succeeds the notice will be replaced by FSP_NotifyListening
 //	or else LLS triggers the upper layer DLL to handle the preset notice
-void LOCALAPI Connect(CommandNewSessionSrv &cmd)
+void LOCALAPI Connect(const CommandNewSessionSrv& cmd)
 {
-	if(cmd.hEvent == NULL)
-		return;		// Do not trace, in case logging is overwhelmed
+	CSocketItemEx* socketItem;
 
-	if ((cmd.index = connectRequests.Push(&cmd)) < 0)
+	int index = ConnectRequestQueue::requests.Push(&cmd);
+	if (index < 0)
 		goto l_bailout1;
 
-	CSocketItemEx *socketItem = CLowerInterface::Singleton.AllocItem();
+	socketItem = CLowerInterface::Singleton.AllocItem();
 	if (socketItem == NULL)
 		goto l_bailout2;
 
 	if (!socketItem->MapControlBlock(cmd))
 		goto l_bailout3;
 
-	socketItem->ScheduleConnect(&cmd);
+	socketItem->ScheduleConnect(index);
 	return;
 
 l_bailout3:
 	CLowerInterface::Singleton.FreeItem(socketItem);
 l_bailout2:
-	connectRequests.Remove(cmd.index);
+	ConnectRequestQueue::requests.Remove(index);
 l_bailout1:
-	::SetEvent(cmd.hEvent);
+	cmd.TriggerULA();
 }
 
 
@@ -129,19 +120,13 @@ l_bailout1:
 //	collision of the near-end ALFID would be filtered out firstly
 //	An FSP socket is incarnated when a listening socket is forked on CONNECT_REQUEST,
 //	or a connection is cloned on MULTIPLY received
-void LOCALAPI Accept(CommandNewSessionSrv &cmd)
+void LOCALAPI Accept(const CommandNewSessionSrv &cmd)
 {
-	if(cmd.hEvent == NULL)
-	{
-		REPORT_ERROR_ON_TRACE();
-		return;
-	}
-
 	CSocketItemEx *socketItem = CLowerInterface::Singleton.AllocItem(cmd);
 	if(socketItem == NULL)
 	{
 		REPORT_ERRMSG_ON_TRACE("Cannot map control block of the client into server's memory space");
-		::SetEvent(cmd.hEvent);
+		cmd.TriggerULA();
 		return;
 	}
 
@@ -154,15 +139,10 @@ void LOCALAPI Accept(CommandNewSessionSrv &cmd)
 //	CommandCloneSessionSrv&		The connection multiplication command
 // Do
 //	Clone the root connection
-void Multiply(CommandCloneSessionSrv &cmd)
+void Multiply(const CommandCloneSessionSrv &cmd)
 {
-	if (cmd.hEvent == NULL)
-	{
-		REPORT_ERROR_ON_TRACE();
-		return;
-	}
-
 	CSocketItemEx *srcItem = CLowerInterface::Singleton[cmd.fiberID];
+	CSocketItemEx* newItem;
 	if(srcItem == NULL)
 	{
 		BREAK_ON_DEBUG();	//TRACE_HERE("Cloned connection not found");
@@ -186,7 +166,7 @@ void Multiply(CommandCloneSessionSrv &cmd)
 		goto l_return;
 	}
 
-	CSocketItemEx *newItem = CLowerInterface::Singleton.AllocItem();
+	newItem = CLowerInterface::Singleton.AllocItem();
 	if (newItem == NULL || !newItem->MapControlBlock(cmd))
 	{
 		if(newItem == NULL)
@@ -198,7 +178,7 @@ void Multiply(CommandCloneSessionSrv &cmd)
 			REPORT_ERRMSG_ON_TRACE("Cannot map control block of the client into server's memory space");
 			CLowerInterface::Singleton.FreeItem(newItem);
 		}
-		::SetEvent(cmd.hEvent);
+		cmd.TriggerULA();
 		goto l_return;
 	}
 
@@ -212,10 +192,66 @@ l_return:
 
 
 
+// Get upper layer application's commands and process them
+// Given
+//	_In_ buffer		buffer of the command received from ULA
+// Return
+//	Nothing
+// TODO: UNRESOLVED!there should be performance profiling variables to record how many commands have been processed?
+void LOCALAPI ProcessCommand(void *buffer)
+{
+    static int n = 0;
+
+	CommandToLLS *pCmd = (CommandToLLS *)buffer;
+	CSocketItemEx *pSocket;
+#if defined(TRACE) && (TRACE & TRACE_ULACALL)
+	printf_s("\n#%d command"
+		", fiber#%u(_%X_)"
+		", %s(code = %d)\n"
+		, n
+		, pCmd->fiberID, be32toh(pCmd->fiberID)
+		, noticeNames[pCmd->opCode], pCmd->opCode);
+#endif
+	switch(pCmd->opCode)
+	{
+	case FSP_Listen:		// register a passive socket
+		Listen(CommandNewSessionSrv(pCmd));
+		break;
+	case InitConnection:	// register an initiative socket
+		Connect(CommandNewSessionSrv(pCmd));
+		break;
+	case FSP_Accept:
+		Accept(CommandNewSessionSrv(pCmd));
+		break;
+	case FSP_Multiply:
+		Multiply(CommandCloneSessionSrv(pCmd));
+		break;
+	default:
+		pSocket = (CSocketItemEx *)CLowerInterface::Singleton[pCmd->fiberID];
+		if(pSocket == NULL)
+		{
+#if defined(TRACE) && (TRACE & TRACE_ULACALL)
+			printf_s("Erratic! %s called for invalid local fiber#%u(_%X_)\n"
+				, opCodeStrings[pCmd->opCode]
+				, pCmd->fiberID, be32toh(pCmd->fiberID));
+#endif
+			break;
+		}
+		pSocket->ProcessCommand(pCmd);
+	}
+	//
+#if defined(TRACE) && (TRACE & TRACE_ULACALL)
+	printf_s("#%d command processed, operation code = %d\n\n.",  n, pCmd->opCode);
+#endif
+	n++;
+}
+
+
+
 // Given
 //	CommandToLLS		The service command requested by ULA
 // Do
-//	Excute ULA's request
+//	Execute ULA's request
 void CSocketItemEx::ProcessCommand(CommandToLLS *pCmd)
 {
 	if (!WaitUseMutex())
@@ -229,7 +265,7 @@ void CSocketItemEx::ProcessCommand(CommandToLLS *pCmd)
 		return;
 	}
 #if defined(TRACE) && (TRACE & TRACE_ULACALL)
-	printf_s(__FUNCTION__ " called (%s), LLS state: %s(%d) <== ULA state: %s(%d)\n"
+	printf_s("%s called (%s), LLS state: %s(%d) <== ULA state: %s(%d)\n", __FUNCTION__
 		, noticeNames[pCmd->opCode]
 		, stateNames[lowState], lowState
 		, stateNames[pControlBlock->state], pControlBlock->state);
@@ -283,15 +319,17 @@ void CSocketItemEx::Connect()
 	if (r <= 0)
 	{
 		const char *serviceName = strchr(peerName, ':');
-		if(serviceName != NULL)
+		if (serviceName != NULL)
 		{
-			serviceName++;
-			strncpy_s(nodeName, INET6_ADDRSTRLEN - 1, peerName, serviceName - peerName - 1);
-			nodeName[serviceName - peerName - 1] = 0;
+			size_t n = serviceName - peerName;
+			n = n < INET6_ADDRSTRLEN ? n : INET6_ADDRSTRLEN - 1;
+			strncpy(nodeName, peerName, n);
+			nodeName[n] = 0;
 			peerName = nodeName;
+			serviceName++;
 		}
 		r = ResolveToFSPoverIPv4(peerName, serviceName);
-		if(r <=  0)
+		if (r <= 0)
 		{
 			Notify(FSP_NameResolutionFailed);
 			Destroy();
@@ -350,11 +388,10 @@ int CSocketItemEx::ResolveToFSPoverIPv4(const char *nodeName, const char *servic
 	// assume the project is compiled in ANSI/MBCS language mode
 	if(getaddrinfo(nodeName, serviceName, & hints, & pAddrInfo) != 0)
 	{
-#if defined(TRACE) && (TRACE & TRACE_ADDRESS)
-		DWORD err = WSAGetLastError();
-		char buffer[1024];
-		FormatMessage(FORMAT_MESSAGE_FROM_SYSTEM, NULL, err, 0, (LPTSTR) & buffer, 1024, NULL);
-		printf_s("Cannot Resolve the IPv4 address of the node %s, error code = %d\n %s\n", nodeName, err, (LPTSTR) buffer);
+#if !defined(NDEBUG) &&  defined(__WINDOWS__)
+		TraceLastError(__FILE__, __LINE__, __FUNCTION__, nodeName);
+#elif !defined(NDEBUG) && (defined(__linux__) || defined(__CYGWIN__))
+		perror("nodeName");
 #endif
 		return -1;
 	}
@@ -377,7 +414,7 @@ int CSocketItemEx::ResolveToFSPoverIPv4(const char *nodeName, const char *servic
 		// Must keep in consistent with TranslateFSPoverIPv4
 		prefixes[n].prefix = PREFIX_FSP_IP6to4;
 		prefixes[n].port = DEFAULT_FSP_UDPPORT;
-		prefixes[n].ipv4 = ((PSOCKADDR_IN)pAddrInfo->ai_addr)->sin_addr.S_un.S_addr;
+		prefixes[n].ipv4 = *(u32*) & ((PSOCKADDR_IN)pAddrInfo->ai_addr)->sin_addr;
 	} while(++n < MAX_PHY_INTERFACES && (pAddrInfo = pAddrInfo->ai_next) != NULL);
 
 	freeaddrinfo(pAddrInfo);
@@ -402,11 +439,10 @@ int CSocketItemEx::ResolveToIPv6(const char *nodeName)
 	// assume the project is compiled in ANSI/MBCS language mode
 	if(getaddrinfo(nodeName, NULL, & hints, & pAddrInfo) != 0)
 	{
-#if defined(TRACE) && (TRACE & TRACE_ADDRESS)
-		DWORD err = WSAGetLastError();
-		char buffer[1024];
-		FormatMessage(FORMAT_MESSAGE_FROM_SYSTEM, NULL, err, 0, (LPTSTR) & buffer, 1024, NULL);
-		printf("Cannot Resolve the IPv6 address of the node %s, error code = %d\n %s\n", nodeName, err, (LPTSTR) buffer);
+#if !defined(NDEBUG) &&  defined(__WINDOWS__)
+		TraceLastError(__FILE__, __LINE__, __FUNCTION__, nodeName);
+#elif !defined(NDEBUG) && (defined(__linux__) || defined(__CYGWIN__))
+		perror("nodeName");
 #endif
 		return -1;
 	}
@@ -426,7 +462,7 @@ int CSocketItemEx::ResolveToIPv6(const char *nodeName)
 	pControlBlock->peerAddr.ipFSP.hostID = SOCKADDR_HOSTID(pAddrInfo->ai_addr);
 	do
 	{
-		prefixes[n] = *(uint64_t *)(((PSOCKADDR_IN6)pAddrInfo->ai_addr)->sin6_addr.u.Byte);
+		prefixes[n] = *(uint64_t*) & ((PSOCKADDR_IN6)pAddrInfo->ai_addr)->sin6_addr;
 	} while(++n < MAX_PHY_INTERFACES && (pAddrInfo = pAddrInfo->ai_next) != NULL);
 
 	freeaddrinfo(pAddrInfo);
@@ -439,5 +475,76 @@ int CSocketItemEx::ResolveToIPv6(const char *nodeName)
 void CommandNewSessionSrv::DoConnect()
 {
 	pSocket->Connect();
-	connectRequests.Remove(index);
+	ConnectRequestQueue::requests.Remove(index);
 }
+
+
+/**
+ *	Manipulation of connection request queue
+ */
+
+// Given
+//	CommandNewSessionSrv		The request for new connection
+// Return
+//	non-negative is the position of the new request in the queue
+//	negative if error
+// Remark
+//	Make a clone of the connect request information in the queue
+//	the caller should set the index of the clone later
+//	There is head-of-line block in this implementation,
+//	which might be beneficial because it is connection rate throttling
+int ConnectRequestQueue::Push(const CommandNewSessionSrv *p)
+{
+	WaitSetMutex();
+	//
+	if(mayFull != 0 && tail == head)
+	{
+		SetMutexFree();
+		return -1;
+	}
+
+	register int i = tail;
+	if(++tail >= CONNECT_BACKLOG_SIZE)
+		tail = 0;
+	q[i] = *p;
+	mayFull = 1;
+	//
+	SetMutexFree();
+	return i;
+}
+
+
+
+// Given
+//	int		the index of the item to be removed
+// Return
+//	0	if no error
+//	-1	if no item could be removed
+int ConnectRequestQueue::Remove(int i)
+{
+	WaitSetMutex();
+	// 
+	if (tail < 0 || tail >= CONNECT_BACKLOG_SIZE)
+	{
+		SetMutexFree();
+		return -1;
+	}
+	//
+	if(mayFull == 0 && head == tail)
+	{
+		SetMutexFree();
+		return -1;
+	}
+	//
+	q[i].opCode = NullCommand;
+	if(i == head)
+		do
+		{
+			if(++head >= CONNECT_BACKLOG_SIZE)
+				head = 0;
+		} while(head != tail && q[head].opCode == NullCommand);
+	mayFull = 0;
+	//
+	SetMutexFree();
+	return 0;
+}	

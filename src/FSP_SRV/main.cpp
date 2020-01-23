@@ -33,15 +33,23 @@
 
 #include "fsp_srv.h"
 
+
+// The singleton instance of the connect request queue
+ConnectRequestQueue ConnectRequestQueue::requests;
+
+// The singleton instance of the lower service interface 
+CLowerInterface	CLowerInterface::Singleton;
+
+extern void LOCALAPI ProcessCommand(void *buffer);
+
+#if defined(__WINDOWS__)
+
 // access control is centralized managed in the 'main' source file
-#include <Accctrl.h>
-#include <Aclapi.h>
+# include <Accctrl.h>
+# include <Aclapi.h>
 
 // get the security attribute of the service, assigned to the mailslot - shall be everyone's free access
 static void GetServiceSA(PSECURITY_ATTRIBUTES);
-
-// forward declaration of the top-level routine to process the ULA's commands
-static void LOCALAPI ProcessCommand(HANDLE);
 
 extern "C"
 int main(int argc, char * argv[])
@@ -66,25 +74,36 @@ int main(int argc, char * argv[])
 		goto l_bailout;
 	}
 
-	try
-	{
-		new TimerWheel();
-	}
-	catch(HRESULT x)
-	{
-		printf("In main: exception number 0x%X, internal panic! Cannot start the timer\n", x); 
-		goto l_bailout;
-	}
-
 	// continue on main thread (thread 1):
+	// Remark
+	//	Terminate only when the mailslot is unreadable due to some panic
 	try
 	{
-		ProcessCommand(md);
+		octet buffer[MAX_CTRLBUF_LEN];
+		DWORD nBytesRead;
+		while(ReadFile(md, buffer, MAX_CTRLBUF_LEN, & nBytesRead, NULL))
+		{
+#if defined(TRACE) && (TRACE & TRACE_ULACALL)
+			printf_s("\n%d octets read from the mailslot.", nBytesRead);
+#endif
+			if(nBytesRead < sizeof(struct CommandToLLS))
+			{
+#if defined(TRACE) && (TRACE & TRACE_ULACALL)
+				printf_s(" Size of the message is too small.\n");
+#endif
+				continue;
+			}
+			ProcessCommand(buffer);
+			// There used to be "hard-coded: (ushort)(-1) mean exit". But it allowed DoS attack
+		}
+#ifndef NDEBUG
+		// TODO: UNRESOLVED! Crash Recovery? if ReadFile fails, it is a crash
+		printf("Fatal! Read mailslot error, command channel broken\n");
+#endif
 	}
 	catch(...)
 	{
 		BREAK_ON_DEBUG();
-		delete TimerWheel::Singleton();
 		CLowerInterface::Singleton.Destroy();
 	}
 
@@ -170,87 +189,70 @@ Cleanup:
 	//	  LocalFree(pACL);
 }
 
+#elif defined(__linux__) || defined(__CYGWIN__)
 
-
-// Get upper layer application's commands and process them
-// Given
-//	_In_ md the handle of the mailslot receiving ULA commands
-// Return
-//	Nothing
-// Remark
-//	Terminate only when the mailslot is unreadable due to some panic
-static void LOCALAPI ProcessCommand(HANDLE md)
+int main(int argc, char * argv[])
 {
-	BYTE buffer[MAX_CTRLBUF_LEN];
-	DWORD nBytesRead;
-	CommandToLLS *pCmd = (CommandToLLS *)buffer;
-	CSocketItemEx *pSocket;
-	// TODO: UNRESOLVED!there should be performance profiling variables to record how many commands have been processed?
-    static int n = 0;
-	while(ReadFile(md, buffer, MAX_CTRLBUF_LEN, & nBytesRead, NULL))
+	struct mq_attr mqa;
+    mqd_t mqdes;
+
+	mqa.mq_flags = 0;       /* Flags (ignored for mq_open()) */
+	mqa.mq_maxmsg = 5;      /* Max. # of messages on queue */
+	mqa.mq_msgsize = MAX_CTRLBUF_LEN;
+	mqa.mq_curmsgs = 0;     /* # of messages currently in queue */
+
+	mqdes = mq_open(SERVICE_MAILSLOT_NAME, O_RDONLY | O_CREAT, 0777, &mqa);
+
+    if (mqdes == (mqd_t) -1)
 	{
-		if(nBytesRead < sizeof(struct CommandToLLS))
-			continue;
-#if defined(TRACE) && (TRACE & TRACE_ULACALL)
-		printf_s("\n\n#%d command"
-			", fiber#%u(_%X_)"
-			", %s(code = %d, size = %d)\n"
-			, n
-			, pCmd->fiberID, be32toh(pCmd->fiberID)
-			, noticeNames[pCmd->opCode], pCmd->opCode, nBytesRead);
-#endif
-		//
-		switch(pCmd->opCode)
+		printf("To read %s:\n", SERVICE_MAILSLOT_NAME);
+		perror("cannot create open the message queue");
+		exit(-1);
+	}
+
+	// also create the receiver
+	if(!CLowerInterface::Singleton.Initialize())
+	{
+		printf("In main cannot access lower interface, aborted.\n"); 
+		goto l_bailout;
+	}
+
+	// continue on main thread (thread 1):
+	try
+	{
+		char buffer[MAX_CTRLBUF_LEN];
+		unsigned int msg_prio;;
+		ssize_t nBytesRead;
+		while((nBytesRead = mq_receive(mqdes, buffer, MAX_CTRLBUF_LEN, &msg_prio)) > 0)
 		{
-		case FSP_Listen:		// register a passive socket
 #if defined(TRACE) && (TRACE & TRACE_ULACALL)
-			printf_s("Listen: assigned event trigger is:\n  %s\n", ((CommandNewSession *)pCmd)->szEventName);
+			printf_s("\n%d octets read from the mailslot.", (int)nBytesRead);
 #endif
-			Listen(CommandNewSessionSrv(pCmd));
-			break;
-		case InitConnection:	// register an initiative socket
-#if defined(TRACE) && (TRACE & TRACE_ULACALL)
-			printf_s("Connect: assigned event trigger is:\n  %s\n", ((CommandNewSession *)pCmd)->szEventName);
-#endif
-			Connect(CommandNewSessionSrv(pCmd));
-			break;
-		case FSP_Accept:
-#if defined(TRACE) && (TRACE & TRACE_ULACALL)
-			printf_s("Accept: assigned event trigger is:\n  %s\n", ((CommandNewSession *)pCmd)->szEventName);
-#endif
-			Accept(CommandNewSessionSrv(pCmd));
-			break;
-		case FSP_Multiply:
-#if defined(TRACE) && (TRACE & TRACE_ULACALL)
-			printf_s("Multiply: assigned event trigger is:\n  %s\n", ((CommandNewSession *)pCmd)->szEventName);
-#endif
-			Multiply(CommandCloneSessionSrv(pCmd));
-			break;
-		default:
-			pSocket = (CSocketItemEx *)CLowerInterface::Singleton[pCmd->fiberID];
-			if(pSocket == NULL)
+			if(nBytesRead < (ssize_t)sizeof(struct CommandToLLS))
 			{
 #if defined(TRACE) && (TRACE & TRACE_ULACALL)
-				printf_s("Erratic!%s (code = %d) called for invalid local fiber#%u(_%X_)\n"
-					, opCodeStrings[pCmd->opCode]
-					, pCmd->opCode
-					, pCmd->fiberID, be32toh(pCmd->fiberID));
+				printf_s(" Size of the message is too small.\n");
 #endif
-				break;
+				continue;
 			}
-			pSocket->ProcessCommand(pCmd);
+			ProcessCommand(buffer);
+			// There used to be "hard-coded: (ushort)(-1) mean exit". But it allowed DoS attack
 		}
-		// hard-coded: (ushort)(-1) mean exit
-		if(buffer[0] == 0xFF || buffer[1] == 0xFF)
-			break;
-		//
-#if defined(TRACE) && (TRACE & TRACE_ULACALL)
-		printf_s("#%d command processed, operation code = %d\n\n",  n, pCmd->opCode);
-#endif
-		n++;
-	}
 #ifndef NDEBUG
-	// TODO: UNRESOLVED! Crash Recovery? if ReadFile fails, it is a crash
-	printf("Fatal! Read mailslot error, command channel broken\n");
+		// TODO: UNRESOLVED! Crash Recovery? if ReadFile fails, it is a crash
+		printf("Fatal! Read mailslot error, command channel broken\n");
 #endif
+	}
+	catch(...)
+	{
+		BREAK_ON_DEBUG();
+		CLowerInterface::Singleton.Destroy();
+	}
+
+l_bailout:
+	mq_unlink(SERVICE_MAILSLOT_NAME);
+	return 0;
 }
+
+#endif
+

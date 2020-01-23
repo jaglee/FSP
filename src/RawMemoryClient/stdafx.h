@@ -2,16 +2,13 @@
 // or project specific include files that are used frequently, but
 // are changed infrequently
 //
-#include <Windows.h>
-#include <stdlib.h>
-#include <stdio.h>
-#include <string.h>
-#include <io.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <share.h>
 #include "../FSP_API.h"
 #include "../Crypto/CryptoStub.h"
+
+#include <fcntl.h>
+#include <io.h>
+#include <stdio.h>
+#include <tchar.h>
 
 // Forward declaration of an auxilary function
 int ReportLastError();

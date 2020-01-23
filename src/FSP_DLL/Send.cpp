@@ -68,7 +68,7 @@ int32_t FSPAPI GetSendBuffer(FSPHANDLE hFSPSocket, CallbackBufferReady fp1)
 	CSocketItemDl *p = CSocketDLLTLB::HandleToRegisteredSocket(hFSPSocket);
 	if(p == NULL)
 		return -EFAULT;
-	if (!p->TestSetSendReturn(fp1))
+	if (!p->TestSetSendReturn((PVOID)fp1))
 		return -EBUSY;
 	return p->AcquireSendBuf();
 }
@@ -124,7 +124,7 @@ int32_t FSPAPI SendInline(FSPHANDLE hFSPSocket, void * buffer, int32_t len, bool
 	CSocketItemDl *p = CSocketDLLTLB::HandleToRegisteredSocket(hFSPSocket);
 	if(p == NULL)
 		return -EFAULT;
-	if(eotFlag && !p->TestSetOnCommit(fp1))
+	if(eotFlag && !p->TestSetOnCommit((PVOID)fp1))
 		return -EBUSY;
 	return p->SendInplace(buffer, len, eotFlag);
 }
@@ -156,7 +156,7 @@ int32_t FSPAPI WriteTo(FSPHANDLE hFSPSocket, const void * buffer, int32_t len, u
 		return -EFAULT;
 	//
 	bool eot = (flags & TO_END_TRANSACTION) != 0;
-	if (eot && !p->TestSetOnCommit(fp1) || !eot && !p->TestSetSendReturn(fp1))
+	if ((eot && !p->TestSetOnCommit((PVOID)fp1)) || (!eot && !p->TestSetSendReturn((PVOID)fp1)))
 		return -EBUSY;
 	return p->SendStream(buffer, len, eot, (flags & TO_COMPRESS_STREAM) != 0);
 }
@@ -308,7 +308,7 @@ int32_t LOCALAPI CSocketItemDl::SendStream(const void* buffer, int32_t len, bool
 			newTransaction = 1;
 	}
 
-	if (InterlockedCompareExchangePointer((PVOID*)&pendingSendBuf, (PVOID)buffer, NULL) != NULL)
+	if (_InterlockedCompareExchangePointer((PVOID*)&pendingSendBuf, (PVOID)buffer, NULL) != NULL)
 	{
 		SetMutexFree();
 		return -EADDRINUSE;
@@ -365,7 +365,7 @@ int CSocketItemDl::LockAndCommit(NotifyOrReturn fp1)
 	if (!WaitUseMutex())
 		return (IsInUse() ? -EDEADLK : -EINTR);
 
-	if (! TestSetOnCommit(fp1))
+	if (! TestSetOnCommit((PVOID)fp1))
 	{
 #if defined(TRACE) && !defined(NDEBUG)
 		printf_s("Commit: the socket is already in commit or graceful shutdown process.\n");
@@ -427,7 +427,7 @@ l_recursion:
 			}
 		}
 
-		NotifyOrReturn fp2 = (NotifyOrReturn)InterlockedExchangePointer((PVOID volatile *)& fpSent, NULL);
+		NotifyOrReturn fp2 = (NotifyOrReturn)_InterlockedExchangePointer((PVOID *)& fpSent, NULL);
 		pendingSendBuf = NULL;
 		if (fp2 != NULL)
 		{
@@ -447,7 +447,7 @@ l_recursion:
 	}
 
 	// Or else it's pending GetSendBuffer()
-	CallbackBufferReady fp2 = (CallbackBufferReady)InterlockedExchangePointer((PVOID volatile *)& fpSent, NULL);
+	CallbackBufferReady fp2 = (CallbackBufferReady)_InterlockedExchangePointer((PVOID volatile *)& fpSent, NULL);
 	if (fp2 == NULL)
 	{
 		SetMutexFree();
@@ -456,10 +456,10 @@ l_recursion:
 
 	ControlBlock::seq_t seqN = pControlBlock->sendBufferNextSN;
 	int32_t m;
-	BYTE *p = pControlBlock->InquireSendBuf(& m);
+	octet *p = pControlBlock->InquireSendBuf(& m);
 	if (p == NULL)
 	{
-		TestSetSendReturn(fp2);
+		TestSetSendReturn((PVOID)fp2);
 		SetMutexFree();
 		// BREAK_ON_DEBUG(); // race condition does exist, but shall be very rare!
 		return;
@@ -470,7 +470,7 @@ l_recursion:
 	// of the callback function. However, if it happens to be updated, prefer the new one
 	bool b = (fp2(this, p, m) >= 0);
 	if (b)
-		TestSetSendReturn(fp2);
+		TestSetSendReturn((PVOID)fp2);
 	if (!WaitUseMutex())
 		return;	// It could be disposed in the callback function.
 
@@ -663,7 +663,7 @@ l_finalize:
 //	Would automatically mark the previous last packet as completed
 int32_t LOCALAPI CSocketItemDl::PrepareToSend(void * buf, int32_t len, bool eot)
 {
-	if(len <= 0 || len % MAX_BLOCK_SIZE != 0 && !eot)
+	if(len <= 0 || (len % MAX_BLOCK_SIZE != 0 && !eot))
 	{
 		bytesBuffered = 0;
 		return -EDOM;
@@ -678,7 +678,7 @@ int32_t LOCALAPI CSocketItemDl::PrepareToSend(void * buf, int32_t len, bool eot)
 
 	int32_t m;
 #ifndef NDEBUG
-	BYTE *bufToCheck = pControlBlock->InquireSendBuf(&m);
+	octet *bufToCheck = pControlBlock->InquireSendBuf(&m);
 	if (bufToCheck != buf)
 	{
 		printf_s("The caller should not mess up the reserved the buffer space!\n");
@@ -732,7 +732,7 @@ int32_t LOCALAPI CSocketItemDl::PrepareToSend(void * buf, int32_t len, bool eot)
 
 	// finally set the new tail of the send queue, and the let LLS detect the change
 	pControlBlock->AddRoundSendBlockN(pControlBlock->sendBufferNextPos, m);
-	_InterlockedExchangeAdd((LONG *)& pControlBlock->sendBufferNextSN, m);
+	_InterlockedExchangeAdd((u32*)& pControlBlock->sendBufferNextSN, m);
 	//^here memory barrier is necessary
 	return m;
 }
@@ -788,7 +788,7 @@ int CSocketItemDl::Commit()
 	if (InState(COMMITTED) || InState(CLOSABLE))
 	{
 		printf_s("Should not call internal commit: protocol implementation error!\n");
-		DebugBreak();
+		BREAK_ON_DEBUG();
 		return -EDOM;
 	}
 #endif
@@ -847,7 +847,7 @@ int CSocketItemDl::Flush()
 		return (IsInUse() ? -EDEADLK : -EINTR);
 
 	register ControlBlock::PFSP_SocketBuf p
-		= (ControlBlock::PFSP_SocketBuf)InterlockedExchangePointer((PVOID *)&skbImcompleteToSend, NULL);
+		= (ControlBlock::PFSP_SocketBuf)_InterlockedExchangePointer((PVOID *)&skbImcompleteToSend, NULL);
 
 	if (p == NULL)
 	{

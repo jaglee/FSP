@@ -51,7 +51,9 @@
 #include <Aclapi.h>
 
 DWORD	CSocketItemDl::idThisProcess = 0;	// the id of the process that attaches this DLL
-CSocketDLLTLB CSocketItemDl::socketsTLB;	// the shared class member
+
+void CSocketDLLTLB::Init() { }
+CSocketDLLTLB::~CSocketDLLTLB() {}
 
 static HANDLE		_mdService; // = NULL;	// the mailslot descriptor of the service
 static HANDLE		timerQueue;	// = NULL;
@@ -78,6 +80,7 @@ BOOL WINAPI DllMain(HINSTANCE hInstance, DWORD dwReason, LPVOID lpvReserved)
 #ifdef TRACE
 		AllocConsole();
 #endif
+		CSocketItemDl::SaveProcessId();
 		_mdService = CreateFileA(SERVICE_MAILSLOT_NAME
 				, GENERIC_WRITE	
 				// no GENERIC_READ needed, but MUST shared read, because LLS create the mailslot for read
@@ -91,8 +94,6 @@ BOOL WINAPI DllMain(HINSTANCE hInstance, DWORD dwReason, LPVOID lpvReserved)
 			REPORT_ERROR_ON_TRACE();
 			return FALSE;
 		}
-		CSocketItemDl::SaveProcessId();
-		//
 		timerQueue = CreateTimerQueue();
 	}
 	else if(dwReason == DLL_PROCESS_DETACH)
@@ -108,9 +109,6 @@ BOOL WINAPI DllMain(HINSTANCE hInstance, DWORD dwReason, LPVOID lpvReserved)
 
 
 
-/**
- *	POSIX gettimeofday(); get current UTC time
- */
 // Return the number of microseconds elapsed since Jan 1, 1970 UTC (Unix epoch)
 DllSpec
 timestamp_t NowUTC()
@@ -126,423 +124,66 @@ timestamp_t NowUTC()
 
 
 
-// Return
-//	true if obtained the mutual-exclusive lock
-//	false if timed out
-// Remark
-//	Exploit _InterlockedCompareExchange8 to keep memory access order as the coded order
-bool CLightMutex::WaitSetMutex()
-{
-	uint64_t t0 = GetTickCount64();
-	while(_InterlockedCompareExchange8(& mutex, 1, 0))
-	{
-		if(GetTickCount64() - t0 > MAX_LOCK_WAIT_ms)
-		{
-			BREAK_ON_DEBUG();
-			return false;
-		}
-		//
-		Sleep(TIMER_SLICE_ms);
-	}
-	return true;
-}
-
-
-
-// Do
-//	Try to obtain the slim-read-write mutual-exclusive lock of the FSP socket
-// Return
-//	true if obtained the mutual-exclusive lock
-//	false if timed out
-// Remark
-//	if there is some thread that has exclusive access on the lock, wait patiently
-bool CSocketItemDl::WaitUseMutex()
-{
-	uint64_t t0 = GetTickCount64();
-	while(!TryMutexLock())
-	{
-		// possible dead lock: should trace the error in debug mode!
-		if(GetTickCount64() - t0 > SESSION_IDLE_TIMEOUT_us/1000)
-			return false;
-		if(!IsInUse())
-			return false;
-		//
-		Sleep(TIMER_SLICE_ms);
-	}
-	//
-	return IsInUse();
-}
-
-
-
 // Given
-//	PFSP_Context
-//	char []		the buffer to hold the name of the event
+//	CommandNewSession	[_inout_]	the buffer to hold the name of the event
 // Do
-//	Create and initialize the shared memory structure of the Session Control Block
+//	Initialize the IPC structure to call LLS
 // Return
-//	0 if no error, negative is the error code
-int LOCALAPI CSocketItemDl::Initialize(PFSP_Context psp1, char szEventName[MAX_NAME_LENGTH])
+//	true if no error, false if failed
+bool CSocketItemDl::InitLLSInterface(CommandNewSession& cmd)
 {
-	// TODO: evaluate configurable shared memory block size? // UNRESOLVED!? MTU?
-	if(psp1->sendSize < 0 || psp1->recvSize < 0 || psp1->sendSize + psp1->recvSize > MAX_FSP_SHM_SIZE + MIN_RESERVED_BUF)
-		return -ENOMEM;
-
-	if(psp1->sendSize < MIN_RESERVED_BUF)
-		psp1->sendSize = MIN_RESERVED_BUF;
-	if(psp1->recvSize < MIN_RESERVED_BUF)
-		psp1->recvSize = MIN_RESERVED_BUF;
-
-	if(psp1->passive)
-	{
-		dwMemorySize = ((sizeof(ControlBlock) + 7) >> 3 << 3)
-			+ sizeof(LLSBackLog) + sizeof(BackLogItem) * (FSP_BACKLOG_SIZE - MIN_QUEUED_INTR);
-	}
-	else
-	{
-		int n = (psp1->sendSize - 1) / MAX_BLOCK_SIZE + (psp1->recvSize - 1) / MAX_BLOCK_SIZE + 2;
-		// See also Init()
-		dwMemorySize = ((sizeof(ControlBlock) + 7) >> 3 << 3)
-			+ n * (((sizeof(ControlBlock::FSP_SocketBuf) + 7) >> 3 << 3) + MAX_BLOCK_SIZE);
-	}
-
 	hMemoryMap = CreateFileMapping(INVALID_HANDLE_VALUE	// backed by the system paging file
 		, NULL	// not inheritable
 		, PAGE_READWRITE | SEC_COMMIT
 		, 0, dwMemorySize	// file mapping size, we limit it to less than 4GB
 		, NULL);
-	if(hMemoryMap == INVALID_HANDLE_VALUE || hMemoryMap == NULL)
+	if (hMemoryMap == INVALID_HANDLE_VALUE || hMemoryMap == NULL)
 	{
 		REPORT_ERRMSG_ON_TRACE("Cannot create shared memory object by CreateFileMapping");
-		return -ENOENT;
+		return false;	// return -ENOENT;
 	}
 
 	// UNRESOLVED! passive socket and initiative socket are of different memory footprint?
 	// if they are, there should be more AllocItem() function
-	pControlBlock = (ControlBlock *)MapViewOfFile(hMemoryMap
+	pControlBlock = (ControlBlock*)MapViewOfFile(hMemoryMap
 		, FILE_MAP_ALL_ACCESS
 		, 0, 0, dwMemorySize);
-	if(pControlBlock == NULL)
+	if (pControlBlock == NULL)
 	{
 		REPORT_ERRMSG_ON_TRACE("Cannot take use of shared memory object by MapViewOfFile");
 		CloseHandle(hMemoryMap);
-		return -ENOMEM;
+		return false;	// return -ENOMEM;
 	}
 
 	// make the event name. the control block address, together with the process id, uniquely identify the event
-	sprintf_s(szEventName, MAX_NAME_LENGTH, REVERSE_EVENT_PREFIX "%08X%p", idThisProcess, pControlBlock);
+	sprintf_s(cmd.szEventName, MAX_NAME_LENGTH, REVERSE_EVENT_PREFIX "%08X%p", idThisProcess, pControlBlock);
 	// system automatically resets the event state to non-signaled after a single waiting thread has been released
-	hEvent = CreateEventA(& attrSecurity
+	hEvent = CreateEventA(&attrSecurity
 		, FALSE // not manual-reset
 		, FALSE // the initial state of the event object is non-signaled
-		, szEventName);	// (LPCTSTR)
+		, cmd.szEventName);	// (LPCTSTR)
 
 #ifdef TRACE
 	printf_s("ID of current process is %d, handle of the event is %p\n", idThisProcess, hEvent);
 #endif
-	if(hEvent == INVALID_HANDLE_VALUE || hEvent == NULL)
+	if (hEvent == INVALID_HANDLE_VALUE || hEvent == NULL)
 	{
 		REPORT_ERRMSG_ON_TRACE("Cannot create event object for reverse synchronization");
-		UnmapViewOfFile(pControlBlock);
-		CloseHandle(hMemoryMap);
-		return -EINTR;	// the event mechanism is actually software interrupt mechanism
+		return false;	// return -EINTR;	// the event mechanism is actually software interrupt mechanism
 	}
 
-	if(psp1->passive)
-		pControlBlock->Init(FSP_BACKLOG_SIZE);
-	else
-		pControlBlock->Init(psp1->sendSize, psp1->recvSize);
-	//
-	pControlBlock->tfrc = psp1->tfrc;
-	pControlBlock->milky = psp1->milky;
-	pControlBlock->noEncrypt = psp1->noEncrypt;
-	//
-	pControlBlock->notices.SetHead(FSP_IPC_CannotReach);
-	//^only after the control block is successfully mapped into the memory space of LLS may it be cleared by LLS
-
-	// could be exploited by ULA to make services distinguishable
-	memcpy(&context, psp1, sizeof(FSP_SocketParameter));
-	pendingSendBuf = (BYTE *)psp1->welcome;
-	pendingSendSize = psp1->len;
-
-	return 0;
-}
-
-
-
-// Given
-//	CommandNewSession & [_Out_]	the command context to be filled
-//	FSP_ServiceCode				the service code to be passed
-// Do
-//	Fill in the command context and call LLS. The service code MUST be one that creates an LLS FSP socket
-// Return
-//	The DLL FSP socket created if succeeded,
-//	NULL if failed.
-CSocketItemDl * LOCALAPI CSocketItemDl::CallCreate(CommandNewSession & objCommand, FSP_ServiceCode cmdCode)
-{
-	objCommand.fiberID = fidPair.source;
-	objCommand.idProcess = idThisProcess;
-	objCommand.opCode = cmdCode;
-	objCommand.hMemoryMap = (uint64_t)hMemoryMap;
-	objCommand.dwMemorySize = dwMemorySize;
-	//
-	return Call(objCommand, sizeof(objCommand)) ? this : NULL;
-}
-
-
-
-// Return
-//	true if having obtained the mutual-exclusive lock and having the session control block validated
-//	false if either timed out in obtaining the lock or found that the session control block invalid
-// Remark
-//	Dispose the DLL FSP socket resource if to return false
-bool CSocketItemDl::LockAndValidate()
-{
-	if (!WaitUseMutex())
-		return false;
-
-	if(InIllegalState())
+	if (!RegisterWaitForSingleObject(&theWaitObject
+		, hEvent
+		, WaitOrTimeOutCallBack
+		, this
+		, INFINITE
+		, WT_EXECUTELONGFUNCTION))
 	{
-#ifndef NDEBUG
-		printf_s(
-			"\nDescriptor#%p, event to be processed, but the socket is in state %s[%d]?\n"
-			, this
-			, stateNames[pControlBlock->state], pControlBlock->state);
-#endif
-		Free();
-		return false;
+		REPORT_ERRMSG_ON_TRACE("Cannot register the handler of the I/O notice (soft interrupt)");
+		return false;	// return -ENXIO;
 	}
 
 	return true;
-}
-
-
-
-// The asynchronous, multi-thread friendly soft interrupt handler
-void CSocketItemDl::WaitEventToDispatch()
-{
-	register long vector = 0;
-	while(LockAndValidate())
-	{
-		register FSP_NoticeCode notice = (FSP_NoticeCode)_InterlockedExchange8(&pControlBlock->notices.nmi, NullNotice);
-		// data race does occur, so we have to double-test to avoid lost of suppressed soft interrupts
-		// built-in rule: bit 0 of the soft interrupt vector is the flag for DLL being in event loop
-		if (notice == NullNotice)
-		{
-			if (vector == 0)
-			{
-				vector = _InterlockedExchange(&pControlBlock->notices.vector, 1) & ((1 << SMALLEST_FSP_NMI) - 2);
-				if (vector == 0)
-				{
-					vector = _InterlockedExchange(&pControlBlock->notices.vector, 0) & ((1 << SMALLEST_FSP_NMI) - 2);
-					if (vector == 0)
-					{
-						SetMutexFree();
-						break;
-					}
-					//
-					_InterlockedOr(&pControlBlock->notices.vector, 1);
-				}
-			}
-			unsigned long i = NullNotice;
-			BitScanForward(&i, vector);
-			notice = (FSP_NoticeCode)i;
-			vector ^= (1 << notice);
-			assert(notice != NullNotice);
-		}
-#ifdef TRACE
-		printf_s("\nIn local fiber#%u, state %s\tnotice: %s\n"
-			, fidPair.source, stateNames[pControlBlock->state], noticeNames[notice]);
-#endif
-		if(notice > FSP_NotifyToFinish)
-			lowerLayerRecycled = 1;
-		//
-		FSP_Session_State s0;
-		NotifyOrReturn fp1;
-		switch(notice)
-		{
-		case FSP_NotifyListening:
-			CancelTimeout();		// See also ::ListenAt
-			SetMutexFree();
-			break;
-		case FSP_NotifyAccepting:	// overloaded callback for either CONNECT_REQUEST or MULTIPLY
-			if(context.onAccepting != NULL && pControlBlock->HasBacklog())
-				ProcessBacklogs();
-			SetMutexFree();
-			break;
-		case FSP_NotifyAccepted:
-			CancelTimeout();		// If any
-			// Asynchronous return of Connect2, where the initiator may cancel data transmission
-			if(InState(CONNECT_AFFIRMING))
-			{
-				ToConcludeConnect();// SetMutexFree();
-				break;
-			}
-			fp1 = (NotifyOrReturn) context.onAccepted;
-			SetMutexFree();
-			if(fp1 != NULL)
-				((CallbackConnected)fp1)(this, &context);
-			if (!LockAndValidate())
-				return;
-			ProcessReceiveBuffer();	// SetMutexFree();
-			break;
-		case FSP_NotifyMultiplied:	// See also @LLS::Connect()
-			CancelTimeout();		// If any
-			fidPair.source = pControlBlock->nearEndInfo.idALF;
-			ProcessReceiveBuffer();	// SetMutexFree();
-			if (!LockAndValidate())
-				return;
-			// To inherently chain WriteTo/SendInline with Multiply
-			ProcessPendingSend();	// SetMutexFree();
-			break;
-		case FSP_NotifyDataReady:
-			ProcessReceiveBuffer();	// SetMutexFree();
-			break;
-		case FSP_NotifyBufferReady:
-			ProcessPendingSend();	// SetMutexFree();
-			break;
-		case FSP_NotifyToCommit:
-			// See also FSP_NotifyDataReady, compare with FSP_NotifyFlushed
-			ProcessReceiveBuffer();	// SetMutexFree();
-			if (!LockAndValidate())
-				return;
-			// Even if there's no callback function to accept data/flags (as in blocking receive mode)
-			// the peerCommitted flag can be set if no further data to deliver
-			if (!HasDataToDeliver())
-				peerCommitted = 1;
-			//
-			if (InState(CLOSABLE) && initiatingShutdown)
-			{
-				SetState(PRE_CLOSED);
-				AppendEoTPacket();
-				Call<FSP_Urge>();
-			}
-			SetMutexFree();
-			break;
-		case FSP_NotifyFlushed:
-			ProcessPendingSend();	// SetMutexFree();
-			if (!LockAndValidate())
-				return;
-			//
-			s0 = GetState();
-			if (!initiatingShutdown || s0 < CLOSABLE)
-			{
-				fp1 = NULL;
-				if (s0 == COMMITTED || s0 >= CLOSABLE)
-					fp1 = (NotifyOrReturn)InterlockedExchangePointer((PVOID *)& fpCommitted, fp1);
-				SetMutexFree();
-				if (fp1 != NULL)
-					fp1(this, FSP_Send, 0);
-			}
-			else if (s0 == CLOSABLE)
-			{
-				SetState(PRE_CLOSED);
-				AppendEoTPacket();
-				Call<FSP_Urge>();
-				SetMutexFree();
-			}
-#ifndef NDEBUG
-			else
-			{
-				printf_s("Protocol implementation error?\n"
-					"Should not get FSP_NotifyFlushed in state later than CLOSABLE after graceful shutdown.\n");
-			}
-#endif
-			break;
-		case FSP_NotifyToFinish:
-			// RELEASE implies both NULCOMMIT and ACK_FLUSH, any way call back of shutdown takes precedence 
-			// See also @LLS::OnGetRelease
-			if(initiatingShutdown)
-			{
-				fp1 = fpFinished;
-				RecycLocked();		// CancelTimer(); SetMutexFree();
-				if (fp1 != NULL)
-					fp1(this, FSP_Shutdown, 0);
-			}
-			else
-			{
-				fp1 = fpFinished;
-				if(fp1 == NULL)
-					fp1 = (NotifyOrReturn)InterlockedExchangePointer((PVOID*)& fpCommitted, NULL);
-				ProcessReceiveBuffer();	// SetMutexFree();
-				if (fp1 != NULL)
-					fp1(this, FSP_Shutdown, 0);		// passive shutdown
-			}
-			break;
-		case FSP_NotifyRecycled:
-			fp1 = context.onError;
-			EnableLLSInterrupt();
-			RecycLocked();		// CancelTimer(); SetMutexFree();
-			if (!initiatingShutdown && fp1 != NULL)
-				fp1(this, FSP_Shutdown, ENXIO);		// a warning for unexpected shutdown
-			return;
-		case FSP_NameResolutionFailed:
-			FreeAndNotify(InitConnection, (int)notice);
-			// UNRESOLVED!? There could be some remedy if name resolution failed?
-			return;
-		case FSP_IPC_CannotReach:
-			fp1 = context.onError;
-			s0 = GetState();
-			Free();
-			if(fp1 == NULL)
-				return;
-			//
-			if (s0 == LISTENING)
-				fp1(this, FSP_Listen, -EIO);
-			else if (s0 != CHALLENGING)
-				fp1(this, (s0 == CLONING ? FSP_Multiply : InitConnection), -EIO);
-			return;
-		case FSP_MemoryCorruption:
-		case FSP_NotifyTimeout:
-		case FSP_NotifyReset:
-			FreeAndNotify(NullCommand, (int)notice);
-			return;
-		}
-	}
-	if (pControlBlock == NULL)
-		Free();
-}
-
-
-
-// Given
-//	PFSP_IN6_ADDR		const, the listening addresses of the passive FSP socket
-//	PFSP_Context		the connection context of the socket, given by ULA
-//	CommandNewSession & the command context of the socket,  to pass to LLS
-// Return
-//	NULL if it failed, or else the new allocated socket whose session control block has been initialized
-CSocketItemDl * LOCALAPI CSocketItemDl::CreateControlBlock(const PFSP_IN6_ADDR nearAddr, PFSP_Context psp1, CommandNewSession & cmd)
-{
-	CSocketItemDl *socketItem = socketsTLB.AllocItem();
-	if(socketItem == NULL)
-		return NULL;
-
-	if(socketItem->Initialize(psp1, cmd.szEventName) < 0)
-		return NULL;
-
-	if(! socketItem->RegisterDrivingEvent())
-	{
-		socketsTLB.FreeItem(socketItem);
-		return NULL;
-	}
-	//
-	socketItem->fidPair.source = nearAddr->idALF;
-	//
-	FSP_ADDRINFO_EX & nearEnd = socketItem->pControlBlock->nearEndInfo;
-	if(nearAddr->_6to4.prefix == PREFIX_FSP_IP6to4)
-	{
-		nearEnd.InitUDPoverIPv4(psp1->ifDefault);
-		nearEnd.idALF = nearAddr->idALF;
-		nearEnd.ipi_addr = nearAddr->_6to4.ipv4;
-	}
-	else
-	{
-		nearEnd.InitNativeIPv6(psp1->ifDefault);
-		*(PIN6_ADDR) & nearEnd = *(PIN6_ADDR)nearAddr;
-	}
-	// Application Layer Thread ID other than the first default would be set in the LLS
-
-	return socketItem;
 }
 
 
@@ -596,170 +237,38 @@ bool CSocketItemDl::CancelTimeout()
 
 
 
-// The function called back as soon as the one-shot timer counts down to 0
-// Suppose that the lower layer recycle LRU
-void CSocketItemDl::TimeOut()
+// Unlike Free, Recycle-locked does not destroy the control block
+// so that the DLL socket may be reused on connection resumption
+// assume the socket has been locked
+int CSocketItemDl::RecycLocked()
 {
-	BOOLEAN b = TryMutexLock();
-	if (!IsInUse())
-	{
-		if(b)
-			SetMutexFree();
-		return;
-	}
+	register HANDLE h;
+	CancelTimeout();
+	if ((h = InterlockedExchangePointer((PVOID*)&theWaitObject, NULL)) != NULL)
+		UnregisterWaitEx(h, NULL);
 
-	assert(timer != NULL);
-	if (!b)
-	{
-		::ChangeTimerQueueTimer(::timerQueue, timer, TIMER_SLICE_ms, 0);
-		inUse = 0;	// Force WaitUseMutex to abort
-		return;
-	}
+	socketsTLB.FreeItem(this);
 
-	FreeAndNotify(NullCommand, (int)FSP_NotifyTimeout);
+	SetMutexFree();
+	return 0;
 }
 
 
 
-// For a prototype it does not worth the trouble to exploit hash table 
-CSocketItemDl *	CSocketDLLTLB::HandleToRegisteredSocket(FSPHANDLE h)
+// Make sure resource is kept until other threads leave critical section
+// Does NOT waits for all callback functions to complete before returning
+// in case of deadlock when the function itself is called in some call-back function
+void CSocketItemDl::Free()
 {
-	register CSocketItemDl *p = (CSocketItemDl *)h;
-	for(register int i = 0; i < MAX_CONNECTION_NUM; i++)
-	{
-		if (CSocketItemDl::socketsTLB.pSockets[i] == p)
-			return ((!p->IsInUse() || p->InIllegalState()) ? NULL : p);
-	}
-	//
-	return NULL;
-}
+	register HANDLE h;
+	CancelTimeout();
+	if ((h = InterlockedExchangePointer((PVOID *)& theWaitObject, NULL)) != NULL)
+		UnregisterWaitEx(h, NULL);
 
+	socketsTLB.FreeItem(this);
 
-
-// The constructor of the Translation Look-aside Buffer of the DLL FSP socket items
-CSocketDLLTLB::CSocketDLLTLB()
-{
-	InitializeSRWLock(& srwLock);
-	sizeOfWorkSet = 0;
-	head = tail = NULL;
-}
-
-
-
-// To obtain a free slot from the TLB. Try to allocate a new item if no slot is registered with a valid item
-// Return
-//	The pointer to the DLL FSP socket if allocated successfully
-//	NULL if failed
-CSocketItemDl * CSocketDLLTLB::AllocItem()
-{
-	AcquireSRWLockExclusive(& srwLock);
-
-	CSocketItemDl * item = NULL;
-	// Compress the array of pointers of allocated sockets
-	if (sizeOfWorkSet >= MAX_CONNECTION_NUM)
-	{
-		register int n = sizeOfWorkSet;
-		register int i, j, k;
-
-		for (i = 0; i < n && pSockets[i]->inUse; i++)
-			;
-		if (i >= n)
-			goto l_bailout;
-		// 0 to i, left inclusively, right exclusively, index socket in use, compressively
-		for (j = i + 1; ; j = k + 1)
-		{
-			for (; j < n && !pSockets[j]->inUse; j++)
-				;
-			// i to j, left inclusively, right exclusively, index socket free
-			if (j >= n)
-				break;
-			//
-			for (k = j + 1; k < n && pSockets[k]->inUse; k++)
-				;
-			// j to k, left inclusively, right exclusively, index socket in use
-			memmove(pSockets + i, pSockets + j, sizeof(pSockets[0]) * (k - j));
-			i += k - j;
-			// on exit the loop totally at most (n - 1) items were moved 
-			if (k >= n)
-				break;
-		}
-		sizeOfWorkSet = i;
-	}
-
-	if (countAllItems < MAX_CONNECTION_NUM)
-	{
-		item = new CSocketItemDl();
-		if (item == NULL)
-			goto l_bailout;	// return NULL;
-		countAllItems++;
-	}
-	else
-	{
-		item = head;
-		if (item == NULL)
-			goto l_bailout;	// return NULL;
-		head = item->next;
-		if (head != NULL)
-			head->prev = NULL;
-		else
-			tail = NULL;
-	}
-
-	memset((octet *)item + sizeof(CSocketItem)
-		, 0
-		, sizeof(CSocketItemDl) - sizeof(CSocketItem));
-	pSockets[sizeOfWorkSet++] = item;
-	_InterlockedExchange8(& item->inUse, 1);
-
-l_bailout:
-	ReleaseSRWLockExclusive( & srwLock);
-	return item;
-}
-
-
-
-// Given
-//	CSocketItemDl *		the pointer to the DLL FSP socket
-// Do
-//	Try to put the socket in the list of the free socket items
-void CSocketDLLTLB::FreeItem(CSocketItemDl *r)
-{
-	AcquireSRWLockExclusive(& srwLock);
-
-	_InterlockedExchange8(& r->inUse, 0);
-	r->next = NULL;
-	r->prev = tail;
-	if(tail == NULL)
-	{
-		head = tail = r;
-	}
-	else
-	{
-		tail->next = r;
-		tail = r;
-	}
-
-	ReleaseSRWLockExclusive( & srwLock);
-}
-
-
-
-// Given
-//	ALFID_T		the application layer fiber ID of the connection to find
-// Return
-//	The pointer to the FSP socket that matches the given ID
-// Remark
-//	The caller should check whether the returned socket is really in work by check the inUse flag
-//	Performance is assumed acceptable
-//	as this is a prototyped implementation which exploits linear search in a small set
-CSocketItemDl * CSocketDLLTLB::operator[](ALFID_T fiberID)
-{
-	for(int i = 0; i < sizeOfWorkSet; i++)
-	{
-		if(pSockets[i]->fidPair.source == fiberID)
-			return pSockets[i];
-	}
-	return NULL;
+	CSocketItem::Destroy();
+	memset((octet *)this + sizeof(CSocketItem), 0, sizeof(CSocketItemDl) - sizeof(CSocketItem));
 }
 
 
@@ -936,7 +445,7 @@ Cleanup:
 
 // Defined here only because this source file is shared across modules
 # define ERROR_SIZE	1024	// FormatMessage buffer size, no dynamic increase
-void TraceLastError(char * fileName, int lineNo, char *funcName, char *s1)
+void TraceLastError(const char * fileName, int lineNo, const char *funcName, const char *s1)
 {
 	DWORD err = GetLastError();
 	CHAR buffer[ERROR_SIZE];

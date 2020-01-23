@@ -55,12 +55,12 @@ void TryWideChar()
 	FindClose(hFind);
 
 	//parsing the buffer
-	int len = min(p - p0, MAX_BLOCK_SIZE);
+	int len = (int)min(p - p0, MAX_BLOCK_SIZE);
 	do
 	{
 		ParseBlock(p0, len);
 		p0 += len;
-		len = min(p - p0, MAX_BLOCK_SIZE);
+		len = (int)min(p - p0, MAX_BLOCK_SIZE);
 	} while (len > 0);
 }
 

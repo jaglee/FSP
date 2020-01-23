@@ -45,13 +45,13 @@ struct _CookieMaterial
 
 #if (TRACE & (TRACE_HEARTBEAT | TRACE_OUTBAND | TRACE_SLIDEWIN)) && (TRACE & TRACE_PACKET)
 #define TRACE_SOCKET()	\
-	(printf_s(__FUNCTION__ ": local fiber#%u(_%X_) in state %s\n"	\
+	(printf_s("%s: local fiber#%u(_%X_) in state %s\n", __FUNCTION__ \
 		, fidPair.source, be32toh(fidPair.source)		\
 		, stateNames[lowState])	\
 	&& pControlBlock->DumpSendRecvWindowInfo())
 #elif (TRACE & TRACE_SLIDEWIN)
 #define TRACE_SOCKET()	\
-	(printf_s(__FUNCTION__ ": local fiber#%u(_%X_) in state %s\n"	\
+	(printf_s("%s: local fiber#%u(_%X_) in state %s\n", __FUNCTION__ \
 		, fidPair.source, be32toh(fidPair.source)		\
 		, stateNames[lowState])	\
 	&& pControlBlock->DumpRecvQueueInfo())
@@ -61,27 +61,86 @@ struct _CookieMaterial
 
 
 
-// Variadic template is not necessarily more efficient that parameter list of variable length in C
-// VS2013 and above support variadic template
-inline
-bool CSocketItemEx::InStates(int n, ...)
+// The handler's main body to accept and process one particular remote packet
+// See also SendPacket
+// From the receiver's point of view the local fiber id was stored in the peer fiber id field of the received packet
+int CLowerInterface::ProcessReceived()
 {
-#ifdef _DEBUG
-	if(pControlBlock == NULL)
-	{
-		printf_s("Uninitialized Session Control Block");
-		return false;
-	}
+	// From the receiver's point of view the local fiber id was stored in the peer fiber id field of the received packet
+#ifdef OVER_UDP_IPv4
+	countRecv -= sizeof(ALFIDPair);	// extra prefixed bytes are subtracted
+	nearInfo.u.idALF = pktBuf->fidPair.peer;
+#else
+	pktBuf->fidPair.peer = nearInfo.u.idALF;
 #endif
-	va_list allowedStates;
-	va_start(allowedStates, n);
-	for(register int i = 0; i < n; i++)
+
+	FSPOperationCode opCode = (FSPOperationCode) pktBuf->hdr.hs.opCode;
+#if defined(TRACE) && (TRACE & TRACE_PACKET)
+	printf_s("#%u(Near end's ALFID): packet %s(%d) received\n\tALFID of packet source is #%u\n"
+		, nearInfo.u.idALF
+		, opCodeStrings[opCode], (int)opCode, pktBuf->fidPair.source);
+	printf_s("Remote address:\n");
+	DumpNetworkUInt16((uint16_t *) & addrFrom, sizeof(addrFrom) / 2);
+	printf_s("Near sink:\n");
+	DumpNetworkUInt16((uint16_t *) & nearInfo.u, sizeof(nearInfo.u) / 2);
+	printf_s("Fixed header:\n");
+	DumpNetworkUInt16((uint16_t *) & pktBuf->hdr, sizeof(pktBuf->hdr) / 2);
+#endif
+	CSocketItemEx *pSocket = NULL;
+	switch (opCode)
 	{
-		if(lowState == va_arg(allowedStates, FSP_Session_State))
-			return true;
+	case INIT_CONNECT:
+		OnGetInitConnect();
+		break;
+	case ACK_INIT_CONNECT:
+		OnInitConnectAck();
+		break;
+	case CONNECT_REQUEST:
+		OnGetConnectRequest();
+		break;
+	case RESET:
+		pSocket = MapSocket();
+		if (pSocket == NULL || !pSocket->IsInUse())
+			break;
+		pSocket->OnGetReset(*FSP_OperationHeader<FSP_RejectConnect>());
+		break;
+	//
+	case ACK_CONNECT_REQ:
+	case ACK_START:
+	case PURE_DATA:
+	case PERSIST:
+	case ACK_FLUSH:
+	case RELEASE:
+	case MULTIPLY:
+	case KEEP_ALIVE:
+		pSocket = MapSocket();
+		if (pSocket == NULL)
+		{
+#ifdef TRACE
+			printf_s("Cannot map socket for local fiber#%u(_%X_)\n", GetLocalFiberID(), be32toh(GetLocalFiberID()));
+#endif
+			break;
+		}
+		pSocket->lenPktData = countRecv - be16toh(pktBuf->hdr.hs.offset);
+		if (pSocket->lenPktData < 0 || pSocket->lenPktData > MAX_BLOCK_SIZE)
+			break;
+		// illegal packet is simply discarded!
+		pSocket->pktSeqNo = be32toh(pktBuf->hdr.sequenceNo);
+#if defined(TRACE) && (TRACE & TRACE_PACKET)
+		printf_s("%s[%d] packet #%u\n\tpayload length %d, to put onto the queue\n"
+			, opCodeStrings[opCode], opCode, pSocket->pktSeqNo, pSocket->lenPktData);
+#endif
+		nearInfo.CopySinkInfTo(&pSocket->tempAddrAccept);
+		// save the source address temporarily as it is not necessarily legitimate
+		pSocket->sockAddrTo[MAX_PHY_INTERFACES] = addrFrom;
+		pSocket->HandleFullICC(pktBuf, opCode);
+		break;
+		// UNRECOGNIZED packets are simply discarded
+	default:
+		;	// do nothing or give a warning?
 	}
-	va_end(allowedStates);
-	return false;
+
+	return 0;
 }
 
 
@@ -104,6 +163,11 @@ void LOCALAPI CLowerInterface::OnGetInitConnect()
 {
 	// Silently discard connection request to black hole, and avoid attacks alike 'port scan'
 	CSocketItemEx *pSocket = MapSocket();
+	FSP_InitiateRequest* q;
+	FSP_Challenge challenge;
+	struct _CookieMaterial cm;
+	timestamp_t t0, t1;
+
 	if (pSocket == NULL || !pSocket->IsPassive())
 		return;
 
@@ -116,7 +180,7 @@ void LOCALAPI CLowerInterface::OnGetInitConnect()
 	CtrlMsgHdr	hdrInfo;
 	ALFID_T	fiberID;
 	memset(&hdrInfo, 0, sizeof(CtrlMsgHdr));
-	memcpy(&hdrInfo, mesgInfo.Control.buf, min(mesgInfo.Control.len, sizeof(hdrInfo)));
+	CopySinkInfTo(hdrInfo);
 	if (hdrInfo.IsIPv6())
 	{
 		fiberID = CLowerInterface::Singleton.RandALFID((PIN6_ADDR) & hdrInfo.u);
@@ -134,12 +198,10 @@ void LOCALAPI CLowerInterface::OnGetInitConnect()
 	}
 
 	// To make the FSP challenge of the responder	
-	FSP_InitiateRequest *q = FSP_OperationHeader<FSP_InitiateRequest>();
-	FSP_Challenge challenge;
-	struct _CookieMaterial cm;
+	q = FSP_OperationHeader<FSP_InitiateRequest>();
 	// the remote address is not changed
-	timestamp_t t0 = be64toh(q->timeStamp);
-	timestamp_t t1 = NowUTC();
+	t0 = be64toh(q->timeStamp);
+	t1 = NowUTC();
 	cm.salt = q->salt;
 	cm.idALF = fiberID;
 	cm.idListener = GetLocalFiberID();
@@ -230,6 +292,7 @@ void LOCALAPI CLowerInterface::OnGetConnectRequest()
 {
 	FSP_ConnectRequest *q = FSP_OperationHeader<FSP_ConnectRequest>();
 	CSocketItemEx *pSocket = MapSocket();
+	const CtrlMsgHdr* pHdr;
 
 	// UNRESOLVED!? Is this a unbeatable DoS attack to initiator if there is a 'man in the middle'?
 	if(pSocket != NULL && pSocket->IsInUse())
@@ -271,10 +334,10 @@ void LOCALAPI CLowerInterface::OnGetConnectRequest()
 #ifdef TRACE
 		printf_s("UNRESOLVED! TODO: put the cookie into the blacklist to fight against DDoS attack!?\n");
 #endif
-		goto l_return;	// the packet has been updated and should be discarded
+		pSocket->SetMutexFree();
+		return;		// the packet has been updated and should be discarded
 	}
 
-#pragma warning(disable:4533)	// initialization of backlogItem is skipped by 'goto l_return'
 	// Simply ignore the duplicated request
 	BackLogItem backlogItem(GetRemoteFiberID(), q->_init.salt);
 	if(pSocket->pControlBlock->backLog.Has(& backlogItem))
@@ -282,7 +345,7 @@ void LOCALAPI CLowerInterface::OnGetConnectRequest()
 
 	assert(sizeof(backlogItem.allowedPrefixes) == sizeof(q->params.subnets));
 	// secondly, fill in the backlog item if it is new
-	CtrlMsgHdr * const pHdr = (CtrlMsgHdr *)mesgInfo.Control.buf;
+	pHdr = GetPacketNearInfo();
 	// Note that FSP over IPv6 does NOT support NAT automatically, by design
 	// However, participants of FSP MAY obtain the IPv6 network prefix
 	// obtained after NAT by uPnP and fill in the subnets field with the value after translation
@@ -290,7 +353,7 @@ void LOCALAPI CLowerInterface::OnGetConnectRequest()
 	if (pHdr->IsIPv6())
 	{
 		memcpy(backlogItem.allowedPrefixes, q->params.subnets, sizeof(TSubnets));
-		memcpy(&backlogItem.acceptAddr, &pHdr->u, sizeof(FSP_SINKINF));
+		pHdr->CopySinkInfTo(&backlogItem.acceptAddr);
 	}
 	else
 	{	// FSP over UDP/IPv4
@@ -299,7 +362,7 @@ void LOCALAPI CLowerInterface::OnGetConnectRequest()
 		// For sake of NAT ignore the subnet prefixes reported by the initiator
 		fspAddr->_6to4.prefix = PREFIX_FSP_IP6to4;
 		//
-		fspAddr->_6to4.ipv4 = addrFrom.Ipv4.sin_addr.S_un.S_addr;
+		fspAddr->_6to4.ipv4 = *(u32*)&addrFrom.Ipv4.sin_addr;
 		fspAddr->_6to4.port = addrFrom.Ipv4.sin_port;
 		backlogItem.allowedPrefixes[0] = fspAddr->subnet;
 #if defined(TRACE) && (TRACE & TRACE_ADDRESS)
@@ -307,7 +370,7 @@ void LOCALAPI CLowerInterface::OnGetConnectRequest()
 		DumpNetworkUInt16((uint16_t *)& fspAddr->subnet, sizeof(fspAddr->subnet) / 2);
 #endif
 		fspAddr->_6to4.ipv4 = pHdr->u.ipi_addr;
-		fspAddr->_6to4.port = DEFAULT_FSP_UDPPORT;
+		fspAddr->_6to4.port = pHdr->u.idALF;
 		fspAddr->idHost = 0;	// no for IPv4 no virtual host might be specified
 		fspAddr->idALF = fiberID;
 #if defined(TRACE) && (TRACE & TRACE_ADDRESS)
@@ -323,7 +386,7 @@ void LOCALAPI CLowerInterface::OnGetConnectRequest()
 	backlogItem.timeDelta = q->timeDelta;
 	backlogItem.tDiff = NowUTC() - tRecvInit;
 	//^SetFirstRTT can only be called when the connection context is fully established
-	backlogItem.remoteHostID = nearInfo.IsIPv6() ? SOCKADDR_HOSTID(mesgInfo.name) : 0;
+	backlogItem.remoteHostID = nearInfo.IsIPv6() ? SOCKADDR_HOSTID(GetPacketSource()) : 0;
 	//^See also GetRemoteFiberID()
 	backlogItem.idParent = 0;
 	rand_w32(& backlogItem.initialSN, 1);
@@ -406,6 +469,79 @@ void LOCALAPI CSocketItemEx::OnGetReset(FSP_RejectConnect& reject)
 	// besides, those states are recoverable.
 	// LISTENING state is not affected by reset signal
 l_bailout:
+	SetMutexFree();
+}
+
+
+
+// Given
+//	PktBufferBlock *	Pointer to the buffer block that holds the remote packet received by the underling network service
+//	FSPOperationCode	The code point of the remote 'operation'
+// Do
+//	Process the packet saved in the buffer that is assumed to have a full ICC
+// Remark
+//	Used to be OS-dependent. TODO: fight against single thread congestion (because of WaitUseMutex) of the socket pool
+void CSocketItemEx::HandleFullICC(PktBufferBlock *pktBuf, FSPOperationCode opCode)
+{
+	if(! WaitUseMutex())
+		return;
+
+	// Because some service call may recycle the FSP socket in a concurrent way
+	SyncState();
+	if (lowState <= 0 || lowState > LARGEST_FSP_STATE)
+		goto l_return;
+
+#if (TRACE & (TRACE_HEARTBEAT | TRACE_OUTBAND | TRACE_SLIDEWIN)) && (TRACE & TRACE_PACKET)
+	printf_s("%s: local fiber#%u(_%X_) in state %s\n"
+		"\t%s(%d) received, seq#%u\n"
+		, __FUNCTION__ 
+		, fidPair.source, be32toh(fidPair.source), stateNames[lowState]
+		, opCodeStrings[opCode], opCode, pktSeqNo
+	);
+#endif
+	pControlBlock->perfCounts.countPacketReceived++;
+	// but not all received are legitimate, and PacketAccepted count in-band packet only.
+
+	// MULTIPLY is semi-out-of-band COMMAND starting from a fresh new ALFID. Note that pktBuf is the received
+	// In the CLONING state ACK_START or PERSIST is the legitimate acknowledgement to MULTIPLY,
+	// while the acknowledgement itself shall typically originate from some new ALFID.
+	if (fidPair.peer != pktBuf->fidPair.source	// it should be rare
+	 && opCode != MULTIPLY && (lowState != CLONING || (opCode != ACK_START && opCode != PERSIST)) )
+	{
+		goto l_return;
+	}
+	//
+	headPacket = pktBuf;
+	switch (opCode)
+	{
+	case ACK_CONNECT_REQ:
+		OnConnectRequestAck();
+		break;
+	case ACK_START:
+		OnGetNulCommit();
+		break;
+	case PURE_DATA:
+		OnGetPureData();
+		break;
+	case PERSIST:
+		OnGetPersist();
+		break;
+	case ACK_FLUSH:
+		OnAckFlush();
+		break;
+	case RELEASE:
+		OnGetRelease();
+		break;
+	case MULTIPLY:
+		OnGetMultiply();
+		break;
+	case KEEP_ALIVE:
+		OnGetKeepAlive();
+	default:
+		;	// Do nothing or give a warning?
+	}
+	//
+l_return:
 	SetMutexFree();
 }
 
@@ -651,7 +787,7 @@ void CSocketItemEx::OnGetNulCommit()
 		SignalFirstEvent(FSP_NotifyMultiplied);
 	}
 	else // if (lowState == CHALLENGING)
-	{	
+	{
 		SetState(CLOSABLE);
 		SignalFirstEvent(FSP_NotifyAccepted);
 	}
@@ -822,7 +958,8 @@ void CSocketItemEx::OnGetPersist()
 		printf_s("\nTransit to %s state from CLONING\n", stateNames[lowState]);
 #endif
 		break;
-		// default:	// case ESTABLISHED: case COMMITTED:	// keep state
+	default:	// case ESTABLISHED: case COMMITTED:	// keep state
+		;
 	}
 	//
 	SendKeepAlive();
@@ -848,7 +985,7 @@ void CSocketItemEx::OnGetKeepAlive()
 #if defined(TRACE) && (TRACE & (TRACE_HEARTBEAT | TRACE_PACKET | TRACE_SLIDEWIN))
 	TRACE_SOCKET();
 #endif
-	bool acknowledgible = InStates(4, ESTABLISHED, COMMITTING, PEER_COMMIT, COMMITTING2);
+	bool acknowledgible = InStates(ESTABLISHED, COMMITTING, PEER_COMMIT, COMMITTING2);
 	if (!acknowledgible && !InState(COMMITTED) && !InState(CLOSABLE))
 	{
 #ifdef TRACE
@@ -873,13 +1010,12 @@ void CSocketItemEx::OnGetKeepAlive()
 	// By default ULA should poll the send buffer, instead to rely on soft-interrupt
 	if (acknowledgible)
 	{
-		ControlBlock::seq_t seq0 = pControlBlock->sendWindowFirstSN;
 		int r = AcceptSNACK(ackSeqNo, pSNACK->gaps, n);
 		if (r > 0 && pControlBlock->CountSendBuffered() == 0)
 			Notify(FSP_NotifyBufferReady);
 #ifndef NDEBUG
 		else if (r < 0)
-			printf_s(__FUNCDNAME__ "AcceptSNACK unexpectedly return %d\n", r);
+			printf_s("OnGetKeepAlive() AcceptSNACK unexpectedly return %d\n", r);
 #endif		// UNRESOLVED?! Should log this very unexpected case
 	}
 
@@ -926,7 +1062,7 @@ void CSocketItemEx::OnGetPureData()
 	}
 
 	// Just ignore the unexpected PURE_DATA
-	if (InStates(4, CLONING, PEER_COMMIT, COMMITTING2, CLOSABLE))
+	if (InStates(CLONING, PEER_COMMIT, COMMITTING2, CLOSABLE))
 	{
 		if (d == 0)
 			return;
@@ -1028,7 +1164,8 @@ bool CSocketItemEx::TransitOnPeerCommit()
 	case CLONING:
 		SetState(_InterlockedExchange8(&transactional, 0) ? CLOSABLE : PEER_COMMIT);
 		break;
-		// default:	// case PEER_COMMIT: case COMMITTING2: case CLOSABLE:	// keep state
+	default:	// case PEER_COMMIT: case COMMITTING2: case CLOSABLE:	// keep state
+		;
 	}
 	//
 	if (!delayAckPending)
@@ -1109,7 +1246,7 @@ void CSocketItemEx::OnGetRelease()
 		return;
 	}
 
-	if (!InStates(5, COMMITTING, COMMITTED, COMMITTING2, CLOSABLE, PRE_CLOSED))
+	if (!InStates(COMMITTING, COMMITTED, COMMITTING2, CLOSABLE, PRE_CLOSED))
 		return;
 
 	if (lenPktData != 0)
@@ -1179,7 +1316,7 @@ void CSocketItemEx::OnGetMultiply()
 {
 	TRACE_SOCKET();
 
-	if (!InStates(6, ESTABLISHED, COMMITTING, COMMITTED, PEER_COMMIT, COMMITTING2, CLOSABLE))
+	if (!InStates(ESTABLISHED, COMMITTING, COMMITTED, PEER_COMMIT, COMMITTING2, CLOSABLE))
 		return;
 
 	// The out-of-band serial number is stored in p1->expectedSN
@@ -1317,11 +1454,11 @@ int CSocketItemEx::PlacePayload()
 	int len = lenPktData;
 	if (len > 0)
 	{
-		BYTE *ubuf = GetRecvPtr(skb);
+		octet*ubuf = GetRecvPtr(skb);
 		if (ubuf == NULL)
 			return -EFAULT;
 		// Assume payload length has been checked
-		memcpy(ubuf, (BYTE *)pHdr + be16toh(pHdr->hs.offset), len);
+		memcpy(ubuf, (octet*)pHdr + be16toh(pHdr->hs.offset), len);
 	}
 	// Or else might be zero for ACK_START or MULTIPLY packet
 	skb->timeRecv = tLastRecv = NowUTC();

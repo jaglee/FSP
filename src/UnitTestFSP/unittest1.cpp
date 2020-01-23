@@ -13,6 +13,12 @@ void UnitTestGenerateSNACK();
 void UnitTestSendRecvWnd();
 void UnitTestHasBeenCommitted();
 
+// The singleton instance of the connect request queue
+ConnectRequestQueue ConnectRequestQueue::requests;
+
+// The singleton instance of the lower service interface 
+CLowerInterface	CLowerInterface::Singleton;
+
 // for line output
 static char linebuf[200];
 
@@ -38,12 +44,6 @@ void UnitTestOpCodeStateNoticeNames()
 	Logger::WriteMessage(noticeNames[LARGEST_FSP_NOTICE + 1]);
 }
 
-
-
-// Just test stubs
-void CSocketItemEx::Connect() { }
-
-void CommandNewSessionSrv::DoConnect() { }
 
 
 
@@ -221,10 +221,10 @@ void UnitTestSocketInState()
 {
 	CSocketItemExDbg socket(2, 2);
 	socket.SetState(CLONING);
-	bool r = socket.InStates(3, COMMITTING, CLONING, PRE_CLOSED);
+	bool r = socket.InStates(COMMITTING, COMMITTING2, CLONING, PRE_CLOSED, CLOSED);
 	Assert::IsTrue(r);
 	socket.SetState(CLOSABLE);
-	r = socket.InStates(4, COMMITTING2, CLONING, PRE_CLOSED, CLOSED);
+	r = socket.InStates(COMMITTING2, CLONING, PRE_CLOSED, CLOSED);
 	Assert::IsFalse(r);
 #if _MSC_VER >= 1800
 	// VS2013 and above support variadic template
@@ -372,11 +372,11 @@ void UnitTestAllocSocket()
 		Assert::IsNotNull(p);
 		p->SetTouchTime(NowUTC());
 	}
-	CSocketItemEx *p0 = p;
+	CSocketItemExDbg *p0 = (CSocketItemExDbg *)p;
 
 	Logger::WriteMessage("All slots allocated.");
 	p = tlb.AllocItem();
-	Assert::IsNull(p);
+	// Assert::IsNull(p);
 	//^As AllocItem automatically free the slot whose ULA process is not alive, this assertion would fail
 
 	tlb.FreeItem(p0);
@@ -386,8 +386,15 @@ void UnitTestAllocSocket()
 	Assert::IsNotNull(p);
 
 	p = tlb.AllocItem();
-	Assert::IsNull(p);
+	// Assert::IsNull(p);
 	//^Again, as AllocItem automatically free the slot whose ULA process is not alive, this assertion would fail
+
+	p0 = (CSocketItemExDbg *)tlb.AllocItem(htonl(80));
+	Assert::IsNotNull(p0);
+	p0->SetParentProcess();
+
+	p = tlb.AllocItem(htonl(80));
+	Assert::IsNull(p);
 }
 
 

@@ -29,14 +29,15 @@
     POSSIBILITY OF SUCH DAMAGE.
  */
 
-#define WIN32_LEAN_AND_MEAN
-#define STRICT
-#include <Windows.h>
-#include <conio.h>
 #include "lz4.h"
+#include "../FSP_Impl.h"
+
+
+#if defined(__WINDOWS__)
+# include <conio.h>
 
 // excluded by WIN32_LEAN_AND_MEAN under VS2003??
-#if (_MSC_VER < 1400)
+# if (_MSC_VER < 1400)
 // typedef VOID (NTAPI * WAITORTIMERCALLBACKFUNC) (PVOID, BOOLEAN );
 typedef WAITORTIMERCALLBACKFUNC WAITORTIMERCALLBACK ;
 
@@ -61,17 +62,22 @@ UnregisterWaitEx(
     HANDLE WaitHandle,
     HANDLE CompletionEvent
     );
+# endif
+
+# define DllExport extern "C" __declspec(dllexport)
+# define DllSpec DllExport
+
+#elif defined(__linux__) || defined(__CYGWIN__)
+# define DllExport
+# define DllSpec DllExport
 #endif
 
-#include "../FSP_Impl.h"
+
 
 // prepare predefined macros before including FSP_API.h
 // effectively avoid double-definition of API by customization
 typedef CSocketItem * PSocketItem;
 #define FSPHANDLE PSocketItem	// the pointer to some entry in the translate look-aside table
-
-#define DllExport extern "C" __declspec(dllexport)
-#define DllSpec DllExport
 
 // DllSpec and FSPHANDLE must be defined properly before FSP_API
 #include "../FSP_API.h"
@@ -81,14 +87,14 @@ typedef CSocketItem * PSocketItem;
 
 // A internal class of CSocketItemDl, it should be
 class CSocketItemDl;
-class CSocketDLLTLB
+class CSocketDLLTLB: CSRWLock
 {
-	SRWLOCK	srwLock;
 	int		countAllItems;
 	int		sizeOfWorkSet;
 	CSocketItemDl * pSockets[MAX_CONNECTION_NUM];
 	CSocketItemDl * head;
 	CSocketItemDl * tail;
+	void	Init();
 public:
 	CSocketItemDl * AllocItem();
 	void FreeItem(CSocketItemDl *);
@@ -97,7 +103,16 @@ public:
 	CSocketItemDl * operator [] (ALFID_T fiberID);
 	CSocketItemDl * operator [] (int i) { return pSockets[i]; }
 
-	CSocketDLLTLB();
+	CSocketDLLTLB()
+	{
+		InitMutex();
+		Init();
+		sizeOfWorkSet = 0;
+		head = tail = NULL;
+	}
+
+	~CSocketDLLTLB();
+
 	// Return the registered socket pointer mapped to the FSP handle
 	static CSocketItemDl * HandleToRegisteredSocket(FSPHANDLE);
 };
@@ -118,9 +133,6 @@ class CSocketItemDl : public CSocketItem
 	friend void UnitTestAllocAndFreeItem();
 
 	static	CSocketDLLTLB socketsTLB;
-	static	DWORD	idThisProcess;
-
-	HANDLE			timer;
 	//
 	CSocketItemDl	*next;
 	CSocketItemDl	*prev;
@@ -151,7 +163,40 @@ protected:
 	char			peerCommitted : 1;	// Only for conventional buffered, streamed read
 	char			pendingEoT : 1;		// EoT flag is pending to be added on a packet
 
+#if defined(__WINDOWS__)
+	static	DWORD	idThisProcess;
 	ALIGN(8)		HANDLE theWaitObject;
+	HANDLE			timer;
+
+	void CopyFatMemPointo(CommandNewSession &cmd)
+	{
+		cmd.hMemoryMap = (uint64_t)hMemoryMap;
+		cmd.dwMemorySize = dwMemorySize;
+	}
+	void EnableLLSInterrupt() { _bittestandreset(&pControlBlock->notices.vector, 0); }
+
+	static VOID NTAPI WaitOrTimeOutCallBack(PVOID param, BOOLEAN isTimeout)
+	{
+		if (isTimeout)
+			((CSocketItemDl *)param)->TimeOut();
+		else
+			((CSocketItemDl *)param)->WaitEventToDispatch();
+	}
+#elif defined(__linux__) || defined(__CYGWIN__)
+	static pid_t	idThisProcess;
+	timer_t	pollingTimer;
+	timer_t			timer;
+	static void PollingNotices(union sigval v) { ((CSocketItemDl*)v.sival_ptr)->WaitEventToDispatch(); }
+	static void TimeOutCallBack(union sigval v) { ((CSocketItemDl*)v.sival_ptr)->TimeOut(); }
+
+	// See also InitLLSInterface()
+	void CopyFatMemPointo(CommandNewSession &cmd)
+	{
+		cmd.GetShmNameFrom(this);
+		cmd.dwMemorySize = dwMemorySize;
+	}
+	void EnableLLSInterrupt() { pControlBlock->notices.vector &= 0xFFFFFFFE; }
+#endif
 
 	// to support full-duplex send and receive does not share the same call back function
 	NotifyOrReturn	fpReceived;
@@ -162,8 +207,8 @@ protected:
 	NotifyOrReturn	fpFinished;		// NULL if synchronous shutdown, non-NULL if asynchronous
 
 	// For network streaming *Buf is not NULL
-	BYTE *			pendingSendBuf;
-	BYTE *			waitingRecvBuf;
+	octet *			pendingSendBuf;
+	octet *			waitingRecvBuf;
 	// count of octets to send
 	int32_t			pendingSendSize;
 	// count of octets expected to receive maximumly
@@ -177,25 +222,6 @@ protected:
 	int32_t			offsetInLastRecvBlock;
 
 	int32_t			pendingPeekedBlocks;	// TryRecvInline called, number of the peeked buffers yet to be unlocked
-
-	// Pair of functions meant to mimic hardware vector interrupt. It is yet OS-dependent, however
-	static VOID NTAPI WaitOrTimeOutCallBack(PVOID param, BOOLEAN isTimeout)
-	{
-		if (isTimeout)
-			((CSocketItemDl *)param)->TimeOut();
-		else
-			((CSocketItemDl *)param)->WaitEventToDispatch();
-	}
-
-	BOOL RegisterDrivingEvent()
-	{
-		return RegisterWaitForSingleObject(&theWaitObject
-			, hEvent
-			, WaitOrTimeOutCallBack
-			, this
-			, INFINITE
-			, WT_EXECUTELONGFUNCTION);
-	}
 
 	bool LOCALAPI AddOneShotTimer(uint32_t);
 	bool CancelTimeout();
@@ -215,7 +241,7 @@ protected:
 	ControlBlock::PFSP_SocketBuf SetHeadPacketIfEmpty(FSPOperationCode);
 
 	// In Multiplex.cpp
-	static CSocketItemDl * LOCALAPI CSocketItemDl::ToPrepareMultiply(FSPHANDLE, PFSP_Context, CommandCloneConnect &);
+	static CSocketItemDl * LOCALAPI ToPrepareMultiply(FSPHANDLE, PFSP_Context, CommandCloneConnect &);
 	FSPHANDLE LOCALAPI WriteOnMultiplied(CommandCloneConnect &, PFSP_Context, unsigned, NotifyOrReturn);
 	FSPHANDLE CompleteMultiply(CommandCloneConnect &);
 	bool LOCALAPI ToWelcomeMultiply(BackLogItem &);
@@ -253,16 +279,58 @@ public:
 	}
 	//^The error handler need not and should not do further clean-up work
 
-	int LOCALAPI Initialize(PFSP_Context, char[MAX_NAME_LENGTH]);
+	// TODO: evaluate configurable shared memory block size? // UNRESOLVED!? MTU?
+	static int32_t AlignMemorySize(PFSP_Context psp1)
+	{
+		if (psp1->sendSize < 0 || psp1->recvSize < 0 || psp1->sendSize + psp1->recvSize > MAX_FSP_SHM_SIZE + MIN_RESERVED_BUF)
+			return -ENOMEM;
+		if (psp1->sendSize < MIN_RESERVED_BUF)
+			psp1->sendSize = MIN_RESERVED_BUF;
+		if (psp1->recvSize < MIN_RESERVED_BUF)
+			psp1->recvSize = MIN_RESERVED_BUF;
+		if (psp1->passive)
+		{
+			return ((sizeof(ControlBlock) + 7) >> 3 << 3)
+				+ sizeof(LLSBackLog) + sizeof(BackLogItem) * (FSP_BACKLOG_SIZE - MIN_QUEUED_INTR);
+		}
+		else
+		{
+			int n = (psp1->sendSize - 1) / MAX_BLOCK_SIZE + (psp1->recvSize - 1) / MAX_BLOCK_SIZE + 2;
+			// See also Init()
+			return ((sizeof(ControlBlock) + 7) >> 3 << 3)
+				+ n * (((sizeof(ControlBlock::FSP_SocketBuf) + 7) >> 3 << 3) + MAX_BLOCK_SIZE);
+		}
+	}
+	bool InitLLSInterface(CommandNewSession&);
+	void SetConnectContext(const PFSP_Context psp1)
+	{
+		if (psp1->passive)
+			pControlBlock->Init(FSP_BACKLOG_SIZE);
+		else
+			pControlBlock->Init(psp1->sendSize, psp1->recvSize);
+		//
+		pControlBlock->tfrc = psp1->tfrc;
+		pControlBlock->milky = psp1->milky;
+		pControlBlock->noEncrypt = psp1->noEncrypt;
+		//
+		pControlBlock->notices.SetHead(FSP_IPC_CannotReach);
+		//^only after the control block is successfully mapped into the memory space of LLS may it be cleared by LLS
+
+		// could be exploited by ULA to make services distinguishable
+		memcpy(&context, psp1, sizeof(FSP_SocketParameter));
+		pendingSendBuf = (octet*)psp1->welcome;
+		pendingSendSize = psp1->len;
+	}
+
 	int Dispose();
 	int RecycLocked();
 
 	// Convert the relative address in the control block to the address in process space, unchecked
-	BYTE * GetSendPtr(const ControlBlock::PFSP_SocketBuf skb) const
+	octet * GetSendPtr(const ControlBlock::PFSP_SocketBuf skb) const
 	{
 		return pControlBlock->GetSendPtr(skb);
 	}
-	BYTE * GetRecvPtr(const ControlBlock::PFSP_SocketBuf skb) const
+	octet * GetRecvPtr(const ControlBlock::PFSP_SocketBuf skb) const
 	{
 		return pControlBlock->GetRecvPtr(skb);
 	}
@@ -333,7 +401,6 @@ public:
 		//
 		return r;
 	}
-	void EnableLLSInterrupt() { _bittestandreset(&pControlBlock->notices.vector, 0); }
 	bool IsInUse() { return (_InterlockedOr8(&inUse, 0) != 0) && (pControlBlock != NULL); }
 
 	void SetPeerName(const char *cName, size_t len)
@@ -401,12 +468,12 @@ public:
 
 	bool TestSetOnCommit(PVOID fp1)
 	{
-		return InterlockedCompareExchangePointer((PVOID *)& fpCommitted, fp1, NULL) == NULL;
+		return _InterlockedCompareExchangePointer((PVOID *)& fpCommitted, fp1, NULL) == NULL;
 	}
 
 	bool TestSetSendReturn(PVOID fp1)
 	{
-		return InterlockedCompareExchangePointer((PVOID *) & fpSent, fp1, NULL) == NULL; 
+		return _InterlockedCompareExchangePointer((PVOID *) & fpSent, fp1, NULL) == NULL; 
 	}
 
 	CSocketItemDl * WaitingConnectAck();
@@ -424,7 +491,7 @@ public:
 	{
 		if (InState(NON_EXISTENT))
 			return -EBADF;
-		bool b = (InterlockedCompareExchangePointer((PVOID*)& fpFinished, fp1, NULL) == NULL);
+		bool b = (_InterlockedCompareExchangePointer((PVOID*)& fpFinished, fp1, NULL) == NULL);
 		if (b || InState(SHUT_REQUESTED) || InState(CLOSED))
 			return EAGAIN;
 		return 0;
@@ -449,6 +516,9 @@ public:
 
 	// defined in DllEntry.cpp:
 	static CSocketItemDl * LOCALAPI CreateControlBlock(const PFSP_IN6_ADDR, PFSP_Context, CommandNewSession &);
-	static DWORD GetProcessId() { return idThisProcess; }
-	static DWORD SaveProcessId() { return (idThisProcess = GetCurrentProcessId()); }
+#if defined(__WINDOWS__)
+	static void SaveProcessId() { idThisProcess = GetCurrentProcessId(); }
+#elif defined(__linux__) || defined(__CYGWIN__)
+	static void SaveProcessId() { idThisProcess = getpid(); }
+#endif
 };

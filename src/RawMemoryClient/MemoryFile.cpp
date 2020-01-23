@@ -3,7 +3,6 @@
  * which meant to check that the memory pattern saved in the designated file is right
  */
 #include "stdafx.h"
-#include "tchar.h"
 
 const char * MEMORY_PATTERN_FILE_NAME = "$memory.^";
 static DWORD totalWritten;

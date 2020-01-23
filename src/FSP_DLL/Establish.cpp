@@ -28,9 +28,28 @@
     POSSIBILITY OF SUCH DAMAGE.
  */
 #include "FSP_DLL.h"
-#include <assert.h>
-#include <stdlib.h>
-#include <tchar.h>
+
+ // The Translation Look-aside Buffer of the FSP socket items for ULA
+CSocketDLLTLB CSocketItemDl::socketsTLB;
+
+
+// Given
+//	PFSP_IN6_ADDR	the place holder of the output FSP/IPv6 address
+//	uint32_t		the 32-bit integer representation of the IPv4 address to be translated
+//	uint32_t		the fiber ID, in no particular byte order
+// Return
+//	the pointer to the place holder of host-id which might be set/updated later
+// Remark
+//	make the rule-adhered IPv6 address, the result is placed at the address given
+DllSpec
+uint32_t * FSPAPI TranslateFSPoverIPv4(PFSP_IN6_ADDR p, uint32_t dwIPv4, uint32_t fiberID)
+{
+	p->_6to4.prefix = PREFIX_FSP_IP6to4;
+	p->_6to4.ipv4 = dwIPv4;
+	p->_6to4.port = DEFAULT_FSP_UDPPORT;
+	p->idALF = fiberID;
+	return & p->idHost;
+}
 
 
 //[API: Listen]
@@ -75,7 +94,6 @@ FSPHANDLE FSPAPI ListenAt(const PFSP_IN6_ADDR listenOn, PFSP_Context psp1)
 
 
 
-
 //[API: Accept]
 //	CHALLENGING-->COMMITTED/CLOSABLE
 // Given
@@ -97,34 +115,6 @@ FSPHANDLE FSPAPI Accept1(FSPHANDLE h)
 	{
 		return NULL;
 	}
-}
-
-
-
-// Return
-//	The socket handle if there is one backlog item successfully processed.
-//	NULL if there is internal error
-// Remark
-//	This is function is blocking. It wait until success or internal error found
-CSocketItemDl *CSocketItemDl::Accept1()
-{
-	BackLogItem	*pLogItem;
-	while(LockAndValidate())
-	{
-		pLogItem = pControlBlock->backLog.Peek();
-		if (pLogItem != NULL)
-		{
-			CSocketItemDl *p = ProcessOneBackLog(pLogItem);
-			pControlBlock->backLog.Pop();
-			SetMutexFree();
-			return p;
-		}
-		//
-		SetMutexFree();
-		Sleep(TIMER_SLICE_ms);
-	}
-	//
-	return NULL;
 }
 
 
@@ -175,7 +165,7 @@ FSPHANDLE FSPAPI Connect2(const char *peerName, PFSP_Context psp1)
 
 	// could be exploited by ULA to make services distinguishable
 	memcpy(&socketItem->context, psp1, sizeof(FSP_SocketParameter));
-	socketItem->pendingSendBuf = (BYTE*)psp1->welcome;
+	socketItem->pendingSendBuf = (octet*)psp1->welcome;
 	socketItem->pendingSendSize = psp1->len;
 
 	CSocketItemDl *p = socketItem->CallCreate(objCommand, InitConnection);
@@ -190,6 +180,126 @@ FSPHANDLE FSPAPI Connect2(const char *peerName, PFSP_Context psp1)
 	}
 
 	return p;
+}
+
+
+
+// Given
+//	FSPHANDLE	the FSP socket handle
+//	octet *		the new session key assumed to have been established by ULA
+//	int			the size of the key, number of octets
+// Do
+//	Manage to call LLS to apply the new session key
+// Return
+//	0 if no error
+//	negative: the error number
+//	(e.g. -EDOM if parameter error)
+// Remark
+//	By default set key life in term of octets may be sent maximumly with master key unchanged to 2^63-1
+DllSpec
+int FSPAPI InstallMasterKey(FSPHANDLE h, octet * key, int32_t keyBytes)
+{
+	if (keyBytes <= 0 || keyBytes > INT32_MAX / 8)
+		return -EDOM;
+	try
+	{
+		CSocketItemDl *pSocket = (CSocketItemDl *)h;
+		return pSocket->InstallRawKey(key, keyBytes * 8, INT64_MAX);
+	}
+	catch(...)
+	{
+		return -EFAULT;
+	}
+}
+
+
+
+// Given
+//	CommandNewSession & [_Out_]	the command context to be filled
+//	FSP_ServiceCode				the service code to be passed
+// Do
+//	Fill in the command context and call LLS. The service code MUST be one that creates an LLS FSP socket
+// Return
+//	The DLL FSP socket created if succeeded,
+//	NULL if failed.
+CSocketItemDl * LOCALAPI CSocketItemDl::CallCreate(CommandNewSession & objCommand, FSP_ServiceCode cmdCode)
+{
+	objCommand.fiberID = fidPair.source;
+	objCommand.idProcess = idThisProcess;
+	objCommand.opCode = cmdCode;
+#ifdef TRACE
+	printf("%s: fiberId = %d, fidPair.source = %d\n", CServiceCode::sof(cmdCode), objCommand.fiberID, fidPair.source);
+#endif
+	CopyFatMemPointo(objCommand);
+	return Call(objCommand, sizeof(objCommand)) ? this : NULL;
+}
+
+
+
+// Given
+//	PFSP_IN6_ADDR		const, the listening addresses of the passive FSP socket
+//	PFSP_Context		the connection context of the socket, given by ULA
+//	CommandNewSession & the command context of the socket,  to pass to LLS
+// Return
+//	NULL if it failed, or else the new allocated socket whose session control block has been initialized
+CSocketItemDl * LOCALAPI CSocketItemDl::CreateControlBlock(const PFSP_IN6_ADDR nearAddr, PFSP_Context psp1, CommandNewSession & cmd)
+{
+	CSocketItemDl *socketItem = socketsTLB.AllocItem();
+	if (socketItem == NULL)
+		return NULL;
+
+	socketItem->dwMemorySize = CSocketItemDl::AlignMemorySize(psp1);
+	if (socketItem->dwMemorySize < 0 || !socketItem->InitLLSInterface(cmd))
+	{
+		socketsTLB.FreeItem(socketItem);
+		return NULL;
+	}
+	socketItem->SetConnectContext(psp1);
+	socketItem->fidPair.source = nearAddr->idALF;
+	//
+	FSP_ADDRINFO_EX & nearEnd = socketItem->pControlBlock->nearEndInfo;
+	if(nearAddr->_6to4.prefix == PREFIX_FSP_IP6to4)
+	{
+		nearEnd.InitUDPoverIPv4(psp1->ifDefault);
+		nearEnd.idALF = nearAddr->idALF;
+		nearEnd.ipi_addr = nearAddr->_6to4.ipv4;
+	}
+	else
+	{
+		nearEnd.InitNativeIPv6(psp1->ifDefault);
+		*(PIN6_ADDR) & nearEnd = *(PIN6_ADDR)nearAddr;
+	}
+	// Application Layer Thread ID other than the first default would be set in the LLS
+
+	return socketItem;
+}
+
+
+
+// Return
+//	The socket handle if there is one backlog item successfully processed.
+//	NULL if there is internal error
+// Remark
+//	This is function is blocking. It wait until success or internal error found
+CSocketItemDl *CSocketItemDl::Accept1()
+{
+	BackLogItem	*pLogItem;
+	while(LockAndValidate())
+	{
+		pLogItem = pControlBlock->backLog.Peek();
+		if (pLogItem != NULL)
+		{
+			CSocketItemDl *p = ProcessOneBackLog(pLogItem);
+			pControlBlock->backLog.Pop();
+			SetMutexFree();
+			return p;
+		}
+		//
+		SetMutexFree();
+		Sleep(TIMER_SLICE_ms);
+	}
+	//
+	return NULL;
 }
 
 
@@ -216,8 +326,8 @@ CSocketItemDl *CSocketItemDl::ProcessOneBackLog(BackLogItem	*pLogItem)
 		return NULL;
 	}
 	// lost some possibility of code reuse, gain flexibility (and reliability)
-	if (pLogItem->idParent == 0 && !socketItem->ToWelcomeConnect(*pLogItem)
-	|| pLogItem->idParent != 0 && !socketItem->ToWelcomeMultiply(*pLogItem))
+	if((pLogItem->idParent == 0 && !socketItem->ToWelcomeConnect(*pLogItem))
+	|| (pLogItem->idParent != 0 && !socketItem->ToWelcomeMultiply(*pLogItem)))
 	{
 		RejectRequest(pLogItem->acceptAddr.idALF, EPERM);
 		socketItem->Free();
@@ -293,7 +403,9 @@ CSocketItemDl * CSocketItemDl::PrepareToAccept(BackLogItem & backLog, CommandNew
 
 	pSocket->pControlBlock->SetRecvWindow(backLog.expectedSN);
 	pSocket->pControlBlock->SetSendWindow(backLog.initialSN);
-	
+#ifdef TRACE // & TRACE_SLIDEWIN)
+	printf("Expected SN: %u, set to %u\n", backLog.expectedSN, pSocket->pControlBlock->recvWindowExpectedSN);
+#endif
 	return pSocket;
 }
 
@@ -450,7 +562,7 @@ ControlBlock::PFSP_SocketBuf CSocketItemDl::SetHeadPacketIfEmpty(FSPOperationCod
 {
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend();
 	ControlBlock::seq_t k = GetSendWindowFirstSN();
-	if(_InterlockedCompareExchange((LONG *)& pControlBlock->sendBufferNextSN, k + 1, k) != k)
+	if(_InterlockedCompareExchange(&pControlBlock->sendBufferNextSN, k + 1, k) != k)
 		return skb;
 
 	pControlBlock->sendBufferNextPos = 1;
@@ -460,56 +572,6 @@ ControlBlock::PFSP_SocketBuf CSocketItemDl::SetHeadPacketIfEmpty(FSPOperationCod
 	skb->InitFlags<TransactionEnded>();
 	skb->ReInitMarkComplete();
 	return NULL;
-}
-
-
-
-// Given
-//	PFSP_IN6_ADDR	the place holder of the output FSP/IPv6 address
-//	uint32_t		the 32-bit integer representation of the IPv4 address to be translated
-//	uint32_t		the fiber ID, in no particular byte order
-// Return
-//	the pointer to the place holder of host-id which might be set/updated later
-// Remark
-//	make the rule-adhered IPv6 address, the result is placed at the address given
-DllSpec
-uint32_t * FSPAPI TranslateFSPoverIPv4(PFSP_IN6_ADDR p, uint32_t dwIPv4, uint32_t fiberID)
-{
-	p->_6to4.prefix = PREFIX_FSP_IP6to4;
-	p->_6to4.ipv4 = dwIPv4;
-	p->_6to4.port = DEFAULT_FSP_UDPPORT;
-	p->idALF = fiberID;
-	return & p->idHost;
-}
-
-
-
-// Given
-//	FSPHANDLE	the FSP socket handle
-//	octet *		the new session key assumed to have been established by ULA
-//	int			the size of the key, number of octets
-// Do
-//	Manage to call LLS to apply the new session key
-// Return
-//	0 if no error
-//	negative: the error number
-//	(e.g. -EDOM if parameter error)
-// Remark
-//	By default set key life in term of octets may be sent maximumly with master key unchanged to 2^63-1
-DllSpec
-int FSPAPI InstallMasterKey(FSPHANDLE h, octet * key, int32_t keyBytes)
-{
-	if (keyBytes <= 0 || keyBytes > INT32_MAX / 8)
-		return -EDOM;
-	try
-	{
-		CSocketItemDl *pSocket = (CSocketItemDl *)h;
-		return pSocket->InstallRawKey(key, keyBytes * 8, INT64_MAX);
-	}
-	catch(...)
-	{
-		return -EFAULT;
-	}
 }
 
 
@@ -538,7 +600,7 @@ int LOCALAPI CSocketItemDl::InstallRawKey(octet *key, int32_t keyBits, uint64_t 
 
 	CommandInstallKey objCommand(pControlBlock->sendBufferNextSN, keyLife);
 	this->InitCommand<FSP_InstallKey>(objCommand);
-	if (keyBits > sizeof(objCommand.ikm) * 8)
+	if (keyBits > (int32_t)sizeof(objCommand.ikm) * 8)
 		keyBits = sizeof(objCommand.ikm) * 8;
 	memcpy(objCommand.ikm, key, keyBits/8);
 	pControlBlock->connectParams.keyBits = keyBits;
@@ -576,4 +638,137 @@ CSocketItemDl * CSocketItemDl::WaitingConnectAck()
 
 	SetMutexFree();
 	return this;
+}
+
+
+
+// For a prototype it does not worth the trouble to exploit hash table 
+CSocketItemDl *	CSocketDLLTLB::HandleToRegisteredSocket(FSPHANDLE h)
+{
+	register CSocketItemDl *p = (CSocketItemDl *)h;
+	for(register int i = 0; i < MAX_CONNECTION_NUM; i++)
+	{
+		if (CSocketItemDl::socketsTLB.pSockets[i] == p)
+			return ((!p->IsInUse() || p->InIllegalState()) ? NULL : p);
+	}
+	//
+	return NULL;
+}
+
+
+
+// To obtain a free slot from the TLB. Try to allocate a new item if no slot is registered with a valid item
+// Return
+//	The pointer to the DLL FSP socket if allocated successfully
+//	NULL if failed
+CSocketItemDl * CSocketDLLTLB::AllocItem()
+{
+	AcquireMutex();
+
+	CSocketItemDl * item = NULL;
+	// Compress the array of pointers of allocated sockets
+	if (sizeOfWorkSet >= MAX_CONNECTION_NUM)
+	{
+		register int n = sizeOfWorkSet;
+		register int i, j, k;
+
+		for (i = 0; i < n && pSockets[i]->inUse; i++)
+			;
+		if (i >= n)
+			goto l_bailout;
+		// 0 to i, left inclusively, right exclusively, index socket in use, compressively
+		for (j = i + 1; ; j = k + 1)
+		{
+			for (; j < n && !pSockets[j]->inUse; j++)
+				;
+			// i to j, left inclusively, right exclusively, index socket free
+			if (j >= n)
+				break;
+			//
+			for (k = j + 1; k < n && pSockets[k]->inUse; k++)
+				;
+			// j to k, left inclusively, right exclusively, index socket in use
+			memmove(pSockets + i, pSockets + j, sizeof(pSockets[0]) * (k - j));
+			i += k - j;
+			// on exit the loop totally at most (n - 1) items were moved 
+			if (k >= n)
+				break;
+		}
+		sizeOfWorkSet = i;
+	}
+
+	if (countAllItems < MAX_CONNECTION_NUM)
+	{
+		item = new CSocketItemDl();
+		if (item == NULL)
+			goto l_bailout;	// return NULL;
+		countAllItems++;
+	}
+	else
+	{
+		item = head;
+		if (item == NULL)
+			goto l_bailout;	// return NULL;
+		head = item->next;
+		if (head != NULL)
+			head->prev = NULL;
+		else
+			tail = NULL;
+	}
+
+	memset((octet *)item + sizeof(CSocketItem)
+		, 0
+		, sizeof(CSocketItemDl) - sizeof(CSocketItem));
+	pSockets[sizeOfWorkSet++] = item;
+	_InterlockedExchange8(& item->inUse, 1);
+
+l_bailout:
+	ReleaseMutex();
+	return item;
+}
+
+
+
+// Given
+//	CSocketItemDl *		the pointer to the DLL FSP socket
+// Do
+//	Try to put the socket in the list of the free socket items
+void CSocketDLLTLB::FreeItem(CSocketItemDl *r)
+{
+	AcquireMutex();
+
+	_InterlockedExchange8(& r->inUse, 0);
+	r->next = NULL;
+	r->prev = tail;
+	if(tail == NULL)
+	{
+		head = tail = r;
+	}
+	else
+	{
+		tail->next = r;
+		tail = r;
+	}
+
+	ReleaseMutex();
+}
+
+
+
+// Given
+//	ALFID_T		the application layer fiber ID of the connection to find
+// Return
+//	The pointer to the FSP socket that matches the given ID
+// Remark
+//	The caller should check whether the returned socket is really in work by check the inUse flag
+//	Performance is assumed acceptable
+//	as this is a prototyped implementation which exploits linear search in a small set
+CSocketItemDl * CSocketDLLTLB::operator[](ALFID_T fiberID)
+{
+	for(int i = 0; i < sizeOfWorkSet; i++)
+	{
+		if(pSockets[i]->fidPair.source == fiberID)
+			return pSockets[i];
+	}
+	return NULL;
 }

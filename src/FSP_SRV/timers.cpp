@@ -27,10 +27,6 @@
     POSSIBILITY OF SUCH DAMAGE.
  */
 #include "fsp_srv.h"
-#include <assert.h>
-#include <intrin.h>
-#include <math.h>
-#include <time.h>
 
 
 // let calling of Destroy() in the NON_EXISTENT state to do cleanup 
@@ -47,7 +43,7 @@
 // TODO: recycle SHUT_REQUESTED or CLOSED socket in LRU manner
 void CSocketItemEx::KeepAlive()
 {
-	const char *c = (char *)InterlockedCompareExchangePointer((void**)&lockedAt, (void*)__FUNCTION__, 0);
+	const char *c = (char *)_InterlockedCompareExchangePointer((void**)&lockedAt, (void*)__FUNCTION__, 0);
 	timestamp_t t1 = NowUTC();
 	// assume it takes little time to get system clock
 	while (t1 - tPreviousLifeDetection > (MAX_LOCK_WAIT_ms << 10))
@@ -219,7 +215,7 @@ void CSocketItemEx::UpdateRTT(ControlBlock::seq_t snAck, uint32_t tDelay)
 	{
 		printf_s("Is the peer to cheat by report a ridiculously delay (%u)?\n"
 			"Smoothed RTT is %u microseconds\n"
-			"Adjusted latest packet delay is %lld\n"
+			"Adjusted latest packet delay is %" PRId64 "\n"
 			, tDelay
 			, tRoundTrip_us
 			, rtt64_us);
@@ -261,7 +257,7 @@ void CSocketItemEx::UpdateRTT(ControlBlock::seq_t snAck, uint32_t tDelay)
 	if (!increaSlow)
 		sendRate_Bpus += double(int64_t(k + 1) * MAX_BLOCK_SIZE) / tRoundTrip_us;
 #if (TRACE & TRACE_HEARTBEAT)
-	fprintf(stderr, "%llu, %u\n", tNow, tRoundTrip_us);
+	fprintf(stderr, "%" PRId64 ", %u\n", tNow, tRoundTrip_us);
 #endif
 }
 
@@ -283,7 +279,7 @@ bool CSocketItemEx::SendKeepAlive()
 	buf3.SetHostID(CLowerInterface::Singleton.addresses);
 	memcpy(buf3.mp.subnets, savedPathsToNearEnd, sizeof(TSubnets));
 
-	InterlockedIncrement(&nextOOBSN);	// Because lastOOBSN start from zero as well. See ValidateSNACK
+	_InterlockedIncrement(&nextOOBSN);	// Because lastOOBSN start from zero as well. See ValidateSNACK
 
 	register int n = (sizeof(buf3.snack.gaps) - sizeof(buf3.mp)) / sizeof(FSP_SelectiveNACK::GapDescriptor);
 	//^ keep the underlying IP packet from segmentation
@@ -352,13 +348,9 @@ bool CSocketItemEx::SendKeepAlive()
 //	or resent as the heartbeat where the delay shall be ignored as well
 bool CSocketItemEx::SendAckFlush()
 {
-#define buf2 cacheAckFlush
-	//if (savedAckedSN == pControlBlock->recvWindowNextSN && savedSendSN == pControlBlock->sendWindowNextSN)
-	//	return (SendPacket(1, ScatteredSendBuffers(&buf2, sizeof(buf2))) > 0);
-	//savedAckedSN = pControlBlock->recvWindowNextSN;
-	//savedSendSN = pControlBlock->sendWindowNextSN;
+	ALIGN(FSP_ALIGNMENT) struct SAckFlushCache buf2;
 
-	InterlockedIncrement(& nextOOBSN);
+	_InterlockedIncrement(& nextOOBSN);
 	buf2.snack._h.opCode = SELECTIVE_NACK;
 	buf2.snack._h.mark = 0;
 	buf2.snack._h.length = SNACK_HEADER_SIZE_LE16;
@@ -385,7 +377,6 @@ bool CSocketItemEx::SendAckFlush()
 		return false;
 	memcpy(&buf2.snack, c, sizeof(buf2.snack));
 	return SendPacket(1, ScatteredSendBuffers(&buf2, sizeof(buf2))) > 0;
-#undef buf2
 }
 
 
@@ -413,7 +404,7 @@ int LOCALAPI CSocketItemEx::AcceptSNACK(ControlBlock::seq_t expectedSN, FSP_Sele
 		return -EDOM;
 	const int32_t capacity = pControlBlock->sendBufferBlockN;
 	if (capacity <= 0
-	 ||	sizeof(ControlBlock) + (sizeof(ControlBlock::FSP_SocketBuf) + MAX_BLOCK_SIZE) * capacity > dwMemorySize)
+	 ||	sizeof(ControlBlock) + (sizeof(ControlBlock::FSP_SocketBuf) + MAX_BLOCK_SIZE) * capacity > (u32)dwMemorySize)
 	{
 #ifdef TRACE
 		BREAK_ON_DEBUG();	//TRACE_HERE("memory overflow");
@@ -454,7 +445,7 @@ int LOCALAPI CSocketItemEx::AcceptSNACK(ControlBlock::seq_t expectedSN, FSP_Sele
 		return nAck;
 
 	pControlBlock->AddRoundSendBlockN(pControlBlock->sendWindowHeadPos, nAck);
-	InterlockedExchange((LONG *)&pControlBlock->sendWindowFirstSN, expectedSN);
+	_InterlockedExchange((u32*)&pControlBlock->sendWindowFirstSN, expectedSN);
 
 	return nAck;
 }
@@ -589,7 +580,7 @@ l_step2:
 		//
 		if (++pControlBlock->sendWindowNextPos >= capacity)
 			pControlBlock->sendWindowNextPos = 0;
-		InterlockedIncrement(&pControlBlock->sendWindowNextSN);
+		_InterlockedIncrement(&pControlBlock->sendWindowNextSN);
 	}
 	// Zero window probing; although there's some code redundancy it keeps clarity
 	else if (pControlBlock->CountSentInFlight() == 0 && pControlBlock->CountSendBuffered() > 0)
@@ -615,7 +606,7 @@ l_step2:
 		//
 		if (++pControlBlock->sendWindowNextPos >= capacity)
 			pControlBlock->sendWindowNextPos = 0;
-		InterlockedIncrement(&pControlBlock->sendWindowNextSN);
+		_InterlockedIncrement(&pControlBlock->sendWindowNextSN);
 	}
 	// For sake of stability do not raise limitSN in this very clock click
 	toStopEmitQ = (int32_t(pControlBlock->sendWindowNextSN - limitSN) >= 0);

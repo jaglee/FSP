@@ -73,7 +73,7 @@
 // #	include <sys/param.h>
 
 #	if BYTE_ORDER == LITTLE_ENDIAN
-
+#		include <intrin.h>
 #		pragma intrinsic(_byteswap_ushort, _byteswap_ulong, _byteswap_uint64)
 
 #		define be16toh(v) _byteswap_ushort(v)

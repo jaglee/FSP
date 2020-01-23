@@ -60,14 +60,14 @@ CSocketSrvTLB::CSocketSrvTLB()
 bool CSocketSrvTLB::PutToScavengeCache(CSocketItemEx *pSocket, timestamp_t tNow)
 {
 	int32_t n;
-	if ((n = InterlockedIncrement(&topOfSC)) >= MAX_CONNECTION_NUM)
+	if ((n = _InterlockedIncrement(&topOfSC)) >= MAX_CONNECTION_NUM)
 	{
-		InterlockedDecrement(&topOfSC);
+		topOfSC--;
 		return false;
 	}
 
-	scavengeCache[n].pSocket = pSocket;
-	scavengeCache[n].timeRecycled = tNow;
+	scavengeCache[n - 1].pSocket = pSocket;
+	scavengeCache[n - 1].timeRecycled = tNow;
 	return true;
 }
 
@@ -75,7 +75,8 @@ bool CSocketSrvTLB::PutToScavengeCache(CSocketItemEx *pSocket, timestamp_t tNow)
 // allocate from the free list
 CSocketItemEx * CSocketSrvTLB::AllocItem()
 {
-	CSocketItemEx *p;
+	CSocketItemEx* p, * p1;
+	timestamp_t tNow;
 
 	AcquireMutex();
 
@@ -84,7 +85,7 @@ CSocketItemEx * CSocketSrvTLB::AllocItem()
 
 	// as this is a prototype is not bothered to exploit hash table
 	// recycle all of the orphan sockets
-	register int i;
+	register u32 i;
 #if !(TRACE & TRACE_HEARTBEAT)
 	for (i = 0, p = itemStorage; i < MAX_CONNECTION_NUM; i++, p++)
 	{
@@ -98,15 +99,15 @@ CSocketItemEx * CSocketSrvTLB::AllocItem()
 		goto l_success;
 	}
 
-	timestamp_t tNow = NowUTC();
-	CSocketItemEx *p1 = NULL;
+	tNow = NowUTC();
+	p1 = NULL;
 	// Reserved: a 'CLOSED' socket might be resurrected,
 	// provides it is the original ULA process that is to reuse the socket
 	if (topOfSC == 0)
 	{
 		for (i = 0, p = itemStorage; i < MAX_CONNECTION_NUM; i++, p++)
 		{
-			if (p->lowState == CLOSED)
+			if (p->lowState == CLOSED || !p->IsInUse())
 				PutToScavengeCache(p, tNow);
 		}
 	}
@@ -121,7 +122,7 @@ CSocketItemEx * CSocketSrvTLB::AllocItem()
 	topOfSC--;
 	for (i = 0; i < topOfSC; i++)
 	{
-		scavengeCache[i] = scavengeCache[i++];
+		scavengeCache[i] = scavengeCache[i+1];
 	}
 
 	p1->WaitUseMutex();		// it is throttling!
@@ -144,51 +145,48 @@ l_success:
 
 // registration of passive socket: it is assumed that performance is out of question for a conceptual prototype
 // allocate in the listeners' socket space
+// detect duplication fiber ID, remove 'brain-dead' socket
+// we may reuse a socket created indirectly by a terminated process
 CSocketItemEx * CSocketSrvTLB::AllocItem(ALFID_T idListener)
 {
 	AcquireMutex();
 
 	CSocketItemEx *p = NULL;
-	// detect duplication fiber ID, remove 'brain-dead' socket
 	for(register int i = 0; i < MAX_LISTENER_NUM; i++)
 	{
-		if (listenerSlots[i].TestSetState(LISTENING))
+		register CSocketItemEx &r = listenerSlots[i];
+		if (!r.IsProcessAlive())
 		{
-			if (p != NULL)
-				p->ClearInUse();
-			p = &listenerSlots[i];
+			r.AbortLLS(true);
+			if (p == NULL)
+			{
+				p = &r;
+				p->TestSetState(LISTENING);
+			}
 			// do not break, for purpose of duplicate allocation detection
 		}
-		else if (!listenerSlots[i].IsProcessAlive())
-		{
-			// we may reuse a socket created indirectly by a terminated process
-			if (p != NULL)
-				p->ClearInUse();
-			p = &listenerSlots[i];
-			p->AbortLLS(true);
-			p->TestSetState(LISTENING);
-			// do not break, for purpose of duplicate allocation detection
-		}
-		else if (listenerSlots[i].fidPair.source == idListener)
+		else if (r.fidPair.source == idListener)
 		{
 #ifdef TRACE
 			printf_s("\nCollision detected:\n"
-					 "\twith process#%u, listener fiber#%u\n", listenerSlots[i].idSrcProcess, idListener);
+					 "\twith process#%u, listener fiber#%u\n", r.idSrcProcess, idListener);
 #endif
 			p = NULL;
 			break;
 		}
-		else
+		else if (p == NULL && r.TestSetState(LISTENING))
 		{
-			continue;
+			p = &r;
+			// do not break, for purpose of duplicate allocation detection and dad process removal
 		}
-		//
-		p->SetPassive();
-		p->fidPair.source = idListener;
 	}
 
 	if (p != NULL)
+	{
+		p->SetPassive();
+		p->fidPair.source = idListener;
 		PutToListenTLB(p, be32toh(idListener) & (MAX_CONNECTION_NUM - 1));
+	}
 
 	ReleaseMutex();
 	return p;
@@ -394,12 +392,47 @@ CMultiplyBacklogItem * CSocketSrvTLB::FindByRemoteId(uint32_t remoteHostId, ALFI
 
 
 
+// Return true if succeeded in obtaining the mutex lock, false if waited but timed-out
+bool CSocketItemEx::WaitUseMutexAt(const char* funcName)
+{
+	uint64_t t0 = GetTickCount64();
+	while (_InterlockedCompareExchangePointer((void**)& lockedAt, (void*)funcName, 0) != 0)
+	{
+		if (!IsInUse() || GetTickCount64() - t0 > MAX_LOCK_WAIT_ms)
+			return false;
+		Sleep(TIMER_SLICE_ms);	// if there is some thread that has exclusive access on the lock, wait patiently
+	}
+
+	if (IsInUse())
+		return true;
+	//
+	lockedAt = 0;
+	return false;
+}
+
+
+
+// Lock the session context if the process of upper layer application is still active
+// Abort the FSP session if ULA is not active
+// Return true if the session context is locked, false if not
+bool CSocketItemEx::LockWithActiveULAt(const char* funcName)
+{
+	void* c = _InterlockedCompareExchangePointer((void**)& lockedAt, (void*)funcName, 0);
+	if (IsProcessAlive())
+		return (c == 0 || WaitUseMutexAt(funcName));
+	//
+	AbortLLS();
+	lockedAt = 0;
+	return false;
+}
+
+
+
 // Initialize the association of the remote end [represent by sockAddrTo] and the near end
 // Side-effect: set the initial 'previous state'
 // TODO: UNRESOLVED! hard-coded here, limit capacity of multi-home support?
 void CSocketItemEx::InitAssociation()
 {
-	uint32_t idRemoteHost = pControlBlock->peerAddr.ipFSP.hostID;
 	// 'source' field of fidPair shall be filled already. See also CInterface::PoolingALFIDs()
 	// and CSocketSrvTLB::AllocItem(), AllocItem(ALFID_T)
 	fidPair.peer = pControlBlock->peerAddr.ipFSP.fiberID;
@@ -412,13 +445,14 @@ void CSocketItemEx::InitAssociation()
 	{
 		memset(&pFarEnd[i], 0, sizeof(pFarEnd[i]));
 		pFarEnd[i].Ipv4.sin_family = AF_INET;
-		pFarEnd[i].Ipv4.sin_addr.S_un.S_addr
+		*(u32 *) & pFarEnd[i].Ipv4.sin_addr
 			= ((PFSP_IN4_ADDR_PREFIX) & pControlBlock->peerAddr.ipFSP.allowedPrefixes[i])->ipv4;
 		pFarEnd[i].Ipv4.sin_port = DEFAULT_FSP_UDPPORT;
 		((PFSP_IN6_ADDR) & (pFarEnd[i].Ipv6.sin6_addr))->idALF = fidPair.peer;
 	}
 	// namelen = sizeof(SOCKADDR_IN);
 #else
+	uint32_t idRemoteHost = pControlBlock->peerAddr.ipFSP.hostID;
 	// local address is yet to be determined by the LLS
 	for(register int i = 0; i < MAX_PHY_INTERFACES; i++)
 	{
@@ -577,7 +611,7 @@ void CSocketItemEx::InitiateMultiply(CSocketItemEx *srcItem)
 	// MULTIPLY can only be the very first packet
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend();
 	void * payload = GetSendPtr(skb);
-	ALIGN(MAC_ALIGNMENT) FSP_FixedHeader q;
+	ALIGN(FSP_ALIGNMENT) FSP_FixedHeader q;
 	void* paidLoad;
 	lastOOBSN = 0;	// As the response from the peer, if any, is not an out-of-band packet
 
@@ -585,7 +619,7 @@ void CSocketItemEx::InitiateMultiply(CSocketItemEx *srcItem)
 	skb->CopyFlagsTo(& q);
 
 	paidLoad = SetIntegrityCheckCode(&q, payload, skb->len, GetSalt(q));
-	if (paidLoad == NULL || skb->len > sizeof(this->cipherText))
+	if (paidLoad == NULL || skb->len > (int32_t)sizeof(this->cipherText))
 	{
 		BREAK_ON_DEBUG();	//TRACE_HERE("Cannot set ICC for the new MULTIPLY command");
 		return;	// but it's an exception!
@@ -599,7 +633,7 @@ void CSocketItemEx::InitiateMultiply(CSocketItemEx *srcItem)
 	SyncState();
 	SendPacket(2, ScatteredSendBuffers(payload, sizeof(FSP_NormalPacketHeader), this->cipherText, skb->len));
 	skb->MarkSent();
-	skb->timeSent = tRecentSend;
+	skb->timeSent = NowUTC();
 	SetFirstRTT(srcItem->tRoundTrip_us);
 	tSessionBegin = skb->timeSent;
 	tPreviousTimeSlot = skb->timeSent;
@@ -660,14 +694,14 @@ void CMultiplyBacklogItem::RespondToMultiply()
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadRecv() + GetRecvWindowHeadPos();
 	// if (!CheckMemoryBorder(skb)) throw -EFAULT;
 	// See also PlacePayload
-	BYTE *ubuf = GetRecvPtr(skb);
+	octet*ubuf = GetRecvPtr(skb);
 	if(ubuf == NULL)
 	{
 		AbortLLS();		// Used to be HandleMemoryCorruption();
 		return;
 	}
 
-	// The opCode field is overridden to PERSIST for sake of clearer transmit transaction management
+	// The opCode field is overriden to PERSIST for sake of clearer transmit transaction management
 	skb->len = CopyOutPlainText(ubuf);
 	CopyOutFVO(skb);
 	skb->opCode = PERSIST;
@@ -675,7 +709,7 @@ void CMultiplyBacklogItem::RespondToMultiply()
 	skb->timeRecv = tLastRecv;	// so that delay of acknowledgement can be calculated more precisely
 
 	pControlBlock->recvWindowExpectedSN = ++pControlBlock->recvWindowNextSN;
-	_InterlockedIncrement((LONG *)&pControlBlock->recvWindowNextPos);
+	_InterlockedIncrement((DWORD*)&pControlBlock->recvWindowNextPos);
 	// The receive buffer is eventually ready
 
 	ControlBlock::PFSP_SocketBuf skbOut = pControlBlock->GetLastBuffered();
@@ -741,7 +775,7 @@ void CSocketItemEx::Accept()
 void CSocketItemEx::SendReset()
 {
 	ControlBlock::seq_t seqR = pControlBlock->sendWindowFirstSN;
-	ALIGN(MAC_ALIGNMENT) FSP_FixedHeader hdr;
+	ALIGN(FSP_ALIGNMENT) FSP_FixedHeader hdr;
 	// Make sure that the packet falls into the receive window
 	if (int32_t(pControlBlock->sendWindowNextSN - seqR) > 0)
 		seqR = pControlBlock->sendWindowNextSN - 1;
@@ -771,7 +805,7 @@ void CSocketItemEx::DisposeOnReset()
 // See also ~::KeepAlive case NON_EXISTENT
 void CSocketItemEx::Destroy()
 {
-	if (InterlockedExchange(&idSrcProcess, 0) == 0)
+	if (_InterlockedExchange(&idSrcProcess, 0) == 0)
 		return;
 	//
 	try
@@ -803,7 +837,7 @@ void CSocketItemEx::Destroy()
 void CSocketItemEx::AbortLLS(bool haveTLBLocked)
 {
 	if (pControlBlock != NULL
-	&& InStates(7, ESTABLISHED, COMMITTING, COMMITTED, COMMITTING2, PEER_COMMIT, CLOSABLE, PRE_CLOSED))
+	&& InStates(ESTABLISHED, COMMITTING, COMMITTED, COMMITTING2, PEER_COMMIT, CLOSABLE, PRE_CLOSED))
 	{
 		SendReset();
 	}

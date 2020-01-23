@@ -448,7 +448,7 @@ void UnitTestByteOrderDefinitin()
 	printf_s("FHS = %08x\n", rFHS);	// 02 01 03 03
 
 	$FSP_FixedHeader fh;
-	printf_s("size of fixed header: %d\n", sizeof(fh)); // 24
+	printf_s("size of fixed header: %zd\n", sizeof(fh)); // 24
 
 	fh.frews.flags = 1;
 	fh.frews.adRecvWS = 2;
@@ -460,9 +460,14 @@ void UnitTestByteOrderDefinitin()
 /**
  * 
  */
+// The singleton instance of the connect request queue
+ConnectRequestQueue ConnectRequestQueue::requests;
+
+// The singleton instance of the lower service interface 
+CLowerInterface	CLowerInterface::Singleton;
+
 int _tmain(int argc, _TCHAR* argv[])
 {
-	//EvaluateTimerWheel();
 	//EvaluateHPET();
 
 	FlowTestAcknowledge();

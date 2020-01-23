@@ -38,13 +38,3 @@ static VOID NTAPI UnitTestReenterTimerWheel(PVOID c, BOOLEAN)
 	Sleep(1000);
 	countReEnter--;
 }
-
-
-
-void EvaluateTimerWheel()
-{
-	CSocketItemExDbg socket(0, 0);	// reserve minumum
-	socket.AddAdhocTimer(50, UnitTestReenterTimerWheel);
-	printf_s("Printer enter to continue:\n");
-	getchar();
-}

@@ -1,8 +1,5 @@
 #include <stdio.h>
 #include "../Intrins.h"
-// POLY   
-// the highest bit is one
-#define CRC_64_I64	0x42F0E1EBA9EA3693ULL   
 //	CRC-64-ECMA-182 x64 + x62 + x57 + x55 + x54 + x53 + x52 + x47 + x46 + x45 +    
 //	x40 + x39 + x38 + x37 + x35 + x33 + x32 + x31 + x29 + x27 + x24 + x23 + x22    
 //	+ x21 + x19 + x17 + x13 + x12 + x10 + x9 + x7 + x4 + x + 1    
@@ -82,8 +79,8 @@ uint64_t CalculateCRC64(register uint64_t nAccum, register const void *p1, size_
 	register size_t i;
 	for (i = 0; i < len; i++ )
 	{
-		nAccum = (nAccum << 8) ^ TableCRC64[(nAccum >> 56) ^ *(buf++)];
-	}   
+		nAccum = (nAccum << 8) ^ TableCRC64[(nAccum >> 56) ^ buf[i]];
+	}
 
-	return nAccum;    
-}  
+	return nAccum;
+}

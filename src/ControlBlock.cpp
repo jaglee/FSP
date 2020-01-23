@@ -26,15 +26,6 @@
     ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
     POSSIBILITY OF SUCH DAMAGE.
  */
-#define WIN32_LEAN_AND_MEAN
-#define STRICT
-#include <Windows.h>
-#include <time.h>
-#include <stdio.h>
-#include <assert.h>
-
-#include <stdlib.h>
-
 #include "FSP_Impl.h"
 
 //
@@ -133,13 +124,31 @@ const char * CStringizeNotice::names[LARGEST_FSP_NOTICE + 1] =
 
 
 
+// Reflexing string representation of FSP_ServiceCode, for debug purpose
+const char* CServiceCode::names[FSP_Shutdown + 1] =
+{
+	"NullCommand",
+	"FSP_Listen",		// register a passive socket
+	"InitConnection",	// register an initiative socket
+	"FSP_Accept",		// accept the connection, make SCB of LLS synchronized with DLL 
+	"FSP_Reject/Reset",	// a forward command, explicitly reject some request
+	"FSP_Start/Urge",
+	"FSP_Send",			// Here it is not a command to LLS, but as a context indicator to ULA
+	"FSP_Receive",		// Here it is not a command to LLS, but as a context indicator to ULA
+	"FSP_InstallKey",	// install the authenticated encryption key
+	"FSP_Multiply",		// clone the connection, make SCB of LLS synchronized with DLL
+	"FSP_Shutdown"
+};
+
+
+
 // assume it is atomic (the assumption might be broken!)
 const char * CStringizeOpCode::operator[](int i)
 {
 	static char errmsg[] = "Unknown opCode: 0123467890123";
 	if (i < 0 || i > LARGEST_OP_CODE)
 	{
-		_itoa_s(i, &errmsg[16], 14, 10);
+		snprintf(&errmsg[16], 14, "%d", i);
 		return &errmsg[0];
 	}
 	return CStringizeOpCode::names[i];
@@ -152,7 +161,7 @@ const char * CStringizeState::operator[](int i)
 	static char errmsg[] = "Unknown state: 0123467890123";
 	if (i < 0 || i > LARGEST_FSP_STATE)
 	{
-		_itoa_s(i, &errmsg[15], 14, 10);
+		snprintf(&errmsg[16], 14, "%d", i);
 		return &errmsg[0];
 	}
 	return CStringizeState::names[i];
@@ -165,10 +174,23 @@ const char * CStringizeNotice::operator[](int i)
 	static char errmsg[] = "Unknown notice: 0123467890123";
 	if (i < 0 || i > LARGEST_FSP_NOTICE)
 	{
-		_itoa_s(i, &errmsg[16], 14, 10);
+		snprintf(&errmsg[16], 14, "%d", i);
 		return &errmsg[0];
 	}
 	return CStringizeNotice::names[i];
+}
+
+
+// String of the code
+const char* CServiceCode::sof(int c)
+{
+	static char errmsg[] = "Unknown service: 0123467890123";
+	if (c < 0 || c > FSP_Shutdown)
+	{
+		snprintf(&errmsg[17], 14, "%d", c);
+		return &errmsg[0];
+	}
+	return CServiceCode::names[c];
 }
 
 
@@ -178,6 +200,29 @@ CStringizeNotice	noticeNames;
 //
 // End Of Reflection
 //
+
+
+
+// Return
+//	true if obtained the mutual-exclusive lock
+//	false if timed out
+// Remark
+//	Exploit _InterlockedCompareExchange8 to keep memory access order as the coded order
+bool CLightMutex::WaitSetMutex()
+{
+	uint64_t t0 = GetTickCount64();
+	while (_InterlockedCompareExchange8(&mutex, 1, 0))
+	{
+		if (GetTickCount64() - t0 > MAX_LOCK_WAIT_ms)
+		{
+			BREAK_ON_DEBUG();
+			return false;
+		}
+		//
+		Sleep(TIMER_SLICE_ms);
+	}
+	return true;
+}
 
 
 
@@ -328,12 +373,12 @@ int LOCALAPI ControlBlock::Init(int32_t & sendSize, int32_t & recvSize)
 	// here we let it interleaved:
 	// send buffer descriptors, receive buffer descriptors, receive buffer blocks and send buffer blocks
 	// we're sure that FSP_SocketBuf itself is 64-bit aligned. to make buffer block 64-bit aligned
-	_InterlockedExchange((LONG *) & sendBufDescriptors, (sizeof(ControlBlock) + 7) & 0xFFFFFFF8);
-	_InterlockedExchange((LONG *) & recvBufDescriptors, sendBufDescriptors + sizeof(FSP_SocketBuf) * sendBufferBlockN);
-	_InterlockedExchange((LONG *) & recvBuffer, (sendBufDescriptors + sizeDescriptors + 7) & 0xFFFFFFF8);
-	_InterlockedExchange((LONG *) & sendBuffer, recvBuffer + recvBufferBlockN * MAX_BLOCK_SIZE);
+	_InterlockedExchange((u32 *) & sendBufDescriptors, (sizeof(ControlBlock) + 7) & 0xFFFFFFF8);
+	_InterlockedExchange((u32 *) & recvBufDescriptors, sendBufDescriptors + sizeof(FSP_SocketBuf) * sendBufferBlockN);
+	_InterlockedExchange((u32 *) & recvBuffer, (sendBufDescriptors + sizeDescriptors + 7) & 0xFFFFFFF8);
+	_InterlockedExchange((u32 *) & sendBuffer, recvBuffer + recvBufferBlockN * MAX_BLOCK_SIZE);
 
-	memset((BYTE *)this + sendBufDescriptors, 0, sizeDescriptors);
+	memset((octet *)this + sendBufDescriptors, 0, sizeDescriptors);
 
 	return 0;
 }
@@ -374,7 +419,7 @@ ControlBlock::PFSP_SocketBuf ControlBlock::GetSendBuf()
 	p->InitMarkLocked();
 	p->ClearFlags();
 	IncRoundSendBlockN(sendBufferNextPos);
-	InterlockedIncrement(&sendBufferNextSN);
+	_InterlockedIncrement(&sendBufferNextSN);
 
 	return p;
 }
@@ -387,7 +432,7 @@ ControlBlock::PFSP_SocketBuf ControlBlock::GetSendBuf()
 //	The start address of the next free send buffer block
 // Remark
 //	It is assumed that the caller have gain exclusive access on the control block among providers
-BYTE * LOCALAPI ControlBlock::InquireSendBuf(int32_t *p_m)
+octet * LOCALAPI ControlBlock::InquireSendBuf(int32_t *p_m)
 {
 	register int32_t k = LCKREAD(sendWindowHeadPos);
 	register int32_t i = sendBufferNextPos;
@@ -399,7 +444,7 @@ BYTE * LOCALAPI ControlBlock::InquireSendBuf(int32_t *p_m)
 	}
 
 	*p_m = ((i >= k ? sendBufferBlockN : k) - i) * MAX_BLOCK_SIZE;
-	return (BYTE *)this + sendBuffer + i * MAX_BLOCK_SIZE;
+	return (octet *)this + sendBuffer + i * MAX_BLOCK_SIZE;
 }
 
 
@@ -428,7 +473,7 @@ ControlBlock::PFSP_SocketBuf LOCALAPI ControlBlock::AllocRecvBuf(seq_t seq1)
 	{
 		p = HeadRecv() + recvWindowNextPos;
 		IncRoundRecvBlockN(recvWindowNextPos);
-		InterlockedIncrement((LONG *) & recvWindowNextSN);
+		_InterlockedIncrement(&recvWindowNextSN);
 	}
 	else
 	{
@@ -443,7 +488,7 @@ ControlBlock::PFSP_SocketBuf LOCALAPI ControlBlock::AllocRecvBuf(seq_t seq1)
 		if(ordered)
 		{
 			recvWindowNextPos = d + 1 >= recvBufferBlockN ? 0 : d + 1;
-			_InterlockedExchange((LONG *) & recvWindowNextSN, seq1 + 1);
+			_InterlockedExchange((u32*)&recvWindowNextSN, seq1 + 1);
 		}
 		else if(p->IsComplete())
 		{
@@ -548,7 +593,7 @@ octet* LOCALAPI ControlBlock::InquireRecvBuf(int32_t& nIO, int32_t& nBlock, bool
 		return NULL;
 	}
 
-	BYTE* pMsg = GetRecvPtr(p);
+	octet* pMsg = GetRecvPtr(p);
 
 	if (tail > recvWindowHeadPos)
 		m = tail - recvWindowHeadPos;
@@ -626,7 +671,7 @@ int LOCALAPI ControlBlock::MarkReceivedFree(int32_t nBlock)
 	}
 	// but preserve the packet flag for EoT detection, etc.
 	AddRoundRecvBlockN(recvWindowHeadPos, m);
-	_InterlockedExchangeAdd((LONG *)&recvWindowFirstSN, m);
+	_InterlockedExchangeAdd((u32*)&recvWindowFirstSN, m);
 	//^Memory barrier is mandatory
 	return 0;
 }
@@ -649,7 +694,7 @@ int LOCALAPI ControlBlock::MarkReceivedFree(int32_t nBlock)
 // Acknowledged are
 //	[..., snExpect),
 //	[snExpect + gapWidth[0], snExpect + gapWidth[0] + dataLength[0]), 
-//	[snExpect + gapWidth[0] + dataLength[0] + gapWidth[1], snExpect + gapWidth[0] + dataLength[0] + gapWidth[1] + dataLength[1]) ¡­¡­
+//	[snExpect + gapWidth[0] + dataLength[0] + gapWidth[1], snExpect + gapWidth[0] + dataLength[0] + gapWidth[1] + dataLength[1]) ï¿½ï¿½ï¿½ï¿½
 int LOCALAPI ControlBlock::GetSelectiveNACK(seq_t & snExpect, FSP_SelectiveNACK::GapDescriptor * buf, int n)
 {
 	if(n <= 0)
@@ -801,12 +846,12 @@ int ControlBlock::DumpSendRecvWindowInfo() const
 {
 	return printf_s("\tSend[head, tail] = [%d, %d], packets on flight = %d\n"
 		"\tSN next to send = %u(@%d)\n"
-		"\tRecv[head, tail] = [%d, %d], receive window size = %d\n"
-		"\tSN first received = %u, max expected = %u\n"
+		"\tRecv[head, tail] = [%d, %d]\n"
+		"\tSN first received = %u, max expected = %u, deliverable width = %d\n"
 		, sendWindowHeadPos, sendBufferNextPos, int(sendWindowNextSN - sendWindowFirstSN)
 		, sendWindowNextSN, sendWindowNextPos
-		, recvWindowHeadPos, recvWindowNextPos, int(recvWindowNextSN - recvWindowFirstSN)
-		, recvWindowFirstSN, recvWindowNextSN);
+		, recvWindowHeadPos, recvWindowNextPos
+		, recvWindowFirstSN, recvWindowExpectedSN, int(recvWindowNextSN - recvWindowFirstSN));
 }
 
 int ControlBlock::DumpRecvQueueInfo() const

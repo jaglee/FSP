@@ -28,29 +28,26 @@
     POSSIBILITY OF SUCH DAMAGE.
  */
 
-#define _CRT_RAND_S
-#include <stdlib.h>
 
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-
-#include <stdio.h>
-#include <time.h>
-
-#include "../endian.h"
 #include "../FSP_Impl.h"
-
 #include "gcm-aes.h"
 
 #define COOKIE_KEY_LEN			20	// salt include, as in RFC4543 5.4
 #define MULTIPLY_BACKLOG_SIZE	8
 
 
- // random generator is somehow dependent on implementation. hardware preferred.
- // might be optimized by loop unrolling
+#if defined(__WINDOWS__)
+
+// random generator is somehow dependent on implementation. hardware preferred.
+// might be optimized by loop unrolling
 static inline
 void rand_w32(uint32_t *p, int n) { for (register int i = 0; i < min(n, 32); i++) { rand_s(p + i); } }
 
+#elif defined(__linux__) || defined(__CYGWIN__)
+
+extern "C" void rand_w32(u32 *, int);
+
+#endif
 
 // Return the number of microseconds elapsed since Jan 1, 1970 (unix epoch time)
 extern "C" timestamp_t NowUTC();
@@ -74,20 +71,33 @@ struct FSP_FixedHeader : public FSP_NormalPacketHeader
 };
 
 
-/**
-* It requires Advanced IPv6 API support to get the application layer thread ID from the IP packet control structure
-*/
+
 // packet information on local address and interface number
 // for IPv6, local fiber ID is derived from local address
 struct CtrlMsgHdr
 {
-#if _WIN32_WINNT >= 0x0600
-	CMSGHDR		pktHdr;
-#else
-	WSACMSGHDR	pktHdr;
-#endif
-	FSP_SINKINF	u;
 
+#if defined(__WINDOWS__)
+# if _WIN32_WINNT >= 0x0600
+	CMSGHDR		pktHdr;
+# else
+	WSACMSGHDR	pktHdr;
+# endif
+#elif defined(__linux__) || defined(__CYGWIN__)
+	/**
+	 * It requires Advanced IPv6 API support [RFC2292]
+	 * to get the application layer thread ID from the IP packet control structure
+	 */
+	struct {
+		socklen_t  cmsg_len;   /* #bytes, including this header */
+		int        cmsg_level; /* originating protocol */
+		int        cmsg_type;  /* protocol-specific type */
+				   /* followed by unsigned char cmsg_data[]; */
+	} pktHdr;
+#endif
+
+	FSP_SINKINF	u;
+	void CopySinkInfTo(PFSP_SINKINF tgt) const { *tgt = u; }
 	bool IsIPv6() const { return (pktHdr.cmsg_level == IPPROTO_IPV6); }
 };
 
@@ -108,8 +118,6 @@ struct CtrlMsgHdr
 #define MAX_LISTENER_NUM	4
 #define MAX_RETRANSMISSION	8
 
-
-
 class CommandNewSessionSrv: protected CommandToLLS
 {
 protected:
@@ -118,20 +126,31 @@ protected:
 	friend class CSocketSrvTLB;
 
 	// defined in command.cpp
-	friend void LOCALAPI Listen(CommandNewSessionSrv &);
-	friend void LOCALAPI Connect(CommandNewSessionSrv &);
-	friend void LOCALAPI Accept(CommandNewSessionSrv &);
+	friend void LOCALAPI Listen(const CommandNewSessionSrv &);
+	friend void LOCALAPI Connect(const CommandNewSessionSrv &);
+	friend void LOCALAPI Accept(const CommandNewSessionSrv &);
 
+#if defined(__WINDOWS__)
 	HANDLE	hMemoryMap;		// pass to LLS by ULA, should be duplicated by the server
 	DWORD	dwMemorySize;	// size of the shared memory, in the mapped view
 	HANDLE	hEvent;
-	UINT	index;
-	CSocketItemEx *pSocket;
+#elif defined(__linux__) || defined(__CYGWIN__)
+	int		hShm;			// handle of the shared memory, open by name
+	int32_t	dwMemorySize;	// size of the shared memory, in the mapped view
+	pthread_t	idThread;	// working thread associated with the new session request
+#endif
+	int		index;
+	class	CSocketItemEx *pSocket;
 
 public:
 	CommandNewSessionSrv(const CommandToLLS *);
 	CommandNewSessionSrv() {}
 
+#if defined(__WINDOWS__)
+	void TriggerULA() const { ::SetEvent(hEvent); }
+#elif defined(__linux__) || defined(__CYGWIN__)
+	void TriggerULA() const { sigval_t value; value.sival_int = (int)fiberID; ::sigqueue(idProcess, SIGNO_FSP, value); }
+#endif
 	void DoConnect();
 };
 
@@ -139,7 +158,7 @@ public:
 
 class CommandCloneSessionSrv: CommandNewSessionSrv
 {
-	friend void Multiply(CommandCloneSessionSrv &);
+	friend void Multiply(const CommandCloneSessionSrv &);
 public:
 	CommandCloneSessionSrv(const CommandToLLS *p): CommandNewSessionSrv(p)
 	{
@@ -147,10 +166,6 @@ public:
 	}
 };
 
-
-
-
-#include <pshpack1.h>
 
 
 // Implemented in os_....cpp because light-weight IPC mutual-locks are OS-dependent
@@ -161,15 +176,19 @@ class ConnectRequestQueue : public CLightMutex
 	int tail;
 	CommandNewSessionSrv q[CONNECT_BACKLOG_SIZE];
 public:
+	static ConnectRequestQueue requests;
+	ConnectRequestQueue() { memset(this, 0, sizeof(ConnectRequestQueue)); }
+
 	int Push(const CommandNewSessionSrv *);
 	int Remove(int);
+	CommandNewSessionSrv & operator [](int i) { return q[i < 0 ? 0 : i % CONNECT_BACKLOG_SIZE]; }
 };
 
 
 
 struct PktBufferBlock
 {
-	ALIGN(MAC_ALIGNMENT)
+	ALIGN(FSP_ALIGNMENT)
 	ALFIDPair	fidPair;
 	FSP_FixedHeader hdr;
 	octet	payload[MAX_BLOCK_SIZE];
@@ -179,8 +198,8 @@ struct PktBufferBlock
 
 struct ScatteredSendBuffers
 {
+#if defined(__WINDOWS__)
 	WSABUF	scattered[3];	// at most three segments: the fiberID pair, header and payload
-	ScatteredSendBuffers() { }
 	ScatteredSendBuffers(void * p1, int n1) { scattered[1].buf = (CHAR *)p1; scattered[1].len = n1; }
 	ScatteredSendBuffers(void * p1, int n1, void * p2, int n2)
 	{
@@ -189,6 +208,18 @@ struct ScatteredSendBuffers
 		scattered[2].buf = (CHAR *)p2;
 		scattered[2].len = n2;
 	}
+#elif defined(__linux__) || defined(__CYGWIN__)
+	struct iovec scattered[3];
+	ScatteredSendBuffers(void * p1, int n1) { scattered[1].iov_base = p1; scattered[1].iov_len = n1; }
+	ScatteredSendBuffers(void * p1, int n1, void * p2, int n2)
+	{
+		scattered[1].iov_base = p1;
+		scattered[1].iov_len = n1;
+		scattered[2].iov_base = p2;
+		scattered[2].iov_len = n2;
+	}
+#endif
+	ScatteredSendBuffers() { }
 };
 
 
@@ -213,6 +244,11 @@ struct FSP_KeepAliveExtension
 };
 
 
+struct SAckFlushCache
+{
+	FSP_FixedHeader		hdr;
+	FSP_SelectiveNACK	snack;
+};
 
 
 // Context management of integrity check code
@@ -254,12 +290,13 @@ struct ICC_Context
 	} curr, prev;
 
 #ifndef NDEBUG
+	ALIGN(MAC_ALIGNMENT)
 	uint64_t	_mac_ctx_protect_epilog[2];
 #endif
 	uint64_t	keyLifeRemain;	// in terms of number of octets that could be encrypted
 	octet		masterKey[FSP_MAX_KEY_SIZE];
-	uint32_t	iBatchRecv;
-	uint32_t	iBatchSend;
+	int32_t		iBatchRecv;
+	int32_t		iBatchSend;
 	uint8_t		originalKeyLength;
 	bool		noEncrypt;
 	bool		isPrevSendCRC;
@@ -337,11 +374,8 @@ class CSocketItemEx : public CSocketItem
 	friend class CLowerInterface;
 	friend class CSocketSrvTLB;
 
-	friend void Multiply(CommandCloneSessionSrv&);
+	friend void Multiply(const CommandCloneSessionSrv&);
 
-	HANDLE	hSrcMemory;
-	DWORD	idSrcProcess;
-	//
 	void Destroy();	// override that of the base class
 	bool IsPassive() const { return lowState == LISTENING; }
 	void SetPassive() { lowState = LISTENING; }
@@ -349,6 +383,8 @@ class CSocketItemEx : public CSocketItem
 	bool IsProcessAlive();
 	//
 protected:
+	// TODO: UNRESOLVED! To be analyzed: is it safe to implement reuse of the shared memory?
+	pid_t			idSrcProcess;
 	PktBufferBlock* headPacket;	// But UNRESOLVED! There used to be an independent packet queue for each SCB for sake of fairness
 	int32_t			lenPktData;
 	ControlBlock::seq_t	pktSeqNo;	// in host byte-order
@@ -406,7 +442,7 @@ protected:
 	timestamp_t tPreviousLifeDetection;
 
 	//- There used to be tKeepAlive_ms here. now reserved
-	HANDLE		timer;			// the repeating timer
+	timer_t		timer;			// the repeating timer
 
 	timestamp_t	tSessionBegin;
 	timestamp_t	tLastRecv;
@@ -416,15 +452,6 @@ protected:
 
 	uint32_t	nextOOBSN;	// host byte order for near end. if it overflow the session MUST be terminated
 	uint32_t	lastOOBSN;	// host byte order, the serial number of peer's last out-of-band packet
-
-	// State variables for ACK_FLUSH cache management
-	ControlBlock::seq_t		savedAckedSN;	// Peer's SN acknowledged by the near end
-	ControlBlock::seq_t		savedSendSN;	// SN of the packet carrying SNACK
-	struct SAckFlushCache
-	{
-		FSP_FixedHeader		hdr;
-		FSP_SelectiveNACK	snack;
-	} ALIGN(MAC_ALIGNMENT) cacheAckFlush;
 
 	void AbortLLS(bool haveTLBLocked = false);
 
@@ -457,7 +484,36 @@ protected:
 	void UpdateRTT(ControlBlock::seq_t, uint32_t);
 
 	bool InState(FSP_Session_State s) { return lowState == s; }
-	bool InStates(int n, ...);
+	bool InStates(FSP_Session_State s1, FSP_Session_State s2, FSP_Session_State s3, FSP_Session_State s4)
+	{
+		return (lowState == s1 || lowState == s2 || lowState == s3 || lowState == s4);
+	}
+
+#if __GNUC__ || _MSC_VER >= 1800
+	template<typename... States>
+	bool InStates(FSP_Session_State first, States ... rest)
+	{
+		return lowState == first || InStates(rest...);
+	}
+#else
+	// do some unclever loop-unrolling
+	bool InStates(FSP_Session_State s1, FSP_Session_State s2, FSP_Session_State s3, FSP_Session_State s4
+		, FSP_Session_State s5)
+	{
+		return (lowState == s1 || InStates(s2, s3, s4, s5));
+	}
+	bool InStates(FSP_Session_State s1, FSP_Session_State s2, FSP_Session_State s3, FSP_Session_State s4
+		, FSP_Session_State s5, FSP_Session_State s6)
+	{
+		return (lowState == s1 || lowState == s2 || InStates(s3, s4, s5, s6));
+	}
+	bool InStates(FSP_Session_State s1, FSP_Session_State s2, FSP_Session_State s3, FSP_Session_State s4
+		, FSP_Session_State s5, FSP_Session_State s6, FSP_Session_State s7)
+	{
+		return (lowState == s1 || lowState == s2 || lowState == s3 || InStates(s4, s5, s6, s7));
+	}
+#endif
+
 	// synchronize the state in the 'cache' and the real state in the session control block
 	void SyncState()
 	{
@@ -489,7 +545,7 @@ protected:
 	// return -EEXIST if overridden, -EFAULT if memory error, or payload effectively placed
 	int	PlacePayload();
 
-	int	 SendPacket(register ULONG, ScatteredSendBuffers);
+	int	 SendPacket(register u32, ScatteredSendBuffers);
 	bool EmitStart();
 	bool SendAckFlush();
 	bool SendKeepAlive();
@@ -501,7 +557,12 @@ protected:
 	void KeepAlive();
 	void DoEventLoop();
 
+
+#if defined(__WINDOWS__)
 	static VOID NTAPI KeepAlive(PVOID c, BOOLEAN) { ((CSocketItemEx *)c)->KeepAlive(); }
+#elif defined(__linux__) || defined(__CYGWIN__)
+	static void KeepAlive(union sigval v) { ((CSocketItemEx *)v.sival_ptr)->KeepAlive(); }
+#endif
 
 	static uint32_t GetSalt(const FSP_FixedHeader& h) { return *(uint32_t*)& h; }
 	//
@@ -520,7 +581,16 @@ public:
 
 	bool IsInUse() { return (pControlBlock != NULL); }
 	void ClearInUse();
+
+#if defined(__WINDOWS__)
 	bool TestSetState(FSP_Session_State s0) { return (_InterlockedCompareExchange8((char*)&lowState, s0, 0) == 0); }
+#elif defined(__GNUC__)
+	bool TestSetState(FSP_Session_State s0)
+	{
+		char zero = 0;
+		return (__atomic_compare_exchange_n((char*)&lowState, &zero, s0, 0, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED));
+	}
+#endif
 
 	void InstallEphemeralKey();
 	void InstallSessionKey(const CommandInstallKey &);
@@ -528,23 +598,23 @@ public:
 
 	bool CheckMemoryBorder(ControlBlock::PFSP_SocketBuf p)
 	{
-		uint32_t d = uint32_t((BYTE *)p - (BYTE*)pControlBlock);
-		return (d >= sizeof(ControlBlock) && d < dwMemorySize);
+		long d = long((octet*)p - (octet*)pControlBlock);
+		return (d >= (long)sizeof(ControlBlock) && d < dwMemorySize);
 	}
 
 	// Convert the relative address in the control block to the address in process space
 	// checked, so that ill-behaviored ULA may not cheat LLS to access data of others
-	BYTE * GetSendPtr(const ControlBlock::PFSP_SocketBuf skb)
+	octet* GetSendPtr(const ControlBlock::PFSP_SocketBuf skb)
 	{
-		uint32_t offset;
-		BYTE * p = pControlBlock->GetSendPtr(skb, offset);
-		return (offset < sizeof(ControlBlock) || offset >= dwMemorySize) ? NULL : p;
+		long offset;
+		octet* p = pControlBlock->GetSendPtr(skb, offset);
+		return (offset < (long)sizeof(ControlBlock) || offset >= dwMemorySize) ? NULL : p;
 	}
-	BYTE * GetRecvPtr(const ControlBlock::PFSP_SocketBuf skb)
+	octet* GetRecvPtr(const ControlBlock::PFSP_SocketBuf skb)
 	{
-		uint32_t offset;
-		BYTE * p = pControlBlock->GetRecvPtr(skb, offset);
-		return (offset < sizeof(ControlBlock) || offset >= dwMemorySize) ? NULL : p;
+		long offset;
+		octet* p = pControlBlock->GetRecvPtr(skb, offset);
+		return (offset < (long)sizeof(ControlBlock) || offset >= dwMemorySize) ? NULL : p;
 	}
 
 	ControlBlock::seq_t GetRecvWindowFirstSN() { return (ControlBlock::seq_t)LCKREAD(pControlBlock->recvWindowFirstSN); }
@@ -557,7 +627,7 @@ public:
 	void SetNearEndInfo(const CtrlMsgHdr & nearInfo)
 	{
 		pControlBlock->nearEndInfo.cmsg_level = nearInfo.pktHdr.cmsg_level;
-		*(FSP_SINKINF *)& pControlBlock->nearEndInfo = nearInfo.u;
+		nearInfo.CopySinkInfTo(&pControlBlock->nearEndInfo);
 	}
 	void SetRemoteFiberID(ALFID_T id);
 
@@ -573,16 +643,22 @@ public:
 	// Remark
 	//	Successive notifications of the same code are automatically merged
 	//	'Non-Mask-able-Interrupt' is not merged, and soft NMI is raised immediately 
+#if defined(__WINDOWS__)
+	void TriggerULA() { ::SetEvent(hEvent); }
+#elif defined(__linux__) || defined(__CYGWIN__)
+	void TriggerULA() { /* take use of pure polling instead */ }
+#endif
 	void Notify(FSP_NoticeCode n)
 	{
-		if ((unsigned long)n >= SMALLEST_FSP_NMI)
+		if ((int)n >= SMALLEST_FSP_NMI)
 		{
 			_InterlockedExchange8(&pControlBlock->notices.nmi, (char)n);
-			::SetEvent(hEvent);
+			TriggerULA();
 			return;
 		}
-		unsigned char	b = _interlockedbittestandset((long *)&pControlBlock->notices.vector, n);
+		long			b = pControlBlock->notices.vector & (1 << (char)n);
 		long			v = pControlBlock->notices.vector & 1;
+		pControlBlock->notices.vector |= (1 << (char)n);
 #if (TRACE & TRACE_ULACALL)
 		if (b)
 		{
@@ -597,9 +673,9 @@ public:
 		printf_s("\nSession #%u raise soft interrupt %s(%d)\n", fidPair.source, noticeNames[n], n);
 #endif
 		if (b == 0 && v == 0)
-			::SetEvent(hEvent);
+			TriggerULA();
 	}
-	void SignalFirstEvent(FSP_NoticeCode code) { pControlBlock->notices.SetHead(code); ::SetEvent(hEvent); }
+	void SignalFirstEvent(FSP_NoticeCode code) { pControlBlock->notices.SetHead(code); TriggerULA(); }
 	//
 	int LOCALAPI AcceptSNACK(ControlBlock::seq_t, FSP_SelectiveNACK::GapDescriptor *, int);
 	//
@@ -642,7 +718,7 @@ public:
 	// Check whether previous KEEP_ALIVE is implicitly acknowledged on getting a validated packet
 	inline void CheckAckToKeepAlive();
 
-	void ScheduleConnect(CommandNewSessionSrv *);
+	void ScheduleConnect(int);
 	// On Feb.17, 2019 Semantics of KeepAlive was fundamentally changed. Now it is the heartbeat of the local side
 	// Send-pacing is a yet-to-implement feature of the rate-control based congestion control sublayer/manager
 	void RestartKeepAlive() { ReplaceTimer(TIMER_SLICE_ms * 2); }
@@ -667,7 +743,6 @@ public:
 	void HandleFullICC(PktBufferBlock *, FSPOperationCode);
 };
 
-#include <poppack.h>
 
 
 // The backlog of connection multiplication, for buffering the payload piggybacked by the MULTIPLY packet
@@ -699,14 +774,12 @@ public:
 
 
 // The translate look-aside buffer of the server's socket pool
-class CSocketSrvTLB
+class CSocketSrvTLB: CSRWLock
 {
 protected:
-	SRWLOCK rtSRWLock;	// runtime Slim-Read-Write Lock
+	friend class CSocketItemEx;
 
-	ALIGN(MAC_ALIGNMENT)
 	CSocketItemEx listenerSlots[MAX_LISTENER_NUM];
-	ALIGN(MAC_ALIGNMENT)
 	CSocketItemEx itemStorage[MAX_CONNECTION_NUM];
 
 	// The translation look-aside buffer of the socket items
@@ -722,18 +795,11 @@ protected:
 		CSocketItemEx	*pSocket;
 		timestamp_t		timeRecycled;
 	}		scavengeCache[MAX_CONNECTION_NUM];
-	LONG	topOfSC;
+	u32		topOfSC;
 	bool	PutToScavengeCache(CSocketItemEx *, timestamp_t);
 
-	void InitMutex() { InitializeSRWLock(&rtSRWLock); }
 public:
 	CSocketSrvTLB();
-#ifdef NDEBUG
-	void AcquireMutex() { AcquireSRWLockExclusive(& rtSRWLock); }
-#else
-	void AcquireMutex();
-#endif
-	void ReleaseMutex() { ReleaseSRWLockExclusive(& rtSRWLock); }
 
 	CSocketItemEx * AllocItem(const CommandNewSessionSrv &);
 	CSocketItemEx * AllocItem(ALFID_T);
@@ -751,68 +817,173 @@ public:
 
 
 
+// Let the compiler do loop-unrolling and embedding
+static inline bool LOCALAPI IsInSubnetSet(uint64_t prefix, const TSubnets subnets)
+{
+	for (register int i = 0; i < MAX_PHY_INTERFACES; i++)
+	{
+		if (subnets[i] == prefix)
+			return true;
+	}
+	return false;
+}
+
+
+
 // A singleton
 class CLowerInterface: public CSocketSrvTLB
 {
 private:
 	friend class CSocketItemEx;
 
-	static const u_int SD_SETSIZE = 32;	// hard-coded, bit number of LONG; assume FD_SETSIZE >= 32
+	// limit socket set size to no greater than bit number of long integer
+	static const int SD_SETSIZE = 31;
+	int		interfaces[SD_SETSIZE];
+	long	disableFlags;
+	SOCKADDR_IN6 addresses[SD_SETSIZE];	// by default IPv6 addresses, but an entry might be a UDP over IPv4 address
 
+#if defined(__WINDOWS__)
 	HANDLE	thReceiver;	// the handle of the thread that listens
 	HANDLE	hMobililty;	// handling mobility, the handle of the address-changed event
-
-	SOCKET	sdSend;		// the socket descriptor, would at last be unbound for sending only
 	fd_set	sdSet;		// set of socket descriptor for listening, one element for each physical interface
-	DWORD	interfaces[FD_SETSIZE];
-	SOCKADDR_IN6 addresses[FD_SETSIZE];	// by default IPv6 addresses, but an entry might be a UDP over IPv4 address
+	SOCKET	sdSend;		// the socket descriptor, would at last be unbound for sending only
+
+# define	LOOP_FOR_ENABLED_INTERFACE(stmt)	\
+	for (register u_int i = 0;		\
+		i < sdSet.fd_count;			\
+		i++)						\
+	{ if (!BitTest(&disableFlags, i)) stmt }
+
+	int SetEffectiveALFID(PIN6_ADDR hintAddr, ALFID_T id1)
+	{
+		for (register u_int j = 0; j < sdSet.fd_count; j++)
+		{
+			if (*(uint64_t*)hintAddr == *(uint64_t*)&addresses[j].sin6_addr)
+			{
+				*(ALFID_T*)((octet *)hintAddr + 12) = id1;
+				return interfaces[j];
+			}
+		}
+		return -1;
+	}
+
+# ifndef OVER_UDP_IPv4
+	DWORD	iRecvAddr;		// index into addresses
+	inline	void DisableSocket(SOCKET);
+#else
+	void	DisableSocket(SOCKET) {}
+# endif
+
+#elif defined(__linux__) || defined(__CYGWIN__)
+	const octet in6addr_linklocalprefix[8] = { 0xFE, 0x80, 00, 00, 00, 00, 00, 00 };
+	const octet in6addr_6to4prefix[2] = { 0x20, 0x02 };
+	const octet in6addr_teredoprefix[4] = { 0x20, 0x01, 0, 0};
+
+	pthread_t	thReceiver;	// the handle of the thread that listens
+	sigevent_t	hMobililty;	// handling mobility, the handle of the address-changed event
+	int		sdSet[SD_SETSIZE];
+	int		sdSend;		// the socket descriptor, would at last be unbound for sending only
+	int		countInterfaces;	// Should be less than SD_SETSIZE
+
+# define	LOOP_FOR_ENABLED_INTERFACE(stmt)	\
+	for (register int i = 0;	\
+		i < countInterfaces;	\
+		i++)					\
+	{ if ((disableFlags & (i << 1)) == 0) stmt }
+
+	int SetEffectiveALFID(PIN6_ADDR hintAddr, ALFID_T id1)
+	{
+		for (register int j = 0; j < countInterfaces; j++)
+		{
+			if (*(uint64_t*)hintAddr == *(uint64_t*)&addresses[j].sin6_addr)
+			{
+				*(ALFID_T*)((octet *)hintAddr + 12) = id1;
+				return interfaces[j];
+			}
+		}
+		return -1;
+	}
+#endif
+
+	int GetSubnets(TSubnets& subnets, const TSubnets& savedPathNearEnds)
+	{
+		memset(subnets, 0, sizeof(TSubnets));
+		int j = 0;
+		LOOP_FOR_ENABLED_INTERFACE
+		({
+			register uint64_t prefix = SOCKADDR_SUBNET(&addresses[i]);
+			if (!IsInSubnetSet(prefix, savedPathNearEnds))
+			{
+				subnets[j++] = prefix;
+				if (j >= MAX_PHY_INTERFACES)
+					break;
+			}
+		})
+		return j;
+	}
+
+	int		BindSendRecv(const SOCKADDR_IN *, int);
 #if defined(_DEBUG) && defined(_WINDLL)
 	friend void UnitTestSelectPath();
 #endif
 
-	LONG	disableFlags;	// harf of the default FD_SETSIZE
-#ifndef OVER_UDP_IPv4
-	ULONG	iRecvAddr;		// index into addresses
-	inline	void DisableSocket(SOCKET);
-#else
-	// For FSP over UDP/IPv4 bind the UDP-socket
-	void DisableSocket(SOCKET) {}
-	int BindSendRecv(const SOCKADDR_IN *, int);
-#endif
-
 	// intermediate buffer to hold the fixed packet header, the optional header and the data
 	PktBufferBlock	pktBuf[1];
-	DWORD	countRecv;
+	int32_t			countRecv;
 
 	// storage location part of the particular receipt of a remote packet, respectively
 	// remote-end address and near-end address
 	SOCKADDR_INET	addrFrom;
 	CtrlMsgHdr		nearInfo;
+
 	// descriptor of what is received, i.e. the particular receipt of a remote packet
+#if defined(__WINDOWS__)
+	WSABUF			iovec[2];
 	WSAMSG			mesgInfo;
+	LPSOCKADDR		GetPacketSource() const { return LPSOCKADDR(mesgInfo.name); }
+	ALFID_T			GetRemoteFiberID() const  { return SOCKADDR_ALFID(mesgInfo.name); }
+	const CtrlMsgHdr* GetPacketNearInfo() const { return (CtrlMsgHdr*)mesgInfo.Control.buf; }
+	void			CopySinkInfTo(CtrlMsgHdr& hdrInfo)
+	{
+		memcpy(&hdrInfo, mesgInfo.Control.buf, min(mesgInfo.Control.len, sizeof(hdrInfo)));
+	}
+#elif defined(__linux__) || defined(__CYGWIN__)
+	struct iovec  	iovec[2];
+	struct msghdr	mesgInfo;
+	const struct sockaddr* GetPacketSource() const { return (const struct sockaddr*)mesgInfo.msg_name; }
+	ALFID_T			GetRemoteFiberID() const  { return SOCKADDR_ALFID(mesgInfo.msg_name); }
+	const CtrlMsgHdr* GetPacketNearInfo() const { return (CtrlMsgHdr*)mesgInfo.msg_control; }
+	void			CopySinkInfTo(CtrlMsgHdr& hdrInfo)
+	{
+		memcpy(&hdrInfo, mesgInfo.msg_control, min((size_t)mesgInfo.msg_controllen, sizeof(hdrInfo)));
+	}
+#endif
 
 	template<typename THdr> THdr * FSP_OperationHeader() { return (THdr *) & pktBuf->hdr; }
 
 	ALFID_T			GetLocalFiberID() const { return nearInfo.u.idALF; }
 	ALFID_T			SetLocalFiberID(ALFID_T);
-	ALFID_T			GetRemoteFiberID() const  { return SOCKADDR_ALFID(mesgInfo.name); }
 
 	CSocketItemEx	*MapSocket() { return (*this)[GetLocalFiberID()]; }
 
 protected:
 	// defined in remote.cpp
+	int	 LOCALAPI ProcessReceived();
 	// processing individual type of packet header
 	void LOCALAPI OnGetInitConnect();
 	void LOCALAPI OnInitConnectAck();
 	void LOCALAPI OnGetConnectRequest();
 
-	// defined in mobile.cpp
-	int LOCALAPI EnumEffectiveAddresses(uint64_t *);
-	int	AcceptAndProcess(SOCKET);
-
+	// FSP over IPv6 and FSP over UDP/IPv4 have different implementation
 	// defined in os-dependent source file
-	inline int SetInterfaceOptions(SOCKET);
-	static DWORD WINAPI ProcessRemotePacket(LPVOID);
+	int LOCALAPI EnumEffectiveAddresses(uint64_t *);
+#if defined(__WINDOWS__)
+	inline	int SetInterfaceOptions(SOCKET);
+	static	DWORD WINAPI ProcessRemotePacket(LPVOID);
+#elif defined(__linux__) || defined(__CYGWIN__)
+	inline	int SetInterfaceOptions(int);
+	static	void * ProcessRemotePacket(void *);
+#endif
 
 public:
 	~CLowerInterface() { Destroy(); }
@@ -836,34 +1007,21 @@ public:
 	// For FSP over IPv6 raw-socket, preconfigure an IPv6 interface with ALFID pool
 	inline void SetLocalApplicationLayerFiberIDs(int);
 	//
-	inline void RemoveALFIDAddressPool(ULONG);		// ULONG: NET_IFINDEX
+	inline void RemoveALFIDAddressPool(u32);		// ULONG: NET_IFINDEX
 	// When an interface is removed/disabled, e.g. due to administrative shutdown at least one IPv6 address is unregistered
-	inline void OnRemoveIPv6Address(ULONG, const IN6_ADDR &);	// ULONG: NET_IFINDEX
+	inline void OnRemoveIPv6Address(u32, const IN6_ADDR &);	// ULONG: NET_IFINDEX
 	// When an interface is enabled, at least one new IPv6 address is added. More detail needed here than OnRemove
-	inline void OnAddingIPv6Address(ULONG, const SOCKADDR_IN6 &);	// ULONG: NET_IFINDEX
-	inline void OnIPv6AddressMayAdded(ULONG, const SOCKADDR_IN6 &);	// ULONG: NET_IFINDEX
+	inline void OnAddingIPv6Address(u32, const SOCKADDR_IN6 &);	// ULONG: NET_IFINDEX
+	inline void OnIPv6AddressMayAdded(u32, const SOCKADDR_IN6 &);	// ULONG: NET_IFINDEX
 	//
-	bool LOCALAPI SelectPath(PFSP_SINKINF, ALFID_T, ULONG, const SOCKADDR_INET *);
+	bool LOCALAPI SelectPath(PFSP_SINKINF, ALFID_T, u32, const SOCKADDR_INET *);
 #else
 	// No, in IPv4 network FSP does not support multi-path
-	bool SelectPath(PFSP_SINKINF, ALFID_T, ULONG, const SOCKADDR_INET *) { return false; }
+	bool SelectPath(PFSP_SINKINF, ALFID_T, u32, const SOCKADDR_INET *) { return false; }
 #endif
 
 	static CLowerInterface Singleton;	// this class is effectively a namespace
 };
-
-
-
-// OS-specific time wheel management
-class TimerWheel
-{
-	static HANDLE	timerQueue;
-public:
-	static HANDLE	Singleton() { return timerQueue; }
-	TimerWheel();
-	~TimerWheel();
-};
-
 
 // defined in socket.cpp
 void LOCALAPI DumpHexical(const void *, int);

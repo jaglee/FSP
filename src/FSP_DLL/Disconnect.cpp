@@ -82,42 +82,6 @@ int  CSocketItemDl::Dispose()
 
 
 
-// Unlike Free, Recycle-locked does not destroy the control block
-// so that the DLL socket may be reused on connection resumption
-// assume the socket has been locked
-int CSocketItemDl::RecycLocked()
-{
-	register HANDLE h;
-	CancelTimeout();
-	if ((h = InterlockedExchangePointer((PVOID*)&theWaitObject, NULL)) != NULL)
-		UnregisterWaitEx(h, NULL);
-
-	socketsTLB.FreeItem(this);
-
-	SetMutexFree();
-	return 0;
-}
-
-
-
-// Make sure resource is kept until other threads leave critical section
-// Does NOT waits for all callback functions to complete before returning
-// in case of deadlock when the function itself is called in some call-back function
-void CSocketItemDl::Free()
-{
-	register HANDLE h;
-	CancelTimeout();
-	if((h = InterlockedExchangePointer((PVOID *) & theWaitObject, NULL)) != NULL)
-		UnregisterWaitEx(h, NULL);
-
-	socketsTLB.FreeItem(this);
-
-	CSocketItem::Destroy();
-	memset((octet *)this + sizeof(CSocketItem), 0, sizeof(CSocketItemDl) - sizeof(CSocketItem));
-}
-
-
-
 // Set the function to be called back on passively shutdown by the remote end
 DllSpec
 int FSPAPI SetOnRelease(FSPHANDLE hFSPSocket, NotifyOrReturn fp1)
@@ -125,7 +89,7 @@ int FSPAPI SetOnRelease(FSPHANDLE hFSPSocket, NotifyOrReturn fp1)
 	CSocketItemDl* p = CSocketDLLTLB::HandleToRegisteredSocket(hFSPSocket);
 	if (p == NULL)
 		return -EFAULT;
-	return p->SetOnRelease(fp1);
+	return p->SetOnRelease((PVOID)fp1);
 }
 
 
@@ -175,7 +139,7 @@ int CSocketItemDl::Shutdown()
 
 	if (InState(SHUT_REQUESTED))
 	{
-		NotifyOrReturn fp1 = (NotifyOrReturn)InterlockedExchangePointer((PVOID*)&fpFinished, NULL);
+		NotifyOrReturn fp1 = (NotifyOrReturn)_InterlockedExchangePointer((PVOID*)&fpFinished, NULL);
 		SetState(CLOSED);
 		RecycLocked();
 		if (fp1 != NULL)

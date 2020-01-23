@@ -30,11 +30,11 @@
 #ifndef _CH_AUTH_KEY_AGREEMENT_H
 #define _CH_AUTH_KEY_AGREEMENT_H
 
-#include "../Intrins.h"
-
+#include <stdio.h>
 #include "CryptoStub.h"
 
-#define CRYPTO_SALT_LENGTH	16	// 128 bits
+#define CRYPTO_SALT_LENGTH		16	// 128 bits
+#define USER_PASSPHRASE_MAXLEN	48	// effectively maximum 47 octets, including the terminating zero
 
 struct SCHAKAPublicInfo
 {
@@ -53,33 +53,15 @@ struct SCHAKAPublicInfo
 
 
 
-/**
- * inline functions
- */
-
-#ifdef __cplusplus
-#define SINLINE static inline
-#else
-#define SINLINE static __inline__
-#endif
-
-
-
 SINLINE
-int MakeSaltedPassword(octet clientInputHash[CRYPTO_NACL_HASHBYTES], const octet salt[CRYPTO_SALT_LENGTH], const char * inputPassword)
+int MakeSaltedPassword(octet clientInputHash[CRYPTO_NACL_HASHBYTES], const octet salt[CRYPTO_SALT_LENGTH], const char* inputPassword)
 {
 	const int len = (int)strlen(inputPassword);
-	octet *clientPasswordHashMaterial = (octet *)_alloca(CRYPTO_SALT_LENGTH + len);
-	if(clientPasswordHashMaterial == NULL)
-	{
-#ifdef TRACE
-		printf_s("Stack overflow in %s, line#%d\n", __FILE__, __LINE__ - 4);
-#endif
-		return -1;
-	}
+	octet clientPasswordHashMaterial[CRYPTO_SALT_LENGTH + USER_PASSPHRASE_MAXLEN];
 
+	memcpy(clientPasswordHashMaterial + CRYPTO_SALT_LENGTH, inputPassword
+		, (len >= USER_PASSPHRASE_MAXLEN ? USER_PASSPHRASE_MAXLEN : len));
 	memcpy(clientPasswordHashMaterial, salt, CRYPTO_SALT_LENGTH);
-	memcpy(clientPasswordHashMaterial + CRYPTO_SALT_LENGTH, inputPassword, len);
 	return CryptoNaClHash(clientInputHash, clientPasswordHashMaterial, CRYPTO_SALT_LENGTH + len);
 }
 
@@ -98,7 +80,7 @@ void MakeResponse(octet cResponse[CRYPTO_NACL_HASHBYTES]
 	memcpy(responseMaterial, bufPublicKey, CRYPTO_NACL_KEYBYTES);
 	*(timestamp_t *)(responseMaterial + CRYPTO_NACL_KEYBYTES) = nonce;
 	// we're definitely sure that the length of responseMaterial is some multiplication of 8-octect
-	for (register int i = 0; i < sizeof(responseMaterial) / sizeof(uint64_t); i++)
+	for (register unsigned i = 0; i < sizeof(responseMaterial) / sizeof(uint64_t); i++)
 	{
 		((uint64_t *)responseMaterial)[i] ^= mask;
 	}
@@ -219,7 +201,7 @@ void ChakaStreamcrypt(octet *buf
 		km.nonce ^= htobe64((uint64_t)i + 1);
 		sha256_hash(hashValue, (octet *)& km, sizeof(km));
 		//
-		k = min(SHA256_DIGEST_SIZE, len);
+		k = (len >= SHA256_DIGEST_SIZE ? len : SHA256_DIGEST_SIZE);
 		for(register int32_t j = 0; j < k; j++)
 		{
 			buf[i] = input[i] ^ hashValue[j];

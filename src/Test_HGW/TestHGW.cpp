@@ -84,7 +84,7 @@ int main()
 	//	"Referer:http://news.qq.com\r\n"
 	//	"\r\n";
 	// Cookie, User-Agent, Accept-Language were not sent
-	r = send(h, getURI, strlen(getURI), 0);
+	r = send(h, getURI, (int)strlen(getURI), 0);
 	if(r == SOCKET_ERROR)
 	{
 		printf_s("send request failed with error number: %d\n", WSAGetLastError());

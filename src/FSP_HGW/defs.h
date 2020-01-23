@@ -26,32 +26,35 @@
     ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
     POSSIBILITY OF SUCH DAMAGE.
  */
-
-#ifdef WIN32
-#include <WinSock2.h>
-#include <mstcpip.h>
-#include <MSWSock.h>
 #include "../FSP_API.h"
-#include "../Crypto/CryptoStub.h"
-#pragma comment(lib, "Ws2_32.lib")
-#else
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <unistd.h>
-#include <strings.h>
-#include <pthread.h>
-#include <sys/wait.h>
-#define _strcmpi strcasecmp
+#include <malloc.h>
+
+#if defined(__WINDOWS__)
+
+# include <WinSock2.h>
+# include <mstcpip.h>
+
+#elif defined(__linux__) || defined(__CYGWIN__)
+
+# include <arpa/inet.h>
+# include <netinet/in.h>
+# define MAX_PATH   260
+# define SD_SEND	SHUT_RD
+# define SD_BOTH	SHUT_RDWR
+# define USHRT_MAX  0xffff        // maximum unsigned short value
+
+# define SOCKET_ERROR   (-1)
+
+typedef int				SOCKET;
+typedef struct sockaddr	SOCKADDR, * PSOCKADDR;
+typedef struct sockaddr_in	SOCKADDR_IN, * PSOCKADDR_IN;
+
 #endif
 
-#include "../FSP_API.h"
-#include "../Crypto/CryptoStub.h"
-
-#define DEFAULT_FILE	"index.html"
-#define	BUFFER_POOL_SIZE 65536
-#define DEFAULT_SOCKS_PORT 1080
-#define HTTP_SUCCESS_HEADER  "HTTP/1.0 200 OK\r\n"
+#define DEFAULT_FILE		"index.html"
+#define	BUFFER_POOL_SIZE	65536
+#define DEFAULT_SOCKS_PORT	1080
+#define HTTP_SUCCESS_HEADER	"HTTP/1.0 200 OK\r\n"
 
 // Edge and Chrome on Windows by default use IE settings
 // Firefox support both SOCKS4 and SOCKS5
@@ -74,7 +77,8 @@ enum ERepCode: octet
 };
 
 
-#include <pshpack1.h>
+#pragma pack(push)
+#pragma pack(1)
 
 typedef struct SRequestResponse
 {
@@ -107,7 +111,7 @@ typedef struct SRequestPoolItem
 } *PRequestPoolItem;
 
 
-#include <poppack.h>
+#pragma pack(pop)
 
 
 class RequestPool

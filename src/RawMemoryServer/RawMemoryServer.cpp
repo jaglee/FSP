@@ -7,6 +7,8 @@
 #include "stdafx.h"
 
 const char		*defaultWelcome = "Memory pattern transfer to test purpose, based on Flexible Session Protocol, version 0.1";
+const char 		*fileName =  "$memory.^";
+
 unsigned char	bufPeerPublicKey[CRYPTO_NACL_KEYBYTES];
 
 volatile bool	finished = false;
@@ -21,7 +23,6 @@ extern int	FSPAPI WeakSecurity_onAccepted(FSPHANDLE, PFSP_Context);
 extern int	FSPAPI SendMemory_onAccepted(FSPHANDLE, PFSP_Context);
 
 
-static char* fileName = "$memory.^";
 static uint8_t* bytesToSend;
 static size_t	sizeOfBuffer;
 
@@ -46,16 +47,6 @@ void FSPAPI onNotice(FSPHANDLE h, FSP_ServiceCode code, int value)
 
 
 
-// The function called back when an FSP connection was released. Parameters are self-describing
-static void FSPAPI onFinish(FSPHANDLE h, FSP_ServiceCode code, int)
-{
-	printf_s("Socket %p, session was to shut down, service code = %d.\n", h, code);
-	finished = true;
-	return;
-}
-
-
-
 // The actual top-level control function to accept the requests for new connections
 // Given
 //	const char *		The welcome message string. The message should only be encoded in multi-byte character set
@@ -74,7 +65,7 @@ void FSPAPI WaitConnection(const char *thisWelcome, unsigned short mLen, Callbac
 	params.sendSize = MAX_FSP_SHM_SIZE;
 	params.recvSize = 0;	// minimal receiving for download server
 
-#ifdef _DEBUG
+#if defined(_DEBUG) || defined(OVER_UDP_IPv4)
 	TranslateFSPoverIPv4(& atAddress, 0, htobe32(80));	//INADDR_ANY
 #else
 	atAddress.subnet = 0xAAAA00E0;	// 0xE0 00 AA AA	// shall be learned
@@ -83,6 +74,11 @@ void FSPAPI WaitConnection(const char *thisWelcome, unsigned short mLen, Callbac
 #endif
 
 	hFspListen = ListenAt(& atAddress, & params);
+	if (hFspListen == NULL)
+	{
+		printf_s("Cannot listen on given local address.\n");
+		return;
+	}
 
 	while(!finished)
 		Sleep(50);	// yield CPU out for about 1/20 second
@@ -98,7 +94,7 @@ void FSPAPI WaitConnection(const char *thisWelcome, unsigned short mLen, Callbac
 // Case 2: for test, send memory pattern with encryption, the length might be specified at command line
 int _tmain(int argc, TCHAR * argv[])
 {
-	errno_t	err = 0;
+	int	err = 0;
 
 	if(argc != 1 && argc != 2)
 	{
@@ -109,7 +105,10 @@ int _tmain(int argc, TCHAR * argv[])
 	if(argc == 1)
 	{
 		WaitConnection(defaultWelcome, (uint16_t)strlen(defaultWelcome) + 1, WeakSecurity_onAccepted);
-		goto l_return;
+l_return:
+		printf("\n\nPress Enter to exit...");
+		getchar();
+		return err;
 	}
 	
 	unsigned short mLen = (unsigned short)strlen(defaultWelcome) + 1;
@@ -120,7 +119,7 @@ int _tmain(int argc, TCHAR * argv[])
 
 	if(argc == 3)
 	{
-		size_t sizeOfBuffer = (size_t)_ttoi64(argv[2]);
+		int64_t sizeOfBuffer = _ttoi64(argv[2]);
 		if(sizeOfBuffer < 4)
 		{
 			_tprintf_s(_T("Usage: %s <filename> [length-of-memory-pattern >= 4]\n"), argv[0]);
@@ -128,7 +127,7 @@ int _tmain(int argc, TCHAR * argv[])
 			goto l_return;
 		}
 		//
-		if(!PrepareMemoryPattern(sizeOfBuffer))
+		if(!PrepareMemoryPattern((size_t)sizeOfBuffer))
 			goto l_return;
 	}
 	else if(! PrepareMemoryPattern(FSP_MAX_KEY_SIZE))	// Just send a key
@@ -137,11 +136,7 @@ int _tmain(int argc, TCHAR * argv[])
 	}
 
 	WaitConnection(thisWelcome, mLen + CRYPTO_NACL_KEYBYTES, SendMemory_onAccepted);
-
-l_return:
-	printf("\n\nPress Enter to exit...");
-	getchar();
-	return err;
+	goto l_return;
 }
 
 
@@ -154,8 +149,8 @@ static int	FSPAPI onAccepting(FSPHANDLE h, PFSP_SINKINF p, PFSP_IN6_ADDR remoteA
 	printf_s("\nTo accept handle of FSP session: %p\n", h);
 	printf_s("Interface#%d, fiber#%u\n", p->ipi6_ifindex, p->idALF);
 	printf_s("Remote address: 0x%X::%X::%X::%X\n"
-		, be32toh(*(u_long*)& remoteAddr->subnet)
-		, be32toh(*((u_long*)& remoteAddr->subnet + 1))
+		, be32toh(*(u32*)& remoteAddr->subnet)
+		, be32toh(*((u32*)& remoteAddr->subnet + 1))
 		, be32toh(remoteAddr->idHost), be32toh(remoteAddr->idALF));
 	return 0;	// no opposition
 }
@@ -250,8 +245,10 @@ static int FSPAPI toSendNextBlock(FSPHANDLE h, void* batchBuffer, int32_t capaci
 		return -ENOMEM;
 	}
 
-	int bytesRead = __min((int32_t)sizeOfBuffer - offset, capacity);
-	if (bytesRead <= 0)
+	int32_t bytesRead = (int32_t)(sizeOfBuffer - offset);
+	if (bytesRead > capacity)
+		bytesRead = capacity;
+	else if (bytesRead <= 0)
 		return EOF;
 
 	memcpy(batchBuffer, bytesToSend + offset, bytesRead);

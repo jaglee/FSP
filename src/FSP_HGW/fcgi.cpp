@@ -1,3 +1,4 @@
+// Fast CGI support. Not implemeneted yet
 /**
  *
 	fastcgi_param   QUERY_STRING            $query_string;
@@ -24,39 +25,11 @@
 	fastcgi_param   SERVER_NAME             $server_name;
 
 	fastcgi_param   HTTPS                   $https;
-
-	# PHP only, required if PHP was built with --enable-force-cgi-redirect
-	fastcgi_param   REDIRECT_STATUS         200;
  *
  */
-#include <stdio.h>
-#include <ctype.h>
-#include <string.h>
-#include <stdlib.h>
-#include <malloc.h>
-#include <fcntl.h>
-#include <io.h>
-#include <sys/types.h>
-#include <sys/stat.h>
+#include "fsp_http.h"
 
-#ifdef WIN32
-#include <WinSock2.h>
-#include "../FSP_API.h"
-#include "../Crypto/CryptoStub.h"
-#else
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <unistd.h>
-#include <strings.h>
-#include <pthread.h>
-#include <sys/wait.h>
-#define _strcmpi strcasecmp
-#endif
-
-
-
-#ifdef WIN32
+#ifdef _WIN32
 #define PIPE_WIDTH 4096
 void execute_cgi(FSPHANDLE client
 				 , const char *path
@@ -110,7 +83,7 @@ void execute_cgi(FSPHANDLE client
 	}
 
 	sprintf(buf, "HTTP/1.0 200 OK\r\n");
-	send(client, buf, strlen(buf), 0);
+	send((int)(long)client, buf, strlen(buf), 0);
 
 	if (pipe(cgi_output) < 0)
 	{
@@ -162,12 +135,13 @@ void execute_cgi(FSPHANDLE client
 		{
 			for (i = 0; i < content_length; i++)
 			{
-			recv(client, &c, 1, 0);
-			write(cgi_input[1], &c, 1);
+				recv((int)(long)client, &c, 1, 0);
+				write(cgi_input[1], &c, 1);
 			}
 		}
+
 		while (read(cgi_output[0], &c, 1) > 0)
-			send(client, &c, 1, 0);
+			send((int)(long)client, &c, 1, 0);
 
 		close(cgi_output[0]);
 		close(cgi_input[1]);

@@ -31,45 +31,172 @@
     POSSIBILITY OF SUCH DAMAGE.
  */
 
-//// Comment the whole block of the three lines to disable forcing FSP over IPv6
-//#ifdef OVER_UDP_IPv4
-//#undef OVER_UDP_IPv4
-//#endif
-
-#ifdef _MSC_VER
-#include <ws2tcpip.h>
-#include <mswsock.h>
-#else
-#include <netinet/in.h>
-#include <netinet/ip6.h>
-#endif
-
-#include <limits.h>
-#include <errno.h>
-#include <stdio.h>
-
 #include "FSP.h"
 
-#pragma intrinsic(_InterlockedCompareExchange, _InterlockedCompareExchange8)
-#pragma intrinsic(_InterlockedExchange, _InterlockedExchange8)
-#pragma intrinsic(_InterlockedExchangeAdd, _InterlockedIncrement)
-#pragma intrinsic(_InterlockedOr, _InterlockedOr8)
+/**
+ * Implementation defined timeout
+ */
 
-#define LCKREAD(dword) _InterlockedOr((volatile long *)&dword, 0)
+#if defined(__WINDOWS__)
 
+# define WIN32_LEAN_AND_MEAN
+# include <windows.h>
+# include <ws2tcpip.h>
+# include <mswsock.h>
+
+# define _CRT_RAND_S
+# define REVERSE_EVENT_PREFIX	"Global\\FlexibleSessionProtocolEvent"
+# define SERVICE_MAILSLOT_NAME	"\\\\.\\mailslot\\flexible\\session\\protocol"
+
+# ifdef TRACE
+   void TraceLastError(const char * fileName, int lineNo, const char *funcName, const char *s1);
+#  define REPORT_ERROR_ON_TRACE() \
+	TraceLastError(__FILE__, __LINE__, __FUNCTION__, "ERROR REPORT")
+#  define REPORT_ERRMSG_ON_TRACE(s1) \
+	TraceLastError(__FILE__, __LINE__, __FUNCTION__, (s1))
+# endif
+# ifdef _DEBUG
+#  define DEINIT_WAIT_TIMEOUT_ms		15000	// 15 seconds
+#  define BREAK_ON_DEBUG()			DebugBreak()
+# else
+#  define DEINIT_WAIT_TIMEOUT_ms		5000	// 5 seconds
+#  define BREAK_ON_DEBUG()
+# endif
+
+# define MAX_LOCK_WAIT_ms			60000	// one minute
+# define TIMER_SLICE_ms				5
+
+# if defined(_MSC_VER) || defined(_MSC_EXTENSIONS)
+#  define DELTA_EPOCH_IN_MICROSECS  11644473600000000Ui64
+# else
+#  define DELTA_EPOCH_IN_MICROSECS  11644473600000000ULL
+# endif
+
+typedef DWORD	pid_t;
+typedef HANDLE	timer_t;
+
+class CSRWLock
+{
+protected:
+	SRWLOCK rtSRWLock;	// runtime Slim-Read-Write Lock
+	void InitMutex() { InitializeSRWLock(&rtSRWLock); }
+# if defined(_DEBUG)
+	void AcquireMutex()
+	{
+		uint64_t t0 = GetTickCount64();
+		while (!TryAcquireSRWLockExclusive(&rtSRWLock))
+		{
+			if (GetTickCount64() - t0 > MAX_LOCK_WAIT_ms)
+			{
+				BREAK_ON_DEBUG();	// To trace the call stack
+				throw - EDEADLK;
+			}
+			Sleep(TIMER_SLICE_ms);	// if there is some thread that has exclusive access on the lock, wait patiently
+		}
+	}
+# else
+	void AcquireMutex() { AcquireSRWLockExclusive(&rtSRWLock); }
+# endif
+	void ReleaseMutex() { ReleaseSRWLockExclusive(& rtSRWLock); }
+};
+
+#elif defined(__linux__) || defined(__CYGWIN__)
+
+# include <arpa/inet.h>
+# include <errno.h>
+# include <fcntl.h>
+# include <mqueue.h>
+# include <netdb.h>
+# include <netinet/in.h>
+# include <netinet/ip6.h>
+# include <pthread.h>
+# include <signal.h>
+# include <sys/mman.h>
+# include <sys/socket.h>
+# include <sys/stat.h>
+# include <sys/time.h>
+# include <sys/types.h>
+# include <time.h>
+# include <unistd.h>
+
+# define BREAK_ON_DEBUG()
+# define DEINIT_WAIT_TIMEOUT_ms		5000	// 5 seconds
+
+# define MAX_LOCK_WAIT_ms			30000	// half a minute
+# define TIMER_SLICE_ms				1		// For HPET
+
+# define INVALID_SOCKET	(-1)
+# define SIGNO_FSP		SIGRTMIN
+
+# define max(a,b)	((a) >= (b) ? (a) : (b))
+# define min(a,b)	((a) <= (b) ? (a) : (b))
+
+# define printf_s	printf // but printf_s is defined in C11?
+# define _strnicmp strncasecmp
+
+# define SHARE_MEMORY_PREFIX	"/FlexibleSessionProtocolSHM"
+# define SERVICE_MAILSLOT_NAME	"/FlexibleSessionProtocolMailQueue"
+
+# ifdef TRACE
+#  define REPORT_ERROR_ON_TRACE()		perror("ERROR REPORT")
+#  define REPORT_ERRMSG_ON_TRACE(s1)	perror(s1)
+# endif
+
+typedef int32_t	DWORD;
+typedef void*	PVOID;
+
+typedef struct addrinfo*	PADDRINFOA;
+typedef struct in6_addr		IN6_ADDR, *PIN6_ADDR;
+typedef struct sockaddr_in  SOCKADDR_IN, *PSOCKADDR_IN;
+typedef struct sockaddr_in6 SOCKADDR_IN6, *PSOCKADDR_IN6;
+
+typedef union _SOCKADDR_INET {
+	struct sockaddr_in	Ipv4;
+	struct sockaddr_in6 Ipv6;
+	sa_family_t			si_family;
+}	SOCKADDR_INET, * PSOCKADDR_INET;
+
+
+static inline uint64_t GetTickCount64()
+{
+	timespec v;
+	clock_gettime(CLOCK_MONOTONIC, &v);
+	return (v.tv_sec * 1000 + v.tv_nsec / 1000);
+}
+
+static inline void Sleep(int32_t millis)
+{
+    struct timespec tv;
+    tv.tv_sec = millis / 1000;
+    tv.tv_nsec = (millis % 1000) * 1000000;
+    nanosleep(&tv, NULL);
+}
+
+class CSRWLock
+{
+protected:
+	pthread_rwlock_t  rtSRWLock;
+	void InitMutex() { rtSRWLock = PTHREAD_RWLOCK_INITIALIZER; }
+	void AcquireMutex() { pthread_rwlock_wrlock(&rtSRWLock); }
+	void ReleaseMutex() { pthread_rwlock_unlock(&rtSRWLock); }
+};
+
+#endif
+
+#include <assert.h>
+#include <errno.h>
+#include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+
+#define FSP_ALIGNMENT	8
 #define	MAC_ALIGNMENT	16
-
 
 /**
  * For testability
  */
-#ifdef TRACE
-# define REPORT_ERROR_ON_TRACE() \
-	TraceLastError(__FILE__, __LINE__, __FUNCDNAME__, "ERROR REPORT")
-# define REPORT_ERRMSG_ON_TRACE(s1) \
-	TraceLastError(__FILE__, __LINE__, __FUNCDNAME__, (s1))
-void TraceLastError(char * fileName, int lineNo, char *funcName, char *s1);
-#else
+#ifndef TRACE
 # define REPORT_ERROR_ON_TRACE()
 # define REPORT_ERRMSG_ON_TRACE(s) (s)
 #endif
@@ -85,9 +212,7 @@ void TraceLastError(char * fileName, int lineNo, char *funcName, char *s1);
 /**
  * IPC
  */
-#define SERVICE_MAILSLOT_NAME	"\\\\.\\mailslot\\flexible\\session\\protocol"
 #define MAX_CTRLBUF_LEN		424	// maximum message passing structure/mailslot size
-#define REVERSE_EVENT_PREFIX	"Global\\FlexibleSessionProtocolEvent"
 #define MAX_NAME_LENGTH		64	// considerably less than MAX_PATH
 
 #ifdef _DEBUG
@@ -97,30 +222,8 @@ void TraceLastError(char * fileName, int lineNo, char *funcName, char *s1);
 #endif
 
 
-
-/**
- * Implementation defined timeout
- */
-
-#ifdef _DEBUG
-# define DEINIT_WAIT_TIMEOUT_ms		15000	// 15 seconds
-# define BREAK_ON_DEBUG()			DebugBreak()
-#else
-# define DEINIT_WAIT_TIMEOUT_ms		5000	// 5 seconds
-# define BREAK_ON_DEBUG()
-#endif
-
-
-#define MAX_LOCK_WAIT_ms			60000	// one minute
-#define TIMER_SLICE_ms				1		// For HPET
 #define	MAX_IDLE_QUOTA_TICKS		6		// Refuse to add quota if sending is idle more than this threshold
 #define SLOW_START_WINDOW_SIZE		4		// in packet
-
-#if defined(_MSC_VER) || defined(_MSC_EXTENSIONS)
-  #define DELTA_EPOCH_IN_MICROSECS  11644473600000000Ui64
-#else
-  #define DELTA_EPOCH_IN_MICROSECS  11644473600000000ULL
-#endif
 
 
 /**
@@ -129,10 +232,8 @@ void TraceLastError(char * fileName, int lineNo, char *funcName, char *s1);
 #ifndef OVER_UDP_IPv4
 // IPv6 requires that every link in the Internet have an MTU of 1280 octets or greater. 
 # define MAX_BLOCK_SIZE		1024
-# define MAX_LLS_BLOCK_SIZE	(MAX_BLOCK_SIZE + sizeof(FSP_NormalPacketHeader))		// 1048
 #else
 # define MAX_BLOCK_SIZE		512
-# define MAX_LLS_BLOCK_SIZE	(MAX_BLOCK_SIZE + sizeof(FSP_NormalPacketHeader) + sizeof(ALFIDPair))	// 544
 #endif
 
 #define MIN_QUEUED_INTR		2	// minimum number of queued (soft) interrupt, must be some power value of 2
@@ -153,13 +254,22 @@ public:
 	const char * operator[](int);
 };
 
-// Reflexing string representation of FSP_Session_State and FSP_ServiceCode, for debug purpose
+// Reflexing string representation of FSP_Session_State, for debug purpose
 class CStringizeState
 {
 	static const char * names[LARGEST_FSP_STATE + 1];
 public:
 	const char * operator[](int);
 };
+
+// Reflexing string representation of FSP_ServiceCode, for debug purpose
+class CServiceCode
+{
+	static const char* names[FSP_Shutdown + 1];
+public:
+	static const char* sof(int);
+};
+
 
 // Reflexing string representation of software vector interrupt (notice), for debug purpose
 class CStringizeNotice
@@ -177,17 +287,19 @@ extern CStringizeNotice noticeNames;
 
 
 
-/**
- * platform-dependent fundamental utility functions
- */
-#define LOCALAPI __fastcall
-
 
 
 /**
  * Parameter data-structure and Session Control Block data-structure
  */
-#include <pshpack1.h>
+#if defined(_MSC_VER)
+# define LOCALAPI __fastcall
+# include <pshpack1.h>
+#else
+# define LOCALAPI
+# pragma pack(push)
+# pragma pack(1)
+#endif
 
 // Network byte order of the length of the fixed header, where host byte order is little-endian
 #define	FIXED_HEADER_SIZE_BE16		0x1800
@@ -211,6 +323,9 @@ extern CStringizeNotice noticeNames;
 	}
 
 
+class CSocketItem;	// forward declaration for sake of declaring CommandToLLS and ControlBlock
+
+
 /**
  * Command to lower layer service
  * Try to make a 32-bit process calling the 64-bit FSP lower-level service possible
@@ -220,7 +335,7 @@ extern CStringizeNotice noticeNames;
 struct CommandToLLS
 {
 	ALIGN(8)
-	DWORD			idProcess;
+	pid_t			idProcess;
 	ALFID_T			fiberID;
 	FSP_ServiceCode	opCode;	// operation code
 };
@@ -229,9 +344,14 @@ struct CommandToLLS
 
 struct CommandNewSession: CommandToLLS
 {
+	uint32_t		dwMemorySize;	// size of the shared memory, in the mapped view
+#if defined(__WINDOWS__)
 	char			szEventName[MAX_NAME_LENGTH];	// name of the callback event
-	DWORD			dwMemorySize;	// size of the shared memory, in the mapped view
 	uint64_t		hMemoryMap;		// pass to LLS by ULA, should be duplicated by the server
+#elif defined(__linux__) || defined(__CYGWIN__)
+	char			shm_name[MAX_NAME_LENGTH + 8];	// name of the shared memory
+	void GetShmNameFrom(CSocketItem *p) { sprintf(shm_name, SHARE_MEMORY_PREFIX "%p", (void *)p); }
+#endif
 
 	CommandNewSession() { memset(this, 0, sizeof(CommandNewSession)); }
 };
@@ -268,14 +388,14 @@ struct FSP_ADDRINFO_EX : FSP_SINKINF
 {
 	int32_t	cmsg_level;
 	//
-	void InitUDPoverIPv4(ULONG if1)
+	void InitUDPoverIPv4(u32 if1)
 	{
 		memset(this, 0, sizeof(FSP_SINKINF));		// inaddr_any
 		ipi_ifindex = if1;
 		cmsg_level = IPPROTO_IP;	/* originating protocol */
 	}
 	//
-	void InitNativeIPv6(ULONG if1)
+	void InitNativeIPv6(u32 if1)
 	{
 		memset(this, 0, sizeof(FSP_SINKINF));		// in6addr_any;
 		ipi6_ifindex = if1;
@@ -333,7 +453,7 @@ struct BackLogItem: SConnectParam
 
 class CLightMutex
 {
-	volatile char		mutex;
+	char mutex;
 public:
 	bool WaitSetMutex();
 	void SetMutexFree() { _InterlockedExchange8(&mutex, 0); }
@@ -376,10 +496,6 @@ public:
 	int Pop();
 	int LOCALAPI Put(const BackLogItem *p);
 };
-
-
-
-class CSocketItem;	// forward declaration for sake of declaring ControlBlock
 
 
 
@@ -513,30 +629,30 @@ struct ControlBlock
 	//
 
 	// Convert the relative address in the control block to the address in process space, unchecked
-	BYTE * GetSendPtr(const PFSP_SocketBuf skb)
+	octet* GetSendPtr(const PFSP_SocketBuf skb)
 	{
-		PFSP_SocketBuf p0 = PFSP_SocketBuf((BYTE *)this + sendBufDescriptors);
-		uint32_t offset = sendBuffer + MAX_BLOCK_SIZE * uint32_t(skb - p0);
-		return (BYTE *)this + offset;
+		PFSP_SocketBuf p0 = PFSP_SocketBuf((octet*)this + sendBufDescriptors);
+		long offset = sendBuffer + MAX_BLOCK_SIZE * long(skb - p0);
+		return (octet*)this + offset;
 	}
-	BYTE * GetSendPtr(const ControlBlock::PFSP_SocketBuf skb, uint32_t &offset)
+	octet* GetSendPtr(const ControlBlock::PFSP_SocketBuf skb, long& offset)
 	{
-		PFSP_SocketBuf p0 = PFSP_SocketBuf((BYTE *)this + sendBufDescriptors);
-		offset = sendBuffer + MAX_BLOCK_SIZE * uint32_t(skb - p0);
-		return (BYTE *)this + offset;
+		PFSP_SocketBuf p0 = PFSP_SocketBuf((octet*)this + sendBufDescriptors);
+		offset = sendBuffer + MAX_BLOCK_SIZE * long(skb - p0);
+		return (octet*)this + offset;
 	}
 
-	BYTE * GetRecvPtr(const PFSP_SocketBuf skb) const
+	octet* GetRecvPtr(const PFSP_SocketBuf skb) const
 	{
-		PFSP_SocketBuf p0 = PFSP_SocketBuf((BYTE *)this + recvBufDescriptors);
-		uint32_t offset = recvBuffer + MAX_BLOCK_SIZE * uint32_t(skb - p0);
-		return (BYTE *)this + offset;
+		PFSP_SocketBuf p0 = PFSP_SocketBuf((octet*)this + recvBufDescriptors);
+		long offset = recvBuffer + MAX_BLOCK_SIZE * long(skb - p0);
+		return (octet*)this + offset;
 	}
-	BYTE * GetRecvPtr(const ControlBlock::PFSP_SocketBuf skb, uint32_t &offset) const
+	octet* GetRecvPtr(const ControlBlock::PFSP_SocketBuf skb, long& offset) const
 	{
-		PFSP_SocketBuf p0 = PFSP_SocketBuf((BYTE *)this + recvBufDescriptors);
-		offset = recvBuffer + MAX_BLOCK_SIZE * uint32_t(skb - p0);
-		return (BYTE *)this + offset;
+		PFSP_SocketBuf p0 = PFSP_SocketBuf((octet*)this + recvBufDescriptors);
+		offset = recvBuffer + MAX_BLOCK_SIZE * long(skb - p0);
+		return (octet*)this + offset;
 	}
 
 	// 7, 8 Send buffer and Receive buffer
@@ -572,8 +688,8 @@ struct ControlBlock
 	int DumpRecvQueueInfo() const { return 0; }
 #endif
 
-	PFSP_SocketBuf HeadSend() const { return (PFSP_SocketBuf)((BYTE *)this + sendBufDescriptors); }
-	PFSP_SocketBuf HeadRecv() const { return (PFSP_SocketBuf)((BYTE *)this + recvBufDescriptors); }
+	PFSP_SocketBuf HeadSend() const { return (PFSP_SocketBuf)((octet*)this + sendBufDescriptors); }
+	PFSP_SocketBuf HeadRecv() const { return (PFSP_SocketBuf)((octet*)this + recvBufDescriptors); }
 
 	// Return the head packet even if the send queue is empty
 	PFSP_SocketBuf GetSendQueueHead() { return HeadSend() + sendWindowHeadPos; }
@@ -599,23 +715,22 @@ struct ControlBlock
 	// 
 	void IncRoundRecvBlockN(int32_t & tgt)
 	{
-		register int32_t a = InterlockedIncrement((LONG *)&tgt) - recvBufferBlockN;
-		if (a >= 0) InterlockedExchange((LONG *)&tgt, a);
+		register int32_t a = _InterlockedIncrement((DWORD*)&tgt) - recvBufferBlockN;
+		if (a >= 0) _InterlockedExchange((DWORD*)&tgt, a);
 	}
 	void IncRoundSendBlockN(int32_t & tgt)
 	{
-		register int32_t a = InterlockedIncrement((LONG *)&tgt) - sendBufferBlockN;
-		if (a >= 0) InterlockedExchange((LONG *)&tgt, a);
+		register int32_t a = _InterlockedIncrement((DWORD*)&tgt) - sendBufferBlockN;
+		if (a >= 0) _InterlockedExchange((DWORD*)&tgt, a);
 	}
 	// Set the right edge of the send window after the very first packet of the queue is sent
 	void SetFirstSendWindowRightEdge()
 	{
 		register seq_t k = LCKREAD(sendWindowFirstSN);
-		if (InterlockedCompareExchange(&sendWindowNextSN, k + 1, k) == k)
+		if (_InterlockedCompareExchange(&sendWindowNextSN, k + 1, k) == k)
 			IncRoundSendBlockN(sendWindowNextPos);
 	}
-
-	BYTE * LOCALAPI InquireSendBuf(int32_t *);
+	octet* LOCALAPI InquireSendBuf(int32_t *);
 
 	int LOCALAPI GetSelectiveNACK(seq_t &, FSP_SelectiveNACK::GapDescriptor *, int);
 	int LOCALAPI DealWithSNACK(seq_t, FSP_SelectiveNACK::GapDescriptor *, int);
@@ -627,7 +742,7 @@ struct ControlBlock
 	void SlideRecvWindowByOne()	// shall be atomic!
 	{
 		IncRoundRecvBlockN(recvWindowHeadPos);
-		InterlockedIncrement((LONG *)& recvWindowFirstSN);
+		_InterlockedIncrement(&recvWindowFirstSN);
 	}
 
 	// Given
@@ -669,7 +784,7 @@ struct ControlBlock
 		skb->ReInitMarkAcked();
 		// but preserve packet flags for possible later reference to EoT, etc.
 		IncRoundSendBlockN(sendWindowHeadPos);
-		InterlockedIncrement(&sendWindowFirstSN);
+		_InterlockedIncrement(&sendWindowFirstSN);
 	}
 
 	// Return the advertisable size of the receive window
@@ -695,20 +810,28 @@ struct ControlBlock
 	int	LOCALAPI	Init(uint16_t);
 };
 
-#include <poppack.h>
-
+#if defined(_MSC_VER)
+# include <poppack.h>
+#else
+# pragma pack(pop)
+#endif
 
 
 class CSocketItem
 {
 protected:
+	ALIGN(FSP_ALIGNMENT)
 	ALFIDPair	fidPair;
+#if defined(__WINDOWS__)
 	HANDLE	hEvent;
 	HANDLE	hMemoryMap;
-	DWORD	dwMemorySize;	// size of the shared memory, in the mapped view
+// #elif defined(__linux__) || defined(__CYGWIN__)
+#endif
+	// size of the shared memory, in the mapped view. This implementation make it less than 2GB:
+	int32_t	dwMemorySize;
 	ControlBlock *pControlBlock;
 
-	//virtual ~CSocketItem() { }	// Make this a semi-abstract class
+#if defined(__WINDOWS__)
 	void Destroy()
 	{
 		register HANDLE h;
@@ -720,6 +843,15 @@ protected:
 		if((h = InterlockedExchangePointer((PVOID *) & hEvent, NULL)) != NULL)
 			::CloseHandle(h);
 	}
+#elif defined(__linux__) || defined(__CYGWIN__)
+	void Destroy()
+	{
+		register void *buf;
+		if ((buf =  _InterlockedExchangePointer((PVOID *)& pControlBlock, NULL)) != NULL)
+			munmap(buf, dwMemorySize);
+	}
+#endif
 };
 
 #endif
+

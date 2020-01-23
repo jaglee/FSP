@@ -51,19 +51,10 @@
 #define DllSpec
 #endif
 
-#include "endian.h"
-
-
 #ifdef NDEBUG	// Run-time default for release version
 # define MAX_FSP_SHM_SIZE		0x4000000	// 64MB
 #elif !defined(MAX_FSP_SHM_SIZE)
 # define MAX_FSP_SHM_SIZE		0x100000	// 1MB
-#endif
-
-#if defined(_M_X64) || defined(_M_IA64)
-    typedef unsigned __int64 ulong_ptr;
-#else
-    typedef unsigned long ulong_ptr;
 #endif
 
 typedef struct FSP_SocketParameter *PFSP_Context;
@@ -154,13 +145,8 @@ typedef int (FSPAPI *CallbackBufferReady)(FSPHANDLE, void *, int32_t);
 //	int				the intent returned value
 typedef void (FSPAPI *NotifyOrReturn)(FSPHANDLE, FSP_ServiceCode, int);
 
-// The function meant to be called at the end of the internal event handler that calls back.
-// Given
-//	FSPHANDLE		the handle of the FSP socket (the context)
-//	ulong_ptr		optional parameter
-typedef void (FSPAPI *LongRunCallback)(FSPHANDLE, ulong_ptr);
 #ifdef __cplusplus
-	};
+	}
 #endif
 
 
@@ -479,7 +465,7 @@ uint32_t * FSPAPI TranslateFSPoverIPv4(PFSP_IN6_ADDR, uint32_t, ULTID_T);
 
 
 DllSpec
-int FSPAPI FSPControl(FSPHANDLE, FSP_ControlCode, ulong_ptr);
+int FSPAPI FSPControl(FSPHANDLE, FSP_ControlCode, ULONG_PTR);
 
 
 // Return the extent pointer set by ULA, either stored directly in FSP_SocketParameter.extentI64ULA

@@ -66,19 +66,8 @@
 	transparent HTTP acceleration!
  */
 
-#include <stdio.h>
-#include <ctype.h>
-#include <string.h>
-#include <stdlib.h>
-#include <malloc.h>
-#include <fcntl.h>
-#include <io.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-
-#include "defs.h"
-#include "../Crypto/CHAKA.h"
-
+#include "fsp_http.h"
+#include <MSWSock.h>
 
 // Storage of private key SHOULD be allocated with random address layout
 static octet bufPrivateKey[CRYPTO_NACL_KEYBYTES];
@@ -183,7 +172,7 @@ VOID CALLBACK TpWorkCallBack(PTP_CALLBACK_INSTANCE, PVOID, PTP_WORK Work);
 //	int		The TCP port number on which the socket is listening for SOCKSv4 service request
 // Do
 //	Create a thread pool to service SOCKS request in a multi-threaded parallel fashion
-void ToServeSOCKS(char *nameAppLayer, int port)
+void ToServeSOCKS(const char *nameAppLayer, int port)
 {
 	int len = sprintf_s(tunnelRequest, sizeof(tunnelRequest), "TUNNEL %s HTTP/1.0\r\n", nameAppLayer);
 	if(len < 0)
@@ -435,7 +424,7 @@ TpWorkCallBack(PTP_CALLBACK_INSTANCE Instance, PVOID parameter, PTP_WORK Work)
 	parms.sendSize = BUFFER_POOL_SIZE;
 	parms.welcome = &p->req;
 	parms.len = (unsigned short)sizeof(p->req);
-	parms.extentI64ULA = (ulong_ptr)p;
+	parms.extentI64ULA = (ULONG_PTR)p;
 	//
 	FSPHANDLE h = MultiplyAndWrite(hClientMaster, & parms, TO_END_TRANSACTION, onSubrequestSent);
 	if(h == NULL)

@@ -32,22 +32,38 @@
 #define CRYPTO_NACL_KEYBYTES	32
 #define CRYPTO_NACL_HASHBYTES	64
 
-// but assume size_t has been defined
-typedef unsigned char octet;
-
+#include "../Intrins.h"
 #include "sha256.h"
 
-#ifdef _MSC_VER
-#define FSPAPI __stdcall
-#else
-#define FSPAPI
+#if defined(__WINDOWS__)
+
+# ifdef _MSC_VER
+#  define FSPAPI __stdcall
+# else
+#  define FSPAPI
+# endif
+
+# define WIN32_LEAN_AND_MEAN
+# include <Windows.h>
+
+# ifndef __cplusplus
+#  define SINLINE static __forceinline
+# endif
+
+#elif defined(__linux__) || defined(__CYGWIN__)
+
+# define FSPAPI
+
+# ifndef __cplusplus
+#  define SINLINE static __inline__
+# endif
+
+# define printf_s	printf	// let the compiler check the safety of formatted printing
+
 #endif
 
-// inline functions
 #ifdef __cplusplus
-#define SINLINE static inline
-#else
-#define SINLINE static __inline__
+# define SINLINE static inline
 #endif
 
 #define crypto_box_curve25519xsalsa20poly1305_beforenm crypto_box_curve25519xsalsa20poly1305_tweet_beforenm
@@ -56,7 +72,6 @@ typedef unsigned char octet;
 
 #define crypto_box_beforenm crypto_box_curve25519xsalsa20poly1305_beforenm
 #define crypto_box_keypair crypto_box_curve25519xsalsa20poly1305_keypair
-
 
 #ifdef __cplusplus
 extern "C"
@@ -70,6 +85,7 @@ extern "C"
 //	Generate a string of random octets of given size, save it in the given buffer
 void randombytes(void *, size_t);
 
+#if defined(__WINDOWS__)
 // WideCharToMultiByte and MultiByteToWideChar have severe security issues handled in these functions:
 
 // Given
@@ -112,6 +128,8 @@ int UTF8ToLocalMBCS(char[], int, LPCSTR);
 // Return
 //	Number of output wide characters
 int UTF8ToWideChars(wchar_t[], int, LPCSTR, int);
+
+#endif
 
 // in tweetnacl.c:
 int crypto_box_beforenm(unsigned char *,const unsigned char *,const unsigned char *);
@@ -194,4 +212,5 @@ void hmac_sha256_key512(octet *output, const octet *key, const octet *input, siz
 	sha256_update(& ctx, (octet *) & km, sizeof(km));
 	sha256_final(& ctx, output);
 }
+
 #endif

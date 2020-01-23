@@ -1,4 +1,7 @@
-#pragma warning(disable:4018 4146 4244)	// For MSVC only
+#ifdef _MSC_VER
+# pragma warning(disable:4018 4146 4244)
+#endif
+
 #include "tweetnacl.h"
 
 #define FOR(i,n) for (i = 0;i < n;++i)

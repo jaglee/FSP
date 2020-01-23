@@ -27,20 +27,14 @@
     POSSIBILITY OF SUCH DAMAGE.
  */
 
-#ifdef _MSC_VER
-#define FSPAPI __stdcall
-#define DllSpec __declspec(dllexport)
-#else
-#define FSPAPI
-#define DllSpec
-#endif
+#include "CryptoStub.h"
 
-typedef unsigned char octet;	// keep sync with CrytoStub.h
+#if defined(__WINDOWS__)
+
+// Used to be __declspec(dllexport), now only static linkgage supported for sake of performance and compatibility
+# define DllSpec
 
 // OS-dependent crypto service
-#define WIN32_LEAN_AND_MEAN
-#define STRICT
-#include <Windows.h>
 #include <wincrypt.h>
 
 #pragma comment(lib, "crypt32.lib")
@@ -306,3 +300,38 @@ l_bailout:
 	LocalFree((HLOCAL)utf16data);
 	return ret;
 }
+
+#elif defined(__linux__) || defined(__CYGWIN__)
+
+#include <memory.h>
+#include "sha256.h"
+#include <sys/time.h>
+
+// A very simple pseudo-random number generator exploiting SHA256
+void randombytes(void *p, size_t n)
+{
+	static octet	keyInternalRand[SHA256_DIGEST_SIZE];
+	static uint64_t nonce;
+	struct
+	{
+		octet	interm[SHA256_DIGEST_SIZE];
+		struct	timeval tv;
+		uint64_t nonce;
+	} _rm;
+
+	memcpy(_rm.interm, keyInternalRand, SHA256_DIGEST_SIZE);
+	gettimeofday(&_rm.tv, NULL);
+	// Note that non-deterministic make it more unpredictable:-)
+	do
+	{
+		unsigned m = (unsigned)(n >= SHA256_DIGEST_SIZE ? SHA256_DIGEST_SIZE : n);
+		_rm.nonce = nonce++;
+		sha256_hash(_rm.interm, (octet *)&_rm, sizeof(_rm));
+		n -= m;
+		memcpy(p + n, _rm.interm, m);
+	} while (n > 0);
+	memcpy(keyInternalRand, _rm.interm, SHA256_DIGEST_SIZE);
+}
+
+
+#endif

@@ -103,7 +103,7 @@ FSPHANDLE FSPAPI MultiplyAndGetSendBuffer(FSPHANDLE hFSP, PFSP_Context psp1, Cal
 	if(onBufferReady != NULL)
 	{
 		int32_t m;
-		BYTE *buf = p->pControlBlock->InquireSendBuf(& m);
+		octet *buf = p->pControlBlock->InquireSendBuf(& m);
 		if(buf == NULL)
 		{
 			p->Free();
@@ -170,12 +170,12 @@ CSocketItemDl * LOCALAPI CSocketItemDl::ToPrepareMultiply(FSPHANDLE h, PFSP_Cont
 inline
 FSPHANDLE LOCALAPI CSocketItemDl::WriteOnMultiplied(CommandCloneConnect &objCommand, PFSP_Context psp1, unsigned flag, NotifyOrReturn fp1)
 {
-	TestSetSendReturn(fp1);
+	TestSetSendReturn((PVOID)fp1);
 	if (psp1->welcome != NULL)
 	{
 		if ((flag & TO_COMPRESS_STREAM) && !AllocStreamState())
 			return NULL;
-		pendingSendBuf = (BYTE *)psp1->welcome;
+		pendingSendBuf = (octet *)psp1->welcome;
 		bytesBuffered = 0;
 		// pendingSendSize set in BufferData
 		if (!WaitUseMutex())
@@ -204,9 +204,7 @@ FSPHANDLE CSocketItemDl::CompleteMultiply(CommandCloneConnect & cmd)
 	// See also InitCommand, CallCreate
 	cmd.fiberID = pControlBlock->idParent;
 	cmd.idProcess = idThisProcess;
-	cmd.hMemoryMap = (uint64_t)hMemoryMap;
-	cmd.dwMemorySize = dwMemorySize;
-	//
+	CopyFatMemPointo(cmd);
 	cmd.opCode = FSP_Multiply;
 	SetState(CLONING);
 	if(! Call(cmd, sizeof(cmd)))
