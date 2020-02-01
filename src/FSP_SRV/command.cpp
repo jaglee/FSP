@@ -210,7 +210,7 @@ void LOCALAPI ProcessCommand(void *buffer)
 		", %s(code = %d)\n"
 		, n
 		, pCmd->fiberID, be32toh(pCmd->fiberID)
-		, noticeNames[pCmd->opCode], pCmd->opCode);
+		, CServiceCode::sof(pCmd->opCode), pCmd->opCode);
 #endif
 	switch(pCmd->opCode)
 	{
@@ -258,7 +258,7 @@ void CSocketItemEx::ProcessCommand(CommandToLLS *pCmd)
 	{
 		printf_s("Socket %p[fiber#%u] in state %s: process command %s[%d]\n"
 			"probably encountered dead-lock: pSCB: %p\n"
-			, this, fidPair.source, stateNames[lowState], noticeNames[pCmd->opCode], pCmd->opCode
+			, this, fidPair.source, stateNames[lowState], CServiceCode::sof(pCmd->opCode), pCmd->opCode
 			, pControlBlock);
 		if(lockedAt != NULL)
 			printf_s("Lastly called by %s\n", lockedAt);
@@ -266,7 +266,7 @@ void CSocketItemEx::ProcessCommand(CommandToLLS *pCmd)
 	}
 #if defined(TRACE) && (TRACE & TRACE_ULACALL)
 	printf_s("%s called (%s), LLS state: %s(%d) <== ULA state: %s(%d)\n", __FUNCTION__
-		, noticeNames[pCmd->opCode]
+		, CServiceCode::sof(pCmd->opCode)
 		, stateNames[lowState], lowState
 		, stateNames[pControlBlock->state], pControlBlock->state);
 #endif

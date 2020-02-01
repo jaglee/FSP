@@ -7,8 +7,8 @@
 
 #include <fcntl.h>
 #include <io.h>
+#include <share.h>
 #include <stdio.h>
-#include <tchar.h>
 
 // Forward declaration of an auxilary function
 int ReportLastError();

@@ -37,7 +37,9 @@
 // OS-dependent crypto service
 #include <wincrypt.h>
 
-#pragma comment(lib, "crypt32.lib")
+#ifdef _MSC_VER
+# pragma comment(lib, "crypt32.lib")
+#endif
 
 #include <malloc.h>
 #include <stdio.h>

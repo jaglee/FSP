@@ -362,7 +362,7 @@ void CSocketItemDl::WaitEventToDispatch()
 			{
 				fp1 = NULL;
 				if (s0 == COMMITTED || s0 >= CLOSABLE)
-					fp1 = (NotifyOrReturn)_InterlockedExchangePointer((PVOID*)&fpCommitted, fp1);
+					fp1 = (NotifyOrReturn)_InterlockedExchangePointer((PVOID*)&fpCommitted, (PVOID)fp1);
 				SetMutexFree();
 				if (fp1 != NULL)
 					fp1(this, FSP_Send, 0);
@@ -412,18 +412,6 @@ void CSocketItemDl::WaitEventToDispatch()
 		case FSP_NameResolutionFailed:
 			FreeAndNotify(InitConnection, (int)notice);
 			// UNRESOLVED!? There could be some remedy if name resolution failed?
-			return;
-		case FSP_IPC_CannotReach:
-			fp1 = context.onError;
-			s0 = GetState();
-			Free();
-			if (fp1 == NULL)
-				return;
-			//
-			if (s0 == LISTENING)
-				fp1(this, FSP_Listen, -EIO);
-			else if (s0 != CHALLENGING)
-				fp1(this, (s0 == CLONING ? FSP_Multiply : InitConnection), -EIO);
 			return;
 		case FSP_MemoryCorruption:
 		case FSP_NotifyTimeout:

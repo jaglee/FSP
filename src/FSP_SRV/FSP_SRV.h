@@ -36,14 +36,14 @@
 #define MULTIPLY_BACKLOG_SIZE	8
 
 
-#if defined(__WINDOWS__)
+#if _MSC_VER
 
 // random generator is somehow dependent on implementation. hardware preferred.
 // might be optimized by loop unrolling
 static inline
 void rand_w32(uint32_t *p, int n) { for (register int i = 0; i < min(n, 32); i++) { rand_s(p + i); } }
 
-#elif defined(__linux__) || defined(__CYGWIN__)
+#elif defined(__linux__) || defined(__CYGWIN__) || defined(__MINGW32__)
 
 extern "C" void rand_w32(u32 *, int);
 
@@ -659,7 +659,7 @@ public:
 		long			b = pControlBlock->notices.vector & (1 << (char)n);
 		long			v = pControlBlock->notices.vector & 1;
 		pControlBlock->notices.vector |= (1 << (char)n);
-#if (TRACE & TRACE_ULACALL)
+#if (TRACE & (TRACE_HEARTBEAT | TRACE_OUTBAND))
 		if (b)
 		{
 			printf_s("\nSession #%u, duplicate soft interrupt %s(%d) eliminated.\n", fidPair.source, noticeNames[n], n);

@@ -30,6 +30,7 @@
 #ifndef _CH_AUTH_KEY_AGREEMENT_H
 #define _CH_AUTH_KEY_AGREEMENT_H
 
+#include <memory.h>
 #include <stdio.h>
 #include "CryptoStub.h"
 

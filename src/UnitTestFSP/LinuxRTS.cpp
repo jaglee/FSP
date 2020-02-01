@@ -167,9 +167,17 @@ void client(pid_t pid)
 	int r;
 	value.sival_int = 18003;
 	if (IsProcessAlive(pid))
+	{
+		if(kill(pid, 0) != 0)	//or sigqueue(pid, 0, value)
+			printf("What? Cannot send signal to an active process?");
 		printf("The process %d is alive.\n", pid);
+	}
 	else
+	{
 		printf("Cannot find the process %d in /proc directory.\n", pid);
+		return;
+	}
+
 	r = sigqueue(pid, SIG_FSP, value); 
 	if (r < 0)
 		perror("Calling sigqueue failed");

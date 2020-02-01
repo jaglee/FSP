@@ -840,9 +840,6 @@ void CSocketItemEx::OnGetPersist()
 	if (!isInitiativeState && lowState < ESTABLISHED)
 		return;
 
-#ifdef TRACE
-	printf_s("Payload length: %d\n", lenPktData);
-#endif
 	if (lenPktData < 0 || lenPktData > MAX_BLOCK_SIZE)
 		return;
 

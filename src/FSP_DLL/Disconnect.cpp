@@ -71,13 +71,38 @@ int  CSocketItemDl::Dispose()
 	// A gracefully shutdown socket is resurrect-able
 	if (pControlBlock->state == CLOSED)
 	{
-		socketsTLB.FreeItem(this);
+		RecycleSimply();
+		SetMutexFree();
 		return 0;
 	}
 
 	EnableLLSInterrupt();
 	SetMutexFree();
 	return Call<FSP_Reset>() ? 0 : -EIO;
+}
+
+
+
+// Unlike Free, Recycle-locked does not destroy the control block
+// so that the DLL socket may be reused on connection resumption
+// assume the socket has been locked
+int CSocketItemDl::RecycLocked()
+{
+	RecycleSimply();
+	SetMutexFree();
+	return 0;
+}
+
+
+
+// Make sure resource is kept until other threads leave critical section
+// Does NOT waits for all callback functions to complete before returning
+// in case of deadlock when the function itself is called in some call-back function
+void CSocketItemDl::Free()
+{
+	RecycleSimply();
+	CSocketItem::Destroy();
+	memset((octet *)this + sizeof(CSocketItem), 0, sizeof(CSocketItemDl) - sizeof(CSocketItem));
 }
 
 

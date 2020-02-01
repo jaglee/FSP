@@ -83,7 +83,7 @@ int FSPAPI ReadFrom(FSPHANDLE hFSPSocket, void *buf, int capacity, NotifyOrRetur
 inline
 int CSocketItemDl::TryUnlockPeeked()
 {
-	int32_t nBlock = _InterlockedExchange((DWORD*)& pendingPeekedBlocks, 0);
+	int32_t nBlock = _InterlockedExchange((PLONG)&pendingPeekedBlocks, 0);
 	if (nBlock == 0)
 		return 1;
 	if (nBlock < 0)
@@ -132,10 +132,10 @@ int CSocketItemDl::RecvInline(CallbackPeeked fp1)
 	}
 
 #ifndef NDEBUG
-	if (_InterlockedExchangePointer((PVOID*)&fpPeeked, fp1) != NULL)
+	if (_InterlockedExchangePointer((PVOID*)&fpPeeked, (PVOID)fp1) != NULL)
 		printf_s("\nFiber#%u, warning: Receive-inline called before previous RecvInline called back\n", fidPair.source);
 #else
-	_InterlockedExchangePointer((PVOID*)&fpPeeked, fp1);
+	_InterlockedExchangePointer((PVOID*)&fpPeeked, (PVOID)fp1);
 #endif
 	return TailFreeMutexAndReturn(0);
 }
@@ -216,7 +216,7 @@ int LOCALAPI CSocketItemDl::ReadFrom(void* buffer, int capacity, NotifyOrReturn 
 		return r;
 	}
 	//
-	if (_InterlockedCompareExchangePointer((PVOID*)&fpReceived, fp1, NULL) != NULL)
+	if (_InterlockedCompareExchangePointer((PVOID*)&fpReceived, (PVOID)fp1, NULL) != NULL)
 	{
 		SetMutexFree();
 		return -EBUSY;
@@ -359,7 +359,7 @@ int32_t CSocketItemDl::FetchReceived()
 	}
 	//
 	pControlBlock->AddRoundRecvBlockN(pControlBlock->recvWindowHeadPos, nPacket);
-	_InterlockedExchangeAdd((u32 *)&pControlBlock->recvWindowFirstSN, nPacket);
+	_InterlockedExchangeAdd((PLONG)&pControlBlock->recvWindowFirstSN, nPacket);
 	//^memory barrier is mandatory
 	return sum;
 }
@@ -442,7 +442,7 @@ l_recursion:
 	// It is also possible that p == NULL while n is the error code. The callback function MUST handle such scenario
 	// If the callback function happens to be updated, prefer the new one
 	if (fp1(this, p, n, eot))
-		_InterlockedCompareExchangePointer((PVOID *)&fpPeeked, fp1, NULL);
+		_InterlockedCompareExchangePointer((PVOID*)&fpPeeked, (PVOID)fp1, NULL);
 	if (n < 0)
 		return;
 

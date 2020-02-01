@@ -6,7 +6,8 @@
                 "${workspaceFolder}/**"
             ],
             "defines": [
-                "_DEBUG",
+				"_DEBUG",
+				"TRACE=190",
                 "UNICODE",
                 "_UNICODE"
             ],

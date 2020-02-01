@@ -27,6 +27,26 @@
     ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
     POSSIBILITY OF SUCH DAMAGE.
  */
+#ifdef __MINGW32__
+# include "os_win.cpp"
+# include "blake2b.h"
+
+// Given
+//	u32 *	pointer to the buffer to store the random 32-bit word
+//	int		number of 32-bit words to generate
+// Do
+//	Generate (pseudo) random number of designated length and store it in the buffer given
+extern "C" void rand_w32(u32 *p, int n)
+{
+	static uint64_t nonce;
+	FILETIME systemTime;
+	GetSystemTimeAsFileTime(&systemTime);
+	++nonce;
+	blake2b(p, n * sizeof(u32), &nonce, sizeof(nonce), &systemTime, sizeof(systemTime));
+}
+
+#else
+
 #include "fsp_srv.h"
 
 #include <ifaddrs.h>
@@ -462,26 +482,7 @@ extern "C" void rand_w32(u32 *p, int n)
 //	It is assumed that process ID is 'almost never' reused
 bool CSocketItemEx::IsProcessAlive()
 {
-	const int START_POSITON = 6;
-	char procName[] = "/proc/000000000";
-	// implement itoa locally
-	uint32_t r = (uint32_t)idSrcProcess;
-	register int i = START_POSITON + 8;
-	while(i >= START_POSITON)
-	{
-		procName[i] = '0' + (char)(r % 10);
-		r = r / 10;
-		i--;
-		if(r == 0)
-			break;
-	}
-	if(i >= START_POSITON)
-		memmove(procName + START_POSITON, procName + i + 1, START_POSITON + 9 - i);	// include the terminating '\0'
-	int fd = open(procName, O_RDONLY);
-	if (fd < 0)
-		return false;
-	close(fd);
-	return true;
+	return (kill(idSrcProcess, 0) == 0);
 }
 
 
@@ -495,16 +496,16 @@ bool LOCALAPI CSocketItemEx::ReplaceTimer(uint32_t period)
 	if (timer == 0)
 	{
 	    struct sigevent sigev;
-		pthread_attr_t tattr;
-		pthread_attr_init(&tattr);
 		sigev.sigev_notify = SIGEV_THREAD;
 		sigev.sigev_value.sival_ptr = this;
 		sigev.sigev_notify_function = KeepAlive;
-		sigev.sigev_notify_attributes = &tattr;
+		sigev.sigev_notify_attributes = NULL;
 		int k = timer_create(CLOCK_MONOTONIC, &sigev, &timer);
-		pthread_attr_destroy(&tattr);
 		if (k == -1)
+		{
+			perror("What? cannot create the timer!");
 			return false;
+		}
 	}
 
     its.it_value.tv_sec = period / 1000;
@@ -512,10 +513,9 @@ bool LOCALAPI CSocketItemEx::ReplaceTimer(uint32_t period)
     its.it_interval.tv_sec = its.it_value.tv_sec;
     its.it_interval.tv_nsec = its.it_value.tv_nsec;
     //^ periodic timer
-
     if (timer_settime(timer, 0, &its, NULL) == 0)
 		return true;
-
+	perror("What? cannot set the timer!");
 	timer_delete(timer);
 	timer = 0;
 	return false;
@@ -667,3 +667,5 @@ int CSocketItemEx::SendPacket(register u32 n1, ScatteredSendBuffers s)
 #endif
 	return n;
 }
+
+#endif

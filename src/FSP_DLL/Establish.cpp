@@ -337,7 +337,7 @@ CSocketItemDl *CSocketItemDl::ProcessOneBackLog(BackLogItem	*pLogItem)
 	if (!socketItem->CallCreate(objCommand, FSP_Accept))
 	{
 		REPORT_ERRMSG_ON_TRACE("Process listening backlog: cannot synchronize - local IPC error");
-		socketsTLB.FreeItem(socketItem);
+		socketItem->Free();
 		return NULL;
 	}
 	//
@@ -562,7 +562,7 @@ ControlBlock::PFSP_SocketBuf CSocketItemDl::SetHeadPacketIfEmpty(FSPOperationCod
 {
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend();
 	ControlBlock::seq_t k = GetSendWindowFirstSN();
-	if(_InterlockedCompareExchange(&pControlBlock->sendBufferNextSN, k + 1, k) != k)
+	if((ControlBlock::seq_t)_InterlockedCompareExchange((PLONG)&pControlBlock->sendBufferNextSN, k + 1, k) != k)
 		return skb;
 
 	pControlBlock->sendBufferNextPos = 1;

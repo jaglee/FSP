@@ -268,20 +268,6 @@ int	GCM_AES_AuthenticateAndDecrypt(GCM_AES_CTX *ctx, uint64_t IV
 #endif
 /* ----------------------------------------------------------------------- */
 
-#if __GNUC__
-#define ALIGN(n)      __attribute__ ((aligned(n))) 
-#define NOINLINE      __attribute__ ((noinline))
-#define FASTCALL
-#elif _MSC_VER
-#define ALIGN(n)      __declspec(align(n))
-#define NOINLINE      __declspec(noinline)
-#define FASTCALL      __fastcall
-#else
-#define ALIGN(n)
-#define NOINLINE
-#define FASTCALL
-#endif
-
 /* ----------------------------------------------------------------------- */
 /* Default implementations, if not defined above                           */
 /* ----------------------------------------------------------------------- */

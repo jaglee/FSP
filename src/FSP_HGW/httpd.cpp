@@ -78,7 +78,7 @@ inline void FreeExtent(FSPHANDLE h, bool disposing = false)
 	if(p != NULL)
 	{
 		free(p);
-		FSPControl(h, FSP_SET_EXT_POINTER, NULL);
+		FSPControl(h, FSP_SET_EXT_POINTER, 0);	//NULL
 	}
 	//
 	if(disposing)
@@ -106,7 +106,7 @@ int main(int argc, char *argv[])
 
 	if(argc <= 1)
 	{
-#ifdef _WIN32
+#if _MSC_VER
 		printf_s("To serve SOCKS v4 request at port %d\n", DEFAULT_SOCKS_PORT);
 		ToServeSOCKS("localhost:80", DEFAULT_SOCKS_PORT);
 		r = 0;
@@ -130,7 +130,7 @@ int main(int argc, char *argv[])
 			goto l_return;
 		}
 
-#ifdef _WIN32
+#if _MSC_VER
 		const char *nameAppLayer = (argc == 4 ? argv[3] : "localhost:80");
 		printf_s("To serve SOCKS v4 request at port %d\n", port);
 		ToServeSOCKS(nameAppLayer, port);

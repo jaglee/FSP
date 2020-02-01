@@ -42,9 +42,8 @@ namespace CSharpAPI
 	    FSP_NotifyToFinish,
 	    FSP_NotifyFlushing, // 22: used to be FSP_Dispose
 	    // 23: Reserved
-	    // 24~31: near end error status
-	    FSP_IPC_CannotReturn = 24,
-	    FSP_MemoryCorruption,
+	    // 24~: near end error status
+	    FSP_MemoryCorruption = 24,
 	    FSP_NotifyOverflow,
 	    FSP_NotifyTimeout,
 	    FSP_NotifyNameResolutionFailed,

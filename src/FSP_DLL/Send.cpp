@@ -732,7 +732,7 @@ int32_t LOCALAPI CSocketItemDl::PrepareToSend(void * buf, int32_t len, bool eot)
 
 	// finally set the new tail of the send queue, and the let LLS detect the change
 	pControlBlock->AddRoundSendBlockN(pControlBlock->sendBufferNextPos, m);
-	_InterlockedExchangeAdd((u32*)& pControlBlock->sendBufferNextSN, m);
+	_InterlockedExchangeAdd((PLONG)&pControlBlock->sendBufferNextSN, m);
 	//^here memory barrier is necessary
 	return m;
 }

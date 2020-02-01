@@ -26,16 +26,23 @@
     ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
     POSSIBILITY OF SUCH DAMAGE.
  */
+#if defined(__MINGW32__)
+
+# include "DllEntry.cpp"
+
+#else
+
 #include "FSP_DLL.h"
 
-const int POLLING_INTERVAL_MICROSECONDS = 1000;	// HPET
+# define  POLLING_INTERVAL_MICROSECONDS 1000	// For HPET
 
 // the id of the process that call the library
 pid_t	CSocketItemDl::idThisProcess = 0;
 
+
+#if defined(__linux__)
+
 static	mqd_t	mqdes;
-
-
 
 // Called by the default constructor only
 void CSocketDLLTLB::Init()
@@ -50,8 +57,6 @@ void CSocketDLLTLB::Init()
 	CSocketItemDl::SaveProcessId();
 }
 
-
-
 CSocketDLLTLB::~CSocketDLLTLB()
 {
 	// TODO: Delete the time-out timer
@@ -60,6 +65,69 @@ CSocketDLLTLB::~CSocketDLLTLB()
 		mq_close(mqdes);
 }
 
+# ifndef _NO_LLS_CALLABLE
+// Given
+//	CommandToLLS &		const, the command context to pass to LLS
+//	int					the size of the command context
+// Return
+//	true if the command has been put in the mailslot successfully
+//	false if it failed
+bool LOCALAPI CSocketItemDl::Call(const CommandToLLS & cmd, int size)
+{
+	int r = mq_send(mqdes, (const char *)&cmd, size, 0);
+	if (r != 0)
+		perror("Cannot send the command to LLS through the message queue");
+	return (r == 0);
+}
+# endif
+
+#elif defined(__CYGWIN__)
+
+# include <sys/msg.h>
+  ALIGN(sizeof(long long)) const char $_FSP_KEY[8] = "FSP*KEY";
+# define FSP_MQ_KEY      (*(uint64_t *)($_FSP_KEY))
+
+static 	key_t	mqKey;
+static	int		msqid;
+
+// Called by the default constructor only
+void CSocketDLLTLB::Init()
+{
+    mqKey = (key_t)FSP_MQ_KEY;
+    msqid = msgget(mqKey, O_WRONLY);
+    if(msqid < 0)
+    {
+        perror("Cannot abtain the XSI message queue for send");
+        exit(-1);
+    }
+
+	CSocketItemDl::SaveProcessId();
+}
+
+CSocketDLLTLB::~CSocketDLLTLB() { /* no descriptor to close */ }
+
+
+# ifndef _NO_LLS_CALLABLE
+// Given
+//	CommandToLLS &		const, the command context to pass to LLS
+//	int					the size of the command context
+// Return
+//	true if the command has been put in the mailslot successfully
+//	false if it failed
+bool LOCALAPI CSocketItemDl::Call(const CommandToLLS & cmd, int size)
+{
+#ifdef TRACE
+	printf("Fiber#%u %d bytes to send to LLS\n", cmd.fiberID, size);
+#endif
+    int r = msgsnd(msqid, &cmd, size - sizeof(long), IPC_NOWAIT);
+    if(r < 0)
+		perror("Cannot send the command to LLS through the XSI message queue");
+	return (r == 0);
+}
+# endif
+
+
+#endif
 
 // Return the number of microseconds elapsed since Jan 1, 1970 UTC (Unix epoch)
 // Let the link-time-optimizer embed the code in the caller block
@@ -108,14 +176,15 @@ bool CSocketItemDl::InitLLSInterface(CommandNewSession & cmd)
 	struct itimerspec its;
 	struct sigevent sigev;
 	sigev.sigev_notify = SIGEV_THREAD;
-	sigev.sigev_value.sival_ptr = this;
-	sigev.sigev_notify_function = PollingNotices;
+	sigev.sigev_value.sival_ptr = this;	
+	sigev.sigev_notify_function = PollingHandler;
 	sigev.sigev_notify_attributes = NULL;
 	if (timer_create(CLOCK_MONOTONIC, &sigev, &pollingTimer) != 0)
 	{
 		perror("Cannot create the polling timer");
 		return false;
 	}
+	timeOut_ns = INT64_MAX;
 
 	its.it_value.tv_sec = 0;
 	its.it_value.tv_nsec = POLLING_INTERVAL_MICROSECONDS * 1000;
@@ -134,21 +203,28 @@ bool CSocketItemDl::InitLLSInterface(CommandNewSession & cmd)
 
 
 
-#ifndef _NO_LLS_CALLABLE
-// Given
-//	CommandToLLS &		const, the command context to pass to LLS
-//	int					the size of the command context
-// Return
-//	true if the command has been put in the mailslot successfully
-//	false if it failed
-bool LOCALAPI CSocketItemDl::Call(const CommandToLLS & cmd, int size)
+// The actual polling timer handler
+void CSocketItemDl::WaitOrTimeOutCallBack()
 {
-	int r = mq_send(mqdes, (const char *)&cmd, size, 0);
-	if (r != 0)
-		perror("Cannot send the command to LLS through the message queue");
-	return (r == 0);
-}
+	timer_t h = LCKREAD(pollingTimer);
+	if (h == 0)
+		return;
+	// The timer might have been 'RecycleSimply', and it causes segment fault
+	// on calling timer_getoverrun given timer id 0
+	int32_t elapsed = (int32_t)timer_getoverrun(h);
+	if(elapsed++ < 0)	// but it should not happen!
+		elapsed = 1;
+	// assume it would not overflow: overrun for 24 days is just too terriable!
+	elapsed *= POLLING_INTERVAL_MICROSECONDS * 1000;
+#ifdef TRACE
+	if(timeOut_ns <= elapsed)
+		printf("It is to time out, time remains = %" PRId64 "ns, elapsed = %dns\n", timeOut_ns, elapsed);
 #endif
+	if((timeOut_ns -= elapsed) <= 0)
+		TimeOut();
+	else
+		WaitEventToDispatch();
+}
 
 
 
@@ -157,38 +233,14 @@ bool LOCALAPI CSocketItemDl::Call(const CommandToLLS & cmd, int size)
 // Return
 //	true if the one-shot timer is registered successfully
 //	false if it failed
+// Remark
+//	Only support multiple of thousand milliseconds.
 bool LOCALAPI CSocketItemDl::AddOneShotTimer(uint32_t dueTime)
 {
-	struct itimerspec its;
-
-	if (timer == 0)
-	{
-		struct sigevent sigev;
-		// pthread_attr_t tattr;
-		// pthread_attr_init(&tattr);
-		sigev.sigev_notify = SIGEV_THREAD;
-		sigev.sigev_value.sival_ptr = this;
-		sigev.sigev_notify_function = TimeOutCallBack;
-		sigev.sigev_notify_attributes = NULL;
-		// Or with CAP_WAKE_ALARM capability, to set a timer against CLOCK_BOOTTIME_ALARM?
-		// it is assumed that the clock is still while system is suspended, CLOCK_BOOTTIME (since Linux 2.6.12)
-		int k = timer_create(CLOCK_MONOTONIC, &sigev, &timer);
-		// pthread_attr_destroy(&tattr)
-		if (k == -1)
-			return false;
-	}
-
-	its.it_value.tv_sec = dueTime / 1000;
-	its.it_value.tv_nsec = dueTime % 1000 * 1000000;
-	its.it_interval.tv_sec = 0;
-	its.it_interval.tv_nsec = 0;
-
-	if (timer_settime(timer, 0, &its, NULL) == 0)
-		return true;
-
-	timer_delete(timer);
-	timer = 0;
-	return false;
+	if(pollingTimer == 0)
+		return false;
+	timeOut_ns = int64_t(dueTime) * 1000000;
+	return true;
 }
 
 
@@ -196,42 +248,11 @@ bool LOCALAPI CSocketItemDl::AddOneShotTimer(uint32_t dueTime)
 // Do
 //	Try to cancel the registered one-shot timer
 // Return
-//	true if the one-shot timer is successfully canceled
-//	false if it failed
+//	true for this implementation
 bool CSocketItemDl::CancelTimeout()
 {
-	timer_t h;
-	if ((h = (timer_t)_InterlockedExchange(&timer, 0)) != 0)
-		return (timer_delete(h) == 0);
+	timeOut_ns = INT64_MAX;
 	return true;
 }
 
-
-
-// Unlike Free, Recycle-locked does not destroy the control block
-// so that the DLL socket may be reused on connection resumption
-// assume the socket has been locked
-int CSocketItemDl::RecycLocked()
-{
-	CancelTimeout();
-
-	socketsTLB.FreeItem(this);
-
-	SetMutexFree();
-	return 0;
-}
-
-
-
-// Make sure resource is kept until other threads leave critical section
-// Does NOT waits for all callback functions to complete before returning
-// in case of deadlock when the function itself is called in some call-back function
-void CSocketItemDl::Free()
-{
-	CancelTimeout();
-
-	socketsTLB.FreeItem(this);
-
-	CSocketItem::Destroy();
-	memset((octet *)this + sizeof(CSocketItem), 0, sizeof(CSocketItemDl) - sizeof(CSocketItem));
-}
+#endif

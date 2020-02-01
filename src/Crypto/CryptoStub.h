@@ -38,26 +38,32 @@
 #if defined(__WINDOWS__)
 
 # ifdef _MSC_VER
+#  ifndef __cplusplus
+#	define SINLINE static __forceinline
+#  endif
 #  define FSPAPI __stdcall
 # else
+#  ifndef __cplusplus
+#	define SINLINE static __inline__
+#  endif
 #  define FSPAPI
+# endif
+
+// Only supported on Windows Vista and above
+# if WINVER < 0x0600
+#	undef	WINVER
+#	define	WINVER 0x0600
 # endif
 
 # define WIN32_LEAN_AND_MEAN
 # include <Windows.h>
 
-# ifndef __cplusplus
-#  define SINLINE static __forceinline
-# endif
-
 #elif defined(__linux__) || defined(__CYGWIN__)
-
-# define FSPAPI
 
 # ifndef __cplusplus
 #  define SINLINE static __inline__
 # endif
-
+# define FSPAPI
 # define printf_s	printf	// let the compiler check the safety of formatted printing
 
 #endif

@@ -115,8 +115,7 @@ const char * CStringizeNotice::names[LARGEST_FSP_NOTICE + 1] =
 	"FSP_NotifyToFinish",
 	"FSP_NotifyRecycled",
 	"FSP_NameResolutionFailed",
-	// 12~16
-	"FSP_IPC_CannotReach",
+	// 12~
 	"FSP_MemoryCorruption",
 	"FSP_NotifyReset",
 	"FSP_NotifyTimeout",
@@ -161,7 +160,7 @@ const char * CStringizeState::operator[](int i)
 	static char errmsg[] = "Unknown state: 0123467890123";
 	if (i < 0 || i > LARGEST_FSP_STATE)
 	{
-		snprintf(&errmsg[16], 14, "%d", i);
+		snprintf(&errmsg[15], 14, "%d", i);
 		return &errmsg[0];
 	}
 	return CStringizeState::names[i];
@@ -373,10 +372,10 @@ int LOCALAPI ControlBlock::Init(int32_t & sendSize, int32_t & recvSize)
 	// here we let it interleaved:
 	// send buffer descriptors, receive buffer descriptors, receive buffer blocks and send buffer blocks
 	// we're sure that FSP_SocketBuf itself is 64-bit aligned. to make buffer block 64-bit aligned
-	_InterlockedExchange((u32 *) & sendBufDescriptors, (sizeof(ControlBlock) + 7) & 0xFFFFFFF8);
-	_InterlockedExchange((u32 *) & recvBufDescriptors, sendBufDescriptors + sizeof(FSP_SocketBuf) * sendBufferBlockN);
-	_InterlockedExchange((u32 *) & recvBuffer, (sendBufDescriptors + sizeDescriptors + 7) & 0xFFFFFFF8);
-	_InterlockedExchange((u32 *) & sendBuffer, recvBuffer + recvBufferBlockN * MAX_BLOCK_SIZE);
+	_InterlockedExchange((PLONG)&sendBufDescriptors, (sizeof(ControlBlock) + 7) & 0xFFFFFFF8);
+	_InterlockedExchange((PLONG)&recvBufDescriptors, sendBufDescriptors + sizeof(FSP_SocketBuf) * sendBufferBlockN);
+	_InterlockedExchange((PLONG)&recvBuffer, (sendBufDescriptors + sizeDescriptors + 7) & 0xFFFFFFF8);
+	_InterlockedExchange((PLONG)&sendBuffer, recvBuffer + recvBufferBlockN * MAX_BLOCK_SIZE);
 
 	memset((octet *)this + sendBufDescriptors, 0, sizeDescriptors);
 
@@ -419,7 +418,7 @@ ControlBlock::PFSP_SocketBuf ControlBlock::GetSendBuf()
 	p->InitMarkLocked();
 	p->ClearFlags();
 	IncRoundSendBlockN(sendBufferNextPos);
-	_InterlockedIncrement(&sendBufferNextSN);
+	_InterlockedIncrement((PLONG)&sendBufferNextSN);
 
 	return p;
 }
@@ -473,7 +472,7 @@ ControlBlock::PFSP_SocketBuf LOCALAPI ControlBlock::AllocRecvBuf(seq_t seq1)
 	{
 		p = HeadRecv() + recvWindowNextPos;
 		IncRoundRecvBlockN(recvWindowNextPos);
-		_InterlockedIncrement(&recvWindowNextSN);
+		_InterlockedIncrement((PLONG)&recvWindowNextSN);
 	}
 	else
 	{
@@ -488,7 +487,7 @@ ControlBlock::PFSP_SocketBuf LOCALAPI ControlBlock::AllocRecvBuf(seq_t seq1)
 		if(ordered)
 		{
 			recvWindowNextPos = d + 1 >= recvBufferBlockN ? 0 : d + 1;
-			_InterlockedExchange((u32*)&recvWindowNextSN, seq1 + 1);
+			_InterlockedExchange((PLONG)&recvWindowNextSN, seq1 + 1);
 		}
 		else if(p->IsComplete())
 		{
@@ -671,7 +670,7 @@ int LOCALAPI ControlBlock::MarkReceivedFree(int32_t nBlock)
 	}
 	// but preserve the packet flag for EoT detection, etc.
 	AddRoundRecvBlockN(recvWindowHeadPos, m);
-	_InterlockedExchangeAdd((u32*)&recvWindowFirstSN, m);
+	_InterlockedExchangeAdd((PLONG)&recvWindowFirstSN, m);
 	//^Memory barrier is mandatory
 	return 0;
 }

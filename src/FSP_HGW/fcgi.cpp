@@ -136,7 +136,8 @@ void execute_cgi(FSPHANDLE client
 			for (i = 0; i < content_length; i++)
 			{
 				recv((int)(long)client, &c, 1, 0);
-				write(cgi_input[1], &c, 1);
+				if((int)write(cgi_input[1], &c, 1) < 0)
+					break;;
 			}
 		}
 

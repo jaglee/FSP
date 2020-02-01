@@ -55,6 +55,7 @@
 #  define REPORT_ERRMSG_ON_TRACE(s1) \
 	TraceLastError(__FILE__, __LINE__, __FUNCTION__, (s1))
 # endif
+
 # ifdef _DEBUG
 #  define DEINIT_WAIT_TIMEOUT_ms		15000	// 15 seconds
 #  define BREAK_ON_DEBUG()			DebugBreak()
@@ -75,6 +76,23 @@
 typedef DWORD	pid_t;
 typedef HANDLE	timer_t;
 
+# ifdef __MINGW32__
+# define IN4ADDR_LOOPBACK 0x0100007F	// Works for x86 little-endian
+# define max(a,b)	((a) >= (b) ? (a) : (b))
+# define min(a,b)	((a) <= (b) ? (a) : (b))
+
+ALIGN(sizeof(uint64_t))
+const struct { octet u[8]; } in6addr_linklocalprefix = { { 0xFE, 0x80, 00, 00, 00, 00, 00, 00 } };
+
+// GetTickCount64() is availabe after Windows Vista (inclusively)
+static inline uint64_t GetTickCount64()
+{
+	FILETIME systemTime;
+	GetSystemTimeAsFileTime(&systemTime);
+	return *(uint64_t *)&systemTime / 10;
+}
+
+# else
 class CSRWLock
 {
 protected:
@@ -99,6 +117,7 @@ protected:
 # endif
 	void ReleaseMutex() { ReleaseSRWLockExclusive(& rtSRWLock); }
 };
+# endif
 
 #elif defined(__linux__) || defined(__CYGWIN__)
 
@@ -186,6 +205,7 @@ protected:
 #include <assert.h>
 #include <errno.h>
 #include <limits.h>
+#include <memory.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
@@ -201,12 +221,14 @@ protected:
 # define REPORT_ERRMSG_ON_TRACE(s) (s)
 #endif
 
-#define TRACE_ADDRESS	1
+// Bit 0 is reserved for 'true'
 #define TRACE_HEARTBEAT	2
 #define TRACE_PACKET	4
 #define TRACE_SLIDEWIN	8
 #define TRACE_ULACALL	16
 #define TRACE_OUTBAND	32	// Other than KEEP_ALIVE
+// Bit 6 is reserved
+#define TRACE_ADDRESS	128
 
 
 /**
@@ -383,7 +405,6 @@ struct CommandCloneConnect : CommandNewSession
 };
 
 
-
 struct FSP_ADDRINFO_EX : FSP_SINKINF
 {
 	int32_t	cmsg_level;
@@ -459,7 +480,15 @@ public:
 	void SetMutexFree() { _InterlockedExchange8(&mutex, 0); }
 };
 
-
+#ifdef __MINGW32__
+class CSRWLock: CLightMutex
+{
+protected:
+	void InitMutex() { /* constructed */ }
+	void AcquireMutex() { WaitSetMutex(); }
+	void ReleaseMutex() { SetMutexFree(); }
+};
+#endif
 
 // 4: The soft interrupt vector of returned notices
 struct LLSNotice
@@ -715,19 +744,19 @@ struct ControlBlock
 	// 
 	void IncRoundRecvBlockN(int32_t & tgt)
 	{
-		register int32_t a = _InterlockedIncrement((DWORD*)&tgt) - recvBufferBlockN;
-		if (a >= 0) _InterlockedExchange((DWORD*)&tgt, a);
+		register int32_t a = _InterlockedIncrement((PLONG)&tgt) - recvBufferBlockN;
+		if (a >= 0) _InterlockedExchange((PLONG)&tgt, a);
 	}
 	void IncRoundSendBlockN(int32_t & tgt)
 	{
-		register int32_t a = _InterlockedIncrement((DWORD*)&tgt) - sendBufferBlockN;
-		if (a >= 0) _InterlockedExchange((DWORD*)&tgt, a);
+		register int32_t a = _InterlockedIncrement((PLONG)&tgt) - sendBufferBlockN;
+		if (a >= 0) _InterlockedExchange((PLONG)&tgt, a);
 	}
 	// Set the right edge of the send window after the very first packet of the queue is sent
 	void SetFirstSendWindowRightEdge()
 	{
 		register seq_t k = LCKREAD(sendWindowFirstSN);
-		if (_InterlockedCompareExchange(&sendWindowNextSN, k + 1, k) == k)
+		if ((seq_t)_InterlockedCompareExchange((PLONG)&sendWindowNextSN, k + 1, k) == k)
 			IncRoundSendBlockN(sendWindowNextPos);
 	}
 	octet* LOCALAPI InquireSendBuf(int32_t *);
@@ -742,7 +771,7 @@ struct ControlBlock
 	void SlideRecvWindowByOne()	// shall be atomic!
 	{
 		IncRoundRecvBlockN(recvWindowHeadPos);
-		_InterlockedIncrement(&recvWindowFirstSN);
+		_InterlockedIncrement((PLONG)&recvWindowFirstSN);
 	}
 
 	// Given
@@ -784,7 +813,7 @@ struct ControlBlock
 		skb->ReInitMarkAcked();
 		// but preserve packet flags for possible later reference to EoT, etc.
 		IncRoundSendBlockN(sendWindowHeadPos);
-		_InterlockedIncrement(&sendWindowFirstSN);
+		_InterlockedIncrement((PLONG)&sendWindowFirstSN);
 	}
 
 	// Return the advertisable size of the receive window

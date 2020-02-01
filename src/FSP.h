@@ -242,12 +242,11 @@ typedef enum
 	// built-in rule: notification after FSP_NotifyToFinish implies the LLS socket has been released already
 	FSP_NotifyRecycled,
 	FSP_NameResolutionFailed,
-	// 12~16: exceptions, soft NMI
-	FSP_IPC_CannotReach,
+	// 12~: exceptions, soft NMI
 	FSP_MemoryCorruption,
 	FSP_NotifyReset,
 	FSP_NotifyTimeout,
-	SMALLEST_FSP_NMI = FSP_IPC_CannotReach,
+	SMALLEST_FSP_NMI = FSP_MemoryCorruption,
 	LARGEST_FSP_NOTICE = FSP_NotifyTimeout,
 } FSP_NoticeCode;
 

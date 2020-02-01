@@ -2,7 +2,6 @@
   Usage: <RawMemoryClient> [remote_fsp_url]    passively accept a memory file transfered by the remote server
  **/
 #include "stdafx.h"
-#include "tchar.h"
 
 // If compiled in Debug mode with the '_DEBUG' macro predefined by default, it tests FSP over UDP/IPv4
 #if defined(_DEBUG) || defined(OVER_UDP_IPv4)
@@ -13,8 +12,8 @@
 
 int BeginReceiveMemoryPattern(FSPHANDLE, size_t);
 
-int StartConnection(char *);
-int CompareMemoryPattern(TCHAR*);
+int StartConnection(const char *);
+int CompareMemoryPattern(const char*);
 
 int32_t ticksToWait;
 
@@ -23,7 +22,7 @@ HANDLE	hFile;		// A shared file descriptor
 
 static unsigned char bufPrivateKey[CRYPTO_NACL_KEYBYTES];
 
-static char fileName[sizeof(TCHAR) * MAX_PATH + 4];
+static char fileName[MAX_PATH + 4];
 static TCHAR finalFileName[MAX_PATH];
 
 // The signal that the main loop is finished
@@ -59,25 +58,20 @@ static void FSPAPI onError2(FSPHANDLE h, FSP_ServiceCode code, int value)
 
 // the server would send the filename in the first message. the client should change the name
 // in case it is in the same directory of the same machine 
-int _tmain(int argc, TCHAR* argv[])
+int main(int argc, char* argv[])
 {
 	int result = -1;
 	if (argc > 2)
 	{
-		_tprintf_s(_T("Usage: %s [<remote_fsp_url>]\n"), argv[0]);
-		goto l_bailout;
+		printf_s("Usage: %s [<remote_fsp_url>]\n", argv[0]);
+l_bailout:
+		printf_s("\n\nPress Enter to exit...");
+		getchar();
+		// handles are automatically closed on exit
+		exit(result);
 	}
 
-#ifdef _MBCS
-	char* urlRemote = argc > 1 ? argv[1] : REMOTE_APPLAYER_NAME;
-#else
-	if (argc > 1)
-	{
-		_tprintf_s(_T("Presently this program does not accept wide-char parameter.\n");
-		goto l_bailout;
-	}
-	char* urlRemote = REMOTE_APPLAYER_NAME;
-#endif
+	const char* urlRemote = argc > 1 ? argv[1] : REMOTE_APPLAYER_NAME;
 	Sleep(2000);	// wait the server up when debug simultaneously
 
 	result = StartConnection(urlRemote);
@@ -87,18 +81,13 @@ int _tmain(int argc, TCHAR* argv[])
 		if (result == -EPERM)
 			printf_s("(The end user does not permit further operation)\n");
 	}
-
-l_bailout:
-	printf_s("\n\nPress Enter to exit...");
-	getchar();
-	// handles are automatically closed on exit
-	exit(result);
+	goto l_bailout;
 }
 
 
 
 // On this client side we test blocking mode while on server side we test asynchronous mode
-int StartConnection(char* urlRemote)
+int StartConnection(const char* urlRemote)
 {
 	static size_t	arrayTestSizes[] = { 511
 		//, 512
@@ -178,7 +167,7 @@ l_nextSize:
 		if (finished)
 			return 0;
 		//
-		if (++indexOfSizeArray >= sizeof(arrayTestSizes) / sizeof(size_t))
+		if (++indexOfSizeArray >= int(sizeof(arrayTestSizes) / sizeof(size_t)))
 			return 0;
 		goto l_nextSize;
 	}
@@ -241,12 +230,8 @@ static void FSPAPI onReceiveFileNameReturn(FSPHANDLE h, FSP_ServiceCode resultCo
 		return;
 	}
 
-#ifdef _MBCS
 	UTF8ToLocalMBCS(finalFileName, MAX_PATH, fileName);
-#else
-	UTF8ToWideChars(finalFileName, MAX_PATH, fileName, strlen(fileName) + 1);
-#endif
-	_tprintf_s(_T("done.\nRemote filename: %s\n"), finalFileName);
+	printf_s("done.\nRemote filename: %s\n", finalFileName);
 	try
 	{
 		// TODO: exploit to GetDiskFreeSpace to take use of SECTOR size
@@ -264,7 +249,7 @@ static void FSPAPI onReceiveFileNameReturn(FSPHANDLE h, FSP_ServiceCode resultCo
 		{
 			char linebuf[80];
 			printf_s("Overwrite existent file? Y/n: ");
-			gets_s(linebuf, sizeof(linebuf));
+			fgets(linebuf, sizeof(linebuf), stdin);
 			int c = toupper(linebuf[0]);
 			if (c != 'Y')
 			{

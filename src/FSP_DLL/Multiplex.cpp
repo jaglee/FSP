@@ -158,7 +158,7 @@ CSocketItemDl * LOCALAPI CSocketItemDl::ToPrepareMultiply(FSPHANDLE h, PFSP_Cont
 	}
 	catch(...)
 	{
-		socketsTLB.FreeItem(socketItem);
+		socketItem->RecycleSimply();
 		return NULL;
 	}
 
@@ -209,7 +209,7 @@ FSPHANDLE CSocketItemDl::CompleteMultiply(CommandCloneConnect & cmd)
 	SetState(CLONING);
 	if(! Call(cmd, sizeof(cmd)))
 	{
-		socketsTLB.FreeItem(this);
+		RecycleSimply();
 		return NULL;
 	}
 

@@ -43,7 +43,7 @@
 // TODO: recycle SHUT_REQUESTED or CLOSED socket in LRU manner
 void CSocketItemEx::KeepAlive()
 {
-	const char *c = (char *)_InterlockedCompareExchangePointer((void**)&lockedAt, (void*)__FUNCTION__, 0);
+	const char *c = (char *)_InterlockedCompareExchangePointer((PVOID*)&lockedAt, (PVOID)__FUNCTION__, 0);
 	timestamp_t t1 = NowUTC();
 	// assume it takes little time to get system clock
 	while (t1 - tPreviousLifeDetection > (MAX_LOCK_WAIT_ms << 10))
@@ -279,7 +279,7 @@ bool CSocketItemEx::SendKeepAlive()
 	buf3.SetHostID(CLowerInterface::Singleton.addresses);
 	memcpy(buf3.mp.subnets, savedPathsToNearEnd, sizeof(TSubnets));
 
-	_InterlockedIncrement(&nextOOBSN);	// Because lastOOBSN start from zero as well. See ValidateSNACK
+	_InterlockedIncrement((PLONG)&nextOOBSN);	// Because lastOOBSN start from zero as well. See ValidateSNACK
 
 	register int n = (sizeof(buf3.snack.gaps) - sizeof(buf3.mp)) / sizeof(FSP_SelectiveNACK::GapDescriptor);
 	//^ keep the underlying IP packet from segmentation
@@ -350,7 +350,7 @@ bool CSocketItemEx::SendAckFlush()
 {
 	ALIGN(FSP_ALIGNMENT) struct SAckFlushCache buf2;
 
-	_InterlockedIncrement(& nextOOBSN);
+	_InterlockedIncrement((PLONG)&nextOOBSN);
 	buf2.snack._h.opCode = SELECTIVE_NACK;
 	buf2.snack._h.mark = 0;
 	buf2.snack._h.length = SNACK_HEADER_SIZE_LE16;
@@ -445,7 +445,7 @@ int LOCALAPI CSocketItemEx::AcceptSNACK(ControlBlock::seq_t expectedSN, FSP_Sele
 		return nAck;
 
 	pControlBlock->AddRoundSendBlockN(pControlBlock->sendWindowHeadPos, nAck);
-	_InterlockedExchange((u32*)&pControlBlock->sendWindowFirstSN, expectedSN);
+	_InterlockedExchange((PLONG)&pControlBlock->sendWindowFirstSN, expectedSN);
 
 	return nAck;
 }
@@ -580,7 +580,7 @@ l_step2:
 		//
 		if (++pControlBlock->sendWindowNextPos >= capacity)
 			pControlBlock->sendWindowNextPos = 0;
-		_InterlockedIncrement(&pControlBlock->sendWindowNextSN);
+		_InterlockedIncrement((PLONG)&pControlBlock->sendWindowNextSN);
 	}
 	// Zero window probing; although there's some code redundancy it keeps clarity
 	else if (pControlBlock->CountSentInFlight() == 0 && pControlBlock->CountSendBuffered() > 0)
@@ -606,7 +606,7 @@ l_step2:
 		//
 		if (++pControlBlock->sendWindowNextPos >= capacity)
 			pControlBlock->sendWindowNextPos = 0;
-		_InterlockedIncrement(&pControlBlock->sendWindowNextSN);
+		_InterlockedIncrement((PLONG)&pControlBlock->sendWindowNextSN);
 	}
 	// For sake of stability do not raise limitSN in this very clock click
 	toStopEmitQ = (int32_t(pControlBlock->sendWindowNextSN - limitSN) >= 0);

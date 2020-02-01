@@ -133,7 +133,7 @@ static void GetServiceSA(PSECURITY_ATTRIBUTES pSA)
                      & pEveryoneSID))
     {
 #ifndef NDEBUG
-        printf("AllocateAndInitializeSid Error %u\n", GetLastError());
+        printf("AllocateAndInitializeSid Error %d\n", (int)GetLastError());
 #endif
         goto Cleanup;
     }
@@ -152,7 +152,7 @@ static void GetServiceSA(PSECURITY_ATTRIBUTES pSA)
     if (SetEntriesInAcl(1, & ea, NULL, &pACL) != ERROR_SUCCESS) 
     {
 #ifndef NDEBUG
-        printf("SetEntriesInAcl Error %u\n", GetLastError());
+        printf("SetEntriesInAcl Error %d\n", (int)GetLastError());
 #endif
         goto Cleanup;
     }
@@ -160,7 +160,7 @@ static void GetServiceSA(PSECURITY_ATTRIBUTES pSA)
     if (!InitializeSecurityDescriptor(& sd, SECURITY_DESCRIPTOR_REVISION)) 
     {  
 #ifndef NDEBUG
-        printf("InitializeSecurityDescriptor Error %u\n", GetLastError());
+        printf("InitializeSecurityDescriptor Error %d\n", (int)GetLastError());
 #endif
         goto Cleanup; 
     } 
@@ -171,7 +171,7 @@ static void GetServiceSA(PSECURITY_ATTRIBUTES pSA)
             pACL, 
             FALSE))   // not a default DACL 
     {  
-        printf("SetSecurityDescriptorDacl Error %u\n", GetLastError());
+        printf("SetSecurityDescriptorDacl Error %d\n", (int)GetLastError());
         goto Cleanup; 
     } 
 
@@ -189,7 +189,7 @@ Cleanup:
 	//	  LocalFree(pACL);
 }
 
-#elif defined(__linux__) || defined(__CYGWIN__)
+#elif defined(__linux__)
 
 int main(int argc, char * argv[])
 {
@@ -222,13 +222,13 @@ int main(int argc, char * argv[])
 	{
 		char buffer[MAX_CTRLBUF_LEN];
 		unsigned int msg_prio;;
-		ssize_t nBytesRead;
-		while((nBytesRead = mq_receive(mqdes, buffer, MAX_CTRLBUF_LEN, &msg_prio)) > 0)
+		int nBytesRead;
+		while((nBytesRead = (int)mq_receive(mqdes, buffer, MAX_CTRLBUF_LEN, &msg_prio)) > 0)
 		{
 #if defined(TRACE) && (TRACE & TRACE_ULACALL)
-			printf_s("\n%d octets read from the mailslot.", (int)nBytesRead);
+			printf_s("\n%d octets read from the message queue.", (int)nBytesRead);
 #endif
-			if(nBytesRead < (ssize_t)sizeof(struct CommandToLLS))
+			if(nBytesRead < (int)sizeof(struct CommandToLLS))
 			{
 #if defined(TRACE) && (TRACE & TRACE_ULACALL)
 				printf_s(" Size of the message is too small.\n");
@@ -240,7 +240,7 @@ int main(int argc, char * argv[])
 		}
 #ifndef NDEBUG
 		// TODO: UNRESOLVED! Crash Recovery? if ReadFile fails, it is a crash
-		printf("Fatal! Read mailslot error, command channel broken\n");
+		printf("Fatal! Read POSIX message queue error, command channel broken\n");
 #endif
 	}
 	catch(...)
@@ -254,5 +254,69 @@ l_bailout:
 	return 0;
 }
 
-#endif
+#elif defined(__CYGWIN__)
 
+# include <sys/msg.h>
+  ALIGN(sizeof(long long)) const char $_FSP_KEY[8] = "FSP*KEY";
+# define FSP_MQ_KEY      (*(uint64_t *)($_FSP_KEY))
+
+int main(int argc, char * argv[])
+{
+	key_t mqKey = (key_t)FSP_MQ_KEY;
+
+    int msqid = msgget(mqKey, IPC_CREAT | IPC_EXCL | O_RDONLY);
+    if(msqid < 0)
+    {
+        msqid = msgget(mqKey, O_RDONLY);
+        if(msqid < 0)
+        {
+            perror("Cannot abtain the XSI message queue for read");
+            exit(-1);
+        }
+    }
+
+	// also create the receiver
+	if(!CLowerInterface::Singleton.Initialize())
+	{
+		printf("In main cannot access lower interface, aborted.\n"); 
+		goto l_bailout;
+	}
+
+	// continue on main thread (thread 1):
+	try
+	{
+		char msgbuf[MAX_CTRLBUF_LEN];
+		int nBytesRead;
+		while((nBytesRead = (int)msgrcv(msqid, &msgbuf, MAX_CTRLBUF_LEN - sizeof(long), 0, 0)) > 0)
+		{
+			nBytesRead += sizeof(long);	// XSI message type
+#if defined(TRACE) && (TRACE & TRACE_ULACALL)
+			printf_s("\n%d octets read from the XSI message queue.", (int)nBytesRead);
+#endif
+			if(nBytesRead < (int)sizeof(struct CommandToLLS))
+			{
+#if defined(TRACE) && (TRACE & TRACE_ULACALL)
+				printf_s(" Size of the message is too small.\n");
+#endif
+				continue;
+			}
+			ProcessCommand(msgbuf);
+			// There used to be "hard-coded: (ushort)(-1) mean exit". But it allowed DoS attack
+		}
+#ifndef NDEBUG
+		// TODO: UNRESOLVED! Crash Recovery? if ReadFile fails, it is a crash
+		printf("Fatal! Read XSI message queue, command channel broken\n");
+#endif
+	}
+	catch(...)
+	{
+		BREAK_ON_DEBUG();
+		CLowerInterface::Singleton.Destroy();
+	}
+
+l_bailout:
+	msgctl(msqid, IPC_RMID, NULL);
+	return 0;
+}
+
+#endif

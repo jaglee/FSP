@@ -36,7 +36,7 @@ ALFID_T CLowerInterface::SetLocalFiberID(ALFID_T value)
 {
 	if(nearInfo.IsIPv6())
 		nearInfo.u.idALF = value;
-	return _InterlockedExchange((u32*)&pktBuf->fidPair.peer, value);
+	return _InterlockedExchange((PLONG)&pktBuf->fidPair.peer, value);
 }
 
 
@@ -384,7 +384,7 @@ void CSocketItemEx::InstallSessionKey(const CommandInstallKey & cmd)
 	DumpHexical(cmd.ikm, pControlBlock->connectParams.keyBits / 8);
 #endif
 	contextOfICC.isPrevSendCRC = contextOfICC.isPrevRecvCRC
-		= (_InterlockedExchange64((int64_t *)&contextOfICC.keyLifeRemain, cmd.keyLife) == 0);
+		= (InterlockedExchange64((int64_t *)&contextOfICC.keyLifeRemain, cmd.keyLife) == 0);
 	contextOfICC.noEncrypt = (pControlBlock->noEncrypt != 0);
 	contextOfICC.snFirstSendWithCurrKey = cmd.nextSendSN;
 	contextOfICC.snFirstRecvWithCurrKey = pControlBlock->connectParams.nextKey$initialSN;

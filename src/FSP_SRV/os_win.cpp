@@ -32,17 +32,18 @@
 #include <MSTcpIP.h>
 #include <Iphlpapi.h>
 
-#include <netfw.h>
 #include <Psapi.h>
 #include <tchar.h>
 
-#pragma comment(lib, "Iphlpapi.lib")
-#pragma comment(lib, "Ws2_32.lib")
-#pragma comment(lib, "User32.lib")
-
+#if _MSC_VER
+# include <netfw.h>
+# pragma comment(lib, "Iphlpapi.lib")
+# pragma comment(lib, "Ws2_32.lib")
+# pragma comment(lib, "User32.lib")
+#endif
 
 #define REPORT_WSAERROR_TRACE(s) (\
-	printf("\n/**\n * %s, line# %d\n * %s\n */\n", __FILE__, __LINE__, __FUNCDNAME__), \
+	printf("\n/**\n * %s, line# %d\n * %s\n */\n", __FILE__, __LINE__, __FUNCTION__), \
 	ReportWSAError(s)\
 	)
 
@@ -53,7 +54,7 @@ static HANDLE	globalTimerQueue;
 static ALFID_T preallocatedIDs[MAX_CONNECTION_NUM];
 
 // The function called by the macro REPORT_WSAERROR_TRACE
-static int LOCALAPI ReportWSAError(char *msg);
+static int LOCALAPI ReportWSAError(const char *msg);
 
 // The function called directly or by ReportWSAError
 static void LOCALAPI ReportErrorAsMessage(int);
@@ -76,7 +77,7 @@ inline int GetPointerOfWSARecvMsg(SOCKET sd)
 }
 
 
-#if (_WIN32_WINNT < 0x0600)
+#if (_WIN32_WINNT < 0x0600) && !defined(OVER_UDP_IPv4)
 static LPFN_WSASENDMSG	WSASendMsg;
 inline int GetPointerOfWSASendMsg(SOCKET sock)
 {
@@ -97,9 +98,10 @@ inline int GetPointerOfWSASendMsg(SOCKET sock)
 #endif
 
 
+#ifndef OVER_UDP_IPv4
 // Forward declaration of the callback function for handling the event that some IPv6 interface was changed
 VOID NETIOAPI_API_ OnUnicastIpChanged(PVOID, PMIB_UNICASTIPADDRESS_ROW, MIB_NOTIFICATION_TYPE);
-
+#endif
 
 /*
  * The OS-dependent CommandNewSessionSrv constructor
@@ -190,7 +192,7 @@ bool CLowerInterface::Initialize()
 		REPORT_WSAERROR_TRACE("Cannot get function pointer WSARecvMsg");
 		return false;
 	}
-#if (_WIN32_WINNT < 0x0600)
+#if (_WIN32_WINNT < 0x0600) && !defined(OVER_UDP_IPv4)
 	if((r = GetPointerOfWSASendMsg(sdSend)) != 0)
 	{
 		REPORT_WSAERROR_TRACE("Cannot get function pointer WSASendMsg");
@@ -309,7 +311,7 @@ int LOCALAPI CLowerInterface::EnumEffectiveAddresses(uint64_t *prefixes)
 		if ((addresses[i].sin6_addr.u.Byte[0] & 0xE0) == 0)
 			continue;
 		// RFC4291 link-local address is NOT compatible with FSP resilience support
-		if (*(uint64_t *)& addresses[i].sin6_addr.u == *(uint64_t *)& in6addr_linklocalprefix.u)
+		if (*(uint64_t *)& addresses[i].sin6_addr == *(uint64_t *)& in6addr_linklocalprefix)
 			continue;
 		// RFC4193 unique local address is preferred if and only if the peer takes use of it as well
 		if (((prefixes[0] & 0xFE) != 0xFC && (addresses[i].sin6_addr.u.Byte[0] & 0xFE) == 0xFC)
@@ -731,7 +733,7 @@ DWORD WINAPI CLowerInterface::ProcessRemotePacket(LPVOID lpParameter)
 	}
 	catch(HRESULT x)
 	{
-		printf("PANIC! To restart after diagnose internal exception 0x%X", x);
+		printf("PANIC! To restart after diagnose internal exception 0x%X", (unsigned)x);
 		return -1;
 	}
 	return 0;
@@ -788,7 +790,7 @@ inline void CLowerInterface::ProcessRemotePacket()
 				Sleep(TIMER_SLICE_ms * 20);	// wait for the network service up again
 				continue;
 			}
-			else if (err = WSAENOTSOCK)
+			else if (err == WSAENOTSOCK)
 				// One of the descriptor sets contains an entry that is not a socket. deliberately close a socket
 			{
 				Sleep(TIMER_SLICE_ms);
@@ -856,7 +858,7 @@ int LOCALAPI CLowerInterface::SendBack(char * buf, int len)
 #ifdef OVER_UDP_IPv4
 	// Store the local(near end) fiber ID as the source, the remote end fiber ID as
 	// the destination fiber ID in the given fiber ID association
-	pktBuf->fidPair.peer = _InterlockedExchange((u32*)&pktBuf->fidPair.source, pktBuf->fidPair.peer);
+	pktBuf->fidPair.peer = _InterlockedExchange((PLONG)&pktBuf->fidPair.source, pktBuf->fidPair.peer);
 #if defined(TRACE) && (TRACE & TRACE_ADDRESS)
 	printf_s("\nSend back to peer socket address:\n");
 	DumpNetworkUInt16((uint16_t *)& addrFrom, sizeof(SOCKADDR_IN6) / 2);
@@ -893,7 +895,7 @@ int LOCALAPI CLowerInterface::SendBack(char * buf, int len)
 //	Print the system message mapped to the last error to the standard output, prefixed by the given message prefix
 // Return
 //	the WSA error number, which is greater than zero. may be zero if no error at all.
-static int LOCALAPI ReportWSAError(char * msg)
+static int LOCALAPI ReportWSAError(const char * msg)
 {
 	int	err = WSAGetLastError();
 
@@ -988,15 +990,15 @@ bool CSocketItemEx::IsProcessAlive()
 //	true if the timer was set, false if it failed.
 bool LOCALAPI CSocketItemEx::ReplaceTimer(uint32_t period)
 {
-	return ( timer == NULL 
-		&&	::CreateTimerQueueTimer(& timer, globalTimerQueue
+	return (
+		(timer == NULL 
+		 &&	::CreateTimerQueueTimer(& timer, globalTimerQueue
 			, KeepAlive	// WAITORTIMERCALLBACK
 			, this		// LPParameter
 			, period
 			, period
-			, WT_EXECUTEINTIMERTHREAD)
-		|| timer != NULL
-		&& ::ChangeTimerQueueTimer(globalTimerQueue, timer, period, period)
+			, WT_EXECUTEINTIMERTHREAD))
+		|| (timer != NULL && ::ChangeTimerQueueTimer(globalTimerQueue, timer, period, period))
 		);
 }
 
@@ -1048,7 +1050,7 @@ void CSocketItemEx::ScheduleConnect(int i)
 bool CSocketItemEx::MapControlBlock(const CommandNewSessionSrv &cmd)
 {
 #ifndef NDEBUG
-	printf_s(__FUNCDNAME__ " called, source process id = %d, size of the shared memory = 0x%X\n", cmd.idProcess, cmd.dwMemorySize);
+	printf_s("%s called, source process id = %d, size of the shared memory = 0x%X\n", __FUNCTION__, cmd.idProcess, cmd.dwMemorySize);
 #endif
 	if(hMemoryMap != NULL)
 		Destroy();
@@ -1211,6 +1213,12 @@ int CSocketItemEx::SendPacket(register u32 n1, ScatteredSendBuffers s)
  *		0 if no error
  *		positive if warning
  */
+#ifdef __MINGW32__
+
+static int CreateFWRules() { return 0; }
+
+#else
+
 static int CreateFWRules()
 {
 	HRESULT hrComInit = S_OK;
@@ -1481,6 +1489,7 @@ l_bailout:
 
 	return 0;
 }
+#endif
 
 
 /**

@@ -28,13 +28,14 @@
     POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include <stdio.h>
 #include <ctype.h>
-#include <string.h>
-#include <stdlib.h>
 #include <fcntl.h>
-#include <sys/types.h>
+#include <memory.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 
 
 #if defined(_WIN32)
@@ -44,17 +45,18 @@
 
 typedef int socklen_t;
 
+# ifdef _MSC_VER
 # pragma comment(lib, "Ws2_32.lib")
+# endif
 
 #elif defined(__linux__) || defined(__CYGWIN__)
 
 # include <pthread.h>
-# include <strings.h>
 # include <sys/socket.h>
 # include <sys/wait.h>
 # include <unistd.h>
-# define closesocket    close
-# define _strcmpi   strcasecmp
+# define closesocket	close
+# define _strcmpi		strcasecmp
 
 static inline void Sleep(int32_t millis)
 {

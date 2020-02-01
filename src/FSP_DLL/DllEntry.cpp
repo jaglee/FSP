@@ -70,7 +70,6 @@ static void GetServiceSA(PSECURITY_ATTRIBUTES);
 extern "C" 
 BOOL WINAPI DllMain(HINSTANCE hInstance, DWORD dwReason, LPVOID lpvReserved)
 {
-	LPCSTR nameContainer = "FSPKeyContainer";
 	// to maintain thread local storage
 	if(dwReason == DLL_PROCESS_ATTACH)
 	{
@@ -156,7 +155,7 @@ bool CSocketItemDl::InitLLSInterface(CommandNewSession& cmd)
 	}
 
 	// make the event name. the control block address, together with the process id, uniquely identify the event
-	sprintf_s(cmd.szEventName, MAX_NAME_LENGTH, REVERSE_EVENT_PREFIX "%08X%p", idThisProcess, pControlBlock);
+	sprintf_s(cmd.szEventName, MAX_NAME_LENGTH, REVERSE_EVENT_PREFIX "%08X%p", (u32)idThisProcess, pControlBlock);
 	// system automatically resets the event state to non-signaled after a single waiting thread has been released
 	hEvent = CreateEventA(&attrSecurity
 		, FALSE // not manual-reset
@@ -211,14 +210,14 @@ bool LOCALAPI CSocketItemDl::Call(const CommandToLLS & cmd, int size)
 //	false if it failed
 bool LOCALAPI CSocketItemDl::AddOneShotTimer(uint32_t dueTime)
 {
-	return (timer == NULL && ::CreateTimerQueueTimer(& timer, ::timerQueue
+	return ((timer == NULL && ::CreateTimerQueueTimer(& timer, ::timerQueue
 			, WaitOrTimeOutCallBack
 			, this		// LPParameter
 			, dueTime
 			, 0
 			, WT_EXECUTEINTIMERTHREAD
-			) != FALSE
-		|| timer != NULL && ::ChangeTimerQueueTimer(::timerQueue, timer, dueTime, 0) != FALSE
+			) != FALSE)
+		|| (timer != NULL && ::ChangeTimerQueueTimer(::timerQueue, timer, dueTime, 0) != FALSE)
 		);
 }
 
@@ -233,42 +232,6 @@ bool CSocketItemDl::CancelTimeout()
 {
 	HANDLE h = (HANDLE)InterlockedExchangePointer((PVOID *)& timer, NULL);
 	return (h == NULL || ::DeleteTimerQueueTimer(::timerQueue, h, NULL) != FALSE);
-}
-
-
-
-// Unlike Free, Recycle-locked does not destroy the control block
-// so that the DLL socket may be reused on connection resumption
-// assume the socket has been locked
-int CSocketItemDl::RecycLocked()
-{
-	register HANDLE h;
-	CancelTimeout();
-	if ((h = InterlockedExchangePointer((PVOID*)&theWaitObject, NULL)) != NULL)
-		UnregisterWaitEx(h, NULL);
-
-	socketsTLB.FreeItem(this);
-
-	SetMutexFree();
-	return 0;
-}
-
-
-
-// Make sure resource is kept until other threads leave critical section
-// Does NOT waits for all callback functions to complete before returning
-// in case of deadlock when the function itself is called in some call-back function
-void CSocketItemDl::Free()
-{
-	register HANDLE h;
-	CancelTimeout();
-	if ((h = InterlockedExchangePointer((PVOID *)& theWaitObject, NULL)) != NULL)
-		UnregisterWaitEx(h, NULL);
-
-	socketsTLB.FreeItem(this);
-
-	CSocketItem::Destroy();
-	memset((octet *)this + sizeof(CSocketItem), 0, sizeof(CSocketItemDl) - sizeof(CSocketItem));
 }
 
 
@@ -298,7 +261,7 @@ static void AllowDuplicateHandle()
 	)
     {
 #ifndef NDEBUG
-        printf("AllocateAndInitializeSid Error %u\n", GetLastError());
+        printf("AllocateAndInitializeSid Error %d\n", (int)GetLastError());
 #endif
         goto Cleanup;
     }
@@ -324,7 +287,7 @@ static void AllowDuplicateHandle()
     if (SetEntriesInAcl(2, ea, NULL, & pACL) != ERROR_SUCCESS) 
     {
 #ifndef NDEBUG
-        printf("SetEntriesInAcl Error %u\n", GetLastError());
+        printf("SetEntriesInAcl Error %d\n", (int)GetLastError());
 #endif
         goto Cleanup;
     }
@@ -332,7 +295,7 @@ static void AllowDuplicateHandle()
     if (! InitializeSecurityDescriptor(& sd, SECURITY_DESCRIPTOR_REVISION)) 
     {  
 #ifndef NDEBUG
-        printf("InitializeSecurityDescriptor Error %u\n", GetLastError());
+        printf("InitializeSecurityDescriptor Error %d\n", (int)GetLastError());
 #endif
         goto Cleanup; 
     } 
@@ -343,7 +306,7 @@ static void AllowDuplicateHandle()
             pACL, 
             FALSE))   // not a default DACL 
     {  
-        printf("SetSecurityDescriptorDacl Error %u\n", GetLastError());
+        printf("SetSecurityDescriptorDacl Error %d\n", (int)GetLastError());
         goto Cleanup; 
     } 
 
@@ -352,7 +315,7 @@ static void AllowDuplicateHandle()
 		, & sd))
 	{
 #ifndef NDEBUG
-        printf("InitializeSecurityDescriptor Error %u\n", GetLastError());
+        printf("InitializeSecurityDescriptor Error %d\n", (int)GetLastError());
 #endif
 		//UNRESOLVED! is it a recoverable error or a fatal?
 	}
@@ -385,7 +348,7 @@ static void GetServiceSA(PSECURITY_ATTRIBUTES pSA)
                      & pEveryoneSID))
     {
 #ifndef NDEBUG
-        printf("AllocateAndInitializeSid Error %u\n", GetLastError());
+        printf("AllocateAndInitializeSid Error %d\n", (int)GetLastError());
 #endif
         goto Cleanup;
     }
@@ -404,7 +367,7 @@ static void GetServiceSA(PSECURITY_ATTRIBUTES pSA)
     if (SetEntriesInAcl(1, & ea, NULL, &pACL) != ERROR_SUCCESS) 
     {
 #ifndef NDEBUG
-        printf("SetEntriesInAcl Error %u\n", GetLastError());
+        printf("SetEntriesInAcl Error %d\n", (int)GetLastError());
 #endif
         goto Cleanup;
     }
@@ -412,7 +375,7 @@ static void GetServiceSA(PSECURITY_ATTRIBUTES pSA)
     if (!InitializeSecurityDescriptor(& sd, SECURITY_DESCRIPTOR_REVISION)) 
     {
 #ifndef NDEBUG
-        printf("InitializeSecurityDescriptor Error %u\n", GetLastError());
+        printf("InitializeSecurityDescriptor Error %d\n", (int)GetLastError());
 #endif
         goto Cleanup; 
     } 
@@ -423,7 +386,7 @@ static void GetServiceSA(PSECURITY_ATTRIBUTES pSA)
             pACL, 
             FALSE))   // not a default DACL 
     {  
-        printf("SetSecurityDescriptorDacl Error %u\n", GetLastError());
+        printf("SetSecurityDescriptorDacl Error %d\n", (int)GetLastError());
         goto Cleanup; 
     } 
 

@@ -27,6 +27,7 @@
     POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include <memory.h>
 #include "defs.h"
 
 // The pool is too small to be bothered to exploit dual-linked queue

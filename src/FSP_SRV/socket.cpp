@@ -60,7 +60,7 @@ CSocketSrvTLB::CSocketSrvTLB()
 bool CSocketSrvTLB::PutToScavengeCache(CSocketItemEx *pSocket, timestamp_t tNow)
 {
 	int32_t n;
-	if ((n = _InterlockedIncrement(&topOfSC)) >= MAX_CONNECTION_NUM)
+	if ((n = _InterlockedIncrement((PLONG)&topOfSC)) >= MAX_CONNECTION_NUM)
 	{
 		topOfSC--;
 		return false;
@@ -396,7 +396,7 @@ CMultiplyBacklogItem * CSocketSrvTLB::FindByRemoteId(uint32_t remoteHostId, ALFI
 bool CSocketItemEx::WaitUseMutexAt(const char* funcName)
 {
 	uint64_t t0 = GetTickCount64();
-	while (_InterlockedCompareExchangePointer((void**)& lockedAt, (void*)funcName, 0) != 0)
+	while (_InterlockedCompareExchangePointer((PVOID*)& lockedAt, (PVOID)funcName, 0) != 0)
 	{
 		if (!IsInUse() || GetTickCount64() - t0 > MAX_LOCK_WAIT_ms)
 			return false;
@@ -417,7 +417,7 @@ bool CSocketItemEx::WaitUseMutexAt(const char* funcName)
 // Return true if the session context is locked, false if not
 bool CSocketItemEx::LockWithActiveULAt(const char* funcName)
 {
-	void* c = _InterlockedCompareExchangePointer((void**)& lockedAt, (void*)funcName, 0);
+	void* c = _InterlockedCompareExchangePointer((PVOID*)& lockedAt, (PVOID)funcName, 0);
 	if (IsProcessAlive())
 		return (c == 0 || WaitUseMutexAt(funcName));
 	//
@@ -709,7 +709,7 @@ void CMultiplyBacklogItem::RespondToMultiply()
 	skb->timeRecv = tLastRecv;	// so that delay of acknowledgement can be calculated more precisely
 
 	pControlBlock->recvWindowExpectedSN = ++pControlBlock->recvWindowNextSN;
-	_InterlockedIncrement((DWORD*)&pControlBlock->recvWindowNextPos);
+	_InterlockedIncrement((PLONG)&pControlBlock->recvWindowNextPos);
 	// The receive buffer is eventually ready
 
 	ControlBlock::PFSP_SocketBuf skbOut = pControlBlock->GetLastBuffered();
@@ -805,7 +805,7 @@ void CSocketItemEx::DisposeOnReset()
 // See also ~::KeepAlive case NON_EXISTENT
 void CSocketItemEx::Destroy()
 {
-	if (_InterlockedExchange(&idSrcProcess, 0) == 0)
+	if (_InterlockedExchange((PLONG)&idSrcProcess, 0) == 0)
 		return;
 	//
 	try

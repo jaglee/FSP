@@ -19,7 +19,7 @@
 //         printf("    overrun count = %d\n", overrun);
 // }
 
-static void mycallback(__sigval_t v)
+static void mycallback(union sigval v)
 {
     // printf("Argument number: %d\n", v.sival_int);
     printf("Command line: %s\n", ((char **)v.sival_ptr)[0]);
@@ -32,16 +32,16 @@ int main(int argc, char *argv[])
     struct sigevent sigev;
     timer_t timerid;
     struct itimerspec its;
-    pthread_attr_t tattr;
-
-    pthread_getattr_default_np(&tattr);
+    // pthread_attr_t tattr;
+    // pthread_getattr_default_np(&tattr);
 
     sigev.sigev_notify = SIGEV_THREAD;
     sigev.sigev_signo = SIGRTMIN;
     // sigev.sigev_value.sival_int = argc;
     sigev.sigev_value.sival_ptr = argv;
     sigev.sigev_notify_function = mycallback;   // ;print_siginfo;
-    sigev.sigev_notify_attributes = &tattr;     // inherit attributes of the parent thread
+    sigev.sigev_notify_attributes = NULL;
+    // sigev.sigev_notify_attributes = &tattr;     // inherit attributes of the parent thread
 
     // Or with CAP_WAKE_ALARM capability, to set a timer against CLOCK_BOOTTIME_ALARM?
     // it is assumed that the clock is still while system is suspended, CLOCK_BOOTTIME (since Linux 2.6.12)
@@ -68,6 +68,18 @@ int main(int argc, char *argv[])
     printf("Timer started.\n");
 
     sleep(5);    // not in milli-seconds, but seconds
+
+    its.it_value.tv_sec = 0;
+    its.it_value.tv_nsec = 16000000;	// 16 milliseconds
+    its.it_interval.tv_sec = its.it_value.tv_sec;
+    its.it_interval.tv_nsec = its.it_value.tv_nsec;
+    if (timer_settime(timerid, 0, &its, NULL) == -1)
+    {
+        printf("Error on timer_settime, fast\n");
+        exit(-1);
+    }
+    printf("Changed to second, fast timer.\n");
+	sleep(2);
 
     exit(0);
 }

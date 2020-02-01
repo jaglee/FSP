@@ -104,16 +104,6 @@ static void FSPAPI onSubrequestSent(FSPHANDLE, FSP_ServiceCode, int);
 void ReportErrorToClient(SOCKET, ERepCode);
 void CloseGracefully(SOCKET);
 
-// Given
-//	const *		the error message meant to be put on system console (and should be logged)
-// Do
-//	Exit the program abruptly for some fatal reason
-static inline void Abort(const char * sc)
-{
-	perror(sc);
-	exit(-1);
-}
-
 //
 // Thread pool wait callback function template
 //

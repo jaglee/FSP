@@ -65,7 +65,7 @@ int BeginReceiveMemoryPattern(FSPHANDLE h, size_t testSize)
 	{
 		char linebuf[80];
 		printf_s("Overwrite existent file? Y/n: ");
-		gets_s(linebuf, sizeof(linebuf));
+		fgets(linebuf, sizeof(linebuf), stdin);
 		int c = toupper(linebuf[0]);
 		if (c != 'Y')
 		{
@@ -99,23 +99,23 @@ int BeginReceiveMemoryPattern(FSPHANDLE h, size_t testSize)
 
 // Limited to 128KB, word alignment of 4 octets
 // "$memory.^";
-int CompareMemoryPattern(TCHAR *fileName)
+int CompareMemoryPattern(const char *fileName)
 {
 	static	octet buf[0x20000];	// 128KB
 
 	int fd;
-	errno_t	err = _tsopen_s(& fd
+	errno_t	err = _sopen_s(& fd
 			, fileName
 			, _O_BINARY | _O_RDONLY | _O_SEQUENTIAL
 			, _SH_DENYWR
 			, 0);
 	if(err != 0)
 	{
-		_tprintf_s(_T("Error number = %d: cannot open file %s\n"), err, fileName);
+		printf_s("Error number = %d: cannot open file %s\n", err, fileName);
 		return -2;
 	}
 
-	_tprintf_s(_T("To check word pattern in %s\n"), fileName);
+	printf_s("To check word pattern in %s\n", fileName);
 
 	int bytesRead = _read(fd, buf, sizeof(buf));
 	_close(fd);
@@ -125,13 +125,12 @@ int CompareMemoryPattern(TCHAR *fileName)
 		return -EDOM;
 
 	for(register int i = 0; i < int(bytesRead / sizeof(uint32_t)); i++)
-
 	{
 		if(* (uint32_t *) & buf[i * sizeof(uint32_t)] != htobe32(i))
 			__debugbreak();
 	}
 
-	_tprintf_s(_T("Word pattern in %s was checked.\n"), fileName);
+	printf_s("Word pattern in %s was checked.\n", fileName);
 
 	return 0;
 }

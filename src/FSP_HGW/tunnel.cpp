@@ -85,12 +85,12 @@ void CloseGracefully(SOCKET client)
 
 static void FreeRequestItem(PRequestPoolItem p, bool graceful = false)
 {
-	if(p->hSocket != SOCKET_ERROR && ! graceful)
+	if(p->hSocket != (SOCKET)SOCKET_ERROR && ! graceful)
 	{
 		shutdown(p->hSocket, SD_BOTH);
 		closesocket(p->hSocket);
 	}
-	else if (p->hSocket != SOCKET_ERROR)
+	else if (p->hSocket != (SOCKET)SOCKET_ERROR)
 	{
 		CloseGracefully(p->hSocket);
 	}
@@ -269,7 +269,7 @@ static bool FSPAPI onRequestArrived(FSPHANDLE h, void *buf, int32_t len, bool eo
 
 	// following code should be put in the remote end point
 	p->hSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-	if(p->hSocket == SOCKET_ERROR)
+	if(p->hSocket == (SOCKET)SOCKET_ERROR)
 	{
 		ReportWSAError("Remote socket() failed");
 		ReportToRemoteClient(p, REP_REJECTED);

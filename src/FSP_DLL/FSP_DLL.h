@@ -174,6 +174,16 @@ protected:
 		cmd.dwMemorySize = dwMemorySize;
 	}
 	void EnableLLSInterrupt() { _bittestandreset(&pControlBlock->notices.vector, 0); }
+	void RecycleSimply()
+	{
+		register HANDLE h;
+		CancelTimeout();
+		if ((h = InterlockedExchangePointer((PVOID*)&theWaitObject, NULL)) != NULL)
+		{
+			UnregisterWaitEx(h, NULL);
+			socketsTLB.FreeItem(this);
+		}
+	}
 
 	static VOID NTAPI WaitOrTimeOutCallBack(PVOID param, BOOLEAN isTimeout)
 	{
@@ -184,10 +194,9 @@ protected:
 	}
 #elif defined(__linux__) || defined(__CYGWIN__)
 	static pid_t	idThisProcess;
-	timer_t	pollingTimer;
-	timer_t			timer;
-	static void PollingNotices(union sigval v) { ((CSocketItemDl*)v.sival_ptr)->WaitEventToDispatch(); }
-	static void TimeOutCallBack(union sigval v) { ((CSocketItemDl*)v.sival_ptr)->TimeOut(); }
+	timer_t			pollingTimer;
+	int64_t			timeOut_ns;
+	static void PollingHandler(union sigval v) { ((CSocketItemDl*)v.sival_ptr)->WaitOrTimeOutCallBack(); }
 
 	// See also InitLLSInterface()
 	void CopyFatMemPointo(CommandNewSession &cmd)
@@ -196,6 +205,17 @@ protected:
 		cmd.dwMemorySize = dwMemorySize;
 	}
 	void EnableLLSInterrupt() { pControlBlock->notices.vector &= 0xFFFFFFFE; }
+	void RecycleSimply()
+	{
+		timer_t h;
+		if ((h = (timer_t)_InterlockedExchange(&pollingTimer, 0)) != 0)
+		{
+			timer_delete(h);
+			socketsTLB.FreeItem(this);
+		}
+	}
+	//
+	void WaitOrTimeOutCallBack();
 #endif
 
 	// to support full-duplex send and receive does not share the same call back function
@@ -312,9 +332,6 @@ public:
 		pControlBlock->tfrc = psp1->tfrc;
 		pControlBlock->milky = psp1->milky;
 		pControlBlock->noEncrypt = psp1->noEncrypt;
-		//
-		pControlBlock->notices.SetHead(FSP_IPC_CannotReach);
-		//^only after the control block is successfully mapped into the memory space of LLS may it be cleared by LLS
 
 		// could be exploited by ULA to make services distinguishable
 		memcpy(&context, psp1, sizeof(FSP_SocketParameter));
