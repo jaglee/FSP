@@ -102,6 +102,8 @@ int CLowerInterface::ProcessReceived()
 		pSocket = MapSocket();
 		if (pSocket == NULL || !pSocket->IsInUse())
 			break;
+		pSocket->pktSeqNo = be32toh(pktBuf->hdr.sequenceNo);
+		pSocket->headPacket = pktBuf;
 		pSocket->OnGetReset(*FSP_OperationHeader<FSP_RejectConnect>());
 		break;
 	//
@@ -117,7 +119,9 @@ int CLowerInterface::ProcessReceived()
 		if (pSocket == NULL)
 		{
 #ifdef TRACE
-			printf_s("Cannot map socket for local fiber#%u(_%X_)\n", GetLocalFiberID(), be32toh(GetLocalFiberID()));
+			printf_s("Cannot map socket for local fiber#%u(_%X_)\ncommand: %s(%d)\n"
+				, GetLocalFiberID(), be32toh(GetLocalFiberID())
+				, opCodeStrings[opCode], (int)opCode);
 #endif
 			break;
 		}
@@ -418,6 +422,7 @@ l_return:
 // The first RESET should be push onto the top. Repeated RESET should be append at the tail.
 void LOCALAPI CSocketItemEx::OnGetReset(FSP_RejectConnect& reject)
 {
+	int32_t offset;
 #ifdef TRACE
 	printf_s("\nRESET got, in state %s\n\n", stateNames[lowState]);
 #endif
@@ -427,47 +432,56 @@ void LOCALAPI CSocketItemEx::OnGetReset(FSP_RejectConnect& reject)
 	if (pControlBlock == NULL)
 		goto l_bailout;
 
-	if (InState(CONNECT_BOOTSTRAP))
+	// LISTENING state is not affected by reset signal
+	switch (lowState)
 	{
+	case LISTENING:
+		// simply ignore
+		break;
+	case CONNECT_BOOTSTRAP:
 		if (reject.timeStamp == pControlBlock->connectParams.nboTimeStamp
 			&& reject.initCheckCode == pControlBlock->connectParams.initCheckCode)
 		{
 			DisposeOnReset();
 		}
 		// otherwise simply ignore
-	}
-	else if (InState(CONNECT_AFFIRMING))
-	{
+		break;
+	case CONNECT_AFFIRMING:
 		if (reject.timeStamp == pControlBlock->connectParams.nboTimeStamp
 			&& reject.cookie == pControlBlock->connectParams.cookie)
 		{
 			DisposeOnReset();
 		}
 		// otherwise simply ignore
-	}
-	else if (InState(CHALLENGING))
-	{
+		break;
+	case CHALLENGING:
 		if (reject.sn.initial == htobe32(pControlBlock->connectParams.initialSN)
 			&& reject.cookie == pControlBlock->connectParams.cookie)
 		{
 			DisposeOnReset();
 		}
 		// otherwise simply ignore
-	}
-	else if (!InState(LISTENING) && !InState(CLOSED))
-	{
-		int32_t offset = OffsetToRecvWinLeftEdge(be32toh(reject.sn.initial));
+		break;
+	case CLONING:
+		contextOfICC.snFirstRecvWithCurrKey = pktSeqNo;
+		fidPair.peer = headPacket->fidPair.source;
+		if (ValidateICC())
+			DisposeOnReset();
+		// otherwise simply ignore
+		break;
+	case CLOSED:
+		// preserve the context for sake of connection resurrection
+		break;
+	default: 	// 'recoverable' states:
+		offset = OffsetToRecvWinLeftEdge(be32toh(reject.sn.initial));
 		if (-1 <= offset && offset < pControlBlock->recvBufferBlockN
-			&& ValidateICC((FSP_NormalPacketHeader*)& reject, 0, fidPair.peer, 0))
+			&& ValidateICC((FSP_NormalPacketHeader*)&reject, 0, fidPair.peer, 0))
 		{
 			DisposeOnReset();
 		}
-		// otherwise simply ignore.
 	}
 	// ^SHUT_REQUESTED (passive shutdown) or 
-	// InStates ESTABLISHED, COMMITTING, PEER_COMMIT, COMMITTING2, COMMITTED, CLOSABLE, PRE_CLOSED, CLONING
-	// besides, those states are recoverable.
-	// LISTENING state is not affected by reset signal
+	// ESTABLISHED, COMMITTING, PEER_COMMIT, COMMITTING2, COMMITTED, CLOSABLE, PRE_CLOSED
 l_bailout:
 	SetMutexFree();
 }
@@ -568,6 +582,17 @@ int CSocketItemEx::ValidateSNACK(ControlBlock::seq_t& ackSeqNo, FSP_SelectiveNAC
 #ifdef TRACE
 		printf_s("%s has encountered replay attack? Sequence number:\n\tinband %u, oob %u - %u\n"
 			, opCodeStrings[p1->hs.opCode], pktSeqNo, sn, lastOOBSN);
+#endif
+		return -EAGAIN;
+	}
+	
+	int32_t d = OffsetToRecvWinLeftEdge(pktSeqNo);
+	if (d > pControlBlock->recvBufferBlockN || d < -pControlBlock->recvBufferBlockN)
+	{
+#ifdef TRACE
+		printf_s("The packet number MUST fall in some safe window to defend against DoS attack\n"
+			"Offset to left edge of the receive window = %d, window width = %d\n"
+			, d, pControlBlock->recvBufferBlockN);
 #endif
 		return -EAGAIN;
 	}
@@ -674,6 +699,7 @@ void CSocketItemEx::OnConnectRequestAck()
 	pControlBlock->perfCounts.countPacketAccepted++;
 
 	// Do not update RTT here, because there's undetermined delay due to backlog processing/calling back ULA
+	// Suppose tLastRecv (so has tLastRecvAny) has been set (by PlacePayload)
 	tSessionBegin = tMigrate = tLastRecv;
 	tPreviousTimeSlot = tRecentSend;
 	tPreviousLifeDetection = tSessionBegin;
@@ -709,7 +735,7 @@ void CSocketItemEx::OnGetNulCommit()
 	TRACE_SOCKET();
 
 	bool isInitiativeState = InState(CHALLENGING) || InState(CLONING);
-	if (! isInitiativeState && lowState < ESTABLISHED)
+	if (!isInitiativeState && lowState < ESTABLISHED)
 		return;
 
 	FSP_NormalPacketHeader* p1 = &headPacket->hdr;
@@ -762,7 +788,7 @@ void CSocketItemEx::OnGetNulCommit()
 		pControlBlock->SlideRecvWindowByOne();
 	}
 	// Indirect dependency: tLastRecv which is exploited in SendAckFlush in TransitOnPeerCommit is set here
-	skb->timeRecv = tLastRecv = NowUTC();
+	skb->timeRecv = tLastRecv = tLastRecvAny = NowUTC();
 	snLastRecv = pktSeqNo;
 	// Network RTT may not be refreshed here as there is undetermined delay caused by application processing
 #if (TRACE & (TRACE_SLIDEWIN | TRACE_HEARTBEAT))
@@ -773,6 +799,8 @@ void CSocketItemEx::OnGetNulCommit()
 	{
 		if (HasBeenCommitted() && TransitOnPeerCommit())
 			Notify(FSP_NotifyToCommit);
+		if (lowState != CLOSABLE)
+			RestartKeepAlive();	// Safe-net calling
 		return;
 	}
 
@@ -783,12 +811,15 @@ void CSocketItemEx::OnGetNulCommit()
 
 	if (isMultiplying)
 	{
-		SetState(_InterlockedExchange8(&transactional, 0) ? CLOSABLE : PEER_COMMIT);
+		if (_InterlockedExchange8(&transactional, 0))
+			Adjourn();
+		else
+			SetState(PEER_COMMIT);
 		SignalFirstEvent(FSP_NotifyMultiplied);
 	}
 	else // if (lowState == CHALLENGING)
 	{
-		SetState(CLOSABLE);
+		Adjourn();
 		SignalFirstEvent(FSP_NotifyAccepted);
 	}
 	SendAckFlush();
@@ -1004,7 +1035,7 @@ void CSocketItemEx::OnGetKeepAlive()
 #if (TRACE & (TRACE_HEARTBEAT | TRACE_PACKET | TRACE_SLIDEWIN))
 	printf_s("Fiber#%u: SNACK packet with %d gap(s) advertised received\n", fidPair.source, n);
 #endif
-	// By default ULA should poll the send buffer, instead to rely on soft-interrupt
+	tLastRecvAny = NowUTC();
 	if (acknowledgible)
 	{
 		int r = AcceptSNACK(ackSeqNo, pSNACK->gaps, n);
@@ -1016,7 +1047,7 @@ void CSocketItemEx::OnGetKeepAlive()
 #endif		// UNRESOLVED?! Should log this very unexpected case
 	}
 
-	// For this FSP version the mobile paramater is mandatory in KEEP_ALIVE
+	// For this FSP version the mobile parameter is mandatory in KEEP_ALIVE
 	HandlePeerSubnets(&((FSP_KeepAliveExtension*) & (headPacket->hdr))->mp);
 }
 
@@ -1114,7 +1145,7 @@ void CSocketItemEx::OnGetPureData()
 	// State transition signaled to DLL CSocketItemDl::WaitEventToDispatch()
 	if (HasBeenCommitted())
 	{
-		if(TransitOnPeerCommit())
+		if (TransitOnPeerCommit())
 			Notify(FSP_NotifyToCommit);
 		return;
 	}
@@ -1137,7 +1168,7 @@ bool CSocketItemEx::TransitOnPeerCommit()
 	pControlBlock->SnapshotReceiveWindowRightEdge();
 	if (hasAcceptedRELEASE)
 	{
-		ReplaceTimer(DEINIT_WAIT_TIMEOUT_ms);
+		// ULA state to be transited by the call-back function
 		Notify(FSP_NotifyToFinish);
 		lowState = CLOSED;
 		SendAckFlush();
@@ -1147,7 +1178,8 @@ bool CSocketItemEx::TransitOnPeerCommit()
 	switch (lowState)
 	{
 	case CHALLENGING:
-		SetState(CLOSABLE);
+	case COMMITTED:
+		Adjourn();
 		break;
 	case ESTABLISHED:
 		SetState(PEER_COMMIT);
@@ -1155,16 +1187,15 @@ bool CSocketItemEx::TransitOnPeerCommit()
 	case COMMITTING:
 		SetState(COMMITTING2);
 		break;
-	case COMMITTED:
-		SetState(CLOSABLE);
-		break;
 	case CLONING:
-		SetState(_InterlockedExchange8(&transactional, 0) ? CLOSABLE : PEER_COMMIT);
+		if (_InterlockedExchange8(&transactional, 0))
+			Adjourn();
+		else
+			SetState(PEER_COMMIT);
 		break;
 	default:	// case PEER_COMMIT: case COMMITTING2: case CLOSABLE:	// keep state
 		;
 	}
-	//
 	if (!delayAckPending)
 		SendAckFlush();
 	return true;
@@ -1200,17 +1231,17 @@ void CSocketItemEx::OnAckFlush()
 	}
 #endif
 	AcceptSNACK(ackSeqNo, NULL, 0);
+	tLastRecvAny = NowUTC();
 
 	if (InState(PRE_CLOSED))
 	{
-		ReplaceTimer(DEINIT_WAIT_TIMEOUT_ms);
 		SetState(CLOSED);
 		Notify(FSP_NotifyToFinish);
 		return;
 	}
 
 	if (InState(COMMITTING2))
-		SetState(CLOSABLE);
+		Adjourn();
 	else if(InState(COMMITTING))
 		SetState(COMMITTED);
 
@@ -1237,7 +1268,7 @@ void CSocketItemEx::OnAckFlush()
 //	And accept RELEASE in PRE_CLOSED state because ACK_FLUSH may race with RELEASE in some scenario
 void CSocketItemEx::OnGetRelease()
 {
-	if (InState(SHUT_REQUESTED))
+	if (InState(SHUT_REQUESTED) || InState(CLOSED))
 	{
 		EnableDelayAck();
 		return;
@@ -1316,19 +1347,17 @@ void CSocketItemEx::OnGetMultiply()
 	if (!InStates(ESTABLISHED, COMMITTING, COMMITTED, PEER_COMMIT, COMMITTING2, CLOSABLE))
 		return;
 
+	// The packet number MUST fall in some safe window to defend against DoS attack
+	int32_t d = OffsetToRecvWinLeftEdge(pktSeqNo);
+	if (d > pControlBlock->recvBufferBlockN || d < -pControlBlock->recvBufferBlockN)
+		return;
+
 	// The out-of-band serial number is stored in p1->expectedSN
-	// Check whether it is a collision OR a replay-attack
+	// However, MULTIPLY is not necessary orderly
 	FSP_FixedHeader* pFH = &headPacket->hdr;
 	uint32_t sn = be32toh(pFH->expectedSN);
-	if (int32_t(sn - lastOOBSN) <= 0)
-	{
-#ifdef TRACE
-		printf_s("MULTIPLY has encountered replay attack? Sequence number:\n\tinband %u, oob %u - %u\n"
-			, pktSeqNo, sn, lastOOBSN);
-#endif
-		return;
-	}
-	lastOOBSN = sn;
+	if (int32_t(sn - lastOOBSN) > 0)
+		lastOOBSN = sn;
 
 	uint32_t remoteHostID = pControlBlock->connectParams.remoteHostID;
 	ALFID_T idSource = headPacket->fidPair.source;
@@ -1339,6 +1368,18 @@ void CSocketItemEx::OnGetMultiply()
 #if defined(TRACE) && (TRACE & TRACE_OUTBAND)
 		printf_s("Duplicate MULTIPLY received?\n"
 			"\tContext for session pair (%u, %u) established already.\n", idParent, idSource);
+#endif
+		return;
+	}
+
+	// Make the 'salt' not so easy to guess to defend against DoS attack
+	BackLogItem backlogItem(pControlBlock->connectParams);
+	backlogItem.idRemote = idSource;
+	backlogItem.salt = (sn ^ backlogItem.timeDelta);
+	if (pControlBlock->backLog.Has(&backlogItem))
+	{
+#if defined(TRACE) && (TRACE & TRACE_OUTBAND)
+		printf_s("Duplicate MULTIPLY received, backlogged already.\n");
 #endif
 		return;
 	}
@@ -1357,19 +1398,9 @@ void CSocketItemEx::OnGetMultiply()
 		REPORT_ERRMSG_ON_TRACE("Cannot allocate new socket slot for multiplication");
 		return;		// for security reason silently ignore the exception
 	}
-	newItem->tLastRecv = NowUTC();
+	newItem->tLastRecv = newItem->tLastRecvAny = tLastRecvAny = NowUTC();
 	newItem->snLastRecv = pktSeqNo;
 
-	BackLogItem backlogItem(pControlBlock->connectParams);
-	backlogItem.idRemote = idSource;
-	if (pControlBlock->backLog.Has(&backlogItem))
-	{
-#if defined(TRACE) && (TRACE & TRACE_OUTBAND)
-		printf_s("Duplicate MULTIPLY received, backlogged already.\n");
-#endif
-		CLowerInterface::Singleton.FreeItem(newItem);
-		return;
-	}
 	pControlBlock->perfCounts.countPacketAccepted++;
 
 	backlogItem.expectedSN = pktSeqNo;
@@ -1385,8 +1416,9 @@ void CSocketItemEx::OnGetMultiply()
 	// While the ALFID part which was assigned dynamically by AllocItem() is preserved
 	newItem->fidPair.peer = idSource;
 	newItem->idParent = idParent;
-	newItem->nextOOBSN = this->nextOOBSN;
-	newItem->lastOOBSN = this->lastOOBSN;
+	// See also InitiateMultiply, setting of nextOOBSN
+	newItem->lastOOBSN = sn;
+	newItem->nextOOBSN = 0;
 	// place payload into the backlog, see also PlacePayload
 	newItem->CopyInPlainText((octet *)pFH + be16toh(pFH->hs.offset), lenPktData);
 
@@ -1414,7 +1446,9 @@ void CSocketItemEx::OnGetMultiply()
 		newItem->DeriveKey(idSource, idParent);
 
 	newItem->SetFirstRTT(tRoundTrip_us);
-	newItem->lowState = NON_EXISTENT;		// so that when timeout it is scavenged
+	newItem->lowState = NON_EXISTENT;
+	//^Accept->AllocItem()->TestSetState(CHALLENGING) requires that lowState was set to 0.
+	// Besides, when timeout the socket is scavenged automatically.
 	newItem->ReplaceTimer(TRANSIENT_STATE_TIMEOUT_ms);
 
 	// Lastly, put it into the backlog. Put it too early may cause race condition
@@ -1458,7 +1492,7 @@ int CSocketItemEx::PlacePayload()
 		memcpy(ubuf, (octet*)pHdr + be16toh(pHdr->hs.offset), len);
 	}
 	// Or else might be zero for ACK_START or MULTIPLY packet
-	skb->timeRecv = tLastRecv = NowUTC();
+	skb->timeRecv = tLastRecv = tLastRecvAny = NowUTC();
 	snLastRecv = pktSeqNo;
 
 	skb->version = pHdr->hs.major;

@@ -35,8 +35,77 @@ int FSPAPI Dispose(FSPHANDLE hFSPSocket)
 {
 	CSocketItemDl *p = CSocketDLLTLB::HandleToRegisteredSocket(hFSPSocket);
 	if(p == NULL)
-		return -EFAULT;
+		return -EBADF;
 	return p->Dispose();
+}
+
+
+
+// Set the function to be called back on passively shutdown by the remote end
+DllSpec
+int FSPAPI SetOnRelease(FSPHANDLE hFSPSocket, NotifyOrReturn fp1)
+{
+	CSocketItemDl* p = CSocketDLLTLB::HandleToRegisteredSocket(hFSPSocket);
+	if (p == NULL)
+		return -EBADF;
+	return p->SetOnRelease((PVOID)fp1);
+}
+
+
+// Try to terminate the session gracefully provided that the peer has commit the transmit transaction
+// Return 0 if no immediate error, or else the error number
+// The callback function might return code of delayed error
+DllSpec
+int FSPAPI Shutdown(FSPHANDLE hFSPSocket, NotifyOrReturn fp1)
+{
+	CSocketItemDl* p = CSocketDLLTLB::HandleToRegisteredSocket(hFSPSocket);
+	if (p == NULL)
+		return -EBADF;
+	return p->Shutdown(fp1);
+}
+
+
+
+/**
+ * 'NotifyOrReturn ChainCloseOnCommitted;' has not been exploited yet, neither ChainOnCommitted
+ */
+// static void FSPAPI ChainCloseOnCommitted(FSPHANDLE h, FSP_ServiceCode c, int v)
+// {
+// 	CSocketItemDl* p = CSocketDLLTLB::HandleToRegisteredSocket(h);
+// 	if (p == NULL)
+// 		return;
+// 	//
+// 	p->ChainOnCommitted(c, v);
+// }
+
+
+
+/**
+ * ChainOnCommitted, together with ChainCloseOnCommitted, are meant to be co-routines of the main thread
+ */
+int  CSocketItemDl::ChainOnCommitted(FSP_ServiceCode c, int v)
+{
+	if (!WaitUseMutex())
+		return IsInUse() ? -EDEADLK : 0;
+
+	FSP_Session_State s = GetState();
+	SetMutexFree();
+	if (s < CLOSABLE)
+		return -EPERM;		// It should not happen
+
+	if (v < 0)
+		return Dispose();
+
+	if (!WaitUseMutex())
+		return IsInUse() ? -EDEADLK : 0;
+	if (c == FSP_Shutdown)
+		return RecycLocked();
+	fpFinished = fpCommitted = NULL;
+	initiatingShutdown = 0;
+	//^So that Shutdown neither return prematurely nor fall in dead-loop
+	SetMutexFree();
+
+	return Shutdown();
 }
 
 
@@ -53,29 +122,32 @@ int  CSocketItemDl::Dispose()
 	if (InState(NON_EXISTENT))
 		return 0;
 
-	inUse = 0;	
+	char u = _InterlockedExchange8(&inUse, 0);
 	//^So that WaitUseMutex of other thread could be interrupted
-	if (!TryMutexLock())
+	timestamp_t t0 = NowUTC();
+	while (!TryMutexLock())
 	{
-		Sleep(TIMER_SLICE_ms * 2);
-		if (!TryMutexLock())
+		if(int64_t(NowUTC() - t0 - MAX_LOCK_WAIT_ms * 1000) > 0)
 			return -EDEADLK;
+		Sleep(TIMER_SLICE_ms);
 	}
 
-	if (pControlBlock == NULL)
+	// might be redundant, but it does little harm:
+	if (u == 0 || pControlBlock == NULL)
 	{
-		Free();	// might be redundant, but it does little harm
+		Free();
 		return 0;
 	}
+	inUse = u;
 
 	// A gracefully shutdown socket is resurrect-able
 	if (pControlBlock->state == CLOSED)
 	{
-		RecycleSimply();
-		SetMutexFree();
+		RecycLocked();
 		return 0;
 	}
 
+	AddOneShotTimer(DEINIT_WAIT_TIMEOUT_ms);
 	EnableLLSInterrupt();
 	SetMutexFree();
 	return Call<FSP_Reset>() ? 0 : -EIO;
@@ -86,9 +158,13 @@ int  CSocketItemDl::Dispose()
 // Unlike Free, Recycle-locked does not destroy the control block
 // so that the DLL socket may be reused on connection resumption
 // assume the socket has been locked
+// Does not actually recycle the socket until the event loop exits
 int CSocketItemDl::RecycLocked()
 {
-	RecycleSimply();
+	if (processingNotice)
+		pendingRecycle = 1;
+	else
+		RecycleSimply();
 	SetMutexFree();
 	return 0;
 }
@@ -98,37 +174,14 @@ int CSocketItemDl::RecycLocked()
 // Make sure resource is kept until other threads leave critical section
 // Does NOT waits for all callback functions to complete before returning
 // in case of deadlock when the function itself is called in some call-back function
+// UNRESOLVED!? TODO: Connection resurrection should be able to reuse cached state
 void CSocketItemDl::Free()
 {
 	RecycleSimply();
 	CSocketItem::Destroy();
-	memset((octet *)this + sizeof(CSocketItem), 0, sizeof(CSocketItemDl) - sizeof(CSocketItem));
-}
-
-
-
-// Set the function to be called back on passively shutdown by the remote end
-DllSpec
-int FSPAPI SetOnRelease(FSPHANDLE hFSPSocket, NotifyOrReturn fp1)
-{
-	CSocketItemDl* p = CSocketDLLTLB::HandleToRegisteredSocket(hFSPSocket);
-	if (p == NULL)
-		return -EFAULT;
-	return p->SetOnRelease((PVOID)fp1);
-}
-
-
-
-// Try to terminate the session gracefully provided that the peer has commit the transmit transaction
-// Return 0 if no immediate error, or else the error number
-// The callback function might return code of delayed error
-DllSpec
-int FSPAPI Shutdown(FSPHANDLE hFSPSocket, NotifyOrReturn fp1)
-{
-	CSocketItemDl *p = CSocketDLLTLB::HandleToRegisteredSocket(hFSPSocket);
-	if(p == NULL)
-		return -EFAULT;
-	return p->Shutdown(fp1);
+	memset((octet*)this + offsetof(CSocketItemDl, context)
+		, 0
+		, sizeof(CSocketItemDl) - offsetof(CSocketItemDl, context));
 }
 
 
@@ -154,25 +207,38 @@ int CSocketItemDl::Shutdown()
 		SetMutexFree();
 		return EAGAIN;	// A warning saying that the socket is already in graceful shutdown process
 	}
+	// Avoid double-entering dead-loop, see also WaitEventToDispatch
+	if (fpCommitted != NULL)
+	{
+		SetMutexFree();
+		return -EBUSY;
+	}
+	// Cannot nest synchronous shutdown in a call-back function
+	if (processingNotice && fpFinished == NULL)
+	{
+		SetMutexFree();
+		return -EDOM;
+	}
 	initiatingShutdown = 1;
 
-	if (InState(CLOSED))
+	FSP_Session_State s = GetState();
+	if (s == CLOSED)
 	{
 		RecycLocked();
 		return 0;
 	}
-
-	if (InState(SHUT_REQUESTED))
+	// It prevents dead-loop to check whether it is already in CLOSED state before passive shut-down.
+	if (s == SHUT_REQUESTED)
 	{
 		NotifyOrReturn fp1 = (NotifyOrReturn)_InterlockedExchangePointer((PVOID*)&fpFinished, NULL);
 		SetState(CLOSED);
+		Call<FSP_Shutdown>();
 		RecycLocked();
 		if (fp1 != NULL)
 			fp1(this, FSP_Shutdown, 0);
 		return 0;
 	}	// assert: FSP_NotifyToFinish has been received and processed. See also WaitEventToDispatch
 
-	FSP_Session_State s = GetState();
 #ifndef _NO_LLS_CALLABLE
 	if (s <= ESTABLISHED || s == COMMITTING || s == COMMITTED)
 	{
@@ -208,10 +274,9 @@ int CSocketItemDl::Shutdown()
 		{
 			Call<FSP_Urge>();
 		}
-		s = GetState();	// it may be in COMMITTING2 or still in PEER_COMMIT state
 	}
 	//
-	if (s == COMMITTING2)
+	if (s == PEER_COMMIT || s == COMMITTING2)
 	{
 		if (fpFinished != NULL)
 		{
@@ -225,34 +290,29 @@ int CSocketItemDl::Shutdown()
 		// BlockOnCommit would free the mutex lock on error
 		s = GetState();
 	}
+	// It must be in CLOSABLE state or later, or NON_EXISTENT after BlockOnCommit
+	if (s == CLOSABLE)
+	{
+		SetState(PRE_CLOSED);
+		if (IsEoTPending() && AppendEoTPacket(RELEASE))
+			Call<FSP_Urge>();
+		//
+		if (fpFinished != NULL)
+		{
+			SetMutexFree();
+			return 0;
+		}
+	}
 	//
-	int32_t deinitWait = DEINIT_WAIT_TIMEOUT_ms;
+	int32_t deinitWait = CLOSING_TIME_WAIT_ms;
 	for (; s != SHUT_REQUESTED && s != CLOSED && s != NON_EXISTENT; s = GetState())
 	{
-		if (s == CLOSABLE)
-		{
-			SetState(PRE_CLOSED);
-			if (IsEoTPending() && AppendEoTPacket(RELEASE))
-				Call<FSP_Urge>();
-			//
-			if (fpFinished != NULL)
-			{
-				SetMutexFree();
-				return 0;
-			}
-		}
 		SetMutexFree();
-		if (fpFinished != NULL)
-			return 0;		// asynchronous mode
-		//
 		Sleep(TIMER_SLICE_ms);
 		//
-		if (s >= CLOSABLE)
-		{
-			deinitWait -= TIMER_SLICE_ms;
-			if (deinitWait <= 0)
-				return ETIMEDOUT;		// Warning, not fatal error
-		}
+		deinitWait -= TIMER_SLICE_ms;
+		if (deinitWait <= 0)
+			return ETIMEDOUT;		// Warning, not fatal error
 		//
 		if (!WaitUseMutex())
 			return (IsInUse() ? -EDEADLK : 0);
@@ -260,6 +320,7 @@ int CSocketItemDl::Shutdown()
 #endif
 	if (s == SHUT_REQUESTED)
 		SetState(s = CLOSED);
+	//
 	if (s == CLOSED)
 		RecycLocked();
 	else

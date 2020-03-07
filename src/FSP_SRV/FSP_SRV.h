@@ -149,7 +149,7 @@ public:
 #if defined(__WINDOWS__)
 	void TriggerULA() const { ::SetEvent(hEvent); }
 #elif defined(__linux__) || defined(__CYGWIN__)
-	void TriggerULA() const { sigval_t value; value.sival_int = (int)fiberID; ::sigqueue(idProcess, SIGNO_FSP, value); }
+	void TriggerULA() const { /* taking use of polling instead of signaling which causes kernel context switching */ }
 #endif
 	void DoConnect();
 };
@@ -376,25 +376,24 @@ class CSocketItemEx : public CSocketItem
 
 	friend void Multiply(const CommandCloneSessionSrv&);
 
-	void Destroy();	// override that of the base class
 	bool IsPassive() const { return lowState == LISTENING; }
 	void SetPassive() { lowState = LISTENING; }
 	//
 	bool IsProcessAlive();
 	//
 protected:
-	// TODO: UNRESOLVED! To be analyzed: is it safe to implement reuse of the shared memory?
-	pid_t			idSrcProcess;
-	PktBufferBlock* headPacket;	// But UNRESOLVED! There used to be an independent packet queue for each SCB for sake of fairness
-	int32_t			lenPktData;
-	ControlBlock::seq_t	pktSeqNo;	// in host byte-order
-
 	// chained list on the collision entry of the remote ALFID TLB
 	CSocketItemEx* prevRemote;
 
 	// chained list on the collision entry of the near ALFID TLB
 	CSocketItemEx* next;
 	CSocketItemEx* prevSame;
+
+	// TODO: UNRESOLVED! To be analyzed: is it safe to implement reuse of the shared memory?
+	pid_t			idSrcProcess;
+	PktBufferBlock* headPacket;	// But UNRESOLVED! There used to be an independent packet queue for each SCB for sake of fairness
+	int32_t			lenPktData;
+	ControlBlock::seq_t	pktSeqNo;	// in host byte-order
 
 	// temporary state for mobile management
 	TSubnets	savedPathsToNearEnd;
@@ -420,6 +419,7 @@ protected:
 	const char* lockedAt;	// == NULL if not locked, or else the function name that locked the socket
 
 	// Cached 'trunk' state
+	char	markInUse : 1;
 	char	hasAcceptedRELEASE : 1;
 	char	delayAckPending : 1;
 	char	callbackTimerPending : 1;
@@ -441,19 +441,20 @@ protected:
 	timestamp_t tPreviousTimeSlot;
 	timestamp_t tPreviousLifeDetection;
 
-	//- There used to be tKeepAlive_ms here. now reserved
 	timer_t		timer;			// the repeating timer
 
 	timestamp_t	tSessionBegin;
 	timestamp_t	tLastRecv;
 	timestamp_t tMigrate;
 	timestamp_t tRecentSend;
+	timestamp_t tLastRecvAny;
 	ControlBlock::FSP_SocketBuf skbRecvClone;
 
 	uint32_t	nextOOBSN;	// host byte order for near end. if it overflow the session MUST be terminated
 	uint32_t	lastOOBSN;	// host byte order, the serial number of peer's last out-of-band packet
 
 	void AbortLLS(bool haveTLBLocked = false);
+	void Destroy();	// override that of the base class
 
 	void EnableDelayAck() { delayAckPending = 1; }
 	void RemoveTimers();
@@ -496,7 +497,7 @@ protected:
 		return lowState == first || InStates(rest...);
 	}
 #else
-	// do some unclever loop-unrolling
+	// do some loop-unrolling
 	bool InStates(FSP_Session_State s1, FSP_Session_State s2, FSP_Session_State s3, FSP_Session_State s4
 		, FSP_Session_State s5)
 	{
@@ -521,7 +522,13 @@ protected:
 		if (_InterlockedExchange8((char *)& lowState, s) != s)
 			tMigrate = NowUTC();
 	}
-	void SetState(FSP_Session_State s) { _InterlockedExchange8((char *)& pControlBlock->state, s); SyncState(); }
+	// But delay copying the 'cache'-ed state to the session control block when frees the mutex lock:
+	void SetState(FSP_Session_State s)
+	{
+		if (_InterlockedExchange8((char*)&pControlBlock->state, s) != s)
+			tMigrate = NowUTC();
+		lowState = s;
+	}
 
 	void SetSequenceAndWS(struct FSP_FixedHeader* pHdr, ControlBlock::seq_t seq1)
 	{
@@ -557,9 +564,8 @@ protected:
 	void KeepAlive();
 	void DoEventLoop();
 
-
 #if defined(__WINDOWS__)
-	static VOID NTAPI KeepAlive(PVOID c, BOOLEAN) { ((CSocketItemEx *)c)->KeepAlive(); }
+	static VOID NTAPI KeepAlive(PVOID c, BOOLEAN) { ((CSocketItemEx*)c)->KeepAlive(); }
 #elif defined(__linux__) || defined(__CYGWIN__)
 	static void KeepAlive(union sigval v) { ((CSocketItemEx *)v.sival_ptr)->KeepAlive(); }
 #endif
@@ -567,6 +573,7 @@ protected:
 	static uint32_t GetSalt(const FSP_FixedHeader& h) { return *(uint32_t*)& h; }
 	//
 public:
+	void UnmapControlBlock() { CSocketItem::Destroy(); }
 #ifdef _DEBUG
 	void SetTouchTime(timestamp_t t) { tLastRecv = tRecentSend = t; }
 #endif
@@ -577,9 +584,9 @@ public:
 #define WaitUseMutex()		WaitUseMutexAt(__FUNCTION__)		//  __func__
 	bool WaitUseMutexAt(const char *);
 	bool LockWithActiveULAt(const char *);
-	void SetMutexFree() { lockedAt = NULL; if(callbackTimerPending) KeepAlive(); }
+	void SetMutexFree() { lockedAt = NULL; if (callbackTimerPending) KeepAlive(); }
 
-	bool IsInUse() { return (pControlBlock != NULL); }
+	bool IsInUse() { return (markInUse != 0); }
 	void ClearInUse();
 
 #if defined(__WINDOWS__)
@@ -675,13 +682,15 @@ public:
 		if (b == 0 && v == 0)
 			TriggerULA();
 	}
-	void SignalFirstEvent(FSP_NoticeCode code) { pControlBlock->notices.SetHead(code); TriggerULA(); }
+	void SignalFirstEvent(FSP_NoticeCode code) { pControlBlock->notices.nmi = (char)code; TriggerULA(); }
 	//
 	int LOCALAPI AcceptSNACK(ControlBlock::seq_t, FSP_SelectiveNACK::GapDescriptor *, int);
 	//
 	void InitiateConnect();
 	void DisposeOnReset();
-	void RejectOrReset(uint32_t);
+	void Recycle();
+	void Reject(uint32_t);
+	void Reset();
 	void InitiateMultiply(CSocketItemEx *);
 	bool FinalizeMultiply();
 
@@ -718,7 +727,10 @@ public:
 	// Check whether previous KEEP_ALIVE is implicitly acknowledged on getting a validated packet
 	inline void CheckAckToKeepAlive();
 
-	void ScheduleConnect(int);
+	bool ScheduleConnect(int);
+
+	// On Feb.18, 2020 to prepare implementation of session hibernation/adjournment
+	void Adjourn() { SetState(CLOSABLE); }
 	// On Feb.17, 2019 Semantics of KeepAlive was fundamentally changed. Now it is the heartbeat of the local side
 	// Send-pacing is a yet-to-implement feature of the rate-control based congestion control sublayer/manager
 	void RestartKeepAlive() { ReplaceTimer(TIMER_SLICE_ms * 2); }
@@ -728,6 +740,7 @@ public:
 	void Listen();
 	void Connect();
 	void Accept();
+	void RefuseToMultiply(uint32_t);
 
 	// Event triggered by the remote peer
 	void OnConnectRequestAck();
@@ -789,7 +802,7 @@ protected:
 	// The free list
 	CSocketItemEx *headFreeSID, *tailFreeSID;
 
-	// The scanvenge cache; it does waste some space, but saves much time
+	// The scavenge cache; it does waste some space, but saves much time
 	struct
 	{
 		CSocketItemEx	*pSocket;
@@ -981,7 +994,6 @@ protected:
 	inline	int SetInterfaceOptions(SOCKET);
 	static	DWORD WINAPI ProcessRemotePacket(LPVOID);
 #elif defined(__linux__) || defined(__CYGWIN__)
-	inline	int SetInterfaceOptions(int);
 	static	void * ProcessRemotePacket(void *);
 #endif
 
@@ -990,7 +1002,7 @@ public:
 	bool Initialize();
 	void Destroy();
 
-	// return the least possible overriden random fiber ID:
+	// return the least possible overridden random fiber ID:
 	ALFID_T LOCALAPI RandALFID(PIN6_ADDR);
 	ALFID_T LOCALAPI RandALFID();
 	int LOCALAPI SendBack(char *, int);

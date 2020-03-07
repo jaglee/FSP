@@ -110,12 +110,10 @@ const char * CStringizeNotice::names[LARGEST_FSP_NOTICE + 1] =
 	"FSP_NotifyDataReady",
 	"FSP_NotifyBufferReady",
 	"FSP_NotifyToCommit",
-	// 8~11
+	// 8~
 	"FSP_NotifyFlushed",
 	"FSP_NotifyToFinish",
-	"FSP_NotifyRecycled",
 	"FSP_NameResolutionFailed",
-	// 12~
 	"FSP_MemoryCorruption",
 	"FSP_NotifyReset",
 	"FSP_NotifyTimeout",
@@ -130,12 +128,13 @@ const char* CServiceCode::names[FSP_Shutdown + 1] =
 	"FSP_Listen",		// register a passive socket
 	"InitConnection",	// register an initiative socket
 	"FSP_Accept",		// accept the connection, make SCB of LLS synchronized with DLL 
-	"FSP_Reject/Reset",	// a forward command, explicitly reject some request
+	"FSP_Reset",		// a forward command, explicitly reject some request
 	"FSP_Start/Urge",
 	"FSP_Send",			// Here it is not a command to LLS, but as a context indicator to ULA
 	"FSP_Receive",		// Here it is not a command to LLS, but as a context indicator to ULA
 	"FSP_InstallKey",	// install the authenticated encryption key
 	"FSP_Multiply",		// clone the connection, make SCB of LLS synchronized with DLL
+	"FSP_Reset",		// a forward command, close the connection abruptly
 	"FSP_Shutdown"
 };
 
@@ -221,28 +220,6 @@ bool CLightMutex::WaitSetMutex()
 		Sleep(TIMER_SLICE_ms);
 	}
 	return true;
-}
-
-
-
-// Given
-//	int		intent capacity of the backlog. Should be no less than 2
-// Do
-//	Initialize the size/capacity, i.e. maximum number of entries of the backlog
-// Return
-//	The real capacity of the backlog. Trim the input value to the largest value of power of 2
-// Remark
-//	There would be at least two item in the queue
-int LLSBackLog::InitSize(int n)
-{
-	if(n <= 1)
-		return 0;
-	int m = 0;
-	while((n >>= 1) > 0)
-		m++;
-	// assume memory has been zeroed
-	capacity = 1 << m;
-	return capacity;
 }
 
 
@@ -353,13 +330,12 @@ BackLogItem * LLSBackLog::FindByRemoteId(ALFID_T idRemote, uint32_t salt)
 int LOCALAPI ControlBlock::Init(int32_t & sendSize, int32_t & recvSize) 
 {
 	memset(this, 0, sizeof(ControlBlock));
-	// notice01 = notice10 = NullCommand;
-	backLog.InitSize();
+	backLog.capacity = FSP_BACKLOG_SIZE;
 
 	recvBufferBlockN = recvSize / MAX_BLOCK_SIZE;
 	sendBufferBlockN = sendSize / MAX_BLOCK_SIZE;
 	if(recvBufferBlockN <= 0 || sendBufferBlockN <= 0)
-		return -EDOM;
+		return -EINVAL;
 
 	recvBufferBlockN = min(recvBufferBlockN, MAX_BUFFER_BLOCKS);
 	sendBufferBlockN = min(sendBufferBlockN, MAX_BUFFER_BLOCKS);
@@ -380,24 +356,6 @@ int LOCALAPI ControlBlock::Init(int32_t & sendSize, int32_t & recvSize)
 	memset((octet *)this + sendBufDescriptors, 0, sizeDescriptors);
 
 	return 0;
-}
-
-
-
-// Given
-//	uint16_t	the upper limit of the capacity of the backlog, should be no greater than USHRT_MAX
-// Do
-//	initialize the backlog queue
-// Return
-//	0 if no error, negative is the error number
-// Remark
-//	The caller should make sure enough memory has been allocated and zeroed
-int LOCALAPI ControlBlock::Init(uint16_t nLog) 
-{
-	memset(this, 0, sizeof(ControlBlock));
-	// notice01 = notice10 = NullCommand;
-	int n = backLog.InitSize(nLog);
-	return (n <= 0 ? -ENOMEM : 0);
 }
 
 
@@ -654,7 +612,7 @@ octet* LOCALAPI ControlBlock::InquireRecvBuf(int32_t& nIO, int32_t& nBlock, bool
 int LOCALAPI ControlBlock::MarkReceivedFree(int32_t nBlock)
 {
 	if (nBlock <= 0)
-		return -EDOM;
+		return -EINVAL;
 
 	register int32_t m = LCKREAD(recvWindowNextPos) - recvWindowHeadPos;
 	if (m <= 0)
@@ -697,7 +655,7 @@ int LOCALAPI ControlBlock::MarkReceivedFree(int32_t nBlock)
 int LOCALAPI ControlBlock::GetSelectiveNACK(seq_t & snExpect, FSP_SelectiveNACK::GapDescriptor * buf, int n)
 {
 	if(n <= 0)
-		return -EDOM;
+		return -EINVAL;
 
 	int32_t nRcv = int32_t(recvWindowNextSN - recvWindowExpectedSN);	// most likely a gap only, however
 	if (nRcv < 0)

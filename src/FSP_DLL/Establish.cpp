@@ -73,13 +73,6 @@ FSPHANDLE FSPAPI ListenAt(const PFSP_IN6_ADDR listenOn, PFSP_Context psp1)
 	if(socketItem == NULL)
 		return NULL;
 
-	if(! socketItem->AddOneShotTimer(TRANSIENT_STATE_TIMEOUT_ms))
-	{
-		REPORT_ERRMSG_ON_TRACE("Cannot set time-out clock for listen");
-		socketItem->Free();
-		return NULL;
-	}
-
 	socketItem->SetState(LISTENING);
 	// MUST set the state before calling LLS so that event-driven state transition may work properly
 
@@ -153,13 +146,6 @@ FSPHANDLE FSPAPI Connect2(const char *peerName, PFSP_Context psp1)
 		return NULL;
 	}
 
-	if(! socketItem->AddOneShotTimer(TRANSIENT_STATE_TIMEOUT_ms))
-	{
-		REPORT_ERRMSG_ON_TRACE("Cannot set time-out clock for connect");
-		socketItem->Free();
-		return NULL;
-	}
-
 	socketItem->SetPeerName(peerName, strlen(peerName));
 	socketItem->SetState(CONNECT_BOOTSTRAP);
 
@@ -200,7 +186,7 @@ DllSpec
 int FSPAPI InstallMasterKey(FSPHANDLE h, octet * key, int32_t keyBytes)
 {
 	if (keyBytes <= 0 || keyBytes > INT32_MAX / 8)
-		return -EDOM;
+		return -EINVAL;
 	try
 	{
 		CSocketItemDl *pSocket = (CSocketItemDl *)h;
@@ -222,7 +208,7 @@ int FSPAPI InstallMasterKey(FSPHANDLE h, octet * key, int32_t keyBytes)
 // Return
 //	The DLL FSP socket created if succeeded,
 //	NULL if failed.
-CSocketItemDl * LOCALAPI CSocketItemDl::CallCreate(CommandNewSession & objCommand, FSP_ServiceCode cmdCode)
+CSocketItemDl* LOCALAPI CSocketItemDl::CallCreate(CommandNewSession& objCommand, FSP_ServiceCode cmdCode)
 {
 	objCommand.fiberID = fidPair.source;
 	objCommand.idProcess = idThisProcess;
@@ -231,7 +217,51 @@ CSocketItemDl * LOCALAPI CSocketItemDl::CallCreate(CommandNewSession & objComman
 	printf("%s: fiberId = %d, fidPair.source = %d\n", CServiceCode::sof(cmdCode), objCommand.fiberID, fidPair.source);
 #endif
 	CopyFatMemPointo(objCommand);
-	return Call(objCommand, sizeof(objCommand)) ? this : NULL;
+	return EnableLLSInteract(objCommand) && Call(objCommand, sizeof(objCommand)) ? this : NULL;
+}
+
+
+
+int32_t CSocketItemDl::AlignMemorySize(PFSP_Context psp1)
+{
+	if (psp1->sendSize < 0 || psp1->recvSize < 0 || psp1->sendSize + psp1->recvSize > MAX_FSP_SHM_SIZE + MIN_RESERVED_BUF)
+		return -ENOMEM;
+
+	// There could be some memory wasted, but it does little harm
+	if (psp1->passive)
+	{
+		return ((sizeof(ControlBlock) + 7) >> 3 << 3)
+			+ sizeof(LLSBackLog) + sizeof(BackLogItem) * (FSP_BACKLOG_UPLIMIT - FSP_BACKLOG_SIZE);
+	}
+
+	if (psp1->sendSize < MIN_RESERVED_BUF)
+		psp1->sendSize = MIN_RESERVED_BUF;
+	if (psp1->recvSize < MIN_RESERVED_BUF)
+		psp1->recvSize = MIN_RESERVED_BUF;
+	
+	int32_t n = (psp1->sendSize - 1) / MAX_BLOCK_SIZE + (psp1->recvSize - 1) / MAX_BLOCK_SIZE + 2;
+	return ((sizeof(ControlBlock) + 7) >> 3 << 3)
+		+ n * (((sizeof(ControlBlock::FSP_SocketBuf) + 7) >> 3 << 3) + MAX_BLOCK_SIZE);
+}
+
+
+
+void CSocketItemDl::SetConnectContext(const PFSP_Context psp1)
+{
+	if (psp1->passive)
+		pControlBlock->InitToListen();
+	else
+		pControlBlock->Init(psp1->sendSize, psp1->recvSize);
+	//
+	pControlBlock->tfrc = psp1->tfrc;
+	pControlBlock->milky = psp1->milky;
+	pControlBlock->noEncrypt = psp1->noEncrypt;
+	pControlBlock->keepAlive = psp1->keepAlive;
+
+	// could be exploited by ULA to make services distinguishable
+	memcpy(&context, psp1, sizeof(FSP_SocketParameter));
+	pendingSendBuf = (octet*)psp1->welcome;
+	pendingSendSize = psp1->len;
 }
 
 
@@ -305,6 +335,25 @@ CSocketItemDl *CSocketItemDl::Accept1()
 
 
 // Given
+//	ALFID_T		the Application Layer Fiber ID in the local context 
+//	ALFID_T		the Application Layer Fiber ID of the parent connection
+//	uint32_t	reason code
+// Do
+//	Instruct LLS to reject the request (if it were to accept)
+//	or reset the connection (if it were to multiply)
+void LOCALAPI CSocketItemDl::RejectRequest(ALFID_T id1, ALFID_T idParent, uint32_t rc)
+{
+	CommandRejectRequest objCommand;
+	objCommand.fiberID = id1;
+	objCommand.idProcess = idThisProcess;
+	objCommand.opCode = (idParent == 0 ? FSP_Reject : FSP_Reset);
+	objCommand.reasonCode = rc;
+	Call(objCommand, sizeof(objCommand));
+}
+
+
+
+// Given
 //	BackLogItem *	the fetched backlog item of the listening socket
 // Do
 //	create new socket, prepare the acknowledgement
@@ -322,14 +371,13 @@ CSocketItemDl *CSocketItemDl::ProcessOneBackLog(BackLogItem	*pLogItem)
 	if (socketItem == NULL)
 	{
 		REPORT_ERRMSG_ON_TRACE("Process listening backlog: insufficient system resource?");
-		RejectRequest(pLogItem->acceptAddr.idALF, ENOSPC);
+		RejectRequest(pLogItem->acceptAddr.idALF, pLogItem->idParent, ENOSPC);
 		return NULL;
 	}
-	// lost some possibility of code reuse, gain flexibility (and reliability)
 	if((pLogItem->idParent == 0 && !socketItem->ToWelcomeConnect(*pLogItem))
 	|| (pLogItem->idParent != 0 && !socketItem->ToWelcomeMultiply(*pLogItem)))
 	{
-		RejectRequest(pLogItem->acceptAddr.idALF, EPERM);
+		RejectRequest(pLogItem->acceptAddr.idALF, pLogItem->idParent, EPERM);
 		socketItem->Free();
 		return NULL;
 	}
@@ -337,6 +385,7 @@ CSocketItemDl *CSocketItemDl::ProcessOneBackLog(BackLogItem	*pLogItem)
 	if (!socketItem->CallCreate(objCommand, FSP_Accept))
 	{
 		REPORT_ERRMSG_ON_TRACE("Process listening backlog: cannot synchronize - local IPC error");
+		RejectRequest(pLogItem->acceptAddr.idALF, pLogItem->idParent, EIO);
 		socketItem->Free();
 		return NULL;
 	}
@@ -646,6 +695,9 @@ CSocketItemDl * CSocketItemDl::WaitingConnectAck()
 CSocketItemDl *	CSocketDLLTLB::HandleToRegisteredSocket(FSPHANDLE h)
 {
 	register CSocketItemDl *p = (CSocketItemDl *)h;
+	if(p == NULL)
+		return p;
+	//
 	for(register int i = 0; i < MAX_CONNECTION_NUM; i++)
 	{
 		if (CSocketItemDl::socketsTLB.pSockets[i] == p)
@@ -715,7 +767,7 @@ CSocketItemDl * CSocketDLLTLB::AllocItem()
 		else
 			tail = NULL;
 	}
-
+	// Or assume memory has been cleared when recycling?
 	memset((octet *)item + sizeof(CSocketItem)
 		, 0
 		, sizeof(CSocketItemDl) - sizeof(CSocketItem));

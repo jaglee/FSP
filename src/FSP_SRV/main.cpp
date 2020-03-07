@@ -191,23 +191,39 @@ Cleanup:
 
 #elif defined(__linux__)
 
+#include <sys/un.h>
+
 int main(int argc, char * argv[])
 {
-	struct mq_attr mqa;
-    mqd_t mqdes;
-
-	mqa.mq_flags = 0;       /* Flags (ignored for mq_open()) */
-	mqa.mq_maxmsg = 5;      /* Max. # of messages on queue */
-	mqa.mq_msgsize = MAX_CTRLBUF_LEN;
-	mqa.mq_curmsgs = 0;     /* # of messages currently in queue */
-
-	mqdes = mq_open(SERVICE_MAILSLOT_NAME, O_RDONLY | O_CREAT, 0777, &mqa);
-
-    if (mqdes == (mqd_t) -1)
+    struct sockaddr_un addr;
+    int sd;
+    sd = socket(AF_UNIX, SOCK_DGRAM, 0); // SOCK_SEQPACKET need listen and accept
+	if(sd < 0)
 	{
-		printf("To read %s:\n", SERVICE_MAILSLOT_NAME);
-		perror("cannot create open the message queue");
+		perror("Cannot create AF_UNIX socket for listening");
 		exit(-1);
+	}
+
+	addr.sun_family = AF_UNIX;
+	strncpy(addr.sun_path, SERVICE_SOCKET_PATH, sizeof(addr.sun_path) - 1);
+	addr.sun_path[sizeof(addr.sun_path) - 1] = 0;
+
+	if(bind(sd, (struct sockaddr*)&addr, sizeof(struct sockaddr_un)) < 0)
+	{
+		int r = 0;
+		if(errno == EADDRINUSE)
+		{
+			if(unlink(addr.sun_path) < 0)
+				printf("%s existed but cannot be unlinked.\n", addr.sun_path);
+			r = bind(sd, (struct sockaddr*)&addr, sizeof(struct sockaddr_un));
+			if(r == 0)
+				printf("%s existed but was unlinked and re-bound.\n", addr.sun_path);
+		}
+		if(r < 0)
+		{
+			perror("Cannot bind the AF_UNIX socket to the designated path");
+			exit(-1);
+		}
 	}
 
 	// also create the receiver
@@ -220,13 +236,13 @@ int main(int argc, char * argv[])
 	// continue on main thread (thread 1):
 	try
 	{
-		char buffer[MAX_CTRLBUF_LEN];
-		unsigned int msg_prio;;
-		int nBytesRead;
-		while((nBytesRead = (int)mq_receive(mqdes, buffer, MAX_CTRLBUF_LEN, &msg_prio)) > 0)
+		socklen_t szAddr = sizeof(struct sockaddr_un);
+		octet buffer[MAX_CTRLBUF_LEN];
+		int	nBytesRead;
+		while((nBytesRead = (int)recvfrom(sd, buffer, sizeof(buffer), 0, (struct sockaddr*)&addr, &szAddr)) > 0)
 		{
 #if defined(TRACE) && (TRACE & TRACE_ULACALL)
-			printf_s("\n%d octets read from the message queue.", (int)nBytesRead);
+			printf_s("\n%d octets read from the domain socket.", (int)nBytesRead);
 #endif
 			if(nBytesRead < (int)sizeof(struct CommandToLLS))
 			{
@@ -240,7 +256,7 @@ int main(int argc, char * argv[])
 		}
 #ifndef NDEBUG
 		// TODO: UNRESOLVED! Crash Recovery? if ReadFile fails, it is a crash
-		printf("Fatal! Read POSIX message queue error, command channel broken\n");
+		perror("Fatal! Cannot read the domain socket, command channel broken");
 #endif
 	}
 	catch(...)
@@ -250,7 +266,8 @@ int main(int argc, char * argv[])
 	}
 
 l_bailout:
-	mq_unlink(SERVICE_MAILSLOT_NAME);
+	close(sd);
+	// unlink(addr.sun_path);
 	return 0;
 }
 
@@ -305,7 +322,7 @@ int main(int argc, char * argv[])
 		}
 #ifndef NDEBUG
 		// TODO: UNRESOLVED! Crash Recovery? if ReadFile fails, it is a crash
-		printf("Fatal! Read XSI message queue, command channel broken\n");
+		perror("Fatal! Read XSI message queue, command channel broken\n");
 #endif
 	}
 	catch(...)

@@ -67,8 +67,7 @@ CommandNewSessionSrv::CommandNewSessionSrv(const CommandToLLS *p1)
 	dwMemorySize = ((CommandNewSession *)p1)->dwMemorySize;
 	hShm = shm_open(((CommandNewSession *)p1)->shm_name, O_RDWR, 0777);
 	if (hShm < 0)
-		perror("Cannot get the handle of the shared memory when MapControlBlock");
-	// And we assign fixed signal number for reverse IPC in linux 
+		perror("Cannot get the handle of the shared memory for MapControlBlock");
 }
 
 
@@ -185,19 +184,6 @@ int LOCALAPI CLowerInterface::EnumEffectiveAddresses(uint64_t *prefixes)
 
 
 // Given
-//	int		The UDP socket to set options
-// Return
-//	0 if no error
-//	negative, as the error number
-inline int CLowerInterface::SetInterfaceOptions(int sd)
-{
-	int enablePktInfo = 1;
-	return setsockopt(sd, IPPROTO_IP, IP_PKTINFO, & enablePktInfo, sizeof(enablePktInfo));
-}
-
-
-
-// Given
 //	PSOCKADDR_IN
 //	int			the position that the address is provisioned
 // Return
@@ -205,12 +191,20 @@ inline int CLowerInterface::SetInterfaceOptions(int sd)
 //	negative, as the error number
 int CLowerInterface::BindSendRecv(const SOCKADDR_IN *pAddrListen, int k)
 {
+	int value = 1;
+
+	if(::setsockopt(sdSend, SOL_SOCKET, SO_REUSEADDR, &value, sizeof(value)) != 0)
+	{
+		perror("Cannot set the socket option to reuse existing local address");
+		return -1;
+	}
 	if (::bind(sdSend, (const struct sockaddr *)pAddrListen, sizeof(SOCKADDR_IN)) != 0)
 	{
 		perror("Cannot bind to the selected address");
 		return -1;
 	}
-	if (SetInterfaceOptions(sdSend) != 0)
+
+	if (::setsockopt(sdSend, IPPROTO_IP, IP_PKTINFO, &value, sizeof(value)) != 0)
 	{
 		perror("Cannot set socket option to fetch the source IP address");
 		return -1;
@@ -258,7 +252,7 @@ inline bool CLowerInterface::LearnAddresses()
 			continue;
 		}
 		p->sin_port = DEFAULT_FSP_UDPPORT;
-		printf("%s bind to listen at UDP socket address: %s:%d\n..."
+		printf("To bind %s for listening at UDP socket address: %s:%d\n..."
 			, pIf->ifa_name
             , inet_ntop(AF_INET, &p->sin_addr, strAddr, sizeof(SOCKADDR_IN) )
 			, be16toh(p->sin_port));
@@ -280,37 +274,11 @@ inline bool CLowerInterface::LearnAddresses()
 			return false;
 		}
 
-		// -1: reserve loopback address as the last resort
 		if (++countInterfaces >= SD_SETSIZE - 1)
 			break;
     }
+	freeifaddrs(ifap);
 
-	// // Set the loopback address as the last resort of receiving
-	// SOCKADDR_IN loopback;
-	// p = &loopback;
-	// p->sin_family = AF_INET;
-	// p->sin_port = DEFAULT_FSP_UDPPORT;
-	// *(uint64_t *)p->sin_zero = 0;
-	// // (binding removed when migrating to linux because loopback interface is already enumerated)
-
-	// // Set the INADDR_ANY for transmission; reuse storage of loopback address
-	// p->sin_addr.s_addr = INADDR_ANY;
-	sdSend = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-	if (sdSend == INVALID_SOCKET)
-	{
-		perror("Create socket: run out of handle space?!");
-	    freeifaddrs(ifap);
-		return false;
-	}
-	
-	// if (::bind(sdSend, (const struct sockaddr *)p, sizeof(SOCKADDR_IN)) != 0)
-	// {
-	// 	perror("Cannot prevent the socket from specific address binding");
-	//     freeifaddrs(ifap);
-	// 	return false;
-	// }
-
-    freeifaddrs(ifap);
 	return true;
 }
 
@@ -404,7 +372,7 @@ inline void CLowerInterface::ProcessRemotePacket()
 #endif
 			}
 		}
-	} while(1, 1);
+	} while(true);
 }
 
 
@@ -422,11 +390,12 @@ int LOCALAPI CLowerInterface::SendBack(char * buf, int len)
 {
 #if defined(TRACE) && (TRACE & TRACE_ADDRESS)
 	printf_s("\nSend back to peer socket address:\n");
-	DumpNetworkUInt16((uint16_t *)& addrFrom, sizeof(SOCKADDR_IN6) / 2);
+	DumpNetworkUInt16((uint16_t *)& addrFrom, sizeof(SOCKADDR_IN) / 2);
 #endif
 	pktBuf->fidPair.peer = _InterlockedExchange((u32*)&pktBuf->fidPair.source, pktBuf->fidPair.peer);
 	iovec[1].iov_base = buf;
 	iovec[1].iov_len = len;
+	((PSOCKADDR_IN)mesgInfo.msg_name)->sin_port = DEFAULT_FSP_UDPPORT;
 	int n = (int)sendmsg(sdSend, &mesgInfo, 0);
 	if (n < 0)
 	{
@@ -550,18 +519,13 @@ static void * HandleConnect(void *p)
 
 
 // The OS-dependent implementation of scheduling connection-request queue
-void CSocketItemEx::ScheduleConnect(int i)
+bool CSocketItemEx::ScheduleConnect(int i)
 {
 	CommandNewSessionSrv &cmd = ConnectRequestQueue::requests[i];
 	cmd.pSocket = this;
 	cmd.index = i;
-	// TODO: but if it failed?
-	int r = pthread_create(&cmd.idThread, NULL, &HandleConnect, this);
-    if (r != 0)
-#ifndef NDEBUG
-		perror("Cannot initialize the thread attribute to set")
-#endif
-		;
+	int r = pthread_create(&cmd.idThread, NULL, HandleConnect, &cmd);
+    return(r == 0);
 }
 
 
@@ -594,9 +558,9 @@ bool CSocketItemEx::MapControlBlock(const CommandNewSessionSrv &cmd)
 
 	dwMemorySize = cmd.dwMemorySize;
 	pControlBlock = (ControlBlock *)mmap(NULL, dwMemorySize,  PROT_READ | PROT_WRITE, MAP_SHARED, cmd.hShm, 0);
-	if (pControlBlock == NULL)
+	if (pControlBlock == MAP_FAILED)
 	{
-		perror("Cannot map the shared memeroy into address space of the service process");
+		perror("Cannot map the shared memory into address space of the service process");
 		close(cmd.hShm);
 		return false;
 	}
@@ -618,10 +582,7 @@ void CSocketItemEx::ClearInUse()
 {
 	register void *buf;
 	if ((buf =  _InterlockedExchangePointer((PVOID *)& pControlBlock, NULL)) != NULL)
-	{
-		munlock(pControlBlock,dwMemorySize);
 		munmap(buf, dwMemorySize);
-	}
 }
 
 
@@ -642,13 +603,12 @@ int CSocketItemEx::SendPacket(register u32 n1, ScatteredSendBuffers s)
 	s.scattered[0].iov_len = sizeof(fidPair);
 
 	// This implementation is for FSP over UDP/IPv4 only, where it needn't to select path
-	CtrlMsgHdr & nearInfo = CLowerInterface::Singleton.nearInfo;
-	msg.msg_control = & nearInfo;
-	msg.msg_controllen = sizeof(nearInfo);
+	msg.msg_control = NULL;
+	msg.msg_controllen = 0;
 	msg.msg_iov = & s.scattered[0];
 	msg.msg_iovlen = n1 + 1;
 	msg.msg_name = sockAddrTo;
-	msg.msg_namelen = sizeof(sockAddrTo->Ipv4);
+	msg.msg_namelen = sizeof(SOCKADDR_IN);
 
 #if defined(TRACE) && (TRACE & TRACE_ADDRESS)
 	printf_s("\nPeer socket address:\n");

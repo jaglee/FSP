@@ -97,9 +97,10 @@ void LOCALAPI Connect(const CommandNewSessionSrv& cmd)
 	if (!socketItem->MapControlBlock(cmd))
 		goto l_bailout3;
 
-	socketItem->ScheduleConnect(index);
-	return;
-
+	if(socketItem->ScheduleConnect(index))
+		return;
+	
+	socketItem->UnmapControlBlock();
 l_bailout3:
 	CLowerInterface::Singleton.FreeItem(socketItem);
 l_bailout2:
@@ -194,7 +195,7 @@ l_return:
 
 // Get upper layer application's commands and process them
 // Given
-//	_In_ buffer		buffer of the command received from ULA
+//	void *		buffer of the command received from ULA
 // Return
 //	Nothing
 // TODO: UNRESOLVED!there should be performance profiling variables to record how many commands have been processed?
@@ -241,7 +242,7 @@ void LOCALAPI ProcessCommand(void *buffer)
 	}
 	//
 #if defined(TRACE) && (TRACE & TRACE_ULACALL)
-	printf_s("#%d command processed, operation code = %d\n\n.",  n, pCmd->opCode);
+	printf_s("#%d command processed, operation code = %d.\n",  n, pCmd->opCode);
 #endif
 	n++;
 }
@@ -264,24 +265,41 @@ void CSocketItemEx::ProcessCommand(CommandToLLS *pCmd)
 			printf_s("Lastly called by %s\n", lockedAt);
 		return;
 	}
+	if (pControlBlock == NULL)
+	{
+#if defined(TRACE) && (TRACE & TRACE_ULACALL)
+		printf_s("%s called (%s), LLS state: %s(%d), control block is null.\n", __FUNCTION__
+			, CServiceCode::sof(pCmd->opCode), stateNames[lowState], lowState);
+#endif
+		if (lowState == NON_EXISTENT && pCmd->opCode == FSP_Reset)
+			RefuseToMultiply(((CommandRejectRequest*)pCmd)->reasonCode);
+		// See also OnMultiply(); or else simply ignore
+		SetMutexFree();
+		return;
+	}
 #if defined(TRACE) && (TRACE & TRACE_ULACALL)
 	printf_s("%s called (%s), LLS state: %s(%d) <== ULA state: %s(%d)\n", __FUNCTION__
 		, CServiceCode::sof(pCmd->opCode)
 		, stateNames[lowState], lowState
 		, stateNames[pControlBlock->state], pControlBlock->state);
 #endif
-
 	switch(pCmd->opCode)
 	{
 	case FSP_Start:
 		RestartKeepAlive();	// If it happened to be stopped
 		DoEventLoop();
 		break;
-	case FSP_Reject:		// FSP_Reset as well
-		RejectOrReset(((CommandRejectRequest *)pCmd)->reasonCode);
+	case FSP_Reject:
+		Reject(((CommandRejectRequest *)pCmd)->reasonCode);
+		break;
+	case FSP_Reset:
+		Reset();
 		break;
 	case FSP_InstallKey:
 		InstallSessionKey((CommandInstallKey &)*pCmd);
+		break;
+	case FSP_Shutdown:
+		Recycle();
 		break;
 	default:
 #ifndef NDEUBG
@@ -300,7 +318,7 @@ void CSocketItemEx::ProcessCommand(CommandToLLS *pCmd)
 void CSocketItemEx::Listen()
 {
 	InitAssociation();
-	lowState = LISTENING;
+	SetPassive();
 	SignalFirstEvent(FSP_NotifyListening);
 }
 
@@ -338,7 +356,7 @@ void CSocketItemEx::Connect()
 	}
 	pControlBlock->connectParams.idRemote = pControlBlock->peerAddr.ipFSP.fiberID;	// Exploited in OnInitConnectAck 
 
-	// By default Connect() prefer initiatiating connection from an IPv6 interface
+	// By default Connect() prefer initiating connection from an IPv6 interface
 	// but if the peer is of FSP over UDP/IPv4 address it must be changed
 	// See also {FSP_DLL}CSocketItemDl::CreateControlBlock()
 	if (((PFSP_IN4_ADDR_PREFIX)pControlBlock->peerAddr.ipFSP.allowedPrefixes)->prefix == PREFIX_FSP_IP6to4)
@@ -356,20 +374,6 @@ void CSocketItemEx::Connect()
 	// Only after ACK_CONNECT_REQ received may it 'SignalReturned();'
 }
 
-
-
-// Send RESET to the remote peer to reject some request in pre-active state.
-// The RESET packet is not guaranteed to be received.
-// See also DisposeOnReset
-void CSocketItemEx::RejectOrReset(uint32_t reasonCode)
-{
-	if (lowState >= ESTABLISHED)
-		SendReset();
-	else if (!IsPassive())
-		CLowerInterface::Singleton.SendPrematureReset(reasonCode, this);
-	SignalFirstEvent(FSP_NotifyRecycled);
-	Destroy();	// MUST signal event before Destroy
-}
 
 
 
@@ -391,18 +395,13 @@ int CSocketItemEx::ResolveToFSPoverIPv4(const char *nodeName, const char *servic
 #if !defined(NDEBUG) &&  defined(__WINDOWS__)
 		TraceLastError(__FILE__, __LINE__, __FUNCTION__, nodeName);
 #elif !defined(NDEBUG) && (defined(__linux__) || defined(__CYGWIN__))
-		perror("nodeName");
+		perror("IPv4 getaddrinfo() failed");
 #endif
 		return -1;
 	}
 
 	if(pAddrInfo == NULL)
-	{
-#if defined(TRACE) && (TRACE & TRACE_ADDRESS)
-		printf("Cannot resolve the IP address of the node %s\n", nodeName);
-#endif
 		return 0;
-	}
 
 	// See also CLowerInterface::EnumEffectiveAddresses
 	register PFSP_IN4_ADDR_PREFIX prefixes = (PFSP_IN4_ADDR_PREFIX)pControlBlock->peerAddr.ipFSP.allowedPrefixes;
@@ -442,18 +441,13 @@ int CSocketItemEx::ResolveToIPv6(const char *nodeName)
 #if !defined(NDEBUG) &&  defined(__WINDOWS__)
 		TraceLastError(__FILE__, __LINE__, __FUNCTION__, nodeName);
 #elif !defined(NDEBUG) && (defined(__linux__) || defined(__CYGWIN__))
-		perror("nodeName");
+		perror("IPv6 getaddrinfo() failed");
 #endif
 		return -1;
 	}
 
 	if(pAddrInfo == NULL)
-	{
-#if defined(TRACE) && (TRACE & TRACE_ADDRESS)
-		printf("Cannot resolve the IPv6 address of the node %s\n", nodeName);
-#endif
 		return 0;
-	}
 
 	// See also CLowerInterface::EnumEffectiveAddresses
 	register uint64_t * prefixes = pControlBlock->peerAddr.ipFSP.allowedPrefixes;
@@ -474,9 +468,14 @@ int CSocketItemEx::ResolveToIPv6(const char *nodeName)
 // a helper function which is self-describing
 void CommandNewSessionSrv::DoConnect()
 {
-	pSocket->Connect();
+	if(pSocket->WaitUseMutex())	// in case of memory access error
+	{
+		pSocket->Connect();
+		pSocket->SetMutexFree();
+	}
 	ConnectRequestQueue::requests.Remove(index);
 }
+
 
 
 /**

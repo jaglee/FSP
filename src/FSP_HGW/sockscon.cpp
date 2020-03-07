@@ -37,6 +37,12 @@
 	field 3: port number, 2 bytes
 	field 4: IPv4 address, 4 bytes
 	field 5: the user ID string, variable length, terminated with a null (0x00)
+
+	For version 4A, if the first three bytes of DSTIP(IPv4 address) are null
+	and the last byte is a non-zero value, following the null byte terminating
+	the user id string there is the destination domain name termianted by
+	another null byte.
+
  *
  *	Server to SOCKS client:
  *
@@ -50,43 +56,23 @@
 	field 4: 4 bytes (should better be zero)
 
  */
-
-/*
- *
- *	TODO: download the white list
- *
-	Process
-	### IPv4: check rule set
-	white list : direct FSP / IPv6 access(TCP / IPv4->FSP / IPv6, transmit via SOCKS)
-	not in the white list: FSP - relay
-	{ /// UNRESOLVED! As a transit method:
-	if not in white - list, try search PTR, [DnsQuery], if get the _FSP exception - list: direct connect
-	}
-	Further streaming :
-	transparent HTTP acceleration!
- */
-
 #include "fsp_http.h"
-#include <MSWSock.h>
 
 // Storage of private key SHOULD be allocated with random address layout
 static octet bufPrivateKey[CRYPTO_NACL_KEYBYTES];
 static octet bufSharedKey[CRYPTO_NACL_KEYBYTES];
+static char	 inputPassword[80];
+
 ALIGN(8)
 static SCHAKAPublicInfo chakaPubInfo;
-static char inputPassword[80];
-static void SetStdinEcho(bool enable = true);
 
 // Request string towards the remote tunnel server
-static char tunnelRequest[80];
+static char		tunnelRequest[80];
 
 // FSP handle of the master connection that the client side, which accept the SOCKS4 service request,
 // made towards the tunnel server. It is the client in the sense that it made tunnel service request
 static FSPHANDLE hClientMaster;
-static bool isRemoteTunnelEndReady = false;
-
-// TCP socket to listen for SOCKSv4 service request
-static SOCKET hListener;
+static bool		 isRemoteTunnelEndReady = false;
 
 // shared by master connection and child connection
 static void FSPAPI onError(FSPHANDLE, FSP_ServiceCode, int);
@@ -97,64 +83,164 @@ static void FSPAPI onCHAKASRReceived(FSPHANDLE, FSP_ServiceCode, int);
 static bool	FSPAPI onResponseReceived(FSPHANDLE, void *, int32_t, bool);
 
 // for child connection
-static void FSPAPI onRelease(FSPHANDLE, FSP_ServiceCode, int);
 static void FSPAPI onSubrequestSent(FSPHANDLE, FSP_ServiceCode, int);
 
-// Client-to SOCKS4 service interface
-void ReportErrorToClient(SOCKET, ERepCode);
-void CloseGracefully(SOCKET);
+// The SOCKS(v4/v5) server reports general failure to the SOCKS client
+static void ReportGeneralError(SOCKET, PRequestPoolItem);
 
-//
-// Thread pool wait callback function template
-//
-VOID
-CALLBACK
-MyWaitCallback(
-    PTP_CALLBACK_INSTANCE Instance,
-    PVOID                 Parameter,
-    PTP_WAIT              Wait,
-    TP_WAIT_RESULT        WaitResult
-    )
+// Get the username and password. The username is stored in the given buffer,
+// the password is saved in some hidden place
+static void GetUserCredential(char *, int);
+
+
+// Given
+//	PRequestPoolItem		pointer to the allocated storage entry for the tunneled SOCKS request/response
+//	SOCKET					the socket handler; if 0, it has been stored in RequestPoolItem
+// Return
+//	SOCKET_ERROR if socket receive error
+//	0 if non-conforming
+//	number of bytes read into the buffer
+static int GetSOCKSv4Request(PRequestPoolItem p, SOCKET client = 0)
 {
-    // Instance, Parameter, Wait, and WaitResult not used in this example.
-    UNREFERENCED_PARAMETER(Instance);
-    UNREFERENCED_PARAMETER(Parameter);
-    UNREFERENCED_PARAMETER(Wait);
-    UNREFERENCED_PARAMETER(WaitResult);
+	SRequestResponse_v4& req = p->req;
+	int r;
+	bool hasDomainName = false;
+	if(client == 0)
+	{
+		client = p->hSocket;
+		r = offsetof(SSocksV5AuthMethodsRequest, methods);
+		r = recv(client, (char*)&req + r, sizeof(req) - r, 0);
+		//^See also SOCKSv5.cpp
+	}
+	else
+	{
+		p->hSocket = client;
+		r = recv(client, (char*)&req, sizeof(req), 0);
+	}
+	if (r == SOCKET_ERROR)
+	{
+		perror("Get SOCKSv4 request: recv() failed");
+		return r;
+	}
+	// the implicit rule says that only socks version 4a supported
+	if (req.version != SOCKS_VERSION)
+	{
+		printf_s("%d: unsupported version\n", req.version);
+		return 0;
+	}
+	if (req.cmd != SOCKS_CMD_CONNECT)
+	{
+		printf_s("%d: unsupported command\n", req.cmd);
+		return 0;
+	}
 
-    //
-    // Do something when the wait is over.
-    //
+	octet* s = (octet*)&req.inet4Addr;
+	if (s[0] == 0 && s[1] == 0 && s[2] == 0)
+	{
+		if (s[3] == 0)
+		{
+			printf_s("Non-conforming SOCKS4a client.");
+			return 0;
+		}
+		hasDomainName = true;
+	}
+#ifndef NDEBUG
+	printf_s("Version %d, command code %d, target at %s:%d\n"
+		, req.version
+		, req.cmd
+		, inet_ntoa(req.inet4Addr)
+		, be16toh(req.nboPort));
+	printf_s("Skipped user Id: ");
+#endif
+
+	char c = 0;
+	do
+	{
+		r = recv(client, & c, 1, 0);
+		if(c == 0)
+			break;
+#ifndef NDEBUG
+		putchar(c);
+#endif
+	} while(r > 0);
+	//
+	if(r < 0)
+	{
+#ifndef NDEBUG
+		perror("Skip user id recv() failed");
+#endif
+		return r;
+	}
+#ifndef NDEBUG
+	putchar('\n');
+#endif
+
+	// SOCKS4a
+	if (hasDomainName)
+	{
+		SRequestResponseV4a& rq4a = p->rqV4a;
+		int i = 0;
+		do
+		{
+			r = recv(client, &c, 1, 0);
+			rq4a.domainName[i++] = c;
+			if (i >= MAX_LEN_DOMAIN_NAME && c != 0)
+			{
+#ifndef NDEBUG
+				printf("Domain name is too long.\n");
+#endif
+				return 0;
+			}
+		} while (r > 0 && c != 0);
+		if (!(r > 0))
+		{
+#ifndef NDEBUG
+			perror("Get domain name failed");
+#endif
+			return r;
+		}
+#ifndef NDEBUG
+		printf_s("To visit: %s\n", rq4a.domainName);
+#endif
+		r = sizeof(req) + i;
+	}
+	else
+	{
+		r = sizeof(req);
+	}
+
+	return r;
 }
 
 
-//
-// Thread pool timer callback function template
-//
-VOID
-CALLBACK
-MyTimerCallback(
-    PTP_CALLBACK_INSTANCE Instance,
-    PVOID                 Parameter,
-    PTP_TIMER             Timer
-    )
-{
-    // Instance, Parameter, and Timer not used in this example.
-    UNREFERENCED_PARAMETER(Instance);
-    UNREFERENCED_PARAMETER(Parameter);
-    UNREFERENCED_PARAMETER(Timer);
 
-    //
-    // Do something when the timer fires.
-    //
+static void RejectV4Client(SOCKET client)
+{
+	SRequestResponse_v4 rep;
+	memset(& rep, 0, sizeof(rep));
+	rep.rep = REP_REJECTED;
+
+	int r = send(client, (char *) & rep, sizeof(rep), 0);
+	if(r == SOCKET_ERROR)
+	{
+		perror("Response to client, send() failed");
+		closesocket(client);
+	}
+	else
+	{
+		CloseGracefully(client);
+	}
 }
 
+
+
+#if defined(__WINDOWS__)
+# include <MSWSock.h>
 
 //
 // This is the thread pool work callback function, forward declaration.
 //
 VOID CALLBACK TpWorkCallBack(PTP_CALLBACK_INSTANCE, PVOID, PTP_WORK Work);
-
 
 
 // Given
@@ -231,20 +317,7 @@ void ToServeSOCKS(const char *nameAppLayer, int port)
     SetThreadpoolCallbackPool(& envCallBack, pool);
     SetThreadpoolCallbackCleanupGroup(& envCallBack, cleanupgroup, NULL);
 
-	//timer = CreateThreadpoolTimer(MyTimerCallback, NULL,  & envCallBack);
-	//if (timer == NULL)
-	//{
-	//    printf_s("CreateThreadpoolTimer failed. LastError: %d\n", GetLastError());
-	//    goto l_bailout2;
-	//}
-
-    //ulDueTime.QuadPart = (ULONGLONG) -(1 * 10 * 1000 * 1000);
-    //FileDueTime.dwHighDateTime = ulDueTime.HighPart;
-    //FileDueTime.dwLowDateTime  = ulDueTime.LowPart;
-    //SetThreadpoolTimer(timer, &FileDueTime, 0, 0);
-
-	//
-	hListener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	SOCKET	 hListener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 	if(hListener == SOCKET_ERROR)
 	{
         printf_s("socket() failed with error: %d\n", WSAGetLastError() );
@@ -297,11 +370,12 @@ void ToServeSOCKS(const char *nameAppLayer, int port)
 				break;
 			//
 			Sleep(2000);	// Simply refuse to serve more request for a while if there's no buffer temporily
+			continue;
 		}
 		//
 		work = CreateThreadpoolWork(TpWorkCallBack, (PVOID)hAccepted, & envCallBack);
 		if (work == NULL)
-			ReportErrorToClient(hAccepted, REP_REJECTED);
+			RejectV4Client(hAccepted);
 		else
 			SubmitThreadpoolWork(work);
 	} while(true);
@@ -312,17 +386,11 @@ l_bailout6:
 l_bailout5:
     WSACleanup();
 
-//l_bailout4:
-	//SetThreadpoolTimer(timer, NULL, 0, 0); // cancel waiting queued callback
-	//WaitForThreadpoolTimerCallbacks(timer, true);
-	////CloseThreadpoolTimer(timer); // unnecessary.
-//l_bailout3:
 	// CloseThreadpoolCleanupGroupMembers also releases objects
 	// that are members of the cleanup group, so it is not necessary 
 	// to call close functions on individual objects 
 	// after calling CloseThreadpoolCleanupGroupMembers.
     CloseThreadpoolCleanupGroupMembers(cleanupgroup, FALSE, NULL);
-//l_bailout2:
 	CloseThreadpoolCleanupGroup(cleanupgroup);
 l_bailout1:
     CloseThreadpool(pool);
@@ -338,117 +406,85 @@ TpWorkCallBack(PTP_CALLBACK_INSTANCE Instance, PVOID parameter, PTP_WORK Work)
 {
     // Instance, Parameter, and Work not used in this example.
     UNREFERENCED_PARAMETER(Instance);
-    UNREFERENCED_PARAMETER(Work);
 
 	PRequestPoolItem p = requestPool.AllocItem();
 	SOCKET client = (SOCKET)parameter;
 	if(p == NULL)
 	{
-		ReportErrorToClient(client, REP_REJECTED);
-		return;
-	}	
-	SRequestResponse & req = p->req;
-
-	int r = recv(client, (char *) & req, sizeof(req), 0);
-	if(r == SOCKET_ERROR)
-	{  
-        printf_s("recv() socks version failed with error: %d\n", WSAGetLastError());
-		requestPool.FreeItem(p);
-		ReportErrorToClient(client, REP_REJECTED);
-        return;
-    }
-
-	// the implicit rule says that only socks version 4a supported
-	if(req.version != SOCKS_VERSION)
-	{
-        printf_s("%d: unsupported version\n", req.version);
-		requestPool.FreeItem(p);
-		ReportErrorToClient(client, REP_REJECTED);
+		closesocket(client);
 		return;
 	}
-	if(req.cmd != SOCKS_CMD_CONNECT)
+	p->hThread = (HANDLE)Work;
+
+	int n = GetSOCKSv4Request(p, client);
+	if(n <= 0)
 	{
-        printf_s("%d: unsupported command\n", req.version);
 		requestPool.FreeItem(p);
-		ReportErrorToClient(client, REP_REJECTED);
+		RejectV4Client(client);
 		return;
 	}
-
-#ifndef NDEBUG
-	printf_s("Version %d, command code %d, target at %s:%d\n"
-		, req.version
-		, req.cmd
-		, inet_ntoa(req.inet4Addr)
-		, be16toh(req.nboPort));
-	printf_s("Skipped user Id: ");
-#endif
-
-	char c = 0;
-	do
-	{
-		r = recv(client, & c, 1, 0);
-		if(c == 0)
-			break;
-#ifndef NDEBUG
-		putchar(c);
-#endif
-	} while(r > 0);
-	//
-	if(r < 0)
-	{
-		printf_s("recv() failed with error: %d\n", WSAGetLastError());
-		requestPool.FreeItem(p);
-		ReportErrorToClient(client, REP_REJECTED);
-		return;
-	}
-	printf_s("\n");
-	//
-	p->hSocket = client;
 
 	FSP_SocketParameter parms;
 	memset(& parms, 0, sizeof(parms));
 	parms.onAccepting = NULL;
 	parms.onAccepted = NULL;
 	parms.onError = onError;
+	parms.keepAlive = 1;
 	parms.recvSize = BUFFER_POOL_SIZE;
 	parms.sendSize = BUFFER_POOL_SIZE;
 	parms.welcome = &p->req;
-	parms.len = (unsigned short)sizeof(p->req);
+	parms.len = (unsigned short)n;
 	parms.extentI64ULA = (ULONG_PTR)p;
 	//
 	FSPHANDLE h = MultiplyAndWrite(hClientMaster, & parms, TO_END_TRANSACTION, onSubrequestSent);
 	if(h == NULL)
 	{
 		requestPool.FreeItem(p);
-		ReportErrorToClient(client, REP_REJECTED);
+		RejectV4Client(client);
 	}
 }
 
 
 
-// Side-effect: if code is not REP_SUCCEEDED, close the socket gracefully as well
-void ReportErrorToClient(SOCKET client, ERepCode code)
+static void SetStdinEcho(bool enable = true)
 {
-	SRequestResponse rep;
-	memset(& rep, 0, sizeof(rep));
-	rep.rep = code;
+    HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE); 
+    DWORD mode;
+    GetConsoleMode(hStdin, &mode);
 
-	int r = send(client, (char *) & rep, sizeof(rep), 0);
-	if(r == SOCKET_ERROR)
-	{
-        printf_s("send() socks response failed with error: %d\n", WSAGetLastError());
-		closesocket(client);
-	}
-	else if(code != REP_SUCCEEDED)
-	{
-		CloseGracefully(client);
-	}
+    if( !enable )
+        mode &= ~ENABLE_ECHO_INPUT;
+    else
+        mode |= ENABLE_ECHO_INPUT;
+
+    SetConsoleMode(hStdin, mode);
 }
+
+
+
+static void GetUserCredential(char *userName, int capacity)
+{
+	printf_s("Please input the username: ");
+	scanf_s("%s", userName, capacity);
+
+	printf_s("Please input the password: ");
+	SetStdinEcho(false);
+
+	scanf_s("%s", inputPassword, _countof(inputPassword));
+	fgetc(stdin);	// Skip Carriage Return
+	SetStdinEcho();
+}
+
+
+// For SOCKSv4 client only
+static void ReportGeneralError(SOCKET client, PRequestPoolItem) { RejectV4Client(client); }
 
 
 //
 // TODO: timeout! for SOCKSv4, it is 2 minutes (120 seconds) 
 //
+#endif
+
 
 // The call back function on exception notified. Just report error and simply abort the program.
 static void FSPAPI onError(FSPHANDLE h, FSP_ServiceCode code, int value)
@@ -459,7 +495,7 @@ static void FSPAPI onError(FSPHANDLE h, FSP_ServiceCode code, int value)
 	if(h == hClientMaster)
 	{
 		printf_s("Fatal IPC %d, error %d encountered in the session with the tunnel server.\n", code, value);
-		closesocket(hListener);	// And thus the main loop would be aborted
+		// UNRESOLVED! TODO: force the main loop to abort?
 	}
 }
 
@@ -488,7 +524,7 @@ static int	FSPAPI  onConnected(FSPHANDLE h, PFSP_Context ctx)
 		return -1;
 	}
 
-	register int i = 0;
+	int i = 0;
 	while (i < recvSize)
 	{
 		if (msg[i++] == 0)
@@ -509,12 +545,7 @@ static int	FSPAPI  onConnected(FSPHANDLE h, PFSP_Context ctx)
 	// And suffixed with the client's identity
 
 	char userName[80];
-	printf_s("Please input the username: ");
-	scanf_s("%s", userName, _countof(userName));
-	printf_s("Please input the password: ");
-	scanf_s("%s", inputPassword, _countof(inputPassword));
-	fgetc(stdin);	// Skip Carriage Return
-	// this is just a demonstration, so don't hide the input
+	GetUserCredential(userName, (int)sizeof(userName));
 
 	int nBytes = (int)strlen(userName) + 1;
 	octet buf[MAX_PATH];
@@ -606,7 +637,7 @@ static void FSPAPI onSubrequestSent(FSPHANDLE h, FSP_ServiceCode c, int value)
 		Dispose(h);
 		return;
 	}
-	if(p->hSocket == INVALID_SOCKET)
+	if(p->hSocket == (SOCKET)(SOCKET_ERROR))
 	{
 		requestPool.FreeItem(p);
 		Dispose(h);
@@ -614,64 +645,19 @@ static void FSPAPI onSubrequestSent(FSPHANDLE h, FSP_ServiceCode c, int value)
 	}
 	if(value < 0)
 	{
-		ReportErrorToClient(p->hSocket, REP_REJECTED);
+		ReportGeneralError(p->hSocket, p);
 		requestPool.FreeItem(p);
 		Dispose(h);
 		return;
 	}
 	//
 	p->hFSP = h;
-	SetOnRelease(h, onRelease);
-	RecvInline(h, onFSPDataAvailable);
-	GetSendBuffer(h, toReadTCPData);
-}
-
-
-
-// The call back function on passive shutdown of the connection
-static void FSPAPI onRelease(FSPHANDLE h, FSP_ServiceCode code, int value)
-{
-	PRequestPoolItem p = (PRequestPoolItem)GetExtPointer(h);
-	if (p == NULL)
+	if (SetOnRelease(h, onRelease) < 0
+	 || RecvInline(h, onFSPDataAvailable) < 0
+	 || GetSendBuffer(h, toReadTCPData) < 0)
 	{
-		Dispose(h);
-		return;
-	}
-	if (p->hSocket == INVALID_SOCKET)
-	{
+		ReportGeneralError(p->hSocket, p);
 		requestPool.FreeItem(p);
 		Dispose(h);
-		return;
 	}
-	CloseGracefully(p->hSocket);
-	requestPool.FreeItem(p);
-	Dispose(h);
-}
-
-
-
-static void SetStdinEcho(bool enable)
-{
-#ifdef WIN32
-    HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE); 
-    DWORD mode;
-    GetConsoleMode(hStdin, &mode);
-
-    if( !enable )
-        mode &= ~ENABLE_ECHO_INPUT;
-    else
-        mode |= ENABLE_ECHO_INPUT;
-
-    SetConsoleMode(hStdin, mode );
-
-#else
-    struct termios tty;
-    tcgetattr(STDIN_FILENO, &tty);
-    if( !enable )
-        tty.c_lflag &= ~ECHO;
-    else
-        tty.c_lflag |= ECHO;
-
-    (void) tcsetattr(STDIN_FILENO, TCSANOW, &tty);
-#endif
 }

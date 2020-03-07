@@ -67,15 +67,13 @@ PRequestPoolItem RequestPool::AllocItem(FSPHANDLE h)
 
 
 
+// For a prototype application, it seems not worth to exploit more complicate data structure
 PRequestPoolItem RequestPool::AllocItem()
 {
 	for(register int i = 0; i < capacity; i++)
 	{
-		if(items[i].hFSP == NULL)
-		{
-			items[i].hFSP = (FSPHANDLE)(-1);
+		if(_InterlockedCompareExchange((u32 *)&items[i].hSocket, SOCKET_ERROR, 0) == 0)
 			return (items + i);
-		}
 	}
 	//
 	return NULL;

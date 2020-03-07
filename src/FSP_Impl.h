@@ -144,8 +144,8 @@ protected:
 # define MAX_LOCK_WAIT_ms			30000	// half a minute
 # define TIMER_SLICE_ms				1		// For HPET
 
-# define INVALID_SOCKET	(-1)
-# define SIGNO_FSP		SIGRTMIN
+# define IN4ADDR_LOOPBACK	0x0100007F	// Works for x86 little-endian
+# define INVALID_SOCKET		(-1)
 
 # define max(a,b)	((a) >= (b) ? (a) : (b))
 # define min(a,b)	((a) <= (b) ? (a) : (b))
@@ -154,7 +154,7 @@ protected:
 # define _strnicmp strncasecmp
 
 # define SHARE_MEMORY_PREFIX	"/FlexibleSessionProtocolSHM"
-# define SERVICE_MAILSLOT_NAME	"/FlexibleSessionProtocolMailQueue"
+# define SERVICE_SOCKET_PATH	"/tmp/FlexibleSessionProsock"
 
 # ifdef TRACE
 #  define REPORT_ERROR_ON_TRACE()		perror("ERROR REPORT")
@@ -176,11 +176,12 @@ typedef union _SOCKADDR_INET {
 }	SOCKADDR_INET, * PSOCKADDR_INET;
 
 
+// Retrieves the number of milliseconds that have elapsed since the system was started
 static inline uint64_t GetTickCount64()
 {
 	timespec v;
 	clock_gettime(CLOCK_MONOTONIC, &v);
-	return (v.tv_sec * 1000 + v.tv_nsec / 1000);
+	return (v.tv_sec * 1000 + v.tv_nsec / 1000000);
 }
 
 static inline void Sleep(int32_t millis)
@@ -258,9 +259,8 @@ protected:
 # define MAX_BLOCK_SIZE		512
 #endif
 
-#define MIN_QUEUED_INTR		2	// minimum number of queued (soft) interrupt, must be some power value of 2
-#define FSP_BACKLOG_SIZE	4	// shall be some power of 2
-#define FSP_MAX_NUM_NOTICE	15	// should be a reasonable value, shall be some multiple of 8 minus 1
+#define FSP_BACKLOG_SIZE	4	// minimum number of backlog items reserved for multiplication
+#define FSP_BACKLOG_UPLIMIT	16	// maximum number of backlog items in the listen queue
 #define	MIN_RESERVED_BUF	(MAX_BLOCK_SIZE * 2)
 #ifndef MAX_BUFFER_BLOCKS
 # define	MAX_BUFFER_BLOCKS	0x20000	// maximum buffer size is implementation specific. here about 128MB for FSP over IPv6
@@ -382,9 +382,7 @@ struct CommandNewSession: CommandToLLS
 
 struct CommandRejectRequest : CommandToLLS
 {
-	uint32_t		reasonCode;	
-
-	CommandRejectRequest(ALFID_T id1, uint32_t rc)	{ fiberID = id1; opCode = FSP_Reject; reasonCode = rc; }
+	uint32_t		reasonCode;
 };
 
 
@@ -438,7 +436,7 @@ struct SConnectParam	// MUST be aligned on 64-bit words!
 	//
 	union
 	{
-	octet		padding[8];	// allow maximum key length of 384-bit, padding the structure to 64 bytes/512bits
+		octet	padding[8];	// allow maximum key length of 384-bit, padding the structure to 64 bytes/512bits
 		octet	tag[FSP_TAG_SIZE];
 		int64_t	tDiff;
 	};
@@ -495,28 +493,18 @@ struct LLSNotice
 {
 	volatile char 	nmi;
 	long			vector;
-	void SetHead(FSP_NoticeCode c) { nmi = (char )c; }
-	// It is inline in the LLS to set the soft interrupt signal, for sake of performance
-	// It is inline in the DLL to fetch the soft interrupt signal, for sake of performance and balance
 };
-
-
 
 class LLSBackLog: public CLightMutex
 {
 	friend struct ControlBlock;
 
-	ALIGN(8)
 	int32_t				capacity;
 	volatile int32_t	headQ;
 	volatile int32_t	tailQ;
 	volatile int32_t	count;
 	//
-	ALIGN(8)
-	BackLogItem			q[MIN_QUEUED_INTR];
-	//
-	void InitSize() { capacity = MIN_QUEUED_INTR; }	// assume memory has been zeroed
-	int	InitSize(int);
+	BackLogItem			q[FSP_BACKLOG_SIZE];
 
 public:
 	BackLogItem * LOCALAPI FindByRemoteId(ALFID_T, uint32_t);
@@ -537,11 +525,11 @@ public:
 // or similar measures to protect sensitive information, integrity and privacy, of user process
 struct ControlBlock
 {
-	ALIGN(8)
 	FSP_Session_State	state;
 	char			tfrc : 1;		// TCP friendly rate control. By default ECN-friendly
 	char			milky : 1;		// by default 0: a normal wine-style payload assumed. FIFO
 	char			noEncrypt : 1;	// by default 0; 1 if session key installed, encrypt the payload
+	char			keepAlive : 1;	// by default 0; 1 if the session is not automatically timed-out
 	ALFID_T			idParent;
 
 	// 1, 2. 
@@ -562,7 +550,6 @@ struct ControlBlock
 	} peerAddr;
 
 	// 3: The negotiated connection parameter
-	ALIGN(8)	// 64-bit alignment, make sure that the session key overlays 'initCheckCode' and 'cookie' only
 	SConnectParam connectParams;
 
 	// 3+: Performance profiling counts
@@ -834,22 +821,19 @@ struct ControlBlock
 	}
 
 	bool HasBacklog() const { return backLog.count > 0; }
+	void InitToListen()
+	{
+		memset(this, 0, sizeof(ControlBlock));
+		backLog.capacity = FSP_BACKLOG_UPLIMIT;
+	}
 
 	int LOCALAPI	Init(int32_t &, int32_t &);
-	int	LOCALAPI	Init(uint16_t);
 };
-
-#if defined(_MSC_VER)
-# include <poppack.h>
-#else
-# pragma pack(pop)
-#endif
 
 
 class CSocketItem
 {
 protected:
-	ALIGN(FSP_ALIGNMENT)
 	ALFIDPair	fidPair;
 #if defined(__WINDOWS__)
 	HANDLE	hEvent;
@@ -865,22 +849,28 @@ protected:
 	{
 		register HANDLE h;
 		//
-		if ((h = InterlockedExchangePointer((PVOID *)& pControlBlock, NULL)) != NULL)
+		if ((h = InterlockedExchangePointer((PVOID*)&pControlBlock, NULL)) != NULL)
 			::UnmapViewOfFile(h);
-		if ((h = InterlockedExchangePointer((PVOID *)& hMemoryMap, NULL)) != NULL)
+		if ((h = InterlockedExchangePointer((PVOID*)&hMemoryMap, NULL)) != NULL)
 			::CloseHandle(h);
-		if((h = InterlockedExchangePointer((PVOID *) & hEvent, NULL)) != NULL)
+		if ((h = InterlockedExchangePointer((PVOID*)&hEvent, NULL)) != NULL)
 			::CloseHandle(h);
 	}
 #elif defined(__linux__) || defined(__CYGWIN__)
 	void Destroy()
 	{
-		register void *buf;
-		if ((buf =  _InterlockedExchangePointer((PVOID *)& pControlBlock, NULL)) != NULL)
+		register void* buf;
+		if ((buf = _InterlockedExchangePointer((PVOID*)&pControlBlock, NULL)) != NULL)
 			munmap(buf, dwMemorySize);
 	}
 #endif
 };
+
+#if defined(_MSC_VER)
+# include <poppack.h>
+#else
+# pragma pack(pop)
+#endif
 
 #endif
 

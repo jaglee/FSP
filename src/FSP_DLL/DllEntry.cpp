@@ -123,8 +123,9 @@ timestamp_t NowUTC()
 
 
 
+
 // Given
-//	CommandNewSession	[_inout_]	the buffer to hold the name of the event
+//	CommandNewSession	: not cared on Windows Platform
 // Do
 //	Initialize the IPC structure to call LLS
 // Return
@@ -154,6 +155,20 @@ bool CSocketItemDl::InitLLSInterface(CommandNewSession& cmd)
 		return false;	// return -ENOMEM;
 	}
 
+	return true;
+}
+
+
+
+// Given
+//	CommandNewSession	[_inout_]	the buffer to hold the name of the event
+// Do
+//	Enable the interface to call and be called back by LLS
+// Return
+//	true if no error, false if failed
+bool CSocketItemDl::EnableLLSInteract(CommandNewSession& cmd)
+{
+
 	// make the event name. the control block address, together with the process id, uniquely identify the event
 	sprintf_s(cmd.szEventName, MAX_NAME_LENGTH, REVERSE_EVENT_PREFIX "%08X%p", (u32)idThisProcess, pControlBlock);
 	// system automatically resets the event state to non-signaled after a single waiting thread has been released
@@ -182,9 +197,8 @@ bool CSocketItemDl::InitLLSInterface(CommandNewSession& cmd)
 		return false;	// return -ENXIO;
 	}
 
-	return true;
+	return AddOneShotTimer(TRANSIENT_STATE_TIMEOUT_ms);
 }
-
 
 
 #ifndef _NO_LLS_CALLABLE
@@ -197,6 +211,7 @@ bool CSocketItemDl::InitLLSInterface(CommandNewSession& cmd)
 bool LOCALAPI CSocketItemDl::Call(const CommandToLLS & cmd, int size)
 {
 	DWORD		nBytesReadWrite;		// number of bytes read/write last time
+	commandLastIssued = cmd.opCode;
 	return ::WriteFile(_mdService, & cmd, size, & nBytesReadWrite, NULL) != FALSE;
 }
 #endif
@@ -230,7 +245,7 @@ bool LOCALAPI CSocketItemDl::AddOneShotTimer(uint32_t dueTime)
 //	false if it failed
 bool CSocketItemDl::CancelTimeout()
 {
-	HANDLE h = (HANDLE)InterlockedExchangePointer((PVOID *)& timer, NULL);
+	HANDLE h = (HANDLE)InterlockedExchangePointer((PVOID*)&timer, NULL);
 	return (h == NULL || ::DeleteTimerQueueTimer(::timerQueue, h, NULL) != FALSE);
 }
 

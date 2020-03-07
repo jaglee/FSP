@@ -29,6 +29,7 @@
 
 #include "fsp_srv.h"
 #include <assert.h>
+#include <stddef.h>
 
 
 // Translation-Look-aside-Buffer of the Service Sockets, the constructor
@@ -72,16 +73,28 @@ bool CSocketSrvTLB::PutToScavengeCache(CSocketItemEx *pSocket, timestamp_t tNow)
 }
 
 
+
 // allocate from the free list
-CSocketItemEx * CSocketSrvTLB::AllocItem()
+CSocketItemEx* CSocketSrvTLB::AllocItem()
 {
 	CSocketItemEx* p, * p1;
 	timestamp_t tNow;
 
 	AcquireMutex();
 
-	if (headFreeSID != NULL && headFreeSID->TestSetState(CONNECT_BOOTSTRAP))
-		goto l_success;
+	if (headFreeSID != NULL)
+	{
+	l_success:
+		p = headFreeSID;
+		headFreeSID = p->next;
+		if (headFreeSID == NULL)
+			tailFreeSID = NULL;
+		ReleaseMutex();
+		//
+		p->lowState = CONNECT_BOOTSTRAP;
+		p->markInUse = 1;
+		return p;
+	}
 
 	// as this is a prototype is not bothered to exploit hash table
 	// recycle all of the orphan sockets
@@ -94,10 +107,7 @@ CSocketItemEx * CSocketSrvTLB::AllocItem()
 	}
 #endif
 	if (headFreeSID != NULL)
-	{
-		headFreeSID->TestSetState(CONNECT_BOOTSTRAP);
 		goto l_success;
-	}
 
 	tNow = NowUTC();
 	p1 = NULL;
@@ -111,7 +121,6 @@ CSocketItemEx * CSocketSrvTLB::AllocItem()
 				PutToScavengeCache(p, tNow);
 		}
 	}
-
 	if (topOfSC <= 0)
 	{
 		ReleaseMutex();
@@ -122,23 +131,12 @@ CSocketItemEx * CSocketSrvTLB::AllocItem()
 	topOfSC--;
 	for (i = 0; i < topOfSC; i++)
 	{
-		scavengeCache[i] = scavengeCache[i+1];
+		scavengeCache[i] = scavengeCache[i + 1];
 	}
-
+	// It is hazardous to release the socket by force
 	p1->WaitUseMutex();		// it is throttling!
 	p1->AbortLLS(true);
-	assert(headFreeSID != NULL);
-	headFreeSID->TestSetState(CONNECT_BOOTSTRAP);
-
-l_success:
-	p = headFreeSID;
-	headFreeSID = p->next;
-	if (headFreeSID == NULL)
-		tailFreeSID = NULL;
-	ReleaseMutex();
-	//
-	p->next = NULL;
-	return p;
+	goto l_success;
 }
 
 
@@ -146,7 +144,8 @@ l_success:
 // registration of passive socket: it is assumed that performance is out of question for a conceptual prototype
 // allocate in the listeners' socket space
 // detect duplication fiber ID, remove 'brain-dead' socket
-// we may reuse a socket created indirectly by a terminated process
+// UNRESOLVED! LRU and round-robin of recycling
+// May we reuse a socket created indirectly by a terminated process?
 CSocketItemEx * CSocketSrvTLB::AllocItem(ALFID_T idListener)
 {
 	AcquireMutex();
@@ -155,17 +154,14 @@ CSocketItemEx * CSocketSrvTLB::AllocItem(ALFID_T idListener)
 	for(register int i = 0; i < MAX_LISTENER_NUM; i++)
 	{
 		register CSocketItemEx &r = listenerSlots[i];
-		if (!r.IsProcessAlive())
+		if (r.IsInUse() && !r.IsProcessAlive())
 		{
 			r.AbortLLS(true);
 			if (p == NULL)
-			{
 				p = &r;
-				p->TestSetState(LISTENING);
-			}
 			// do not break, for purpose of duplicate allocation detection
 		}
-		else if (r.fidPair.source == idListener)
+		else if (r.IsInUse() && r.fidPair.source == idListener)
 		{
 #ifdef TRACE
 			printf_s("\nCollision detected:\n"
@@ -183,6 +179,8 @@ CSocketItemEx * CSocketSrvTLB::AllocItem(ALFID_T idListener)
 
 	if (p != NULL)
 	{
+		memset(p, 0, sizeof(CSocketItemEx));
+		p->markInUse = 1;
 		p->SetPassive();
 		p->fidPair.source = idListener;
 		PutToListenTLB(p, be32toh(idListener) & (MAX_CONNECTION_NUM - 1));
@@ -199,10 +197,10 @@ CSocketItemEx * CSocketSrvTLB::AllocItem(ALFID_T idListener)
 //	int					the 'compressed' hash key for searching the socket item
 // Do
 //	Insert the given socket item into the translation-look-aside buffer of listening sockets
-void CSocketSrvTLB::PutToListenTLB(CSocketItemEx * p, int k)
+void CSocketSrvTLB::PutToListenTLB(CSocketItemEx* p, int k)
 {
-	CSocketItemEx *p0 = tlbSockets[k];
-	register CSocketItemEx *p1;
+	CSocketItemEx* p0 = tlbSockets[k];
+	register CSocketItemEx* p1;
 	// TODO: UNRESOLVED! Is it unnecessary to detect the stale entry?
 	for (p1 = p0; p1 != NULL; p1 = p1->prevSame)
 	{
@@ -270,9 +268,8 @@ void CSocketSrvTLB::FreeItemDonotCareLock(CSocketItemEx *p)
 		tailFreeSID = p;
 	}
 	p->next = NULL;	// in case it is not
-
-	bzero(&p->contextOfICC, sizeof(ICC_Context));
-	//^For sake of security enforcement.
+	bzero((octet *)p + offsetof(CSocketItemEx, idSrcProcess)
+		, sizeof(CSocketItemEx) - offsetof(CSocketItemEx, idSrcProcess));
 	// It might be unfriendly for connection resurrection. However, here security takes precedence.
 }
 
@@ -293,6 +290,7 @@ CSocketItemEx * CSocketSrvTLB::operator[](ALFID_T id)
 			return p;
 		p = p->prevSame;
 	} while(p != NULL);
+	//
 	return p;	// assert(p == NULL);
 }
 
@@ -322,6 +320,7 @@ CSocketItemEx * CSocketSrvTLB::AllocItem(const CommandNewSessionSrv & cmd)
 			p = NULL;
 			goto l_return;
 		}
+		p->markInUse = 1;
 	}
 l_return:
 	ReleaseMutex();
@@ -525,7 +524,7 @@ void CSocketItemEx::InitiateConnect()
 	skb->timeSent = tRecentSend;
 
 	SyncState();
-	ReplaceTimer(RETRANSMIT_MIN_TIMEOUT_us);
+	ReplaceTimer(RETRANSMIT_MIN_TIMEOUT_us/1000);
 }
 
 
@@ -570,7 +569,7 @@ void CSocketItemEx::AffirmConnect(const SConnectParam & initState, ALFID_T idLis
 	skb->len = sizeof(FSP_ConnectRequest);
 
 	SetState(CONNECT_AFFIRMING);
-	ReplaceTimer(RETRANSMIT_MIN_TIMEOUT_us);
+	ReplaceTimer(RETRANSMIT_MIN_TIMEOUT_us/1000);
 	SendPacket(1, ScatteredSendBuffers(pkt, skb->len));	// it would set tRecentSend
 }
 
@@ -631,6 +630,12 @@ void CSocketItemEx::InitiateMultiply(CSocketItemEx *srcItem)
 
 	pControlBlock->SetFirstSendWindowRightEdge();
 	SyncState();
+	//// In case of trace condition
+	//if (!WaitUseMutex())
+	//{
+	//	BREAK_ON_DEBUG();
+	//	return;
+	//}
 	SendPacket(2, ScatteredSendBuffers(payload, sizeof(FSP_NormalPacketHeader), this->cipherText, skb->len));
 	skb->MarkSent();
 	skb->timeSent = NowUTC();
@@ -638,7 +643,8 @@ void CSocketItemEx::InitiateMultiply(CSocketItemEx *srcItem)
 	tSessionBegin = skb->timeSent;
 	tPreviousTimeSlot = skb->timeSent;
 	tPreviousLifeDetection = tSessionBegin;
-	ReplaceTimer(RETRANSMIT_MIN_TIMEOUT_us);
+	ReplaceTimer(RETRANSMIT_MIN_TIMEOUT_us/1000);
+	//SetMutexFree();
 }
 
 
@@ -662,7 +668,10 @@ bool CSocketItemEx::FinalizeMultiply()
 	printf_s("\nGet the acknowledgement ACK_START/PERSIST of MULTIPLY\n");
 #endif
 	if (!ValidateICC())
+	{
+		BREAK_ON_DEBUG();	//TRACE_HERE("Invalid integrity check code!?");
 		return false;
+	}
 
 #if defined(TRACE) && (TRACE & TRACE_OUTBAND)
 	printf_s("Response of MULTIPLY was accepted, recvBufferBlockN = %d\n"
@@ -674,6 +683,26 @@ bool CSocketItemEx::FinalizeMultiply()
 	// And continue to accept the payload in the caller
 	pControlBlock->SetRecvWindow(pktSeqNo);
 	return CLowerInterface::Singleton.PutToRemoteTLB((CMultiplyBacklogItem *)this);
+}
+
+
+
+// See also OnGetMultiply(), SendReset(), ICC_Context::InheritR1()
+void CSocketItemEx::RefuseToMultiply(uint32_t reasonCode)
+{
+	ALIGN(FSP_ALIGNMENT) FSP_FixedHeader hdr;
+	// See also SendReset(), but note that there was no receive window nor send window
+	SetHeaderSignature(hdr, RESET);
+	((FSP_RejectConnect*)&hdr)->reasons = reasonCode;
+	hdr.sequenceNo = htobe32(contextOfICC.snFirstSendWithCurrKey);
+	hdr.expectedSN = htobe32(contextOfICC.snFirstRecvWithCurrKey);
+	SetIntegrityCheckCode(&hdr);
+	SendPacket(1, ScatteredSendBuffers(&hdr, sizeof(hdr)));
+
+	// See also Recycle(), but lowState is already zeroed, and control block is not mapped at all
+	RemoveTimers();
+	CLowerInterface::Singleton.FreeItem(this);
+
 }
 
 
@@ -700,8 +729,8 @@ void CMultiplyBacklogItem::RespondToMultiply()
 		AbortLLS();		// Used to be HandleMemoryCorruption();
 		return;
 	}
-
-	// The opCode field is overriden to PERSIST for sake of clearer transmit transaction management
+	// tRecentSend = NowUTC();	// in case it is timed-out prematurely
+	// The opCode field is overridden to PERSIST for sake of clearer transmit transaction management
 	skb->len = CopyOutPlainText(ubuf);
 	CopyOutFVO(skb);
 	skb->opCode = PERSIST;
@@ -723,9 +752,8 @@ void CMultiplyBacklogItem::RespondToMultiply()
 	else
 	{
 		SetState(skbOut->GetFlag<TransactionEnded>() ? COMMITTING : ESTABLISHED);
-		pControlBlock->notices.SetHead(FSP_NotifyDataReady);	// But do not signal until next packet is received
+		pControlBlock->notices.nmi = FSP_NotifyDataReady;		// But do not signal until next packet is received
 	}
-
 	RestartKeepAlive();
 }
 
@@ -747,15 +775,13 @@ void CSocketItemEx::Accept()
 	InitAssociation();
 	//
 	pControlBlock->SetFirstSendWindowRightEdge();
-	if(lowState == CHALLENGING)
+	if (lowState == CHALLENGING)
 	{
 		InstallEphemeralKey();
 		//^ ephemeral session key material was ready when CSocketItemDl::PrepareToAccept
 		SetFirstRTT(pControlBlock->connectParams.tDiff);
 		EmitStart();
 		tSessionBegin = tRecentSend;
-		pControlBlock->notices.SetHead(NullNotice);
-		//^ The success or failure signal is delayed until ACK_START, PERSIST or RESET received
 		ReplaceTimer(TRANSIENT_STATE_TIMEOUT_ms);	// The socket slot might be a reused one
 	}
 	else
@@ -801,6 +827,45 @@ void CSocketItemEx::DisposeOnReset()
 
 
 
+// Presume that ULA has release upper-layer socket, recycle the LLS counterpart.
+void CSocketItemEx::Recycle()
+{
+	lowState = NON_EXISTENT;
+	RemoveTimers();
+	UnmapControlBlock();
+	CLowerInterface::Singleton.FreeItem(this);
+}
+
+
+
+// Send RESET to the remote peer to reject some request in pre-active state but keep local context.
+// The RESET packet is not guaranteed to be received by the remote peer.
+// ULA should use FSP_Reset command if it is to free local context.
+void CSocketItemEx::Reject(uint32_t reasonCode)
+{
+	if (lowState >= ESTABLISHED)
+		SendReset();
+	else if (!IsPassive())
+		CLowerInterface::Singleton.SendPrematureReset(reasonCode, this);
+}
+
+
+
+// Send RESET to the remote peer to reject some request in pre-active state.
+// The RESET packet is not guaranteed to be received by the remote peer.
+// The local context is free as well
+// See also DisposeOnReset, Recycle
+void CSocketItemEx::Reset()
+{
+	if (lowState >= ESTABLISHED)
+		SendReset();
+	else if (!IsPassive())
+		CLowerInterface::Singleton.SendPrematureReset(FSP_Reset, this);
+	Destroy();	// MUST signal event before Destroy
+}
+
+
+
 // Set the state to 'NON_EXISTENT', and make the resources be safely recyclable
 // See also ~::KeepAlive case NON_EXISTENT
 void CSocketItemEx::Destroy()
@@ -814,8 +879,9 @@ void CSocketItemEx::Destroy()
 		printf_s("\nSCB of fiber#%u to be destroyed\n", fidPair.source);
 #endif
 		lowState = NON_EXISTENT;	// Do not [SetState(NON_EXISTENT);] as the ULA might do further cleanup
+		markInUse = 0;
 		RemoveTimers();
-		CSocketItem::Destroy();
+		UnmapControlBlock();
 		//
 		CLowerInterface::Singleton.FreeItem(this);
 	}
@@ -849,7 +915,7 @@ void CSocketItemEx::AbortLLS(bool haveTLBLocked)
 	}
 	// If TLB has been locked, 'Destroy' is simplified:
 	RemoveTimers();
-	CSocketItem::Destroy();
+	UnmapControlBlock();
 	CLowerInterface::Singleton.FreeItemDonotCareLock(this);
 }
 

@@ -42,17 +42,24 @@ pid_t	CSocketItemDl::idThisProcess = 0;
 
 #if defined(__linux__)
 
-static	mqd_t	mqdes;
+#include <sys/un.h>
+
+static	struct sockaddr_un addr;
+static	int sdClient;
 
 // Called by the default constructor only
 void CSocketDLLTLB::Init()
 {
-	mqdes = mq_open(SERVICE_MAILSLOT_NAME, O_WRONLY);
-	if (mqdes == (mqd_t)-1)
+	sdClient = socket(AF_UNIX, SOCK_DGRAM, 0); // SOCK_SEQPACKET need listen and accept
+	if(sdClient < 0)
 	{
-		perror("Cannot open the message queue");
+		perror("Cannot create AF_UNIX socket for sending");
 		exit(-1);
 	}
+
+	addr.sun_family = AF_UNIX;
+	strncpy(addr.sun_path, SERVICE_SOCKET_PATH, sizeof(addr.sun_path) - 1);
+	addr.sun_path[sizeof(addr.sun_path) - 1] = 0;
 
 	CSocketItemDl::SaveProcessId();
 }
@@ -61,8 +68,8 @@ CSocketDLLTLB::~CSocketDLLTLB()
 {
 	// TODO: Delete the time-out timer
 	//
-	if (mqdes != 0 && mqdes != (mqd_t)-1)
-		mq_close(mqdes);
+	if (sdClient != 0 && sdClient != -1)
+		close(sdClient);
 }
 
 # ifndef _NO_LLS_CALLABLE
@@ -74,10 +81,14 @@ CSocketDLLTLB::~CSocketDLLTLB()
 //	false if it failed
 bool LOCALAPI CSocketItemDl::Call(const CommandToLLS & cmd, int size)
 {
-	int r = mq_send(mqdes, (const char *)&cmd, size, 0);
-	if (r != 0)
-		perror("Cannot send the command to LLS through the message queue");
-	return (r == 0);
+#ifdef TRACE
+	printf("Fiber#%u %d bytes to send to LLS\n", cmd.fiberID, size);
+#endif
+	int r = (int)sendto(sdClient, &cmd, size, 0, (struct sockaddr*)&addr, sizeof(addr));
+	commandLastIssued = cmd.opCode;
+	if (r < 0)
+		perror("Cannot send the command to LLS through the domain socket");
+	return (r >= 0);
 }
 # endif
 
@@ -126,7 +137,6 @@ bool LOCALAPI CSocketItemDl::Call(const CommandToLLS & cmd, int size)
 }
 # endif
 
-
 #endif
 
 // Return the number of microseconds elapsed since Jan 1, 1970 UTC (Unix epoch)
@@ -142,7 +152,7 @@ timestamp_t NowUTC()
 
 
 // Given
-//	CommandNewSession	[_inout_]	the buffer to hold the name of the event
+//	CommandNewSession	[_inout_]	the buffer to hold the name of the shared memory object
 // Do
 //	Initialize the IPC structure to call LLS
 // Return
@@ -165,14 +175,27 @@ bool CSocketItemDl::InitLLSInterface(CommandNewSession & cmd)
 	}
 
 	pControlBlock = (ControlBlock*)mmap(NULL, dwMemorySize, PROT_READ | PROT_WRITE, MAP_SHARED, hShm, 0);
-	if (pControlBlock == NULL)
+	if (pControlBlock == MAP_FAILED)
 	{
-		perror("Cannot map the shared memory in server");
+		perror("Cannot map the shared memory into address space of ULA");
+		pControlBlock = NULL;
 		return false;
 	}
 	close(hShm);
 	mlock(pControlBlock, dwMemorySize);
+	return true;
+}
 
+
+
+// Given
+//	CommandNewSession	[not used for Linux platform]
+// Do
+//	Enable ULA-LLS interaction, polling mode
+// Return
+//	true if no error, false if failed
+bool CSocketItemDl::EnableLLSInteract(CommandNewSession &)
+{
 	struct itimerspec its;
 	struct sigevent sigev;
 	sigev.sigev_notify = SIGEV_THREAD;
@@ -186,10 +209,12 @@ bool CSocketItemDl::InitLLSInterface(CommandNewSession & cmd)
 	}
 	timeOut_ns = INT64_MAX;
 
+	// Here we wait at least three timer slices to make sure other initialization is ready
+	// assume timer-slice is less than one third of a second.
 	its.it_value.tv_sec = 0;
-	its.it_value.tv_nsec = POLLING_INTERVAL_MICROSECONDS * 1000;
+	its.it_value.tv_nsec = TIMER_SLICE_ms * 3000000;
 	its.it_interval.tv_sec = 0;
-	its.it_interval.tv_nsec = its.it_value.tv_nsec;
+	its.it_interval.tv_nsec = POLLING_INTERVAL_MICROSECONDS * 1000;
 
 	if (timer_settime(pollingTimer, 0, &its, NULL) != 0)
 	{
@@ -198,6 +223,7 @@ bool CSocketItemDl::InitLLSInterface(CommandNewSession & cmd)
 		return false;
 	}
 
+	timeOut_ns = int64_t(TRANSIENT_STATE_TIMEOUT_ms) * 1000000;
 	return true;
 }
 

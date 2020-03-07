@@ -137,6 +137,9 @@ class CSocketItemDl : public CSocketItem
 	CSocketItemDl	*next;
 	CSocketItemDl	*prev;
 
+	// for sake of incarnating new accepted connection
+	FSP_SocketParameter context;
+
 	// optional on-the-wire compression/decompression
 	// Forward declaration for compression-decompression
 	struct SStreamState;
@@ -144,9 +147,6 @@ class CSocketItemDl : public CSocketItem
 	// 
 	SStreamState	* pStreamState;
 	SDecodeState	* pDecodeState;
-
-	// for sake of incarnating new accepted connection
-	FSP_SocketParameter context;
 
 protected:
 	// for sake of buffered, streamed I/O
@@ -162,6 +162,10 @@ protected:
 	char			peerCommitPending : 1;
 	char			peerCommitted : 1;	// Only for conventional buffered, streamed read
 	char			pendingEoT : 1;		// EoT flag is pending to be added on a packet
+	char			pendingRecycle : 1;
+	char			processingNotice : 1;
+
+	FSP_ServiceCode commandLastIssued;
 
 #if defined(__WINDOWS__)
 	static	DWORD	idThisProcess;
@@ -300,45 +304,13 @@ public:
 	//^The error handler need not and should not do further clean-up work
 
 	// TODO: evaluate configurable shared memory block size? // UNRESOLVED!? MTU?
-	static int32_t AlignMemorySize(PFSP_Context psp1)
-	{
-		if (psp1->sendSize < 0 || psp1->recvSize < 0 || psp1->sendSize + psp1->recvSize > MAX_FSP_SHM_SIZE + MIN_RESERVED_BUF)
-			return -ENOMEM;
-		if (psp1->sendSize < MIN_RESERVED_BUF)
-			psp1->sendSize = MIN_RESERVED_BUF;
-		if (psp1->recvSize < MIN_RESERVED_BUF)
-			psp1->recvSize = MIN_RESERVED_BUF;
-		if (psp1->passive)
-		{
-			return ((sizeof(ControlBlock) + 7) >> 3 << 3)
-				+ sizeof(LLSBackLog) + sizeof(BackLogItem) * (FSP_BACKLOG_SIZE - MIN_QUEUED_INTR);
-		}
-		else
-		{
-			int n = (psp1->sendSize - 1) / MAX_BLOCK_SIZE + (psp1->recvSize - 1) / MAX_BLOCK_SIZE + 2;
-			// See also Init()
-			return ((sizeof(ControlBlock) + 7) >> 3 << 3)
-				+ n * (((sizeof(ControlBlock::FSP_SocketBuf) + 7) >> 3 << 3) + MAX_BLOCK_SIZE);
-		}
-	}
+	static int32_t AlignMemorySize(PFSP_Context);
+
 	bool InitLLSInterface(CommandNewSession&);
-	void SetConnectContext(const PFSP_Context psp1)
-	{
-		if (psp1->passive)
-			pControlBlock->Init(FSP_BACKLOG_SIZE);
-		else
-			pControlBlock->Init(psp1->sendSize, psp1->recvSize);
-		//
-		pControlBlock->tfrc = psp1->tfrc;
-		pControlBlock->milky = psp1->milky;
-		pControlBlock->noEncrypt = psp1->noEncrypt;
+	bool EnableLLSInteract(CommandNewSession&);
+	void SetConnectContext(const PFSP_Context);
 
-		// could be exploited by ULA to make services distinguishable
-		memcpy(&context, psp1, sizeof(FSP_SocketParameter));
-		pendingSendBuf = (octet*)psp1->welcome;
-		pendingSendSize = psp1->len;
-	}
-
+	int ChainOnCommitted(FSP_ServiceCode, int);
 	int Dispose();
 	int RecycLocked();
 
@@ -394,30 +366,7 @@ public:
 	bool WaitUseMutex();
 	void SetMutexFree() { _InterlockedExchange8(&locked, 0); }
 	bool TryMutexLock() { return _InterlockedCompareExchange8(&locked, 1, 0) == 0; }
-	// Given
-	//	int		the value meant to be returned
-	// Do
-	//	Process the receive buffer and send queue, then free the mutex and return the value
-	// Remark
-	//	ULA function may be called back on processing the receive buffer or send queue,
-	//	and this function SHALL be called as the 'parameter' of the return statement
-	//	Processing the receive buffer takes precedence because receiving is to free resource
-	int  TailFreeMutexAndReturn(int r)
-	{
-		if (HasDataToDeliver() && (fpReceived != NULL || fpPeeked != NULL))
-		{
-			ProcessReceiveBuffer();
-			if (!TryMutexLock())
-				return r;
-		}
-		//
-		if (HasFreeSendBuffer() && (fpSent != NULL || pendingSendBuf != NULL))
-			ProcessPendingSend();
-		else
-			SetMutexFree();
-		//
-		return r;
-	}
+	int  TailFreeMutexAndReturn(int);
 	bool IsInUse() { return (_InterlockedOr8(&inUse, 0) != 0) && (pControlBlock != NULL); }
 
 	void SetPeerName(const char *cName, size_t len)
@@ -437,25 +386,19 @@ public:
 #ifndef _NO_LLS_CALLABLE
 	bool LOCALAPI Call(const CommandToLLS &, int);
 #else
-	bool Call(const CommandToLLS &, int) { return true; }
+	bool Call(const CommandToLLS &cmd, int) { commandLastIssued = cmd.opCode; return true; }
 #endif
 
 	// TODO: for heavy-load network application, polling is not only more efficient but more responsive as well
 	// Signal LLS that the send buffer is not null
 	template<FSP_ServiceCode c> bool Call()
 	{
-		ALIGN(8) CommandToLLS cmd;
+		CommandToLLS cmd;
 		InitCommand<c>(cmd);
 		return Call(cmd, sizeof(cmd));
 	}
 	CSocketItemDl * LOCALAPI CallCreate(CommandNewSession &, FSP_ServiceCode);
-	void LOCALAPI RejectRequest(ALFID_T id1, uint32_t rc)
-	{
-		CommandRejectRequest objCommand(id1, rc);
-		objCommand.idProcess = idThisProcess;
-		initiatingShutdown = 1;
-		Call(objCommand, sizeof(objCommand));
-	}
+	void LOCALAPI RejectRequest(ALFID_T, ALFID_T, uint32_t);
 
 	int LOCALAPI InstallRawKey(octet *, int32_t, uint64_t);
 

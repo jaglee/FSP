@@ -67,7 +67,7 @@ int32_t FSPAPI GetSendBuffer(FSPHANDLE hFSPSocket, CallbackBufferReady fp1)
 {
 	CSocketItemDl *p = CSocketDLLTLB::HandleToRegisteredSocket(hFSPSocket);
 	if(p == NULL)
-		return -EFAULT;
+		return -EBADF;
 	if (!p->TestSetSendReturn((PVOID)fp1))
 		return -EBUSY;
 	return p->AcquireSendBuf();
@@ -123,7 +123,7 @@ int32_t FSPAPI SendInline(FSPHANDLE hFSPSocket, void * buffer, int32_t len, bool
 {
 	CSocketItemDl *p = CSocketDLLTLB::HandleToRegisteredSocket(hFSPSocket);
 	if(p == NULL)
-		return -EFAULT;
+		return -EBADF;
 	if(eotFlag && !p->TestSetOnCommit((PVOID)fp1))
 		return -EBUSY;
 	return p->SendInplace(buffer, len, eotFlag);
@@ -153,7 +153,7 @@ int32_t FSPAPI WriteTo(FSPHANDLE hFSPSocket, const void * buffer, int32_t len, u
 {
 	CSocketItemDl *p = CSocketDLLTLB::HandleToRegisteredSocket(hFSPSocket);
 	if(p == NULL)
-		return -EFAULT;
+		return -EBADF;
 	//
 	bool eot = (flags & TO_END_TRANSACTION) != 0;
 	if ((eot && !p->TestSetOnCommit((PVOID)fp1)) || (!eot && !p->TestSetSendReturn((PVOID)fp1)))
@@ -177,7 +177,7 @@ int FSPAPI Flush(FSPHANDLE hFSPSocket)
 {
 	CSocketItemDl *p = CSocketDLLTLB::HandleToRegisteredSocket(hFSPSocket);
 	if(p == NULL)
-		return -EFAULT;
+		return -EBADF;
 	return p->Flush();
 }
 
@@ -190,7 +190,7 @@ int FSPAPI Commit(FSPHANDLE hFSPSocket, NotifyOrReturn fp1)
 {
 	CSocketItemDl *p = CSocketDLLTLB::HandleToRegisteredSocket(hFSPSocket);
 	if(p == NULL)
-		return -EFAULT;
+		return -EBADF;
 	return p->LockAndCommit(fp1);
 }
 
@@ -256,7 +256,7 @@ int32_t CSocketItemDl::AcquireSendBuf()
 int32_t LOCALAPI CSocketItemDl::SendInplace(void * buffer, int32_t len, bool eot)
 {
 	if (len <= 0)
-		return -EDOM;
+		return -EINVAL;
 
 	if (!WaitUseMutex())
 		return (IsInUse() ? -EDEADLK : -EINTR);
@@ -324,12 +324,12 @@ int32_t LOCALAPI CSocketItemDl::SendStream(const void* buffer, int32_t len, bool
 	// By default it should be asynchronous:
 	if (fpSent != NULL || fpCommitted != NULL)
 		return TailFreeMutexAndReturn(BufferData(len));
-	// assert(pendingSendSize == len);
+	// Shall insert	`Call<FSP_Urge>();` if LLS is not working in polling mode
 
-// If it is blocking, wait until every byte has been put into the queue
+	// If it is blocking, wait until every byte has been put into the queue
 	while ((r = BufferData(len)) >= 0)
 	{
-		// It used to urge LLS to send. Now (as at Feb.17, 2019) LLS works in polling mode
+		// Call<FSP_Urge>(); // polling mode needn't urging
 		if (pendingSendSize <= 0)
 			break;
 		// Here wait LLS to free some send buffer block
@@ -419,7 +419,7 @@ l_recursion:
 		if (HasDataToCommit())
 		{
 			BufferData(pendingSendSize);
-			// It used to urge LLS to send. Now (as on Feb.17, 2019) LLS works in polling mode
+			// Call<FSP_Urge>();
 			if (HasDataToCommit())
 			{
 				SetMutexFree();
@@ -441,7 +441,9 @@ l_recursion:
 	// SendInplace does not rely on keeping 'pendingEoT' state internally, and such state takes precedence
 	if (IsEoTPending())
 	{
+		// It needn't urge if LLS works in polling mode
 		AppendEoTPacket();
+		// Call<FSP_Urge>();
 		SetMutexFree();
 		return;
 	}
@@ -497,7 +499,7 @@ l_recursion:
 int LOCALAPI CSocketItemDl::BufferData(int m)
 {
 	if (m < 0)
-		return -EDOM;
+		return -EINVAL;
 	if (m == 0 && !HasInternalBufferedToSend())
 		return 0;
 	ControlBlock::PFSP_SocketBuf p = skbImcompleteToSend;
@@ -666,7 +668,7 @@ int32_t LOCALAPI CSocketItemDl::PrepareToSend(void * buf, int32_t len, bool eot)
 	if(len <= 0 || (len % MAX_BLOCK_SIZE != 0 && !eot))
 	{
 		bytesBuffered = 0;
-		return -EDOM;
+		return -EINVAL;
 	}
 
 	// Automatically mark the last unsent packet as completed. See also BufferData()
@@ -766,6 +768,7 @@ int CSocketItemDl::BlockOnCommit()
 		}
 		else if (GetTickCount64() - t0 > COMMITTING_TIMEOUT_ms)
 		{
+			SetMutexFree();
 			return -EBUSY;
 		}
 		s = GetState();

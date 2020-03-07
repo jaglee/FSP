@@ -60,21 +60,20 @@ int LOCALAPI CallbackReceived(void *c, void *s, int n)
 
 void UnitTestBackLogs()
 {
-	static const int MAX_BACKLOG_SIZE = 4;
-	static const int TEST_SIZE = sizeof(ControlBlock) + sizeof(BackLogItem) * MAX_BACKLOG_SIZE;
+	static const int TEST_SIZE = sizeof(ControlBlock) + sizeof(BackLogItem) * FSP_BACKLOG_UPLIMIT;
 	ControlBlock *buf = (ControlBlock *)_alloca(TEST_SIZE);
 	ControlBlock & cqq = *buf;
 	BackLogItem item, *pItem;
 	register int i;
 	int n;
 
-	cqq.Init(MAX_BACKLOG_SIZE);
+	cqq.InitToListen();
 	pItem = cqq.backLog.Peek();
 	Assert::IsNull(pItem, L"There should be no item to be popped");
 
 	item.idRemote = 1234;
 	item.salt = 4321;	// item.sessionKey[0] = 0xAA; // used to exploit session key
-	for(i = 0; i < MAX_BACKLOG_SIZE; i++)
+	for(i = 0; i < FSP_BACKLOG_UPLIMIT; i++)
 	{
 		n = cqq.backLog.Put(& item);
 		//
@@ -91,7 +90,7 @@ void UnitTestBackLogs()
 	b = cqq.backLog.Has(& item);
 	Assert::IsFalse(b, L"Nonexistent backlog item should not be found");
 
-	for(i = 0; i < MAX_BACKLOG_SIZE; i++)
+	for(i = 0; i < FSP_BACKLOG_UPLIMIT; i++)
 	{
 		pItem = cqq.backLog.Peek();
 		Assert::IsNotNull(pItem, L"There should be log item peekable");
@@ -100,45 +99,7 @@ void UnitTestBackLogs()
 		Logger::WriteMessage(linebuf);
 	}
 	pItem = cqq.backLog.Peek();
-	Assert::IsNull(pItem, L"Cannot peek anothing when it is empty");
-	n = cqq.backLog.Pop();
-	Assert::IsTrue(n < 0, L"Cannot pop when it is empty");
-	//
-	// change the length of the backlog queue on the fly
-	//
-	cqq.Init(MIN_QUEUED_INTR);
-	pItem = cqq.backLog.Peek();
-	Assert::IsNull(pItem, L"There should be no item peekable");
-
-	item.idRemote = 1234;
-	item.salt = 4321;	// item.sessionKey[0] = 0xAA; // used to exploit session key
-	for(i = 0; i < MIN_QUEUED_INTR; i++)
-	{
-		n = cqq.backLog.Put(& item);
-		//
-		sprintf_s(linebuf, sizeof(linebuf), "Insert at position %d\n", n);
-		Logger::WriteMessage(linebuf);
-	}
-	n = cqq.backLog.Put(& item);
-	Assert::IsTrue(n < 0, L"Cannot push into backlog when overflow");
-	
-	b = cqq.backLog.Has(& item);
-	Assert::IsTrue(b, L"Cannot find the backlog item just put into the queue");
-
-	item.salt = 3412;	// item.sessionKey[0] = 0xBB; // used to exploit session key
-	b = cqq.backLog.Has(& item);
-	Assert::IsFalse(b, L"Nonexistent backlog item should not be found");
-
-	for(i = 0; i < MIN_QUEUED_INTR; i++)
-	{
-		pItem = cqq.backLog.Peek();
-		Assert::IsNotNull(pItem, L"There should be log item peekable");
-		n = cqq.backLog.Pop();
-		sprintf_s(linebuf, sizeof(linebuf), "Position at %d popped\n", n);
-		Logger::WriteMessage(linebuf);
-	}
-	pItem = cqq.backLog.Peek();
-	Assert::IsNull(pItem, L"Cannot peek anothing when it is empty");
+	Assert::IsNull(pItem, L"Cannot peek anything when it is empty");
 	n = cqq.backLog.Pop();
 	Assert::IsTrue(n < 0, L"Cannot pop when it is empty");
 }

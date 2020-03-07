@@ -36,9 +36,9 @@ int FSPAPI RecvInline(FSPHANDLE hFSPSocket, CallbackPeeked fp1)
 {
 	CSocketItemDl *p = CSocketDLLTLB::HandleToRegisteredSocket(hFSPSocket);
 	if(p == NULL)
-		return -EFAULT;
+		return -EBADF;
 	if(fp1 == NULL)
-		return -EDOM;
+		return -EINVAL;
 	return p->RecvInline(fp1);
 }
 
@@ -51,12 +51,12 @@ void* FSPAPI TryRecvInline(FSPHANDLE hFSPSocket, int32_t* pSize, bool* pFlag)
 	CSocketItemDl* p = CSocketDLLTLB::HandleToRegisteredSocket(hFSPSocket);
 	if (p == NULL)
 	{
-		*pSize = -EFAULT;
+		*pSize = -EBADF;
 		return NULL;
 	}
 	if (pFlag == NULL)
 	{
-		*pSize = -EDOM;
+		*pSize = -EINVAL;
 		return NULL;
 	}
 	return p->TryRecvInline(*pSize, *pFlag);
@@ -70,7 +70,7 @@ int FSPAPI ReadFrom(FSPHANDLE hFSPSocket, void *buf, int capacity, NotifyOrRetur
 {
 	CSocketItemDl *p = CSocketDLLTLB::HandleToRegisteredSocket(hFSPSocket);
 	if(p == NULL)
-		return -EFAULT;
+		return -EBADF;
 	return p->ReadFrom(buf, capacity, fp1);
 }
 
@@ -449,12 +449,6 @@ l_recursion:
 	if (!WaitUseMutex())
 		return;	// it could be disposed in the callback function
 
-	if (GetState() >= CLOSED)
-	{
-		SetMutexFree();
-		return;	// it could be shutdown gracefully in the callback function
-	}
-
 	int r = TryUnlockPeeked();
 	if (r < 0)
 	{
@@ -463,6 +457,12 @@ l_recursion:
 #endif
 		SetMutexFree();
 		return;	// protected it from dead loop caused by receive queue messed up
+	}
+	// it could be shutdown gracefully in the callback function, however there may be data pending to deliver
+	if (GetState() >= CLOSED)
+	{
+		SetMutexFree();
+		return;
 	}
 
 	offsetInLastRecvBlock = 0;

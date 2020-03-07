@@ -235,7 +235,7 @@ bool CLowerInterface::Initialize()
 // The body of the class destructor
 void CLowerInterface::Destroy()
 {
-	DeleteTimerQueueEx(globalTimerQueue, INVALID_HANDLE_VALUE);
+	DeleteTimerQueueEx(globalTimerQueue, NULL);
 #ifndef OVER_UDP_IPv4
 	CancelMibChangeNotify2(hMobililty);
 #endif
@@ -835,7 +835,7 @@ inline void CLowerInterface::ProcessRemotePacket()
 			printf_s("\nPacket on socket #%X: processed, result = %d\n", (unsigned)sdRecv, r);
 #endif
 		}
-	} while (1, 1);
+	} while(true);
 }
 
 
@@ -1007,7 +1007,7 @@ bool LOCALAPI CSocketItemEx::ReplaceTimer(uint32_t period)
 void CSocketItemEx::RemoveTimers()
 {
 	HANDLE h;
-	if((h = (HANDLE)InterlockedExchangePointer(& timer, NULL)) != NULL)
+	if ((h = (HANDLE)InterlockedExchangePointer(&timer, NULL)) != NULL)
 		::DeleteTimerQueueTimer(globalTimerQueue, h, NULL);
 }
 
@@ -1030,12 +1030,12 @@ DWORD WINAPI HandleConnect(LPVOID p)
 
 
 // The OS-dependent implementation of scheduling connection-request queue
-void CSocketItemEx::ScheduleConnect(int i)
+bool CSocketItemEx::ScheduleConnect(int i)
 {
 	CommandNewSessionSrv & cmd = ConnectRequestQueue::requests[i];
 	cmd.pSocket = this;
 	cmd.index = i;
-	QueueUserWorkItem(HandleConnect, &cmd, WT_EXECUTELONGFUNCTION);
+	return(QueueUserWorkItem(HandleConnect, &cmd, WT_EXECUTELONGFUNCTION) != FALSE);
 }
 
 
@@ -1121,6 +1121,7 @@ void CSocketItemEx::ClearInUse()
 	register HANDLE h;
 	if ((h = InterlockedExchangePointer((PVOID *)& pControlBlock, NULL)) != NULL)
 		::UnmapViewOfFile(h);
+	markInUse = 0;
 }
 
 
@@ -1154,7 +1155,7 @@ int CSocketItemEx::SendPacket(register u32 n1, ScatteredSendBuffers s)
 	wsaMsg.dwBufferCount = n1;
 	wsaMsg.lpBuffers = & s.scattered[1];
 	wsaMsg.name = (LPSOCKADDR)sockAddrTo;
-	wsaMsg.namelen = sizeof(sockAddrTo->Ipv6);
+	wsaMsg.namelen = sizeof(SOCKADDR_IN6);
 # ifndef NDEBUG
 	s.scattered[0].buf = NULL;
 	s.scattered[0].len = 0;
@@ -1188,7 +1189,7 @@ int CSocketItemEx::SendPacket(register u32 n1, ScatteredSendBuffers s)
 		, &n
 		, 0
 		, (const struct sockaddr *)sockAddrTo
-		, sizeof(sockAddrTo->Ipv4)
+		, sizeof(SOCKADDR_IN)
 		, NULL
 		, NULL);
 #endif

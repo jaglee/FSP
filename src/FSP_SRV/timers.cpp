@@ -122,7 +122,8 @@ void CSocketItemEx::KeepAlive()
 	case COMMITTED:
 	case PEER_COMMIT:
 	case COMMITTING2:
-		if (int64_t(t1 - SESSION_IDLE_TIMEOUT_us - tLastRecv) > 0)
+		if ((int64_t(t1 - SESSION_IDLE_TIMEOUT_us - tLastRecvAny) > 0)
+		 && (int64_t(t1 - SESSION_IDLE_TIMEOUT_us - tRecentSend) > 0))
 		{
 #ifdef TRACE
 			printf_s("\nSession idle time out in the %s state\n", stateNames[lowState]);
@@ -133,22 +134,22 @@ void CSocketItemEx::KeepAlive()
 		break;
 	case CLOSABLE:
 		// CLOSABLE does NOT time out to CLOSED, and does NOT automatically recycled.
+		SendAckFlush();	// The KEEP_ALIVE signal, see also tLastRecvAny, AllocItem()
 		DoEventLoop();
 		break;
 	case SHUT_REQUESTED:
 		// As if CLOSED, only might have to send lazy ACK_FLUSH. See also OnGetRelease()
 		if (delayAckPending && SendAckFlush())
 			delayAckPending = 0;
+		// Do not time-out because it may have to wait ULA to fetch all data in the receive buffer
 		break;
 	case PRE_CLOSED:
-		// Automatically migrate to CLOSED state in TIME-WAIT state alike in TCP
-		if (t1 - tMigrate > (CLOSING_TIME_WAIT_ms * 1000))
+		if (int64_t(t1 - CLOSING_TIME_WAIT_ms * 1000 - tLastRecvAny) > 0)
 		{
 			ReplaceTimer(DEINIT_WAIT_TIMEOUT_ms);
 			EmitStart();	// It shall be a RELEASE packet which is retransmitted at most once
 			SetState(CLOSED);
 		}	// ULA should have its own time-out clock enabled
-		DoEventLoop();
 		break;
 	case CLOSED:
 		if (int64_t(t1 - tMigrate + 1024 - (UINT32_MAX << 10)) < 0)
@@ -465,12 +466,12 @@ int LOCALAPI CSocketItemEx::AcceptSNACK(ControlBlock::seq_t expectedSN, FSP_Sele
 
  */
 //
-// A simple quota-based AIMD congestion avoidance algorithm is implemenented here
+// A simple quota-based AIMD congestion avoidance algorithm is implemented here
 //
 // Assume it has got the mutex
 // 1. Resend one packet (if any)
 // 2. Send a new packet (if any)
-// 3. Delayed acknowledgement
+// 3. Lazy acknowledgement and Mobile management
 // TODO: UNRESOLVED! milky payload SHOULD never be resent?
 void CSocketItemEx::DoEventLoop()
 {
@@ -621,6 +622,7 @@ l_post_step3:
 		goto l_step2;
 
 l_final:
+	// Mobile management effectiveness analysis: TODO
 	// Finally, (Really!) Lazy acknowledgement
 	if ((delayAckPending || IsNearEndMoved() || mobileNoticeInFlight)
 		&& SendKeepAlive())
@@ -634,3 +636,13 @@ l_final:
 	startedSlow = true.
 	send_rate = (negotiated send rate!)(1 / 2 available, or quota - based)
  */
+
+
+
+//// Adjourn: when recover from Adjournment, RTT must be recovered.
+//// TODO: there are many yet-to-be-specified detail about session adjournment and resumption
+//void CSocketItemEx::Adjourn()
+//{
+//	SetState(CLOSABLE);
+//	ReplaceTimer(pControlBlock->keepAlive ? (CLOSING_TIME_WAIT_ms >> 2) : (SESSION_IDLE_TIMEOUT_us / 4000));
+//}

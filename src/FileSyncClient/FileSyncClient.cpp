@@ -205,8 +205,7 @@ static void FSPAPI onAcknowledgeSent(FSPHANDLE h, FSP_ServiceCode c, int r)
 		return;
 	}
 
-	// On server side we test asynchronous mode
-	r = Shutdown(h, NULL);
+	r = Shutdown(h, FSP_IgnoreNotice);
 	if(r < 0)
 	{
 		printf_s("Cannot shutdown gracefully in the final stage, error#: %d\n", r);

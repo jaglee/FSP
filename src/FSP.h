@@ -205,7 +205,7 @@ typedef enum _FSP_Operation_Code : char
 
 
 
-// Somewhat 'paravirtualization' protocol for DLL to 'hyper-call' LLS and vice-versa
+//  Protocol for ULA to 'hyper-call' FSP LLS
 typedef enum : char
 {
 	NullCommand = 0,
@@ -213,18 +213,19 @@ typedef enum : char
 	InitConnection,		// register an initiative socket
 	FSP_Accept,			// accept the connection, make SCB of LLS synchronized with DLL 
 	FSP_Reject,			// a forward command, explicitly reject some request
-	FSP_Reset = FSP_Reject,
 	FSP_Start,
 	FSP_Urge = FSP_Start,
 	FSP_Send,			// Here it is not a command to LLS, but as a context indicator to ULA
 	FSP_Receive,		// Here it is not a command to LLS, but as a context indicator to ULA
 	FSP_InstallKey,		// install the authenticated encryption key
 	FSP_Multiply,		// clone the connection, make SCB of LLS synchronized with DLL
-	FSP_Shutdown		// Here it is not a command to LLS, but as a context indicator to ULA
+	FSP_Reset,
+	FSP_Shutdown		// Here it is passive shutdown responding to LLS and a context indicator to ULA
 } FSP_ServiceCode;
 
 
 
+//  Protocol for FSP LLS to 'interrupt' ULA
 typedef enum
 {
 	NullNotice = 0,
@@ -240,7 +241,6 @@ typedef enum
 	FSP_NotifyFlushed,
 	FSP_NotifyToFinish,
 	// built-in rule: notification after FSP_NotifyToFinish implies the LLS socket has been released already
-	FSP_NotifyRecycled,
 	FSP_NameResolutionFailed,
 	// 12~: exceptions, soft NMI
 	FSP_MemoryCorruption,

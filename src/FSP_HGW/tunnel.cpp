@@ -29,6 +29,12 @@
 
 #include "fsp_http.h"
 
+#if defined(__WINDOWS__)
+# include <ws2tcpip.h>
+#elif defined(__linux__) || defined(__CYGWIN__)
+# include <netdb.h>
+#endif
+
 /**
   How does it work:
   Each tunnel client makes one master connection with the tunnel end-server
@@ -97,8 +103,8 @@ static void FreeRequestItem(PRequestPoolItem p, bool graceful = false)
 	//
 	if(p->hFSP != NULL)
 	{
-		if(graceful)
-			Shutdown(p->hFSP, NULL);
+		if (graceful)
+			Shutdown(p->hFSP, FSP_IgnoreNotice);
 		else
 			Dispose(p->hFSP);
 	}
@@ -124,15 +130,15 @@ bool FSPAPI onFSPDataAvailable(FSPHANDLE h, void * buf, int32_t len, bool eot)
 		return false;
 	}
 
-#ifndef NDEBUG
+#ifdef _DEBUG_PEEK
 	printf_s("%d bytes received from the remote FSP peer\n", len);
 #endif
 	if (len == 0)
 		return true;
 
-#ifndef NDEBUG
+#ifdef _DEBUG_PEEK
 	if (pReq->countFSPreceived == 0)
-		printf_s("%.300s\n", (char *)buf);
+		printf_s("Remote status report: version = %d, error code = %d\n", *(octet *)buf, *((octet *)buf + 1));
 #endif
 	pReq->countFSPreceived += len;
 
@@ -166,15 +172,14 @@ int FSPAPI toReadTCPData(FSPHANDLE h, void *buf, int32_t capacity)
 		else
 			printf("TCP side: no further data available.\n");
 #endif
-		Shutdown(h, NULL);
 		FreeRequestItem(pReq, (n == 0));
 		return 0;
 	}
 
-#if defined(_DEBUG_PEEK)
-	printf_s("%d bytes read from the TCP end, first 300 chars:\n", n);
-	if (pReq->countTCPreceived == 0)
-		printf_s("%.300s\n", (char*)buf);
+#ifdef _DEBUG_PEEK
+	printf_s("%d bytes read from the TCP end\n", n);
+	// if (pReq->countTCPreceived == 0)
+	// 	printf_s("First 300 chars:\n%.300s\n", (char*)buf);
 #endif
 
 	pReq->countTCPreceived += n;
@@ -200,38 +205,101 @@ int FSPAPI toReadTCPData(FSPHANDLE h, void *buf, int32_t capacity)
 
 
 // The version of the reply code should be zero while DSTPORT and DSTIP are ignored
-// Side-effect: cleanup if the 'error' code is not REP_SUCCEEDED
-void ReportSuccessViaFSP(PRequestPoolItem p)
+static bool ReportSuccessViaFSPv4(PRequestPoolItem p)
 {
-	SRequestResponse rep;
+	SRequestResponse_v4 rep;
 	SOCKADDR_IN boundAddr;
 	socklen_t	namelen = sizeof(boundAddr);
 
 	int r = getsockname(p->hSocket, (SOCKADDR *)& boundAddr, &namelen);
 	if (r < 0)
-	{
-		FreeRequestItem(p);
-		return;
-	}
+		return false;
+
 	rep.inet4Addr = boundAddr.sin_addr;
 	rep.nboPort = boundAddr.sin_port;
 	rep.rep = REP_SUCCEEDED;
 	rep._reserved = 0;
 
 	r = WriteTo(p->hFSP, &rep, sizeof(rep), TO_END_TRANSACTION, NULL);
-	if(r <= 0)
-		FreeRequestItem(p);
+	return (r > 0);
 }
 
 
 
-void ReportToRemoteClient(PRequestPoolItem p, ERepCode code)
+static void ReportFailureRemotelyV4(PRequestPoolItem p)
 {
-	SRequestResponse rep;
+	SRequestResponse_v4 rep;
 	memset(& rep, 0, sizeof(rep));
-	rep.rep = code;
+	rep.rep = REP_REJECTED;
 
 	WriteTo(p->hFSP, & rep, sizeof(rep), TO_END_TRANSACTION, NULL);
+
+	FreeRequestItem(p, true);
+}
+
+
+
+static bool ReportSuccessViaFSP(PRequestPoolItem p)
+{
+#ifdef _DEBUG_PEEK
+	printf("%s: saved socks version = %d\n", __func__, p->socks_version);
+#endif
+	if (p->socks_version != SOCKS_VERSION_5)
+		return ReportSuccessViaFSPv4(p);
+
+	SRequestResponseV5 &rep = p->rqV5;
+	int r;
+	// version and reserved field are kept
+	rep.rep = SOCKS_SERVICE_NOERROR;
+	if(rep.addrType == ADDRTYPE_IPv4)
+	{
+		SOCKADDR_IN boundAddr;
+		socklen_t	namelen = sizeof(boundAddr);
+
+		r = getsockname(p->hSocket, (SOCKADDR *)& boundAddr, &namelen);
+		if (r < 0)
+			return false;
+
+		rep.inet4Addr = boundAddr.sin_addr;
+		rep.nboPort = boundAddr.sin_port;
+		r = int(offsetof(SRequestResponseV5, nboPort) + sizeof(rep.nboPort));
+	}
+	else if(rep.addrType == ADDRTYPE_DOMAINNAME)
+	{
+		r = rep.domainName.len + int(offsetof(SRequestResponseV5, domainName) + 3);
+	}
+	else	// unsupported address type should have been filtered
+	{
+		return false;
+	}
+#ifdef _DEBUG_PEEK
+	printf("To write %d octets to the remote FSP end.\n", r);
+#endif
+
+	r = WriteTo(p->hFSP, &rep, r, TO_END_TRANSACTION, NULL);
+#ifdef _DEBUG_PEEK
+	printf("Report success to the SOCKS client, %d octets sent.\n", r);
+#endif
+	return (r > 0);
+}
+
+
+
+static void ReportFailureRemotely(PRequestPoolItem p)
+{
+	if (p->socks_version != SOCKS_VERSION_5)
+	{
+		ReportFailureRemotelyV4(p);
+		return;
+	}
+
+	size_t offsetOfPort = offsetof(SRequestResponseV5, nboPort);
+	SRequestResponseV5 &rep = p->rqV5;
+	rep.rep = SOCKS_HOST_UNREACHABLE;
+	rep.addrType = ADDRTYPE_IPv4;
+	rep.inet4Addr.s_addr = INADDR_ANY; 
+	rep.nboPort = 0;
+	WriteTo(p->hFSP, &rep, offsetOfPort + 2, TO_END_TRANSACTION, NULL);
 
 	FreeRequestItem(p, true);
 }
@@ -252,6 +320,7 @@ int	FSPAPI onMultiplying(FSPHANDLE hSrv, PFSP_SINKINF p, PFSP_IN6_ADDR remoteAdd
 #endif
 	if(requestPool.AllocItem(hSrv) == NULL)
 		return -1;	// no more resource!
+	SetOnRelease(hSrv, onRelease);
 
 	RecvInline(hSrv, onRequestArrived);
 	return 0;	// no opposition
@@ -259,27 +328,83 @@ int	FSPAPI onMultiplying(FSPHANDLE hSrv, PFSP_SINKINF p, PFSP_IN6_ADDR remoteAdd
 
 
 
-static bool FSPAPI onRequestArrived(FSPHANDLE h, void *buf, int32_t len, bool eot)
+// Given
+//	FSPHANDLE		the handle of the FSP socket that connecting the two tunnel ends
+//	FSP_ServiceCode the notification code that close the FSP socket
+//	int				the notification value accompanying the code
+// Do
+//	Shutdown the connection on demand of the release-connection request of the peer
+void FSPAPI onRelease(FSPHANDLE h, FSP_ServiceCode code, int value)
 {
-	PRequestPoolItem p = requestPool.FindItem(h);
-	if(p == NULL)
-		return false;	// but it may be deadlocked!?
-	if(! eot || len < (int)sizeof(SRequestResponse))
-		return false;	// to report break of protocol!
+#ifdef TRACE
+	printf_s("SOCKS service terminated on request of the peer, FSP handle is %p\n", h);
+#endif
+	PRequestPoolItem p = (PRequestPoolItem)GetExtPointer(h);
+	if (p == NULL)
+	{
+		Dispose(h);
+		return;
+	}
+	if (p->hSocket == SOCKET_ERROR)
+	{
+		requestPool.FreeItem(p);
+		Dispose(h);
+		return;
+	}
+	FreeRequestItem(p, true);
+}
 
-	// following code should be put in the remote end point
+
+
+static in_addr ResolveIPv4Address(const char* nodeName)
+{
+	static const struct addrinfo hints = { 0, AF_INET, };
+	const in_addr ADDR_ZERO = *(in_addr*)&hints.ai_addr;
+	struct addrinfo* pAddrInfo;
+
+	if (getaddrinfo(nodeName, NULL, &hints, &pAddrInfo) != 0)
+		return ADDR_ZERO;
+
+	if (pAddrInfo == NULL)
+		return ADDR_ZERO;
+
+	const in_addr ret = ((sockaddr_in*)pAddrInfo->ai_addr)->sin_addr;
+	freeaddrinfo(pAddrInfo);
+	return ret;
+}
+
+
+
+static bool HandleSOCKSRequestV4(PRequestPoolItem p, PRequestResponse_v4 q, int32_t len)
+{
+	if(len < (int)sizeof(SRequestResponse_v4) || len > (int)sizeof(SRequestResponseV4a))
+		return false;
+
 	p->hSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-	if(p->hSocket == (SOCKET)SOCKET_ERROR)
+	if (p->hSocket == (SOCKET)SOCKET_ERROR)
 	{
 		ReportWSAError("Remote socket() failed");
-		ReportToRemoteClient(p, REP_REJECTED);
 		return false;
 	}
 
+	char* s = (char*)&q->inet4Addr;
 	sockaddr_in remoteEnd;
-	SRequestResponse *q = (SRequestResponse *)buf;
 	memset(&remoteEnd, 0, sizeof(sockaddr_in));
-	remoteEnd.sin_addr = q->inet4Addr;
+	if (s[0] == 0 && s[1] == 0 && s[2] == 0)
+	{
+		s = ((SRequestResponseV4a*)q)->domainName;
+		s[MAX_LEN_DOMAIN_NAME - 1] = 0;
+#ifndef NDEBUG
+		printf_s("To resolve IP address of %s\n", s);
+#endif
+		remoteEnd.sin_addr = ResolveIPv4Address(s);
+	}
+	else
+	{
+		remoteEnd.sin_addr = q->inet4Addr;
+	}
+	if (*(uint32_t*)&remoteEnd.sin_addr == 0)
+		return false;
 	remoteEnd.sin_family = AF_INET;
 	remoteEnd.sin_port = q->nboPort;
 #ifndef NDEBUG
@@ -290,20 +415,117 @@ static bool FSPAPI onRequestArrived(FSPHANDLE h, void *buf, int32_t len, bool eo
 		, be16toh(q->nboPort));
 #endif
 
-	int r = connect(p->hSocket, (PSOCKADDR) & remoteEnd, sizeof(remoteEnd));
-	if(r != 0)
+	int r = connect(p->hSocket, (PSOCKADDR)&remoteEnd, sizeof(remoteEnd));
+	if (r != 0)
 	{
 		ReportWSAError("Remote connect() failed");
-		ReportToRemoteClient(p, REP_REJECTED);
 		return false;
 	}
-	ReportSuccessViaFSP(p);
+	p->socks_version = q->version;
 
-	RecvInline(h, onFSPDataAvailable);
-	GetSendBuffer(h, toReadTCPData);
+	return true;
+}
+
+
+
+// Only support CONNECT request
+static bool HandleSOCKSv5Request(PRequestPoolItem p, PRequestResponseV5 q, int32_t len)
+{
+	int offset = (int)offsetof(SRequestResponseV5, nboPort);
+	if (len < offset + (int)sizeof(q->nboPort) || q->cmd != SOCKS_CMD_CONNECT)
+		return false;
+
+	p->hSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	if (p->hSocket == (SOCKET)SOCKET_ERROR)
+	{
+		ReportWSAError("Remote socket() failed");
+		return false;
+	}
+
+	sockaddr_in remoteEnd;
+	memset(&remoteEnd, 0, sizeof(sockaddr_in));
+	remoteEnd.sin_family = AF_INET;
+
+	if (q->addrType == ADDRTYPE_IPv4)
+	{
+		remoteEnd.sin_addr = q->inet4Addr;
+		remoteEnd.sin_port = q->nboPort;
+	}
+	else if(q->addrType == ADDRTYPE_DOMAINNAME && q->domainName.len > 0)
+	{
+		offset -= (int)sizeof(in_addr) - 1;
+		offset += q->domainName.len;
+		// save the first octet of the port number in case that domain name length is the maximum
+		char c = *((octet*)q + offset);
+		q->domainName.txt[q->domainName.len] = '\0';
+#ifdef _DEBUG_PEEK
+		printf("Domain name length = %d, try to resolve IPv4 address of %s\n", q->domainName.len, q->domainName.txt);
+#endif
+		remoteEnd.sin_addr = ResolveIPv4Address(q->domainName.txt);
+		if(*(uint32_t*)&remoteEnd.sin_addr == 0)
+			return false;
+		// recover the first octet of the port number, avoid alignment error
+		*(octet*)&remoteEnd.sin_port = *((octet*)q + offset) = c;
+		*((octet*)&remoteEnd.sin_port + 1) = *((octet*)q + offset + 1);
+	}
+	else
+	{
+		return false;	// Address type not supported, should be filtered by the request end.
+	}
+	memcpy(&p->rqV5, q, offset + sizeof(q->nboPort));
+
+#ifndef NDEBUG
+	printf_s("Version %d, command code %d, try to connect to %s:%d\n"
+		, q->version
+		, q->cmd
+		, inet_ntoa(remoteEnd.sin_addr)
+		, be16toh(remoteEnd.sin_port));
+#endif
+
+	int r = connect(p->hSocket, (PSOCKADDR)&remoteEnd, sizeof(sockaddr_in));
+	if (r != 0)
+	{
+		ReportWSAError("Remote connect() failed");
+		return false;
+	}
+
+	return true;
+}
+
+
+
+static bool FSPAPI onRequestArrived(FSPHANDLE h, void *buf, int32_t len, bool eot)
+{
+	PRequestPoolItem p = requestPool.FindItem(h);
+	if(p == NULL)
+		return false;	// but it may be deadlocked!?
+	if(! eot)
+		return false;	// to report break of protocol!
+
+	bool b;
+	if (*(octet *)buf == SOCKS_VERSION_5)
+		b = HandleSOCKSv5Request(p, (PRequestResponseV5)buf, len);
+	else
+		b = HandleSOCKSRequestV4(p, (PRequestResponse_v4)buf, len);
+
+	if (!b)
+	{
+		ReportFailureRemotely(p);
+		return false;
+	}
+	// Bytes in the request matter
+	p->countFSPreceived = len;
+
+	if (!ReportSuccessViaFSP(p)
+	 || (RecvInline(h, onFSPDataAvailable) < 0)
+	 || (GetSendBuffer(h, toReadTCPData) < 0))
+	 {
+		FreeRequestItem(p);
+	 }
 
 	return false;	// do not chain the previous call-back function
 }
+
 
 
 #ifdef _WIN32

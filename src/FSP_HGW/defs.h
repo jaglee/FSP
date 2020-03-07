@@ -33,11 +33,15 @@
 
 # include <WinSock2.h>
 # include <mstcpip.h>
+# define pthread_t	HANDLE
 
 #elif defined(__linux__) || defined(__CYGWIN__)
 
 # include <arpa/inet.h>
 # include <netinet/in.h>
+# include <termios.h>
+# include <unistd.h>
+
 # define MAX_PATH   260
 # define SD_SEND	SHUT_RD
 # define SD_BOTH	SHUT_RDWR
@@ -60,16 +64,31 @@ typedef struct sockaddr_in	SOCKADDR_IN, * PSOCKADDR_IN;
 // Firefox support both SOCKS4 and SOCKS5
 // All of them does not support SOCKS4a
 #define SOCKS_VERSION		4
+#define SOCKS_VERSION_5		5
 #define SOCKS_CMD_CONNECT	1	// only support CONNECT
+#define	SOCKS_V5_AUTH_NULL 	0	// only support null authentication
+#define SOCKS_V5_NO_ACCEPTABLE '\xFF'
+
 #ifndef MAX_WORKING_THREADS
 # define MAX_WORKING_THREADS	40
 #endif
 // fine tuning this value to half number of workable hyper-thread of the platform
 #define RECV_TIME_OUT		30	// half a miniute
-
+#define MAX_LEN_DOMAIN_NAME 256	// including the terminating zero!
 
 enum ERepCode: octet
 {
+	// Error codes of SOCKS version 5 start from 'no error' (0)
+	SOCKS_SERVICE_NOERROR = 0,
+	SOCKS_SERVER_FAILURE,		// 1
+	SOCKS_CONNECT_DISALLOWED,	// 2
+	SOCKS_NETWORK_UNREACHABLE,	// 3
+	SOCKS_HOST_UNREACHABLE,		// 4
+	SOCKS_CONNECTION_REFUSED,	// 5
+	SOCKS_TTL_EXPIRED,			// 6
+	SOCKS_COMMAND_UNSUPPORTED,	// 7
+	SOCKS_ADDRESS_UPSUPPORTED,	// 8
+	// 'Error' codes of SOCKS version 4 are reported numbers
 	REP_SUCCEEDED = 0x5A,
 	REP_REJECTED = 0x5B,
 	REP_NO_IDENTD = 0x5C,
@@ -77,10 +96,20 @@ enum ERepCode: octet
 };
 
 
+enum EAddrType: octet
+{
+	ADDRTYPE_IPv4 = 1,
+	ADDRTYPE_IPv6 = 4,
+	ADDRTYPE_DOMAINNAME = 3
+};
+
+
+
 #pragma pack(push)
 #pragma pack(1)
 
-typedef struct SRequestResponse
+// SOCKSv4 tunnel request: Version(0x4), Command(0x1), DstPort(2 octets), DstIP(4 octets)
+typedef struct SRequestResponse_v4
 {
 	union
 	{
@@ -94,10 +123,60 @@ typedef struct SRequestResponse
 	};
 	uint16_t nboPort;	// port number in network byte order
 	in_addr inet4Addr;
-	// char	userId[2];	// just a placeholder
-} *PRequestResponse;
+} *PRequestResponse_v4;
 
-// SOCKSv4 tunnel request: Version(0x4), Command(0x1), DstPort(2 octets), DstIP(4 octets)
+
+
+struct SRequestResponseV4a : SRequestResponse_v4
+{
+	char domainName[MAX_LEN_DOMAIN_NAME];
+};
+
+
+// Authentication method candidates, Client to Server
+struct SSocksV5AuthMethodsRequest
+{
+	octet	version;
+	uint8_t	count;
+	octet	methods[255];
+};
+
+
+
+// Authentication method selected, Server to Client
+struct SSocksV5AuthMethodResponse
+{
+	octet	version;
+	octet	method;
+};
+
+
+
+typedef struct SRequestResponseV5
+{
+	octet	version;
+	union
+	{
+		octet cmd;
+		octet rep;
+	};
+	octet	_zero;		// reserved
+	octet	addrType;
+	union /* But of variable length! */
+	{
+		struct
+		{
+			struct in_addr inet4Addr;
+			uint16_t nboPort;		// port number in network byte order
+		};
+		struct
+		{
+			uint8_t	len;
+			char	txt[MAX_LEN_DOMAIN_NAME-1];
+			uint16_t _place_holder_for_nboPort;
+		}	domainName;
+	};
+} *PRequestResponseV5;
 
 
 
@@ -105,7 +184,16 @@ typedef struct SRequestPoolItem
 {
 	SOCKET			hSocket;
 	FSPHANDLE		hFSP;
-	SRequestResponse req;
+	pthread_t		hThread;
+	union
+	{
+		octet		socks_version;
+		SSocksV5AuthMethodsRequest	amr;
+		SSocksV5AuthMethodResponse	ans;
+		SRequestResponse_v4			req;
+		SRequestResponseV5			rqV5;
+		SRequestResponseV4a			rqV4a;
+	};
 	int64_t			countTCPreceived;
 	int64_t			countFSPreceived;
 } *PRequestPoolItem;

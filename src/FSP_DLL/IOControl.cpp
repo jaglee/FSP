@@ -50,6 +50,11 @@ void FSPAPI FreeFSPHandle(FSPHANDLE h)
 }
 
 
+
+DllSpec void FSPAPI FSP_IgnoreNotice(FSPHANDLE, FSP_ServiceCode, int) {}
+
+
+
 // When use FSPControl to enumerate interfaces,
 // 'value' is the pointer to the first element of an array of IN6_PKTINFO structure
 // and the 'ipi6_ifindex' field of the first element should store the size of the array
@@ -95,7 +100,7 @@ int FSPAPI FSPControl(FSPHANDLE hFSPSocket, FSP_ControlCode controlCode, ULONG_P
 			*((int *)value) = pSocket->HasPeerCommitted() ? 1 : 0;
 			break;
 		default:
-			return -EDOM;
+			return -EINVAL;
 		}
 		return 0;
 	}
@@ -245,6 +250,33 @@ bool CSocketItemDl::LockAndValidate()
 
 
 
+// Given
+//	int		the value meant to be returned
+// Do
+//	Process the receive buffer and send queue, then free the mutex and return the value
+// Remark
+//	ULA function may be called back on processing the receive buffer or send queue,
+//	and this function SHALL be called as the 'parameter' of the return statement
+//	Processing the receive buffer takes precedence because receiving is to free resource
+int  CSocketItemDl::TailFreeMutexAndReturn(int r)
+{
+	if (HasDataToDeliver() && (fpReceived != NULL || fpPeeked != NULL))
+	{
+		ProcessReceiveBuffer();
+		if (!TryMutexLock())
+			return r;
+	}
+	//
+	if (HasFreeSendBuffer() && (fpSent != NULL || pendingSendBuf != NULL))
+		ProcessPendingSend();
+	else
+		SetMutexFree();
+	//
+	return r;
+}
+
+
+
 // The asynchronous, multi-thread friendly soft interrupt handler
 void CSocketItemDl::WaitEventToDispatch()
 {
@@ -281,8 +313,10 @@ void CSocketItemDl::WaitEventToDispatch()
 					break;
 				}
 			}
-			assert(notice != NullNotice);
 		}
+		// If it is polling notice can be null
+		if (notice == NullNotice)
+			break;
 #ifdef TRACE
 		printf_s("\nIn local fiber#%u, state %s\tnotice: %s\n"
 			, fidPair.source, stateNames[pControlBlock->state], noticeNames[notice]);
@@ -292,6 +326,7 @@ void CSocketItemDl::WaitEventToDispatch()
 		//
 		FSP_Session_State s0;
 		NotifyOrReturn fp1;
+		processingNotice = 1;
 		switch (notice)
 		{
 		case FSP_NotifyListening:
@@ -316,7 +351,7 @@ void CSocketItemDl::WaitEventToDispatch()
 			if (fp1 != NULL)
 				((CallbackConnected)fp1)(this, &context);
 			if (!LockAndValidate())
-				return;
+				goto l_postloop;
 			ProcessReceiveBuffer();	// SetMutexFree();
 			break;
 		case FSP_NotifyMultiplied:	// See also @LLS::Connect()
@@ -324,7 +359,7 @@ void CSocketItemDl::WaitEventToDispatch()
 			fidPair.source = pControlBlock->nearEndInfo.idALF;
 			ProcessReceiveBuffer();	// SetMutexFree();
 			if (!LockAndValidate())
-				return;
+				goto l_postloop;
 			// To inherently chain WriteTo/SendInline with Multiply
 			ProcessPendingSend();	// SetMutexFree();
 			break;
@@ -338,7 +373,7 @@ void CSocketItemDl::WaitEventToDispatch()
 			// See also FSP_NotifyDataReady, compare with FSP_NotifyFlushed
 			ProcessReceiveBuffer();	// SetMutexFree();
 			if (!LockAndValidate())
-				return;
+				goto l_postloop;
 			// Even if there's no callback function to accept data/flags (as in blocking receive mode)
 			// the peerCommitted flag can be set if no further data to deliver
 			if (!HasDataToDeliver())
@@ -355,8 +390,7 @@ void CSocketItemDl::WaitEventToDispatch()
 		case FSP_NotifyFlushed:
 			ProcessPendingSend();	// SetMutexFree();
 			if (!LockAndValidate())
-				return;
-			//
+				goto l_postloop;
 			s0 = GetState();
 			if (!initiatingShutdown || s0 < CLOSABLE)
 			{
@@ -379,6 +413,7 @@ void CSocketItemDl::WaitEventToDispatch()
 			{
 				printf_s("Protocol implementation error?\n"
 					"Should not get FSP_NotifyFlushed in state later than CLOSABLE after graceful shutdown.\n");
+				SetMutexFree();
 			}
 #endif
 			break;
@@ -402,27 +437,26 @@ void CSocketItemDl::WaitEventToDispatch()
 					fp1(this, FSP_Shutdown, 0);		// passive shutdown
 			}
 			break;
-		case FSP_NotifyRecycled:
-			fp1 = context.onError;
-			EnableLLSInterrupt();
-			RecycLocked();		// CancelTimer(); SetMutexFree();
-			if (!initiatingShutdown && fp1 != NULL)
-				fp1(this, FSP_Shutdown, ENXIO);		// a warning for unexpected shutdown
-			return;
 		case FSP_NameResolutionFailed:
-			FreeAndNotify(InitConnection, (int)notice);
+			FreeAndNotify(InitConnection, ENOENT);
 			// UNRESOLVED!? There could be some remedy if name resolution failed?
 			return;
 		case FSP_MemoryCorruption:
-		case FSP_NotifyTimeout:
+			FreeAndNotify(FSP_Reset, EFAULT);	// Memory access error because of bad address
+			return;
 		case FSP_NotifyReset:
-			FreeAndNotify(NullCommand, (int)notice);
+			FreeAndNotify(FSP_Reject, EPIPE);	// Reset because the peer breaks the pipe
+			return;
+		case FSP_NotifyTimeout:
+			FreeAndNotify(FSP_Reset, ETIMEDOUT);// Reset because of time-out
 			return;
 		default:
 			;	// But NullNotice is impossible
 		}
 	}
-	if (pControlBlock == NULL)
+l_postloop:
+	processingNotice = 0;
+	if (pendingRecycle || !IsInUse())
 		Free();
 }
 
@@ -446,6 +480,14 @@ void CSocketItemDl::TimeOut()
 		inUse = 0;	// Force WaitUseMutex to abort
 		return;
 	}
+	if (processingNotice)
+	{
+		pendingRecycle = 1;
+		return;
+	}
 
-	FreeAndNotify(NullCommand, (int)FSP_NotifyTimeout);
+	NotifyOrReturn fp1 = context.onError;
+	Free();
+	if (fp1 != NULL)
+		fp1(this, commandLastIssued, -ETIMEDOUT);
 }

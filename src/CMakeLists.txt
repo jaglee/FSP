@@ -4,16 +4,20 @@ cmake_minimum_required (VERSION 3.6)
 project(Flexible_Session_Protocol VERSION 0.1)
 
 # FSP is in preliminary stage, only debug/trace version is provided as is
-if(${CMAKE_BUILD_TYPE} EQUAL "Debug")
+if(${CMAKE_BUILD_TYPE} STREQUAL "Debug")
+	message("Generation build type Debug")
 	add_definitions(-D_DEBUG -DTRACE=16)
 	add_compile_options(-g)
 else()
+	message("Generation build type Release")
 	add_definitions(-DTRACE)	# -DNDEBUG
 	add_compile_options(-O2)
 endif()
 
 add_definitions(-DOVER_UDP_IPv4)
-add_compile_options(-pthread -Wall -Werror -Wno-error=unused-value -Wno-strict-aliasing)
+add_compile_options(-pthread -Wall -Werror -Wno-error=unused-value -Wno-strict-aliasing -Wno-error=invalid-offsetof)
+
+SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-class-memaccess")
 
 if(${MINGW})
     list(APPEND EXTRA_LIBS Ws2_32)
@@ -34,7 +38,6 @@ if(${MINGW})
                 RawMemoryClient/RawMemoryClient.cpp RawMemoryClient/MemoryFile.cpp
                 Crypto/CryptoStub.c Crypto/sha256.c Crypto/tweetnacl.c)
     target_link_libraries(RawMemoryClient PUBLIC ${EXTRA_LIBS})
-#	set(SOCKSRC	FSP_HGW/sockscon.cpp) # Unfortunately MinGW-gcc-7.1.0 does not support Vista or later yet
 else()
     add_executable(RawMemoryServer
                 RawMemoryServer/RawMemoryServer.cpp RawMemoryServer/MemoryFile.cpp
@@ -44,7 +47,7 @@ endif()
 
 add_definitions(-D_DEBUG_PEEK)
 add_executable(FSP_HTTP
-                FSP_HGW/httpd.cpp FSP_HGW/RequestPool.cpp FSP_HGW/tunnel.cpp ${SOCKSRC}
+                FSP_HGW/httpd.cpp FSP_HGW/RequestPool.cpp FSP_HGW/tunnel.cpp FSP_HGW/SOCKSv5.cpp
                 FSP_HGW/fcgi.cpp 
                 Crypto/CryptoStub.c Crypto/sha256.c Crypto/tweetnacl.c)
 target_link_libraries(FSP_HTTP PUBLIC ${EXTRA_LIBS})

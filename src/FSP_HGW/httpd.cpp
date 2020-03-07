@@ -106,14 +106,15 @@ int main(int argc, char *argv[])
 
 	if(argc <= 1)
 	{
-#if _MSC_VER
-		printf_s("To serve SOCKS v4 request at port %d\n", DEFAULT_SOCKS_PORT);
+		printf_s("To serve SOCKS"
+#if defined(__WINDOWS__)
+		"v4"
+#elif defined(__linux__) || defined(__CYGWIN__)
+		"v5"
+#endif
+			" request at port %d\n", DEFAULT_SOCKS_PORT);
 		ToServeSOCKS("localhost:80", DEFAULT_SOCKS_PORT);
 		r = 0;
-#else
-		printf_s("SOCKS server end of the FSP-HTTP tunnel is not yet implemented in Linux.\n");
-		goto l_return;
-#endif
 	}
 	else if (strcmp(argv[1], "-p") == 0)
 	{
@@ -130,15 +131,16 @@ int main(int argc, char *argv[])
 			goto l_return;
 		}
 
-#if _MSC_VER
 		const char *nameAppLayer = (argc == 4 ? argv[3] : "localhost:80");
-		printf_s("To serve SOCKS v4 request at port %d\n", port);
+		printf_s("To serve SOCKS"
+#if defined(__WINDOWS__)
+		"v4"
+#elif defined(__linux__) || defined(__CYGWIN__)
+		"v5"
+#endif
+			" request at port %d\n", port);
 		ToServeSOCKS(nameAppLayer, port);
 		r = 0;
-#else
-		printf_s("SOCKS server end of the FSP-HTTP tunnel is not yet implemented in Linux.\n");
-		goto l_return;
-#endif
 	}
 	else if (strcmp(argv[1], "-d") == 0)
 	{
@@ -187,6 +189,7 @@ l_return:
 
 
 
+// The key is registrating 'onAccepting' as 'onMultiplying' in the incarnated connection
 // HTTP 1.0 over FSP version 0 with 'TUNNEL' extension
 void StartHTTPoverFSP()
 {
@@ -356,9 +359,9 @@ static void FSPAPI onFirstLineRead(FSPHANDLE client, FSP_ServiceCode c, int r)
 	lineBuf->lastOffset += r;
 
 	char buf[1024];
-	char method[255];
-	char url[255];
-	char path[512];
+	char method[256];
+	char url[256];
+	char path[MAX_PATH + 256];
 	int i, j;
 	struct stat st;
 	int fcgi = 0;	// whether to pass the content via fast-cgi
@@ -460,12 +463,11 @@ static void FSPAPI onFirstLineRead(FSPHANDLE client, FSP_ServiceCode c, int r)
 
 
 
-// Print out an error message with perror() (for system errors; based
-// on value of errno, which indicates system call errors) and exit the
-// program indicating an error.
+// Print out an error message and exit the program indicating an error.
 void Abort(const char *sc)
 {
-	perror(sc);
+	printf("\n%s\nPress Enter to exit...", sc);
+	getchar();
 	exit(-1);
 }
 

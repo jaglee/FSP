@@ -93,9 +93,12 @@ typedef struct AssociatedData: LineBuffer
 } *PFSAData;
 
 
+// Share routines for each tunnel end
+void FSPAPI onRelease(FSPHANDLE, FSP_ServiceCode, int);
+void CloseGracefully(SOCKET);
+
 // Server side forward declarations
 int	FSPAPI onMultiplying(FSPHANDLE, PFSP_SINKINF, PFSP_IN6_ADDR);
-void ReportToRemoteClient(PRequestPoolItem, ERepCode);
 
 
 // Given

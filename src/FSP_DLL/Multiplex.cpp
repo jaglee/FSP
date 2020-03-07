@@ -52,13 +52,6 @@ FSPHANDLE FSPAPI MultiplyAndWrite(FSPHANDLE hFSP, PFSP_Context psp1, unsigned fl
 	if(p == NULL)
 		return p;
 
-	if (!p->AddOneShotTimer(TRANSIENT_STATE_TIMEOUT_ms))
-	{
-		REPORT_ERRMSG_ON_TRACE("Cannot set time-out clock for MultiplyAndWrite");
-		p->Free();
-		return NULL;
-	}
-
 	FSPHANDLE h = p->WriteOnMultiplied(objCommand, psp1, flag, fp1);
 	if (h == NULL)
 	{
@@ -92,13 +85,6 @@ FSPHANDLE FSPAPI MultiplyAndGetSendBuffer(FSPHANDLE hFSP, PFSP_Context psp1, Cal
 	CSocketItemDl *p = CSocketItemDl::ToPrepareMultiply(hFSP, psp1, objCommand);
 	if(p == NULL)
 		return p;
-
-	if (!p->AddOneShotTimer(TRANSIENT_STATE_TIMEOUT_ms))
-	{
-		REPORT_ERRMSG_ON_TRACE("Cannot set time-out clock for MultiplyAndGetSendBuffer");
-		p->Free();
-		return NULL;
-	}
 
 	if(onBufferReady != NULL)
 	{
@@ -207,7 +193,7 @@ FSPHANDLE CSocketItemDl::CompleteMultiply(CommandCloneConnect & cmd)
 	CopyFatMemPointo(cmd);
 	cmd.opCode = FSP_Multiply;
 	SetState(CLONING);
-	if(! Call(cmd, sizeof(cmd)))
+	if (!EnableLLSInteract(cmd) || !Call(cmd, sizeof(cmd)))
 	{
 		RecycleSimply();
 		return NULL;

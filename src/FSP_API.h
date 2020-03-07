@@ -45,8 +45,6 @@
 #define FSPHANDLE void *	// the pointer to some entry in the translate look-aside table
 #endif
 
-#define INVALID_FSPHANDLE_VALUE NULL
-
 #ifndef DllSpec
 #define DllSpec
 #endif
@@ -145,6 +143,9 @@ typedef int (FSPAPI *CallbackBufferReady)(FSPHANDLE, void *, int32_t);
 //	int				the intent returned value
 typedef void (FSPAPI *NotifyOrReturn)(FSPHANDLE, FSP_ServiceCode, int);
 
+// A paramenter for argument of NotifyOrReturn type, meant to ignore some LLS notice
+DllSpec void FSPAPI FSP_IgnoreNotice(FSPHANDLE, FSP_ServiceCode, int);
+
 #ifdef __cplusplus
 	}
 #endif
@@ -168,7 +169,8 @@ struct FSP_SocketParameter
 			unsigned short	noEncrypt:	1;	// do not encrypt the payload in the transport layer
 			unsigned short	precompress:1;	// data to send on connect ready were pre-compressed
 			unsigned short	tfrc:		1;	// TCP friendly rate control. By default ECN-friendly
-			unsigned short	RESERVED:	10;
+			unsigned short	keepAlive : 1;	// The connection should be kept alive. By default timed-out automatically
+			unsigned short	RESERVED:	9;
 			unsigned short	passive:	1;	// internal use only, shall be ignored by ULA
 			unsigned short	isError:	1;	// if set, 'flags' is the error reason
 		};

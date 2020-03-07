@@ -42,8 +42,19 @@ static void FSPAPI onError(FSPHANDLE h, FSP_ServiceCode code, int value)
 	finished = true;
 	if (hFinished != NULL)
 		SetEvent(hFinished);
-	return;
 }
+
+
+
+static void FSPAPI onShutDown(FSPHANDLE h, FSP_ServiceCode c, int v)
+{
+	printf_s("Shutdown: socket %p, service code = %d, return %d\n", h, c, v);
+	finished = true;
+	if (hFinished != NULL)
+		SetEvent(hFinished);
+	CompareMemoryPattern(finalFileName);
+}
+
 
 
 // A clone of onError. For test of FSPControl FSP_SET_CALLBACK_ON_ERROR
@@ -51,7 +62,8 @@ static void FSPAPI onError2(FSPHANDLE h, FSP_ServiceCode code, int value)
 {
 	printf_s("Notify2: socket %p, service code = %d, return %d\n", h, code, value);
 	finished = true;
-	return;
+	if (hFinished != NULL)
+		SetEvent(hFinished);
 }
 
 
@@ -91,7 +103,7 @@ int StartConnection(const char* urlRemote)
 {
 	static size_t	arrayTestSizes[] = { 511
 		//, 512
-		//, 513
+		, 513
 		//, 1024
 		//, 1536
 		//, 2048
@@ -102,9 +114,9 @@ int StartConnection(const char* urlRemote)
 		//, 4096
 		//, 4097
 		//, 1000000	// 1MB
-		, 10000000	// 10MB
-		, 100000000	// 100MB
-		, 1000000000// 1GB
+		//, 10000000	// 10MB
+		//, 100000000	// 100MB
+		//, 1000000000// 1GB
 	};
 	static int		indexOfSizeArray;	// start from zero
 
@@ -160,9 +172,11 @@ l_nextSize:
 		//
 		WaitForSingleObject(hFinished, INFINITE);
 		//
-		HANDLE h = InterlockedExchangePointer((PVOID*)& hFile, NULL);
-		if (h != NULL)
-			CloseHandle(h);
+		if (hFile != NULL)
+		{
+			CloseHandle(hFile);
+			hFile = NULL;
+		}
 
 		if (finished)
 			return 0;
@@ -331,16 +345,12 @@ static void FSPAPI onAcknowledgeSent(FSPHANDLE h, FSP_ServiceCode c, int r)
 		return;
 	}
 
-	// On server side we test asynchronous mode
-	r = Shutdown(h, NULL);
+	r = Shutdown(h, onShutDown);
 	if (r < 0)
 	{
 		printf_s("Cannot shutdown gracefully in the final stage, error#: %d\n", r);
 		Dispose(h);
 	}
-
-	finished = true;
-	CompareMemoryPattern(finalFileName);
 }
 
 
