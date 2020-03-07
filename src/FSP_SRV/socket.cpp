@@ -58,85 +58,40 @@ CSocketSrvTLB::CSocketSrvTLB()
 
 
 
-bool CSocketSrvTLB::PutToScavengeCache(CSocketItemEx *pSocket, timestamp_t tNow)
-{
-	int32_t n;
-	if ((n = _InterlockedIncrement((PLONG)&topOfSC)) >= MAX_CONNECTION_NUM)
-	{
-		topOfSC--;
-		return false;
-	}
-
-	scavengeCache[n - 1].pSocket = pSocket;
-	scavengeCache[n - 1].timeRecycled = tNow;
-	return true;
-}
-
-
-
 // allocate from the free list
 CSocketItemEx* CSocketSrvTLB::AllocItem()
 {
-	CSocketItemEx* p, * p1;
-	timestamp_t tNow;
-
+	CSocketItemEx *p;
 	AcquireMutex();
-
-	if (headFreeSID != NULL)
-	{
-	l_success:
-		p = headFreeSID;
-		headFreeSID = p->next;
-		if (headFreeSID == NULL)
-			tailFreeSID = NULL;
-		ReleaseMutex();
-		//
-		p->lowState = CONNECT_BOOTSTRAP;
-		p->markInUse = 1;
-		return p;
-	}
 
 	// as this is a prototype is not bothered to exploit hash table
 	// recycle all of the orphan sockets
-	register u32 i;
-#if !(TRACE & TRACE_HEARTBEAT)
-	for (i = 0, p = itemStorage; i < MAX_CONNECTION_NUM; i++, p++)
-	{
-		if (!p->IsProcessAlive())
-			p->AbortLLS(true);
-	}
-#endif
 	if (headFreeSID != NULL)
-		goto l_success;
-
-	tNow = NowUTC();
-	p1 = NULL;
-	// Reserved: a 'CLOSED' socket might be resurrected,
-	// provides it is the original ULA process that is to reuse the socket
-	if (topOfSC == 0)
 	{
-		for (i = 0, p = itemStorage; i < MAX_CONNECTION_NUM; i++, p++)
-		{
-			if (p->lowState == CLOSED || !p->IsInUse())
-				PutToScavengeCache(p, tNow);
-		}
+		p = headFreeSID;
+		headFreeSID = (CSocketItemEx *)p->next;
+		if (headFreeSID == NULL)
+			tailFreeSID = NULL;
 	}
-	if (topOfSC <= 0)
+	else if(headLRUitem != NULL)
+	{
+		p = headLRUitem;
+		headLRUitem = (CSocketItemEx *)p->next;
+		if (headLRUitem == NULL)
+			tailLRUitem = NULL;
+		p->UnmapControlBlock();
+	}
+	else
 	{
 		ReleaseMutex();
 		return NULL;
 	}
 
-	p1 = scavengeCache[0].pSocket;
-	topOfSC--;
-	for (i = 0; i < topOfSC; i++)
-	{
-		scavengeCache[i] = scavengeCache[i + 1];
-	}
-	// It is hazardous to release the socket by force
-	p1->WaitUseMutex();		// it is throttling!
-	p1->AbortLLS(true);
-	goto l_success;
+	ReleaseMutex();
+	//
+	p->lowState = CONNECT_BOOTSTRAP;
+	p->markInUse = 1;
+	return p;
 }
 
 
@@ -154,14 +109,7 @@ CSocketItemEx * CSocketSrvTLB::AllocItem(ALFID_T idListener)
 	for(register int i = 0; i < MAX_LISTENER_NUM; i++)
 	{
 		register CSocketItemEx &r = listenerSlots[i];
-		if (r.IsInUse() && !r.IsProcessAlive())
-		{
-			r.AbortLLS(true);
-			if (p == NULL)
-				p = &r;
-			// do not break, for purpose of duplicate allocation detection
-		}
-		else if (r.IsInUse() && r.fidPair.source == idListener)
+		if (r.IsInUse() && r.fidPair.source == idListener)
 		{
 #ifdef TRACE
 			printf_s("\nCollision detected:\n"
@@ -202,7 +150,7 @@ void CSocketSrvTLB::PutToListenTLB(CSocketItemEx* p, int k)
 	CSocketItemEx* p0 = tlbSockets[k];
 	register CSocketItemEx* p1;
 	// TODO: UNRESOLVED! Is it unnecessary to detect the stale entry?
-	for (p1 = p0; p1 != NULL; p1 = p1->prevSame)
+	for (p1 = p0; p1 != NULL; p1 = (CSocketItemEx*)p1->prev)
 	{
 		if (p == p1)
 			return;
@@ -214,7 +162,7 @@ void CSocketSrvTLB::PutToListenTLB(CSocketItemEx* p, int k)
 		}
 	}
 	assert(p1 == NULL && p != NULL);
-	p->prevSame = p0;
+	p->prev = p0;
 	tlbSockets[k] = p;
 }
 
@@ -232,22 +180,22 @@ void CSocketSrvTLB::FreeItemDonotCareLock(CSocketItemEx *p)
 	if(p->IsPassive())
 	{
 		int k = be32toh(p->fidPair.source) & (MAX_CONNECTION_NUM - 1);
-		register CSocketItemEx *p1 = tlbSockets[k];
+		register CSocketItem *p1 = tlbSockets[k];
 		// detach it from the hash collision list
 		if(p1 == p)
 		{
-			tlbSockets[k] = p1->prevSame;
+			tlbSockets[k] = (CSocketItemEx *)p1->prev;
 		}
 		else
 		{
 			while(p1 != NULL)
 			{
-				if(p1->prevSame == p)
+				if(p1->prev == p)
 				{
-					p1->prevSame = p->prevSame;
+					p1->prev = p->prev;
 					break;
 				}
-				p1 = p1->prevSame;
+				p1 = p1->prev;
 			}
 			//^it provides a safe-net to check whether p1 == NULL firstly
 			if(p1 == NULL)
@@ -268,9 +216,43 @@ void CSocketSrvTLB::FreeItemDonotCareLock(CSocketItemEx *p)
 		tailFreeSID = p;
 	}
 	p->next = NULL;	// in case it is not
-	bzero((octet *)p + offsetof(CSocketItemEx, idSrcProcess)
-		, sizeof(CSocketItemEx) - offsetof(CSocketItemEx, idSrcProcess));
+	
+	int m = sizeof(CSocketItem) + sizeof(CSocketItemEx *);
+	bzero((octet *)p + m, sizeof(CSocketItemEx) - m);
 	// It might be unfriendly for connection resurrection. However, here security takes precedence.
+}
+
+
+
+
+// Given
+//	CSocketItemEx	The pointer to the socket item to free
+// Do
+//	Put the given socket item onto the free list
+// Remark
+//	Assume having obtained the lock of TLB. Will free the lock in the end.
+void CSocketSrvTLB::RecycleItem(CSocketItemEx* p)
+{
+	if (p->IsPassive())
+	{
+		FreeItem(p);
+		return;
+	}
+
+	AcquireMutex();
+	
+	if (tailLRUitem == NULL)
+	{
+		headLRUitem = tailLRUitem = p;
+	}
+	else
+	{
+		tailLRUitem->next = p;
+		tailLRUitem = p;
+	}
+	p->next = NULL;	// in case it is not
+
+	ReleaseMutex();
 }
 
 
@@ -288,7 +270,7 @@ CSocketItemEx * CSocketSrvTLB::operator[](ALFID_T id)
 	{
 		if(p->fidPair.source == id)
 			return p;
-		p = p->prevSame;
+		p = (CSocketItemEx *)p->prev;
 	} while(p != NULL);
 	//
 	return p;	// assert(p == NULL);
@@ -405,22 +387,6 @@ bool CSocketItemEx::WaitUseMutexAt(const char* funcName)
 	if (IsInUse())
 		return true;
 	//
-	lockedAt = 0;
-	return false;
-}
-
-
-
-// Lock the session context if the process of upper layer application is still active
-// Abort the FSP session if ULA is not active
-// Return true if the session context is locked, false if not
-bool CSocketItemEx::LockWithActiveULAt(const char* funcName)
-{
-	void* c = _InterlockedCompareExchangePointer((PVOID*)& lockedAt, (PVOID)funcName, 0);
-	if (IsProcessAlive())
-		return (c == 0 || WaitUseMutexAt(funcName));
-	//
-	AbortLLS();
 	lockedAt = 0;
 	return false;
 }
@@ -630,21 +596,29 @@ void CSocketItemEx::InitiateMultiply(CSocketItemEx *srcItem)
 
 	pControlBlock->SetFirstSendWindowRightEdge();
 	SyncState();
-	//// In case of trace condition
-	//if (!WaitUseMutex())
-	//{
-	//	BREAK_ON_DEBUG();
-	//	return;
-	//}
-	SendPacket(2, ScatteredSendBuffers(payload, sizeof(FSP_NormalPacketHeader), this->cipherText, skb->len));
+	// In case of race condition
+	if (!WaitUseMutex())
+	{
+		BREAK_ON_DEBUG();
+		return;
+	}
+
+	int r = SendPacket(2, ScatteredSendBuffers(payload, sizeof(FSP_NormalPacketHeader), this->cipherText, skb->len));
+	if (r <= 0)
+	{
+		SignalFirstEvent(FSP_NotifyReset);
+		Recycle();
+		return;
+	}
+
+	skb->timeSent = tRecentSend;
 	skb->MarkSent();
-	skb->timeSent = NowUTC();
 	SetFirstRTT(srcItem->tRoundTrip_us);
 	tSessionBegin = skb->timeSent;
 	tPreviousTimeSlot = skb->timeSent;
 	tPreviousLifeDetection = tSessionBegin;
 	ReplaceTimer(RETRANSMIT_MIN_TIMEOUT_us/1000);
-	//SetMutexFree();
+	SetMutexFree();
 }
 
 
@@ -669,7 +643,7 @@ bool CSocketItemEx::FinalizeMultiply()
 #endif
 	if (!ValidateICC())
 	{
-		BREAK_ON_DEBUG();	//TRACE_HERE("Invalid integrity check code!?");
+		// BREAK_ON_DEBUG();	//TRACE_HERE("Invalid integrity check code!?");
 		return false;
 	}
 
@@ -752,7 +726,7 @@ void CMultiplyBacklogItem::RespondToMultiply()
 	else
 	{
 		SetState(skbOut->GetFlag<TransactionEnded>() ? COMMITTING : ESTABLISHED);
-		pControlBlock->notices.nmi = FSP_NotifyDataReady;		// But do not signal until next packet is received
+		// pControlBlock->nmi = 0;
 	}
 	RestartKeepAlive();
 }
@@ -819,10 +793,9 @@ void CSocketItemEx::SendReset()
 // See also Destroy() and *::KeepAlive case NON_EXISTENT
 void CSocketItemEx::DisposeOnReset()
 {
-	lowState = NON_EXISTENT;	// But the ULA's state is kept
 	// It is somewhat an NMI to ULA
 	SignalFirstEvent(FSP_NotifyReset);
-	ReplaceTimer(DEINIT_WAIT_TIMEOUT_ms);
+	ScheduleCleanup();
 }
 
 
@@ -841,34 +814,31 @@ void CSocketItemEx::Recycle()
 // Send RESET to the remote peer to reject some request in pre-active state but keep local context.
 // The RESET packet is not guaranteed to be received by the remote peer.
 // ULA should use FSP_Reset command if it is to free local context.
-void CSocketItemEx::Reject(uint32_t reasonCode)
+// TODO:
+void CSocketItemEx::Reject(const CommandRejectRequest& r)
 {
 	if (lowState >= ESTABLISHED)
 		SendReset();
 	else if (!IsPassive())
-		CLowerInterface::Singleton.SendPrematureReset(reasonCode, this);
+		CLowerInterface::Singleton.SendPrematureReset(r.reasonCode, this);
 }
 
 
 
-// Send RESET to the remote peer to reject some request in pre-active state.
-// The RESET packet is not guaranteed to be received by the remote peer.
+// Send RESET to the remote peer to abort some established connection, 
+// however the RESET packet is not guaranteed to be received.
 // The local context is free as well
-// See also DisposeOnReset, Recycle
+// See also DisposeOnReset, Recycle, Reject
 void CSocketItemEx::Reset()
 {
-	if (lowState >= ESTABLISHED)
+	if (pControlBlock != NULL)
 		SendReset();
-	else if (!IsPassive())
-		CLowerInterface::Singleton.SendPrematureReset(FSP_Reset, this);
-	Destroy();	// MUST signal event before Destroy
+	Free();
 }
 
 
 
-// Set the state to 'NON_EXISTENT', and make the resources be safely recyclable
-// See also ~::KeepAlive case NON_EXISTENT
-void CSocketItemEx::Destroy()
+void CSocketItemEx::Free()
 {
 	if (_InterlockedExchange((PLONG)&idSrcProcess, 0) == 0)
 		return;
@@ -894,23 +864,31 @@ void CSocketItemEx::Destroy()
 
 
 
+void CSocketItemEx::PutToResurrectable()
+{
+	RemoveTimers();
+	ClearInUse();
+	CLowerInterface::Singleton.RecycleItem(this);
+}
+
+
+
 // Given
 //	bool		whether having obtained the mutex lock of the TLB
 // Do
 //	Abort the session at the LLS layer.
 // Remark
 //	Might send RESET packet to the remote end
+//	Send RESET if it is ULA eventually calls to Abort
+//	only the original process may resurrect the CLOSED FSP connection
 void CSocketItemEx::AbortLLS(bool haveTLBLocked)
 {
-	if (pControlBlock != NULL
-	&& InStates(ESTABLISHED, COMMITTING, COMMITTED, COMMITTING2, PEER_COMMIT, CLOSABLE, PRE_CLOSED))
-	{
+	if (pControlBlock != NULL && pControlBlock->state >= ESTABLISHED)
 		SendReset();
-	}
 	//
 	if (!haveTLBLocked)
 	{
-		Destroy();
+		ScheduleCleanup();
 		return;
 	}
 	// If TLB has been locked, 'Destroy' is simplified:

@@ -47,7 +47,7 @@
 #pragma pack(push)
 #pragma pack(1)
 
-struct CSocketItemDl::SStreamState
+struct SStreamState
 {
 	LZ4_stream_t	streamState;
 	//
@@ -95,7 +95,7 @@ struct CSocketItemDl::SStreamState
 
 
 
-struct CSocketItemDl::SDecodeState
+struct SDecodeState
 {
 	LZ4_streamDecode_t decodeState;
 	//
@@ -157,7 +157,7 @@ struct CSocketItemDl::SDecodeState
 
 
 // return number of output octets
-int32_t CSocketItemDl::SStreamState::ForcefullyCompress()
+int32_t SStreamState::ForcefullyCompress()
 {
 	int	messageSize = min(rNext, FSP_MAX_SEGMENT_SIZE);
 	if(messageSize == 0)
@@ -188,7 +188,7 @@ int32_t CSocketItemDl::SStreamState::ForcefullyCompress()
 
 // assert: pCtx->srcDstNext == pCtx->dstNext && needData == 0
 // return number of output octets
-int32_t CSocketItemDl::SDecodeState::Decompress()
+int32_t SDecodeState::Decompress()
 {
 	if(dstNext > LZ4_DICTIONARY_SIZE)
 	{
@@ -248,8 +248,7 @@ bool CSocketItemDl::AllocStreamState()
 		return true;
 
 	int n = LZ4_compressBound(FSP_MAX_SEGMENT_SIZE);
-	pStreamState = (CSocketItemDl::SStreamState *)
-		malloc(sizeof(CSocketItemDl::SStreamState) + sizeof(uint32_t) + n);
+	pStreamState = (SStreamState *)malloc(sizeof(SStreamState) + sizeof(uint32_t) + n);
 	if(pStreamState == NULL)
 		return false;
 	//
@@ -272,8 +271,7 @@ bool CSocketItemDl::AllocDecodeState()
 		return true;
 
 	int n = LZ4_compressBound(FSP_MAX_SEGMENT_SIZE);
-	pDecodeState = (CSocketItemDl::SDecodeState *)
-		malloc(sizeof(CSocketItemDl::SDecodeState) + n);
+	pDecodeState = (SDecodeState *)malloc(sizeof(SDecodeState) + n);
 	if(pDecodeState == NULL)
 		return false;
 
@@ -351,7 +349,7 @@ bool CSocketItemDl::HasInternalBufferedToSend()
 //	Previously decoded blocks *must* remain available at the memory position where they were decoded (up to 64 KB)
 int	CSocketItemDl::Decompress(void *pOut, int &tgtSize, const void *pIn, int srcLen)
 {
-	register CSocketItemDl::SDecodeState *pCtx = pDecodeState;
+	register SDecodeState *pCtx = pDecodeState;
 	// Firstly, check whether the buffered decompressed data has more data to deliver. If it does, return the data
 	if (pCtx->dstNext - pCtx->srcDstNext > 0)
 	{

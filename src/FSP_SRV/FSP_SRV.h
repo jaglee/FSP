@@ -33,8 +33,6 @@
 #include "gcm-aes.h"
 
 #define COOKIE_KEY_LEN			20	// salt include, as in RFC4543 5.4
-#define MULTIPLY_BACKLOG_SIZE	8
-
 
 #if _MSC_VER
 
@@ -111,56 +109,53 @@ struct CtrlMsgHdr
 
 
 
-// per-host connection mumber and listener limit defined in LLS:
+// per-host connection number and listener limit defined in LLS:
 #ifndef MAX_CONNECTION_NUM	// must be some power value of 2
 # define MAX_CONNECTION_NUM	256
 #endif
 #define MAX_LISTENER_NUM	4
 #define MAX_RETRANSMISSION	8
 
-class CommandNewSessionSrv: protected CommandToLLS
+class CSocketItemEx;
+
+struct CommandNewSessionSrvEntry: CommandNewSessionCommon
 {
-protected:
+#if defined(__WINDOWS__)
+	HANDLE	hMemoryMap;		// pass to LLS by ULA, should be duplicated by the server
+#elif defined(__linux__) || defined(__CYGWIN__)
+	int		hShm;			// handle of the shared memory, open by name
+	pthread_t	idThread;	// working thread associated with the new session request
+#endif
+
+	int		index;
+	class	CSocketItemEx* pSocket;
+};
+
+
+class CommandNewSessionSrv: protected CommandNewSessionSrvEntry
+{
 	friend class ConnectRequestQueue;
 	friend class CSocketItemEx;
 	friend class CSocketSrvTLB;
 
 	// defined in command.cpp
-	friend void LOCALAPI Listen(const CommandNewSessionSrv &);
-	friend void LOCALAPI Connect(const CommandNewSessionSrv &);
-	friend void LOCALAPI Accept(const CommandNewSessionSrv &);
-
-#if defined(__WINDOWS__)
-	HANDLE	hMemoryMap;		// pass to LLS by ULA, should be duplicated by the server
-	DWORD	dwMemorySize;	// size of the shared memory, in the mapped view
-	HANDLE	hEvent;
-#elif defined(__linux__) || defined(__CYGWIN__)
-	int		hShm;			// handle of the shared memory, open by name
-	int32_t	dwMemorySize;	// size of the shared memory, in the mapped view
-	pthread_t	idThread;	// working thread associated with the new session request
-#endif
-	int		index;
-	class	CSocketItemEx *pSocket;
-
+	friend CSocketItemEx* LOCALAPI Listen(const CommandNewSessionSrv&);
+	friend CSocketItemEx* LOCALAPI Connect(const CommandNewSessionSrv&);
+	friend CSocketItemEx* LOCALAPI Accept(const CommandNewSessionSrv&);
 public:
-	CommandNewSessionSrv(const CommandToLLS *);
+	CommandNewSessionSrv(const CommandNewSession*);
 	CommandNewSessionSrv() {}
 
-#if defined(__WINDOWS__)
-	void TriggerULA() const { ::SetEvent(hEvent); }
-#elif defined(__linux__) || defined(__CYGWIN__)
-	void TriggerULA() const { /* taking use of polling instead of signaling which causes kernel context switching */ }
-#endif
 	void DoConnect();
 };
 
 
 
-class CommandCloneSessionSrv: CommandNewSessionSrv
+class CommandCloneSessionSrv: public CommandNewSessionSrv
 {
-	friend void Multiply(const CommandCloneSessionSrv &);
+	friend CSocketItemEx * LOCALAPI Multiply(const CommandCloneSessionSrv &);
 public:
-	CommandCloneSessionSrv(const CommandToLLS *p): CommandNewSessionSrv(p)
+	CommandCloneSessionSrv(const CommandNewSession *p) : CommandNewSessionSrv(p)
 	{
 		// Used to receive 'committing' flag in the command
 	}
@@ -174,14 +169,16 @@ class ConnectRequestQueue : public CLightMutex
 	char mayFull;
 	int	head;
 	int tail;
-	CommandNewSessionSrv q[CONNECT_BACKLOG_SIZE];
+	CommandNewSessionSrvEntry q[CONNECT_BACKLOG_SIZE];
 public:
 	static ConnectRequestQueue requests;
 	ConnectRequestQueue() { memset(this, 0, sizeof(ConnectRequestQueue)); }
-
 	int Push(const CommandNewSessionSrv *);
 	int Remove(int);
-	CommandNewSessionSrv & operator [](int i) { return q[i < 0 ? 0 : i % CONNECT_BACKLOG_SIZE]; }
+	CommandNewSessionSrv & operator [](int i)
+	{
+		return *(CommandNewSessionSrv *)&q[i < 0 ? 0 : i % CONNECT_BACKLOG_SIZE];
+	}
 };
 
 
@@ -369,28 +366,16 @@ struct ICC_Context
 
 
 
-class CSocketItemEx : public CSocketItem
+struct SocketItemEx : CSocketItem
 {
-	friend class CLowerInterface;
-	friend class CSocketSrvTLB;
-
-	friend void Multiply(const CommandCloneSessionSrv&);
-
-	bool IsPassive() const { return lowState == LISTENING; }
-	void SetPassive() { lowState = LISTENING; }
-	//
-	bool IsProcessAlive();
-	//
-protected:
 	// chained list on the collision entry of the remote ALFID TLB
 	CSocketItemEx* prevRemote;
 
-	// chained list on the collision entry of the near ALFID TLB
-	CSocketItemEx* next;
-	CSocketItemEx* prevSame;
-
-	// TODO: UNRESOLVED! To be analyzed: is it safe to implement reuse of the shared memory?
+	SOCKET			sdPipe;
 	pid_t			idSrcProcess;
+	timer_t			timer;
+	pthread_t		hThreadWait;
+
 	PktBufferBlock* headPacket;	// But UNRESOLVED! There used to be an independent packet queue for each SCB for sake of fairness
 	int32_t			lenPktData;
 	ControlBlock::seq_t	pktSeqNo;	// in host byte-order
@@ -441,8 +426,6 @@ protected:
 	timestamp_t tPreviousTimeSlot;
 	timestamp_t tPreviousLifeDetection;
 
-	timer_t		timer;			// the repeating timer
-
 	timestamp_t	tSessionBegin;
 	timestamp_t	tLastRecv;
 	timestamp_t tMigrate;
@@ -452,9 +435,24 @@ protected:
 
 	uint32_t	nextOOBSN;	// host byte order for near end. if it overflow the session MUST be terminated
 	uint32_t	lastOOBSN;	// host byte order, the serial number of peer's last out-of-band packet
+};
 
+
+
+class CSocketItemEx : protected SocketItemEx
+{
+	friend class CLowerInterface;
+	friend class CSocketSrvTLB;
+
+	friend CSocketItemEx * LOCALAPI Multiply(const CommandCloneSessionSrv&);
+
+	bool IsPassive() const { return lowState == LISTENING; }
+	void SetPassive() { lowState = LISTENING; }
+	//
+protected:
 	void AbortLLS(bool haveTLBLocked = false);
-	void Destroy();	// override that of the base class
+	void Free();
+	void PutToResurrectable();
 
 	void EnableDelayAck() { delayAckPending = 1; }
 	void RemoveTimers();
@@ -522,7 +520,6 @@ protected:
 		if (_InterlockedExchange8((char *)& lowState, s) != s)
 			tMigrate = NowUTC();
 	}
-	// But delay copying the 'cache'-ed state to the session control block when frees the mutex lock:
 	void SetState(FSP_Session_State s)
 	{
 		if (_InterlockedExchange8((char*)&pControlBlock->state, s) != s)
@@ -552,7 +549,7 @@ protected:
 	// return -EEXIST if overridden, -EFAULT if memory error, or payload effectively placed
 	int	PlacePayload();
 
-	int	 SendPacket(register u32, ScatteredSendBuffers);
+	int	 SendPacket(u32, ScatteredSendBuffers);
 	bool EmitStart();
 	bool SendAckFlush();
 	bool SendKeepAlive();
@@ -575,15 +572,16 @@ protected:
 public:
 	void UnmapControlBlock() { CSocketItem::Destroy(); }
 #ifdef _DEBUG
-	void SetTouchTime(timestamp_t t) { tLastRecv = tRecentSend = t; }
+	void SetTouchTime(timestamp_t t) { tLastRecv = tRecentSend = tLastRecvAny = t; }
 #endif
+	bool SetComChannel(SOCKET);
 	bool MapControlBlock(const CommandNewSessionSrv &);
+
 	void InitAssociation();
 
 #define LockWithActiveULA() LockWithActiveULAt(__FUNCTION__)	//  __func__
 #define WaitUseMutex()		WaitUseMutexAt(__FUNCTION__)		//  __func__
 	bool WaitUseMutexAt(const char *);
-	bool LockWithActiveULAt(const char *);
 	void SetMutexFree() { lockedAt = NULL; if (callbackTimerPending) KeepAlive(); }
 
 	bool IsInUse() { return (markInUse != 0); }
@@ -646,50 +644,29 @@ public:
 	// Given
 	//	FSP_NoticeCode		the code of the notification to alert DLL
 	// Do
-	//	Set into the soft interrupt vector according to the code
-	// Remark
-	//	Successive notifications of the same code are automatically merged
-	//	'Non-Mask-able-Interrupt' is not merged, and soft NMI is raised immediately 
-#if defined(__WINDOWS__)
-	void TriggerULA() { ::SetEvent(hEvent); }
-#elif defined(__linux__) || defined(__CYGWIN__)
-	void TriggerULA() { /* take use of pure polling instead */ }
-#endif
-	void Notify(FSP_NoticeCode n)
+	//	Send the notification through the bi-direction message pipe to the ULA
+	void Notify(FSP_NoticeCode c)
 	{
-		if ((int)n >= SMALLEST_FSP_NMI)
+		if (pControlBlock->nmi == (char)c)
 		{
-			_InterlockedExchange8(&pControlBlock->notices.nmi, (char)n);
-			TriggerULA();
-			return;
-		}
-		long			b = pControlBlock->notices.vector & (1 << (char)n);
-		long			v = pControlBlock->notices.vector & 1;
-		pControlBlock->notices.vector |= (1 << (char)n);
 #if (TRACE & (TRACE_HEARTBEAT | TRACE_OUTBAND))
-		if (b)
-		{
-			printf_s("\nSession #%u, duplicate soft interrupt %s(%d) eliminated.\n", fidPair.source, noticeNames[n], n);
-			return;
-		}
-		if (v != 0)
-		{
-			printf_s("\nSession #%u, soft interrupt %s(%d) suppressed.\n", fidPair.source, noticeNames[n], n);
-			return;
-		}
-		printf_s("\nSession #%u raise soft interrupt %s(%d)\n", fidPair.source, noticeNames[n], n);
+			printf_s("\nSession #%u, duplicate soft interrupt %s(%d) eliminated.\n", fidPair.source, noticeNames[c], c);
 #endif
-		if (b == 0 && v == 0)
-			TriggerULA();
+			return;
+		}
+		pControlBlock->nmi = (char)c;
+		send(sdPipe, (char*)&c, 1, 0);
 	}
-	void SignalFirstEvent(FSP_NoticeCode code) { pControlBlock->notices.nmi = (char)code; TriggerULA(); }
+	void SignalEvent(FSP_NoticeCode c) { send(sdPipe, (char*)&c, 1, 0); }
+	void SignalFirstEvent(FSP_NoticeCode code) { pControlBlock->nmi = (char)code; SignalEvent(code); }
+
 	//
 	int LOCALAPI AcceptSNACK(ControlBlock::seq_t, FSP_SelectiveNACK::GapDescriptor *, int);
 	//
 	void InitiateConnect();
 	void DisposeOnReset();
 	void Recycle();
-	void Reject(uint32_t);
+	void Reject(const CommandRejectRequest&);
 	void Reset();
 	void InitiateMultiply(CSocketItemEx *);
 	bool FinalizeMultiply();
@@ -731,12 +708,16 @@ public:
 
 	// On Feb.18, 2020 to prepare implementation of session hibernation/adjournment
 	void Adjourn() { SetState(CLOSABLE); }
+
 	// On Feb.17, 2019 Semantics of KeepAlive was fundamentally changed. Now it is the heartbeat of the local side
 	// Send-pacing is a yet-to-implement feature of the rate-control based congestion control sublayer/manager
 	void RestartKeepAlive() { ReplaceTimer(TIMER_SLICE_ms * 2); }
+	void ScheduleCleanup() { lowState = NON_EXISTENT; ReplaceTimer(TIMER_SLICE_ms); }
+	void ScheduleResurrectable() { SetState(CLOSED); ReplaceTimer(TIMER_SLICE_ms); }
+
 
 	// Command of ULA
-	void ProcessCommand(CommandToLLS *);
+	void WaitULACommand();
 	void Listen();
 	void Connect();
 	void Accept();
@@ -801,15 +782,7 @@ protected:
 
 	// The free list
 	CSocketItemEx *headFreeSID, *tailFreeSID;
-
-	// The scavenge cache; it does waste some space, but saves much time
-	struct
-	{
-		CSocketItemEx	*pSocket;
-		timestamp_t		timeRecycled;
-	}		scavengeCache[MAX_CONNECTION_NUM];
-	u32		topOfSC;
-	bool	PutToScavengeCache(CSocketItemEx *, timestamp_t);
+	CSocketItemEx *headLRUitem, *tailLRUitem;
 
 public:
 	CSocketSrvTLB();
@@ -817,8 +790,9 @@ public:
 	CSocketItemEx * AllocItem(const CommandNewSessionSrv &);
 	CSocketItemEx * AllocItem(ALFID_T);
 	CSocketItemEx * AllocItem();
-	void FreeItemDonotCareLock(CSocketItemEx *r);
-	void FreeItem(CSocketItemEx *r) { AcquireMutex(); FreeItemDonotCareLock(r); ReleaseMutex(); }
+	void FreeItemDonotCareLock(CSocketItemEx *);
+	void FreeItem(CSocketItemEx *p) { AcquireMutex(); FreeItemDonotCareLock(p); ReleaseMutex(); }
+	void RecycleItem(CSocketItemEx*);
 
 	CSocketItemEx * operator[](ALFID_T);
 

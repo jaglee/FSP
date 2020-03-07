@@ -60,10 +60,10 @@ int LOCALAPI CallbackReceived(void *c, void *s, int n)
 
 void UnitTestBackLogs()
 {
-	static const int TEST_SIZE = sizeof(ControlBlock) + sizeof(BackLogItem) * FSP_BACKLOG_UPLIMIT;
+	static const int TEST_SIZE = sizeof(ControlBlock) + sizeof(SItemBackLog) * FSP_BACKLOG_UPLIMIT;
 	ControlBlock *buf = (ControlBlock *)_alloca(TEST_SIZE);
 	ControlBlock & cqq = *buf;
-	BackLogItem item, *pItem;
+	SItemBackLog item, *pItem;
 	register int i;
 	int n;
 
@@ -75,19 +75,19 @@ void UnitTestBackLogs()
 	item.salt = 4321;	// item.sessionKey[0] = 0xAA; // used to exploit session key
 	for(i = 0; i < FSP_BACKLOG_UPLIMIT; i++)
 	{
-		n = cqq.backLog.Put(& item);
+		n = cqq.backLog.Put(item);
 		//
 		sprintf_s(linebuf, sizeof(linebuf), "Insert at position %d\n", n);
 		Logger::WriteMessage(linebuf);
 	}
-	n = cqq.backLog.Put(& item);
+	n = cqq.backLog.Put(item);
 	Assert::IsTrue(n < 0, L"Cannot push into backlog when overflow");
 	
-	bool b = cqq.backLog.Has(& item);
+	bool b = cqq.backLog.Has(item);
 	Assert::IsTrue(b, L"Cannot find the backlog item just put into the queue");
 
 	item.salt = 3412;	// item.sessionKey[0] = 0xBB; // used to exploit session key
-	b = cqq.backLog.Has(& item);
+	b = cqq.backLog.Has(item);
 	Assert::IsFalse(b, L"Nonexistent backlog item should not be found");
 
 	for(i = 0; i < FSP_BACKLOG_UPLIMIT; i++)
@@ -312,7 +312,7 @@ void UnitTestSocketRTLB()
 void UnitTestConnectQueue()
 {
 	static ConnectRequestQueue commandRequests;
-	CommandToLLS raw;
+	CommandNewSession raw;
 	raw.opCode = InitConnection;
 	CommandNewSessionSrv t(&raw);
 
@@ -327,28 +327,33 @@ void UnitTestAllocSocket()
 {
 	static CSocketSrvTLB & tlb = CLowerInterfaceDbg::Singleton;
 	CSocketItemEx *p;
+	CSocketItemExDbg *p0, *p1 = NULL;
 	for (register int i = 0; i < MAX_CONNECTION_NUM; i++)
 	{
 		p = tlb.AllocItem();
 		Assert::IsNotNull(p);
 		p->SetTouchTime(NowUTC());
+		if (p1 == NULL)
+			p1 = (CSocketItemExDbg*)p;
 	}
-	CSocketItemExDbg *p0 = (CSocketItemExDbg *)p;
-
 	Logger::WriteMessage("All slots allocated.");
+	p0 = (CSocketItemExDbg*)p;
+	p1->Init(2, 2);
 	p = tlb.AllocItem();
-	// Assert::IsNull(p);
-	//^As AllocItem automatically free the slot whose ULA process is not alive, this assertion would fail
+	Assert::IsNull(p);
+	//^TRACE=2, 6, 10... when the second bit of the TRACE macro value is set
+	// Or else this assertion will fail
+	// as AllocItem automatically frees the slot whose ULA process is not alive
 
 	tlb.FreeItem(p0);
 	Logger::WriteMessage("One slot is free");
 
 	p = tlb.AllocItem();
 	Assert::IsNotNull(p);
+	Assert::IsTrue(p == (CSocketItemEx*)p0);
 
 	p = tlb.AllocItem();
-	// Assert::IsNull(p);
-	//^Again, as AllocItem automatically free the slot whose ULA process is not alive, this assertion would fail
+	Assert::IsNull(p);
 
 	p0 = (CSocketItemExDbg *)tlb.AllocItem(htonl(80));
 	Assert::IsNotNull(p0);
@@ -356,6 +361,11 @@ void UnitTestAllocSocket()
 
 	p = tlb.AllocItem(htonl(80));
 	Assert::IsNull(p);
+
+	p1->PutToResurrectable();
+	p = tlb.AllocItem();
+	Assert::IsNotNull(p);
+	Assert::IsTrue(p == (CSocketItemEx *)p1);
 }
 
 

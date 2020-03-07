@@ -116,6 +116,11 @@ __forceinline char _InterlockedExchange8(volatile char * a, char b)
 	__asm mov	AL, b;
 	__asm xchg	AL, byte ptr[ecx];
 }
+
+# endif
+
+# ifndef bzero
+#   define bzero(p, size) memset((p), 0, (size))
 # endif
 
 #else
@@ -125,6 +130,5 @@ __forceinline char _InterlockedExchange8(volatile char * a, char b)
   typedef u32*			ULONG_PTR;
 
 #endif
-
 
 #endif

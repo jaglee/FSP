@@ -151,7 +151,8 @@ DllSpec void FSPAPI FSP_IgnoreNotice(FSPHANDLE, FSP_ServiceCode, int);
 #endif
 
 
-
+#pragma pack(push)
+#pragma pack(1)
 struct FSP_SocketParameter
 {
 	CallbackRequested	onAccepting;	// NULL if synchronous accepting, non-NULL if asynchronous
@@ -183,7 +184,7 @@ struct FSP_SocketParameter
 	//
 	uint64_t	extentI64ULA;
 };
-
+#pragma pack(pop)
 
 
 #ifdef __cplusplus
@@ -448,8 +449,13 @@ DllSpec
 int FSPAPI Shutdown(FSPHANDLE, NotifyOrReturn);
 
 
-// return 0 if no zero, negative if error, positive if warning
-// expect to call back onError(), to facilitate error handling
+// Given
+//	FSPHANDLE		the FSP socket
+// Return
+//	0 if no error
+//	negative if error
+// Remark
+//	It is blocking in the sense that it waits locked operation to exit
 DllSpec
 int FSPAPI Dispose(FSPHANDLE hFSPSocket);
 

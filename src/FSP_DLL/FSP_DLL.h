@@ -36,33 +36,6 @@
 #if defined(__WINDOWS__)
 # include <conio.h>
 
-// excluded by WIN32_LEAN_AND_MEAN under VS2003??
-# if (_MSC_VER < 1400)
-// typedef VOID (NTAPI * WAITORTIMERCALLBACKFUNC) (PVOID, BOOLEAN );
-typedef WAITORTIMERCALLBACKFUNC WAITORTIMERCALLBACK ;
-
-extern "C"
-DECLSPEC_IMPORT
-BOOL
-WINAPI
-RegisterWaitForSingleObject(
-  PHANDLE phNewWaitObject,
-  HANDLE hObject,
-  WAITORTIMERCALLBACK Callback,
-  PVOID Context,
-  ULONG dwMilliseconds,
-  ULONG dwFlags
-);
-
-extern "C"
-DECLSPEC_IMPORT
-BOOL
-WINAPI
-UnregisterWaitEx(
-    HANDLE WaitHandle,
-    HANDLE CompletionEvent
-    );
-# endif
 
 # define DllExport extern "C" __declspec(dllexport)
 # define DllSpec DllExport
@@ -82,11 +55,12 @@ typedef CSocketItem * PSocketItem;
 // DllSpec and FSPHANDLE must be defined properly before FSP_API
 #include "../FSP_API.h"
 
-#define MAX_CONNECTION_NUM	256	// must be some power value of 2
+#ifndef MAX_CONNECTION_NUM	// must be some power value of 2
+# define MAX_CONNECTION_NUM	256
+#endif
 
+struct CSocketItemDl;
 
-// A internal class of CSocketItemDl, it should be
-class CSocketItemDl;
 class CSocketDLLTLB: CSRWLock
 {
 	int		countAllItems;
@@ -119,36 +93,24 @@ public:
 
 
 
-class CSocketItemDl : public CSocketItem
+// Forward declaration for compression-decompression
+struct SStreamState;
+struct SDecodeState;
+
+
+// Data Layout for socket item in the library, had better dynamically linked
+struct CSocketItemDl : CSocketItem
 {
-	friend class	CSocketDLLTLB;
-	friend struct	CommandToLLS;
-
-	friend FSPHANDLE FSPAPI ListenAt(const PFSP_IN6_ADDR, PFSP_Context);
-	friend FSPHANDLE FSPAPI Accept1(FSPHANDLE);
-	friend FSPHANDLE FSPAPI Connect2(const char *, PFSP_Context);
-	friend FSPHANDLE FSPAPI MultiplyAndWrite(FSPHANDLE, PFSP_Context, unsigned, NotifyOrReturn);
-	friend FSPHANDLE FSPAPI MultiplyAndGetSendBuffer(FSPHANDLE, PFSP_Context, CallbackBufferReady);
-
-	friend void UnitTestAllocAndFreeItem();
-
-	static	CSocketDLLTLB socketsTLB;
-	//
-	CSocketItemDl	*next;
-	CSocketItemDl	*prev;
+	static CSocketDLLTLB	socketsTLB;
+	static pid_t			idThisProcess;
 
 	// for sake of incarnating new accepted connection
 	FSP_SocketParameter context;
 
 	// optional on-the-wire compression/decompression
-	// Forward declaration for compression-decompression
-	struct SStreamState;
-	struct SDecodeState;
-	// 
 	SStreamState	* pStreamState;
 	SDecodeState	* pDecodeState;
 
-protected:
 	// for sake of buffered, streamed I/O
 	ControlBlock::PFSP_SocketBuf skbImcompleteToSend;
 
@@ -166,61 +128,8 @@ protected:
 	char			processingNotice : 1;
 
 	FSP_ServiceCode commandLastIssued;
-
-#if defined(__WINDOWS__)
-	static	DWORD	idThisProcess;
-	ALIGN(8)		HANDLE theWaitObject;
-	HANDLE			timer;
-
-	void CopyFatMemPointo(CommandNewSession &cmd)
-	{
-		cmd.hMemoryMap = (uint64_t)hMemoryMap;
-		cmd.dwMemorySize = dwMemorySize;
-	}
-	void EnableLLSInterrupt() { _bittestandreset(&pControlBlock->notices.vector, 0); }
-	void RecycleSimply()
-	{
-		register HANDLE h;
-		CancelTimeout();
-		if ((h = InterlockedExchangePointer((PVOID*)&theWaitObject, NULL)) != NULL)
-		{
-			UnregisterWaitEx(h, NULL);
-			socketsTLB.FreeItem(this);
-		}
-	}
-
-	static VOID NTAPI WaitOrTimeOutCallBack(PVOID param, BOOLEAN isTimeout)
-	{
-		if (isTimeout)
-			((CSocketItemDl *)param)->TimeOut();
-		else
-			((CSocketItemDl *)param)->WaitEventToDispatch();
-	}
-#elif defined(__linux__) || defined(__CYGWIN__)
-	static pid_t	idThisProcess;
-	timer_t			pollingTimer;
-	int64_t			timeOut_ns;
-	static void PollingHandler(union sigval v) { ((CSocketItemDl*)v.sival_ptr)->WaitOrTimeOutCallBack(); }
-
-	// See also InitLLSInterface()
-	void CopyFatMemPointo(CommandNewSession &cmd)
-	{
-		cmd.GetShmNameFrom(this);
-		cmd.dwMemorySize = dwMemorySize;
-	}
-	void EnableLLSInterrupt() { pControlBlock->notices.vector &= 0xFFFFFFFE; }
-	void RecycleSimply()
-	{
-		timer_t h;
-		if ((h = (timer_t)_InterlockedExchange(&pollingTimer, 0)) != 0)
-		{
-			timer_delete(h);
-			socketsTLB.FreeItem(this);
-		}
-	}
-	//
-	void WaitOrTimeOutCallBack();
-#endif
+	timer_t			timer;
+	pthread_t		hThreadWait;
 
 	// to support full-duplex send and receive does not share the same call back function
 	NotifyOrReturn	fpReceived;
@@ -247,6 +156,57 @@ protected:
 
 	int32_t			pendingPeekedBlocks;	// TryRecvInline called, number of the peeked buffers yet to be unlocked
 
+#if defined(__WINDOWS__)
+	static VOID NTAPI TimeOutCallBack(PVOID param, BOOLEAN isTimeout)
+	{
+		UNREFERENCED_PARAMETER(isTimeout);
+		((CSocketItemDl *)param)->TimeOut();
+	}
+
+	static DWORD WINAPI WaitNoticeCallBack(LPVOID param)
+	{
+		((CSocketItemDl*)param)->WaitEventToDispatch();
+		return 0;
+	}
+
+	void CopyFatMemPointo(CommandNewSession &cmd)
+	{
+		cmd.hMemoryMap = (uint64_t)hMemoryMap;
+		cmd.dwMemorySize = dwMemorySize;
+	}
+
+	void RecycleSimply()
+	{
+		register HANDLE h;
+		CancelTimeout();
+		if ((h = InterlockedExchangePointer((PVOID*)&hThreadWait, NULL)) != NULL)
+		{
+			closesocket(sdPipe);	// which would break the main loop of the notice-processing thread by force
+			socketsTLB.FreeItem(this);
+		}
+	}
+#elif defined(__linux__) || defined(__CYGWIN__)
+	static void TimeOutHandler(union sigval v) { ((CSocketItemDl*)v.sival_ptr)->TimeOut(); }
+	static void *NoticeHandler(void *p) { ((CSocketItemDl*)p)->WaitEventToDispatch(); return NULL; }
+
+	// See also InitLLSInterface()
+	void CopyFatMemPointo(CommandNewSession &cmd)
+	{
+		cmd.GetShmNameFrom(this);
+		cmd.dwMemorySize = dwMemorySize;
+	}
+
+	void RecycleSimply()
+	{
+		timer_t h;
+		if ((h = (timer_t)_InterlockedExchange(&timer, 0)) != 0)
+		{
+			timer_delete(h);
+			socketsTLB.FreeItem(this);
+		}
+	}
+#endif
+
 	bool LOCALAPI AddOneShotTimer(uint32_t);
 	bool CancelTimeout();
 	void TimeOut();
@@ -255,12 +215,12 @@ protected:
 	bool LockAndValidate();
 
 	// in Establish.cpp
-	CSocketItemDl *ProcessOneBackLog(BackLogItem *);
+	CSocketItemDl *ProcessOneBackLog(PItemBackLog);
 	void ProcessBacklogs();
 	CSocketItemDl *Accept1();
 
-	CSocketItemDl * PrepareToAccept(BackLogItem &, CommandNewSession &);
-	bool LOCALAPI ToWelcomeConnect(BackLogItem &);
+	CSocketItemDl * PrepareToAccept(SItemBackLog &, CommandNewSession &);
+	bool LOCALAPI ToWelcomeConnect(SItemBackLog &);
 	void ToConcludeConnect();
 	ControlBlock::PFSP_SocketBuf SetHeadPacketIfEmpty(FSPOperationCode);
 
@@ -268,7 +228,7 @@ protected:
 	static CSocketItemDl * LOCALAPI ToPrepareMultiply(FSPHANDLE, PFSP_Context, CommandCloneConnect &);
 	FSPHANDLE LOCALAPI WriteOnMultiplied(CommandCloneConnect &, PFSP_Context, unsigned, NotifyOrReturn);
 	FSPHANDLE CompleteMultiply(CommandCloneConnect &);
-	bool LOCALAPI ToWelcomeMultiply(BackLogItem &);
+	bool LOCALAPI ToWelcomeMultiply(SItemBackLog &);
 
 	// In Send.cpp
 	void ProcessPendingSend();
@@ -376,26 +336,29 @@ public:
 	}
 	int ComparePeerName(const char *cName) { return _strnicmp(pControlBlock->peerAddr.name, cName, sizeof(pControlBlock->peerAddr.name)); }
 
-	template<FSP_ServiceCode cmd> void InitCommand(CommandToLLS & objCommand)
-	{
-		objCommand.fiberID = fidPair.source;
-		objCommand.idProcess = idThisProcess;
-		objCommand.opCode = cmd;
-	}
-
 #ifndef _NO_LLS_CALLABLE
-	bool LOCALAPI Call(const CommandToLLS &, int);
+	// Given
+	//	UCommandToLLS *		const, the command context to pass to LLS
+	//	int					the size of the command context
+	// Return
+	//	true if the command has been put in the mailslot successfully
+	//	false if it failed
+	bool LOCALAPI Call(const UCommandToLLS* pCmd, int n = sizeof(UCommandToLLS))
+	{
+		commandLastIssued = pCmd->opCode;
+		return (send(sdPipe, (char*)pCmd, n, 0) > 0);
+	}
 #else
-	bool Call(const CommandToLLS &cmd, int) { commandLastIssued = cmd.opCode; return true; }
+	bool Call(const UCommandToLLS *pCmd, int n = 0) { commandLastIssued = pCmd->opCode; return true; }
 #endif
 
-	// TODO: for heavy-load network application, polling is not only more efficient but more responsive as well
+	// For heavy-load network application, polling is not only more efficient but more responsive as well?
 	// Signal LLS that the send buffer is not null
 	template<FSP_ServiceCode c> bool Call()
 	{
-		CommandToLLS cmd;
-		InitCommand<c>(cmd);
-		return Call(cmd, sizeof(cmd));
+		char cmd = (char)c;
+		commandLastIssued = c;
+		return (send(sdPipe, &cmd, 1, 0) > 0);
 	}
 	CSocketItemDl * LOCALAPI CallCreate(CommandNewSession &, FSP_ServiceCode);
 	void LOCALAPI RejectRequest(ALFID_T, ALFID_T, uint32_t);

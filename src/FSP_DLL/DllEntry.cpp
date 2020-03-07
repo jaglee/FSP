@@ -50,21 +50,16 @@
 #include <Accctrl.h>
 #include <Aclapi.h>
 
+#pragma comment(lib, "Ws2_32.lib")
+
 DWORD	CSocketItemDl::idThisProcess = 0;	// the id of the process that attaches this DLL
 
 void CSocketDLLTLB::Init() { }
 CSocketDLLTLB::~CSocketDLLTLB() {}
 
-static HANDLE		_mdService; // = NULL;	// the mailslot descriptor of the service
 static HANDLE		timerQueue;	// = NULL;
 
-
-// A value of zero for ai_socktype indicates the caller will accept any socket type. 
-// A value of zero for ai_protocol indicates the caller will accept any protocol. 
-static SECURITY_ATTRIBUTES attrSecurity;
 static void AllowDuplicateHandle();
-static void GetServiceSA(PSECURITY_ATTRIBUTES);
-
 
 
 extern "C" 
@@ -73,34 +68,23 @@ BOOL WINAPI DllMain(HINSTANCE hInstance, DWORD dwReason, LPVOID lpvReserved)
 	// to maintain thread local storage
 	if(dwReason == DLL_PROCESS_ATTACH)
 	{
-        DisableThreadLibraryCalls(hInstance);
+		WSADATA wsaData;
+		// initialize windows socket support
+		if (WSAStartup(0x202, &wsaData) < 0)
+			return FALSE;
+
+		DisableThreadLibraryCalls(hInstance);
 		AllowDuplicateHandle();
-		GetServiceSA(& attrSecurity);
 #ifdef TRACE
 		AllocConsole();
 #endif
 		CSocketItemDl::SaveProcessId();
-		_mdService = CreateFileA(SERVICE_MAILSLOT_NAME
-				, GENERIC_WRITE	
-				// no GENERIC_READ needed, but MUST shared read, because LLS create the mailslot for read
-				, FILE_SHARE_WRITE | FILE_SHARE_READ
-				, NULL
-				, OPEN_EXISTING
-				, 0
-				, NULL);
-		if(_mdService == INVALID_HANDLE_VALUE)
-		{
-			REPORT_ERROR_ON_TRACE();
-			return FALSE;
-		}
 		timerQueue = CreateTimerQueue();
 	}
 	else if(dwReason == DLL_PROCESS_DETACH)
 	{
 		DeleteTimerQueueEx(timerQueue, NULL);
-		//
-		if(_mdService != NULL)
-			CloseHandle(_mdService);
+		WSACleanup();
 	}
 	//
 	return TRUE;
@@ -168,53 +152,48 @@ bool CSocketItemDl::InitLLSInterface(CommandNewSession& cmd)
 //	true if no error, false if failed
 bool CSocketItemDl::EnableLLSInteract(CommandNewSession& cmd)
 {
+	struct sockaddr_in addr;
+	sdPipe = socket(AF_INET, SOCK_STREAM, 0);
+	if (sdPipe < 0)
+	{
+		REPORT_ERRMSG_ON_TRACE("Cannot create the socket to communicate with LLS");
+		return false;
+	}
 
-	// make the event name. the control block address, together with the process id, uniquely identify the event
-	sprintf_s(cmd.szEventName, MAX_NAME_LENGTH, REVERSE_EVENT_PREFIX "%08X%p", (u32)idThisProcess, pControlBlock);
-	// system automatically resets the event state to non-signaled after a single waiting thread has been released
-	hEvent = CreateEventA(&attrSecurity
-		, FALSE // not manual-reset
-		, FALSE // the initial state of the event object is non-signaled
-		, cmd.szEventName);	// (LPCTSTR)
+	addr.sin_family = AF_INET;
+	addr.sin_port = htobe16(DEFAULT_FSP_UDPPORT);
+	addr.sin_addr.S_un.S_addr = IN4ADDR_LOOPBACK;
+	memset(addr.sin_zero, 0, sizeof(addr.sin_zero));
+    if (connect(sdPipe, (const sockaddr*)&addr, sizeof(struct sockaddr_in)) < 0)
+    {
+l_abort:
+		closesocket(sdPipe);
+		sdPipe = INVALID_SOCKET;
+		return false;
+    }
+
+	DWORD optval = 1;
+	setsockopt(sdPipe, IPPROTO_TCP, TCP_NODELAY, (const char*)&optval, sizeof(optval));
+	setsockopt(sdPipe, SOL_SOCKET, SO_DONTLINGER, (const char*)&optval, sizeof(optval));
+
+	hThreadWait = CreateThread(NULL // LPSECURITY_ATTRIBUTES, get a default security descriptor inherited
+		, 0							// dwStackSize, uses the default size for the executables
+		, WaitNoticeCallBack		// LPTHREAD_START_ROUTINE
+		, this		// LPVOID lpParameter
+		, 0			// DWORD dwCreationFlags: run on creation
+		, NULL);	// LPDWORD lpThreadId, not returned here.
+	if (hThreadWait == NULL)
+	{
+		REPORT_ERROR_ON_TRACE();
+		goto l_abort;
+	}
 
 #ifdef TRACE
-	printf_s("ID of current process is %d, handle of the event is %p\n", idThisProcess, hEvent);
+	printf_s("ID of current process is %d, handle of the socket pipe is %d\n", idThisProcess, sdPipe);
 #endif
-	if (hEvent == INVALID_HANDLE_VALUE || hEvent == NULL)
-	{
-		REPORT_ERRMSG_ON_TRACE("Cannot create event object for reverse synchronization");
-		return false;	// return -EINTR;	// the event mechanism is actually software interrupt mechanism
-	}
-
-	if (!RegisterWaitForSingleObject(&theWaitObject
-		, hEvent
-		, WaitOrTimeOutCallBack
-		, this
-		, INFINITE
-		, WT_EXECUTELONGFUNCTION))
-	{
-		REPORT_ERRMSG_ON_TRACE("Cannot register the handler of the I/O notice (soft interrupt)");
-		return false;	// return -ENXIO;
-	}
 
 	return AddOneShotTimer(TRANSIENT_STATE_TIMEOUT_ms);
 }
-
-
-#ifndef _NO_LLS_CALLABLE
-// Given
-//	CommandToLLS &		const, the command context to pass to LLS
-//	int					the size of the command context
-// Return
-//	true if the command has been put in the mailslot successfully
-//	false if it failed
-bool LOCALAPI CSocketItemDl::Call(const CommandToLLS & cmd, int size)
-{
-	DWORD		nBytesReadWrite;		// number of bytes read/write last time
-	commandLastIssued = cmd.opCode;
-	return ::WriteFile(_mdService, & cmd, size, & nBytesReadWrite, NULL) != FALSE;
-}
-#endif
 
 
 
@@ -226,7 +205,7 @@ bool LOCALAPI CSocketItemDl::Call(const CommandToLLS & cmd, int size)
 bool LOCALAPI CSocketItemDl::AddOneShotTimer(uint32_t dueTime)
 {
 	return ((timer == NULL && ::CreateTimerQueueTimer(& timer, ::timerQueue
-			, WaitOrTimeOutCallBack
+			, TimeOutCallBack
 			, this		// LPParameter
 			, dueTime
 			, 0
@@ -340,83 +319,6 @@ Cleanup:
 		FreeSid(pServiceSID);
 	if(pOwnerSID)
 		FreeSid(pOwnerSID);
-}
-
-
-
-// a security attribute depends on a security descriptor
-// while a security descriptor depends on an ACL
-// while an ACL contains at least one explicit access entry (ACL entry) [if it is NULL, by default everyone access]
-// while an explicit access entry requires a SID
-static void GetServiceSA(PSECURITY_ATTRIBUTES pSA)
-{
-    PSID pEveryoneSID = NULL;
-    PACL pACL = NULL;
-    EXPLICIT_ACCESS ea;
-    SID_IDENTIFIER_AUTHORITY SIDAuthWorld = SECURITY_WORLD_SID_AUTHORITY;
-	static SECURITY_DESCRIPTOR sd;	// as it is referenced by pSA
-
-    // Create a well-known SID for the Everyone group.
-    if(!AllocateAndInitializeSid(&SIDAuthWorld, 1,
-                     SECURITY_WORLD_RID,	// dwSubAuthority0
-                     0, 0, 0, 0, 0, 0, 0, // dwSubAuthority 1~7
-                     & pEveryoneSID))
-    {
-#ifndef NDEBUG
-        printf("AllocateAndInitializeSid Error %d\n", (int)GetLastError());
-#endif
-        goto Cleanup;
-    }
-
-    // Initialize an EXPLICIT_ACCESS structure for an ACE.
-    // The ACE will allow Everyone read access to the key.
-    ZeroMemory(&ea, sizeof(EXPLICIT_ACCESS));
-    ea.grfAccessPermissions = GENERIC_ALL;	// SPECIFIC_RIGHTS_ALL;
-    ea.grfAccessMode = SET_ACCESS;
-    ea.grfInheritance= NO_INHERITANCE;
-    ea.Trustee.TrusteeForm = TRUSTEE_IS_SID;
-    ea.Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
-    ea.Trustee.ptstrName  = (LPTSTR) pEveryoneSID;
-
-    // Create a new ACL that contains the new ACEs.
-    if (SetEntriesInAcl(1, & ea, NULL, &pACL) != ERROR_SUCCESS) 
-    {
-#ifndef NDEBUG
-        printf("SetEntriesInAcl Error %d\n", (int)GetLastError());
-#endif
-        goto Cleanup;
-    }
- 
-    if (!InitializeSecurityDescriptor(& sd, SECURITY_DESCRIPTOR_REVISION)) 
-    {
-#ifndef NDEBUG
-        printf("InitializeSecurityDescriptor Error %d\n", (int)GetLastError());
-#endif
-        goto Cleanup; 
-    } 
- 
-    // Add the ACL to the security descriptor. 
-    if (!SetSecurityDescriptorDacl(& sd, 
-            TRUE,     // bDaclPresent flag   
-            pACL, 
-            FALSE))   // not a default DACL 
-    {  
-        printf("SetSecurityDescriptorDacl Error %d\n", (int)GetLastError());
-        goto Cleanup; 
-    } 
-
-    // Initialize a security attributes structure.
-	
-    pSA->nLength = sizeof (SECURITY_ATTRIBUTES);
-    pSA->lpSecurityDescriptor = & sd;
-    pSA->bInheritHandle = FALSE;
-
-Cleanup:
-	;	// do not free SID or ACL, until the process terminated(?) 
-    //if (pEveryoneSID) 
-    //    FreeSid(pEveryoneSID);
-	// if(pACL)
-	//	  LocalFree(pACL);
 }
 
 

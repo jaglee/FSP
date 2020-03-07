@@ -29,10 +29,8 @@
  */
 #include "fsp_srv.h"
 
-#include <MSTcpIP.h>
 #include <Iphlpapi.h>
 
-#include <Psapi.h>
 #include <tchar.h>
 
 #if _MSC_VER
@@ -106,13 +104,10 @@ VOID NETIOAPI_API_ OnUnicastIpChanged(PVOID, PMIB_UNICASTIPADDRESS_ROW, MIB_NOTI
 /*
  * The OS-dependent CommandNewSessionSrv constructor
  */
-CommandNewSessionSrv::CommandNewSessionSrv(const CommandToLLS *p1)
+CommandNewSessionSrv::CommandNewSessionSrv(const CommandNewSession* pCmd)
 {
-	CommandNewSession *pCmd = (CommandNewSession *)p1;
-	memcpy(this, pCmd, sizeof(CommandToLLS));
+	memcpy(this, pCmd, sizeof(CommandNewSessionCommon));
 	hMemoryMap = (HANDLE)pCmd->hMemoryMap;
-	dwMemorySize = pCmd->dwMemorySize;
-	hEvent = OpenEventA(EVENT_MODIFY_STATE, FALSE, (LPCSTR)pCmd->szEventName);
 }
 
 
@@ -202,14 +197,12 @@ bool CLowerInterface::Initialize()
 
 	// only after the required fields initialized may the listener thread started
 	// fetch message from remote endpoint and deliver them to upper layer application
-	DWORD idReceiver;	// the thread id of the receiver
 	thReceiver = CreateThread(NULL // LPSECURITY_ATTRIBUTES, get a default security descriptor inherited
 		, 0			// dwStackSize, uses the default size for the executables
 		, ProcessRemotePacket	// LPTHREAD_START_ROUTINE
 		, this		// LPVOID lpParameter
 		, 0			// DWORD dwCreationFlags: run on creation
-		, & idReceiver);	// LPDWORD lpThreadId
-	printf_s("Thread ID of the receiver of the packet from the remote end point = %d\r\n", idReceiver);
+		, NULL);	// LPDWORD lpThreadId
 	if(thReceiver == NULL)
 	{
 		REPORT_ERROR_ON_TRACE();
@@ -933,15 +926,24 @@ static void LOCALAPI ReportErrorAsMessage(int err)
 
 
 // Defined here only because this source file is shared across modules
-# define ERROR_SIZE	1024	// FormatMessage buffer size, no dynamic increase
 void TraceLastError(const char * fileName, int lineNo, const char *funcName, const char *s1)
 {
-	TCHAR buffer[ERROR_SIZE];
+	LPTSTR	buffer = NULL;
 	DWORD err = GetLastError();
-	FormatMessage(FORMAT_MESSAGE_FROM_SYSTEM, NULL, err, 0, buffer, ERROR_SIZE, NULL);
+
 	printf_s("\n/**\n * %s, line %d\n * %s\n * %s\n */\n", fileName, lineNo, funcName, s1);
-	if(buffer[0] != 0)
-		_tprintf_s((TCHAR *)buffer);
+
+	if (FormatMessage(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM
+		, NULL
+		, err
+		, 0
+		, (LPTSTR)&buffer
+		, 0
+		, NULL) != 0)
+	{
+		_tprintf_s(buffer);
+		LocalFree(buffer);
+	}
 }
 
 
@@ -959,27 +961,6 @@ extern "C" timestamp_t NowUTC()
 	timestamp_t & t = *(timestamp_t *)& systemTime;
 	t /= 10;
 	return (t - DELTA_EPOCH_IN_MICROSECS);
-}
-
-
-
-
-// Return
-//	Whether the ULA process associated with the LLS socket is still alive
-// Remark
-//	It is assumed that process ID is 'almost never' reused
-bool CSocketItemEx::IsProcessAlive()
-{
-	// PROCESS_QUERY_LIMITED_INFORMATION
-	HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION, false, idSrcProcess);
-	DWORD exitCode;
-	if (hProcess == NULL)
-		return false;	// no such process at all. maybe information may not be queried, but it is rare
-
-	BOOL r = GetExitCodeProcess(hProcess, &exitCode);
-	CloseHandle(hProcess);
-
-	return (r && exitCode == STILL_ACTIVE);
 }
 
 
@@ -1011,6 +992,41 @@ void CSocketItemEx::RemoveTimers()
 		::DeleteTimerQueueTimer(globalTimerQueue, h, NULL);
 }
 
+
+
+DWORD WINAPI WaitULACommand(LPVOID p)
+{
+	try
+	{
+		((CSocketItemEx*)p)->WaitULACommand();
+		return 1;
+	}
+	catch (...)
+	{
+		return 0;
+	}
+}
+
+
+
+// Given
+//	SOCKET		the socket that created as a two-way stream end point
+// Do
+//	Set the socket as the bi-directional IPC end point and create the thread
+// Return
+//	true the communication channel was established successfully
+//	false if it failed
+bool CSocketItemEx::SetComChannel(SOCKET sd)
+{
+	sdPipe = sd;
+	hThreadWait = CreateThread(NULL // LPSECURITY_ATTRIBUTES, get a default security descriptor inherited
+			, 0						// dwStackSize, uses the default size for the executables
+			, ::WaitULACommand		// LPTHREAD_START_ROUTINE
+			, this		// LPVOID lpParameter
+			, 0			// DWORD dwCreationFlags: run on creation
+			, NULL);	// LPDWORD lpThreadId, not returned here.
+	return (hThreadWait != NULL);
+}
 
 
 // For ScheduleConnect
@@ -1053,7 +1069,7 @@ bool CSocketItemEx::MapControlBlock(const CommandNewSessionSrv &cmd)
 	printf_s("%s called, source process id = %d, size of the shared memory = 0x%X\n", __FUNCTION__, cmd.idProcess, cmd.dwMemorySize);
 #endif
 	if(hMemoryMap != NULL)
-		Destroy();
+		Free();
 
 	HANDLE hThatProcess = OpenProcess(PROCESS_DUP_HANDLE
 		, false
@@ -1103,7 +1119,6 @@ bool CSocketItemEx::MapControlBlock(const CommandNewSessionSrv &cmd)
 	// this->fiberID == cmd.fiberID, provided it is a passive/welcome socket, not a initiative socket
 	// assert: the queue of the returned value has been initialized by the caller already
 	idSrcProcess = cmd.idProcess;
-	hEvent = cmd.hEvent;
 	return true;
 
 l_bailout1:

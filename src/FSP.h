@@ -214,7 +214,7 @@ typedef enum : char
 	FSP_Accept,			// accept the connection, make SCB of LLS synchronized with DLL 
 	FSP_Reject,			// a forward command, explicitly reject some request
 	FSP_Start,
-	FSP_Urge = FSP_Start,
+	// FSP_Urge = FSP_Start,
 	FSP_Send,			// Here it is not a command to LLS, but as a context indicator to ULA
 	FSP_Receive,		// Here it is not a command to LLS, but as a context indicator to ULA
 	FSP_InstallKey,		// install the authenticated encryption key

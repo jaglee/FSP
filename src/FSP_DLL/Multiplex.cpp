@@ -193,7 +193,7 @@ FSPHANDLE CSocketItemDl::CompleteMultiply(CommandCloneConnect & cmd)
 	CopyFatMemPointo(cmd);
 	cmd.opCode = FSP_Multiply;
 	SetState(CLONING);
-	if (!EnableLLSInteract(cmd) || !Call(cmd, sizeof(cmd)))
+	if (!EnableLLSInteract(cmd) || !Call((UCommandToLLS*)&cmd))
 	{
 		RecycleSimply();
 		return NULL;
@@ -212,7 +212,7 @@ FSPHANDLE CSocketItemDl::CompleteMultiply(CommandCloneConnect & cmd)
 //		|-->[{Return}:Reject]-->{abort creating new context}
 // See also
 //	ToWelcomeConnect, ToConcludeConnect(), @LLS::ResponseToMultiply, @LLS::Recycle
-bool LOCALAPI CSocketItemDl::ToWelcomeMultiply(BackLogItem & backLog)
+bool LOCALAPI CSocketItemDl::ToWelcomeMultiply(SItemBackLog & backLog)
 {
 	PFSP_IN6_ADDR remoteAddr = (PFSP_IN6_ADDR) & pControlBlock->peerAddr.ipFSP.allowedPrefixes[MAX_PHY_INTERFACES - 1];
 	// Multiplication is 0-RTT, it's allowed to prebuffer data to transmit

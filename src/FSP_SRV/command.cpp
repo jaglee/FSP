@@ -44,13 +44,13 @@
 //	The notice queue of the command context is preset to FSP_IPC_CannotReturn
 //	If 'Listen' succeeds the notice will be replaced by FSP_NotifyListening
 //	or else LLS triggers the upper layer DLL to handle the preset notice
-void LOCALAPI Listen(const CommandNewSessionSrv& cmd)
+CSocketItemEx * LOCALAPI Listen(const CommandNewSessionSrv& cmd)
 {
 	CSocketItemEx* socketItem = CLowerInterface::Singleton.AllocItem(cmd.fiberID);
 	if (socketItem == NULL)
 	{
 		REPORT_ERRMSG_ON_TRACE("Multiple call to listen on the same local fiber ID?");
-		goto l_bailout1;
+		return NULL;
 	}
 
 	if (!socketItem->MapControlBlock(cmd))
@@ -60,13 +60,11 @@ void LOCALAPI Listen(const CommandNewSessionSrv& cmd)
 	}
 
 	socketItem->Listen();
-	return;
+	return socketItem;
 
 l_bailout2:
 	CLowerInterface::Singleton.FreeItem(socketItem);
-l_bailout1:
-	cmd.TriggerULA();
-	return;
+	return NULL;
 }
 
 
@@ -82,13 +80,13 @@ l_bailout1:
 //	The notice queue of the command context is preset to FSP_IPC_CannotReturn
 //	If the function succeeds the notice will be replaced by FSP_NotifyListening
 //	or else LLS triggers the upper layer DLL to handle the preset notice
-void LOCALAPI Connect(const CommandNewSessionSrv& cmd)
+CSocketItemEx * LOCALAPI Connect(const CommandNewSessionSrv& cmd)
 {
 	CSocketItemEx* socketItem;
 
 	int index = ConnectRequestQueue::requests.Push(&cmd);
 	if (index < 0)
-		goto l_bailout1;
+		return NULL;
 
 	socketItem = CLowerInterface::Singleton.AllocItem();
 	if (socketItem == NULL)
@@ -98,15 +96,15 @@ void LOCALAPI Connect(const CommandNewSessionSrv& cmd)
 		goto l_bailout3;
 
 	if(socketItem->ScheduleConnect(index))
-		return;
+		return socketItem;
 	
 	socketItem->UnmapControlBlock();
 l_bailout3:
 	CLowerInterface::Singleton.FreeItem(socketItem);
+	socketItem = NULL;
 l_bailout2:
 	ConnectRequestQueue::requests.Remove(index);
-l_bailout1:
-	cmd.TriggerULA();
+	return socketItem;
 }
 
 
@@ -121,18 +119,18 @@ l_bailout1:
 //	collision of the near-end ALFID would be filtered out firstly
 //	An FSP socket is incarnated when a listening socket is forked on CONNECT_REQUEST,
 //	or a connection is cloned on MULTIPLY received
-void LOCALAPI Accept(const CommandNewSessionSrv &cmd)
+CSocketItemEx * LOCALAPI Accept(const CommandNewSessionSrv &cmd)
 {
 	CSocketItemEx *socketItem = CLowerInterface::Singleton.AllocItem(cmd);
 	if(socketItem == NULL)
 	{
 		REPORT_ERRMSG_ON_TRACE("Cannot map control block of the client into server's memory space");
-		cmd.TriggerULA();
-		return;
+		return NULL;
 	}
 
 	socketItem->Accept();
 	// Only on exception would it signal event to DLL
+	return socketItem;
 }
 
 
@@ -140,20 +138,20 @@ void LOCALAPI Accept(const CommandNewSessionSrv &cmd)
 //	CommandCloneSessionSrv&		The connection multiplication command
 // Do
 //	Clone the root connection
-void Multiply(const CommandCloneSessionSrv &cmd)
+CSocketItemEx * LOCALAPI Multiply(const CommandCloneSessionSrv &cmd)
 {
 	CSocketItemEx *srcItem = CLowerInterface::Singleton[cmd.fiberID];
 	CSocketItemEx* newItem;
 	if(srcItem == NULL)
 	{
 		BREAK_ON_DEBUG();	//TRACE_HERE("Cloned connection not found");
-		return;
+		return NULL;
 	}
 
 	if(! srcItem->WaitUseMutex())
 	{
 		BREAK_ON_DEBUG();	//TRACE_HERE("Cloned connect busy");
-		return;
+		return NULL;
 	}
 
 	// To make life easier we do not allow clone FSP session across process border
@@ -164,6 +162,7 @@ void Multiply(const CommandCloneSessionSrv &cmd)
 				 "\tsource process id = %u, this process id = %u\n"
 				 , cmd.fiberID, srcItem->idSrcProcess, cmd.idProcess);
 #endif
+		newItem = NULL;
 		goto l_return;
 	}
 
@@ -178,8 +177,8 @@ void Multiply(const CommandCloneSessionSrv &cmd)
 		{
 			REPORT_ERRMSG_ON_TRACE("Cannot map control block of the client into server's memory space");
 			CLowerInterface::Singleton.FreeItem(newItem);
+			newItem = NULL;
 		}
-		cmd.TriggerULA();
 		goto l_return;
 	}
 
@@ -189,6 +188,7 @@ void Multiply(const CommandCloneSessionSrv &cmd)
 l_return:
 	// Only on exception would it signal event to DLL
 	srcItem->SetMutexFree();
+	return newItem;
 }
 
 
@@ -199,116 +199,149 @@ l_return:
 // Return
 //	Nothing
 // TODO: UNRESOLVED!there should be performance profiling variables to record how many commands have been processed?
-void LOCALAPI ProcessCommand(void *buffer)
+CSocketItemEx * LOCALAPI ProcessCommand(void *buffer)
 {
     static int n = 0;
 
-	CommandToLLS *pCmd = (CommandToLLS *)buffer;
-	CSocketItemEx *pSocket;
+	FSP_ServiceCode cmd = *(FSP_ServiceCode *)buffer;
+	CSocketItemEx *pSocket = NULL;
 #if defined(TRACE) && (TRACE & TRACE_ULACALL)
-	printf_s("\n#%d command"
-		", fiber#%u(_%X_)"
+	printf_s("\n#%d global command"
 		", %s(code = %d)\n"
 		, n
-		, pCmd->fiberID, be32toh(pCmd->fiberID)
-		, CServiceCode::sof(pCmd->opCode), pCmd->opCode);
+		, CServiceCode::sof(cmd), cmd);
 #endif
-	switch(pCmd->opCode)
+	switch(cmd)
 	{
 	case FSP_Listen:		// register a passive socket
-		Listen(CommandNewSessionSrv(pCmd));
+		pSocket = Listen(CommandNewSessionSrv((CommandNewSession *)buffer));
 		break;
 	case InitConnection:	// register an initiative socket
-		Connect(CommandNewSessionSrv(pCmd));
+		pSocket = Connect(CommandNewSessionSrv((CommandNewSession*)buffer));
 		break;
 	case FSP_Accept:
-		Accept(CommandNewSessionSrv(pCmd));
+		pSocket = Accept(CommandNewSessionSrv((CommandNewSession*)buffer));
 		break;
 	case FSP_Multiply:
-		Multiply(CommandCloneSessionSrv(pCmd));
+		pSocket = Multiply(CommandCloneSessionSrv((CommandNewSession*)buffer));
 		break;
 	default:
-		pSocket = (CSocketItemEx *)CLowerInterface::Singleton[pCmd->fiberID];
-		if(pSocket == NULL)
-		{
 #if defined(TRACE) && (TRACE & TRACE_ULACALL)
-			printf_s("Erratic! %s called for invalid local fiber#%u(_%X_)\n"
-				, opCodeStrings[pCmd->opCode]
-				, pCmd->fiberID, be32toh(pCmd->fiberID));
+		printf_s("Erratic! Invalid ULA call %s to create local fiber#%u(_%X_)\n"
+			, opCodeStrings[cmd]
+			, ((CommandNewSession*)buffer)->fiberID, be32toh(((CommandNewSession*)buffer)->fiberID));
 #endif
-			break;
-		}
-		pSocket->ProcessCommand(pCmd);
+		break;
 	}
 	//
 #if defined(TRACE) && (TRACE & TRACE_ULACALL)
-	printf_s("#%d command processed, operation code = %d.\n",  n, pCmd->opCode);
+	printf_s("#%d command processed, operation code = %d.\n",  n, cmd);
 #endif
 	n++;
+	return pSocket;
 }
 
 
 
-// Given
-//	CommandToLLS		The service command requested by ULA
-// Do
-//	Execute ULA's request
-void CSocketItemEx::ProcessCommand(CommandToLLS *pCmd)
+// Remark: if the socket is broken before the full RESET command is received, the peer would be informed
+void CSocketItemEx::WaitULACommand()
 {
-	if (!WaitUseMutex())
-	{
-		printf_s("Socket %p[fiber#%u] in state %s: process command %s[%d]\n"
-			"probably encountered dead-lock: pSCB: %p\n"
-			, this, fidPair.source, stateNames[lowState], CServiceCode::sof(pCmd->opCode), pCmd->opCode
-			, pControlBlock);
-		if(lockedAt != NULL)
-			printf_s("Lastly called by %s\n", lockedAt);
-		return;
-	}
-	if (pControlBlock == NULL)
-	{
-#if defined(TRACE) && (TRACE & TRACE_ULACALL)
-		printf_s("%s called (%s), LLS state: %s(%d), control block is null.\n", __FUNCTION__
-			, CServiceCode::sof(pCmd->opCode), stateNames[lowState], lowState);
-#endif
-		if (lowState == NON_EXISTENT && pCmd->opCode == FSP_Reset)
-			RefuseToMultiply(((CommandRejectRequest*)pCmd)->reasonCode);
-		// See also OnMultiply(); or else simply ignore
-		SetMutexFree();
-		return;
-	}
-#if defined(TRACE) && (TRACE & TRACE_ULACALL)
-	printf_s("%s called (%s), LLS state: %s(%d) <== ULA state: %s(%d)\n", __FUNCTION__
-		, CServiceCode::sof(pCmd->opCode)
-		, stateNames[lowState], lowState
-		, stateNames[pControlBlock->state], pControlBlock->state);
-#endif
-	switch(pCmd->opCode)
-	{
-	case FSP_Start:
-		RestartKeepAlive();	// If it happened to be stopped
-		DoEventLoop();
-		break;
-	case FSP_Reject:
-		Reject(((CommandRejectRequest *)pCmd)->reasonCode);
-		break;
-	case FSP_Reset:
-		Reset();
-		break;
-	case FSP_InstallKey:
-		InstallSessionKey((CommandInstallKey &)*pCmd);
-		break;
-	case FSP_Shutdown:
-		Recycle();
-		break;
-	default:
-#ifndef NDEUBG
-		printf("Internal error: undefined upper layer application command code %d\n", pCmd->opCode);
-#endif
-		break;
-	}
+	char buffer[sizeof(UCommandToLLS)];
+	static uint32_t n;
 	//
-	SetMutexFree();
+	while (recv(sdPipe, buffer, 1, 0) > 0)
+	{
+		char &cmd = buffer[0];
+#if defined(TRACE) && (TRACE & TRACE_ULACALL)
+		printf_s("\n#%u per socket command"
+			", %s(code = %d)\n"
+			, n
+			, CServiceCode::sof(cmd), cmd);
+#endif
+		if ( ((cmd == FSP_Reset || cmd == FSP_Reject)
+		 && (recv(sdPipe, buffer + 1, sizeof(CommandRejectRequest) - 1, 0) < (int)sizeof(CommandRejectRequest) - 1))
+		 || (cmd == FSP_InstallKey
+		 && (recv(sdPipe, buffer + 1, sizeof(CommandInstallKey) - 1, 0) < (int)sizeof(CommandInstallKey) - 1)) )
+		{
+			break;
+		}
+
+		if (!WaitUseMutex())
+		{
+			printf_s("Socket %p[fiber#%u] in state %s: process command %s[%d]\n"
+				"probably encountered dead-lock: pSCB: %p\n"
+				, this, fidPair.source, stateNames[lowState], CServiceCode::sof(cmd), cmd
+				, pControlBlock);
+			if (lockedAt != NULL)
+				printf_s("Lastly called by %s\n", lockedAt);
+			BREAK_ON_DEBUG();
+			continue;
+		}
+
+		if (pControlBlock == NULL)
+		{
+#if defined(TRACE) && (TRACE & TRACE_ULACALL)
+			printf_s("%s called (%s), LLS state: %s(%d), control block is null.\n", __FUNCTION__
+				, CServiceCode::sof(cmd), stateNames[lowState], lowState);
+#endif
+			if (lowState == NON_EXISTENT && (cmd == FSP_Reset || cmd == FSP_Reject))
+				RefuseToMultiply(((CommandRejectRequest*)buffer)->reasonCode);
+			// See also OnMultiply(); or else simply ignore
+			break;	// exit the loop
+		}
+#if defined(TRACE) && (TRACE & TRACE_ULACALL)
+		printf_s("%s called (%s), LLS state: %s(%d) <== ULA state: %s(%d)\n", __FUNCTION__
+			, CServiceCode::sof(cmd)
+			, stateNames[lowState], lowState
+			, stateNames[pControlBlock->state], pControlBlock->state);
+#endif
+		SyncState();
+
+		switch (cmd)
+		{
+		case FSP_Start:
+			RestartKeepAlive();	// If it happened to be stopped
+			DoEventLoop();
+			break;
+		case FSP_Reject:
+			Reject(*((CommandRejectRequest*)buffer));
+			break;
+		case FSP_Reset:
+			SetMutexFree();
+			goto l_free;
+			break;
+		case FSP_InstallKey:
+			InstallSessionKey(*((CommandInstallKey *)buffer));
+			break;
+		case FSP_Shutdown:
+			Recycle();
+			break;
+		default:
+#ifndef NDEBUG
+			printf("Internal error: undefined upper layer application command code %d\n", cmd);
+#endif
+			break;
+		}
+		//
+		SetMutexFree();
+#if defined(TRACE) && (TRACE & TRACE_ULACALL)
+		printf_s("#%d command processed, operation code = %d.\n", n, cmd);
+#endif
+		n++;
+	}
+	// 
+l_free:
+	// Unlike WaitUseMutex, here the inUse flag is cleared and it is waited to unlock
+	uint64_t t0 = GetTickCount64();
+	ClearInUse();
+	do
+	{
+		if (_InterlockedCompareExchangePointer((PVOID*)& lockedAt, (PVOID)__FUNCTION__, 0) == 0)
+			break;
+		Sleep(TIMER_SLICE_ms);
+	} while (GetTickCount64() - t0 < MAX_LOCK_WAIT_ms);
+	//
+	Reset();
 }
 
 
@@ -333,8 +366,12 @@ void CSocketItemEx::Connect()
 #endif
 	char nodeName[INET6_ADDRSTRLEN];
 	char *peerName = PeerName();
+#ifndef OVER_UDP_IPv4
 	int r = ResolveToIPv6(peerName);
 	if (r <= 0)
+#else
+	int r;
+#endif
 	{
 		const char *serviceName = strchr(peerName, ':');
 		if (serviceName != NULL)
@@ -349,8 +386,8 @@ void CSocketItemEx::Connect()
 		r = ResolveToFSPoverIPv4(peerName, serviceName);
 		if (r <= 0)
 		{
-			Notify(FSP_NameResolutionFailed);
-			Destroy();
+			SignalFirstEvent(FSP_NameResolutionFailed);
+			Free();
 			return;
 		}
 	}
@@ -386,7 +423,7 @@ void CSocketItemEx::Connect()
 //	Number of addresses resolved, negative if error
 int CSocketItemEx::ResolveToFSPoverIPv4(const char *nodeName, const char *serviceName)
 {
-	static const struct addrinfo hints = { 0, AF_INET, };
+	static const ADDRINFOA hints = { 0, AF_INET, };
 	PADDRINFOA pAddrInfo;
 
 	// assume the project is compiled in ANSI/MBCS language mode
@@ -430,7 +467,7 @@ int CSocketItemEx::ResolveToFSPoverIPv4(const char *nodeName, const char *servic
 //	Number of addresses resolved, negative if error
 int CSocketItemEx::ResolveToIPv6(const char *nodeName)
 {
-	static const struct addrinfo hints = { 0, AF_INET6, };
+	static const ADDRINFOA hints = { 0, AF_INET6, };
 	PADDRINFOA pAddrInfo;
 	// A value of zero for ai_socktype indicates the caller will accept any socket type. 
 	// A value of zero for ai_protocol indicates the caller will accept any protocol. 
@@ -483,7 +520,7 @@ void CommandNewSessionSrv::DoConnect()
  */
 
 // Given
-//	CommandNewSessionSrv		The request for new connection
+//	CommandNewSessionSrv *		Pointer of the request for new connection
 // Return
 //	non-negative is the position of the new request in the queue
 //	negative if error

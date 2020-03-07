@@ -58,11 +58,11 @@ static void FSPAPI onNotice(FSPHANDLE, FSP_ServiceCode, int);
 static void FSPAPI onFirstLineRead(FSPHANDLE, FSP_ServiceCode, int);
 static void FSPAPI onFurtherTunnelRequest(FSPHANDLE, FSP_ServiceCode, int);
 
-// Forward declaration of the default toplevel function of the
+// Forward declaration of the default top level function of the
 // HTTP server 1.0 over FSP version 0 AND tunnel server
 void	StartHTTPoverFSP();
 
-// Forward declaration of the toplevel function that implements service interface for SOCKS gateway
+// Forward declaration of the top level function that implements service interface for SOCKS gateway
 void	ToServeSOCKS(const char *, int);
 
 
@@ -146,7 +146,8 @@ int main(int argc, char *argv[])
 	{
 		if (argc != 3 && argc != 4)
 		{
-			printf_s("Usage[as a tunnel remote-end and httpf server]: %s -d <root directory> [max-requests]\n", argv[0]);
+			printf_s("Usage[as a tunnel remote-end and hypertext-FSP server]:\n"
+				"%s -d <root directory> [max-requests]\n", argv[0]);
 			goto l_return;
 		}
 		//
@@ -189,7 +190,7 @@ l_return:
 
 
 
-// The key is registrating 'onAccepting' as 'onMultiplying' in the incarnated connection
+// The key is registering 'onAccepting' as 'onMultiplying' in the incarnated connection
 // HTTP 1.0 over FSP version 0 with 'TUNNEL' extension
 void StartHTTPoverFSP()
 {
@@ -243,7 +244,7 @@ void StartHTTPoverFSP()
 // The callback function to handle general notification of LLS. Parameters are self-describing.
 static void FSPAPI onNotice(FSPHANDLE h, FSP_ServiceCode code, int value)
 {
-	printf_s("Notify: socket %p, service code = %d, return %d\n", h, code, value);
+	printf_s("Notification: socket %p, service code = %d, return %d\n", h, code, value);
 	if(value >= 0)
 		return;	// waring is simply ignored
 	//

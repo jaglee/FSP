@@ -73,7 +73,7 @@ typedef struct sockaddr_in	SOCKADDR_IN, * PSOCKADDR_IN;
 # define MAX_WORKING_THREADS	40
 #endif
 // fine tuning this value to half number of workable hyper-thread of the platform
-#define RECV_TIME_OUT		30	// half a miniute
+#define RECV_TIME_OUT		30	// half a minute
 #define MAX_LEN_DOMAIN_NAME 256	// including the terminating zero!
 
 enum ERepCode: octet
@@ -215,6 +215,11 @@ public:
 	PRequestPoolItem AllocItem();
 	PRequestPoolItem FindItem(FSPHANDLE);
 	bool FreeItem(PRequestPoolItem);
+	bool FreeItem(FSPHANDLE h)
+	{
+		PRequestPoolItem p = FindItem(h);
+		return (p != NULL && FreeItem(p));
+	}
 };
 
 extern RequestPool requestPool;

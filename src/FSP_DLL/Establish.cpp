@@ -177,9 +177,9 @@ FSPHANDLE FSPAPI Connect2(const char *peerName, PFSP_Context psp1)
 // Do
 //	Manage to call LLS to apply the new session key
 // Return
-//	0 if no error
+//	positive if it is number of octets passed as the initial key material
 //	negative: the error number
-//	(e.g. -EDOM if parameter error)
+//	(e.g. -EINVAL if error of invalid argument)
 // Remark
 //	By default set key life in term of octets may be sent maximumly with master key unchanged to 2^63-1
 DllSpec
@@ -211,13 +211,13 @@ int FSPAPI InstallMasterKey(FSPHANDLE h, octet * key, int32_t keyBytes)
 CSocketItemDl* LOCALAPI CSocketItemDl::CallCreate(CommandNewSession& objCommand, FSP_ServiceCode cmdCode)
 {
 	objCommand.fiberID = fidPair.source;
-	objCommand.idProcess = idThisProcess;
 	objCommand.opCode = cmdCode;
+	objCommand.idProcess = idThisProcess;
 #ifdef TRACE
 	printf("%s: fiberId = %d, fidPair.source = %d\n", CServiceCode::sof(cmdCode), objCommand.fiberID, fidPair.source);
 #endif
 	CopyFatMemPointo(objCommand);
-	return EnableLLSInteract(objCommand) && Call(objCommand, sizeof(objCommand)) ? this : NULL;
+	return EnableLLSInteract(objCommand) && Call((UCommandToLLS*)&objCommand) ? this : NULL;
 }
 
 
@@ -231,7 +231,7 @@ int32_t CSocketItemDl::AlignMemorySize(PFSP_Context psp1)
 	if (psp1->passive)
 	{
 		return ((sizeof(ControlBlock) + 7) >> 3 << 3)
-			+ sizeof(LLSBackLog) + sizeof(BackLogItem) * (FSP_BACKLOG_UPLIMIT - FSP_BACKLOG_SIZE);
+			+ sizeof(LLSBackLog) + sizeof(SItemBackLog) * (FSP_BACKLOG_UPLIMIT - FSP_BACKLOG_SIZE);
 	}
 
 	if (psp1->sendSize < MIN_RESERVED_BUF)
@@ -313,7 +313,7 @@ CSocketItemDl * LOCALAPI CSocketItemDl::CreateControlBlock(const PFSP_IN6_ADDR n
 //	This is function is blocking. It wait until success or internal error found
 CSocketItemDl *CSocketItemDl::Accept1()
 {
-	BackLogItem	*pLogItem;
+	PItemBackLog	pLogItem;
 	while(LockAndValidate())
 	{
 		pLogItem = pControlBlock->backLog.Peek();
@@ -344,24 +344,24 @@ CSocketItemDl *CSocketItemDl::Accept1()
 void LOCALAPI CSocketItemDl::RejectRequest(ALFID_T id1, ALFID_T idParent, uint32_t rc)
 {
 	CommandRejectRequest objCommand;
-	objCommand.fiberID = id1;
-	objCommand.idProcess = idThisProcess;
-	objCommand.opCode = (idParent == 0 ? FSP_Reject : FSP_Reset);
+	objCommand.opCode = FSP_Reject;
+	objCommand.idToRject = id1;
+	objCommand.idParent = idParent;
 	objCommand.reasonCode = rc;
-	Call(objCommand, sizeof(objCommand));
+	Call((UCommandToLLS *)&objCommand, sizeof(CommandRejectRequest));
 }
 
 
 
 // Given
-//	BackLogItem *	the fetched backlog item of the listening socket
+//	PItemBackLog	the fetched backlog item of the listening socket
 // Do
 //	create new socket, prepare the acknowledgement
 //	and call LLS to send the acknowledgement to the connection request or multiplication request
 // Return
 //	true if success
 //	false if failed.
-CSocketItemDl *CSocketItemDl::ProcessOneBackLog(BackLogItem	*pLogItem)
+CSocketItemDl *CSocketItemDl::ProcessOneBackLog(PItemBackLog pLogItem)
 {
 	// TODO: set the default interface to non-zero?
 	CommandNewSession objCommand;
@@ -399,7 +399,7 @@ CSocketItemDl *CSocketItemDl::ProcessOneBackLog(BackLogItem	*pLogItem)
 // and call LLS to send the acknowledgement to the connection request or multiplication request
 void CSocketItemDl::ProcessBacklogs()
 {
-	BackLogItem		*pLogItem;
+	PItemBackLog pLogItem;
 	for (; (pLogItem = pControlBlock->backLog.Peek()) != NULL; pControlBlock->backLog.Pop())
 	{
 		ProcessOneBackLog(pLogItem);
@@ -408,11 +408,11 @@ void CSocketItemDl::ProcessBacklogs()
 
 
 // Given
-//	BackLogItem &		the reference to the accepting backlog item
+//	SItemBackLog &		the reference to the accepting backlog item
 //	CommandNewSession & the command context of the backlog
 // Return
 //	The pointer to the socket created for the new connection requested
-CSocketItemDl * CSocketItemDl::PrepareToAccept(BackLogItem & backLog, CommandNewSession & cmd)
+CSocketItemDl * CSocketItemDl::PrepareToAccept(SItemBackLog & backLog, CommandNewSession & cmd)
 {
 	PFSP_IN6_ADDR pListenIP = (PFSP_IN6_ADDR) & backLog.acceptAddr;
 	FSP_SocketParameter newContext = this->context;
@@ -452,9 +452,7 @@ CSocketItemDl * CSocketItemDl::PrepareToAccept(BackLogItem & backLog, CommandNew
 
 	pSocket->pControlBlock->SetRecvWindow(backLog.expectedSN);
 	pSocket->pControlBlock->SetSendWindow(backLog.initialSN);
-#ifdef TRACE // & TRACE_SLIDEWIN)
-	printf("Expected SN: %u, set to %u\n", backLog.expectedSN, pSocket->pControlBlock->recvWindowExpectedSN);
-#endif
+
 	return pSocket;
 }
 
@@ -465,7 +463,7 @@ CSocketItemDl * CSocketItemDl::PrepareToAccept(BackLogItem & backLog, CommandNew
 //		| -->[API:Accept]
 //			-->{new context}CHALLENGING-->[Send ACK_CONNECT_REQ]
 // Given
-//	BackLogItem &	the reference to the accepting backlog item
+//	SItemBackLog &	the reference to the accepting backlog item
 // Do
 //	(ACK_CONNECT_REQ, Initial SN, Expected SN, Timestamp, Receive Window[, payload])
 // Return
@@ -477,7 +475,7 @@ CSocketItemDl * CSocketItemDl::PrepareToAccept(BackLogItem & backLog, CommandNew
 //	prepared welcome message MUST fit into the preallocated send buffer
 //	See also PrepareToSend
 //	Attention please! ULA MAY NOT send data onAccepting!
-bool LOCALAPI CSocketItemDl::ToWelcomeConnect(BackLogItem & backLog)
+bool LOCALAPI CSocketItemDl::ToWelcomeConnect(SItemBackLog & backLog)
 {
 	PFSP_IN6_ADDR p = (PFSP_IN6_ADDR) & pControlBlock->peerAddr.ipFSP.allowedPrefixes[MAX_PHY_INTERFACES - 1];
 	//
@@ -647,15 +645,18 @@ int LOCALAPI CSocketItemDl::InstallRawKey(octet *key, int32_t keyBits, uint64_t 
 	if (!WaitUseMutex())
 		return (IsInUse() ? -EDEADLK : -EINTR);
 
-	CommandInstallKey objCommand(pControlBlock->sendBufferNextSN, keyLife);
-	this->InitCommand<FSP_InstallKey>(objCommand);
-	if (keyBits > (int32_t)sizeof(objCommand.ikm) * 8)
-		keyBits = sizeof(objCommand.ikm) * 8;
-	memcpy(objCommand.ikm, key, keyBits/8);
+	int sizeIKM = keyBits / 8;
+	if (sizeIKM <= 0 || sizeIKM > 2048)
+		return -EINVAL;	// invalid argument
+
 	pControlBlock->connectParams.keyBits = keyBits;
+	CommandInstallKey objCommand(keyLife);
+	int r = Call((UCommandToLLS*)&objCommand, sizeof(CommandInstallKey)) ? 0 : -EIO;
+	if (r == 0)
+		r = send(sdPipe, (char *)key, sizeIKM, 0);
 
 	SetMutexFree();
-	return Call(objCommand, sizeof(objCommand)) ? 0 : -EIO;
+	return r;
 }
 
 
@@ -761,16 +762,14 @@ CSocketItemDl * CSocketDLLTLB::AllocItem()
 		item = head;
 		if (item == NULL)
 			goto l_bailout;	// return NULL;
-		head = item->next;
+		head = (CSocketItemDl *)item->next;
 		if (head != NULL)
 			head->prev = NULL;
 		else
 			tail = NULL;
 	}
-	// Or assume memory has been cleared when recycling?
-	memset((octet *)item + sizeof(CSocketItem)
-		, 0
-		, sizeof(CSocketItemDl) - sizeof(CSocketItem));
+	//// Or assume memory has been cleared when recycling?
+	//bzero((octet *)item + sizeof(CSocketItem), sizeof(CSocketItemDl) - sizeof(CSocketItem));
 	pSockets[sizeOfWorkSet++] = item;
 	_InterlockedExchange8(& item->inUse, 1);
 

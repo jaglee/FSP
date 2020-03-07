@@ -280,48 +280,41 @@ int  CSocketItemDl::TailFreeMutexAndReturn(int r)
 // The asynchronous, multi-thread friendly soft interrupt handler
 void CSocketItemDl::WaitEventToDispatch()
 {
-	register long vector = 0;
-	while (LockAndValidate())
+	FSP_NoticeCode notice;
+	while (recv(sdPipe, (char *)&notice, 1, 0) > 0)
 	{
-		register FSP_NoticeCode notice = (FSP_NoticeCode)_InterlockedExchange8(&pControlBlock->notices.nmi, NullNotice);
-		// data race does occur, so we have to double-test to avoid lost of suppressed soft interrupts
-		// built-in rule: bit 0 of the soft interrupt vector is the flag for DLL being in event loop
-		if (notice == NullNotice)
+		char c = _InterlockedExchange8(&pControlBlock->nmi, 0);
+		// If non-maskable interrupted, abort any waitable loop
+		char available = (c < SMALLEST_FSP_NMI ? 1 : _InterlockedExchange8(&inUse, 0));
+
+		if (available)
 		{
-			if (vector == 0)
+			uint64_t t0 = GetTickCount64();
+			while (!TryMutexLock())
 			{
-				vector = _InterlockedExchange(&pControlBlock->notices.vector, 1) & ((1 << SMALLEST_FSP_NMI) - 2);
-				if (vector == 0)
+				if (GetTickCount64() - t0 > SESSION_IDLE_TIMEOUT_us / 1000)
 				{
-					vector = _InterlockedExchange(&pControlBlock->notices.vector, 0) & ((1 << SMALLEST_FSP_NMI) - 2);
-					if (vector == 0)
-					{
-						SetMutexFree();
-						break;
-					}
-					//
-					_InterlockedOr(&pControlBlock->notices.vector, 1);
-				}
-			}
-			notice = NullNotice;
-			for (register int i = 1; i <= LARGEST_FSP_NOTICE; i++)
-			{
-				if (vector & (1 << i))
-				{
-					notice = (FSP_NoticeCode)i;
-					vector ^= 1 << i;
+					available = 0;
 					break;
 				}
+				//
+				Sleep(TIMER_SLICE_ms);
 			}
+			//
+			if (pControlBlock == NULL || InIllegalState())
+				available = 0;
 		}
-		// If it is polling notice can be null
-		if (notice == NullNotice)
+		//
+		if (!available)
 			break;
+		// NMI takes precedence over any pending notices in the stream
+		if (c != 0)
+			notice = (FSP_NoticeCode)c;
 #ifdef TRACE
 		printf_s("\nIn local fiber#%u, state %s\tnotice: %s\n"
 			, fidPair.source, stateNames[pControlBlock->state], noticeNames[notice]);
 #endif
-		if (notice > FSP_NotifyToFinish)
+		if (notice >= SMALLEST_FSP_NMI)
 			lowerLayerRecycled = 1;
 		//
 		FSP_Session_State s0;
@@ -383,7 +376,7 @@ void CSocketItemDl::WaitEventToDispatch()
 			{
 				SetState(PRE_CLOSED);
 				AppendEoTPacket();
-				Call<FSP_Urge>();
+				// Call<FSP_Urge>();
 			}
 			SetMutexFree();
 			break;
@@ -405,7 +398,7 @@ void CSocketItemDl::WaitEventToDispatch()
 			{
 				SetState(PRE_CLOSED);
 				AppendEoTPacket();
-				Call<FSP_Urge>();
+				// Call<FSP_Urge>();
 				SetMutexFree();
 			}
 #ifndef NDEBUG
@@ -445,19 +438,22 @@ void CSocketItemDl::WaitEventToDispatch()
 			FreeAndNotify(FSP_Reset, EFAULT);	// Memory access error because of bad address
 			return;
 		case FSP_NotifyReset:
-			FreeAndNotify(FSP_Reject, EPIPE);	// Reset because the peer breaks the pipe
-			return;
+			goto l_postloop;
 		case FSP_NotifyTimeout:
 			FreeAndNotify(FSP_Reset, ETIMEDOUT);// Reset because of time-out
 			return;
 		default:
-			;	// But NullNotice is impossible
+			;	// Just skip unknown notices in sake of resynchronization
 		}
+		//
+		processingNotice = 0;
 	}
+	//
 l_postloop:
-	processingNotice = 0;
-	if (pendingRecycle || !IsInUse())
-		Free();
+	NotifyOrReturn fp1 = context.onError;
+	Dispose();
+	if (fp1 != NULL)
+		fp1(this, FSP_Reject, -EPIPE);	// Reset because the peer breaks the pipe
 }
 
 

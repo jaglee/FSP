@@ -79,7 +79,7 @@ ALFID_T LOCALAPI CLowerInterface::RandALFID(PIN6_ADDR hintAddr)
 	}
 	// circle the entry
 	tailFreeSID->next = p;	// if it is the only entry, p->next is assigned p
-	headFreeSID = p->next;
+	headFreeSID = (CSocketItemEx *)p->next;
 	tailFreeSID = p;
 	if(headFreeSID == p)
 		p->next = NULL;
@@ -101,7 +101,7 @@ ALFID_T LOCALAPI CLowerInterface::RandALFID()
 	// circle the entry
 	tailFreeSID->next = p;	// if it is the only entry, p->next is assigned p
 	tailFreeSID = p;
-	headFreeSID = p->next;	// might be NULL, to be re-calibrated
+	headFreeSID = (CSocketItemEx *)p->next;	// might be NULL
 	if(p->next == NULL)
 		headFreeSID = p;
 	else
@@ -367,29 +367,42 @@ void CSocketItemEx::InstallEphemeralKey()
 //	Put the new session key effective starting from the sequence number designated in the parameter given by ULA
 // Remark
 //	The key length and the first sequence number exploiting the new session key at the receive side next
-//	are designated in the control block while the key life and the first sequence number exploiting
-//	the new session key at the send side are given in the parameter
+//	are designated in the control block
+//	but the first packet exploiting the new session key is the one next to the packet at the tail of the send queue
+//	by convention, while the key life is given in the parameter.
 // See @DLL::InstallRawKey
-void CSocketItemEx::InstallSessionKey(const CommandInstallKey & cmd)
+void CSocketItemEx::InstallSessionKey(const CommandInstallKey& cmd)
 {
 #if defined(TRACE) && (TRACE & (TRACE_SLIDEWIN | TRACE_ULACALL))
-	printf_s("\n%s\n\tsendWindowNextSN = %u\n"
-		"\tsendBufferNextSN = %09u, \trecvWindowNextSN = %09u\n"
-		"\tcommand.nextSendSN = %09u, \t RecvRE snapshot = %09u\n"
+	printf_s("\n%s\n"
+		"\tsendWindowNextSN = %09u\n"
+		"\tsendBufferNextSN = %09u\n"
+		"\trecvWindowNextSN = %09u\n"
+		"\t RecvRE snapshot = %09u\n"
 		, __FUNCTION__
 		, pControlBlock->sendWindowNextSN
-		, pControlBlock->sendBufferNextSN, pControlBlock->recvWindowNextSN
-		, cmd.nextSendSN, pControlBlock->connectParams.nextKey$initialSN);
+		, pControlBlock->sendBufferNextSN
+		, pControlBlock->recvWindowNextSN
+		, pControlBlock->connectParams.nextKey$initialSN);
 	printf("Key length: %d bits\t", pControlBlock->connectParams.keyBits);
-	DumpHexical(cmd.ikm, pControlBlock->connectParams.keyBits / 8);
 #endif
+	int sizeIKM = pControlBlock->connectParams.keyBits / 8;
+	char ikm[2048];// it is hard-coded to 2KB bytes, i.e. maximumly 16384 bits
+	sizeIKM = min((int)sizeof(ikm), sizeIKM);
+	if (sizeIKM <= 0)
+		return;
+	recv(sdPipe, ikm, sizeIKM, 0);
+#if defined(TRACE) && (TRACE & (TRACE_SLIDEWIN | TRACE_ULACALL))
+	DumpHexical(ikm, sizeIKM);
+#endif
+
 	contextOfICC.isPrevSendCRC = contextOfICC.isPrevRecvCRC
-		= (InterlockedExchange64((int64_t *)&contextOfICC.keyLifeRemain, cmd.keyLife) == 0);
+		= (InterlockedExchange64((int64_t*)&contextOfICC.keyLifeRemain, cmd.keyLife) == 0);
 	contextOfICC.noEncrypt = (pControlBlock->noEncrypt != 0);
-	contextOfICC.snFirstSendWithCurrKey = cmd.nextSendSN;
+	contextOfICC.snFirstSendWithCurrKey = pControlBlock->sendBufferNextSN;
 	contextOfICC.snFirstRecvWithCurrKey = pControlBlock->connectParams.nextKey$initialSN;
 
-	contextOfICC.InitiateExternalKey(cmd.ikm, pControlBlock->connectParams.keyBits / 8);
+	contextOfICC.InitiateExternalKey(ikm, sizeIKM);
 }
 
 
@@ -1100,7 +1113,7 @@ int CSocketItemEx::EmitWithICC(ControlBlock::PFSP_SocketBuf skb, ControlBlock::s
 	if(payload == NULL)
 	{
 		REPORT_ERRMSG_ON_TRACE("TODO: debug log memory corruption error");
-		AbortLLS();			// Used to be HandleMemoryCorruption();
+		BREAK_ON_DEBUG();
 		return -EFAULT;
 	}
 

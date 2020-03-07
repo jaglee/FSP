@@ -33,182 +33,60 @@
 
 #include "fsp_srv.h"
 
+#if defined(__WINDOWS__)
+# define AF_FOR_IPC			AF_INET
+# define CLOSE_IPC			closesocket
+# define SOCKADDR_FOR_IPC	struct sockaddr_in
+#elif defined(__linux__) || defined(__CYGWIN__)
+# include <netinet/tcp.h>
+# include <sys/un.h>
+# define AF_FOR_IPC			AF_UNIX
+# define CLOSE_IPC			close
+# define SOCKADDR_FOR_IPC	struct sockaddr_un
+#endif
 
-// The singleton instance of the connect request queue
+CSocketItemEx* LOCALAPI ProcessCommand(void* buffer);
+
+ // The singleton instance of the connect request queue
 ConnectRequestQueue ConnectRequestQueue::requests;
 
 // The singleton instance of the lower service interface 
 CLowerInterface	CLowerInterface::Singleton;
 
-extern void LOCALAPI ProcessCommand(void *buffer);
-
-#if defined(__WINDOWS__)
-
-// access control is centralized managed in the 'main' source file
-# include <Accctrl.h>
-# include <Aclapi.h>
-
-// get the security attribute of the service, assigned to the mailslot - shall be everyone's free access
-static void GetServiceSA(PSECURITY_ATTRIBUTES);
-
 extern "C"
 int main(int argc, char * argv[])
 {
-	SECURITY_ATTRIBUTES attrSecurity;
-	GetServiceSA(& attrSecurity);
+	SOCKADDR_FOR_IPC addr;
+	int sd;
 
-	HANDLE md = CreateMailslot(SERVICE_MAILSLOT_NAME
-		, MAX_CTRLBUF_LEN
-		, MAILSLOT_WAIT_FOREVER
-		, & attrSecurity);
-	if(md == INVALID_HANDLE_VALUE)
-	{
-		printf("Panic!Cannot create the mailslot to accept service request.\n");
-		return -1;
-	}
-
-	// also create the receiver
 	if(!CLowerInterface::Singleton.Initialize())
 	{
-		printf("In main cannot access lower interface, aborted.\n"); 
-		goto l_bailout;
-	}
-
-	// continue on main thread (thread 1):
-	// Remark
-	//	Terminate only when the mailslot is unreadable due to some panic
-	try
-	{
-		octet buffer[MAX_CTRLBUF_LEN];
-		DWORD nBytesRead;
-		while(ReadFile(md, buffer, MAX_CTRLBUF_LEN, & nBytesRead, NULL))
-		{
-#if defined(TRACE) && (TRACE & TRACE_ULACALL)
-			printf_s("\n%d octets read from the mailslot.", nBytesRead);
-#endif
-			if(nBytesRead < sizeof(struct CommandToLLS))
-			{
-#if defined(TRACE) && (TRACE & TRACE_ULACALL)
-				printf_s(" Size of the message is too small.\n");
-#endif
-				continue;
-			}
-			ProcessCommand(buffer);
-			// There used to be "hard-coded: (ushort)(-1) mean exit". But it allowed DoS attack
-		}
-#ifndef NDEBUG
-		// TODO: UNRESOLVED! Crash Recovery? if ReadFile fails, it is a crash
-		printf("Fatal! Read mailslot error, command channel broken\n");
-#endif
-	}
-	catch(...)
-	{
-		BREAK_ON_DEBUG();
-		CLowerInterface::Singleton.Destroy();
-	}
-
-l_bailout:
-	CloseHandle(md);
-	return 0;
-}
-
-
-
-// a security attribute depends on a security descriptor
-// while a security descriptor depends on an ACL
-// while an ACL contains at least one explicit access entry (ACL entry) [if it is NULL, by default everyone access]
-// while an explicit access entry requires a SID
-static void GetServiceSA(PSECURITY_ATTRIBUTES pSA)
-{
-    PSID pEveryoneSID = NULL;
-    PACL pACL = NULL;
-    EXPLICIT_ACCESS ea;
-    SID_IDENTIFIER_AUTHORITY SIDAuthWorld = SECURITY_WORLD_SID_AUTHORITY;
-	static SECURITY_DESCRIPTOR sd;	// as it is referenced by pSA
-
-    // Create a well-known SID for the Everyone group.
-    if(!AllocateAndInitializeSid(&SIDAuthWorld, 1,
-                     SECURITY_WORLD_RID,	// dwSubAuthority0
-                     0, 0, 0, 0, 0, 0, 0, // dwSubAuthority 1~7
-                     & pEveryoneSID))
-    {
-#ifndef NDEBUG
-        printf("AllocateAndInitializeSid Error %d\n", (int)GetLastError());
-#endif
-        goto Cleanup;
-    }
-
-    // Initialize an EXPLICIT_ACCESS structure for an ACE.
-    // The ACE will allow Everyone read access to the key.
-    ZeroMemory(&ea, sizeof(EXPLICIT_ACCESS));
-    ea.grfAccessPermissions = GENERIC_ALL;	// SPECIFIC_RIGHTS_ALL;
-    ea.grfAccessMode = SET_ACCESS;
-    ea.grfInheritance= NO_INHERITANCE;
-    ea.Trustee.TrusteeForm = TRUSTEE_IS_SID;
-    ea.Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
-    ea.Trustee.ptstrName  = (LPTSTR) pEveryoneSID;
-
-    // Create a new ACL that contains the new ACEs.
-    if (SetEntriesInAcl(1, & ea, NULL, &pACL) != ERROR_SUCCESS) 
-    {
-#ifndef NDEBUG
-        printf("SetEntriesInAcl Error %d\n", (int)GetLastError());
-#endif
-        goto Cleanup;
-    }
- 
-    if (!InitializeSecurityDescriptor(& sd, SECURITY_DESCRIPTOR_REVISION)) 
-    {  
-#ifndef NDEBUG
-        printf("InitializeSecurityDescriptor Error %d\n", (int)GetLastError());
-#endif
-        goto Cleanup; 
-    } 
- 
-    // Add the ACL to the security descriptor. 
-    if (!SetSecurityDescriptorDacl(& sd, 
-            TRUE,     // bDaclPresent flag   
-            pACL, 
-            FALSE))   // not a default DACL 
-    {  
-        printf("SetSecurityDescriptorDacl Error %d\n", (int)GetLastError());
-        goto Cleanup; 
-    } 
-
-    // Initialize a security attributes structure.
-	
-    pSA->nLength = sizeof (SECURITY_ATTRIBUTES);
-    pSA->lpSecurityDescriptor = & sd;
-    pSA->bInheritHandle = FALSE;
-
-Cleanup:
-	;	// do not free SID or ACL, until the process terminated(?) 
-    //if (pEveryoneSID) 
-    //    FreeSid(pEveryoneSID);
-	// if(pACL)
-	//	  LocalFree(pACL);
-}
-
-#elif defined(__linux__)
-
-#include <sys/un.h>
-
-int main(int argc, char * argv[])
-{
-    struct sockaddr_un addr;
-    int sd;
-    sd = socket(AF_UNIX, SOCK_DGRAM, 0); // SOCK_SEQPACKET need listen and accept
-	if(sd < 0)
-	{
-		perror("Cannot create AF_UNIX socket for listening");
+		REPORT_ERRMSG_ON_TRACE("Cannot access lower interface in main(), aborted.");
 		exit(-1);
 	}
 
-	addr.sun_family = AF_UNIX;
+	sd = socket(AF_FOR_IPC, SOCK_STREAM, 0);
+	if (sd < 0)
+	{
+		REPORT_ERRMSG_ON_TRACE("Cannot create the socket for listening ULA's command");
+		exit(-1);
+	}
+
+#if defined(__WINDOWS__)
+	addr.sin_family = AF_FOR_IPC;
+	addr.sin_port = htobe16(DEFAULT_FSP_UDPPORT);
+	addr.sin_addr.S_un.S_addr = IN4ADDR_LOOPBACK;
+	memset(addr.sin_zero, 0, sizeof(addr.sin_zero));
+	if (bind(sd, (struct sockaddr*) & addr, sizeof(SOCKADDR_FOR_IPC)) < 0)
+	{
+		REPORT_ERRMSG_ON_TRACE("Cannot bind the command-stream socket to the loop-back address.");
+		exit(-1);
+	}
+#elif defined(__linux__) || defined(__CYGWIN__)
+	addr.sun_family = AF_FOR_IPC;
 	strncpy(addr.sun_path, SERVICE_SOCKET_PATH, sizeof(addr.sun_path) - 1);
 	addr.sun_path[sizeof(addr.sun_path) - 1] = 0;
-
-	if(bind(sd, (struct sockaddr*)&addr, sizeof(struct sockaddr_un)) < 0)
+	if (bind(sd, (struct sockaddr*)&addr, sizeof(SOCKADDR_FOR_IPC)) < 0)
 	{
 		int r = 0;
 		if(errno == EADDRINUSE)
@@ -225,115 +103,49 @@ int main(int argc, char * argv[])
 			exit(-1);
 		}
 	}
-
-	// also create the receiver
-	if(!CLowerInterface::Singleton.Initialize())
+#endif
+	// If the backlog argument is greater than the value in /proc/sys/net/core/somaxconn,
+	// then it is silently truncated to that value; the default value in this file is 128
+	if (listen(sd, MAX_CONNECTION_NUM) != 0)
 	{
-		printf("In main cannot access lower interface, aborted.\n"); 
-		goto l_bailout;
+		REPORT_ERRMSG_ON_TRACE("Cannot set the listening queue to accept ULA's command.");
+		exit(-1);
 	}
 
-	// continue on main thread (thread 1):
 	try
 	{
-		socklen_t szAddr = sizeof(struct sockaddr_un);
-		octet buffer[MAX_CTRLBUF_LEN];
-		int	nBytesRead;
-		while((nBytesRead = (int)recvfrom(sd, buffer, sizeof(buffer), 0, (struct sockaddr*)&addr, &szAddr)) > 0)
+		socklen_t szAddr = sizeof(SOCKADDR_FOR_IPC);
+		SOCKADDR_FOR_IPC addrIn;
+		int sdNew;
+		char buffer[sizeof(UCommandToLLS)];
+		while ((sdNew = accept(sd, (struct sockaddr*) & addrIn, &szAddr)) != -1)
 		{
-#if defined(TRACE) && (TRACE & TRACE_ULACALL)
-			printf_s("\n%d octets read from the domain socket.", (int)nBytesRead);
-#endif
-			if(nBytesRead < (int)sizeof(struct CommandToLLS))
+			DWORD optval = 1;
+			setsockopt(sdNew, IPPROTO_TCP, TCP_NODELAY, (const char*)&optval, sizeof(optval));
+			// Is it necessary to set the SO_LINGER option?
+			// setsockopt(sdNew, SOL_SOCKET, SO_DONTLINGER, (const char*)&optval, sizeof(optval));
+
+			int nBytesRead = recv(sdNew, buffer, sizeof(UCommandToLLS), 0);
+			if (nBytesRead < (int)sizeof(UCommandToLLS))
 			{
-#if defined(TRACE) && (TRACE & TRACE_ULACALL)
-				printf_s(" Size of the message is too small.\n");
-#endif
+				REPORT_ERRMSG_ON_TRACE("Cannot read from the incarnated socket.");
+				CLOSE_IPC(sdNew);
 				continue;
 			}
-			ProcessCommand(buffer);
-			// There used to be "hard-coded: (ushort)(-1) mean exit". But it allowed DoS attack
+
+			CSocketItemEx *pSocket = ProcessCommand(buffer);
+			if (pSocket != NULL)
+				pSocket->SetComChannel(sdNew);
+			else
+				CLOSE_IPC(sdNew);
 		}
-#ifndef NDEBUG
-		// TODO: UNRESOLVED! Crash Recovery? if ReadFile fails, it is a crash
-		perror("Fatal! Cannot read the domain socket, command channel broken");
-#endif
+		REPORT_ERRMSG_ON_TRACE("Command channel broken.");
 	}
-	catch(...)
+	catch (...)
 	{
 		BREAK_ON_DEBUG();
 		CLowerInterface::Singleton.Destroy();
 	}
 
-l_bailout:
-	close(sd);
-	// unlink(addr.sun_path);
-	return 0;
+	exit(0);
 }
-
-#elif defined(__CYGWIN__)
-
-# include <sys/msg.h>
-  ALIGN(sizeof(long long)) const char $_FSP_KEY[8] = "FSP*KEY";
-# define FSP_MQ_KEY      (*(uint64_t *)($_FSP_KEY))
-
-int main(int argc, char * argv[])
-{
-	key_t mqKey = (key_t)FSP_MQ_KEY;
-
-    int msqid = msgget(mqKey, IPC_CREAT | IPC_EXCL | O_RDONLY);
-    if(msqid < 0)
-    {
-        msqid = msgget(mqKey, O_RDONLY);
-        if(msqid < 0)
-        {
-            perror("Cannot abtain the XSI message queue for read");
-            exit(-1);
-        }
-    }
-
-	// also create the receiver
-	if(!CLowerInterface::Singleton.Initialize())
-	{
-		printf("In main cannot access lower interface, aborted.\n"); 
-		goto l_bailout;
-	}
-
-	// continue on main thread (thread 1):
-	try
-	{
-		char msgbuf[MAX_CTRLBUF_LEN];
-		int nBytesRead;
-		while((nBytesRead = (int)msgrcv(msqid, &msgbuf, MAX_CTRLBUF_LEN - sizeof(long), 0, 0)) > 0)
-		{
-			nBytesRead += sizeof(long);	// XSI message type
-#if defined(TRACE) && (TRACE & TRACE_ULACALL)
-			printf_s("\n%d octets read from the XSI message queue.", (int)nBytesRead);
-#endif
-			if(nBytesRead < (int)sizeof(struct CommandToLLS))
-			{
-#if defined(TRACE) && (TRACE & TRACE_ULACALL)
-				printf_s(" Size of the message is too small.\n");
-#endif
-				continue;
-			}
-			ProcessCommand(msgbuf);
-			// There used to be "hard-coded: (ushort)(-1) mean exit". But it allowed DoS attack
-		}
-#ifndef NDEBUG
-		// TODO: UNRESOLVED! Crash Recovery? if ReadFile fails, it is a crash
-		perror("Fatal! Read XSI message queue, command channel broken\n");
-#endif
-	}
-	catch(...)
-	{
-		BREAK_ON_DEBUG();
-		CLowerInterface::Singleton.Destroy();
-	}
-
-l_bailout:
-	msgctl(msqid, IPC_RMID, NULL);
-	return 0;
-}
-
-#endif

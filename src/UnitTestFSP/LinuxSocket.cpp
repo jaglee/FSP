@@ -66,11 +66,20 @@ void server()
 	octet buffer[MAX_CTRLBUF_LEN];
 	socklen_t szAddr = sizeof(struct sockaddr_un);
 	int	nRead = (int)recvfrom(sd, buffer, sizeof(buffer), 0, (struct sockaddr*)&addr, &szAddr);
-	printf("%d octets read\n", nRead);
+	printf("%d octets read. ", nRead);
 	if(nRead > 0)
-		printf("Message received: %s\n", buffer);
+		printf("message received:\n%s\n", buffer);
 	else
-		perror("Receive error");
+		perror("the value is the error code.");
+	
+	int len = snprintf((char *)buffer, MAX_CTRLBUF_LEN, "OK, %d octets received", nRead);
+	buffer[MAX_CTRLBUF_LEN - 1] = 0;
+	if(len >= MAX_CTRLBUF_LEN)
+		len = MAX_CTRLBUF_LEN;
+	else
+		len++;	// counting into the terminating zero
+	sendto(sd, buffer, len, 0, (const struct sockaddr *)&addr, szAddr);
+
 	close(sd);
 	// unlink(addr.sun_path);
 }
@@ -97,5 +106,14 @@ void client(char *msg)
 		printf("%d octets sent\n", nSent);
 	else
 		perror("Send error");
+	
+	socklen_t szAddr = sizeof(struct sockaddr_un);
+	octet buffer[MAX_CTRLBUF_LEN];
+	int	nRead = (int)recvfrom(sd, buffer, sizeof(buffer), 0, (struct sockaddr*)&addr, &szAddr);
+	if(nRead > 0)
+		printf("%s\n", buffer);
+	else
+		printf("The peer did not acknowledge.\n");
+
 	close(sd);
 }

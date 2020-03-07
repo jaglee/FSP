@@ -61,11 +61,10 @@ static octet	keyInternalRand[FSP_MAX_KEY_SIZE];
 /*
  * The OS-dependent CommandNewSessionSrv constructor
  */
-CommandNewSessionSrv::CommandNewSessionSrv(const CommandToLLS *p1)
+CommandNewSessionSrv::CommandNewSessionSrv(const CommandNewSession* pCmd)
 {
-	memcpy(this, p1, sizeof(CommandToLLS));
-	dwMemorySize = ((CommandNewSession *)p1)->dwMemorySize;
-	hShm = shm_open(((CommandNewSession *)p1)->shm_name, O_RDWR, 0777);
+	memcpy(this, pCmd, sizeof(CommandNewSessionCommon));
+	hShm = shm_open(pCmd->shm_name, O_RDWR, 0777);
 	if (hShm < 0)
 		perror("Cannot get the handle of the shared memory for MapControlBlock");
 }
@@ -444,17 +443,6 @@ extern "C" void rand_w32(u32 *p, int n)
 }
 
 
-
-// Return
-//	Whether the ULA process associated with the LLS socket is still alive
-// Remark
-//	It is assumed that process ID is 'almost never' reused
-bool CSocketItemEx::IsProcessAlive()
-{
-	return (kill(idSrcProcess, 0) == 0);
-}
-
-
 // Given
 //	uint32_t		number of millisecond delayed to trigger the timer
 // Return
@@ -498,6 +486,36 @@ void CSocketItemEx::RemoveTimers()
 	timer_t h;
 	if((h = (timer_t)_InterlockedExchange(& timer, 0)) != 0)
 		timer_delete(h);
+}
+
+
+
+static void * WaitULACommand(void *p)
+{
+	try
+	{
+		((CSocketItemEx*)p)->WaitULACommand();
+		return p;
+	}
+	catch (...)
+	{
+		return NULL;
+	}
+}
+
+
+
+// Given
+//	SOCKET		the socket that created as a two-way stream end point
+// Do
+//	Set the socket as the bi-directional IPC end point and create the thread
+// Return
+//	true the communication channel was established successfully
+//	false if it failed
+bool CSocketItemEx::SetComChannel(SOCKET sd)
+{
+	sdPipe = sd;
+	return (pthread_create(&hThreadWait, NULL, ::WaitULACommand, this) == 0);
 }
 
 

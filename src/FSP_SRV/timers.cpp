@@ -28,70 +28,34 @@
  */
 #include "fsp_srv.h"
 
+// For experimental purpose it is defined here. with exponential backup off, it is to retry 4 times
+#define RETRANSMISSION_LIMITS	15
 
-// let calling of Destroy() in the NON_EXISTENT state to do cleanup 
 #define TIMED_OUT() \
-		ReplaceTimer(DEINIT_WAIT_TIMEOUT_ms);	\
-		Notify(FSP_NotifyTimeout);	\
-		lowState = NON_EXISTENT;	\
+		SignalFirstEvent(FSP_NotifyTimeout);	\
+		ScheduleCleanup();			\
 		SetMutexFree();	\
 		return
 
 
 
-// Now it is the polling timer. Unlike LockWithActiveULA(), here the socket is locked without wait
 // TODO: recycle SHUT_REQUESTED or CLOSED socket in LRU manner
 void CSocketItemEx::KeepAlive()
 {
-	const char *c = (char *)_InterlockedCompareExchangePointer((PVOID*)&lockedAt, (PVOID)__FUNCTION__, 0);
+	const char *sLock = (char *)_InterlockedCompareExchangePointer((PVOID*)&lockedAt, (PVOID)__FUNCTION__, NULL);
 	timestamp_t t1 = NowUTC();
 	// assume it takes little time to get system clock
-	while (t1 - tPreviousLifeDetection > (MAX_LOCK_WAIT_ms << 10))
-	{
-		if (IsProcessAlive())
-		{
-			tPreviousLifeDetection = t1;
-			break;
-		}
-		if (c == 0)
-		{
-			// If the time-out handler took the lock, it may abort the session safely
-			AbortLLS();
-		}
-		else if(IsInUse())
-		{
-			ClearInUse();
-			//^So that any WaitUseMutex() would be forcefully aborted
-			ReplaceTimer(TIMER_SLICE_ms);
-			// Assume there is no dead loop, eventually the socket would be unlocked
-			// and the time-out handler would safely abort the session
-		}
-		else
-		{
-			Destroy();	// The subroutine itself prevents double-entering
-		}
-		return;
-	}
 
 	callbackTimerPending = 0;
-	if (!IsInUse())
-	{
-		if (c == 0)
-			SetMutexFree();
-		return;		// the socket has been released elsewhere
-	}
-	if (c != 0)
+	if (sLock != NULL)
 	{
 		callbackTimerPending = 1;
 		return;
 	}
-
-	// See also TIMEDOUT(); DEINIT_WAIT_TIMEOUT_ms
-	if (lowState == NON_EXISTENT)
+	// It might be redundant, but do little harm to do double checks
+	if (!IsInUse() || pControlBlock == NULL)
 	{
-		if (pControlBlock->state >= ESTABLISHED)
-			SendReset();
-		Destroy();
+		RemoveTimers();
 		SetMutexFree();
 		return;
 	}
@@ -128,6 +92,7 @@ void CSocketItemEx::KeepAlive()
 #ifdef TRACE
 			printf_s("\nSession idle time out in the %s state\n", stateNames[lowState]);
 #endif
+			SendReset();
 			TIMED_OUT();
 		}
 		DoEventLoop();
@@ -144,24 +109,24 @@ void CSocketItemEx::KeepAlive()
 		// Do not time-out because it may have to wait ULA to fetch all data in the receive buffer
 		break;
 	case PRE_CLOSED:
-		if (int64_t(t1 - CLOSING_TIME_WAIT_ms * 1000 - tLastRecvAny) > 0)
+		// ULA should have its own time-out clock enabled
+		if (int64_t(t1 - CLOSING_TIME_WAIT_ms * 1000 - tLastRecvAny) < 0)
 		{
-			ReplaceTimer(DEINIT_WAIT_TIMEOUT_ms);
-			EmitStart();	// It shall be a RELEASE packet which is retransmitted at most once
-			SetState(CLOSED);
-		}	// ULA should have its own time-out clock enabled
-		break;
+			ReplaceTimer(uint32_t((t1 - tMigrate) >> 10) + TIMER_SLICE_ms);
+			//^exponentially back off
+			EmitStart();	// Shall be the RELEASE packet
+			break;
+		}
+		SetState(CLOSED);
+		// The socket is subjected to be recycled in LRU manner
 	case CLOSED:
-		if (int64_t(t1 - tMigrate + 1024 - (UINT32_MAX << 10)) < 0)
-			ReplaceTimer(uint32_t((t1 - tMigrate) >> 10) + MAX_LOCK_WAIT_ms);
-		//^exponentially back off;  the socket is subjected to be recycled in LRU manner
+		PutToResurrectable();
 		break;
 	default:
-#ifndef NDEBUG
-		printf_s("\n*** Implementation may not add state arbitrarily %s(%d)! ***\n", stateNames[lowState], lowState);
-		// The shared memory portion of ControlBlock might be inaccessible.
-#endif
-		Destroy();
+		if (pControlBlock->state >= ESTABLISHED)
+			SendReset();
+		Free();
+		break;
 	}
 
 	SetMutexFree();
@@ -479,7 +444,7 @@ void CSocketItemEx::DoEventLoop()
 	_InterlockedExchange8((char*)& lowState, pControlBlock->state);
 	if (lowState <= NON_EXISTENT || lowState > LARGEST_FSP_STATE)
 	{
-		Destroy();
+		Free();
 		return;
 	}
 
@@ -519,6 +484,12 @@ loop_start:
 		}
 		else if ((p->marks & ControlBlock::FSP_BUF_ACKED) == 0)
 		{
+			bool resent = (p->marks & ControlBlock::FSP_BUF_RESENT) != 0;
+			if (resent && int64_t(tNow - tLastRecvAny - tRTO_us * RETRANSMISSION_LIMITS < 0))
+			{
+				SendReset();
+				TIMED_OUT();
+			}
 #if (TRACE & TRACE_HEARTBEAT)
 			printf_s("Fiber#%u, to retransmit packet #%u\n", fidPair.source, seq1);
 #endif
@@ -529,8 +500,7 @@ loop_start:
 				goto l_final;
 			quotaLeft -= (p->len + sizeof(FSP_NormalPacketHeader));
 			// For TCP-friendly congestion control, loss of packet means congestion encountered
-			if (!somePacketResent && (p->marks & ControlBlock::FSP_BUF_RESENT) != 0
-			 && pControlBlock->tfrc)	// TODO: detect ECN
+			if (!somePacketResent && resent && pControlBlock->tfrc)	// TODO: detect ECN
 			{
 				sendRate_Bpus /= 2;
 				quotaLeft /= 2;

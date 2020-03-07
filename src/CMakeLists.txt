@@ -15,9 +15,7 @@ else()
 endif()
 
 add_definitions(-DOVER_UDP_IPv4)
-add_compile_options(-pthread -Wall -Werror -Wno-error=unused-value -Wno-strict-aliasing -Wno-error=invalid-offsetof)
-
-SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-class-memaccess")
+add_compile_options(-pthread -Wall -Werror -Wno-error=unused-value -Wno-strict-aliasing)
 
 if(${MINGW})
     list(APPEND EXTRA_LIBS Ws2_32)

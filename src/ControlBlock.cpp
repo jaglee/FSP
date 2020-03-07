@@ -225,24 +225,24 @@ bool CLightMutex::WaitSetMutex()
 
 
 // Given
-//	TLogItem	the item to be pushed
+//	PItemBackLog	pointe to the item to be pushed
 // Return
 //	non-negative on success, or negative on failure
 // Remark
 //	capacity must be some power of 2
-int LOCALAPI LLSBackLog::Put(const BackLogItem *p)
+int LLSBackLog::Put(const SItemBackLog& r)
 {
 	if (!WaitSetMutex())
 		return -EDEADLK;
 
-	if(count >= capacity)
+	if (count >= capacity)
 	{
 		SetMutexFree();
 		return -ENOMEM;
 	}
 
 	register int i = tailQ;
-	q[i] = *p;
+	q[i] = r;
 	tailQ = (i + 1) & (capacity - 1);
 
 	count++;
@@ -288,7 +288,7 @@ int LLSBackLog::Pop()
 // Return
 //	true if the given backlog item is matched with some item in the queue
 //	false if no match found
-BackLogItem * LLSBackLog::FindByRemoteId(ALFID_T idRemote, uint32_t salt)
+PItemBackLog LLSBackLog::FindByRemoteId(ALFID_T idRemote, uint32_t salt)
 {
 	if (!WaitSetMutex())
 		throw - EINTR;

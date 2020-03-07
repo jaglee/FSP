@@ -28,10 +28,6 @@
 #define GCM_BLOCK_LEN_POWER 4	// 2^^4 == 16
 #define GMAC_SALT_LEN		4	// As of RFC4543
 
-#ifndef bzero
-#define bzero(p, size) memset((p), 0, (size))
-#endif
-
 typedef struct _GCM_AES_CTX {
 	uint32_t	K[4*(RIJNDAEL_MAXNR + 1)];
 	uint8_t		H[GCM_BLOCK_LEN];	/* hash subkey */

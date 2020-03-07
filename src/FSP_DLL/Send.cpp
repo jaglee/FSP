@@ -391,8 +391,8 @@ int CSocketItemDl::LockAndCommit(NotifyOrReturn fp1)
 #endif
 		fpCommitted = NULL;
 		SetMutexFree();
-		if (fp1 != NULL)
-			fp1(this, FSP_Urge, EEXIST);
+		//if (fp1 != NULL)
+		//	fp1(this, FSP_Urge, EEXIST);
 		return 0;	// It is already in a state that the near end's last transmit transaction has been committed
 	}
 
@@ -813,7 +813,7 @@ int CSocketItemDl::Commit()
 		if (HasFreeSendBuffer())
 		{
 			BufferData(pendingSendSize);
-			Call<FSP_Urge>();
+			//Call<FSP_Urge>();
 		}
 		// else Case 4.1, the send queue is full and there is some payload to wait free buffer
 	}
@@ -824,13 +824,14 @@ int CSocketItemDl::Commit()
 		skbImcompleteToSend->ReInitMarkComplete();
 		skbImcompleteToSend = NULL;
 		MigrateToNewStateOnCommit();
-		Call<FSP_Urge>();
+		//Call<FSP_Urge>();
 	}
 	// Case 3, there is at least one idle slot to put an EoT packet
-	else if (AppendEoTPacket())
-	{
-		Call<FSP_Urge>();
-	}
+	else { AppendEoTPacket(); }
+	//else if (AppendEoTPacket())
+	//{
+	//	Call<FSP_Urge>();
+	//}
 	// else Case 4.2, the send queue is full and is to append a NULCOMMIT
 	// Case 4: just to wait some buffer ready. See also ProcessPendingSend
 
@@ -859,7 +860,7 @@ int CSocketItemDl::Flush()
 	}
 
 	p->ReInitMarkComplete();
-	Call<FSP_Urge>();
+	// Call<FSP_Urge>();
 	SetMutexFree();
 	return 0;
 }

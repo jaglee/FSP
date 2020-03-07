@@ -175,7 +175,7 @@ void LOCALAPI CLowerInterface::OnGetInitConnect()
 	if (pSocket == NULL || !pSocket->IsPassive())
 		return;
 
-	if (!pSocket->LockWithActiveULA())
+	if (!pSocket->WaitUseMutex())
 		return;
 
 	// control structure, specified the local address (the Application Layer Thread ID part)
@@ -245,7 +245,7 @@ void LOCALAPI CLowerInterface::OnInitConnectAck()
 	if(pSocket == NULL)
 		return;
 
-	if(! pSocket->LockWithActiveULA())
+	if (!pSocket->WaitUseMutex())
 		return;
 
 	SConnectParam & initState = pSocket->pControlBlock->connectParams;
@@ -256,7 +256,7 @@ void LOCALAPI CLowerInterface::OnInitConnectAck()
 
 	if(initState.initCheckCode != pkt->initCheckCode || idListener != pkt->params.idListener)
 		goto l_return;
-	// Remote sink info validated, to regiser validated remote address:
+	// Remote sink info validated, to register validated remote address:
 	// the officially announced IP address of the responder shall be accepted by the initiator
 	memset(initState.allowedPrefixes, 0, sizeof(initState.allowedPrefixes));
 	memcpy(initState.allowedPrefixes, pkt->params.subnets, sizeof(pkt->params.subnets));
@@ -320,7 +320,7 @@ void LOCALAPI CLowerInterface::OnGetConnectRequest()
 	if (pSocket == NULL || !pSocket->IsPassive())
 		return;
 
-	if (!pSocket->LockWithActiveULA())
+	if (!pSocket->WaitUseMutex())
 		return;
 
 	// cf. OnInitConnectAck() and SocketItemEx::AffirmConnect()
@@ -343,8 +343,10 @@ void LOCALAPI CLowerInterface::OnGetConnectRequest()
 	}
 
 	// Simply ignore the duplicated request
-	BackLogItem backlogItem(GetRemoteFiberID(), q->_init.salt);
-	if(pSocket->pControlBlock->backLog.Has(& backlogItem))
+	SItemBackLog backlogItem;
+	backlogItem.idRemote = GetRemoteFiberID();
+	backlogItem.salt = q->_init.salt;
+	if(pSocket->pControlBlock->backLog.Has(backlogItem))
 		goto l_return;
 
 	assert(sizeof(backlogItem.allowedPrefixes) == sizeof(q->params.subnets));
@@ -397,7 +399,7 @@ void LOCALAPI CLowerInterface::OnGetConnectRequest()
 	backlogItem.expectedSN = be32toh(q->initialSN);	// CONNECT_REQUEST does NOT consume a sequence number
 
 	// lastly, put it into the backlog
-	if (pSocket->pControlBlock->backLog.Put(&backlogItem) < 0)
+	if (pSocket->pControlBlock->backLog.Put(backlogItem) < 0)
 	{
 #ifdef TRACE
 		printf_s("Cannot put the connection request into the backlog of the listening session's control block.\n");
@@ -427,16 +429,13 @@ void LOCALAPI CSocketItemEx::OnGetReset(FSP_RejectConnect& reject)
 	printf_s("\nRESET got, in state %s\n\n", stateNames[lowState]);
 #endif
 	// No, we cannot reset a socket without validation
-	if (!LockWithActiveULA())
+	if (!WaitUseMutex())
 		return;
-	if (pControlBlock == NULL)
-		goto l_bailout;
 
-	// LISTENING state is not affected by reset signal
 	switch (lowState)
 	{
+	// LISTENING state is not affected by reset signal
 	case LISTENING:
-		// simply ignore
 		break;
 	case CONNECT_BOOTSTRAP:
 		if (reject.timeStamp == pControlBlock->connectParams.nboTimeStamp
@@ -482,7 +481,7 @@ void LOCALAPI CSocketItemEx::OnGetReset(FSP_RejectConnect& reject)
 	}
 	// ^SHUT_REQUESTED (passive shutdown) or 
 	// ESTABLISHED, COMMITTING, PEER_COMMIT, COMMITTING2, COMMITTED, CLOSABLE, PRE_CLOSED
-l_bailout:
+
 	SetMutexFree();
 }
 
@@ -501,6 +500,8 @@ void CSocketItemEx::HandleFullICC(PktBufferBlock *pktBuf, FSPOperationCode opCod
 		return;
 
 	// Because some service call may recycle the FSP socket in a concurrent way
+	if (pControlBlock == NULL)
+		goto l_return;
 	SyncState();
 	if (lowState <= 0 || lowState > LARGEST_FSP_STATE)
 		goto l_return;
@@ -674,10 +675,7 @@ int CSocketItemEx::ValidateSNACK(ControlBlock::seq_t& ackSeqNo, FSP_SelectiveNAC
 void CSocketItemEx::OnConnectRequestAck()
 {
 	if (!InState(CONNECT_AFFIRMING))
-	{
-		BREAK_ON_DEBUG();
 		return;
-	}
 
 	FSP_NormalPacketHeader& response = *(FSP_NormalPacketHeader*)& headPacket->hdr;
 	if(be32toh(response.expectedSN) != pControlBlock->sendWindowFirstSN)
@@ -917,7 +915,7 @@ void CSocketItemEx::OnGetPersist()
 	int countPlaced = PlacePayload();
 	if (countPlaced == -EFAULT)
 	{
-		Notify(FSP_MemoryCorruption);
+		SignalFirstEvent(FSP_MemoryCorruption);
 		return;
 	}
 	// Make acknowledgement, in case previous acknowledgement is lost
@@ -1124,7 +1122,7 @@ void CSocketItemEx::OnGetPureData()
 	int r = PlacePayload();
 	if (r == -EFAULT)
 	{
-		Notify(FSP_MemoryCorruption);
+		SignalFirstEvent(FSP_MemoryCorruption);
 		return;
 	}
 	if (r == -ENOENT || r == -EEXIST)
@@ -1168,9 +1166,8 @@ bool CSocketItemEx::TransitOnPeerCommit()
 	pControlBlock->SnapshotReceiveWindowRightEdge();
 	if (hasAcceptedRELEASE)
 	{
-		// ULA state to be transited by the call-back function
+		SetState(SHUT_REQUESTED); // See also OnGetRelease
 		Notify(FSP_NotifyToFinish);
-		lowState = CLOSED;
 		SendAckFlush();
 		return false;
 	}
@@ -1237,6 +1234,7 @@ void CSocketItemEx::OnAckFlush()
 	{
 		SetState(CLOSED);
 		Notify(FSP_NotifyToFinish);
+		PutToResurrectable();
 		return;
 	}
 
@@ -1324,10 +1322,12 @@ void CSocketItemEx::OnGetRelease()
 	}
 	else
 	{
-		SendAckFlush();
 		SetState(SHUT_REQUESTED);
+		SendAckFlush();
 	}
 	Notify(FSP_NotifyToFinish);
+	if (lowState == CLOSED)
+		PutToResurrectable();
 }
 
 
@@ -1373,10 +1373,11 @@ void CSocketItemEx::OnGetMultiply()
 	}
 
 	// Make the 'salt' not so easy to guess to defend against DoS attack
-	BackLogItem backlogItem(pControlBlock->connectParams);
+	SItemBackLog backlogItem;
+	memcpy(&backlogItem, &pControlBlock->connectParams, sizeof(SConnectParam));
 	backlogItem.idRemote = idSource;
 	backlogItem.salt = (sn ^ backlogItem.timeDelta);
-	if (pControlBlock->backLog.Has(&backlogItem))
+	if (pControlBlock->backLog.Has(backlogItem))
 	{
 #if defined(TRACE) && (TRACE & TRACE_OUTBAND)
 		printf_s("Duplicate MULTIPLY received, backlogged already.\n");
@@ -1452,7 +1453,7 @@ void CSocketItemEx::OnGetMultiply()
 	newItem->ReplaceTimer(TRANSIENT_STATE_TIMEOUT_ms);
 
 	// Lastly, put it into the backlog. Put it too early may cause race condition
-	if (pControlBlock->backLog.Put(&backlogItem) < 0)
+	if (pControlBlock->backLog.Put(backlogItem) < 0)
 	{
 		REPORT_ERRMSG_ON_TRACE("Cannot put the multiplying connection request into the SCB backlog");
 		CLowerInterface::Singleton.FreeItem(newItem);

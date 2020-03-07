@@ -217,11 +217,11 @@ static int GetSOCKSv4Request(PRequestPoolItem p, SOCKET client = 0)
 static void RejectV4Client(SOCKET client)
 {
 	SRequestResponse_v4 rep;
-	memset(& rep, 0, sizeof(rep));
+	memset(&rep, 0, sizeof(rep));
 	rep.rep = REP_REJECTED;
 
-	int r = send(client, (char *) & rep, sizeof(rep), 0);
-	if(r == SOCKET_ERROR)
+	int r = send(client, (char*)&rep, sizeof(rep), 0);
+	if (r == SOCKET_ERROR)
 	{
 		perror("Response to client, send() failed");
 		closesocket(client);
@@ -369,7 +369,7 @@ void ToServeSOCKS(const char *nameAppLayer, int port)
 			if(r != WSAENOBUFS)
 				break;
 			//
-			Sleep(2000);	// Simply refuse to serve more request for a while if there's no buffer temporily
+			Sleep(50);	// Simply refuse to serve more request for a while if there's no buffer temporarily
 			continue;
 		}
 		//
@@ -490,13 +490,10 @@ static void ReportGeneralError(SOCKET client, PRequestPoolItem) { RejectV4Client
 static void FSPAPI onError(FSPHANDLE h, FSP_ServiceCode code, int value)
 {
 #ifdef TRACE
-	printf_s("Notify: socket %p, service code = %d, return %d\n", h, code, value);
+	printf_s("Notification: socket %p, service code = %d, return %d\n", h, code, value);
 #endif
-	if(h == hClientMaster)
-	{
-		printf_s("Fatal IPC %d, error %d encountered in the session with the tunnel server.\n", code, value);
-		// UNRESOLVED! TODO: force the main loop to abort?
-	}
+	if (value < 0)
+		requestPool.FreeItem(h);
 }
 
 

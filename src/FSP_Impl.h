@@ -33,20 +33,15 @@
 
 #include "FSP.h"
 
-/**
- * Implementation defined timeout
- */
-
 #if defined(__WINDOWS__)
 
 # define WIN32_LEAN_AND_MEAN
 # include <windows.h>
 # include <ws2tcpip.h>
+# include <MSTcpIP.h>
 # include <mswsock.h>
 
 # define _CRT_RAND_S
-# define REVERSE_EVENT_PREFIX	"Global\\FlexibleSessionProtocolEvent"
-# define SERVICE_MAILSLOT_NAME	"\\\\.\\mailslot\\flexible\\session\\protocol"
 
 # ifdef TRACE
    void TraceLastError(const char * fileName, int lineNo, const char *funcName, const char *s1);
@@ -75,6 +70,7 @@
 
 typedef DWORD	pid_t;
 typedef HANDLE	timer_t;
+typedef HANDLE	pthread_t;
 
 # ifdef __MINGW32__
 # define IN4ADDR_LOOPBACK 0x0100007F	// Works for x86 little-endian
@@ -144,7 +140,8 @@ protected:
 # define MAX_LOCK_WAIT_ms			30000	// half a minute
 # define TIMER_SLICE_ms				1		// For HPET
 
-# define IN4ADDR_LOOPBACK	0x0100007F	// Works for x86 little-endian
+// Network byte order of the IPv4 loop back address
+# define IN4ADDR_LOOPBACK	0x0100007F		// works for x86 little-endian
 # define INVALID_SOCKET		(-1)
 
 # define max(a,b)	((a) >= (b) ? (a) : (b))
@@ -163,8 +160,9 @@ protected:
 
 typedef int32_t	DWORD;
 typedef void*	PVOID;
+typedef int		SOCKET;
 
-typedef struct addrinfo*	PADDRINFOA;
+typedef struct addrinfo		ADDRINFOA, *PADDRINFOA;
 typedef struct in6_addr		IN6_ADDR, *PIN6_ADDR;
 typedef struct sockaddr_in  SOCKADDR_IN, *PSOCKADDR_IN;
 typedef struct sockaddr_in6 SOCKADDR_IN6, *PSOCKADDR_IN6;
@@ -214,6 +212,7 @@ protected:
 #define FSP_ALIGNMENT	8
 #define	MAC_ALIGNMENT	16
 
+
 /**
  * For testability
  */
@@ -235,7 +234,6 @@ protected:
 /**
  * IPC
  */
-#define MAX_CTRLBUF_LEN		424	// maximum message passing structure/mailslot size
 #define MAX_NAME_LENGTH		64	// considerably less than MAX_PATH
 
 #ifdef _DEBUG
@@ -308,21 +306,6 @@ extern CStringizeState	stateNames;
 extern CStringizeNotice noticeNames;
 
 
-
-
-
-/**
- * Parameter data-structure and Session Control Block data-structure
- */
-#if defined(_MSC_VER)
-# define LOCALAPI __fastcall
-# include <pshpack1.h>
-#else
-# define LOCALAPI
-# pragma pack(push)
-# pragma pack(1)
-#endif
-
 // Network byte order of the length of the fixed header, where host byte order is little-endian
 #define	FIXED_HEADER_SIZE_BE16		0x1800
 
@@ -345,8 +328,11 @@ extern CStringizeNotice noticeNames;
 	}
 
 
-class CSocketItem;	// forward declaration for sake of declaring CommandToLLS and ControlBlock
+struct CSocketItem;	// forward declaration for sake of declaring CommandToLLS and ControlBlock
 
+
+#pragma pack(push)
+#pragma pack(4)
 
 /**
  * Command to lower layer service
@@ -354,21 +340,19 @@ class CSocketItem;	// forward declaration for sake of declaring CommandToLLS and
  * by exploiting POST-FIX(!) ALIGN(8)
  * Feasible in a little-endian CPU, provided that the structure is pre-zeroed
  */
-struct CommandToLLS
+struct CommandNewSessionCommon
 {
-	ALIGN(8)
-	pid_t			idProcess;
+	FSP_ServiceCode	opCode;
 	ALFID_T			fiberID;
-	FSP_ServiceCode	opCode;	// operation code
+	pid_t			idProcess;
+	uint32_t		dwMemorySize;	// size of the shared memory, in the mapped view
 };
 
 
 
-struct CommandNewSession: CommandToLLS
+struct CommandNewSession: CommandNewSessionCommon
 {
-	uint32_t		dwMemorySize;	// size of the shared memory, in the mapped view
 #if defined(__WINDOWS__)
-	char			szEventName[MAX_NAME_LENGTH];	// name of the callback event
 	uint64_t		hMemoryMap;		// pass to LLS by ULA, should be duplicated by the server
 #elif defined(__linux__) || defined(__CYGWIN__)
 	char			shm_name[MAX_NAME_LENGTH + 8];	// name of the shared memory
@@ -380,19 +364,23 @@ struct CommandNewSession: CommandToLLS
 
 
 
-struct CommandRejectRequest : CommandToLLS
+struct CommandRejectRequest
 {
+	FSP_ServiceCode	opCode;
+	ALFID_T			idToRject;
+	ALFID_T			idParent;
 	uint32_t		reasonCode;
 };
 
 
 
-struct CommandInstallKey : CommandToLLS
+struct CommandInstallKey
 {
-	uint32_t	nextSendSN;	// ControlBlock::seq_t
+	FSP_ServiceCode	opCode;
 	uint64_t	keyLife;
-	octet		ikm[400];	// it is hard-coded to 400 bytes, i.e. 3200 bits
-	CommandInstallKey(uint32_t seq1, uint64_t v) { nextSendSN = seq1; keyLife = v; }
+	// followed by the initial key material
+	// whose length is specified in the connection parameter of the control block
+	CommandInstallKey(uint64_t v) { opCode = FSP_InstallKey; keyLife = v; }
 };
 
 
@@ -401,6 +389,31 @@ struct CommandCloneConnect : CommandNewSession
 {
 	// used to pass 'committing' flag in the command
 };
+
+
+union UCommandToLLS
+{
+	struct CommandCloneConnect	clone;
+	struct CommandNewSession	creation;
+	struct CommandInstallKey	keying;
+	FSP_ServiceCode				opCode;
+};
+
+#pragma pack(pop)
+
+
+
+/**
+* Parameter data-structure and Session Control Block data-structure
+*/
+#if defined(_MSC_VER)
+# define LOCALAPI __fastcall
+# include <pshpack1.h>
+#else
+# define LOCALAPI
+# pragma pack(push)
+# pragma pack(1)
+#endif
 
 
 struct FSP_ADDRINFO_EX : FSP_SINKINF
@@ -456,17 +469,14 @@ struct SConnectParam	// MUST be aligned on 64-bit words!
 
 
 
-struct BackLogItem: SConnectParam
+// Structure of an item for the backlog
+typedef struct SItemBackLog: SConnectParam
 {
 	FSP_ADDRINFO_EX	acceptAddr;		// including the local fiber ID
 	ALFID_T		idParent;
 	//^ 0 if it is the 'root' acceptor, otherwise the local fiber ID of the cloned connection
 	uint32_t	expectedSN;	// the expected sequence number of the packet to receive by order
-	//
-	BackLogItem() { } // default constructor
-	BackLogItem(const SConnectParam & v): SConnectParam(v) { }
-	BackLogItem(ALFID_T id1, uint32_t salt1) { idRemote = id1; salt = salt1; } 
-};
+} *PItemBackLog;
 
 
 
@@ -488,12 +498,7 @@ protected:
 };
 #endif
 
-// 4: The soft interrupt vector of returned notices
-struct LLSNotice
-{
-	volatile char 	nmi;
-	long			vector;
-};
+
 
 class LLSBackLog: public CLightMutex
 {
@@ -504,14 +509,14 @@ class LLSBackLog: public CLightMutex
 	volatile int32_t	tailQ;
 	volatile int32_t	count;
 	//
-	BackLogItem			q[FSP_BACKLOG_SIZE];
+	SItemBackLog		q[FSP_BACKLOG_SIZE];
 
 public:
-	BackLogItem * LOCALAPI FindByRemoteId(ALFID_T, uint32_t);
-	bool Has(const BackLogItem *p) { return FindByRemoteId(p->idRemote, p->salt) != NULL; }
-	BackLogItem * Peek() { return count <= 0 ? NULL : q  + headQ; }
+	PItemBackLog FindByRemoteId(ALFID_T, uint32_t);
+	bool Has(const SItemBackLog& r) { return FindByRemoteId(r.idRemote, r.salt) != NULL; }
+	PItemBackLog Peek() { return count <= 0 ? NULL : q  + headQ; }
 	int Pop();
-	int LOCALAPI Put(const BackLogItem *p);
+	int Put(const SItemBackLog&);
 };
 
 
@@ -526,6 +531,7 @@ public:
 struct ControlBlock
 {
 	FSP_Session_State	state;
+	char			nmi;			// the notice that is equivalent to 'non-maskable interrupt'
 	char			tfrc : 1;		// TCP friendly rate control. By default ECN-friendly
 	char			milky : 1;		// by default 0: a normal wine-style payload assumed. FIFO
 	char			noEncrypt : 1;	// by default 0; 1 if session key installed, encrypt the payload
@@ -555,8 +561,7 @@ struct ControlBlock
 	// 3+: Performance profiling counts
 	CSocketPerformance perfCounts;
 
-	// 4: The queue of returned notices
-	LLSNotice	notices;
+	// 4: The queue of
 	// Backlog for listening/connected socket [for client it could be an alternate of Web Socket]
 	LLSBackLog	backLog;
 
@@ -831,18 +836,21 @@ struct ControlBlock
 };
 
 
-class CSocketItem
+struct CSocketItem
 {
-protected:
 	ALFIDPair	fidPair;
 #if defined(__WINDOWS__)
-	HANDLE	hEvent;
 	HANDLE	hMemoryMap;
-// #elif defined(__linux__) || defined(__CYGWIN__)
 #endif
 	// size of the shared memory, in the mapped view. This implementation make it less than 2GB:
 	int32_t	dwMemorySize;
+	SOCKET	sdPipe;
+	// For IPC via shared memory:
 	ControlBlock *pControlBlock;
+	// For common dual-linked list management:
+	CSocketItem*	next;
+	CSocketItem*	prev;
+
 
 #if defined(__WINDOWS__)
 	void Destroy()
@@ -853,8 +861,10 @@ protected:
 			::UnmapViewOfFile(h);
 		if ((h = InterlockedExchangePointer((PVOID*)&hMemoryMap, NULL)) != NULL)
 			::CloseHandle(h);
-		if ((h = InterlockedExchangePointer((PVOID*)&hEvent, NULL)) != NULL)
-			::CloseHandle(h);
+
+		shutdown((SOCKET)sdPipe, SD_BOTH);
+		closesocket((SOCKET)sdPipe);
+		sdPipe = 0;
 	}
 #elif defined(__linux__) || defined(__CYGWIN__)
 	void Destroy()
@@ -862,6 +872,9 @@ protected:
 		register void* buf;
 		if ((buf = _InterlockedExchangePointer((PVOID*)&pControlBlock, NULL)) != NULL)
 			munmap(buf, dwMemorySize);
+		shutdown(sdPipe, SHUT_RDWR);
+		close(sdPipe);
+		sdPipe = 0;
 	}
 #endif
 };

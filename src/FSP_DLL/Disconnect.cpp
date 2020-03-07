@@ -119,10 +119,10 @@ int  CSocketItemDl::ChainOnCommitted(FSP_ServiceCode c, int v)
 //	For passive/listening socket it releases LLS TCB as well, and to expect NotifyRecycled
 int  CSocketItemDl::Dispose()
 {
-	if (InState(NON_EXISTENT))
+	char u = _InterlockedExchange8(&inUse, 0);
+	if (u == 0 || pControlBlock == NULL)
 		return 0;
 
-	char u = _InterlockedExchange8(&inUse, 0);
 	//^So that WaitUseMutex of other thread could be interrupted
 	timestamp_t t0 = NowUTC();
 	while (!TryMutexLock())
@@ -132,25 +132,8 @@ int  CSocketItemDl::Dispose()
 		Sleep(TIMER_SLICE_ms);
 	}
 
-	// might be redundant, but it does little harm:
-	if (u == 0 || pControlBlock == NULL)
-	{
-		Free();
-		return 0;
-	}
-	inUse = u;
-
-	// A gracefully shutdown socket is resurrect-able
-	if (pControlBlock->state == CLOSED)
-	{
-		RecycLocked();
-		return 0;
-	}
-
-	AddOneShotTimer(DEINIT_WAIT_TIMEOUT_ms);
-	EnableLLSInterrupt();
-	SetMutexFree();
-	return Call<FSP_Reset>() ? 0 : -EIO;
+	Free();
+	return 0;
 }
 
 
@@ -179,9 +162,7 @@ void CSocketItemDl::Free()
 {
 	RecycleSimply();
 	CSocketItem::Destroy();
-	memset((octet*)this + offsetof(CSocketItemDl, context)
-		, 0
-		, sizeof(CSocketItemDl) - offsetof(CSocketItemDl, context));
+	bzero((octet*)this + sizeof(CSocketItem), sizeof(CSocketItemDl) - sizeof(CSocketItem));
 }
 
 
@@ -255,7 +236,7 @@ int CSocketItemDl::Shutdown()
 			if (HasFreeSendBuffer())
 			{
 				BufferData(pendingSendSize);
-				Call<FSP_Urge>();
+				// Call<FSP_Urge>();
 			}
 		}
 		else if (skbImcompleteToSend != NULL)
@@ -267,13 +248,14 @@ int CSocketItemDl::Shutdown()
 			MigrateToNewStateOnCommit();
 			// No, RELEASE packet may not carry payload.
 			AppendEoTPacket(RELEASE);
-			Call<FSP_Urge>();
+			// Call<FSP_Urge>();
 			//^It may or may not be success, but it does not matter
 		}
-		else if (AppendEoTPacket(RELEASE))
-		{
-			Call<FSP_Urge>();
-		}
+		else { AppendEoTPacket(RELEASE); }
+		//else if (AppendEoTPacket(RELEASE))
+		//{
+		//	//Call<FSP_Urge>();
+		//}
 	}
 	//
 	if (s == PEER_COMMIT || s == COMMITTING2)
@@ -294,8 +276,9 @@ int CSocketItemDl::Shutdown()
 	if (s == CLOSABLE)
 	{
 		SetState(PRE_CLOSED);
-		if (IsEoTPending() && AppendEoTPacket(RELEASE))
-			Call<FSP_Urge>();
+		if (IsEoTPending()) AppendEoTPacket(RELEASE);
+		//if (IsEoTPending() && AppendEoTPacket(RELEASE))
+		//	Call<FSP_Urge>();
 		//
 		if (fpFinished != NULL)
 		{

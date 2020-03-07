@@ -40,7 +40,7 @@
 pid_t	CSocketItemDl::idThisProcess = 0;
 
 
-#if defined(__linux__)
+#if defined(__linux__) || defined(__CYGWIN__)
 
 #include <sys/un.h>
 
@@ -50,7 +50,7 @@ static	int sdClient;
 // Called by the default constructor only
 void CSocketDLLTLB::Init()
 {
-	sdClient = socket(AF_UNIX, SOCK_DGRAM, 0); // SOCK_SEQPACKET need listen and accept
+	sdClient = socket(AF_UNIX, SOCK_STREAM, 0);
 	if(sdClient < 0)
 	{
 		perror("Cannot create AF_UNIX socket for sending");
@@ -71,71 +71,6 @@ CSocketDLLTLB::~CSocketDLLTLB()
 	if (sdClient != 0 && sdClient != -1)
 		close(sdClient);
 }
-
-# ifndef _NO_LLS_CALLABLE
-// Given
-//	CommandToLLS &		const, the command context to pass to LLS
-//	int					the size of the command context
-// Return
-//	true if the command has been put in the mailslot successfully
-//	false if it failed
-bool LOCALAPI CSocketItemDl::Call(const CommandToLLS & cmd, int size)
-{
-#ifdef TRACE
-	printf("Fiber#%u %d bytes to send to LLS\n", cmd.fiberID, size);
-#endif
-	int r = (int)sendto(sdClient, &cmd, size, 0, (struct sockaddr*)&addr, sizeof(addr));
-	commandLastIssued = cmd.opCode;
-	if (r < 0)
-		perror("Cannot send the command to LLS through the domain socket");
-	return (r >= 0);
-}
-# endif
-
-#elif defined(__CYGWIN__)
-
-# include <sys/msg.h>
-  ALIGN(sizeof(long long)) const char $_FSP_KEY[8] = "FSP*KEY";
-# define FSP_MQ_KEY      (*(uint64_t *)($_FSP_KEY))
-
-static 	key_t	mqKey;
-static	int		msqid;
-
-// Called by the default constructor only
-void CSocketDLLTLB::Init()
-{
-    mqKey = (key_t)FSP_MQ_KEY;
-    msqid = msgget(mqKey, O_WRONLY);
-    if(msqid < 0)
-    {
-        perror("Cannot abtain the XSI message queue for send");
-        exit(-1);
-    }
-
-	CSocketItemDl::SaveProcessId();
-}
-
-CSocketDLLTLB::~CSocketDLLTLB() { /* no descriptor to close */ }
-
-
-# ifndef _NO_LLS_CALLABLE
-// Given
-//	CommandToLLS &		const, the command context to pass to LLS
-//	int					the size of the command context
-// Return
-//	true if the command has been put in the mailslot successfully
-//	false if it failed
-bool LOCALAPI CSocketItemDl::Call(const CommandToLLS & cmd, int size)
-{
-#ifdef TRACE
-	printf("Fiber#%u %d bytes to send to LLS\n", cmd.fiberID, size);
-#endif
-    int r = msgsnd(msqid, &cmd, size - sizeof(long), IPC_NOWAIT);
-    if(r < 0)
-		perror("Cannot send the command to LLS through the XSI message queue");
-	return (r == 0);
-}
-# endif
 
 #endif
 
@@ -183,6 +118,7 @@ bool CSocketItemDl::InitLLSInterface(CommandNewSession & cmd)
 	}
 	close(hShm);
 	mlock(pControlBlock, dwMemorySize);
+	
 	return true;
 }
 
@@ -191,65 +127,30 @@ bool CSocketItemDl::InitLLSInterface(CommandNewSession & cmd)
 // Given
 //	CommandNewSession	[not used for Linux platform]
 // Do
-//	Enable ULA-LLS interaction, polling mode
+//	Enable ULA-LLS interaction
 // Return
 //	true if no error, false if failed
 bool CSocketItemDl::EnableLLSInteract(CommandNewSession &)
 {
-	struct itimerspec its;
-	struct sigevent sigev;
-	sigev.sigev_notify = SIGEV_THREAD;
-	sigev.sigev_value.sival_ptr = this;	
-	sigev.sigev_notify_function = PollingHandler;
-	sigev.sigev_notify_attributes = NULL;
-	if (timer_create(CLOCK_MONOTONIC, &sigev, &pollingTimer) != 0)
+	struct sockaddr_un addr;
+	sdPipe = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (sdPipe < 0)
 	{
-		perror("Cannot create the polling timer");
-		return false;
-	}
-	timeOut_ns = INT64_MAX;
-
-	// Here we wait at least three timer slices to make sure other initialization is ready
-	// assume timer-slice is less than one third of a second.
-	its.it_value.tv_sec = 0;
-	its.it_value.tv_nsec = TIMER_SLICE_ms * 3000000;
-	its.it_interval.tv_sec = 0;
-	its.it_interval.tv_nsec = POLLING_INTERVAL_MICROSECONDS * 1000;
-
-	if (timer_settime(pollingTimer, 0, &its, NULL) != 0)
-	{
-		perror("Cannot set the polling timer");
-		timer_delete(pollingTimer);
+		REPORT_ERRMSG_ON_TRACE("Cannot create the socket to communicate with LLS");
 		return false;
 	}
 
-	timeOut_ns = int64_t(TRANSIENT_STATE_TIMEOUT_ms) * 1000000;
-	return true;
-}
+	addr.sun_family = AF_UNIX;
+	strncpy(addr.sun_path, SERVICE_SOCKET_PATH, sizeof(addr.sun_path) - 1);
+	addr.sun_path[sizeof(addr.sun_path) - 1] = 0;
+    if (connect(sdPipe, (const sockaddr*)&addr, sizeof(struct sockaddr_un)) < 0)
+    {
+		SOCKET h = _InterlockedExchange(&sdPipe, INVALID_SOCKET);
+		close(h);
+		return false;
+    }
 
-
-
-// The actual polling timer handler
-void CSocketItemDl::WaitOrTimeOutCallBack()
-{
-	timer_t h = LCKREAD(pollingTimer);
-	if (h == 0)
-		return;
-	// The timer might have been 'RecycleSimply', and it causes segment fault
-	// on calling timer_getoverrun given timer id 0
-	int32_t elapsed = (int32_t)timer_getoverrun(h);
-	if(elapsed++ < 0)	// but it should not happen!
-		elapsed = 1;
-	// assume it would not overflow: overrun for 24 days is just too terriable!
-	elapsed *= POLLING_INTERVAL_MICROSECONDS * 1000;
-#ifdef TRACE
-	if(timeOut_ns <= elapsed)
-		printf("It is to time out, time remains = %" PRId64 "ns, elapsed = %dns\n", timeOut_ns, elapsed);
-#endif
-	if((timeOut_ns -= elapsed) <= 0)
-		TimeOut();
-	else
-		WaitEventToDispatch();
+	return (pthread_create(&hThreadWait, NULL, NoticeHandler, this) == 0);
 }
 
 
@@ -263,9 +164,31 @@ void CSocketItemDl::WaitOrTimeOutCallBack()
 //	Only support multiple of thousand milliseconds.
 bool LOCALAPI CSocketItemDl::AddOneShotTimer(uint32_t dueTime)
 {
-	if(pollingTimer == 0)
+	struct itimerspec its;
+	struct sigevent sigev;
+	sigev.sigev_notify = SIGEV_THREAD;
+	sigev.sigev_value.sival_ptr = this;	
+	sigev.sigev_notify_function = TimeOutHandler;
+	sigev.sigev_notify_attributes = NULL;
+	if (timer_create(CLOCK_MONOTONIC, &sigev, &timer) != 0)
+	{
+		perror("Cannot create the polling timer");
 		return false;
-	timeOut_ns = int64_t(dueTime) * 1000000;
+	}
+
+	its.it_value.tv_sec = dueTime / 1000;
+	its.it_value.tv_nsec = (dueTime % 1000) * 1000000;
+	its.it_interval.tv_sec = 0;
+	its.it_interval.tv_nsec = 0;
+
+	if (timer_settime(timer, 0, &its, NULL) != 0)
+	{
+		perror("Cannot set the polling timer");
+		timer_delete(timer);
+		timer = 0;
+		return false;
+	}
+
 	return true;
 }
 
@@ -277,8 +200,8 @@ bool LOCALAPI CSocketItemDl::AddOneShotTimer(uint32_t dueTime)
 //	true for this implementation
 bool CSocketItemDl::CancelTimeout()
 {
-	timeOut_ns = INT64_MAX;
-	return true;
+	timer_t h = _InterlockedExchange(&timer, 0);
+	return (h != 0 && timer_delete(h) == 0);
 }
 
 #endif

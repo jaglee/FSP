@@ -6,26 +6,21 @@ typedef ControlBlock * PControlBlock;
 class CSocketItemExDbg: public CSocketItemEx
 {
 public:
-	CSocketItemExDbg()
-	{
-		int32_t ss = MAX_BLOCK_SIZE * 2;
-		int32_t sr = MAX_BLOCK_SIZE * 2;
-		memset(this, 0, sizeof(CSocketItemEx));
-		dwMemorySize = sizeof(ControlBlock) + (sizeof(ControlBlock::FSP_SocketBuf) + MAX_BLOCK_SIZE) * 8;
-		pControlBlock = (ControlBlock *)malloc(dwMemorySize);
-		pControlBlock->Init(ss, sr);
-	};
-
-	CSocketItemExDbg(int nSend, int nRecv)
+	int Init(int nSend, int nRecv)
 	{
 		memset(this, 0, sizeof(CSocketItemEx));
-		dwMemorySize = sizeof(ControlBlock) + (sizeof(ControlBlock::FSP_SocketBuf) + MAX_BLOCK_SIZE) * (nSend + nRecv);
-		pControlBlock = (ControlBlock *)malloc(dwMemorySize);
+		//
+		dwMemorySize = (int32_t)sizeof(ControlBlock)
+			+ int32_t(sizeof(ControlBlock::FSP_SocketBuf) + MAX_BLOCK_SIZE) * (nSend + nRecv);
+		pControlBlock = (ControlBlock*)malloc(dwMemorySize);
+		if (pControlBlock == NULL)
+			return -ENOMEM;
 		//
 		nSend *= MAX_BLOCK_SIZE;
 		nRecv *= MAX_BLOCK_SIZE;
-		pControlBlock->Init(nSend, nRecv);
-	};
+		return pControlBlock->Init(nSend, nRecv);
+	}
+	CSocketItemExDbg(int nSend = 2, int nRecv = 2) { Init(nSend, nRecv); };
 
 	~CSocketItemExDbg()
 	{
@@ -33,6 +28,7 @@ public:
 	}
 
 	void SetState(FSP_Session_State s) { CSocketItemEx::SetState(s); }
+	void SetLowState(FSP_Session_State s) { lowState = s; }
 	bool NotInStates(FSP_Session_State first, FSP_Session_State second)
 	{
 		return lowState != first && lowState != second;
@@ -49,20 +45,30 @@ public:
 
 	PControlBlock GetControlBlock() const { return PControlBlock(pControlBlock); }
 	ControlBlock::PFSP_SocketBuf AllocRecvBuf(ControlBlock::seq_t seq1) { return pControlBlock->AllocRecvBuf(seq1); }
-	void InstallSessionKey(BYTE key[FSP_MIN_KEY_SIZE])
+
+	// Note that the first packet to apply the new session key is always the one buffered next
+	void InstallSessionKey(BYTE ikm[FSP_MIN_KEY_SIZE])
 	{
-		CommandInstallKey cmd(pControlBlock->sendBufferNextSN, INT32_MAX);
-		memcpy(cmd.ikm, key, FSP_MIN_KEY_SIZE);
+		CommandInstallKey cmd(INT32_MAX);
 		pControlBlock->connectParams.keyBits = FSP_MIN_KEY_SIZE * 8;
 		pControlBlock->SnapshotReceiveWindowRightEdge();
-		CSocketItemEx::InstallSessionKey(cmd);
+
+		// CSocketItemEx::InstallSessionKey(cmd); ::
+		contextOfICC.isPrevSendCRC = contextOfICC.isPrevRecvCRC
+			= (InterlockedExchange64((int64_t*)&contextOfICC.keyLifeRemain, cmd.keyLife) == 0);
+		contextOfICC.noEncrypt = (pControlBlock->noEncrypt != 0);
+		contextOfICC.snFirstSendWithCurrKey = pControlBlock->sendBufferNextSN;
+		contextOfICC.snFirstRecvWithCurrKey = pControlBlock->connectParams.nextKey$initialSN;
+		contextOfICC.InitiateExternalKey(ikm, FSP_MIN_KEY_SIZE);
 	}
+
 	void SetPairOfFiberID(ALFID_T src, ALFID_T dst) { fidPair.source = src; fidPair.peer = dst; }
 	void SetParentProcess() { idSrcProcess = GetCurrentProcessId(); }
 
 	// For test algorithm for generating KEEP_ALIVE packet in timer.cpp
 	int32_t LOCALAPI GenerateSNACK(FSP_KeepAliveExtension&);
 
+	friend void UnitTestAllocSocket();
 	friend void UnitTestSocketRTLB();
 	friend void UnitTestICC();
 	friend void UnitTestHMAC();
