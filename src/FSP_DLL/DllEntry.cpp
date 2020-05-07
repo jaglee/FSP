@@ -52,21 +52,25 @@
 
 #pragma comment(lib, "Ws2_32.lib")
 
-DWORD	CSocketItemDl::idThisProcess = 0;	// the id of the process that attaches this DLL
 
 void CSocketDLLTLB::Init() { }
 CSocketDLLTLB::~CSocketDLLTLB() {}
 
-static HANDLE		timerQueue;	// = NULL;
+static DWORD		idThisProcess;	// the id of the process that attaches this DLL
+static HANDLE		timerQueue;		// = NULL;
+static pthread_t	hThreadWait;
 
 static void AllowDuplicateHandle();
+static bool CreateExecUnitPool();
+static void DestroyExecUnitPool();
 
 
 extern "C" 
 BOOL WINAPI DllMain(HINSTANCE hInstance, DWORD dwReason, LPVOID lpvReserved)
 {
+	SOCKET& sdPipe = CSocketItemDl::sdPipe;
 	// to maintain thread local storage
-	if(dwReason == DLL_PROCESS_ATTACH)
+	if (dwReason == DLL_PROCESS_ATTACH)
 	{
 		WSADATA wsaData;
 		// initialize windows socket support
@@ -78,12 +82,64 @@ BOOL WINAPI DllMain(HINSTANCE hInstance, DWORD dwReason, LPVOID lpvReserved)
 #ifdef TRACE
 		AllocConsole();
 #endif
-		CSocketItemDl::SaveProcessId();
 		timerQueue = CreateTimerQueue();
+		if (timerQueue == NULL)
+		{
+			REPORT_ERRMSG_ON_TRACE("Cannot create the timer queue for repetitive tasks");
+			return false;
+		}
+
+		sdPipe = socket(AF_INET, SOCK_STREAM, 0);
+		if (sdPipe < 0)
+		{
+			REPORT_ERRMSG_ON_TRACE("Cannot create the socket to communicate with LLS");
+			DeleteTimerQueueEx(timerQueue, NULL);
+			return FALSE;
+		}
+
+		struct sockaddr_in addr;
+		addr.sin_family = AF_INET;
+		addr.sin_port = htobe16(DEFAULT_FSP_UDPPORT);
+		addr.sin_addr.S_un.S_addr = IN4ADDR_LOOPBACK;
+		memset(addr.sin_zero, 0, sizeof(addr.sin_zero));
+		if (connect(sdPipe, (const sockaddr*)&addr, sizeof(struct sockaddr_in)) < 0)
+		{
+l_bailout:
+			DeleteTimerQueueEx(timerQueue, NULL);
+			closesocket(sdPipe);
+			sdPipe = INVALID_SOCKET;
+			return FALSE;
+		}
+
+		DWORD optval = 1;
+		setsockopt(sdPipe, IPPROTO_TCP, TCP_NODELAY, (const char*)&optval, sizeof(optval));
+		setsockopt(sdPipe, SOL_SOCKET, SO_DONTLINGER, (const char*)&optval, sizeof(optval));
+
+		if (!CreateExecUnitPool())
+			goto l_bailout;
+
+		hThreadWait = CreateThread(NULL // LPSECURITY_ATTRIBUTES, get a default security descriptor inherited
+			, 0							// dwStackSize, uses the default size for the executables
+			, CSocketItemDl::WaitNoticeCallBack		// LPTHREAD_START_ROUTINE
+			, CSocketItemDl::headOfInUse			// LPVOID lpParameter
+			, 0			// DWORD dwCreationFlags: run on creation
+			, NULL);	// LPDWORD lpThreadId, not returned here.
+		if (hThreadWait == NULL)
+		{
+			REPORT_ERRMSG_ON_TRACE("Cannot create the thread to handle communication with LLS");
+			DestroyExecUnitPool();
+			goto l_bailout;
+		}
+
+		idThisProcess = GetCurrentProcessId();
 	}
-	else if(dwReason == DLL_PROCESS_DETACH)
+	else if (dwReason == DLL_PROCESS_DETACH)
 	{
 		DeleteTimerQueueEx(timerQueue, NULL);
+		TerminateThread(hThreadWait, 0);
+		DestroyExecUnitPool();
+		shutdown(sdPipe, SD_BOTH);
+		closesocket(sdPipe);
 		WSACleanup();
 	}
 	//
@@ -107,14 +163,11 @@ timestamp_t NowUTC()
 
 
 
-
-// Given
-//	CommandNewSession	: not cared on Windows Platform
 // Do
 //	Initialize the IPC structure to call LLS
 // Return
 //	true if no error, false if failed
-bool CSocketItemDl::InitLLSInterface(CommandNewSession& cmd)
+bool CSocketItemDl::InitSharedMemory()
 {
 	hMemoryMap = CreateFileMapping(INVALID_HANDLE_VALUE	// backed by the system paging file
 		, NULL	// not inheritable
@@ -144,88 +197,36 @@ bool CSocketItemDl::InitLLSInterface(CommandNewSession& cmd)
 
 
 
-// Given
-//	CommandNewSession	[_inout_]	the buffer to hold the name of the event
-// Do
-//	Enable the interface to call and be called back by LLS
-// Return
-//	true if no error, false if failed
-bool CSocketItemDl::EnableLLSInteract(CommandNewSession& cmd)
+void CSocketItemDl::CopyFatMemPointo(CommandNewSession& cmd)
 {
-	struct sockaddr_in addr;
-	sdPipe = socket(AF_INET, SOCK_STREAM, 0);
-	if (sdPipe < 0)
-	{
-		REPORT_ERRMSG_ON_TRACE("Cannot create the socket to communicate with LLS");
-		return false;
-	}
-
-	addr.sin_family = AF_INET;
-	addr.sin_port = htobe16(DEFAULT_FSP_UDPPORT);
-	addr.sin_addr.S_un.S_addr = IN4ADDR_LOOPBACK;
-	memset(addr.sin_zero, 0, sizeof(addr.sin_zero));
-    if (connect(sdPipe, (const sockaddr*)&addr, sizeof(struct sockaddr_in)) < 0)
-    {
-l_abort:
-		closesocket(sdPipe);
-		sdPipe = INVALID_SOCKET;
-		return false;
-    }
-
-	DWORD optval = 1;
-	setsockopt(sdPipe, IPPROTO_TCP, TCP_NODELAY, (const char*)&optval, sizeof(optval));
-	setsockopt(sdPipe, SOL_SOCKET, SO_DONTLINGER, (const char*)&optval, sizeof(optval));
-
-	hThreadWait = CreateThread(NULL // LPSECURITY_ATTRIBUTES, get a default security descriptor inherited
-		, 0							// dwStackSize, uses the default size for the executables
-		, WaitNoticeCallBack		// LPTHREAD_START_ROUTINE
-		, this		// LPVOID lpParameter
-		, 0			// DWORD dwCreationFlags: run on creation
-		, NULL);	// LPDWORD lpThreadId, not returned here.
-	if (hThreadWait == NULL)
-	{
-		REPORT_ERROR_ON_TRACE();
-		goto l_abort;
-	}
-
-#ifdef TRACE
-	printf_s("ID of current process is %d, handle of the socket pipe is %d\n", idThisProcess, sdPipe);
-#endif
-
-	return AddOneShotTimer(TRANSIENT_STATE_TIMEOUT_ms);
+	cmd.hMemoryMap = (uint64_t)hMemoryMap;
+	cmd.idProcess = idThisProcess;
+	cmd.dwMemorySize = dwMemorySize;
 }
 
 
 
+
 // Given
-//	uint32_t		number of milliseconds to wait till the timer shoot
+//	uint32_t		number of milliseconds to wait till the timer shoots for the first time
 // Return
-//	true if the one-shot timer is registered successfully
+//	true if the timer is registered successfully
 //	false if it failed
-bool LOCALAPI CSocketItemDl::AddOneShotTimer(uint32_t dueTime)
+bool CSocketItemDl::AddTimer(uint32_t dueTime)
 {
 	return ((timer == NULL && ::CreateTimerQueueTimer(& timer, ::timerQueue
 			, TimeOutCallBack
 			, this		// LPParameter
 			, dueTime
-			, 0
+#ifdef TRACE
+			, 8000		// for convenience of debugging
+#else
+			, TIMER_SLICE_ms
+#endif
 			, WT_EXECUTEINTIMERTHREAD
 			) != FALSE)
-		|| (timer != NULL && ::ChangeTimerQueueTimer(::timerQueue, timer, dueTime, 0) != FALSE)
+		|| (timer != NULL && ::ChangeTimerQueueTimer(::timerQueue, timer, dueTime, TIMER_SLICE_ms) != FALSE)
 		);
-}
-
-
-
-// Do
-//	Try to cancel the registered one-shot timer
-// Return
-//	true if the one-shot timer is successfully canceled
-//	false if it failed
-bool CSocketItemDl::CancelTimeout()
-{
-	HANDLE h = (HANDLE)InterlockedExchangePointer((PVOID*)&timer, NULL);
-	return (h == NULL || ::DeleteTimerQueueTimer(::timerQueue, h, NULL) != FALSE);
 }
 
 
@@ -341,4 +342,67 @@ void TraceLastError(const char * fileName, int lineNo, const char *funcName, con
 		, NULL);
 	if(buffer[0] != 0)
 		puts(buffer);
+}
+
+
+
+/**
+ * Implementation dependent: thread pool to handle soft interrupt of LLS 
+ */
+static TP_CALLBACK_ENVIRON	envCallBack;
+static PTP_POOL				pool;	// = NULL;
+static PTP_CLEANUP_GROUP	cleanupgroup; // = NULL;
+
+static bool CreateExecUnitPool()
+{
+	//FILETIME FileDueTime;
+	//ULARGE_INTEGER ulDueTime;
+	//PTP_TIMER timer = NULL;
+	BOOL bRet = FALSE;
+
+	InitializeThreadpoolEnvironment(&envCallBack);
+	pool = CreateThreadpool(NULL);
+	if (pool == NULL)
+	{
+		printf_s("CreateThreadpool failed. LastError: %u\n", GetLastError());
+		return false;
+	}
+
+	SetThreadpoolThreadMaximum(pool, MAX_WORKING_THREADS);
+	bRet = SetThreadpoolThreadMinimum(pool, 1);
+	if (!bRet)
+	{
+		printf_s("SetThreadpoolThreadMinimum failed. LastError: %d\n", GetLastError());
+		CloseThreadpool(pool);
+		return false;
+	}
+
+	cleanupgroup = CreateThreadpoolCleanupGroup();
+	if (cleanupgroup == NULL)
+	{
+		printf_s("CreateThreadpoolCleanupGroup failed. LastError: %d\n", GetLastError());
+		CloseThreadpool(pool);
+		return false;
+	}
+
+	SetThreadpoolCallbackPool(&envCallBack, pool);
+	SetThreadpoolCallbackCleanupGroup(&envCallBack, cleanupgroup, NULL);
+
+	return true;
+}
+
+
+static void DestroyExecUnitPool()
+{
+	if (cleanupgroup == NULL)
+		return;
+	CloseThreadpoolCleanupGroupMembers(cleanupgroup, FALSE, NULL);
+	CloseThreadpoolCleanupGroup(cleanupgroup);
+}
+
+
+bool CSocketItemDl::CreateNoticeHandler()
+{
+	pwk = CreateThreadpoolWork(ProcessNVCallBack, (PVOID)this, &envCallBack);
+	return (pwk != NULL);
 }

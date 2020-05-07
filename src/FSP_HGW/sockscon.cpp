@@ -419,8 +419,8 @@ TpWorkCallBack(PTP_CALLBACK_INSTANCE Instance, PVOID parameter, PTP_WORK Work)
 	int n = GetSOCKSv4Request(p, client);
 	if(n <= 0)
 	{
-		requestPool.FreeItem(p);
 		RejectV4Client(client);
+		requestPool.FreeItem(p);
 		return;
 	}
 
@@ -436,11 +436,11 @@ TpWorkCallBack(PTP_CALLBACK_INSTANCE Instance, PVOID parameter, PTP_WORK Work)
 	parms.len = (unsigned short)n;
 	parms.extentI64ULA = (ULONG_PTR)p;
 	//
-	FSPHANDLE h = MultiplyAndWrite(hClientMaster, & parms, TO_END_TRANSACTION, onSubrequestSent);
-	if(h == NULL)
+	p->hFSP = MultiplyAndWrite(hClientMaster, & parms, TO_END_TRANSACTION, onSubrequestSent);
+	if(p->hFSP == NULL)
 	{
-		requestPool.FreeItem(p);
 		RejectV4Client(client);
+		requestPool.FreeItem(p);
 	}
 }
 
@@ -648,7 +648,7 @@ static void FSPAPI onSubrequestSent(FSPHANDLE h, FSP_ServiceCode c, int value)
 		return;
 	}
 	//
-	p->hFSP = h;
+	p->hFSP = h;	// In case this function was called back before MultiplyAndWrite return
 	if (SetOnRelease(h, onRelease) < 0
 	 || RecvInline(h, onFSPDataAvailable) < 0
 	 || GetSendBuffer(h, toReadTCPData) < 0)

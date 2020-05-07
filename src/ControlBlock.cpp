@@ -73,7 +73,7 @@ const char * CStringizeState::names[LARGEST_FSP_STATE + 1] =
 	// before getting ACK_CONNECT_REQ, timeout to retry or NON_EXISTENT
 	"CONNECT_AFFIRMING",
 	// after getting legal CONNECT_REQUEST and sending back ACK_CONNECT_REQ
-	// before getting ACK_START or first PERSIST. timeout to NON_EXISTENT:
+	// before getting first NULCOMMIT or PERSIST. timeout to NON_EXISTENT:
 	"CHALLENGING",
 	// context cloned by MultiplyAndWrite or MultiplyAndGetSendBuffer:
 	"CLONING",
@@ -105,8 +105,8 @@ const char * CStringizeNotice::names[LARGEST_FSP_NOTICE + 1] =
 	// 1~7
 	"FSP_NotifyListening",	// a reverse command to signal success execution of FSP_Listen
 	"FSP_NotifyAccepting",	// a reverse command to make context ready
-	"FSP_NotifyMultiplied",	// a reverse command to inform DLL to accept a multiply request
 	"FSP_NotifyAccepted",
+	"FSP_NotifyMultiplied",	// a reverse command to inform DLL to accept a multiply request
 	"FSP_NotifyDataReady",
 	"FSP_NotifyBufferReady",
 	"FSP_NotifyToCommit",
@@ -114,6 +114,7 @@ const char * CStringizeNotice::names[LARGEST_FSP_NOTICE + 1] =
 	"FSP_NotifyFlushed",
 	"FSP_NotifyToFinish",
 	"FSP_NameResolutionFailed",
+	"FSP_IPC_Failure",
 	"FSP_MemoryCorruption",
 	"FSP_NotifyReset",
 	"FSP_NotifyTimeout",
@@ -520,11 +521,8 @@ ControlBlock::PFSP_SocketBuf LOCALAPI ControlBlock::AllocRecvBuf(seq_t seq1)
 //	However, it is not meant to be thoroughly idempotent in the sense that
 //	receive buffers that have been inquired may not be delivered by ReadFrom
 //	If the returned value is NULL, stored in int & [_Out_] is the error number
-//	-EACCES		the buffer space is corrupted and unaccessible
 //	-EPIPE		it is a compressed stream and ULA should receive in pipe mode
-//	-EFAULT		the descriptor is corrupted (illegal payload length:
-//				payload length of an intermediate packet of a message should be MAX_BLOCK_SIZE,
-//				payload length of any packet should be no less than 0 and no greater than MAX_BLOCK_SIZE)
+//	-EFAULT		the buffer space is corrupted and unaccessible
 //	-EPERM		non-conforming to the protocol, shall be prohibited
 octet* LOCALAPI ControlBlock::InquireRecvBuf(int32_t& nIO, int32_t& nBlock, bool& eotFlag)
 {
@@ -533,7 +531,7 @@ octet* LOCALAPI ControlBlock::InquireRecvBuf(int32_t& nIO, int32_t& nBlock, bool
 	eotFlag = false;
 	if (tail > recvBufferBlockN)
 	{
-		nIO = -EACCES;	// -13
+		nIO = -EFAULT;
 		return NULL;
 	}
 
@@ -546,7 +544,7 @@ octet* LOCALAPI ControlBlock::InquireRecvBuf(int32_t& nIO, int32_t& nBlock, bool
 	PFSP_SocketBuf p = GetFirstReceived();
 	if (p->GetFlag<Compressed>())
 	{
-		nIO = -EPIPE;	// -33
+		nIO = -EPIPE;	// -32
 		return NULL;
 	}
 
@@ -777,7 +775,7 @@ int LOCALAPI ControlBlock::DealWithSNACK(seq_t expectedSN, FSP_SelectiveNACK::Ga
 // Return
 //	true if the last packet in the queue is a packet with EoT flag set
 //	false if otherwise
-bool ControlBlock::HasBeenCommitted()
+bool ControlBlock::PeerCommitted()
 {
 	register int32_t d = int32_t(recvWindowExpectedSN - recvWindowNextSN); 	// there should be no gap
 	if (d != 0)
@@ -802,11 +800,11 @@ bool ControlBlock::HasBeenCommitted()
 int ControlBlock::DumpSendRecvWindowInfo() const
 {
 	return printf_s("\tSend[head, tail] = [%d, %d], packets on flight = %d\n"
-		"\tSN next to send = %u(@%d)\n"
+		"\tSN next to send = %u(@%d), latest buffered = %u, \n"
 		"\tRecv[head, tail] = [%d, %d]\n"
 		"\tSN first received = %u, max expected = %u, deliverable width = %d\n"
 		, sendWindowHeadPos, sendBufferNextPos, int(sendWindowNextSN - sendWindowFirstSN)
-		, sendWindowNextSN, sendWindowNextPos
+		, sendWindowNextSN, sendWindowNextPos, sendBufferNextSN
 		, recvWindowHeadPos, recvWindowNextPos
 		, recvWindowFirstSN, recvWindowExpectedSN, int(recvWindowNextSN - recvWindowFirstSN));
 }

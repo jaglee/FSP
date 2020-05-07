@@ -38,20 +38,8 @@
 //	[S get the shared secret][hmac_sm3(salted_password, Curve25519-shared secret)]
 // UNERSOLVED! Put client's identity for hashing? [/Signature: certificate is out-of-band]
 // Not bothered to apply RFC8018 PKCS #5: Password-Based Cryptography Specification
-#include <Windows.h>
-#include <stdlib.h>
-#include <stdio.h>
-#include <string.h>
-#include <io.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <share.h>
-
-#include "../FSP_API.h"
+#include "stdafx.h"
 #include "../Crypto/CHAKA.h"
-
-// Forward declaration of an auxiliary function
-int ReportLastError();
 
 const char *	theUserId = "FSP_Sciter";
 
@@ -62,7 +50,7 @@ const char *	theUserId = "FSP_Sciter";
 static octet bufSharedKey[CRYPTO_NACL_KEYBYTES];
 ALIGN(8)
 static SCHAKAPublicInfo chakaPubInfo;
-static unsigned char bufPrivateKey[CRYPTO_NACL_KEYBYTES];
+static octet bufPrivateKey[CRYPTO_NACL_KEYBYTES];
 
 // Forward declarations
 static int	FSPAPI onConnected(FSPHANDLE, PFSP_Context);
@@ -74,23 +62,12 @@ static void FSPAPI onAcknowledgeSent(FSPHANDLE, FSP_ServiceCode, int);
 // an internal function to parsing each memory segment received 'inline'
 static int ParseBlock(octet *, int32_t);
 
-static bool finished;
-
-// dispose/recycle resource
-static void finalize()
-{
-	finished = true;
-	// TODO: further per-process clean-up works here!
-}
-
-
 
 // The call back function on exception notified. Just report error and simply abort the program.
 static void FSPAPI onError(FSPHANDLE h, FSP_ServiceCode code, int value)
 {
 	printf_s("Notify: socket %p, service code = %d, return %d\n", h, code, value);
 	finalize();
-	return;
 }
 
 
@@ -112,7 +89,7 @@ int ToAcceptPushedDirectory(char *remoteAppURL)
 		return -1;
 	}
 
-	while(!finished)
+	while (!finished || !r2finish)
 		Sleep(50);	// yield CPU out for about 1/20 second
 
 	return 0;
@@ -200,6 +177,7 @@ static void FSPAPI onServerResponseReceived(FSPHANDLE h, FSP_ServiceCode c, int 
 	if(! CHAKAResponseByClient(chakaPubInfo, clientInputHash, clientResponse))
 	{
 		Dispose(h);
+		finalize();
 		return;
 	}
 
@@ -210,6 +188,11 @@ static void FSPAPI onServerResponseReceived(FSPHANDLE h, FSP_ServiceCode c, int 
 	memset(bufSharedKey, 0, CRYPTO_NACL_KEYBYTES);
 	memset(bufPrivateKey, 0, CRYPTO_NACL_KEYBYTES);
 
+	if (toAcceptFile)
+	{
+		StartAcceptFile(h);
+		return;
+	}
 	// The server side write with the stream mode, while the client side read with block buffer mode
 	printf_s("\nTo read file list...\n");
 	RecvInline(h, onReceiveNextBlock);
@@ -217,31 +200,9 @@ static void FSPAPI onServerResponseReceived(FSPHANDLE h, FSP_ServiceCode c, int 
 
 
 
-static char strStrings[1200];	// arbitrary size for test only
-static void FSPAPI onStringsRead(FSPHANDLE h, FSP_ServiceCode code, int len)
-{
-	if(len < 0)
-	{
-		printf_s("onStringsRead get call back parameter value %d\n", len);
-		Dispose(h);
-		return;
-	}
-
-	ParseBlock((octet *)strStrings, len);
-	
-	if (!HasReadEoT(h))
-	{
-		ReadFrom(h, strStrings, (int)sizeof(strStrings), onStringsRead);
-		return;
-	}
-	//
-	printf_s("All data have been received, to acknowledge...\n");
-	WriteTo(h, "0000", 4, TO_END_TRANSACTION, onAcknowledgeSent);
-}
-
-
 static void SynchronousRead(FSPHANDLE h)
 {
+	char strStrings[1200];	// arbitrary size for test only
 	int len;
 	do
 	{
@@ -252,8 +213,6 @@ static void SynchronousRead(FSPHANDLE h)
 			printf_s("In SynchronousRead, ReadFrom() return %d\n", len);
 	} while (len > 0 && !HasReadEoT(h));
 	//
-	//FSPControl(h, FSP_GET_PEER_COMMITTED, (ulong_ptr) & len);
-	//assert(len != 0);
 	printf_s("All data have been received, to acknowledge...\n");
 	WriteTo(h, "0000", 4, TO_END_TRANSACTION, onAcknowledgeSent);
 }
@@ -266,7 +225,7 @@ static bool FSPAPI onReceiveNextBlock(FSPHANDLE h, void *buf, int32_t len, bool 
 {
 	if(len == -EPIPE)
 	{
-		printf_s("It cannot be asynchronous read inlined. Change to blocking-mode stream read.\n");
+		printf_s("It cannot be asynchronously read. Change to blocking-mode stream read.\n");
 		SynchronousRead(h);
 		return false;
 	}
@@ -275,6 +234,7 @@ static bool FSPAPI onReceiveNextBlock(FSPHANDLE h, void *buf, int32_t len, bool 
 	{
 		printf_s("FSP Internal panic? Receive nothing when calling the CallbackPeeked? Error code = %d\n", len);
 		Dispose(h);
+		finalize();
 		return false;
 	}
 
@@ -379,6 +339,7 @@ static void FSPAPI onAcknowledgeSent(FSPHANDLE h, FSP_ServiceCode c, int r)
 	if(r < 0)
 	{
 		Dispose(h);
+		finalize();
 		return;
 	}
 

@@ -37,6 +37,7 @@
 // Register a passive FSP socket
 // Given
 //	CommandNewSessionSrv&	the command context given by ULA
+//	SProcessRoot&			root of the ULA's kinship tree 
 // Do
 //	Register a listening FSP socket at the specific application layer fiberID
 // Remark
@@ -44,7 +45,7 @@
 //	The notice queue of the command context is preset to FSP_IPC_CannotReturn
 //	If 'Listen' succeeds the notice will be replaced by FSP_NotifyListening
 //	or else LLS triggers the upper layer DLL to handle the preset notice
-CSocketItemEx * LOCALAPI Listen(const CommandNewSessionSrv& cmd)
+CSocketItemEx * LOCALAPI Listen(const CommandNewSessionSrv& cmd, SProcessRoot& r)
 {
 	CSocketItemEx* socketItem = CLowerInterface::Singleton.AllocItem(cmd.fiberID);
 	if (socketItem == NULL)
@@ -59,6 +60,7 @@ CSocketItemEx * LOCALAPI Listen(const CommandNewSessionSrv& cmd)
 		goto l_bailout2;
 	}
 
+	socketItem->AddKinshipTo(r);
 	socketItem->Listen();
 	return socketItem;
 
@@ -72,6 +74,7 @@ l_bailout2:
 // Register an initiative FSP socket
 // Given
 //	CommandNewSessionSrv&	the command context given by ULA
+//	SProcessRoot&			root of the ULA's kinship tree
 // Do
 //	Map the command context and put the connect request into the queue
 //	LLS try to make the connection request to the remote end in the queued thread
@@ -80,7 +83,7 @@ l_bailout2:
 //	The notice queue of the command context is preset to FSP_IPC_CannotReturn
 //	If the function succeeds the notice will be replaced by FSP_NotifyListening
 //	or else LLS triggers the upper layer DLL to handle the preset notice
-CSocketItemEx * LOCALAPI Connect(const CommandNewSessionSrv& cmd)
+CSocketItemEx * LOCALAPI Connect(const CommandNewSessionSrv& cmd, SProcessRoot& r)
 {
 	CSocketItemEx* socketItem;
 
@@ -88,7 +91,7 @@ CSocketItemEx * LOCALAPI Connect(const CommandNewSessionSrv& cmd)
 	if (index < 0)
 		return NULL;
 
-	socketItem = CLowerInterface::Singleton.AllocItem();
+	socketItem = CLowerInterface::Singleton.AllocItem(&r);
 	if (socketItem == NULL)
 		goto l_bailout2;
 
@@ -119,12 +122,19 @@ l_bailout2:
 //	collision of the near-end ALFID would be filtered out firstly
 //	An FSP socket is incarnated when a listening socket is forked on CONNECT_REQUEST,
 //	or a connection is cloned on MULTIPLY received
-CSocketItemEx * LOCALAPI Accept(const CommandNewSessionSrv &cmd)
+CSocketItemEx* LOCALAPI Accept(const CommandNewSessionSrv& cmd)
 {
-	CSocketItemEx *socketItem = CLowerInterface::Singleton.AllocItem(cmd);
-	if(socketItem == NULL)
+	CSocketItemEx* socketItem = CLowerInterface::Singleton[cmd.fiberID];
+	if (socketItem == NULL)
+	{
+		REPORT_ERRMSG_ON_TRACE("Cannot find the socket entry for the pre-allocated ALFID");
+		return NULL;
+	}
+
+	if (!socketItem->MapControlBlock(cmd))
 	{
 		REPORT_ERRMSG_ON_TRACE("Cannot map control block of the client into server's memory space");
+		CLowerInterface::Singleton.FreeItem(socketItem);
 		return NULL;
 	}
 
@@ -134,58 +144,42 @@ CSocketItemEx * LOCALAPI Accept(const CommandNewSessionSrv &cmd)
 }
 
 
+
 // Given
 //	CommandCloneSessionSrv&		The connection multiplication command
 // Do
 //	Clone the root connection
-CSocketItemEx * LOCALAPI Multiply(const CommandCloneSessionSrv &cmd)
+// TODO: check the belonging context of the original session...
+CSocketItemEx * Multiply(const CommandCloneSessionSrv& cmd)
 {
-	CSocketItemEx *srcItem = CLowerInterface::Singleton[cmd.fiberID];
-	CSocketItemEx* newItem;
-	if(srcItem == NULL)
+	CSocketItemEx* srcItem = CLowerInterface::Singleton[cmd.fiberID];
+	if (srcItem == NULL)
 	{
 		BREAK_ON_DEBUG();	//TRACE_HERE("Cloned connection not found");
 		return NULL;
 	}
 
-	if(! srcItem->WaitUseMutex())
+	if (!srcItem->WaitUseMutex())
 	{
 		BREAK_ON_DEBUG();	//TRACE_HERE("Cloned connect busy");
 		return NULL;
 	}
 
-	// To make life easier we do not allow clone FSP session across process border
-	if(cmd.idProcess != srcItem->idSrcProcess)
+	CSocketItemEx* newItem = CLowerInterface::Singleton.AllocItem(srcItem->rootULA);
+	if (newItem == NULL)
 	{
-#ifdef TRACE
-		printf_s("\nCannot clone other user's session, source fiber#%u\n"
-				 "\tsource process id = %u, this process id = %u\n"
-				 , cmd.fiberID, srcItem->idSrcProcess, cmd.idProcess);
-#endif
+		REPORT_ERRMSG_ON_TRACE("Cannot allocate new socket slot");
+	}
+	else if(!newItem->MapControlBlock(cmd))
+	{
+		REPORT_ERRMSG_ON_TRACE("Cannot map control block of the client into server's memory space");
+		CLowerInterface::Singleton.FreeItem(newItem);
 		newItem = NULL;
-		goto l_return;
 	}
-
-	newItem = CLowerInterface::Singleton.AllocItem();
-	if (newItem == NULL || !newItem->MapControlBlock(cmd))
+	else
 	{
-		if(newItem == NULL)
-		{
-			REPORT_ERRMSG_ON_TRACE("Cannot allocate new socket slot");
-		}
-		else
-		{
-			REPORT_ERRMSG_ON_TRACE("Cannot map control block of the client into server's memory space");
-			CLowerInterface::Singleton.FreeItem(newItem);
-			newItem = NULL;
-		}
-		goto l_return;
+		newItem->InitiateMultiply(srcItem);
 	}
-
-	newItem->transactional = newItem->pControlBlock->GetSendQueueHead()->GetFlag<TransactionEnded>();
-	//^See also @DLL::SetHeadPacketIfEmpty
-	newItem->InitiateMultiply(srcItem);
-l_return:
 	// Only on exception would it signal event to DLL
 	srcItem->SetMutexFree();
 	return newItem;
@@ -193,155 +187,172 @@ l_return:
 
 
 
-// Get upper layer application's commands and process them
 // Given
-//	void *		buffer of the command received from ULA
-// Return
-//	Nothing
-// TODO: UNRESOLVED!there should be performance profiling variables to record how many commands have been processed?
-CSocketItemEx * LOCALAPI ProcessCommand(void *buffer)
-{
-    static int n = 0;
-
-	FSP_ServiceCode cmd = *(FSP_ServiceCode *)buffer;
-	CSocketItemEx *pSocket = NULL;
-#if defined(TRACE) && (TRACE & TRACE_ULACALL)
-	printf_s("\n#%d global command"
-		", %s(code = %d)\n"
-		, n
-		, CServiceCode::sof(cmd), cmd);
-#endif
-	switch(cmd)
-	{
-	case FSP_Listen:		// register a passive socket
-		pSocket = Listen(CommandNewSessionSrv((CommandNewSession *)buffer));
-		break;
-	case InitConnection:	// register an initiative socket
-		pSocket = Connect(CommandNewSessionSrv((CommandNewSession*)buffer));
-		break;
-	case FSP_Accept:
-		pSocket = Accept(CommandNewSessionSrv((CommandNewSession*)buffer));
-		break;
-	case FSP_Multiply:
-		pSocket = Multiply(CommandCloneSessionSrv((CommandNewSession*)buffer));
-		break;
-	default:
-#if defined(TRACE) && (TRACE & TRACE_ULACALL)
-		printf_s("Erratic! Invalid ULA call %s to create local fiber#%u(_%X_)\n"
-			, opCodeStrings[cmd]
-			, ((CommandNewSession*)buffer)->fiberID, be32toh(((CommandNewSession*)buffer)->fiberID));
-#endif
-		break;
-	}
-	//
-#if defined(TRACE) && (TRACE & TRACE_ULACALL)
-	printf_s("#%d command processed, operation code = %d.\n",  n, cmd);
-#endif
-	n++;
-	return pSocket;
-}
-
-
-
-// Remark: if the socket is broken before the full RESET command is received, the peer would be informed
-void CSocketItemEx::WaitULACommand()
+//	SProcessRoot *			Pointer of the root of the process kinship tree
+// Do
+//	Process the command of ULA
+// Remark
+//	If new socket entry is created on request of ULA, it will be added to the process kinship tree
+void CLowerInterface::ProcessULACommand(SProcessRoot *pRoot)
 {
 	char buffer[sizeof(UCommandToLLS)];
+	int m;
 	static uint32_t n;
 	//
-	while (recv(sdPipe, buffer, 1, 0) > 0)
+	SProcessRoot& r = *pRoot;
+	while (recv(r.sdPipe, buffer, sizeof(SCommandToLLS), 0) > 0)
 	{
-		char &cmd = buffer[0];
+		FSP_ServiceCode& cmd = *(FSP_ServiceCode*)buffer;
 #if defined(TRACE) && (TRACE & TRACE_ULACALL)
 		printf_s("\n#%u per socket command"
 			", %s(code = %d)\n"
 			, n
 			, CServiceCode::sof(cmd), cmd);
 #endif
-		if ( ((cmd == FSP_Reset || cmd == FSP_Reject)
-		 && (recv(sdPipe, buffer + 1, sizeof(CommandRejectRequest) - 1, 0) < (int)sizeof(CommandRejectRequest) - 1))
-		 || (cmd == FSP_InstallKey
-		 && (recv(sdPipe, buffer + 1, sizeof(CommandInstallKey) - 1, 0) < (int)sizeof(CommandInstallKey) - 1)) )
-		{
+		//
+		if (cmd == FSP_Listen || cmd == FSP_Accept || cmd == InitConnection || cmd == FSP_Multiply)
+			m = sizeof(UCommandToLLS) - sizeof(SCommandToLLS);
+		else if (cmd == FSP_InstallKey)
+			m = sizeof(CommandInstallKey) - sizeof(SCommandToLLS);
+		else if (cmd == FSP_Reject)
+			m = sizeof(CommandRejectRequest) - sizeof(SCommandToLLS);
+		else
+			m = 0;
+
+		if (m > 0 && recv(r.sdPipe, buffer + sizeof(SCommandToLLS), m, 0) < m)
 			break;
-		}
 
-		if (!WaitUseMutex())
-		{
-			printf_s("Socket %p[fiber#%u] in state %s: process command %s[%d]\n"
-				"probably encountered dead-lock: pSCB: %p\n"
-				, this, fidPair.source, stateNames[lowState], CServiceCode::sof(cmd), cmd
-				, pControlBlock);
-			if (lockedAt != NULL)
-				printf_s("Lastly called by %s\n", lockedAt);
-			BREAK_ON_DEBUG();
-			continue;
-		}
-
-		if (pControlBlock == NULL)
-		{
 #if defined(TRACE) && (TRACE & TRACE_ULACALL)
-			printf_s("%s called (%s), LLS state: %s(%d), control block is null.\n", __FUNCTION__
-				, CServiceCode::sof(cmd), stateNames[lowState], lowState);
+		printf_s("\n#%d global command"
+			", %s(code = %d)\n"
+			, n
+			, CServiceCode::sof(cmd), cmd);
 #endif
-			if (lowState == NON_EXISTENT && (cmd == FSP_Reset || cmd == FSP_Reject))
-				RefuseToMultiply(((CommandRejectRequest*)buffer)->reasonCode);
-			// See also OnMultiply(); or else simply ignore
-			break;	// exit the loop
-		}
-#if defined(TRACE) && (TRACE & TRACE_ULACALL)
-		printf_s("%s called (%s), LLS state: %s(%d) <== ULA state: %s(%d)\n", __FUNCTION__
-			, CServiceCode::sof(cmd)
-			, stateNames[lowState], lowState
-			, stateNames[pControlBlock->state], pControlBlock->state);
-#endif
-		SyncState();
-
+		CSocketItemEx* pSocket = NULL;
 		switch (cmd)
 		{
-		case FSP_Start:
-			RestartKeepAlive();	// If it happened to be stopped
-			DoEventLoop();
+		case FSP_Listen:		// register a passive socket
+			pSocket = Listen(CommandNewSessionSrv((CommandNewSession*)buffer), r);
 			break;
-		case FSP_Reject:
-			Reject(*((CommandRejectRequest*)buffer));
+		case InitConnection:	// register an initiative socket
+			pSocket = Connect(CommandNewSessionSrv((CommandNewSession*)buffer), r);
 			break;
-		case FSP_Reset:
-			SetMutexFree();
-			goto l_free;
+		case FSP_Accept:
+			pSocket = Accept(CommandNewSessionSrv((CommandNewSession*)buffer));
 			break;
-		case FSP_InstallKey:
-			InstallSessionKey(*((CommandInstallKey *)buffer));
-			break;
-		case FSP_Shutdown:
-			Recycle();
+		case FSP_Multiply:
+			pSocket = Multiply(CommandCloneSessionSrv((CommandNewSession*)buffer));
 			break;
 		default:
-#ifndef NDEBUG
-			printf("Internal error: undefined upper layer application command code %d\n", cmd);
-#endif
-			break;
+			for (CSocketItemEx* p = r.latest; p != NULL; p = (CSocketItemEx*)p->prev)
+			{
+				if (p->fidPair.source == ((SCommandToLLS*)buffer)->fiberID)
+				{
+					p->ProcessCommand(buffer);
+					pSocket = p;
+					break;
+				}
+			}
 		}
 		//
-		SetMutexFree();
 #if defined(TRACE) && (TRACE & TRACE_ULACALL)
 		printf_s("#%d command processed, operation code = %d.\n", n, cmd);
 #endif
 		n++;
+		if (pSocket == NULL)
+		{
+			SNotification resp;
+			resp.sig = FSP_IPC_Failure;
+			resp.fiberID = ((CommandNewSession*)buffer)->fiberID;
+			send(r.sdPipe, (char*)&resp, sizeof(resp), 0);
+		}
 	}
-	// 
-l_free:
-	// Unlike WaitUseMutex, here the inUse flag is cleared and it is waited to unlock
-	uint64_t t0 = GetTickCount64();
-	ClearInUse();
-	do
-	{
-		if (_InterlockedCompareExchangePointer((PVOID*)& lockedAt, (PVOID)__FUNCTION__, 0) == 0)
-			break;
-		Sleep(TIMER_SLICE_ms);
-	} while (GetTickCount64() - t0 < MAX_LOCK_WAIT_ms);
 	//
-	Reset();
+	FreeULAChannel(pRoot);
+}
+
+
+
+// Remark: if the socket is broken before the full RESET command is received, the peer would be informed
+void CSocketItemEx::ProcessCommand(const char* buffer)
+{
+	char cmd = buffer[0];
+	static uint32_t n;
+#if defined(TRACE) && (TRACE & TRACE_ULACALL)
+	printf_s("\n#%u per socket command"
+		", %s(code = %d)\n"
+		, n
+		, CServiceCode::sof(cmd), cmd);
+#endif
+
+	if (!WaitUseMutex())
+	{
+		printf_s("Socket %p[fiber#%u] in state %s: process command %s[%d]\n"
+			"probably encountered dead-lock: pSCB: %p\n"
+			, this, fidPair.source, stateNames[lowState], CServiceCode::sof(cmd), cmd
+			, pControlBlock);
+		if (lockedAt != NULL)
+			printf_s("Lastly called by %s\n", lockedAt);
+		BREAK_ON_DEBUG();
+		return;
+	}
+
+	if (pControlBlock == NULL)
+	{
+#if defined(TRACE) && (TRACE & TRACE_ULACALL)
+		printf_s("%s called (%s), LLS state: %s(%d), control block is null.\n", __FUNCTION__
+			, CServiceCode::sof(cmd), stateNames[lowState], lowState);
+#endif
+		if (lowState == NON_EXISTENT && (cmd == FSP_Reset || cmd == FSP_Reject))
+			RefuseToMultiply(((CommandRejectRequest*)buffer)->reasonCode);
+		// See also OnMultiply(); or else simply ignore
+		SetMutexFree();
+		return;
+	}
+#if defined(TRACE) && (TRACE & TRACE_ULACALL)
+	printf_s("%s called (%s), LLS state: %s(%d) <== ULA state: %s(%d)\n", __FUNCTION__
+		, CServiceCode::sof(cmd)
+		, stateNames[lowState], lowState
+		, stateNames[pControlBlock->state], pControlBlock->state);
+#endif
+	SyncState();
+	//
+	if (lowState <= NON_EXISTENT || lowState > LARGEST_FSP_STATE)
+	{
+		Free(); SetMutexFree();
+		return;
+	}
+
+	switch (cmd)
+	{
+	case FSP_Start:
+		RestartKeepAlive();	// If it happened to be stopped
+		DoEventLoop();
+		break;
+	case FSP_Reject:
+		Reject(*((CommandRejectRequest*)buffer));
+		break;
+	case FSP_Reset:
+		Reset();
+		break;
+	case FSP_InstallKey:
+		InstallSessionKey(*((CommandInstallKey*)buffer));
+		break;
+	case FSP_Shutdown:
+		Recycle();
+		break;
+	default:
+#ifndef NDEBUG
+		printf("Internal error: undefined upper layer application command code %d\n", cmd);
+#endif
+		break;
+	}
+	//
+	SetMutexFree();
+#if defined(TRACE) && (TRACE & TRACE_ULACALL)
+	printf_s("#%d command processed, operation code = %d.\n", n, cmd);
+#endif
+	n++;
 }
 
 
@@ -352,7 +363,7 @@ void CSocketItemEx::Listen()
 {
 	InitAssociation();
 	SetPassive();
-	SignalFirstEvent(FSP_NotifyListening);
+	Notify(FSP_NotifyListening);
 }
 
 
@@ -386,7 +397,7 @@ void CSocketItemEx::Connect()
 		r = ResolveToFSPoverIPv4(peerName, serviceName);
 		if (r <= 0)
 		{
-			SignalFirstEvent(FSP_NameResolutionFailed);
+			SignalNMI(FSP_NameResolutionFailed);
 			Free();
 			return;
 		}

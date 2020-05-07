@@ -59,6 +59,8 @@ typedef CSocketItem * PSocketItem;
 # define MAX_CONNECTION_NUM	256
 #endif
 
+#define MAX_WORKING_THREADS (MAX_CONNECTION_NUM*2)
+
 struct CSocketItemDl;
 
 class CSocketDLLTLB: CSRWLock
@@ -102,7 +104,8 @@ struct SDecodeState;
 struct CSocketItemDl : CSocketItem
 {
 	static CSocketDLLTLB	socketsTLB;
-	static pid_t			idThisProcess;
+	static SOCKET			sdPipe;
+	static CSocketItemDl*	headOfInUse;
 
 	// for sake of incarnating new accepted connection
 	FSP_SocketParameter context;
@@ -124,12 +127,15 @@ struct CSocketItemDl : CSocketItem
 	char			peerCommitPending : 1;
 	char			peerCommitted : 1;	// Only for conventional buffered, streamed read
 	char			pendingEoT : 1;		// EoT flag is pending to be added on a packet
-	char			pendingRecycle : 1;
-	char			processingNotice : 1;
+
+	short			noticeVector;
+	char			processingNotice;
 
 	FSP_ServiceCode commandLastIssued;
 	timer_t			timer;
-	pthread_t		hThreadWait;
+
+	int64_t			timeOut_ns;
+	timestamp_t		timeLastTriggered;
 
 	// to support full-duplex send and receive does not share the same call back function
 	NotifyOrReturn	fpReceived;
@@ -156,45 +162,44 @@ struct CSocketItemDl : CSocketItem
 
 	int32_t			pendingPeekedBlocks;	// TryRecvInline called, number of the peeked buffers yet to be unlocked
 
+	static void WaitEventToDispatch();
 #if defined(__WINDOWS__)
 	static VOID NTAPI TimeOutCallBack(PVOID param, BOOLEAN isTimeout)
 	{
 		UNREFERENCED_PARAMETER(isTimeout);
-		((CSocketItemDl *)param)->TimeOut();
+		((CSocketItemDl*)param)->TimeOut();
 	}
 
 	static DWORD WINAPI WaitNoticeCallBack(LPVOID param)
 	{
-		((CSocketItemDl*)param)->WaitEventToDispatch();
+		UNREFERENCED_PARAMETER(param);
+		WaitEventToDispatch();
 		return 0;
 	}
 
-	void CopyFatMemPointo(CommandNewSession &cmd)
+	static void CALLBACK ProcessNVCallBack(PTP_CALLBACK_INSTANCE Instance, PVOID parameter, PTP_WORK Work)
 	{
-		cmd.hMemoryMap = (uint64_t)hMemoryMap;
-		cmd.dwMemorySize = dwMemorySize;
+		UNREFERENCED_PARAMETER(Instance);
+		UNREFERENCED_PARAMETER(Work);
+		((CSocketItemDl *)parameter)->ProcessNoticeVector();
 	}
+
+	PTP_WORK	pwk;
+	bool CreateNoticeHandler();	// Which create the work handler (pwk) of the thread pool
+	void ScheduleProcessNV(CSocketItemDl*) { SubmitThreadpoolWork(pwk); }
+
+	void CopyFatMemPointo(CommandNewSession&);
 
 	void RecycleSimply()
 	{
-		register HANDLE h;
 		CancelTimeout();
-		if ((h = InterlockedExchangePointer((PVOID*)&hThreadWait, NULL)) != NULL)
-		{
-			closesocket(sdPipe);	// which would break the main loop of the notice-processing thread by force
-			socketsTLB.FreeItem(this);
-		}
+		socketsTLB.FreeItem(this);
 	}
 #elif defined(__linux__) || defined(__CYGWIN__)
 	static void TimeOutHandler(union sigval v) { ((CSocketItemDl*)v.sival_ptr)->TimeOut(); }
-	static void *NoticeHandler(void *p) { ((CSocketItemDl*)p)->WaitEventToDispatch(); return NULL; }
+	static void* NoticeHandler(void*) { WaitEventToDispatch(); return NULL; }
 
-	// See also InitLLSInterface()
-	void CopyFatMemPointo(CommandNewSession &cmd)
-	{
-		cmd.GetShmNameFrom(this);
-		cmd.dwMemorySize = dwMemorySize;
-	}
+	void CopyFatMemPointo(CommandNewSession&);
 
 	void RecycleSimply()
 	{
@@ -207,27 +212,35 @@ struct CSocketItemDl : CSocketItem
 	}
 #endif
 
-	bool LOCALAPI AddOneShotTimer(uint32_t);
-	bool CancelTimeout();
+	bool AddTimer(uint32_t);
+	void CancelTimeout() { timeOut_ns = INT64_MAX; }
+	bool IsTimedOut() { return ((int64_t(timeOut_ns - (NowUTC() - timeLastTriggered) * 1000)) < 0); }
+	bool StartPolling()
+	{
+		timeOut_ns = TRANSIENT_STATE_TIMEOUT_ms * 1000000ULL;
+		timeLastTriggered = NowUTC();
+		return CreateNoticeHandler() && AddTimer(TIMER_SLICE_ms);
+	}
 	void TimeOut();
 
-	void WaitEventToDispatch();
 	bool LockAndValidate();
+	void ProcessNotice(FSP_NoticeCode);
+	void ProcessNoticeVector();
 
 	// in Establish.cpp
 	CSocketItemDl *ProcessOneBackLog(PItemBackLog);
 	void ProcessBacklogs();
 	CSocketItemDl *Accept1();
 
-	CSocketItemDl * PrepareToAccept(SItemBackLog &, CommandNewSession &);
+	CSocketItemDl * PrepareToAccept(SItemBackLog &);
 	bool LOCALAPI ToWelcomeConnect(SItemBackLog &);
 	void ToConcludeConnect();
 	ControlBlock::PFSP_SocketBuf SetHeadPacketIfEmpty(FSPOperationCode);
 
 	// In Multiplex.cpp
-	static CSocketItemDl * LOCALAPI ToPrepareMultiply(FSPHANDLE, PFSP_Context, CommandCloneConnect &);
-	FSPHANDLE LOCALAPI WriteOnMultiplied(CommandCloneConnect &, PFSP_Context, unsigned, NotifyOrReturn);
-	FSPHANDLE CompleteMultiply(CommandCloneConnect &);
+	static CSocketItemDl * LOCALAPI ToPrepareMultiply(FSPHANDLE, PFSP_Context);
+	FSPHANDLE LOCALAPI WriteOnMultiplied(PFSP_Context, unsigned, NotifyOrReturn);
+	FSPHANDLE CompleteMultiply();
 	bool LOCALAPI ToWelcomeMultiply(SItemBackLog &);
 
 	// In Send.cpp
@@ -266,13 +279,20 @@ public:
 	// TODO: evaluate configurable shared memory block size? // UNRESOLVED!? MTU?
 	static int32_t AlignMemorySize(PFSP_Context);
 
-	bool InitLLSInterface(CommandNewSession&);
-	bool EnableLLSInteract(CommandNewSession&);
+	bool InitSharedMemory();
 	void SetConnectContext(const PFSP_Context);
 
-	int ChainOnCommitted(FSP_ServiceCode, int);
 	int Dispose();
-	int RecycLocked();
+
+	// Unlike Free, Recycle-locked does not destroy the control block
+	// so that the DLL socket may be reused on connection resumption
+	// assume the socket has been locked
+	int RecycLocked()
+	{
+		RecycleSimply();
+		SetMutexFree();
+		return 0;
+	}
 
 	// Convert the relative address in the control block to the address in process space, unchecked
 	octet * GetSendPtr(const ControlBlock::PFSP_SocketBuf skb) const
@@ -345,22 +365,24 @@ public:
 	//	false if it failed
 	bool LOCALAPI Call(const UCommandToLLS* pCmd, int n = sizeof(UCommandToLLS))
 	{
-		commandLastIssued = pCmd->opCode;
+		commandLastIssued = pCmd->sharedInfo.opCode;
 		return (send(sdPipe, (char*)pCmd, n, 0) > 0);
 	}
 #else
-	bool Call(const UCommandToLLS *pCmd, int n = 0) { commandLastIssued = pCmd->opCode; return true; }
+	bool Call(const UCommandToLLS *pCmd, int n = 0) { commandLastIssued = pCmd->sharedInfo.opCode; return true; }
 #endif
 
 	// For heavy-load network application, polling is not only more efficient but more responsive as well?
 	// Signal LLS that the send buffer is not null
 	template<FSP_ServiceCode c> bool Call()
 	{
-		char cmd = (char)c;
+		SCommandToLLS cmd;
+		cmd.opCode = c;
+		cmd.fiberID = fidPair.source;
 		commandLastIssued = c;
-		return (send(sdPipe, &cmd, 1, 0) > 0);
+		return (send(sdPipe, (char *)&cmd, sizeof(SCommandToLLS), 0) > 0);
 	}
-	CSocketItemDl * LOCALAPI CallCreate(CommandNewSession &, FSP_ServiceCode);
+	CSocketItemDl * CallCreate(FSP_ServiceCode);
 	void LOCALAPI RejectRequest(ALFID_T, ALFID_T, uint32_t);
 
 	int LOCALAPI InstallRawKey(octet *, int32_t, uint64_t);
@@ -375,19 +397,17 @@ public:
 	int32_t LOCALAPI SendStream(const void *, int32_t, bool, bool);
 	int Flush();
 
-	bool AppendEoTPacket(FSPOperationCode op1)
+	bool AppendEoTPacket()
 	{
 		ControlBlock::PFSP_SocketBuf p = pControlBlock->GetSendBuf();
 		if (p == NULL)
 			return false;
-		p->opCode = op1;
+		p->opCode = (initiatingShutdown ? RELEASE : NULCOMMIT);
 		p->len = 0;
 		p->SetFlag<TransactionEnded>();
 		p->ReInitMarkComplete();
-		MigrateToNewStateOnCommit();
 		return true;
 	}
-	bool AppendEoTPacket() { return AppendEoTPacket(initiatingShutdown ? RELEASE : NULCOMMIT); }
 
 	bool TestSetOnCommit(PVOID fp1)
 	{
@@ -438,10 +458,5 @@ public:
 	PFSP_Context GetFSPContext() { return &this->context; }
 
 	// defined in DllEntry.cpp:
-	static CSocketItemDl * LOCALAPI CreateControlBlock(const PFSP_IN6_ADDR, PFSP_Context, CommandNewSession &);
-#if defined(__WINDOWS__)
-	static void SaveProcessId() { idThisProcess = GetCurrentProcessId(); }
-#elif defined(__linux__) || defined(__CYGWIN__)
-	static void SaveProcessId() { idThisProcess = getpid(); }
-#endif
+	static CSocketItemDl * LOCALAPI CreateControlBlock(const PFSP_IN6_ADDR, PFSP_Context);
 };

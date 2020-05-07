@@ -107,6 +107,7 @@ VOID NETIOAPI_API_ OnUnicastIpChanged(PVOID, PMIB_UNICASTIPADDRESS_ROW, MIB_NOTI
 CommandNewSessionSrv::CommandNewSessionSrv(const CommandNewSession* pCmd)
 {
 	memcpy(this, pCmd, sizeof(CommandNewSessionCommon));
+	idProcess = pCmd->idProcess;
 	hMemoryMap = (HANDLE)pCmd->hMemoryMap;
 }
 
@@ -977,11 +978,22 @@ bool LOCALAPI CSocketItemEx::ReplaceTimer(uint32_t period)
 			, KeepAlive	// WAITORTIMERCALLBACK
 			, this		// LPParameter
 			, period
+#if (TRACE & TRACE_HEARTBEAT)
+			, 10000		// 10 seconds
+#else
 			, period
+#endif
 			, WT_EXECUTEINTIMERTHREAD))
-		|| (timer != NULL && ::ChangeTimerQueueTimer(globalTimerQueue, timer, period, period))
+		|| (timer != NULL && ::ChangeTimerQueueTimer(globalTimerQueue, timer, period
+#if (TRACE & TRACE_HEARTBEAT)
+			, 10000		// 10 seconds
+#else
+			, period
+#endif
+		))
 		);
 }
+
 
 
 // Assume a mutex has been obtained
@@ -994,17 +1006,10 @@ void CSocketItemEx::RemoveTimers()
 
 
 
-DWORD WINAPI WaitULACommand(LPVOID p)
+static DWORD WINAPI WaitULACommand(LPVOID p)
 {
-	try
-	{
-		((CSocketItemEx*)p)->WaitULACommand();
-		return 1;
-	}
-	catch (...)
-	{
-		return 0;
-	}
+	CLowerInterface::Singleton.ProcessULACommand((SProcessRoot*)p);
+	return 0;
 }
 
 
@@ -1016,17 +1021,41 @@ DWORD WINAPI WaitULACommand(LPVOID p)
 // Return
 //	true the communication channel was established successfully
 //	false if it failed
-bool CSocketItemEx::SetComChannel(SOCKET sd)
+bool CSocketSrvTLB::AddULAChannel(SOCKET sd)
 {
-	sdPipe = sd;
-	hThreadWait = CreateThread(NULL // LPSECURITY_ATTRIBUTES, get a default security descriptor inherited
-			, 0						// dwStackSize, uses the default size for the executables
-			, ::WaitULACommand		// LPTHREAD_START_ROUTINE
-			, this		// LPVOID lpParameter
-			, 0			// DWORD dwCreationFlags: run on creation
-			, NULL);	// LPDWORD lpThreadId, not returned here.
-	return (hThreadWait != NULL);
+	unsigned long bitIndex;
+	AcquireMutex();
+
+	octet isNonZero = _BitScanForward(&bitIndex, forestFreeFlags);
+	if (!isNonZero)
+	{
+		ReleaseMutex();
+		return false;
+	}
+
+	SProcessRoot& r = forestULA[bitIndex];
+	r.latest = NULL;
+	r.headLRUitem = r.tailLRUitem = NULL;
+	r.sdPipe = sd;
+	r.hThreadWait = CreateThread(NULL // LPSECURITY_ATTRIBUTES, get a default security descriptor inherited
+	, 0						// dwStackSize, uses the default size for the executables
+	, ::WaitULACommand		// LPTHREAD_START_ROUTINE
+	, &r		// LPVOID lpParameter
+	, 0			// DWORD dwCreationFlags: run on creation
+	, NULL);	// LPDWORD lpThreadId, not returned here.
+
+	if (r.hThreadWait == NULL)
+	{
+		ReleaseMutex();
+		return false;
+	}
+	forestFreeFlags ^= 1 << bitIndex;
+	r.index = bitIndex;
+
+	ReleaseMutex();
+	return true;
 }
+
 
 
 // For ScheduleConnect
@@ -1118,7 +1147,6 @@ bool CSocketItemEx::MapControlBlock(const CommandNewSessionSrv &cmd)
 	CloseHandle(hThatProcess);
 	// this->fiberID == cmd.fiberID, provided it is a passive/welcome socket, not a initiative socket
 	// assert: the queue of the returned value has been initialized by the caller already
-	idSrcProcess = cmd.idProcess;
 	return true;
 
 l_bailout1:

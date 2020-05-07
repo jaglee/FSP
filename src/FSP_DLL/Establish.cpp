@@ -67,16 +67,14 @@ DllSpec
 FSPHANDLE FSPAPI ListenAt(const PFSP_IN6_ADDR listenOn, PFSP_Context psp1)
 { 
 	psp1->passive = 1;	// override what is provided by ULA
-	CommandNewSession objCommand;
-	//
-	CSocketItemDl *socketItem = CSocketItemDl::CreateControlBlock(listenOn, psp1, objCommand);
+	CSocketItemDl *socketItem = CSocketItemDl::CreateControlBlock(listenOn, psp1);
 	if(socketItem == NULL)
 		return NULL;
 
 	socketItem->SetState(LISTENING);
 	// MUST set the state before calling LLS so that event-driven state transition may work properly
 
-	CSocketItemDl *p = socketItem->CallCreate(objCommand, FSP_Listen);
+	CSocketItemDl *p = socketItem->CallCreate(FSP_Listen);
 	if (p == NULL)
 	{
 		REPORT_ERRMSG_ON_TRACE("Cannot create the LLS socket to listen");
@@ -125,6 +123,7 @@ FSPHANDLE FSPAPI Accept1(FSPHANDLE h)
 //	the function called back on connected should be given as the onAccepted function pointer
 //  in the structure pointed by PSP_SocketParameter.
 //	If it is NULL, this function is blocking
+//	For sake of load-balance by DNS round-robin, we refrain from resurrecting a connection from scratch
 DllSpec
 FSPHANDLE FSPAPI Connect2(const char *peerName, PFSP_Context psp1)
 {
@@ -135,11 +134,8 @@ FSPHANDLE FSPAPI Connect2(const char *peerName, PFSP_Context psp1)
 	}
 
 	IN6_ADDR addrAny = IN6ADDR_ANY_INIT;
-	CommandNewSession objCommand;
-
 	psp1->passive = 0;		// override what is provided by ULA
-
-	CSocketItemDl * socketItem = CSocketItemDl::CreateControlBlock((PFSP_IN6_ADDR) & addrAny, psp1, objCommand);
+	CSocketItemDl * socketItem = CSocketItemDl::CreateControlBlock((PFSP_IN6_ADDR) & addrAny, psp1);
 	if(socketItem == NULL)
 	{
 		psp1->flags = -EBADF;	// -E_HANDLE ?
@@ -154,7 +150,7 @@ FSPHANDLE FSPAPI Connect2(const char *peerName, PFSP_Context psp1)
 	socketItem->pendingSendBuf = (octet*)psp1->welcome;
 	socketItem->pendingSendSize = psp1->len;
 
-	CSocketItemDl *p = socketItem->CallCreate(objCommand, InitConnection);
+	CSocketItemDl *p = socketItem->CallCreate(InitConnection);
 	if (p == NULL)
 	{
 		REPORT_ERRMSG_ON_TRACE("Cannot create the LLS socket to request connection establishment");
@@ -201,23 +197,20 @@ int FSPAPI InstallMasterKey(FSPHANDLE h, octet * key, int32_t keyBytes)
 
 
 // Given
-//	CommandNewSession & [_Out_]	the command context to be filled
 //	FSP_ServiceCode				the service code to be passed
 // Do
 //	Fill in the command context and call LLS. The service code MUST be one that creates an LLS FSP socket
 // Return
 //	The DLL FSP socket created if succeeded,
 //	NULL if failed.
-CSocketItemDl* LOCALAPI CSocketItemDl::CallCreate(CommandNewSession& objCommand, FSP_ServiceCode cmdCode)
+CSocketItemDl* CSocketItemDl::CallCreate(FSP_ServiceCode cmdCode)
 {
-	objCommand.fiberID = fidPair.source;
-	objCommand.opCode = cmdCode;
-	objCommand.idProcess = idThisProcess;
+	CommandNewSession objCommand(cmdCode, fidPair.source);
 #ifdef TRACE
 	printf("%s: fiberId = %d, fidPair.source = %d\n", CServiceCode::sof(cmdCode), objCommand.fiberID, fidPair.source);
 #endif
 	CopyFatMemPointo(objCommand);
-	return EnableLLSInteract(objCommand) && Call((UCommandToLLS*)&objCommand) ? this : NULL;
+	return StartPolling() && Call((UCommandToLLS*)&objCommand) ? this : NULL;
 }
 
 
@@ -269,17 +262,16 @@ void CSocketItemDl::SetConnectContext(const PFSP_Context psp1)
 // Given
 //	PFSP_IN6_ADDR		const, the listening addresses of the passive FSP socket
 //	PFSP_Context		the connection context of the socket, given by ULA
-//	CommandNewSession & the command context of the socket,  to pass to LLS
 // Return
 //	NULL if it failed, or else the new allocated socket whose session control block has been initialized
-CSocketItemDl * LOCALAPI CSocketItemDl::CreateControlBlock(const PFSP_IN6_ADDR nearAddr, PFSP_Context psp1, CommandNewSession & cmd)
+CSocketItemDl * LOCALAPI CSocketItemDl::CreateControlBlock(const PFSP_IN6_ADDR nearAddr, PFSP_Context psp1)
 {
 	CSocketItemDl *socketItem = socketsTLB.AllocItem();
 	if (socketItem == NULL)
 		return NULL;
 
 	socketItem->dwMemorySize = CSocketItemDl::AlignMemorySize(psp1);
-	if (socketItem->dwMemorySize < 0 || !socketItem->InitLLSInterface(cmd))
+	if (socketItem->dwMemorySize < 0 || !socketItem->InitSharedMemory())
 	{
 		socketsTLB.FreeItem(socketItem);
 		return NULL;
@@ -345,7 +337,7 @@ void LOCALAPI CSocketItemDl::RejectRequest(ALFID_T id1, ALFID_T idParent, uint32
 {
 	CommandRejectRequest objCommand;
 	objCommand.opCode = FSP_Reject;
-	objCommand.idToRject = id1;
+	objCommand.fiberID = id1;
 	objCommand.idParent = idParent;
 	objCommand.reasonCode = rc;
 	Call((UCommandToLLS *)&objCommand, sizeof(CommandRejectRequest));
@@ -361,13 +353,12 @@ void LOCALAPI CSocketItemDl::RejectRequest(ALFID_T id1, ALFID_T idParent, uint32
 // Return
 //	true if success
 //	false if failed.
+// TODO: set the default interface to non-zero?
 CSocketItemDl *CSocketItemDl::ProcessOneBackLog(PItemBackLog pLogItem)
 {
-	// TODO: set the default interface to non-zero?
-	CommandNewSession objCommand;
 	CSocketItemDl * socketItem;
 	//
-	socketItem = PrepareToAccept(*pLogItem, objCommand);
+	socketItem = PrepareToAccept(*pLogItem);
 	if (socketItem == NULL)
 	{
 		REPORT_ERRMSG_ON_TRACE("Process listening backlog: insufficient system resource?");
@@ -382,7 +373,7 @@ CSocketItemDl *CSocketItemDl::ProcessOneBackLog(PItemBackLog pLogItem)
 		return NULL;
 	}
 	//
-	if (!socketItem->CallCreate(objCommand, FSP_Accept))
+	if (!socketItem->CallCreate(FSP_Accept))
 	{
 		REPORT_ERRMSG_ON_TRACE("Process listening backlog: cannot synchronize - local IPC error");
 		RejectRequest(pLogItem->acceptAddr.idALF, pLogItem->idParent, EIO);
@@ -409,10 +400,9 @@ void CSocketItemDl::ProcessBacklogs()
 
 // Given
 //	SItemBackLog &		the reference to the accepting backlog item
-//	CommandNewSession & the command context of the backlog
 // Return
 //	The pointer to the socket created for the new connection requested
-CSocketItemDl * CSocketItemDl::PrepareToAccept(SItemBackLog & backLog, CommandNewSession & cmd)
+CSocketItemDl * CSocketItemDl::PrepareToAccept(SItemBackLog & backLog)
 {
 	PFSP_IN6_ADDR pListenIP = (PFSP_IN6_ADDR) & backLog.acceptAddr;
 	FSP_SocketParameter newContext = this->context;
@@ -433,11 +423,11 @@ CSocketItemDl * CSocketItemDl::PrepareToAccept(SItemBackLog & backLog, CommandNe
 	}
 	// If the incarnated connection could be cloned, onAccepting shall be set by FSPControl
 
-	CSocketItemDl *pSocket = CreateControlBlock(pListenIP, &newContext, cmd);
+	CSocketItemDl* pSocket = CreateControlBlock(pListenIP, &newContext);
 	if(pSocket == NULL)
 		return NULL;
 
-	pSocket->pControlBlock->idParent = this->fidPair.source;
+	pSocket->pControlBlock->connectParams.idParent = this->fidPair.source;
 	// IP address, including Session ID stored in nearEndInfo would be set by CreateControlBlock
 	// Cached fiber ID in the DLL SocketItem stub is set by CreateControlBlock as well
 
@@ -547,13 +537,13 @@ bool LOCALAPI CSocketItemDl::ToWelcomeConnect(SItemBackLog & backLog)
 //|--[Rcv.ACK_CONNECT_REQ]-->[Notify]
 //   |-->{Callback return to accept}
 //	  |-->{EOT}
-//		 |-->{No Payload to Send}-->COMMITTING2-->[Send ACK_START]
+//		 |-->{No Payload to Send}-->COMMITTING2-->[Send NULCOMMIT]
 //		 |-->{Has Payload to Send}
 //			|-->{ULA-flushing}-->COMMITTING2
 //				-->[Send PERSIST with EoT]
 //			|-->{Not ULA-flushing}-->PEER_COMMIT-->[Send PERSIST]
 //	  |-->{Not EOT}
-//		 |-->{No Payload to Send}-->COMMITTING-->[Send ACK_START]
+//		 |-->{No Payload to Send}-->COMMITTING-->[Send NULCOMMIT]
 //		 |-->{Has Payload to Send}
 //			|-->{ULA-flushing}-->COMMITTING
 //				-->[Send PERSIST with EoT]
@@ -588,11 +578,10 @@ void CSocketItemDl::ToConcludeConnect()
 	// If it has not sent anything onAccepted, send an immediate acknowledgement to ACK_CONNECT_REQ
 	if (pControlBlock->sendBufferNextSN == seq0)
 	{
-		SetHeadPacketIfEmpty(ACK_START);
+		SetHeadPacketIfEmpty(NULCOMMIT);
 		SetState(s0 == ESTABLISHED ? COMMITTING : COMMITTING2);
 	}
 	//^it works as pControlBlock->sendBufferBlockN <= INT32_MAX
-	// ACK_START implies to Commit. See also ToWelcomeMultiply:
 	Call<FSP_Start>();
 }
 
@@ -628,9 +617,9 @@ ControlBlock::PFSP_SocketBuf CSocketItemDl::SetHeadPacketIfEmpty(FSPOperationCod
 //	int32_t		length of the key in bits, should be multiplication of 64
 //	uint64_t	life of the key, maximum number of packets that may utilize the key
 // Return
-//	-EDEADLK	if cannot obtain the right lock
 //	-EIO	if cannot trigger LLS to do the installation work through I/O
 //	0		if no failure
+//	positive
 // Remark
 //	We need the mutex lock because it shall be atomic to copy in key material structure as the parameter
 //	Normally only in CLOSABLE or COMMITTING2 state may a session key installed
@@ -649,14 +638,17 @@ int LOCALAPI CSocketItemDl::InstallRawKey(octet *key, int32_t keyBits, uint64_t 
 	if (sizeIKM <= 0 || sizeIKM > 2048)
 		return -EINVAL;	// invalid argument
 
+	pControlBlock->connectParams.initialSN = pControlBlock->sendBufferNextSN;
+	//^And expectedSN was set in SnapshotReceiveWindowRightEdge
 	pControlBlock->connectParams.keyBits = keyBits;
-	CommandInstallKey objCommand(keyLife);
+
+	CommandInstallKey objCommand(fidPair.source, keyLife);
 	int r = Call((UCommandToLLS*)&objCommand, sizeof(CommandInstallKey)) ? 0 : -EIO;
 	if (r == 0)
 		r = send(sdPipe, (char *)key, sizeIKM, 0);
 
 	SetMutexFree();
-	return r;
+	return (r > 0 ? 0 : -EIO);
 }
 
 
@@ -773,6 +765,11 @@ CSocketItemDl * CSocketDLLTLB::AllocItem()
 	pSockets[sizeOfWorkSet++] = item;
 	_InterlockedExchange8(& item->inUse, 1);
 
+	// push to inUse list
+	item->next = CSocketItemDl::headOfInUse;
+	item->prev = NULL;
+	CSocketItemDl::headOfInUse = item;
+
 l_bailout:
 	ReleaseMutex();
 	return item;
@@ -784,21 +781,30 @@ l_bailout:
 //	CSocketItemDl *		the pointer to the DLL FSP socket
 // Do
 //	Try to put the socket in the list of the free socket items
-void CSocketDLLTLB::FreeItem(CSocketItemDl *r)
+void CSocketDLLTLB::FreeItem(CSocketItemDl *p)
 {
+	CSocketItemDl& r = *p;
 	AcquireMutex();
 
-	_InterlockedExchange8(& r->inUse, 0);
-	r->next = NULL;
-	r->prev = tail;
-	if(tail == NULL)
+	// detach it from inUse list
+	if (r.prev == NULL)
+		CSocketItemDl::headOfInUse = (CSocketItemDl*)r.next;
+	else
+		r.prev->next = r.next;
+
+	_InterlockedExchange8(&r.inUse, 0);
+
+	// attach it to free list
+	r.next = NULL;
+	r.prev = tail;
+	if (tail == NULL)
 	{
-		head = tail = r;
+		head = tail = p;
 	}
 	else
 	{
-		tail->next = r;
-		tail = r;
+		tail->next = p;
+		tail = p;
 	}
 
 	ReleaseMutex();

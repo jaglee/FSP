@@ -8,9 +8,8 @@ const ControlBlock::seq_t FIRST_SN = 12;
 // See also CSocketItemDl::Connect2
 CSocketItemDbg *GetPreparedSocket(int32_t minSendBufSize = 0)
 {
-	static CommandNewSession objCommand;
 	static FSP_SocketParameter parms;
-	memset(& parms, sizeof(parms), 0);
+	bzero(& parms, sizeof(parms));
 	parms.onAccepting = NULL;
 	parms.onAccepted = NULL;
 	parms.onError = NULL;
@@ -21,7 +20,7 @@ CSocketItemDbg *GetPreparedSocket(int32_t minSendBufSize = 0)
 	parms.len = 0;			// or else memory access exception may occur
 
 	IN6_ADDR addrAny = IN6ADDR_ANY_INIT;
-	return (CSocketItemDbg *)CSocketItemDl::CreateControlBlock((PFSP_IN6_ADDR) & addrAny, & parms, objCommand);
+	return (CSocketItemDbg *)CSocketItemDl::CreateControlBlock((PFSP_IN6_ADDR) & addrAny, & parms);
 }
 
 
@@ -70,7 +69,7 @@ void UnitTestBufferData()
 	assert(pSocketItem->skbImcompleteToSend != NULL);	// the last packet is incomplete
 	// Now, reset, but this time the head packet is set
 	pSCB->SetSendWindow(FIRST_SN);
-	skb = pSocketItem->SetHeadPacketIfEmpty(ACK_START);
+	skb = pSocketItem->SetHeadPacketIfEmpty(NULCOMMIT);
 	assert(skb == NULL);	// The queue IS empty
 	pSocketItem->newTransaction = 1;
 	pSocketItem->SetEndTransaction();
@@ -79,7 +78,7 @@ void UnitTestBufferData()
 	// now, there was no enough buffer and the data were partly buffered
 	pSocketItem->pendingSendBuf = preparedTestData;
 	r = pSocketItem->BufferData(MIN_RESERVED_BUF - 2);
-	skb = pSocketItem->SetHeadPacketIfEmpty(ACK_START);
+	skb = pSocketItem->SetHeadPacketIfEmpty(NULCOMMIT);
 	assert(skb != NULL);	// The queue is not empty
 	printf_s("%d packets completed, %d octets remains\n", r, pSocketItem->pendingSendSize);
 	printf_s("Buffer next SN = %u\n", pSCB->sendBufferNextSN);
@@ -87,7 +86,11 @@ void UnitTestBufferData()
 	//
 	// Now, slide the send window, and leave one more slot for sending
 	//
-	pSCB->SlideSendWindowByOne();
+	skb = pSCB->GetSendQueueHead();
+	skb->ReInitMarkAcked();
+	pSCB->IncRoundSendBlockN(pSCB->sendWindowHeadPos);
+	InterlockedIncrement((PLONG)&pSCB->sendWindowFirstSN);
+
 	pSocketItem->BufferData(pSocketItem->pendingSendSize);
 	printf_s("Buffer next SN = %u\n", pSCB->sendBufferNextSN);
 	assert(pSCB->sendBufferNextSN == FIRST_SN + MIN_RESERVED_BUF / MAX_BLOCK_SIZE + 1);
@@ -205,7 +208,7 @@ void UnitTestBufferData()
 		assert(skb != NULL);
 		*skb = *skb1;
 	}
-	// Right-aligned the first packet. See also @LLS::Placepayload
+	// Right-aligned the first packet. See also @LLS::PlacePayload
 	skb = pSCB->HeadRecv();
 	if (skb->opCode == PERSIST && skb->len < MAX_BLOCK_SIZE)
 	{
@@ -507,6 +510,7 @@ void UnitTestAllocRecvBuf()
 	pSCB->MarkReceivedFree(nB);
 	printf_s("After MarkReceivedFree\n"
 		"Head position = %d, head SN = %u\n\n", pSCB->recvWindowHeadPos, pSCB->recvWindowFirstSN);
+	// FIRST+SN + 0, 1, 2: free
 
 	// The next round
 	skb = pSCB->AllocRecvBuf(pSCB->recvWindowNextSN);	// FIRST_SN + 3
@@ -527,6 +531,7 @@ void UnitTestAllocRecvBuf()
 	assert(skb != NULL);
 	INIT_SKB();
 
+	// Free FIRST_SN + 3
 	pSCB->MarkReceivedFree(1);
 
 	skb = pSCB->AllocRecvBuf(FIRST_SN + 6);
@@ -534,7 +539,9 @@ void UnitTestAllocRecvBuf()
 	INIT_SKB();
 	assert(pSCB->recvWindowNextPos == 1);
 	assert(pSCB->recvWindowExpectedSN = FIRST_SN + 7);
-	pSCB->MarkReceivedFree(1);	// 
+
+	// Free FIRST_SN + 4, 5; 6 is occupied, 7, 8is free
+	pSCB->MarkReceivedFree(2);
 
 	skb = pSCB->AllocRecvBuf(FIRST_SN + 8);
 	assert(skb != NULL);
@@ -543,10 +550,7 @@ void UnitTestAllocRecvBuf()
 	assert(pSCB->recvWindowExpectedSN = FIRST_SN + 7);
 
 	skb = pSCB->AllocRecvBuf(FIRST_SN + 9);
-	assert(skb != NULL);
-	INIT_SKB();
-	assert(pSCB->recvWindowNextPos == 1);
-	assert(pSCB->recvWindowExpectedSN = FIRST_SN + 7);
+	assert(skb == NULL);
 
 	r = pSCB->GetSelectiveNACK(seq0, gaps, MAX_GAPS_NUM);
 	assert(r == 1 && seq0 == FIRST_SN + 7);
@@ -554,11 +558,11 @@ void UnitTestAllocRecvBuf()
 	skb = pSCB->AllocRecvBuf(FIRST_SN + 7);
 	assert(skb != NULL);
 	INIT_SKB();
-	assert(pSCB->recvWindowNextPos == 1);
-	assert(pSCB->recvWindowExpectedSN = FIRST_SN + 10);
+	assert(pSCB->recvWindowNextPos == 0);
+	assert(pSCB->recvWindowExpectedSN = FIRST_SN + 9);
 
 	r = pSCB->GetSelectiveNACK(seq0, gaps, MAX_GAPS_NUM);
-	assert(r == 0 && seq0 == FIRST_SN + 10);
+	assert(r == 0 && seq0 == FIRST_SN + 9);
 #undef INIT_SKB
 }
 
@@ -1056,19 +1060,19 @@ int _tmain(int argc, _TCHAR* argv[])
 	FUZ_unitTests();
 	UnitTestCompressAndDecode();
 
-	//UnitTestBufferData();
+	UnitTestBufferData();
 
-	//UnitTestAllocRecvBuf();
+	UnitTestAllocRecvBuf();
 
-	//UnitTestFetchReceived();
+	UnitTestFetchReceived();
 
-	//LogicTestPackedSend();
+	LogicTestPackedSend();
 
-	//UnitTestPrepareToSend();
+	UnitTestPrepareToSend();
 
-	//UnitTestInquireRecvBuf();
+	UnitTestInquireRecvBuf();
 
-	//UnitTestTryRecvInline();
+	UnitTestTryRecvInline();
 
 	UnitTestTryGetSendBuffer();
 

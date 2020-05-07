@@ -13,7 +13,7 @@ static int FSPAPI onMultiplied(FSPHANDLE hRev, PFSP_Context ctx)
 	printf_s("\nSocket handle of the clone session: %p\n", hRev);
 	if(hRev == NULL)
 	{
-		printf_s("\tConnection multication failed.\n");
+		printf_s("\tConnection multiplication failed.\n");
 		return -1;
 	}
 
@@ -26,7 +26,6 @@ static void FSPAPI onError(FSPHANDLE hRev, FSP_ServiceCode code, int value)
 {
 	printf_s("Clone session, socket %p has been reset (%d, %d).\n", hRev, code, value);
 	r2Finish = finished = true;
-	return;
 }
 
 
@@ -37,7 +36,6 @@ static void FSPAPI onSignatureSent(FSPHANDLE hRev, FSP_ServiceCode c, int r)
 	printf_s("Clone session, socket %p, result of sending the signature: %d\n", hRev, r);
 	Shutdown(hRev, NULL);
 	r2Finish = true;
-	return;
 }
 
 

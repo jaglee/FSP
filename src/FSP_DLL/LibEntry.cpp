@@ -36,16 +36,14 @@
 
 # define  POLLING_INTERVAL_MICROSECONDS 1000	// For HPET
 
-// the id of the process that call the library
-pid_t	CSocketItemDl::idThisProcess = 0;
-
-
 #if defined(__linux__) || defined(__CYGWIN__)
 
+#include <netinet/tcp.h>
 #include <sys/un.h>
 
 static	struct sockaddr_un addr;
-static	int sdClient;
+static	pthread_t	hThreadWait;
+static	int&		sdClient = CSocketItemDl::sdPipe;
 
 // Called by the default constructor only
 void CSocketDLLTLB::Init()
@@ -61,14 +59,29 @@ void CSocketDLLTLB::Init()
 	strncpy(addr.sun_path, SERVICE_SOCKET_PATH, sizeof(addr.sun_path) - 1);
 	addr.sun_path[sizeof(addr.sun_path) - 1] = 0;
 
-	CSocketItemDl::SaveProcessId();
+	if (connect(sdClient, (const sockaddr*)&addr, sizeof(struct sockaddr_un)) < 0)
+	{
+		perror("Cannot connect with LLS");
+		exit(-2);
+	}
+
+	DWORD optval = 1;
+	setsockopt(sdClient, IPPROTO_TCP, TCP_NODELAY, (const char*)&optval, sizeof(optval));
+
+	// only after the required fields initialized may the listener thread started
+	// fetch message from remote endpoint and deliver them to upper layer application
+	if(pthread_create(&hThreadWait, NULL, CSocketItemDl::NoticeHandler, CSocketItemDl::headOfInUse) != 0)
+	{
+		perror("Cannot create the thread to handle LLS's soft interrupt");
+		exit(-3);
+	}
 }
 
+
+// Assume that the timer and the notice-handler have been terminated before this destructor is called
 CSocketDLLTLB::~CSocketDLLTLB()
 {
-	// TODO: Delete the time-out timer
-	//
-	if (sdClient != 0 && sdClient != -1)
+	if (sdClient != INVALID_SOCKET)
 		close(sdClient);
 }
 
@@ -86,17 +99,16 @@ timestamp_t NowUTC()
 
 
 
-// Given
-//	CommandNewSession	[_inout_]	the buffer to hold the name of the shared memory object
 // Do
 //	Initialize the IPC structure to call LLS
 // Return
 //	true if no error, false if failed
-bool CSocketItemDl::InitLLSInterface(CommandNewSession & cmd)
+bool CSocketItemDl::InitSharedMemory()
 {
-	cmd.GetShmNameFrom(this);
+	snprintf(shm_name, sizeof(shm_name), SHARE_MEMORY_PREFIX "%p", (void *)this);
+	shm_name[sizeof(shm_name) - 1] = 0;
 
-	int hShm = shm_open(cmd.shm_name, O_RDWR | O_CREAT | O_TRUNC, 0777);
+	int hShm = shm_open(shm_name, O_RDWR | O_CREAT | O_TRUNC, 0777);
 	if (hShm < 0)
 	{
 		perror("Cannot open the shared memory for read/write in ULA");
@@ -124,45 +136,22 @@ bool CSocketItemDl::InitLLSInterface(CommandNewSession & cmd)
 
 
 
-// Given
-//	CommandNewSession	[not used for Linux platform]
-// Do
-//	Enable ULA-LLS interaction
-// Return
-//	true if no error, false if failed
-bool CSocketItemDl::EnableLLSInteract(CommandNewSession &)
+void CSocketItemDl::CopyFatMemPointo(CommandNewSession &cmd)
 {
-	struct sockaddr_un addr;
-	sdPipe = socket(AF_UNIX, SOCK_STREAM, 0);
-	if (sdPipe < 0)
-	{
-		REPORT_ERRMSG_ON_TRACE("Cannot create the socket to communicate with LLS");
-		return false;
-	}
-
-	addr.sun_family = AF_UNIX;
-	strncpy(addr.sun_path, SERVICE_SOCKET_PATH, sizeof(addr.sun_path) - 1);
-	addr.sun_path[sizeof(addr.sun_path) - 1] = 0;
-    if (connect(sdPipe, (const sockaddr*)&addr, sizeof(struct sockaddr_un)) < 0)
-    {
-		SOCKET h = _InterlockedExchange(&sdPipe, INVALID_SOCKET);
-		close(h);
-		return false;
-    }
-
-	return (pthread_create(&hThreadWait, NULL, NoticeHandler, this) == 0);
+	memcpy(cmd.shm_name, this->shm_name, sizeof(shm_name));
+	cmd.dwMemorySize = dwMemorySize;
 }
 
 
 
 // Given
-//	uint32_t		number of milliseconds to wait till the timer shoot
+//	uint32_t		number of milliseconds to wait till the timer shoots for the first time
 // Return
-//	true if the one-shot timer is registered successfully
+//	true if the timer is registered successfully
 //	false if it failed
 // Remark
 //	Only support multiple of thousand milliseconds.
-bool LOCALAPI CSocketItemDl::AddOneShotTimer(uint32_t dueTime)
+bool CSocketItemDl::AddTimer(uint32_t dueTime)
 {
 	struct itimerspec its;
 	struct sigevent sigev;
@@ -179,7 +168,7 @@ bool LOCALAPI CSocketItemDl::AddOneShotTimer(uint32_t dueTime)
 	its.it_value.tv_sec = dueTime / 1000;
 	its.it_value.tv_nsec = (dueTime % 1000) * 1000000;
 	its.it_interval.tv_sec = 0;
-	its.it_interval.tv_nsec = 0;
+	its.it_interval.tv_nsec = POLLING_INTERVAL_MICROSECONDS * 1000;
 
 	if (timer_settime(timer, 0, &its, NULL) != 0)
 	{
@@ -190,18 +179,6 @@ bool LOCALAPI CSocketItemDl::AddOneShotTimer(uint32_t dueTime)
 	}
 
 	return true;
-}
-
-
-
-// Do
-//	Try to cancel the registered one-shot timer
-// Return
-//	true for this implementation
-bool CSocketItemDl::CancelTimeout()
-{
-	timer_t h = _InterlockedExchange(&timer, 0);
-	return (h != 0 && timer_delete(h) == 0);
 }
 
 #endif

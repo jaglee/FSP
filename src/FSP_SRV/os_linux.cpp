@@ -490,17 +490,11 @@ void CSocketItemEx::RemoveTimers()
 
 
 
-static void * WaitULACommand(void *p)
+
+static void* WaitULACommand(void* p)
 {
-	try
-	{
-		((CSocketItemEx*)p)->WaitULACommand();
-		return p;
-	}
-	catch (...)
-	{
-		return NULL;
-	}
+	CLowerInterface::Singleton.ProcessULACommand((SProcessRoot*)p);
+	return p;
 }
 
 
@@ -512,10 +506,39 @@ static void * WaitULACommand(void *p)
 // Return
 //	true the communication channel was established successfully
 //	false if it failed
-bool CSocketItemEx::SetComChannel(SOCKET sd)
+bool CSocketSrvTLB::AddULAChannel(SOCKET sd)
 {
-	sdPipe = sd;
-	return (pthread_create(&hThreadWait, NULL, ::WaitULACommand, this) == 0);
+	AcquireMutex();
+
+	unsigned long bitIndex;
+	char isNonZero = 0;
+	for (bitIndex = 0; bitIndex < sizeof(forestFreeFlags) * 8; bitIndex++)
+	{
+		if ((forestFreeFlags & (1 << bitIndex)) == 1)
+		{
+			isNonZero = 1;
+			break;
+		}
+	}
+	if (!isNonZero)
+	{
+		ReleaseMutex();
+		return false;
+	}
+	SProcessRoot& r = forestULA[bitIndex];
+	r.headLRUitem = r.tailLRUitem = NULL;
+	r.sdPipe = sd;
+
+	if (pthread_create(&r.hThreadWait, NULL, ::WaitULACommand, &r) != 0)
+	{
+		ReleaseMutex();
+		return false;
+	}
+	forestFreeFlags ^= 1 << bitIndex;
+	r.index = bitIndex;
+
+	ReleaseMutex();
+	return true;
 }
 
 
@@ -558,8 +581,7 @@ bool CSocketItemEx::ScheduleConnect(int i)
 bool CSocketItemEx::MapControlBlock(const CommandNewSessionSrv &cmd)
 {
 #ifndef NDEBUG
-	printf("MapControlBlock called, source process id = %d, size of the shared memory = 0x%X\n"
-		, cmd.idProcess, cmd.dwMemorySize);
+	printf("MapControlBlock called, size of the shared memory = 0x%X\n", cmd.dwMemorySize);
 #endif
 	if(pControlBlock != NULL)
 	{
@@ -589,7 +611,6 @@ bool CSocketItemEx::MapControlBlock(const CommandNewSessionSrv &cmd)
 	close(cmd.hShm);
 	mlock(pControlBlock, dwMemorySize);
 
-	idSrcProcess = cmd.idProcess;
 	return true;
 }
 

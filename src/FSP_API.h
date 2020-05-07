@@ -186,6 +186,11 @@ struct FSP_SocketParameter
 };
 #pragma pack(pop)
 
+// If not specified otherwise, any function that returns integer return
+//	-EBADF if the handler given is invalid
+//	-EDEADLK if cannot obtain the mutex lock
+//	-EINTR if the connection is/has been interrupted by LLS
+//	-EINVAL	if parameter domain error
 
 #ifdef __cplusplus
 	extern "C" {
@@ -260,9 +265,6 @@ FSPHANDLE FSPAPI MultiplyAndGetSendBuffer(FSPHANDLE, PFSP_Context, CallbackBuffe
 //	the length of the key in bytes
 // return
 //	0 if no error
-//	-EDOM	if parameter domain error
-//	-EFAULT if unexpected exception
-//	-EINTR	if cannot obtain the right lock
 //	-EIO	if cannot trigger LLS to do the installation work through I/O
 DllSpec
 int FSPAPI InstallMasterKey(FSPHANDLE, octet *, int32_t);
@@ -273,6 +275,7 @@ int FSPAPI InstallMasterKey(FSPHANDLE, octet *, int32_t);
 //	the pointer to the callback function
 // return
 //	negative if error, or the capacity of immediately available buffer (might be 0)
+//	(-EBUSY if previous asynchronous send has not finished yet)
 DllSpec
 int32_t FSPAPI GetSendBuffer(FSPHANDLE, CallbackBufferReady);
 
@@ -289,7 +292,6 @@ DllSpec
 void* FSPAPI TryGetSendBuffer(FSPHANDLE, int32_t*);
 
 
-
 // Given
 //	FSPHANDLE	the socket handle
 //	void *		the buffer pointer
@@ -299,6 +301,8 @@ void* FSPAPI TryGetSendBuffer(FSPHANDLE, int32_t*);
 // Return
 //	zero or positive, number of payload octets in the send queue
 //	negative if it is the error number
+//	-EBUSY if previous transmit transaction has not been committed yet
+//	-ENOMEM if no enough memory available
 // Remark
 //	The buffer MUST begin from what GetSendBuffer has returned and
 //	may not exceed the capacity that GetSendBuffer has returned
@@ -321,6 +325,9 @@ int32_t FSPAPI SendInline(FSPHANDLE, void *, int32_t, bool, NotifyOrReturn);
 // Return
 //	non-negative if it is the number of octets put into the queue immediately. might be 0.
 //	negative if it failed
+//	-EADDRINUSE if previous send is not finished and internal buffer address is in use
+//	-EBUSY		if cannot commit the transmit transaction (if requested) on time
+//	-ENOMEM		if no enough available for buffering compression state
 // Remark
 //	Only all data have been buffered may be NotifyOrReturn called.
 //	If NotifyOrReturn is NULL the function is blocking, i.e.
@@ -333,6 +340,9 @@ int32_t FSPAPI WriteTo(FSPHANDLE, const void *, int32_t, unsigned, NotifyOrRetur
 //	the socket handle
 //	the pointer to the function called back when peeking finished
 // return 0 if no immediate error, or else the error number
+//	-EADDRINUSE	if previous receive is not finished and internal buffer address is in use
+//	-EDOM		if internal state prevents it from receiving in inline mode
+//	-EFAULT		if internal state chaos found
 // remark
 //	if it failed, when CallbackPeeked is called the first parameter is passed with NULL
 //	while the second parameter is passed with the error number
@@ -365,7 +375,10 @@ void* FSPAPI TryRecvInline(FSPHANDLE, int32_t*, bool*);
 // Return
 //	positive if it is the number of octets received immediately
 //	0 if no immediate error while NotifyOrReturn is not NULL
-//	negative if error
+//	-EADDRINUSE	if previous receive is not finished and internal buffer address is in use
+//	-EBUSY		if previous asynchronous read has not finished yet
+//	-EFAULT		if the packet buffer was broken
+//	-ENOMEM		if it is to decompress, but there is no enough memory for internal buffer
 // Remark
 //	NotifyOrReturn is called when receive buffer is full OR end of transaction encountered
 //	NotifyOrReturn might report error later even if ReadFrom itself return no error
@@ -391,10 +404,9 @@ bool FSPAPI HasReadEoT(FSPHANDLE);
 // Return
 //	0 if no error
 //	-EAGAIN if commit more than once, which may render dead-lock
-//	-EDEADLK if no mutual-exclusive lock available
-//	-EDOM if the connection is aborted
+//	-EBUSY if can not reach target state in the limited time
+//	-EDOM if internal state chaos found
 //	-EFAULT	if internal resource error encountered
-//	-EIO if the packet piggyback EoT flag cannot be sent
 // Remark
 //	Would block until the connection is CLOSABLE, closed or reset if the function pointer is NULL
 DllSpec
@@ -405,9 +417,7 @@ int FSPAPI Commit(FSPHANDLE, NotifyOrReturn);
 //	FSPHANDLE		the FSP socket
 // Return
 //	0 if no error
-//	-EDEADLK if no mutual-exclusive lock available
-//	-EFAULT if internal resource error encountered
-//	-EIO if LLS is not available
+//	negative if some common error
 // Remark
 //	Unlike Commit, the last packet is not necessarily marked EoT
 //	For compatibility with TCP byte-stream transmission
@@ -439,9 +449,7 @@ int FSPAPI SetOnRelease(FSPHANDLE, NotifyOrReturn);
 //	ETIMEOUT warning if the connection is already CLOSABLE but fails to migrate to CLOSED state timely
 //	0 if no error
 //	-EBUSY if it is still committing while the function is called in blocking mode
-//	-EDEADLK if no mutual-exclusive lock available
 //	-EDOM if the peer has not committed the transmit transaction at first
-//	-EFAULT if internal resource error encountered, typical time-out clock unavailable
 // Remark
 //	If the pointer of the callback function is null,
 //	it would block the caller until the connection is closed or reset

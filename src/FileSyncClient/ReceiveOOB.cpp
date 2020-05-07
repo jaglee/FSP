@@ -3,10 +3,8 @@
  */
 #include "stdafx.h"
 
-extern int32_t ticksToWait;
-extern bool r2finish;
 
-// The call back function to be executed when the clone connection is closed
+ // The call back function to be executed when the clone connection is closed
 static void FSPAPI onShutdown(FSPHANDLE hRev, FSP_ServiceCode code, int value)
 {
 	printf_s("Clone session, socket %p has been shutdown.\n", hRev);
@@ -22,8 +20,12 @@ static bool FSPAPI onSignatureReceived(FSPHANDLE hRev, void * buf, int32_t lengt
 	printf_s("Cloned session, socket %p, %d bytes received, message:\n", hRev, length);
 	if(buf != NULL)
 		printf_s("%s\n", (CHAR *)buf);
-	// assert(eot);
-	Shutdown(hRev, NULL);
+#ifndef NDEBUG
+	int r = Shutdown(hRev, onShutdown);
+	printf("To asynchronously shutdown; returned %d\n", r);
+#else
+	Shutdown(hRev, onShutdown);
+#endif
 	return false;
 }
 

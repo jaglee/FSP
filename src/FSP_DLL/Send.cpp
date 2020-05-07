@@ -324,12 +324,10 @@ int32_t LOCALAPI CSocketItemDl::SendStream(const void* buffer, int32_t len, bool
 	// By default it should be asynchronous:
 	if (fpSent != NULL || fpCommitted != NULL)
 		return TailFreeMutexAndReturn(BufferData(len));
-	// Shall insert	`Call<FSP_Urge>();` if LLS is not working in polling mode
 
 	// If it is blocking, wait until every byte has been put into the queue
 	while ((r = BufferData(len)) >= 0)
 	{
-		// Call<FSP_Urge>(); // polling mode needn't urging
 		if (pendingSendSize <= 0)
 			break;
 		// Here wait LLS to free some send buffer block
@@ -391,8 +389,6 @@ int CSocketItemDl::LockAndCommit(NotifyOrReturn fp1)
 #endif
 		fpCommitted = NULL;
 		SetMutexFree();
-		//if (fp1 != NULL)
-		//	fp1(this, FSP_Urge, EEXIST);
 		return 0;	// It is already in a state that the near end's last transmit transaction has been committed
 	}
 
@@ -419,7 +415,6 @@ l_recursion:
 		if (HasDataToCommit())
 		{
 			BufferData(pendingSendSize);
-			// Call<FSP_Urge>();
 			if (HasDataToCommit())
 			{
 				SetMutexFree();
@@ -441,9 +436,11 @@ l_recursion:
 	// SendInplace does not rely on keeping 'pendingEoT' state internally, and such state takes precedence
 	if (IsEoTPending())
 	{
-		// It needn't urge if LLS works in polling mode
+		if (!initiatingShutdown)
+			MigrateToNewStateOnCommit();
+		else
+			SetState(PRE_CLOSED);
 		AppendEoTPacket();
-		// Call<FSP_Urge>();
 		SetMutexFree();
 		return;
 	}
@@ -658,9 +655,8 @@ l_finalize:
 //	bool	whether to terminate the transmit transaction
 // Return
 //	number of blocks split
-//	-EFAULT if the first parameter is illegal
-//	-ENOMEM if too larger size requested
-//	-EDOM if the second or third parameter is illegal
+//	-EINVAL if the second or third parameter is illegal
+//	-ENOMEM if size requested is larger than available
 // Remark
 //	Would automatically mark the previous last packet as completed
 int32_t LOCALAPI CSocketItemDl::PrepareToSend(void * buf, int32_t len, bool eot)
@@ -811,10 +807,7 @@ int CSocketItemDl::Commit()
 	{
 		// flush internal buffer for compression, if it is non-empty
 		if (HasFreeSendBuffer())
-		{
 			BufferData(pendingSendSize);
-			//Call<FSP_Urge>();
-		}
 		// else Case 4.1, the send queue is full and there is some payload to wait free buffer
 	}
 	else if (skbImcompleteToSend != NULL)
@@ -824,15 +817,13 @@ int CSocketItemDl::Commit()
 		skbImcompleteToSend->ReInitMarkComplete();
 		skbImcompleteToSend = NULL;
 		MigrateToNewStateOnCommit();
-		//Call<FSP_Urge>();
 	}
 	// Case 3, there is at least one idle slot to put an EoT packet
-	else { AppendEoTPacket(); }
-	//else if (AppendEoTPacket())
-	//{
-	//	Call<FSP_Urge>();
-	//}
-	// else Case 4.2, the send queue is full and is to append a NULCOMMIT
+	else
+	{
+		MigrateToNewStateOnCommit();
+		AppendEoTPacket();
+	}
 	// Case 4: just to wait some buffer ready. See also ProcessPendingSend
 
 #ifdef _NO_LLS_CALLABLE
@@ -860,7 +851,6 @@ int CSocketItemDl::Flush()
 	}
 
 	p->ReInitMarkComplete();
-	// Call<FSP_Urge>();
 	SetMutexFree();
 	return 0;
 }

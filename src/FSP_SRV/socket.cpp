@@ -52,34 +52,92 @@ CSocketSrvTLB::CSocketSrvTLB()
 		// other link pointers are already set to NULL
 	}
 	tailFreeSID->next = NULL;	// reset last 'next' pointer
-	//
+
+	forestFreeFlags = ~0;
+
 	InitMutex();
 }
 
 
 
-// allocate from the free list
-CSocketItemEx* CSocketSrvTLB::AllocItem()
+// Return an available random ID. Here it is pre-calculated. Should be really random for better security
+// In this implementation it is actually preprocessing for socket entry allocation
+ALFID_T CSocketSrvTLB::RandALFID(CSocketItemEx *parent)
 {
+	SProcessRoot& r = *parent->rootULA;
+	CSocketItemEx *p = headFreeSID;
+	if (p == NULL)
+	{
+		p = r.headLRUitem;
+		if (p == NULL)
+			return 0;
+		//
+		r.headLRUitem = (CSocketItemEx*)p->next;
+		if (r.headLRUitem == NULL)
+		{
+			p->prev = NULL;
+			r.headLRUitem = r.tailLRUitem = p;
+		}
+		else
+		{
+			p->prev = r.tailLRUitem;
+			r.tailLRUitem->next = p;
+			r.tailLRUitem = p;
+		}
+	}
+	else
+	{
+		headFreeSID = (CSocketItemEx*)p->next;
+		if (headFreeSID == NULL)
+			tailFreeSID = NULL;
+		if (r.tailLRUitem == NULL)
+		{
+			p->prev = NULL;
+			r.headLRUitem = r.tailLRUitem = p;
+		}
+		else
+		{
+			p->prev = r.tailLRUitem;
+			r.tailLRUitem->next = p;
+			r.tailLRUitem = p;
+		}
+		p->rootULA = &r;
+	}
+	r.tailLRUitem->next = NULL;
+	// just take use of fiberID portion of the new entry
+	return p->fidPair.source;
+}
+
+
+
+// Allocate one socket entry from the recycle queue of the socket kinship tree,
+// or from the global pool of free entrie if the forementioned queue is empty.
+CSocketItemEx* CSocketSrvTLB::AllocItem(SProcessRoot *pRoot)
+{
+	SProcessRoot& r = *pRoot;
 	CSocketItemEx *p;
 	AcquireMutex();
 
-	// as this is a prototype is not bothered to exploit hash table
-	// recycle all of the orphan sockets
-	if (headFreeSID != NULL)
+	// TODO: reuse the original fiber ID, provide idParent is the same
+	if (r.headLRUitem != NULL)
+	{
+		p = r.headLRUitem;
+		r.headLRUitem = (CSocketItemEx*)p->next;
+		if (r.headLRUitem == NULL)
+			r.tailLRUitem = NULL;
+		else
+			r.headLRUitem->prev = NULL;
+		//
+		p->UnmapControlBlock();
+	}
+	else if (headFreeSID != NULL)
 	{
 		p = headFreeSID;
 		headFreeSID = (CSocketItemEx *)p->next;
 		if (headFreeSID == NULL)
 			tailFreeSID = NULL;
-	}
-	else if(headLRUitem != NULL)
-	{
-		p = headLRUitem;
-		headLRUitem = (CSocketItemEx *)p->next;
-		if (headLRUitem == NULL)
-			tailLRUitem = NULL;
-		p->UnmapControlBlock();
+		else
+			headFreeSID->prev = NULL;
 	}
 	else
 	{
@@ -87,10 +145,56 @@ CSocketItemEx* CSocketSrvTLB::AllocItem()
 		return NULL;
 	}
 
-	ReleaseMutex();
-	//
-	p->lowState = CONNECT_BOOTSTRAP;
+	p->AddKinshipTo(r);
 	p->markInUse = 1;
+
+	ReleaseMutex();
+	return p;
+}
+
+
+
+// Allocate one socket entry from the recycle queue of the socket kinship tree,
+// working in tandem with RandALFID()
+CSocketItemEx* CSocketSrvTLB::AllocItem(SProcessRoot *pRoot, ALFID_T idLocal)
+{
+	SProcessRoot& r = *pRoot;
+	CSocketItemEx* p;
+	AcquireMutex();
+
+	// There should be a pre-allocated socket entry for the given ALFID but not in use yet
+	p = (*this)[idLocal];
+	if (p == NULL || (p->IsInUse() && !p->recyclePending))
+	{
+l_abnormal:
+		ReleaseMutex();
+		return NULL;
+	}
+
+	// TODO: resurrect the connection!
+	if (p->recyclePending)
+	{
+		p->recyclePending = 0;
+	}
+
+	if (p->prev != NULL)
+		p->prev->next = p->next;
+	else if (r.headLRUitem != p)
+		goto l_abnormal;
+	else
+		r.headLRUitem = (CSocketItemEx*)p->next;
+		
+	if (p->next != NULL)
+		p->next->prev = p->prev;
+	else if (r.tailLRUitem != p)
+		goto l_abnormal;
+	else
+		r.tailLRUitem = (CSocketItemEx*)p->prev;
+
+	p->AddKinshipTo(r);
+	p->markInUse = 1;
+
+	ReleaseMutex();
 	return p;
 }
 
@@ -112,8 +216,7 @@ CSocketItemEx * CSocketSrvTLB::AllocItem(ALFID_T idListener)
 		if (r.IsInUse() && r.fidPair.source == idListener)
 		{
 #ifdef TRACE
-			printf_s("\nCollision detected:\n"
-					 "\twith process#%u, listener fiber#%u\n", r.idSrcProcess, idListener);
+			printf_s("\nCollision detected, listener fiber#%u\n", idListener);
 #endif
 			p = NULL;
 			break;
@@ -121,13 +224,14 @@ CSocketItemEx * CSocketSrvTLB::AllocItem(ALFID_T idListener)
 		else if (p == NULL && r.TestSetState(LISTENING))
 		{
 			p = &r;
-			// do not break, for purpose of duplicate allocation detection and dad process removal
+			// do not break, for purpose of duplicate allocation detection
 		}
 	}
 
 	if (p != NULL)
 	{
-		memset(p, 0, sizeof(CSocketItemEx));
+		unsigned m = sizeof(CSocketItem) + sizeof(SProcessRoot *) + sizeof(CSocketItemEx *) * 2;
+		bzero((octet *)p + m, sizeof(CSocketItemEx) - m);
 		p->markInUse = 1;
 		p->SetPassive();
 		p->fidPair.source = idListener;
@@ -145,25 +249,57 @@ CSocketItemEx * CSocketSrvTLB::AllocItem(ALFID_T idListener)
 //	int					the 'compressed' hash key for searching the socket item
 // Do
 //	Insert the given socket item into the translation-look-aside buffer of listening sockets
-void CSocketSrvTLB::PutToListenTLB(CSocketItemEx* p, int k)
+// Return
+//	true if it succeeded. if the entry has been registered in the TLB, return true. 
+//	false if it failed, typically because some entry with the same ALFID has been registered
+bool CSocketSrvTLB::PutToListenTLB(CSocketItemEx *p1, int k)
 {
-	CSocketItemEx* p0 = tlbSockets[k];
-	register CSocketItemEx* p1;
-	// TODO: UNRESOLVED! Is it unnecessary to detect the stale entry?
-	for (p1 = p0; p1 != NULL; p1 = (CSocketItemEx*)p1->prev)
+	register CSocketItemEx *p = tlbSockets[k];
+	while (p != NULL)
 	{
 		if (p == p1)
-			return;
-		//
+			return true;
 		if (p->fidPair.source == p1->fidPair.source)
 		{
 			REPORT_ERRMSG_ON_TRACE("collision found when putting socket into sockets TLB");
-			return;
+			return false;
 		}
+		p = p->prevSame;
 	}
-	assert(p1 == NULL && p != NULL);
-	p->prev = p0;
-	tlbSockets[k] = p;
+	p1->prevSame = tlbSockets[k];
+	tlbSockets[k] = p1;
+	return true;
+}
+
+
+
+
+// Given
+//	CSocketItemEx *		pointer to the socket item to be detached
+// Do
+//	Detach the given socket item from the translation-look-aside buffer of listening sockets
+// Return
+//	true if the socket was registered in the TLB of listening sockets
+//	false if the TLB cache missed
+bool CSocketSrvTLB::DetachFromListenTLB(CSocketItemEx *p1)
+{
+	int k = be32toh(p1->fidPair.source) & (MAX_CONNECTION_NUM - 1);
+	CSocketItemEx *p = tlbSockets[k];
+	if (p == p1)
+	{
+		tlbSockets[k] = p->prevSame;
+		return true;
+	}
+	while (p != NULL)
+	{
+		if (p->prevSame == p1)
+		{
+			p->prevSame = p1->prevSame;
+			return true;
+		}
+		p = p->prevSame;
+	}
+	return false;
 }
 
 
@@ -176,52 +312,14 @@ void CSocketSrvTLB::PutToListenTLB(CSocketItemEx* p, int k)
 //	Assume having obtained the lock of TLB. Will free the lock in the end.
 void CSocketSrvTLB::FreeItemDonotCareLock(CSocketItemEx *p)
 {
-	// if it is allocated by AllocItem(ALFID_T idListener):
-	if(p->IsPassive())
-	{
-		int k = be32toh(p->fidPair.source) & (MAX_CONNECTION_NUM - 1);
-		register CSocketItem *p1 = tlbSockets[k];
-		// detach it from the hash collision list
-		if(p1 == p)
-		{
-			tlbSockets[k] = (CSocketItemEx *)p1->prev;
-		}
-		else
-		{
-			while(p1 != NULL)
-			{
-				if(p1->prev == p)
-				{
-					p1->prev = p->prev;
-					break;
-				}
-				p1 = p1->prev;
-			}
-			//^it provides a safe-net to check whether p1 == NULL firstly
-			if(p1 == NULL)
-				REPORT_ERRMSG_ON_TRACE("A passive socket to be free is not an instance allocated properly");
-		}
-		//
-		return;
-	}
-
-	// if it is allocated by AllocItem() [by assigning a pseudo-random fiber ID]
-	if(tailFreeSID == NULL)
-	{
-		headFreeSID = tailFreeSID = p;
-	}
+	if (p->rootULA)
+		p->RecycleInULAKinship();
+	//
+	if (!p->IsPassive())
+		DetachFromRemoteTLB(p);
 	else
-	{
-		tailFreeSID->next = p;
-		tailFreeSID = p;
-	}
-	p->next = NULL;	// in case it is not
-	
-	int m = sizeof(CSocketItem) + sizeof(CSocketItemEx *);
-	bzero((octet *)p + m, sizeof(CSocketItemEx) - m);
-	// It might be unfriendly for connection resurrection. However, here security takes precedence.
+		DetachFromListenTLB(p);
 }
-
 
 
 
@@ -231,7 +329,7 @@ void CSocketSrvTLB::FreeItemDonotCareLock(CSocketItemEx *p)
 //	Put the given socket item onto the free list
 // Remark
 //	Assume having obtained the lock of TLB. Will free the lock in the end.
-void CSocketSrvTLB::RecycleItem(CSocketItemEx* p)
+void CSocketSrvTLB::RecycleItem(CSocketItemEx *p)
 {
 	if (p->IsPassive())
 	{
@@ -240,19 +338,65 @@ void CSocketSrvTLB::RecycleItem(CSocketItemEx* p)
 	}
 
 	AcquireMutex();
-	
-	if (tailLRUitem == NULL)
+	p->RecycleInULAKinship();
+	ReleaseMutex();
+}
+
+
+
+// Suppose it will automatically make the working thread terminated by closing the communication pipe
+bool CSocketSrvTLB::FreeULAChannel(SProcessRoot *pRoot)
+{
+	SProcessRoot& r = *pRoot;
+	AcquireMutex();
+
+	CLOSE_SOCKET(r.sdPipe);
+
+	CSocketItemEx *p = r.headLRUitem;
+	if (p != NULL)
 	{
-		headLRUitem = tailLRUitem = p;
+		if (tailFreeSID == NULL)
+			headFreeSID = p;
+		else
+			tailFreeSID->next = p;
+		p->prev = tailFreeSID;
+		tailFreeSID = r.tailLRUitem;
+		r.headLRUitem = r.tailLRUitem = NULL;
+		//
+		do
+		{
+			p->rootULA = NULL;
+			p = (CSocketItemEx*)p->next;
+		} while (p != NULL);
 	}
-	else
+
+	p = r.latest;
+	if (p != NULL)
 	{
-		tailLRUitem->next = p;
-		tailLRUitem = p;
+		CSocketItemEx *savedTail = tailFreeSID;
+		CSocketItemEx *p1st;
+		tailFreeSID = p;
+		do
+		{
+			// DONOT 'reset' here, or else working thread may encounter memory access exception
+			p->rootULA = NULL;
+			p->ScheduleCleanup();
+			p1st = p;
+			p = (CSocketItemEx *)p->prev;
+		} while (p != NULL);
+		//
+		if (savedTail == NULL)
+			headFreeSID = p1st;
+		else
+			savedTail->next = p1st;
+		p1st->prev = savedTail;	// Which used to be NULL
 	}
-	p->next = NULL;	// in case it is not
+	r.latest = NULL;
+
+	forestFreeFlags |= 1 << r.index;
 
 	ReleaseMutex();
+	return true;
 }
 
 
@@ -270,7 +414,7 @@ CSocketItemEx * CSocketSrvTLB::operator[](ALFID_T id)
 	{
 		if(p->fidPair.source == id)
 			return p;
-		p = (CSocketItemEx *)p->prev;
+		p = p->prevSame;
 	} while(p != NULL);
 	//
 	return p;	// assert(p == NULL);
@@ -279,40 +423,7 @@ CSocketItemEx * CSocketSrvTLB::operator[](ALFID_T id)
 
 
 // Given
-//	CommandNewSessionSrv	The 'new session' command
-// Return
-//	The new socket item, with control block memory mapped
-// We allow a socket slot waiting scavenge to be reused earlier than recycled. See also KeepAlive
-CSocketItemEx * CSocketSrvTLB::AllocItem(const CommandNewSessionSrv & cmd)
-{
-	AcquireMutex();
-	//
-	CSocketItemEx *p = (*this)[cmd.fiberID];
-	if(p != NULL)
-	{
-		if (!p->TestSetState(CHALLENGING))
-		{
-			p = NULL;
-			goto l_return;
-		}
-		if(! p->MapControlBlock(cmd))
-		{
-			REPORT_ERRMSG_ON_TRACE("Control block shall be created by the ULA via DLL call already");
-			p->ClearInUse();	// No, you cannot 'FreeItem(p);' because mutex is SHARED_BUSY
-			p = NULL;
-			goto l_return;
-		}
-		p->markInUse = 1;
-	}
-l_return:
-	ReleaseMutex();
-	return p;
-}
-
-
-
-// Given
-//	CSocketItemEx * The pointer to the socket that to be put into the Remote Translate Look-aside Buffer
+//	CSocketItemEx * The pointer to the socket to be put into the Remote Translate Look-aside Buffer
 // Return
 //	true if succeeded
 //	false if failed
@@ -324,7 +435,7 @@ bool CSocketSrvTLB::PutToRemoteTLB(CMultiplyBacklogItem *pItem)
 	uint32_t remoteHostId = SOCKADDR_HOSTID(pItem->sockAddrTo);
 	ALFID_T idRemote = pItem->fidPair.peer;
 	ALFID_T idParent = pItem->idParent;
-	assert(pItem->pControlBlock == NULL || pItem->idParent == pItem->pControlBlock->idParent);
+	assert(pItem->pControlBlock == NULL || pItem->idParent == pItem->pControlBlock->connectParams.idParent);
 	int k = be32toh(idRemote) & (MAX_CONNECTION_NUM-1);
 	CSocketItemEx *p0 = tlbSocketsByRemote[k];
 	pItem->prevRemote = p0;	// might be NULL
@@ -345,6 +456,36 @@ bool CSocketSrvTLB::PutToRemoteTLB(CMultiplyBacklogItem *pItem)
 	// If no collision found, good!
 	tlbSocketsByRemote[k] = pItem;
 	return true;
+}
+
+
+
+// Given
+//	CSocketItemEx * The pointer to the socket to be detached
+// Do
+//	Detach the given socket from the Remote Translate Look-aside Buffer
+// Return
+//	true if the socket is registered in the remote TLB
+//	false if TLB cache missed
+bool CSocketSrvTLB::DetachFromRemoteTLB(CSocketItemEx *p1)
+{
+	int k = be32toh(p1->fidPair.peer) & (MAX_CONNECTION_NUM - 1);
+	CSocketItemEx* p = tlbSocketsByRemote[k];
+	if (p == p1)
+	{
+		tlbSocketsByRemote[k] = p->prevRemote;
+		return true;
+	}
+	while (p != NULL)
+	{
+		if (p->prevRemote == p1)
+		{
+			p->prevRemote = p1->prevRemote;
+			return true;
+		}
+		p = p->prevRemote;
+	}
+	return false;
 }
 
 
@@ -401,7 +542,7 @@ void CSocketItemEx::InitAssociation()
 	// 'source' field of fidPair shall be filled already. See also CInterface::PoolingALFIDs()
 	// and CSocketSrvTLB::AllocItem(), AllocItem(ALFID_T)
 	fidPair.peer = pControlBlock->peerAddr.ipFSP.fiberID;
-	idParent = pControlBlock->idParent;
+	idParent = pControlBlock->connectParams.idParent;
 
 	// See also CLowerInterface::EnumEffectiveAddresses
 	register PSOCKADDR_INET const pFarEnd = sockAddrTo;
@@ -485,11 +626,14 @@ void CSocketItemEx::InitiateConnect()
 	q->initCheckCode = initState.initCheckCode;
 	// See also AffirmConnect()
 
+	lowState = NON_EXISTENT;
+	SyncState();
+	//^So that tMigrate is set
+
 	skb->ReInitMarkComplete();
 	SendPacket(1, ScatteredSendBuffers(q, sizeof(FSP_InitiateRequest)));
 	skb->timeSent = tRecentSend;
 
-	SyncState();
 	ReplaceTimer(RETRANSMIT_MIN_TIMEOUT_us/1000);
 }
 
@@ -556,13 +700,16 @@ void CSocketItemEx::InitiateMultiply(CSocketItemEx *srcItem)
 	pControlBlock->nearEndInfo.idALF = fidPair.source;	// and pass back to DLL/ULA
 	pControlBlock->connectParams = srcItem->pControlBlock->connectParams;
 	InitAssociation();
-	// pControlBlock->idParent was set in @DLL::ToPrepareMultiply()
-	assert(idParent == pControlBlock->idParent);	// Set in InitAssociation
+	// pControlBlock->connectParams.idParent was set in @DLL::ToPrepareMultiply()
+	assert(idParent == pControlBlock->connectParams.idParent);	// Set in InitAssociation
 	assert(fidPair.peer == srcItem->fidPair.peer);	// Set in InitAssociation
 
 	ControlBlock::seq_t seq0 = pControlBlock->sendWindowNextSN;	// See also @DLL::ToPrepareMultiply
 	nextOOBSN = ++srcItem->nextOOBSN;
-	contextOfICC.InheritS0(srcItem->contextOfICC, seq0);
+	
+	// The snFirstRecvWithCurrKey is unset until the first response packet is accepted.
+	contextOfICC.snFirstSendWithCurrKey = seq0 + 1;
+	contextOfICC.InheritS0(srcItem->contextOfICC);
 #if defined(TRACE) && (TRACE & TRACE_OUTBAND)
 	printf_s("\nTo send MULTIPLY in LLS, ICC context:\n"
 		"\tSN of MULTIPLY to send = %09u\n"
@@ -595,7 +742,10 @@ void CSocketItemEx::InitiateMultiply(CSocketItemEx *srcItem)
 	memcpy(payload, &q, sizeof(FSP_NormalPacketHeader));
 
 	pControlBlock->SetFirstSendWindowRightEdge();
+	lowState = NON_EXISTENT;
 	SyncState();
+	//^So that tMigrate is set
+
 	// In case of race condition
 	if (!WaitUseMutex())
 	{
@@ -606,7 +756,7 @@ void CSocketItemEx::InitiateMultiply(CSocketItemEx *srcItem)
 	int r = SendPacket(2, ScatteredSendBuffers(payload, sizeof(FSP_NormalPacketHeader), this->cipherText, skb->len));
 	if (r <= 0)
 	{
-		SignalFirstEvent(FSP_NotifyReset);
+		SignalNMI(FSP_NotifyReset);
 		Recycle();
 		return;
 	}
@@ -626,8 +776,8 @@ void CSocketItemEx::InitiateMultiply(CSocketItemEx *srcItem)
 // On getting the peer's response to MULTIPLY, fill in the proper field of contextOfICC
 // so that the derived new session key is put into effect
 // Remark
-//	On get the peer's ACK_START/PERSIST the socket would be put into the remote id's translate look-aside buffer
-//	In some extreme situation the peer's ACK_START/PERSIST to MULTIPLY could be received before tSessionBegin was set
+//	On get the peer's NULCOMMIT/PERSIST the socket would be put into the remote id's translate look-aside buffer
+//	In some extreme situation the peer's NULCOMMIT/PERSIST to MULTIPLY could be received before tSessionBegin was set
 //	and such an acknowledgement is effectively lost
 //	however, it is not a fault but is a feature in sake of proper state management
 bool CSocketItemEx::FinalizeMultiply()
@@ -639,11 +789,11 @@ bool CSocketItemEx::FinalizeMultiply()
 	assert(fidPair.peer == headPacket->fidPair.source);
 
 #if defined(TRACE) && (TRACE & TRACE_OUTBAND)
-	printf_s("\nGet the acknowledgement ACK_START/PERSIST of MULTIPLY\n");
+	printf_s("\nGet the acknowledgement NULCOMMIT/PERSIST of MULTIPLY\n");
 #endif
 	if (!ValidateICC())
 	{
-		// BREAK_ON_DEBUG();	//TRACE_HERE("Invalid integrity check code!?");
+		REPORT_ERRMSG_ON_TRACE("Invalid integrity check code for finalizing MULTIPLY!?");
 		return false;
 	}
 
@@ -690,12 +840,11 @@ void CSocketItemEx::RefuseToMultiply(uint32_t reasonCode)
 //			|{Send queue not EoT}
 //				|{Peer's MULTIPLY was not EoT}-->ESTABLISHED
 //				|{Peer's MULTIPLY was EoT}-->PEER_COMMIT
-// Congest the peer's MULTIPLY payload and make response designated by ULA transmitted
+// Digest the peer's MULTIPLY payload and make response designated by ULA transmitted
 // See also OnGetMultiply(), @DLL::PrepareToAccept, ToWelcomeMultiply
 void CMultiplyBacklogItem::RespondToMultiply()
 {
 	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadRecv() + GetRecvWindowHeadPos();
-	// if (!CheckMemoryBorder(skb)) throw -EFAULT;
 	// See also PlacePayload
 	octet*ubuf = GetRecvPtr(skb);
 	if(ubuf == NULL)
@@ -721,12 +870,12 @@ void CMultiplyBacklogItem::RespondToMultiply()
 	{
 		SetState(skbOut->GetFlag<TransactionEnded>() ? COMMITTING2 : PEER_COMMIT);
 		SendAckFlush();
-		SignalFirstEvent(FSP_NotifyToCommit);					// And deliver data instantly if it is to commit
+		Notify(FSP_NotifyToCommit);					// And deliver data instantly if it is to commit
 	}
 	else
 	{
 		SetState(skbOut->GetFlag<TransactionEnded>() ? COMMITTING : ESTABLISHED);
-		// pControlBlock->nmi = 0;
+		NotifyDataReady();
 	}
 	RestartKeepAlive();
 }
@@ -747,13 +896,20 @@ void CSocketItemEx::Accept()
 		return;	// but how on earth could it happen? race condition does exist!
 
 	InitAssociation();
-	//
+	// See also @DLL::ToWelcomeConnect:
 	pControlBlock->SetFirstSendWindowRightEdge();
+#if (TRACE & TRACE_SLIDEWIN)
+	printf_s("%s: local fiber#%u(_%X_) in state %s\n", __FUNCTION__
+		, fidPair.source, be32toh(fidPair.source)
+		, stateNames[lowState]);
+	pControlBlock->DumpSendRecvWindowInfo();
+#endif
 	if (lowState == CHALLENGING)
 	{
 		InstallEphemeralKey();
 		//^ ephemeral session key material was ready when CSocketItemDl::PrepareToAccept
 		SetFirstRTT(pControlBlock->connectParams.tDiff);
+		//
 		EmitStart();
 		tSessionBegin = tRecentSend;
 		ReplaceTimer(TRANSIENT_STATE_TIMEOUT_ms);	// The socket slot might be a reused one
@@ -794,7 +950,7 @@ void CSocketItemEx::SendReset()
 void CSocketItemEx::DisposeOnReset()
 {
 	// It is somewhat an NMI to ULA
-	SignalFirstEvent(FSP_NotifyReset);
+	SignalNMI(FSP_NotifyReset);
 	ScheduleCleanup();
 }
 
@@ -840,9 +996,6 @@ void CSocketItemEx::Reset()
 
 void CSocketItemEx::Free()
 {
-	if (_InterlockedExchange((PLONG)&idSrcProcess, 0) == 0)
-		return;
-	//
 	try
 	{
 #ifdef TRACE
@@ -864,11 +1017,12 @@ void CSocketItemEx::Free()
 
 
 
+// TODO:  lazily Free(); // !
 void CSocketItemEx::PutToResurrectable()
 {
 	RemoveTimers();
-	ClearInUse();
-	CLowerInterface::Singleton.RecycleItem(this);
+	recyclePending = 1;
+	hasAcceptedRELEASE = 0;
 }
 
 

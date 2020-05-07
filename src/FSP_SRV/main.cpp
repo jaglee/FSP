@@ -45,8 +45,6 @@
 # define SOCKADDR_FOR_IPC	struct sockaddr_un
 #endif
 
-CSocketItemEx* LOCALAPI ProcessCommand(void* buffer);
-
  // The singleton instance of the connect request queue
 ConnectRequestQueue ConnectRequestQueue::requests;
 
@@ -117,26 +115,12 @@ int main(int argc, char * argv[])
 		socklen_t szAddr = sizeof(SOCKADDR_FOR_IPC);
 		SOCKADDR_FOR_IPC addrIn;
 		int sdNew;
-		char buffer[sizeof(UCommandToLLS)];
 		while ((sdNew = accept(sd, (struct sockaddr*) & addrIn, &szAddr)) != -1)
 		{
 			DWORD optval = 1;
 			setsockopt(sdNew, IPPROTO_TCP, TCP_NODELAY, (const char*)&optval, sizeof(optval));
-			// Is it necessary to set the SO_LINGER option?
-			// setsockopt(sdNew, SOL_SOCKET, SO_DONTLINGER, (const char*)&optval, sizeof(optval));
 
-			int nBytesRead = recv(sdNew, buffer, sizeof(UCommandToLLS), 0);
-			if (nBytesRead < (int)sizeof(UCommandToLLS))
-			{
-				REPORT_ERRMSG_ON_TRACE("Cannot read from the incarnated socket.");
-				CLOSE_IPC(sdNew);
-				continue;
-			}
-
-			CSocketItemEx *pSocket = ProcessCommand(buffer);
-			if (pSocket != NULL)
-				pSocket->SetComChannel(sdNew);
-			else
+			if (!CLowerInterface::Singleton.AddULAChannel(sdNew))
 				CLOSE_IPC(sdNew);
 		}
 		REPORT_ERRMSG_ON_TRACE("Command channel broken.");

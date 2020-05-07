@@ -16,5 +16,13 @@
 // Forward declaration of an auxilary function
 int ReportLastError();
 
-extern HANDLE	hFinished;
-extern HANDLE	hFile;
+extern int32_t ticksToWait;
+extern bool finished;
+extern bool r2finish;
+extern bool	toAcceptFile;
+
+void		StartAcceptFile(FSPHANDLE);
+
+// dispose/recycle resource
+// TODO: further per-process clean-up works here!
+static inline void finalize() { r2finish = finished = true; }

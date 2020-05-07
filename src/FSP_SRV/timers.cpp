@@ -32,7 +32,7 @@
 #define RETRANSMISSION_LIMITS	15
 
 #define TIMED_OUT() \
-		SignalFirstEvent(FSP_NotifyTimeout);	\
+		SignalNMI(FSP_NotifyTimeout);	\
 		ScheduleCleanup();			\
 		SetMutexFree();	\
 		return
@@ -59,6 +59,10 @@ void CSocketItemEx::KeepAlive()
 		SetMutexFree();
 		return;
 	}
+
+	// Only need to synchronize the state in the 'cache' and the real state once because TCB is locked
+	if (lowState != NON_EXISTENT)
+		_InterlockedExchange8((char*)&lowState, pControlBlock->state);
 
 	switch(lowState)
 	{
@@ -99,7 +103,6 @@ void CSocketItemEx::KeepAlive()
 		break;
 	case CLOSABLE:
 		// CLOSABLE does NOT time out to CLOSED, and does NOT automatically recycled.
-		SendAckFlush();	// The KEEP_ALIVE signal, see also tLastRecvAny, AllocItem()
 		DoEventLoop();
 		break;
 	case SHUT_REQUESTED:
@@ -114,17 +117,16 @@ void CSocketItemEx::KeepAlive()
 		{
 			ReplaceTimer(uint32_t((t1 - tMigrate) >> 10) + TIMER_SLICE_ms);
 			//^exponentially back off
-			EmitStart();	// Shall be the RELEASE packet
+			EmitRelease();
 			break;
 		}
-		SetState(CLOSED);
+		// suppose TRANSIENT_STATE_TIMEOUT_ms is no less than CLOSING_TIME_WAIT_ms
+		if (int64_t(t1 - tMigrate) > TRANSIENT_STATE_TIMEOUT_ms * 1000)
+			SetState(CLOSED);
 		// The socket is subjected to be recycled in LRU manner
 	case CLOSED:
-		PutToResurrectable();
 		break;
 	default:
-		if (pControlBlock->state >= ESTABLISHED)
-			SendReset();
 		Free();
 		break;
 	}
@@ -440,14 +442,6 @@ int LOCALAPI CSocketItemEx::AcceptSNACK(ControlBlock::seq_t expectedSN, FSP_Sele
 // TODO: UNRESOLVED! milky payload SHOULD never be resent?
 void CSocketItemEx::DoEventLoop()
 {
-	// Only need to synchronize the state in the 'cache' and the real state once because TCB is locked
-	_InterlockedExchange8((char*)& lowState, pControlBlock->state);
-	if (lowState <= NON_EXISTENT || lowState > LARGEST_FSP_STATE)
-	{
-		Free();
-		return;
-	}
-
 	// Used to loop header of DoResend
 	const int32_t	capacity = pControlBlock->sendBufferBlockN;
 	int32_t			i1 = pControlBlock->sendWindowHeadPos;
@@ -459,6 +453,7 @@ void CSocketItemEx::DoEventLoop()
 	bool somePacketResent = false;
 	bool toStopEmitQ = (int32_t(pControlBlock->sendWindowNextSN - limitSN) >= 0);
 	bool toStopResend = (int32_t(seq1 - pControlBlock->sendWindowNextSN) >= 0);
+	bool toZWP;
 
 	if (!toStopEmitQ || !toStopResend)
 		quotaLeft += sendRate_Bpus * (tNow - tPreviousTimeSlot);
@@ -530,8 +525,9 @@ loop_start:
 	toStopResend = (int32_t(seq1 - pControlBlock->sendWindowNextSN) >= 0);
 	
 l_step2:
-	// Used to be loop-body of EmitQ:
-	if (!toStopEmitQ)
+	toZWP = (pControlBlock->CountSentInFlight() == 0 && pControlBlock->CountSendBuffered() > 0);
+	// Note that zero window probe is subjected to quota limitation
+	if (!toStopEmitQ || toZWP)
 	{
 		skb = pControlBlock->HeadSend() + pControlBlock->sendWindowNextPos;
 		if (skb->MayNotSend())
@@ -541,39 +537,15 @@ l_step2:
 		}
 #ifndef UNIT_TEST
 		if (quotaLeft - (skb->len + sizeof(FSP_NormalPacketHeader)) < 0)
-			goto l_final;	// No quota left for send or resend
+			goto l_final;
 		if (EmitWithICC(skb, pControlBlock->sendWindowNextSN) <= 0)
 			goto l_final;
 		quotaLeft -= (skb->len + sizeof(FSP_NormalPacketHeader));
 #endif
 		skb->MarkSent();
 		pControlBlock->perfCounts.countPacketSent++;
-		//
-		if (++pControlBlock->sendWindowNextPos >= capacity)
-			pControlBlock->sendWindowNextPos = 0;
-		_InterlockedIncrement((PLONG)&pControlBlock->sendWindowNextSN);
-	}
-	// Zero window probing; although there's some code redundancy it keeps clarity
-	else if (pControlBlock->CountSentInFlight() == 0 && pControlBlock->CountSendBuffered() > 0)
-	{
-		skb = pControlBlock->HeadSend() + pControlBlock->sendWindowNextPos;
-		if (skb->MayNotSend())
-		{
-			toStopEmitQ = true;
-			goto l_post_step3;	// ULA is still to fill the buffer
-		}
-		//
-#ifndef UNIT_TEST
-		if (quotaLeft - (skb->len + sizeof(FSP_NormalPacketHeader)) < 0)
-			goto l_final;	// No quota left for zero window probe
-		if (EmitWithICC(skb, pControlBlock->sendWindowNextSN) <= 0)
-			goto l_final;
-		quotaLeft -= (skb->len + sizeof(FSP_NormalPacketHeader));
-#endif
-		pControlBlock->perfCounts.countZWPsent++;
-		//
-		skb->MarkSent();
-		pControlBlock->perfCounts.countPacketSent++;
+		if (toZWP)
+			pControlBlock->perfCounts.countZWPsent++;
 		//
 		if (++pControlBlock->sendWindowNextPos >= capacity)
 			pControlBlock->sendWindowNextPos = 0;

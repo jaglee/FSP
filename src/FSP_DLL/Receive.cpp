@@ -268,14 +268,13 @@ l_postloop:
 
 
 // Return
-//	-EDOM	(-33)	if the PERSIST packet of the size of some packet does not conform to the protocol
 //	-EFAULT (-14)	if the packet buffer was broken
 //	-ENOMEM (-12)	if it is to decompress, but there is no enough memory for internal buffer
 //	non-negative: number of octets fetched. might be zero
 // Remark
+//	NULCOMMIT packet which is payload-less would make it return instantly.
 //	Left border of the receive window is slided if RecvInline has been called
 //	but the inquired receive buffer has not been unlocked
-//	A payload-less PERSIST with EndOfTransaction flag set would make it return instantly
 //	Automatically decompress, but the return value is the size of the raw data, not the decompression result
 int32_t CSocketItemDl::FetchReceived()
 {
@@ -430,26 +429,34 @@ l_recursion:
 #endif
 	if (!eot && n == 0)	// Redundant soft-interrupt shall be simply ignored
 	{
-		// assert(pendingPeekedBlocks == 0);
+		assert(pendingPeekedBlocks == 0);
 		fpPeeked = fp1;
 		SetMutexFree();
 		return;
 	}
 
 	SetMutexFree();
+
 	// It is possible that no meaningful payload is received but an EoT flag is got.
 	// The callback function should work in such scenario
 	// It is also possible that p == NULL while n is the error code. The callback function MUST handle such scenario
 	// If the callback function happens to be updated, prefer the new one
 	if (fp1(this, p, n, eot))
 		_InterlockedCompareExchangePointer((PVOID*)&fpPeeked, (PVOID)fp1, NULL);
+
 	if (n < 0)
+	{
+#ifdef TRACE
+		printf_s("The callback function returned %d\n", n);
+#endif
 		return;
+	}
 
 	if (!WaitUseMutex())
 		return;	// it could be disposed in the callback function
 
 	int r = TryUnlockPeeked();
+	offsetInLastRecvBlock = 0;
 	if (r < 0)
 	{
 #ifdef TRACE
@@ -458,6 +465,7 @@ l_recursion:
 		SetMutexFree();
 		return;	// protected it from dead loop caused by receive queue messed up
 	}
+
 	// it could be shutdown gracefully in the callback function, however there may be data pending to deliver
 	if (GetState() >= CLOSED)
 	{
@@ -465,7 +473,6 @@ l_recursion:
 		return;
 	}
 
-	offsetInLastRecvBlock = 0;
 	// If (n < 0) some unrecoverable error has occur. Should avoid the risk of dead-loop.
 	if (n >= 0 && HasDataToDeliver())
 		goto l_recursion;

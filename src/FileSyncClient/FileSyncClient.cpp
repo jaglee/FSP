@@ -1,6 +1,7 @@
 /**
   Usage: <FileSyncClient> [remote_fsp_url]    passively accept a file list sent by the FileSyncServer
- **/
+  Or:  <FileSyncClient> - [remote_fsp_url]    passively accept a file sent by the FileSyncServer
+  **/
 #include "stdafx.h"
 #include "tchar.h"
 
@@ -19,31 +20,25 @@ int	FSPAPI onMultiplying(FSPHANDLE, PFSP_SINKINF, PFSP_IN6_ADDR);
 // A shared global parameter to configure the time to wait the connection multiplication request is sent and acknowledged:
 // by default there is no reverse socket and wait for about 30 seconds to wait one. see also main()
 int32_t ticksToWait;
+bool	finished;
 bool	r2finish;	// whether the reverse channel is about to finish.
+bool	toAcceptFile = false;
 
-HANDLE	hFinished;
-HANDLE	hFile;		// A shared file descriptor
+static HANDLE	hFile;
+static char	fileName[sizeof(TCHAR) * MAX_PATH + 4];
 
-static unsigned char bufPrivateKey[CRYPTO_NACL_KEYBYTES];
 
-static char fileName[sizeof(TCHAR) * MAX_PATH + 4];
-
-// The signal that the main loop is finished
-static bool finished;
 
 // Forward declarations
 static void FSPAPI onReceiveFileNameReturn(FSPHANDLE, FSP_ServiceCode, int);
 static bool FSPAPI onReceiveNextBlock(FSPHANDLE, void *, int32_t, bool);
-static void FSPAPI onAcknowledgeSent(FSPHANDLE, FSP_ServiceCode, int);
 
 
 // The call back function on exception notified. Just report error and simply abort the program.
 static void FSPAPI onError(FSPHANDLE h, FSP_ServiceCode code, int value)
 {
 	printf_s("Notify: socket %p, service code = %d, return %d\n", h, code, value);
-	r2finish = finished = true;
-	if (hFinished != NULL)
-		SetEvent(hFinished);
+	finalize();
 	return;
 }
 
@@ -53,22 +48,33 @@ static void FSPAPI onError(FSPHANDLE h, FSP_ServiceCode code, int value)
 // in case it is in the same directory of the same machine 
 int _tmain(int argc, TCHAR *argv[])
 {
+	char *urlRemote = REMOTE_APPLAYER_NAME;
 	int result = -1;
-	if(argc > 2)
+	if(argc > 3)
 	{
-		_tprintf_s(_T("Usage: %s [<remote_fsp_url>]\n"), argv[0]);
+l_usage:
+		_tprintf_s(_T("Usage: %s [-] [<remote_fsp_url>]\n"), argv[0]);
 		goto l_bailout;
 	}
 
+
 #ifdef _MBCS
-	char *urlRemote = argc > 1 ? argv[1] : REMOTE_APPLAYER_NAME;
+	if (argc > 1)
+	{
+		toAcceptFile = (argv[1][0] == '-' && argv[1][1] == 0);
+		if (!toAcceptFile && argc == 3)
+			goto l_usage;
+		if (argc == 3)
+			urlRemote = argv[2];
+		else if (!toAcceptFile)
+			urlRemote = argv[1];
+	}
 #else
 	if(argc > 1)
 	{
 		_tprintf_s(_T("Presently this program does not accept wide-char parameter.\n");
 		goto l_bailout;
 	}
-	char *urlRemote = REMOTE_APPLAYER_NAME;
 #endif
 	Sleep(2000);	// wait the server up when debug simultaneously
 	result = ToAcceptPushedDirectory(urlRemote);
@@ -85,6 +91,14 @@ l_bailout:
 
 
 
+void StartAcceptFile(FSPHANDLE h)
+{
+	FSPControl(h, FSP_SET_CALLBACK_ON_REQUEST, (ULONG_PTR)onMultiplying);
+	ReadFrom(h, fileName, sizeof(fileName), onReceiveFileNameReturn);
+}
+
+
+
 // On receive the name of the remote file prepare to accept the content by receive 'inline'
 // here 'inline' means ULA shares buffer memory with LLS
 static void FSPAPI onReceiveFileNameReturn(FSPHANDLE h, FSP_ServiceCode resultCode, int resultValue)
@@ -93,6 +107,7 @@ static void FSPAPI onReceiveFileNameReturn(FSPHANDLE h, FSP_ServiceCode resultCo
 	{
 		printf_s("\nUnknown result code %d returned by FSP LLS, returned = %d\n", resultCode, resultValue);
 		Dispose(h);
+		finalize();
 		return;
 	}
 
@@ -128,6 +143,7 @@ static void FSPAPI onReceiveFileNameReturn(FSPHANDLE h, FSP_ServiceCode resultCo
 			if(c != 'Y')
 			{
 				Dispose(h);
+				finalize();
 				return;
 			}
 			//
@@ -143,6 +159,7 @@ static void FSPAPI onReceiveFileNameReturn(FSPHANDLE h, FSP_ServiceCode resultCo
 			{
 				ReportLastError();	// "Cannot create the new file"
 				Dispose(h);
+				finalize();
 				return;
 			}
 		}
@@ -153,6 +170,7 @@ static void FSPAPI onReceiveFileNameReturn(FSPHANDLE h, FSP_ServiceCode resultCo
 	catch(...)
 	{
 		Dispose(h);
+		finalize();
 	}
 }
 
@@ -168,6 +186,7 @@ static bool FSPAPI onReceiveNextBlock(FSPHANDLE h, void *buf, int32_t len, bool 
 	{
 		printf("FSP Internal panic? Receive nothing when calling the CallbackPeeked? Error code = %d\n", len);
 		Dispose(h);
+		finalize();
 		return false;
 	}
 
@@ -178,6 +197,7 @@ static bool FSPAPI onReceiveNextBlock(FSPHANDLE h, void *buf, int32_t len, bool 
 	{
 		ReportLastError();
 		Dispose(h);
+		finalize();
 		return false;
 	}
 
@@ -185,35 +205,14 @@ static bool FSPAPI onReceiveNextBlock(FSPHANDLE h, void *buf, int32_t len, bool 
 	printf_s("%d bytes written to local storage, totally %d bytes.\n", bytesWritten, totalWritten);
 	if(eot)
 	{
-		printf_s("All data have been received, to acknowledge...\n");
-		WriteTo(h, "0000", 4, TO_END_TRANSACTION, onAcknowledgeSent);
+		printf_s("All data have been received.\n");
+		finished = true;
 		return false;
 	}
 
 	return true;
 }
 
-
-
-// This time it is really shutdown
-static void FSPAPI onAcknowledgeSent(FSPHANDLE h, FSP_ServiceCode c, int r)
-{
-	printf_s("Result of sending the acknowledgement: %d\n", r);
-	if(r < 0)
-	{
-		Dispose(h);
-		return;
-	}
-
-	r = Shutdown(h, FSP_IgnoreNotice);
-	if(r < 0)
-	{
-		printf_s("Cannot shutdown gracefully in the final stage, error#: %d\n", r);
-		Dispose(h);
-	}
-
-	finished = true;
-}
 
 
 

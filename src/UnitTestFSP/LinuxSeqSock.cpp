@@ -4,6 +4,7 @@
 #include <sys/un.h>
 
 #define LOCAL_FILE_PATH "/tmp/FlexibleSessionProtocolMQ"
+#define MAX_CTRLBUF_LEN sizeof(UCommandToLLS)
 #define MAX_ERRORS		5
 
 /* Used as argument to thread_start() */

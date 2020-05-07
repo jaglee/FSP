@@ -42,77 +42,6 @@ ALFID_T CLowerInterface::SetLocalFiberID(ALFID_T value)
 
 
 // Given
-//	PIN6_ADDR	the pointer to placeholder of the [in,out] hint address
-// Do
-//	Get the head item from the free ALFID list.
-//	If the hint address is IN6_ANY, by default the first interface is exploit and the hint address is updated accordingly
-//	If the hint address is not IN6_ANY, alter ALFID_T part of it if the prefix part matched the prefix of some interface
-// Return
-//	the fiber ID, or 0 if no more slot available or hint-address prefix, if any, has no matching interface
-ALFID_T LOCALAPI CLowerInterface::RandALFID(PIN6_ADDR hintAddr)
-{
-	CSocketItemEx *p = headFreeSID;
-	int ifIndex;
-
-	if(p == NULL)
-	{
-		REPORT_ERROR_ON_TRACE();
-		return 0;
-	}
-
-	// by default exploit the first interface configured
-	if (*(uint64_t*)hintAddr == 0)
-	{
-		*(ALFID_T*)((octet *)hintAddr + 12) = p->fidPair.source;
-		memcpy(hintAddr, &addresses[0].sin6_addr, 12);
-		ifIndex = interfaces[0];
-	}
-	else
-	{
-		ifIndex = SetEffectiveALFID(hintAddr, p->fidPair.source);
-		if (ifIndex < 0)
-		{
-			// it is weired if it failed
-			REPORT_ERROR_ON_TRACE();
-			return 0;
-		}
-	}
-	// circle the entry
-	tailFreeSID->next = p;	// if it is the only entry, p->next is assigned p
-	headFreeSID = (CSocketItemEx *)p->next;
-	tailFreeSID = p;
-	if(headFreeSID == p)
-		p->next = NULL;
-	// just take use of fiberID portion of the new entry
-	return p->fidPair.source;
-}
-
-
-
-// Return an available random ID. Here it is pre-calculated. Should be really random for better security
-ALFID_T LOCALAPI CLowerInterface::RandALFID()
-{
-	CSocketItemEx *p = headFreeSID;
-	if(p == NULL)
-	{
-		REPORT_ERROR_ON_TRACE();
-		return 0;
-	}
-	// circle the entry
-	tailFreeSID->next = p;	// if it is the only entry, p->next is assigned p
-	tailFreeSID = p;
-	headFreeSID = (CSocketItemEx *)p->next;	// might be NULL
-	if(p->next == NULL)
-		headFreeSID = p;
-	else
-		p->next = NULL;
-	// just take use of fiberID portion of the new entry
-	return p->fidPair.source;
-}
-
-
-
-// Given
 //	CSocketItemEx *	the pointer to the premature socket (default NULL)
 //	uint32_t			reason code flags of reset (default zero)
 // Do
@@ -374,16 +303,7 @@ void CSocketItemEx::InstallEphemeralKey()
 void CSocketItemEx::InstallSessionKey(const CommandInstallKey& cmd)
 {
 #if defined(TRACE) && (TRACE & (TRACE_SLIDEWIN | TRACE_ULACALL))
-	printf_s("\n%s\n"
-		"\tsendWindowNextSN = %09u\n"
-		"\tsendBufferNextSN = %09u\n"
-		"\trecvWindowNextSN = %09u\n"
-		"\t RecvRE snapshot = %09u\n"
-		, __FUNCTION__
-		, pControlBlock->sendWindowNextSN
-		, pControlBlock->sendBufferNextSN
-		, pControlBlock->recvWindowNextSN
-		, pControlBlock->connectParams.nextKey$initialSN);
+	pControlBlock->DumpSendRecvWindowInfo();
 	printf("Key length: %d bits\t", pControlBlock->connectParams.keyBits);
 #endif
 	int sizeIKM = pControlBlock->connectParams.keyBits / 8;
@@ -391,7 +311,7 @@ void CSocketItemEx::InstallSessionKey(const CommandInstallKey& cmd)
 	sizeIKM = min((int)sizeof(ikm), sizeIKM);
 	if (sizeIKM <= 0)
 		return;
-	recv(sdPipe, ikm, sizeIKM, 0);
+	recv(rootULA->sdPipe, ikm, sizeIKM, 0);
 #if defined(TRACE) && (TRACE & (TRACE_SLIDEWIN | TRACE_ULACALL))
 	DumpHexical(ikm, sizeIKM);
 #endif
@@ -399,9 +319,16 @@ void CSocketItemEx::InstallSessionKey(const CommandInstallKey& cmd)
 	contextOfICC.isPrevSendCRC = contextOfICC.isPrevRecvCRC
 		= (InterlockedExchange64((int64_t*)&contextOfICC.keyLifeRemain, cmd.keyLife) == 0);
 	contextOfICC.noEncrypt = (pControlBlock->noEncrypt != 0);
-	contextOfICC.snFirstSendWithCurrKey = pControlBlock->sendBufferNextSN;
-	contextOfICC.snFirstRecvWithCurrKey = pControlBlock->connectParams.nextKey$initialSN;
-
+	contextOfICC.snFirstRecvWithCurrKey = pControlBlock->connectParams.expectedSN;
+	contextOfICC.snFirstSendWithCurrKey = pControlBlock->connectParams.initialSN;
+#if defined(TRACE) && (TRACE & (TRACE_SLIDEWIN | TRACE_ULACALL))
+	printf_s("\n\n#%u(Near end's ALFID): %s\n"
+		"First SN to send with current key  = %09u\n"
+		"First SN expected with current key = %09u\n"
+		, fidPair.source, __FUNCTION__
+		, contextOfICC.snFirstSendWithCurrKey
+		, contextOfICC.snFirstRecvWithCurrKey);
+#endif
 	contextOfICC.InitiateExternalKey(ikm, sizeIKM);
 }
 
@@ -444,8 +371,6 @@ void ICC_Context::InitiateExternalKey(const void *ikm, int n)
 	blake2b_ctx ctx;
 
 	originalKeyLength = (n > FSP_MIN_KEY_SIZE ? FSP_MAX_KEY_SIZE : FSP_MIN_KEY_SIZE);
-	if (n > (int)sizeof(SConnectParam))
-		n = sizeof(SConnectParam);
 	
 	bzero(zeros, FSP_MAX_KEY_SIZE);
 	bzero(&ctx, sizeof(ctx));
@@ -592,9 +517,9 @@ GCM_AES_CTX * ICC_Context::GetGCMContextForSend(GCM_AES_CTX & ctx, ControlBlock:
 
 
 // Remark
-//	And initiate that of the child for sending the very first packet
-//	The snFirstRecvWithCurrKey is unset until the first response packet is accepted.
-void ICC_Context::InheritS0(const ICC_Context &src, ControlBlock::seq_t seq0)
+//	Initiate the security context of the child connection for sending the very first packet
+//	Assume snFirstSendWithCurrKey has been set by the caller directly
+void ICC_Context::InheritS0(const ICC_Context &src)
 {
 	if ((keyLifeRemain = src.keyLifeRemain) == 0)
 	{
@@ -605,7 +530,6 @@ void ICC_Context::InheritS0(const ICC_Context &src, ControlBlock::seq_t seq0)
 
 	isPrevSendCRC = isPrevRecvCRC = false;
 	noEncrypt = src.noEncrypt;
-	snFirstSendWithCurrKey = seq0 + 1;
 
 	if (noEncrypt)
 	{
@@ -638,13 +562,13 @@ void ICC_Context::InheritS0(const ICC_Context &src, ControlBlock::seq_t seq0)
 
 
 // Remark
-//	And initiate that of the child for accepting the very first packet
-//	The snFirstRecvWithCurrKey is set by the caller directly
+//	Initiate security context of the child connection to accept the very first packet
+//	provided that snFirstRecvWithCurrKey has been set by the caller directly
 //	Unlike InheritS0, it does not necessarily applying the most recent key of the original connection
 //	because MULTIPLY is out-of-band and it might be in the race condition
 //	that MULTIPLY is received before the ULA installs new key
 //	Assume this ICC_Context has been zeroed
-void ICC_Context::InheritR1(const ICC_Context &src, ControlBlock::seq_t seq0)
+void ICC_Context::InheritR1(const ICC_Context &src)
 {
 	if ((keyLifeRemain = src.keyLifeRemain) == 0)
 	{
@@ -655,7 +579,6 @@ void ICC_Context::InheritR1(const ICC_Context &src, ControlBlock::seq_t seq0)
 
 	isPrevSendCRC = isPrevRecvCRC = false;
 	noEncrypt = src.noEncrypt;
-	snFirstSendWithCurrKey = seq0;
 
 	if (noEncrypt)
 	{
@@ -715,7 +638,7 @@ void ICC_Context::Derive(const octet *info, int LEN)
 //  Set the session key for the packet next sent and the next received. 
 //	K_out = PRF(K, [d] || Label || 0x00 || Context || L)
 //	[d]		- Depth. It is alike the KDF counter mode as the NIST SP800-108 (not the feedback mode)
-//	Label	�C A string that identifies the purpose for the derived keying material,
+//	Label	- A string that identifies the purpose for the derived keying material,
 //	          here we set to "Multiply an FSP connection"
 //	Context	- idInitiator, idResponder
 //	Length	- An integer specifying the length (in bits) of the derived keying material K-output
@@ -1004,7 +927,7 @@ bool LOCALAPI CSocketItemEx::ValidateICC(FSP_NormalPacketHeader *p1, int32_t ctL
 	CONNECT_REQUEST		payload buffer	/ temporary: initiator may retransmit it actively/stateless for responder
 	ACK_CONNECT_REQ		separate payload/ separate : responder may retransmit it passively/transient for initiator
 	RESET				temporary		/ temporary: one-shot only
-	ACK_START			payload buffer	/ payload buffer
+	NULCOMMIT			payload buffer	/ payload buffer
 							Initiator of CONNECT REQUEST may retransmit it actively
 							Responder of MULTIPY may retransmit it on demand
 	PURE_DATA			separate payload/ separate payload: fixed header regenerated on retransmission
@@ -1044,11 +967,9 @@ bool CSocketItemEx::EmitStart()
 		// ACK_CONNECT_REQ is an in-band packet to start a transmit transaction for the responder
 	case NULCOMMIT:
 		// NULCOMMIT is an in-band payload-less packet that commits a transmit transaction
-		// NULCOMMIT is alias to ACK_START to confirm ACK_CONNECT_REQ or MULTIPLY as well
 	case PERSIST:
+		// Both NULCOMMIT and PERSIST may be exploited to confirm ACK_CONNECT_REQ or MULTIPLY
 		// PERSIST is a packet with payload that starts a transmit transaction as well
-	case RELEASE:
-		// RELEASE is an in-band control packet that has both NULCOMMIT and ACK_FLUSH semantics
 		result = EmitWithICC(skb, pControlBlock->sendWindowFirstSN);
 		skb->MarkSent();
 		break;
@@ -1066,6 +987,32 @@ bool CSocketItemEx::EmitStart()
 		BREAK_ON_DEBUG();
 		return false;
 	}
+#if defined(TRACE) && (TRACE & TRACE_PACKET)
+	printf_s("Session#%u emit %s, result = %d, time : 0x%016" PRIx64 "\n"
+		, fidPair.source, opCodeStrings[skb->opCode], result, skb->timeSent);
+#endif
+	return (result >= 0);
+}
+
+
+
+// Do
+//	Transmit the last packet which is assumed to be the RELEASE packet in the send queue
+// Remark
+//	A RELEASE packet that has been acknowledged should not and would not be resent
+bool CSocketItemEx::EmitRelease()
+{
+	if (int32_t(LCKREAD(pControlBlock->sendBufferNextSN) - pControlBlock->sendWindowFirstSN - 1) != 0)
+		return false;
+
+	ControlBlock::PFSP_SocketBuf skb = pControlBlock->GetSendQueueHead();
+	if (!skb->IsComplete() || skb->opCode != RELEASE)
+		return false;
+	int const result = EmitWithICC(skb, pControlBlock->sendWindowFirstSN);
+	skb->timeSent = NowUTC();
+	skb->MarkSent();
+	pControlBlock->sendWindowNextSN = pControlBlock->sendBufferNextSN;
+	pControlBlock->sendWindowNextPos = pControlBlock->sendBufferNextPos;
 #if defined(TRACE) && (TRACE & TRACE_PACKET)
 	printf_s("Session#%u emit %s, result = %d, time : 0x%016" PRIx64 "\n"
 		, fidPair.source, opCodeStrings[skb->opCode], result, skb->timeSent);

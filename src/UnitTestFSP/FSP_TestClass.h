@@ -8,7 +8,8 @@ class CSocketItemExDbg: public CSocketItemEx
 public:
 	int Init(int nSend, int nRecv)
 	{
-		memset(this, 0, sizeof(CSocketItemEx));
+		int m = offsetof(SocketItemEx, timer);
+		bzero((octet *)this + m, m);
 		//
 		dwMemorySize = (int32_t)sizeof(ControlBlock)
 			+ int32_t(sizeof(ControlBlock::FSP_SocketBuf) + MAX_BLOCK_SIZE) * (nSend + nRecv);
@@ -43,13 +44,14 @@ public:
 	}
 #endif
 
+	SProcessRoot* GetProcessRoot() { return rootULA; }
 	PControlBlock GetControlBlock() const { return PControlBlock(pControlBlock); }
 	ControlBlock::PFSP_SocketBuf AllocRecvBuf(ControlBlock::seq_t seq1) { return pControlBlock->AllocRecvBuf(seq1); }
 
 	// Note that the first packet to apply the new session key is always the one buffered next
 	void InstallSessionKey(BYTE ikm[FSP_MIN_KEY_SIZE])
 	{
-		CommandInstallKey cmd(INT32_MAX);
+		CommandInstallKey cmd(0, INT32_MAX);	// Application Layer Fiber ID is not exploited here, however.
 		pControlBlock->connectParams.keyBits = FSP_MIN_KEY_SIZE * 8;
 		pControlBlock->SnapshotReceiveWindowRightEdge();
 
@@ -58,12 +60,11 @@ public:
 			= (InterlockedExchange64((int64_t*)&contextOfICC.keyLifeRemain, cmd.keyLife) == 0);
 		contextOfICC.noEncrypt = (pControlBlock->noEncrypt != 0);
 		contextOfICC.snFirstSendWithCurrKey = pControlBlock->sendBufferNextSN;
-		contextOfICC.snFirstRecvWithCurrKey = pControlBlock->connectParams.nextKey$initialSN;
+		contextOfICC.snFirstRecvWithCurrKey = pControlBlock->connectParams.expectedSN;
 		contextOfICC.InitiateExternalKey(ikm, FSP_MIN_KEY_SIZE);
 	}
 
 	void SetPairOfFiberID(ALFID_T src, ALFID_T dst) { fidPair.source = src; fidPair.peer = dst; }
-	void SetParentProcess() { idSrcProcess = GetCurrentProcessId(); }
 
 	// For test algorithm for generating KEEP_ALIVE packet in timer.cpp
 	int32_t LOCALAPI GenerateSNACK(FSP_KeepAliveExtension&);

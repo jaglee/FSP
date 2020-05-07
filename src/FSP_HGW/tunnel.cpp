@@ -117,7 +117,7 @@ static void FreeRequestItem(PRequestPoolItem p, bool graceful = false)
 // This is an I/O routine which rely on the full-duplex mode
 bool FSPAPI onFSPDataAvailable(FSPHANDLE h, void * buf, int32_t len, bool eot)
 {
-	SRequestPoolItem *pReq = requestPool.FindItem(h);
+	PRequestPoolItem pReq = requestPool.FindItem(h);
 	if (pReq == NULL)
 	{
 		printf_s("Broken protocol pipe! Cannot get the request state related to the FSP socket.\n");

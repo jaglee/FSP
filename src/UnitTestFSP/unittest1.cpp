@@ -204,34 +204,27 @@ void UnitTestSocketSrvTLB()
 		DbgRaiseAssertionFailure();
 	}
 
-	CSocketItemEx *p1 = (CSocketItemEx *)CLowerInterface::Singleton.AllocItem(2);
+	CSocketItemExDbg *p1 = (CSocketItemExDbg *)CLowerInterface::Singleton.AllocItem(2);
 	Assert::IsNotNull(p1, L"There should be free item slot for listener");
 
 	CSocketItemEx *p = (CSocketItemEx *)CLowerInterface::Singleton[2];
 	Assert::IsTrue(p == p1, L"The remapped listening socket should be the same as the allocated");
 
-	p = (CSocketItemEx *)CLowerInterface::Singleton.AllocItem();
+	SProcessRoot r;
+	bzero(&r, sizeof(r));
+	p->AddKinshipTo(r);
+
+	p = (CSocketItemEx *)CLowerInterface::Singleton.AllocItem(p1->GetProcessRoot());
 	Assert::IsNotNull(p, L"There should be free item slot");
 
 	IN6_ADDR addrList[MAX_PHY_INTERFACES];
 	// no hint
 	memset(addrList, 0, sizeof(addrList));
-	ALFID_T id = CLowerInterface::Singleton.RandALFID();
-	Assert::IsFalse(id == 0, L"There should be free id space");
-
-	id = CLowerInterface::Singleton.RandALFID(addrList);
+	ALFID_T id = CLowerInterface::Singleton.RandALFID(p1);
 	Assert::IsFalse(id == 0, L"There should be free id space");
 
 	sprintf_s(linebuf, "Allocated ID = %u\n", id);
 	Logger::WriteMessage(linebuf);
-
-#if 0
-	for(int i = 0; i < MAX_PHY_INTERFACES; i++)
-	{
-		RtlIpv6AddressToString(& addrList[i], linebuf);
-		Logger::WriteMessage(linebuf);
-	}
-#endif
 
 	CSocketItemEx *p2 = (CSocketItemEx *)CLowerInterface::Singleton[id];
 	Assert::IsFalse(p2 == p1, L"RandID shouldn't alloc the same item as AllocItem for listener");
@@ -266,24 +259,25 @@ void UnitTestSocketRTLB()
 	CSocketItemExDbg *p = (CSocketItemExDbg *)(*pRTLB)[2];
 	Assert::IsTrue(p == p1, L"The remapped listening socket should be the same as the allocated");
 
-	p = (CSocketItemExDbg *)pRTLB->AllocItem();
+	SProcessRoot r;
+	bzero(&r, sizeof(r));
+	p->AddKinshipTo(r);
+
+	p = (CSocketItemExDbg *)pRTLB->AllocItem(p1->GetProcessRoot());
 	Assert::IsNotNull(p, L"There should be free item slot");
 
 	IN6_ADDR addrList[MAX_PHY_INTERFACES];
 	// no hint
 	memset(addrList, 0, sizeof(addrList));
-	ALFID_T id = pRTLB->RandALFID();
-	Assert::IsFalse(id == 0, L"There should be free id space");
-
-	id = pRTLB->RandALFID(addrList);
+	ALFID_T id = pRTLB->RandALFID(p1);
 	Assert::IsFalse(id == 0, L"There should be free id space");
 
 	sprintf_s(linebuf, "Allocated ID = %u\n", id);
 	Logger::WriteMessage(linebuf);
 
 	CSocketItemExDbg *p2 = (CSocketItemExDbg *)(*pRTLB)[id];
-	Assert::IsFalse(p2 == p1, L"RandID shouldn't alloc the same item as AllocItem for listener");
-	Assert::IsFalse(p2 == p, L"RandID shouldn't alloc the same item as AllocItem");
+	Assert::IsFalse(p2 == p1, L"RandID shouldn't allocate the same item as AllocItem for listener");
+	Assert::IsFalse(p2 == p, L"RandID shouldn't allocate the same item as AllocItem");
 
 	p->fidPair.peer = id;
 	p->idParent = 0xABCD;
@@ -312,8 +306,7 @@ void UnitTestSocketRTLB()
 void UnitTestConnectQueue()
 {
 	static ConnectRequestQueue commandRequests;
-	CommandNewSession raw;
-	raw.opCode = InitConnection;
+	CommandNewSession raw(InitConnection, 0);
 	CommandNewSessionSrv t(&raw);
 
 	int i = commandRequests.Push(& t);
@@ -328,9 +321,12 @@ void UnitTestAllocSocket()
 	static CSocketSrvTLB & tlb = CLowerInterfaceDbg::Singleton;
 	CSocketItemEx *p;
 	CSocketItemExDbg *p0, *p1 = NULL;
+	SProcessRoot r;
+	memset(&r, 0, sizeof(SProcessRoot));
+	CLowerInterfaceDbg::Singleton.MakeALFIDsPool();
 	for (register int i = 0; i < MAX_CONNECTION_NUM; i++)
 	{
-		p = tlb.AllocItem();
+		p = tlb.AllocItem(&r);
 		Assert::IsNotNull(p);
 		p->SetTouchTime(NowUTC());
 		if (p1 == NULL)
@@ -338,34 +334,49 @@ void UnitTestAllocSocket()
 	}
 	Logger::WriteMessage("All slots allocated.");
 	p0 = (CSocketItemExDbg*)p;
+
+	p1->fidPair.peer = 80;
 	p1->Init(2, 2);
-	p = tlb.AllocItem();
+	tlb.PutToRemoteTLB((CMultiplyBacklogItem*)p1);
+
+	p = tlb.AllocItem(&r);
 	Assert::IsNull(p);
-	//^TRACE=2, 6, 10... when the second bit of the TRACE macro value is set
-	// Or else this assertion will fail
-	// as AllocItem automatically frees the slot whose ULA process is not alive
 
 	tlb.FreeItem(p0);
 	Logger::WriteMessage("One slot is free");
 
-	p = tlb.AllocItem();
+	p = tlb.AllocItem(&r);
 	Assert::IsNotNull(p);
 	Assert::IsTrue(p == (CSocketItemEx*)p0);
 
-	p = tlb.AllocItem();
+	p = tlb.AllocItem(&r);
 	Assert::IsNull(p);
 
 	p0 = (CSocketItemExDbg *)tlb.AllocItem(htonl(80));
 	Assert::IsNotNull(p0);
-	p0->SetParentProcess();
+	p0->AddKinshipTo(r);
 
 	p = tlb.AllocItem(htonl(80));
 	Assert::IsNull(p);
 
-	p1->PutToResurrectable();
-	p = tlb.AllocItem();
+	tlb.FreeItem(p1);	// should eventually call DetachFromRemoteTLB
+	p = tlb.AllocItem(&r);
 	Assert::IsNotNull(p);
 	Assert::IsTrue(p == (CSocketItemEx *)p1);
+
+	p1->PutToResurrectable();
+	tlb.FreeItem(p1);
+	//^DetachFromRemoteTLB should return false because p1 == p but it was not put into the TLB again
+
+	ALFID_T fid = tlb.RandALFID(p0);
+	Assert::IsTrue(fid != 0);
+	
+	p = tlb.AllocItem(&r, fid);
+	Assert::IsNotNull(p);
+
+	tlb.FreeItem(p0);	// should eventually call DetachFromListenTLB
+
+	tlb.FreeULAChannel(&r);
 }
 
 

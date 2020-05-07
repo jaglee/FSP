@@ -66,50 +66,6 @@ int FSPAPI Shutdown(FSPHANDLE hFSPSocket, NotifyOrReturn fp1)
 
 
 
-/**
- * 'NotifyOrReturn ChainCloseOnCommitted;' has not been exploited yet, neither ChainOnCommitted
- */
-// static void FSPAPI ChainCloseOnCommitted(FSPHANDLE h, FSP_ServiceCode c, int v)
-// {
-// 	CSocketItemDl* p = CSocketDLLTLB::HandleToRegisteredSocket(h);
-// 	if (p == NULL)
-// 		return;
-// 	//
-// 	p->ChainOnCommitted(c, v);
-// }
-
-
-
-/**
- * ChainOnCommitted, together with ChainCloseOnCommitted, are meant to be co-routines of the main thread
- */
-int  CSocketItemDl::ChainOnCommitted(FSP_ServiceCode c, int v)
-{
-	if (!WaitUseMutex())
-		return IsInUse() ? -EDEADLK : 0;
-
-	FSP_Session_State s = GetState();
-	SetMutexFree();
-	if (s < CLOSABLE)
-		return -EPERM;		// It should not happen
-
-	if (v < 0)
-		return Dispose();
-
-	if (!WaitUseMutex())
-		return IsInUse() ? -EDEADLK : 0;
-	if (c == FSP_Shutdown)
-		return RecycLocked();
-	fpFinished = fpCommitted = NULL;
-	initiatingShutdown = 0;
-	//^So that Shutdown neither return prematurely nor fall in dead-loop
-	SetMutexFree();
-
-	return Shutdown();
-}
-
-
-
 // Dispose the socket, recycle the ULA TCB, inform LLS on demand
 // Return
 //	0 if no error
@@ -132,23 +88,10 @@ int  CSocketItemDl::Dispose()
 		Sleep(TIMER_SLICE_ms);
 	}
 
+	if (ESTABLISHED <= pControlBlock->state && pControlBlock->state <= CLOSABLE)
+		Call<FSP_Reset>();
+
 	Free();
-	return 0;
-}
-
-
-
-// Unlike Free, Recycle-locked does not destroy the control block
-// so that the DLL socket may be reused on connection resumption
-// assume the socket has been locked
-// Does not actually recycle the socket until the event loop exits
-int CSocketItemDl::RecycLocked()
-{
-	if (processingNotice)
-		pendingRecycle = 1;
-	else
-		RecycleSimply();
-	SetMutexFree();
 	return 0;
 }
 
@@ -181,7 +124,7 @@ void CSocketItemDl::Free()
 int CSocketItemDl::Shutdown()
 {
 	if (!WaitUseMutex())
-		return (IsInUse() ? -EDEADLK : 0);
+		return (IsInUse() ? -EDEADLK : -EAGAIN);
 
 	if (lowerLayerRecycled || initiatingShutdown != 0)
 	{
@@ -194,31 +137,23 @@ int CSocketItemDl::Shutdown()
 		SetMutexFree();
 		return -EBUSY;
 	}
-	// Cannot nest synchronous shutdown in a call-back function
-	if (processingNotice && fpFinished == NULL)
-	{
-		SetMutexFree();
-		return -EDOM;
-	}
 	initiatingShutdown = 1;
 
+	// It prevents dead-loop to check whether it is already in CLOSED state before proactive shut-down
 	FSP_Session_State s = GetState();
-	if (s == CLOSED)
-	{
-		RecycLocked();
-		return 0;
-	}
-	// It prevents dead-loop to check whether it is already in CLOSED state before passive shut-down.
-	if (s == SHUT_REQUESTED)
+	if (s == SHUT_REQUESTED || s == CLOSED)
 	{
 		NotifyOrReturn fp1 = (NotifyOrReturn)_InterlockedExchangePointer((PVOID*)&fpFinished, NULL);
-		SetState(CLOSED);
-		Call<FSP_Shutdown>();
+		if (s == SHUT_REQUESTED)
+		{
+			SetState(CLOSED);
+			Call<FSP_Shutdown>();
+		}		// assert: FSP_NotifyToFinish has been received and processed. See also WaitEventToDispatch
 		RecycLocked();
 		if (fp1 != NULL)
 			fp1(this, FSP_Shutdown, 0);
 		return 0;
-	}	// assert: FSP_NotifyToFinish has been received and processed. See also WaitEventToDispatch
+	}
 
 #ifndef _NO_LLS_CALLABLE
 	if (s <= ESTABLISHED || s == COMMITTING || s == COMMITTED)
@@ -234,10 +169,8 @@ int CSocketItemDl::Shutdown()
 		{
 			// flush internal buffer for compression, if it is non-empty
 			if (HasFreeSendBuffer())
-			{
 				BufferData(pendingSendSize);
-				// Call<FSP_Urge>();
-			}
+			// or else just to wait
 		}
 		else if (skbImcompleteToSend != NULL)
 		{
@@ -245,17 +178,14 @@ int CSocketItemDl::Shutdown()
 			skbImcompleteToSend->SetFlag<TransactionEnded>();
 			skbImcompleteToSend->ReInitMarkComplete();
 			skbImcompleteToSend = NULL;
-			MigrateToNewStateOnCommit();
-			// No, RELEASE packet may not carry payload.
-			AppendEoTPacket(RELEASE);
-			// Call<FSP_Urge>();
-			//^It may or may not be success, but it does not matter
+			SetState(PRE_CLOSED);
+			AppendEoTPacket();
 		}
-		else { AppendEoTPacket(RELEASE); }
-		//else if (AppendEoTPacket(RELEASE))
-		//{
-		//	//Call<FSP_Urge>();
-		//}
+		else
+		{
+			SetState(PRE_CLOSED);
+			AppendEoTPacket();
+		}
 	}
 	//
 	if (s == PEER_COMMIT || s == COMMITTING2)
@@ -276,9 +206,8 @@ int CSocketItemDl::Shutdown()
 	if (s == CLOSABLE)
 	{
 		SetState(PRE_CLOSED);
-		if (IsEoTPending()) AppendEoTPacket(RELEASE);
-		//if (IsEoTPending() && AppendEoTPacket(RELEASE))
-		//	Call<FSP_Urge>();
+		if (IsEoTPending())
+			AppendEoTPacket();
 		//
 		if (fpFinished != NULL)
 		{
@@ -288,7 +217,7 @@ int CSocketItemDl::Shutdown()
 	}
 	//
 	int32_t deinitWait = CLOSING_TIME_WAIT_ms;
-	for (; s != SHUT_REQUESTED && s != CLOSED && s != NON_EXISTENT; s = GetState())
+	while (s != SHUT_REQUESTED && s != CLOSED && s != NON_EXISTENT)
 	{
 		SetMutexFree();
 		Sleep(TIMER_SLICE_ms);
@@ -299,6 +228,8 @@ int CSocketItemDl::Shutdown()
 		//
 		if (!WaitUseMutex())
 			return (IsInUse() ? -EDEADLK : 0);
+
+		s = GetState();
 	}
 #endif
 	if (s == SHUT_REQUESTED)

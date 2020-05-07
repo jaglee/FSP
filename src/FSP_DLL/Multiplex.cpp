@@ -47,12 +47,11 @@
 DllExport
 FSPHANDLE FSPAPI MultiplyAndWrite(FSPHANDLE hFSP, PFSP_Context psp1, unsigned flag, NotifyOrReturn fp1)
 {
-	CommandCloneConnect objCommand;
-	CSocketItemDl *p = CSocketItemDl::ToPrepareMultiply(hFSP, psp1, objCommand);
+	CSocketItemDl *p = CSocketItemDl::ToPrepareMultiply(hFSP, psp1);
 	if(p == NULL)
 		return p;
 
-	FSPHANDLE h = p->WriteOnMultiplied(objCommand, psp1, flag, fp1);
+	FSPHANDLE h = p->WriteOnMultiplied(psp1, flag, fp1);
 	if (h == NULL)
 	{
 		p->Free();
@@ -81,8 +80,7 @@ FSPHANDLE FSPAPI MultiplyAndWrite(FSPHANDLE hFSP, PFSP_Context psp1, unsigned fl
 DllExport
 FSPHANDLE FSPAPI MultiplyAndGetSendBuffer(FSPHANDLE hFSP, PFSP_Context psp1, CallbackBufferReady onBufferReady)
 {
-	CommandCloneConnect objCommand;
-	CSocketItemDl *p = CSocketItemDl::ToPrepareMultiply(hFSP, psp1, objCommand);
+	CSocketItemDl *p = CSocketItemDl::ToPrepareMultiply(hFSP, psp1);
 	if(p == NULL)
 		return p;
 
@@ -99,7 +97,7 @@ FSPHANDLE FSPAPI MultiplyAndGetSendBuffer(FSPHANDLE hFSP, PFSP_Context psp1, Cal
 		onBufferReady(p, buf, m);
 	}
 
-	return p->CompleteMultiply(objCommand);
+	return p->CompleteMultiply();
 }
 
 
@@ -107,14 +105,13 @@ FSPHANDLE FSPAPI MultiplyAndGetSendBuffer(FSPHANDLE hFSP, PFSP_Context psp1, Cal
 // Given
 //	CSocketItemDl *		The parent socket item
 //	PFSP_Context		The context of the new child connection
-//	CommandCloneConnect & [_Out_] The connection multiplication command structure
 // Return
 //	The new socket item
 // Remark
 //	Requirement of a command structure is rendered by CreateControlBlock
 //	It is not hard-limited, but ULA shall only clone a connection in the
 //	ESTABLISHED(COMMITTING, COMMITTED, PEER_COMMIT, COMMITTING2 or CLOSABLE) state
-CSocketItemDl * LOCALAPI CSocketItemDl::ToPrepareMultiply(FSPHANDLE h, PFSP_Context psp1, CommandCloneConnect & objCommand)
+CSocketItemDl * LOCALAPI CSocketItemDl::ToPrepareMultiply(FSPHANDLE h, PFSP_Context psp1)
 {
 	CSocketItemDl *p = CSocketDLLTLB::HandleToRegisteredSocket(h);
 	if(p == NULL)
@@ -125,7 +122,7 @@ CSocketItemDl * LOCALAPI CSocketItemDl::ToPrepareMultiply(FSPHANDLE h, PFSP_Cont
 
 	IN6_ADDR addrAny = IN6ADDR_ANY_INIT;
 	psp1->passive = 0;	// override what is provided by ULA
-	CSocketItemDl * socketItem = CSocketItemDl::CreateControlBlock((PFSP_IN6_ADDR) & addrAny, psp1, objCommand);
+	CSocketItemDl * socketItem = CSocketItemDl::CreateControlBlock((PFSP_IN6_ADDR) & addrAny, psp1);
 	if(socketItem == NULL)
 	{
 		psp1->flags = -EBADF;	// -E_HANDLE?
@@ -135,7 +132,7 @@ CSocketItemDl * LOCALAPI CSocketItemDl::ToPrepareMultiply(FSPHANDLE h, PFSP_Cont
 	try
 	{
 		socketItem->pControlBlock->connectParams = p->pControlBlock->connectParams;
-		socketItem->pControlBlock->idParent = p->fidPair.source;
+		socketItem->pControlBlock->connectParams.idParent = p->fidPair.source;
 		socketItem->pControlBlock->SetSendWindow(LCKREAD(p->pControlBlock->sendWindowNextSN) - 1);
 		//^The receive window would be initialized in LLS
 		// The MULTIPLY packet itself is sent in old key, while the packet next to MULTIPLY is send in derived key
@@ -154,7 +151,7 @@ CSocketItemDl * LOCALAPI CSocketItemDl::ToPrepareMultiply(FSPHANDLE h, PFSP_Cont
 
 
 inline
-FSPHANDLE LOCALAPI CSocketItemDl::WriteOnMultiplied(CommandCloneConnect &objCommand, PFSP_Context psp1, unsigned flag, NotifyOrReturn fp1)
+FSPHANDLE LOCALAPI CSocketItemDl::WriteOnMultiplied(PFSP_Context psp1, unsigned flag, NotifyOrReturn fp1)
 {
 	TestSetSendReturn((PVOID)fp1);
 	if (psp1->welcome != NULL)
@@ -170,16 +167,14 @@ FSPHANDLE LOCALAPI CSocketItemDl::WriteOnMultiplied(CommandCloneConnect &objComm
 		BufferData(psp1->len);
 		SetMutexFree();
 	}
-	return CompleteMultiply(objCommand);
+	return CompleteMultiply();
 }
 
 
 
-// Given
-//	CommandCloneConnect & [_InOut_]	The command context whose shared memory and event handlers have been prepared
 // Do
 //	Fill in the MULTPLY packet, construct and pass command to LLS
-FSPHANDLE CSocketItemDl::CompleteMultiply(CommandCloneConnect & cmd)
+FSPHANDLE CSocketItemDl::CompleteMultiply()
 {
 	ControlBlock::PFSP_SocketBuf skb = SetHeadPacketIfEmpty(MULTIPLY);
 	if (skb != NULL)
@@ -188,12 +183,10 @@ FSPHANDLE CSocketItemDl::CompleteMultiply(CommandCloneConnect & cmd)
 		skb->ReInitMarkComplete();
 	}
 	// See also InitCommand, CallCreate
-	cmd.fiberID = pControlBlock->idParent;
-	cmd.idProcess = idThisProcess;
+	CommandCloneConnect cmd(pControlBlock->connectParams.idParent);
 	CopyFatMemPointo(cmd);
-	cmd.opCode = FSP_Multiply;
 	SetState(CLONING);
-	if (!EnableLLSInteract(cmd) || !Call((UCommandToLLS*)&cmd))
+	if (!StartPolling() || !Call((UCommandToLLS*)&cmd))
 	{
 		RecycleSimply();
 		return NULL;
@@ -208,7 +201,7 @@ FSPHANDLE CSocketItemDl::CompleteMultiply(CommandCloneConnect & cmd)
 //	|-->/MULTIPLY/-->[API{Callback}]-->{new context}CONNECT_AFFIRMING
 //		|-->[{Return Accept}]
 //			|{has payload prebuffered}-->{further LLS process}
-//			|{without payload}-->[Prebuffer ACK_START]-->{further LLS process}
+//			|{without payload}-->[Send NULCOMMIT]
 //		|-->[{Return}:Reject]-->{abort creating new context}
 // See also
 //	ToWelcomeConnect, ToConcludeConnect(), @LLS::ResponseToMultiply, @LLS::Recycle
@@ -221,6 +214,6 @@ bool LOCALAPI CSocketItemDl::ToWelcomeMultiply(SItemBackLog & backLog)
 	if (context.onAccepting != NULL	&& context.onAccepting(this, & backLog.acceptAddr, remoteAddr) < 0)
 		return false;
 
-	SetHeadPacketIfEmpty(ACK_START);
+	SetHeadPacketIfEmpty(NULCOMMIT);
 	return true;
 }

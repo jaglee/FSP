@@ -254,7 +254,7 @@ static int FSPAPI toSendNextBlock(FSPHANDLE h, void* batchBuffer, int32_t capaci
 	memcpy(batchBuffer, bytesToSend + offset, bytesRead);
 	offset += bytesRead;
 
-	// Would wait until acknowledgement is received. Shutdown is called in onResponseReceived
+	// Would wait until acknowledgement is received
 	bool r = (offset >= (int)sizeOfBuffer);
 	int n = SendInline(h, batchBuffer, bytesRead, r, NULL);
 	if (n < 0)

@@ -2,7 +2,7 @@
  * Simple HTTP 1.0 server over FSP version 0. SOCKS gateway and tunnel server as well
  *
  * Usage 1: as the SOCKSv4 proxy: fsp_socks -p <port number> [Remote FSP address]
- * Usage 2: as the HTTP server (and tunnel responder)�� fsp_http -d <local web root>
+ * Usage 2: as the HTTP server (and tunnel responder) fsp_http -d <local web root> [MAX_WORKING_THREADS]
     Copyright (c) 2017, Jason Gao
     All rights reserved.
 

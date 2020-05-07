@@ -63,6 +63,7 @@ void server()
 	// offsetof(struct sockaddr_un, sun_path)+strlen(addr.sun_path)+1
 	// When coding portable applications, keep in mind that some implementations have sun_path as short as 92 bytes.
 
+#define MAX_CTRLBUF_LEN sizeof(UCommandToLLS)
 	octet buffer[MAX_CTRLBUF_LEN];
 	socklen_t szAddr = sizeof(struct sockaddr_un);
 	int	nRead = (int)recvfrom(sd, buffer, sizeof(buffer), 0, (struct sockaddr*)&addr, &szAddr);

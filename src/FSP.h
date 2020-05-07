@@ -127,10 +127,11 @@ typedef ALFID_T	 ULTID_T;
 	ECHILD		-
 	EAGAIN		-
 	ENOMEM		Near end only: no memory
-	EACCES		Memory access out of border
-	EFAULT		General fault
+	EACCES		Permission denied
+	EFAULT		Bad address, memory access out of border
 	EBUSY		Near end only: the underlying socket is busy, new service request may not be accepted
 	EEXIST		Collision exists when making connection multiplication
+	EINVAL		Invalid argument, passed by the remote peer
 	EDOM		Domain error: i.e. parameter value is unacceptable
 */
 
@@ -148,7 +149,7 @@ typedef enum _FSP_Session_State: char
 	// before getting ACK_CONNECT_REQ, timeout to retry or NON_EXISTENT
 	CONNECT_AFFIRMING,
 	// after getting legal CONNECT_REQUEST and sending back ACK_CONNECT_REQ
-	// before getting ACK_START or first PERSIST. timeout to NON_EXISTENT:
+	// before getting first NULCOMMIT or PERSIST. timeout to NON_EXISTENT:
 	CHALLENGING,
 	// local context cloned/connection multiplying
 	CLONING,
@@ -185,7 +186,7 @@ typedef enum _FSP_Operation_Code : char
 	CONNECT_REQUEST,
 	ACK_CONNECT_REQ,	// may piggyback payload
 	RESET,
-	NULCOMMIT,	// Payloadless transmit transaction commitment
+	NULCOMMIT,	// Payload-less transmit transaction commitment
 	PURE_DATA,	// Without any optional header
 	PERSIST,	// Start a new transmit transaction, while EoT flag make it transactional
 	ACK_FLUSH,
@@ -198,8 +199,6 @@ typedef enum _FSP_Operation_Code : char
 	//
 	PEER_SUBNETS = 16,
 	SELECTIVE_NACK,
-	ACK_START = NULCOMMIT,
-	//^In-band acknowledgement to CLONE or ACK_CONNECT_REQUEST if no data to send back.
 	LARGEST_OP_CODE = SELECTIVE_NACK
 } FSPOperationCode;
 
@@ -214,7 +213,6 @@ typedef enum : char
 	FSP_Accept,			// accept the connection, make SCB of LLS synchronized with DLL 
 	FSP_Reject,			// a forward command, explicitly reject some request
 	FSP_Start,
-	// FSP_Urge = FSP_Start,
 	FSP_Send,			// Here it is not a command to LLS, but as a context indicator to ULA
 	FSP_Receive,		// Here it is not a command to LLS, but as a context indicator to ULA
 	FSP_InstallKey,		// install the authenticated encryption key
@@ -232,8 +230,8 @@ typedef enum
 	// 1~7
 	FSP_NotifyListening,		// a reverse command to signal success execution of FSP_Listen
 	FSP_NotifyAccepting,		// a reverse command to make context ready
-	FSP_NotifyMultiplied,		// a reverse command to inform DLL to accept a multiply request
 	FSP_NotifyAccepted,
+	FSP_NotifyMultiplied,		// a reverse command to inform DLL to accept a multiply request
 	FSP_NotifyDataReady,
 	FSP_NotifyBufferReady,
 	FSP_NotifyToCommit,
@@ -242,11 +240,11 @@ typedef enum
 	FSP_NotifyToFinish,
 	// built-in rule: notification after FSP_NotifyToFinish implies the LLS socket has been released already
 	FSP_NameResolutionFailed,
+	FSP_IPC_Failure,
 	// 12~: exceptions, soft NMI
 	FSP_MemoryCorruption,
 	FSP_NotifyReset,
 	FSP_NotifyTimeout,
-	SMALLEST_FSP_NMI = FSP_MemoryCorruption,
 	LARGEST_FSP_NOTICE = FSP_NotifyTimeout,
 } FSP_NoticeCode;
 

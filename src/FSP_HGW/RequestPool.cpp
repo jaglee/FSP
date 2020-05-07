@@ -54,7 +54,7 @@ PRequestPoolItem RequestPool::AllocItem(FSPHANDLE h)
 
 	for(register int i = 0; i < capacity; i++)
 	{
-		if(items[i].hFSP == NULL)
+		if (_InterlockedCompareExchange((u32*)&items[i].hSocket, SOCKET_ERROR, 0) == 0)
 		{
 			FSPControl(h, FSP_SET_EXT_POINTER, ULONG_PTR(items + i));
 			items[i].hFSP = h;
@@ -104,6 +104,9 @@ bool RequestPool::FreeItem(PRequestPoolItem p)
 
 	if(offset < 0 || offset >= capacity)
 		return false;
+
+	if (p->hSocket != NULL && p->hSocket != SOCKET_ERROR)
+		closesocket(p->hSocket);
 
 	memset(p, 0, sizeof(SRequestPoolItem));
 	return true;

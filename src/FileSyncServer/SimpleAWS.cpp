@@ -51,9 +51,15 @@ static TCHAR pattern[MAX_PATH];
 /**
  * The key agreement block
  */
-// TODO: should associated salt, password and passwordHash with the session!
+ // TODO: should associated salt, password and passwordHash with the session!
 const octet salt[CRYPTO_SALT_LENGTH] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
 const char *password = "Passw0rd";
+
+// assume that address space layout randomization keep the secret hard to find
+static octet	bufPrivateKey[CRYPTO_NACL_KEYBYTES];
+static octet*	bufPublicKey;
+static octet	bufPeerPublicKey[CRYPTO_NACL_KEYBYTES];
+
 ALIGN(8)
 static uint8_t passwordHash[CRYPTO_NACL_HASHBYTES];
 
@@ -61,9 +67,44 @@ static octet bufSharedKey[CRYPTO_NACL_KEYBYTES];
 static SCHAKAPublicInfo chakaPubInfo;
 static char sessionClientIdString[_MAX_PATH];
 
+static void FSPAPI onPublicKeyReceived(FSPHANDLE, FSP_ServiceCode, int);
 static void FSPAPI onServerResponseSent(FSPHANDLE h, FSP_ServiceCode c, int r);
 static void FSPAPI onClientResponseReceived(FSPHANDLE h, FSP_ServiceCode c, int r);
+
+static void StartToSendDirectory(FSPHANDLE);
+
+
+/**
+ * Start of an incarnated connection
+ */
+static int FSPAPI onAccepted(FSPHANDLE, PFSP_Context);
+
+
+/**
+ * For sending directory content
+ */
+
+static char	linebuf[80];
+
 static void FSPAPI onFileListSent(FSPHANDLE h, FSP_ServiceCode c, int r);
+static void FSPAPI onResponseReceived(FSPHANDLE, FSP_ServiceCode, int);
+
+
+// The callback function to handle general notification of LLS. Parameters are self-describing.
+static void FSPAPI onNotice(FSPHANDLE h, FSP_ServiceCode code, int value)
+{
+	printf_s("Notify: socket %p, service code = %d, return %d\n", h, code, value);
+	if (value < 0)
+		r2Finish = finished = true;
+}
+
+
+// The function called back when an FSP connection was released. Parameters are self-describing
+static void FSPAPI onFinish(FSPHANDLE h, FSP_ServiceCode code, int)
+{
+	printf_s("Socket %p, session was to shut down, service code = %d.\n", h, code);
+	r2Finish = finished = true;
+}
 
 
 //
@@ -88,19 +129,47 @@ bool PrepareServiceSAWS(LPCTSTR pathName)
 	_tcscpy_s(pattern, pathName);
 	_tcscat_s(pattern, _T("\\*"));
 	//
-	MakeSaltedPassword(passwordHash, salt, password);
 	return true;
 }
 
 
 
+void ActivateListening(const char* thisWelcome, unsigned short mLen)
+{
+	// For concept demonstration only: prepare the password data entry
+	bufPublicKey = (unsigned char*)thisWelcome + mLen - CRYPTO_NACL_KEYBYTES;
+	CryptoNaClKeyPair(bufPublicKey, bufPrivateKey);
+	MakeSaltedPassword(passwordHash, salt, password);
+
+	FSP_SocketParameter params;
+	FSP_IN6_ADDR atAddress;
+	memset(&params, 0, sizeof(params));
+	params.onAccepting = onAccepting;
+	params.onAccepted = onAccepted;
+	params.onError = onNotice;
+	params.welcome = thisWelcome;
+	params.len = mLen;
+	params.sendSize = MAX_FSP_SHM_SIZE;
+	params.recvSize = 0;	// minimal receiving for download server
+
+#ifdef _DEBUG
+	TranslateFSPoverIPv4(&atAddress, 0, htobe32(80));	//INADDR_ANY
+#else
+	atAddress.subnet = 0xAAAA00E0;	// 0xE0 00 AA AA	// shall be learned
+	atAddress.idHost = 0;
+	atAddress.idALF = 0x01000000;		// 0x01 [well, it should be the well-known service number...] 
+#endif
+
+	hFspListen = ListenAt(&atAddress, &params);
+}
+
+
+
 // On connected, send the public key and the client nonce to the remote end.
-int FSPAPI ServiceSAWS_onAccepted(FSPHANDLE h, PFSP_Context ctx)
+static int FSPAPI onAccepted(FSPHANDLE h, PFSP_Context ctx)
 {
 	printf_s("\nSimple AWS onAccepted: handle of FSP session %p\n", h);
 
-	// TODO: check connection context
-	extern unsigned char * bufPublicKey;
 	InitCHAKAServer(chakaPubInfo, bufPublicKey);
 
 	ReadFrom(h, & chakaPubInfo.peerPublicKey, sizeof(chakaPubInfo.peerPublicKey), onPublicKeyReceived);
@@ -177,9 +246,19 @@ static void FSPAPI onClientResponseReceived(FSPHANDLE h, FSP_ServiceCode c, int 
 	memset(bufSharedKey, 0, CRYPTO_NACL_KEYBYTES);
 	memset(bufPrivateKey, 0, CRYPTO_NACL_KEYBYTES);
 
-	// To list files remotely
+	if (toSendFile)
+		StartToSendFile(h);
+	else
+		StartToSendDirectory(h);
+}
+
+
+
+// To list files remotely
+static void StartToSendDirectory(FSPHANDLE h)
+{
 	WIN32_FIND_DATA findFileData;
-	HANDLE hFind = FindFirstFile(pattern, & findFileData); 
+	HANDLE hFind = FindFirstFile(pattern, &findFileData);
 	if(hFind == INVALID_HANDLE_VALUE)
 	{
 		_tprintf_s(_T("Directory is empty: %s\n"), pattern);
@@ -198,9 +277,8 @@ static void FSPAPI onClientResponseReceived(FSPHANDLE h, FSP_ServiceCode c, int 
 #else
 		int nBytes = WideStringToUTF8(buffer, sizeof(buffer), fName);
 #endif
-//		WriteTo(h, buffer, nBytes, 0, NULL);
 		WriteTo(h, buffer, nBytes, TO_COMPRESS_STREAM, NULL);
-	}  while (FindNextFile(hFind, &findFileData));
+	} while (FindNextFile(hFind, &findFileData));
 	//
 	FindClose(hFind);
 	//Commit(h, onFileListSent);
@@ -211,7 +289,6 @@ static void FSPAPI onClientResponseReceived(FSPHANDLE h, FSP_ServiceCode c, int 
 
 
 
-//
 static void FSPAPI onFileListSent(FSPHANDLE h, FSP_ServiceCode c, int r)
 {
 	if(r < 0)
@@ -223,6 +300,26 @@ static void FSPAPI onFileListSent(FSPHANDLE h, FSP_ServiceCode c, int r)
 	ReadFrom(h, linebuf, sizeof(linebuf), onResponseReceived);
 }
 
+
+
+// The call back function executed when the upper layer application has acknowledged
+static void FSPAPI onResponseReceived(FSPHANDLE h, FSP_ServiceCode c, int r)
+{
+	if (r < 0)
+	{
+		printf_s("Wait response got error number %d. To abort.\n", r);
+		Dispose(h);
+		return;
+	}
+
+	printf_s("Response received: %s. To shutdown.\n", linebuf);
+	if (Shutdown(h, onFinish) < 0)
+	{
+		printf_s("What? Cannot shutdown gracefully!\n");
+		Dispose(h);
+		return;
+	}
+}
 
 
 // Defined here only because this source file is shared across modules

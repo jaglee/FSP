@@ -59,6 +59,8 @@
 #  define BREAK_ON_DEBUG()
 # endif
 
+# define CLOSE_SOCKET(sd)			(closesocket(sd), sd = INVALID_SOCKET)
+
 # define MAX_LOCK_WAIT_ms			60000	// one minute
 # define TIMER_SLICE_ms				5
 
@@ -143,6 +145,8 @@ protected:
 // Network byte order of the IPv4 loop back address
 # define IN4ADDR_LOOPBACK	0x0100007F		// works for x86 little-endian
 # define INVALID_SOCKET		(-1)
+
+# define CLOSE_SOCKET(sd)	(close(sd), sd = INVALID_SOCKET)
 
 # define max(a,b)	((a) >= (b) ? (a) : (b))
 # define min(a,b)	((a) <= (b) ? (a) : (b))
@@ -340,47 +344,48 @@ struct CSocketItem;	// forward declaration for sake of declaring CommandToLLS an
  * by exploiting POST-FIX(!) ALIGN(8)
  * Feasible in a little-endian CPU, provided that the structure is pre-zeroed
  */
-struct CommandNewSessionCommon
+struct SCommandToLLS
 {
 	FSP_ServiceCode	opCode;
-	ALFID_T			fiberID;
-	pid_t			idProcess;
-	uint32_t		dwMemorySize;	// size of the shared memory, in the mapped view
+	ALFID_T		fiberID;
+};
+
+
+struct CommandNewSessionCommon : SCommandToLLS
+{
+	// size of the shared memory, in the mapped view
+	uint32_t	dwMemorySize;
 };
 
 
 
 struct CommandNewSession: CommandNewSessionCommon
 {
-#if defined(__WINDOWS__)
-	uint64_t		hMemoryMap;		// pass to LLS by ULA, should be duplicated by the server
-#elif defined(__linux__) || defined(__CYGWIN__)
-	char			shm_name[MAX_NAME_LENGTH + 8];	// name of the shared memory
-	void GetShmNameFrom(CSocketItem *p) { sprintf(shm_name, SHARE_MEMORY_PREFIX "%p", (void *)p); }
+#if defined(__linux__) || defined(__CYGWIN__)
+	char		shm_name[MAX_NAME_LENGTH + 4];
+#elif defined(__WINDOWS__)
+	DWORD		idProcess;
+	uint64_t	hMemoryMap;		// pass to LLS by ULA, should be duplicated by the server
 #endif
-
-	CommandNewSession() { memset(this, 0, sizeof(CommandNewSession)); }
+	CommandNewSession(FSP_ServiceCode c, ALFID_T id1) { opCode = c; fiberID = id1; }
 };
 
 
 
-struct CommandRejectRequest
+struct CommandRejectRequest : SCommandToLLS
 {
-	FSP_ServiceCode	opCode;
-	ALFID_T			idToRject;
-	ALFID_T			idParent;
-	uint32_t		reasonCode;
+	ALFID_T		idParent;
+	uint32_t	reasonCode;
 };
 
 
 
-struct CommandInstallKey
+struct CommandInstallKey : SCommandToLLS
 {
-	FSP_ServiceCode	opCode;
 	uint64_t	keyLife;
 	// followed by the initial key material
 	// whose length is specified in the connection parameter of the control block
-	CommandInstallKey(uint64_t v) { opCode = FSP_InstallKey; keyLife = v; }
+	CommandInstallKey(ALFID_T id1, uint64_t v) { opCode = FSP_InstallKey; fiberID = id1; keyLife = v; }
 };
 
 
@@ -388,6 +393,7 @@ struct CommandInstallKey
 struct CommandCloneConnect : CommandNewSession
 {
 	// used to pass 'committing' flag in the command
+	CommandCloneConnect(ALFID_T id1) : CommandNewSession(FSP_Multiply, id1) { }
 };
 
 
@@ -396,7 +402,7 @@ union UCommandToLLS
 	struct CommandCloneConnect	clone;
 	struct CommandNewSession	creation;
 	struct CommandInstallKey	keying;
-	FSP_ServiceCode				opCode;
+	struct SCommandToLLS		sharedInfo;
 };
 
 #pragma pack(pop)
@@ -414,6 +420,14 @@ union UCommandToLLS
 # pragma pack(push)
 # pragma pack(1)
 #endif
+
+
+struct SNotification
+{
+	ALFID_T		fiberID;
+	FSP_NoticeCode	sig;
+};
+
 
 
 struct FSP_ADDRINFO_EX : FSP_SINKINF
@@ -449,23 +463,22 @@ struct SConnectParam	// MUST be aligned on 64-bit words!
 	//
 	union
 	{
-		octet	padding[8];	// allow maximum key length of 384-bit, padding the structure to 64 bytes/512bits
+		octet	padding[8];	// allow maximum key length of 320 bit
 		octet	tag[FSP_TAG_SIZE];
 		int64_t	tDiff;
 	};
 
 	int32_t		keyBits;	// by default 128
-	union
-	{
-		uint32_t	initialSN;
-		int32_t		nextKey$initialSN;
-	};
+	ALFID_T		idParent;
+	//^ 0 if it is the 'root' acceptor, otherwise the local fiber ID of the cloned connection
+	uint32_t	expectedSN;	// the expected sequence number of the packet to receive by order
+	uint32_t	initialSN;
 
 	ALFID_T		idRemote;	// ID of the listener or the new forked, depending on context
 	uint32_t	remoteHostID;
 	//
 	TSubnets	allowedPrefixes;
-};	// totally 64 bytes, 512 bits
+};	// totally 96 bytes, 768 bits
 
 
 
@@ -473,9 +486,6 @@ struct SConnectParam	// MUST be aligned on 64-bit words!
 typedef struct SItemBackLog: SConnectParam
 {
 	FSP_ADDRINFO_EX	acceptAddr;		// including the local fiber ID
-	ALFID_T		idParent;
-	//^ 0 if it is the 'root' acceptor, otherwise the local fiber ID of the cloned connection
-	uint32_t	expectedSN;	// the expected sequence number of the packet to receive by order
 } *PItemBackLog;
 
 
@@ -514,7 +524,7 @@ class LLSBackLog: public CLightMutex
 public:
 	PItemBackLog FindByRemoteId(ALFID_T, uint32_t);
 	bool Has(const SItemBackLog& r) { return FindByRemoteId(r.idRemote, r.salt) != NULL; }
-	PItemBackLog Peek() { return count <= 0 ? NULL : q  + headQ; }
+	PItemBackLog Peek() { return count <= 0 ? NULL : &q[headQ]; }
 	int Pop();
 	int Put(const SItemBackLog&);
 };
@@ -531,18 +541,21 @@ public:
 struct ControlBlock
 {
 	FSP_Session_State	state;
-	char			nmi;			// the notice that is equivalent to 'non-maskable interrupt'
-	char			tfrc : 1;		// TCP friendly rate control. By default ECN-friendly
-	char			milky : 1;		// by default 0: a normal wine-style payload assumed. FIFO
-	char			noEncrypt : 1;	// by default 0; 1 if session key installed, encrypt the payload
-	char			keepAlive : 1;	// by default 0; 1 if the session is not automatically timed-out
-	ALFID_T			idParent;
+
+	char		isDataAvailable;
+	char		hasFreedBuffer;
+	char		nmi;			// Non-Maskable Interrupt, flagging that the TCB is corrupted
+
+	u32			tfrc : 1;		// TCP friendly rate control. By default ECN-friendly
+	u32			milky : 1;		// by default 0: a normal wine-style payload assumed. FIFO
+	u32			noEncrypt : 1;	// by default 0; 1 if session key installed, encrypt the payload
+	u32			keepAlive : 1;	// by default 0; 1 if the session is not automatically timed-out
 
 	// 1, 2. 
 	// The matched list of local and remote addresses is cached in LLS
 	// canonical name of the near end and the remote end,
 	// the initial address and interface of the near end, and the dynamic addresses of the remote end
-	char			nearEndName[256];	// RFC1035, maximum length of a full domain name is 253 octets. Add padding zeroes
+	char			nearEndName[256];	// RFC1035, maximum length of a full domain name is 255 octets
 	FSP_ADDRINFO_EX	nearEndInfo;
 	struct
 	{
@@ -725,7 +738,7 @@ struct ControlBlock
 	}
 
 	// Take snapshot of the right edge of the receive window, typically on transmit transaction committed
-	void SnapshotReceiveWindowRightEdge() { connectParams.nextKey$initialSN = recvWindowNextSN; }
+	void SnapshotReceiveWindowRightEdge() { connectParams.expectedSN = recvWindowNextSN; }
 
 	// Allocate a new send buffer
 	PFSP_SocketBuf	GetSendBuf();
@@ -744,6 +757,7 @@ struct ControlBlock
 		register int32_t a = _InterlockedIncrement((PLONG)&tgt) - sendBufferBlockN;
 		if (a >= 0) _InterlockedExchange((PLONG)&tgt, a);
 	}
+
 	// Set the right edge of the send window after the very first packet of the queue is sent
 	void SetFirstSendWindowRightEdge()
 	{
@@ -796,17 +810,7 @@ struct ControlBlock
 	}
 
 	// Whether both the End of Transaction flag is received and there is no receiving gap left
-	bool HasBeenCommitted();
-
-	// Slide the send window to skip the head slot, supposing that it has been acknowledged
-	void SlideSendWindowByOne()
-	{
-		PFSP_SocketBuf skb = GetSendQueueHead();
-		skb->ReInitMarkAcked();
-		// but preserve packet flags for possible later reference to EoT, etc.
-		IncRoundSendBlockN(sendWindowHeadPos);
-		_InterlockedIncrement((PLONG)&sendWindowFirstSN);
-	}
+	bool PeerCommitted();
 
 	// Return the advertisable size of the receive window
 	int32_t GetAdvertisableRecvWin() { return int32_t(LCKREAD(recvWindowFirstSN) + recvBufferBlockN - recvWindowExpectedSN); }
@@ -839,18 +843,18 @@ struct ControlBlock
 struct CSocketItem
 {
 	ALFIDPair	fidPair;
-#if defined(__WINDOWS__)
+#if defined(__linux__) || defined(__CYGWIN__)
+	char	shm_name[MAX_NAME_LENGTH + 4];
+#elif defined(__WINDOWS__)
 	HANDLE	hMemoryMap;
 #endif
 	// size of the shared memory, in the mapped view. This implementation make it less than 2GB:
 	int32_t	dwMemorySize;
-	SOCKET	sdPipe;
 	// For IPC via shared memory:
 	ControlBlock *pControlBlock;
 	// For common dual-linked list management:
 	CSocketItem*	next;
 	CSocketItem*	prev;
-
 
 #if defined(__WINDOWS__)
 	void Destroy()
@@ -861,10 +865,6 @@ struct CSocketItem
 			::UnmapViewOfFile(h);
 		if ((h = InterlockedExchangePointer((PVOID*)&hMemoryMap, NULL)) != NULL)
 			::CloseHandle(h);
-
-		shutdown((SOCKET)sdPipe, SD_BOTH);
-		closesocket((SOCKET)sdPipe);
-		sdPipe = 0;
 	}
 #elif defined(__linux__) || defined(__CYGWIN__)
 	void Destroy()
@@ -872,9 +872,6 @@ struct CSocketItem
 		register void* buf;
 		if ((buf = _InterlockedExchangePointer((PVOID*)&pControlBlock, NULL)) != NULL)
 			munmap(buf, dwMemorySize);
-		shutdown(sdPipe, SHUT_RDWR);
-		close(sdPipe);
-		sdPipe = 0;
 	}
 #endif
 };

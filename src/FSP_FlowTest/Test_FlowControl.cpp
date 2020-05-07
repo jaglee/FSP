@@ -157,19 +157,21 @@ void FlowTestAcknowledge()
 
 
 
-void PrepareFlowTestResend(CSocketItemExDbg & dbgSocket, PControlBlock & pSCB)
+void PrepareFlowTestResend(CSocketItemExDbg& dbgSocket, PControlBlock& pSCB)
 {
+	static SProcessRoot r;
+
 	// set the begin of the send sequence number for the test to work properly
 	// set the negotiated receive window parameter
 	int memsize = sizeof(ControlBlock) + (sizeof ControlBlock::FSP_SocketBuf + MAX_BLOCK_SIZE) * 8;
 	int32_t s1 = (memsize - sizeof(ControlBlock)) / 2;
 	int32_t s2 = (memsize - sizeof(ControlBlock)) / 2;
 
-	memset(& dbgSocket, 0, sizeof(CSocketItemExDbg));
+	memset(&dbgSocket, 0, sizeof(CSocketItemExDbg));
 	dbgSocket.dwMemorySize = memsize;
-	if(dbgSocket.pControlBlock != NULL)
+	if (dbgSocket.pControlBlock != NULL)
 		free(dbgSocket.pControlBlock);
-	pSCB = (ControlBlock *)malloc(dbgSocket.dwMemorySize);
+	pSCB = (ControlBlock*)malloc(dbgSocket.dwMemorySize);
 	dbgSocket.pControlBlock = pSCB;
 
 	pSCB->Init(s1, s2);
@@ -197,7 +199,7 @@ void PrepareFlowTestResend(CSocketItemExDbg & dbgSocket, PControlBlock & pSCB)
 	assert(pSCB->sendBufferNextSN == FIRST_SN + 4);
 
 	skb = pSCB->GetSendBuf();
-	assert(skb == NULL);	// as we knew there're only 4 packet slots 
+	assert(skb == NULL);	// as we knew there are only 4 packet slots 
 
 	++(pSCB->sendWindowNextSN);
 
@@ -229,6 +231,9 @@ void PrepareFlowTestResend(CSocketItemExDbg & dbgSocket, PControlBlock & pSCB)
 
 	skb5 = pSCB->AllocRecvBuf(FIRST_SN + 4);
 	assert(skb5 == NULL);	// No more space in the receive buffer
+
+	pSCB->state = ESTABLISHED;
+	dbgSocket.AddKinshipTo(r);
 }
 
 
