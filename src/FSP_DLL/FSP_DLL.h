@@ -41,6 +41,8 @@
 # define DllSpec DllExport
 
 #elif defined(__linux__) || defined(__CYGWIN__)
+# include "thpool.h"
+
 # define DllExport
 # define DllSpec DllExport
 #endif
@@ -75,10 +77,6 @@ public:
 	CSocketItemDl * AllocItem();
 	void FreeItem(CSocketItemDl *);
 
-	// Application Layer Fiber ID (ALFID) === fiberID
-	CSocketItemDl * operator [] (ALFID_T fiberID);
-	CSocketItemDl * operator [] (int i) { return pSockets[i]; }
-
 	CSocketDLLTLB()
 	{
 		InitMutex();
@@ -104,7 +102,6 @@ struct SDecodeState;
 struct CSocketItemDl : CSocketItem
 {
 	static CSocketDLLTLB	socketsTLB;
-	static SOCKET			sdPipe;
 	static CSocketItemDl*	headOfInUse;
 
 	// for sake of incarnating new accepted connection
@@ -127,9 +124,12 @@ struct CSocketItemDl : CSocketItem
 	char			peerCommitPending : 1;
 	char			peerCommitted : 1;	// Only for conventional buffered, streamed read
 	char			pendingEoT : 1;		// EoT flag is pending to be added on a packet
+	char			toReleaseMemory : 1;
 
-	short			noticeVector;
 	char			processingNotice;
+	FSP_NoticeCode	oneshotNotice;		// non-maskable interrupt, one-shot notice
+	FSP_NoticeCode	receiveNotice;		// later FSP_NotifyCommit may override FSP_NotifyDataReady
+	FSP_NoticeCode	sendAllowedNotice;	// later FSP_NotifyFlushed may override FSP_NotifyBufferReady
 
 	FSP_ServiceCode commandLastIssued;
 	timer_t			timer;
@@ -162,6 +162,8 @@ struct CSocketItemDl : CSocketItem
 
 	int32_t			pendingPeekedBlocks;	// TryRecvInline called, number of the peeked buffers yet to be unlocked
 
+
+	static SOCKET &SDPipe();
 	static void WaitEventToDispatch();
 #if defined(__WINDOWS__)
 	static VOID NTAPI TimeOutCallBack(PVOID param, BOOLEAN isTimeout)
@@ -177,16 +179,54 @@ struct CSocketItemDl : CSocketItem
 		return 0;
 	}
 
-	static void CALLBACK ProcessNVCallBack(PTP_CALLBACK_INSTANCE Instance, PVOID parameter, PTP_WORK Work)
+	static TP_CALLBACK_ENVIRON	envCallBack;
+
+	static void CALLBACK OneshotCallBack(PTP_CALLBACK_INSTANCE Instance, PVOID parameter, PTP_WORK Work)
 	{
 		UNREFERENCED_PARAMETER(Instance);
 		UNREFERENCED_PARAMETER(Work);
-		((CSocketItemDl *)parameter)->ProcessNoticeVector();
+		((CSocketItemDl*)parameter)->CallBackOneshot();
 	}
 
-	PTP_WORK	pwk;
-	bool CreateNoticeHandler();	// Which create the work handler (pwk) of the thread pool
-	void ScheduleProcessNV(CSocketItemDl*) { SubmitThreadpoolWork(pwk); }
+	static void CALLBACK ReceiveCallBack(PTP_CALLBACK_INSTANCE Instance, PVOID parameter, PTP_WORK Work)
+	{
+		UNREFERENCED_PARAMETER(Instance);
+		UNREFERENCED_PARAMETER(Work);
+		((CSocketItemDl*)parameter)->CallBackOnReceive();
+	}
+	static void CALLBACK SendCallBack(PTP_CALLBACK_INSTANCE Instance, PVOID parameter, PTP_WORK Work)
+	{
+		UNREFERENCED_PARAMETER(Instance);
+		UNREFERENCED_PARAMETER(Work);
+		((CSocketItemDl*)parameter)->CallBackOnBufferReady();
+	}
+
+	bool CSocketItemDl::ScheduleOneshotCallback()
+	{
+		PTP_WORK	pwk = CreateThreadpoolWork(OneshotCallBack, (PVOID)this, &envCallBack);
+		if (pwk == NULL)
+			return false;
+		SubmitThreadpoolWork(pwk);
+		return true;
+	}
+
+	bool CSocketItemDl::ScheduleReceiveCallback()
+	{
+		PTP_WORK	pwk = CreateThreadpoolWork(ReceiveCallBack, (PVOID)this, &envCallBack);
+		if (pwk == NULL)
+			return false;
+		SubmitThreadpoolWork(pwk);
+		return true;
+	}
+
+	bool CSocketItemDl::ScheduleSendCallback()
+	{
+		PTP_WORK	pwk = CreateThreadpoolWork(SendCallBack, (PVOID)this, &envCallBack);
+		if (pwk == NULL)
+			return false;
+		SubmitThreadpoolWork(pwk);
+		return true;
+	}
 
 	void CopyFatMemPointo(CommandNewSession&);
 
@@ -219,13 +259,16 @@ struct CSocketItemDl : CSocketItem
 	{
 		timeOut_ns = TRANSIENT_STATE_TIMEOUT_ms * 1000000ULL;
 		timeLastTriggered = NowUTC();
-		return CreateNoticeHandler() && AddTimer(TIMER_SLICE_ms);
+		return AddTimer(TIMER_SLICE_ms);
 	}
 	void TimeOut();
 
 	bool LockAndValidate();
 	void ProcessNotice(FSP_NoticeCode);
-	void ProcessNoticeVector();
+
+	void CallBackOneshot();
+	void CallBackOnReceive();
+	void CallBackOnBufferReady();
 
 	// in Establish.cpp
 	CSocketItemDl *ProcessOneBackLog(PItemBackLog);
@@ -267,14 +310,14 @@ struct CSocketItemDl : CSocketItem
 
 public:
 	void Free();
-	void FreeAndNotify(FSP_ServiceCode c, int v)
-	{
-		NotifyOrReturn fp1 = context.onError;
-		Free();
-		if (fp1 != NULL)
-			fp1(this, c, -v);
-	}
+	void FreeAndNotify(FSP_ServiceCode, int);
 	//^The error handler need not and should not do further clean-up work
+	void FreeWithReset()
+	{
+		if (pControlBlock != NULL)
+			Call<FSP_Reset>();
+		Free();
+	}
 
 	// TODO: evaluate configurable shared memory block size? // UNRESOLVED!? MTU?
 	static int32_t AlignMemorySize(PFSP_Context);
@@ -344,7 +387,7 @@ public:
 	bool HasPeerCommitted() { return peerCommitted != 0; }
 
 	bool WaitUseMutex();
-	void SetMutexFree() { _InterlockedExchange8(&locked, 0); }
+	void SetMutexFree();
 	bool TryMutexLock() { return _InterlockedCompareExchange8(&locked, 1, 0) == 0; }
 	int  TailFreeMutexAndReturn(int);
 	bool IsInUse() { return (_InterlockedOr8(&inUse, 0) != 0) && (pControlBlock != NULL); }
@@ -357,17 +400,7 @@ public:
 	int ComparePeerName(const char *cName) { return _strnicmp(pControlBlock->peerAddr.name, cName, sizeof(pControlBlock->peerAddr.name)); }
 
 #ifndef _NO_LLS_CALLABLE
-	// Given
-	//	UCommandToLLS *		const, the command context to pass to LLS
-	//	int					the size of the command context
-	// Return
-	//	true if the command has been put in the mailslot successfully
-	//	false if it failed
-	bool LOCALAPI Call(const UCommandToLLS* pCmd, int n = sizeof(UCommandToLLS))
-	{
-		commandLastIssued = pCmd->sharedInfo.opCode;
-		return (send(sdPipe, (char*)pCmd, n, 0) > 0);
-	}
+	bool LOCALAPI Call(const UCommandToLLS* pCmd, int n = sizeof(UCommandToLLS));
 #else
 	bool Call(const UCommandToLLS *pCmd, int n = 0) { commandLastIssued = pCmd->sharedInfo.opCode; return true; }
 #endif
@@ -380,7 +413,7 @@ public:
 		cmd.opCode = c;
 		cmd.fiberID = fidPair.source;
 		commandLastIssued = c;
-		return (send(sdPipe, (char *)&cmd, sizeof(SCommandToLLS), 0) > 0);
+		return (send(SDPipe(), (char*)&cmd, sizeof(SCommandToLLS), 0) > 0);
 	}
 	CSocketItemDl * CallCreate(FSP_ServiceCode);
 	void LOCALAPI RejectRequest(ALFID_T, ALFID_T, uint32_t);

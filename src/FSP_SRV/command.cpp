@@ -264,7 +264,7 @@ void CLowerInterface::ProcessULACommand(SProcessRoot *pRoot)
 			SNotification resp;
 			resp.sig = FSP_IPC_Failure;
 			resp.fiberID = ((CommandNewSession*)buffer)->fiberID;
-			send(r.sdPipe, (char*)&resp, sizeof(resp), 0);
+			send(r.sdPipe, (char*)&resp, sizeof(SNotification), 0);
 		}
 	}
 	//

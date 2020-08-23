@@ -83,15 +83,12 @@ int  CSocketItemDl::Dispose()
 	timestamp_t t0 = NowUTC();
 	while (!TryMutexLock())
 	{
-		if(int64_t(NowUTC() - t0 - MAX_LOCK_WAIT_ms * 1000) > 0)
+		if (int64_t(NowUTC() - t0 - MAX_LOCK_WAIT_ms * 1000) > 0)
 			return -EDEADLK;
 		Sleep(TIMER_SLICE_ms);
 	}
+	FreeWithReset();
 
-	if (ESTABLISHED <= pControlBlock->state && pControlBlock->state <= CLOSABLE)
-		Call<FSP_Reset>();
-
-	Free();
 	return 0;
 }
 
@@ -106,6 +103,31 @@ void CSocketItemDl::Free()
 	RecycleSimply();
 	CSocketItem::Destroy();
 	bzero((octet*)this + sizeof(CSocketItem), sizeof(CSocketItemDl) - sizeof(CSocketItem));
+}
+
+
+
+// Given
+//	FSP_ServiceCode		The service code passed to the call back function context.onError
+//	int					The delayed return value associated with the service code
+// Do
+//	Try to release resource and call back the error handler
+// Remark
+//	The error handler need not and should not do further clean-up work
+//	To avoid memory access fault releasing of the shared memory is delayed till explicit SetMutexFree
+void CSocketItemDl::FreeAndNotify(FSP_ServiceCode c, int v)
+{
+	NotifyOrReturn fp1 = context.onError;
+	RecycleSimply();
+	toReleaseMemory = 1;
+	if (!processingNotice)
+	{
+		CSocketItem::Destroy();
+		// toReleaseMemory = 0;	// 'bzero' covers toReleaseMemory
+		bzero((octet*)this + sizeof(CSocketItem), sizeof(CSocketItemDl) - sizeof(CSocketItem));
+	}
+	if (fp1 != NULL)
+		fp1(this, c, -v);
 }
 
 

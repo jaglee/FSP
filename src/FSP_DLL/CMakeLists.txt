@@ -8,6 +8,6 @@
 
 add_library (FSPLib LibEntry.cpp
              Deflate.cpp Disconnect.cpp Establish.cpp IOControl.cpp Multiplex.cpp Receive.cpp Send.cpp
-             lz4.c
+             lz4.c thpool.c
             ../ControlBlock.cpp)
 target_link_libraries(FSPLib PUBLIC ${EXTRA_LIBS})

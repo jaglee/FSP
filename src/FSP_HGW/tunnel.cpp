@@ -100,6 +100,7 @@ static void FreeRequestItem(PRequestPoolItem p, bool graceful = false)
 	{
 		CloseGracefully(p->hSocket);
 	}
+	p->hSocket = SOCKET_ERROR;
 	//
 	if(p->hFSP != NULL)
 	{
@@ -107,6 +108,7 @@ static void FreeRequestItem(PRequestPoolItem p, bool graceful = false)
 			Shutdown(p->hFSP, FSP_IgnoreNotice);
 		else
 			Dispose(p->hFSP);
+		p->hFSP = NULL;
 	}
 	//
 	requestPool.FreeItem(p);
@@ -157,47 +159,51 @@ bool FSPAPI onFSPDataAvailable(FSPHANDLE h, void * buf, int32_t len, bool eot)
 
 // Only when the server side close the TCP socket would the tunnel be closed gracefully.
 // This is a long-run I/O routine which rely on the full-duplex mode heavily
-int FSPAPI toReadTCPData(FSPHANDLE h, void *buf, int32_t capacity)
+int FSPAPI toReadTCPData(FSPHANDLE h, void* buf, int32_t capacity)
 {
-	SRequestPoolItem *pReq = requestPool.FindItem(h);
-	if(pReq == NULL)
+	SRequestPoolItem* pReq = requestPool.FindItem(h);
+	if (pReq == NULL)
 		return 0;
-
-	int n = recv(pReq->hSocket, (char *)buf, capacity, 0);
-	if (n <= 0)
-	{
-#ifndef NDEBUG
-		if (n < 0)
-			ReportWSAError("TCP side receive error");
-		else
-			printf("TCP side: no further data available.\n");
-#endif
-		FreeRequestItem(pReq, (n == 0));
-		return 0;
-	}
-
-#ifdef _DEBUG_PEEK
-	printf_s("%d bytes read from the TCP end\n", n);
-	// if (pReq->countTCPreceived == 0)
-	// 	printf_s("First 300 chars:\n%.300s\n", (char*)buf);
-#endif
-
-	pReq->countTCPreceived += n;
-	int r;
+	int32_t offset = 0;
 	do
 	{
-		r = SendInline(h, buf, n, true, NULL);
-		if (r >= 0)
-			break;
-		Sleep(1);	// yield CPU out for at least 1ms/one time slice
-	} while (r == -EBUSY);
-	if(r < 0)
-	{
+		int n = recv(pReq->hSocket, (char*)buf + offset, capacity - offset, 0);
+		if (n <= 0)
+		{
 #ifndef NDEBUG
-		printf_s("SendInline() in toReadTCPData failed!? Error code: %d\n", r);
+			if (n < 0)
+				ReportWSAError("TCP side receive error");
+			else
+				printf("TCP side: no further data available.\n");
 #endif
-		FreeRequestItem(pReq);
-	}
+			FreeRequestItem(pReq, (n == 0));
+			return 0;
+		}
+		offset += n;
+
+#ifdef _DEBUG_PEEK
+		printf_s("%d bytes read from the TCP end\n", n);
+		if (pReq->countTCPreceived == 0)
+			printf_s("First 300 chars:\n%.300s\n", (char*)buf);
+#endif
+
+		pReq->countTCPreceived += n;
+		int r;
+		do
+		{
+			r = SendInline(h, buf, n, true, NULL);
+			if (r >= 0)
+				break;
+			Sleep(1);	// yield CPU out for at least 1ms/one time slice
+		} while (r == -EBUSY);
+		if (r < 0)
+		{
+#ifndef NDEBUG
+			printf_s("SendInline() in toReadTCPData failed!? Error code: %d\n", r);
+#endif
+			FreeRequestItem(pReq);
+		}
+	} while (offset < capacity);
 
 	return 0;
 }
@@ -380,12 +386,7 @@ static bool HandleSOCKSRequestV4(PRequestPoolItem p, PRequestResponse_v4 q, int3
 	if(len < (int)sizeof(SRequestResponse_v4) || len > (int)sizeof(SRequestResponseV4a))
 		return false;
 
-	p->hSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-	if (p->hSocket == (SOCKET)SOCKET_ERROR)
-	{
-		ReportWSAError("Remote socket() failed");
-		return false;
-	}
+	p->socks_version = q->version;
 
 	char* s = (char*)&q->inet4Addr;
 	sockaddr_in remoteEnd;
@@ -405,6 +406,7 @@ static bool HandleSOCKSRequestV4(PRequestPoolItem p, PRequestResponse_v4 q, int3
 	}
 	if (*(uint32_t*)&remoteEnd.sin_addr == 0)
 		return false;
+
 	remoteEnd.sin_family = AF_INET;
 	remoteEnd.sin_port = q->nboPort;
 #ifndef NDEBUG
@@ -415,13 +417,19 @@ static bool HandleSOCKSRequestV4(PRequestPoolItem p, PRequestResponse_v4 q, int3
 		, be16toh(q->nboPort));
 #endif
 
+	p->hSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	if (p->hSocket == (SOCKET)SOCKET_ERROR)
+	{
+		ReportWSAError("Remote socket() failed");
+		return false;
+	}
+
 	int r = connect(p->hSocket, (PSOCKADDR)&remoteEnd, sizeof(remoteEnd));
 	if (r != 0)
 	{
 		ReportWSAError("Remote connect() failed");
 		return false;
 	}
-	p->socks_version = q->version;
 
 	return true;
 }
@@ -434,13 +442,6 @@ static bool HandleSOCKSv5Request(PRequestPoolItem p, PRequestResponseV5 q, int32
 	int offset = (int)offsetof(SRequestResponseV5, nboPort);
 	if (len < offset + (int)sizeof(q->nboPort) || q->cmd != SOCKS_CMD_CONNECT)
 		return false;
-
-	p->hSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-	if (p->hSocket == (SOCKET)SOCKET_ERROR)
-	{
-		ReportWSAError("Remote socket() failed");
-		return false;
-	}
 
 	sockaddr_in remoteEnd;
 	memset(&remoteEnd, 0, sizeof(sockaddr_in));
@@ -470,6 +471,7 @@ static bool HandleSOCKSv5Request(PRequestPoolItem p, PRequestResponseV5 q, int32
 	}
 	else
 	{
+		p->socks_version = q->version;
 		return false;	// Address type not supported, should be filtered by the request end.
 	}
 	memcpy(&p->rqV5, q, offset + sizeof(q->nboPort));
@@ -481,6 +483,13 @@ static bool HandleSOCKSv5Request(PRequestPoolItem p, PRequestResponseV5 q, int32
 		, inet_ntoa(remoteEnd.sin_addr)
 		, be16toh(remoteEnd.sin_port));
 #endif
+
+	p->hSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	if (p->hSocket == (SOCKET)SOCKET_ERROR)
+	{
+		ReportWSAError("Remote socket() failed");
+		return false;
+	}
 
 	int r = connect(p->hSocket, (PSOCKADDR)&remoteEnd, sizeof(sockaddr_in));
 	if (r != 0)

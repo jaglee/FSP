@@ -57,6 +57,7 @@ void CSocketDLLTLB::Init() { }
 CSocketDLLTLB::~CSocketDLLTLB() {}
 
 static DWORD		idThisProcess;	// the id of the process that attaches this DLL
+static SOCKET		sdPipe;
 static HANDLE		timerQueue;		// = NULL;
 static pthread_t	hThreadWait;
 
@@ -68,7 +69,6 @@ static void DestroyExecUnitPool();
 extern "C" 
 BOOL WINAPI DllMain(HINSTANCE hInstance, DWORD dwReason, LPVOID lpvReserved)
 {
-	SOCKET& sdPipe = CSocketItemDl::sdPipe;
 	// to maintain thread local storage
 	if (dwReason == DLL_PROCESS_ATTACH)
 	{
@@ -163,6 +163,9 @@ timestamp_t NowUTC()
 
 
 
+SOCKET& CSocketItemDl::SDPipe() { return sdPipe; }
+
+
 // Do
 //	Initialize the IPC structure to call LLS
 // Return
@@ -227,6 +230,20 @@ bool CSocketItemDl::AddTimer(uint32_t dueTime)
 			) != FALSE)
 		|| (timer != NULL && ::ChangeTimerQueueTimer(::timerQueue, timer, dueTime, TIMER_SLICE_ms) != FALSE)
 		);
+}
+
+
+
+// Given
+//	UCommandToLLS *		const, the command context to pass to LLS
+//	int					the size of the command context
+// Return
+//	true if the command has been put in the mailslot successfully
+//	false if it failed
+bool LOCALAPI CSocketItemDl::Call(const UCommandToLLS* pCmd, int n)
+{
+	commandLastIssued = pCmd->sharedInfo.opCode;
+	return (send(sdPipe, (char*)pCmd, n, 0) > 0);
 }
 
 
@@ -349,9 +366,10 @@ void TraceLastError(const char * fileName, int lineNo, const char *funcName, con
 /**
  * Implementation dependent: thread pool to handle soft interrupt of LLS 
  */
-static TP_CALLBACK_ENVIRON	envCallBack;
 static PTP_POOL				pool;	// = NULL;
 static PTP_CLEANUP_GROUP	cleanupgroup; // = NULL;
+
+TP_CALLBACK_ENVIRON	CSocketItemDl::envCallBack;
 
 static bool CreateExecUnitPool()
 {
@@ -360,7 +378,7 @@ static bool CreateExecUnitPool()
 	//PTP_TIMER timer = NULL;
 	BOOL bRet = FALSE;
 
-	InitializeThreadpoolEnvironment(&envCallBack);
+	InitializeThreadpoolEnvironment(&CSocketItemDl::envCallBack);
 	pool = CreateThreadpool(NULL);
 	if (pool == NULL)
 	{
@@ -385,8 +403,8 @@ static bool CreateExecUnitPool()
 		return false;
 	}
 
-	SetThreadpoolCallbackPool(&envCallBack, pool);
-	SetThreadpoolCallbackCleanupGroup(&envCallBack, cleanupgroup, NULL);
+	SetThreadpoolCallbackPool(&CSocketItemDl::envCallBack, pool);
+	SetThreadpoolCallbackCleanupGroup(&CSocketItemDl::envCallBack, cleanupgroup, NULL);
 
 	return true;
 }
@@ -398,11 +416,4 @@ static void DestroyExecUnitPool()
 		return;
 	CloseThreadpoolCleanupGroupMembers(cleanupgroup, FALSE, NULL);
 	CloseThreadpoolCleanupGroup(cleanupgroup);
-}
-
-
-bool CSocketItemDl::CreateNoticeHandler()
-{
-	pwk = CreateThreadpoolWork(ProcessNVCallBack, (PVOID)this, &envCallBack);
-	return (pwk != NULL);
 }

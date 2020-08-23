@@ -119,6 +119,7 @@ int main(int argc, char * argv[])
 		{
 			DWORD optval = 1;
 			setsockopt(sdNew, IPPROTO_TCP, TCP_NODELAY, (const char*)&optval, sizeof(optval));
+			// setsockopt(sdNew, SOL_SOCKET, SO_DONTLINGER, (const char*)&optval, sizeof(optval));
 
 			if (!CLowerInterface::Singleton.AddULAChannel(sdNew))
 				CLOSE_IPC(sdNew);

@@ -33,12 +33,25 @@
 
 # include <WinSock2.h>
 # include <mstcpip.h>
+# include <io.h>
+# include <share.h>
+
 # define pthread_t	HANDLE
+
+typedef int socklen_t;
+
+# ifdef _MSC_VER
+# pragma comment(lib, "Ws2_32.lib")
+# endif
+
 
 #elif defined(__linux__) || defined(__CYGWIN__)
 
 # include <arpa/inet.h>
 # include <netinet/in.h>
+# include <pthread.h>
+# include <sys/socket.h>
+# include <sys/wait.h>
 # include <termios.h>
 # include <unistd.h>
 
@@ -49,9 +62,20 @@
 
 # define SOCKET_ERROR   (-1)
 
+# define closesocket	close
+# define _strcmpi		strcasecmp
+
 typedef int				SOCKET;
 typedef struct sockaddr	SOCKADDR, * PSOCKADDR;
 typedef struct sockaddr_in	SOCKADDR_IN, * PSOCKADDR_IN;
+
+static inline void Sleep(int32_t millis)
+{
+    struct timespec tv;
+    tv.tv_sec = millis / 1000;
+    tv.tv_nsec = (millis % 1000) * 1000000;
+    nanosleep(&tv, NULL);
+}
 
 #endif
 

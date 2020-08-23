@@ -71,19 +71,10 @@ int main()
 		"Accept: text/html, application/xhtml+xml, image/jxr\r\n"
 		"Accept-Encoding: gzip, deflate\r\n"
 		"Accept-Language: en-US, en; q=0.8, zh-Hans-CN; q=0.5, zh-Hans; q=0.3\n"
-		"Connection: Keep-Alive\r\n"
 		"DNT: 1\r\n"
 		"Host: news.qq.com\r\n"
 		"User-Agent: Mozilla/5.0 (compatible; MSIE 10.0; Windows NT 6.2; Trident/6.0)\r\n"
 		"\r\n";
-	//	"Host: news.qq.com\r\n"
-	//	"\r\n";
-	//char *getURI = "GET /cdn_djl.js HTTP/1.1\r\n"
-	//	"Host: jsqmt.qq.com\r\n"
-	//	"Accept: application/javascript,*/*;q=0.8\r\n"
-	//	"Referer:http://news.qq.com\r\n"
-	//	"\r\n";
-	// Cookie, User-Agent, Accept-Language were not sent
 	r = send(h, getURI, (int)strlen(getURI), 0);
 	if(r == SOCKET_ERROR)
 	{
@@ -93,14 +84,103 @@ int main()
 	printf_s("%d bytes sent for HTTP request\n", r);
 	
 	static char largeBuf[0x100000];	// 1MB
-	do
-	{
-		r = recv(h, largeBuf, sizeof(largeBuf), 0);
-		if(r > 0)
-			printf_s("\r\n\n%d\r\n\n%s", r, largeBuf);
-	} while(r > 0);
+	r = recv(h, largeBuf, sizeof(largeBuf), 0);
+	if(r > 0)
+		printf_s("\r\n\n%d\r\n\n%s", r, largeBuf);
+	else if(r == SOCKET_ERROR)
+		printf_s("recv response body failed with error number: %d\n", WSAGetLastError());
 
-	if(r == SOCKET_ERROR)
+	shutdown(h, SD_BOTH);
+	closesocket(h);
+	// Or else 10056, socket already connected
+
+	h = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	// Or else 10038, not a socket
+	if (h == SOCKET_ERROR)
+	{
+		printf_s("socket() failed with error: %d\n", WSAGetLastError());
+		return -1;
+	}
+	r = connect(h, (sockaddr*)&remoteEnd, sizeof(sockaddr_in));
+	if (r == SOCKET_ERROR)
+	{
+		printf_s("listen() failed with error: %d\n", WSAGetLastError());
+		closesocket(h);
+		return -1;
+	}
+
+	char request1[] = "\x04\x01\x0B\x1B\x7D\x27\x34\x1A";			// An erroneous request
+	r = send(h, request1, sizeof(request1), 0);
+	if (r == SOCKET_ERROR)
+	{
+		printf_s("send socks request failed with error number: %d\n", WSAGetLastError());
+		goto l_bailout;
+	}
+	printf_s("%d bytes sent for SOCKS CONNECT(unknown port)\n", r);
+
+	r = recv(h, buf, sizeof(buf), 0);
+	if (r == SOCKET_ERROR)
+	{
+		printf_s("recv socks response failed with error number: %d\n", WSAGetLastError());
+		goto l_bailout;
+	}
+	if (buf[1] == 90)
+	{
+		printf_s("Connect request shall be rejected!\n");
+		r = -1;
+		goto l_bailout;
+	}
+	shutdown(h, SD_BOTH);
+	closesocket(h);
+
+	h = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	if (h == SOCKET_ERROR)
+	{
+		printf_s("socket() failed with error: %d\n", WSAGetLastError());
+		return -1;
+	}
+	r = connect(h, (sockaddr*)&remoteEnd, sizeof(sockaddr_in));
+	if (r == SOCKET_ERROR)
+	{
+		printf_s("listen() failed with error: %d\n", WSAGetLastError());
+		closesocket(h);
+		return -1;
+	}
+
+	// redirect:
+	char request2[] = "\x04\x01\x01\xBB\x7D\x27\x34\x1ASciter";	// https://news.qq.com:443
+	r = send(h, request1, sizeof(request2), 0);
+	if (r == SOCKET_ERROR)
+	{
+		printf_s("send socks request failed with error number: %d\n", WSAGetLastError());
+		goto l_bailout;
+	}
+	printf_s("%d bytes sent for SOCKS CONNECT(https)\n", r);
+	r = recv(h, buf, sizeof(buf), 0);
+	if (r == SOCKET_ERROR)
+	{
+		printf_s("recv socks response failed with error number: %d\n", WSAGetLastError());
+		goto l_bailout;
+	}
+	if (buf[1] != 90)
+	{
+		printf_s("Connect request for https rejected.\n");
+		r = -1;
+		goto l_bailout;
+	}
+
+	r = send(h, getURI, (int)strlen(getURI), 0);	// Should have made a https hello request
+	if (r == SOCKET_ERROR)
+	{
+		printf_s("send request failed with error number: %d\n", WSAGetLastError());
+		goto l_bailout;
+	}
+	printf_s("%d bytes sent for HTTP request\n", r);
+
+	r = recv(h, largeBuf, sizeof(largeBuf), 0);
+	if (r > 0)
+		printf_s("\r\n\n%d\r\n\n%s", r, largeBuf);
+	else if (r == SOCKET_ERROR)
 		printf_s("recv response body failed with error number: %d\n", WSAGetLastError());
 
 l_bailout:

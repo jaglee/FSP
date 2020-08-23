@@ -711,13 +711,16 @@ public:
 	//	Send the notification through the bi-direction message pipe to the ULA
 	void Notify(FSP_NoticeCode code)
 	{
-#if ((TRACE & TRACE_PACKET) && (TRACE & TRACE_ULACALL))
+#if ((TRACE & TRACE_PACKET) || (TRACE & TRACE_ULACALL))
 		printf_s("\nSession #%u, raise soft interrupt %s(%d).\n", fidPair.source, noticeNames[code], code);
 #endif
 		SNotification resp;
 		resp.sig = code;
 		resp.fiberID = fidPair.source;
-		send(rootULA->sdPipe, (char*)&resp, sizeof(resp), 0);
+		int r = send(rootULA->sdPipe, (char*)&resp, sizeof(SNotification), 0);
+#if ((TRACE & TRACE_PACKET) || (TRACE & TRACE_ULACALL))
+		printf_s("%d bytes of notification sent.\n", r);
+#endif
 	}
 	void SignalNMI(FSP_NoticeCode code)
 	{
@@ -727,13 +730,13 @@ public:
 	// Emulate 'Large receive offload'
 	void NotifyDataReady()
 	{
-		if (_InterlockedCompareExchange8(&pControlBlock->isDataAvailable, 0, 1) == 0)
+		if (_InterlockedCompareExchange8(&pControlBlock->isDataAvailable, 1, 0) == 0)
 			Notify(FSP_NotifyDataReady);
 	}
 	// Emulate 'Large send offload'
 	void NotifyBufferReady()
 	{
-		if (_InterlockedCompareExchange8(&pControlBlock->hasFreedBuffer, 0, 1) == 0)
+		if (_InterlockedCompareExchange8(&pControlBlock->hasFreedBuffer, 1, 0) == 0)
 			Notify(FSP_NotifyBufferReady);
 	}
 
@@ -790,7 +793,6 @@ public:
 	// Send-pacing is a yet-to-implement feature of the rate-control based congestion control sublayer/manager
 	void RestartKeepAlive() { ReplaceTimer(TIMER_SLICE_ms * 2); }
 	void ScheduleCleanup() { lowState = NON_EXISTENT; ReplaceTimer(TIMER_SLICE_ms); }
-	void ScheduleResurrectable() { SetState(CLOSED); ReplaceTimer(TIMER_SLICE_ms); }
 
 
 	// Command of ULA

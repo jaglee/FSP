@@ -405,6 +405,14 @@ union UCommandToLLS
 	struct SCommandToLLS		sharedInfo;
 };
 
+
+
+struct SNotification
+{
+	ALFID_T			fiberID;
+	FSP_NoticeCode	sig;
+};
+
 #pragma pack(pop)
 
 
@@ -420,13 +428,6 @@ union UCommandToLLS
 # pragma pack(push)
 # pragma pack(1)
 #endif
-
-
-struct SNotification
-{
-	ALFID_T		fiberID;
-	FSP_NoticeCode	sig;
-};
 
 
 

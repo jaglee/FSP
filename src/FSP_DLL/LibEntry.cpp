@@ -43,7 +43,9 @@
 
 static	struct sockaddr_un addr;
 static	pthread_t	hThreadWait;
+static	threadpool	thpool;
 static	int&		sdClient = CSocketItemDl::sdPipe;
+
 
 // Called by the default constructor only
 void CSocketDLLTLB::Init()
@@ -75,6 +77,12 @@ void CSocketDLLTLB::Init()
 		perror("Cannot create the thread to handle LLS's soft interrupt");
 		exit(-3);
 	}
+
+	if((thpool = thpool_init(MAX_WORKING_THREADS)) == NULL)
+	{
+		perror("Cannot create the thread pool to manage LLS's soft interrupt");
+		exit(-4);
+	}
 }
 
 
@@ -83,6 +91,8 @@ CSocketDLLTLB::~CSocketDLLTLB()
 {
 	if (sdClient != INVALID_SOCKET)
 		close(sdClient);
+	if(thpool != NULL)
+		thpool_destroy(thpool);
 }
 
 #endif
@@ -95,6 +105,14 @@ timestamp_t NowUTC()
 	struct timeval tv;
 	gettimeofday(&tv, NULL);
 	return ((uint64_t)tv.tv_sec * 1000000 + (uint64_t)tv.tv_usec);
+}
+
+
+
+// Schedule ProcessNVCallBack to be executed by the thread pool to handle LLS' soft interrupt
+void CSocketItemDl::ScheduleProcessNV()
+{
+	thpool_add_work(thpool, ProcessNVCallBack, this);
 }
 
 

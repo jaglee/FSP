@@ -105,7 +105,7 @@ bool RequestPool::FreeItem(PRequestPoolItem p)
 	if(offset < 0 || offset >= capacity)
 		return false;
 
-	if (p->hSocket != NULL && p->hSocket != SOCKET_ERROR)
+	if (p->hSocket && p->hSocket != SOCKET_ERROR)
 		closesocket(p->hSocket);
 
 	memset(p, 0, sizeof(SRequestPoolItem));

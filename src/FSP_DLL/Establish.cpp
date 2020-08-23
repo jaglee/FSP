@@ -570,8 +570,8 @@ void CSocketItemDl::ToConcludeConnect()
 	SetMutexFree();
 	if(context.onAccepted != NULL && context.onAccepted(this, &context) < 0)
 	{
-		if(WaitUseMutex())	// in case of memory access error
-			Free();
+		if (WaitUseMutex())	// in case of memory access error
+			FreeWithReset();
 		return;
 	}
 
@@ -645,7 +645,7 @@ int LOCALAPI CSocketItemDl::InstallRawKey(octet *key, int32_t keyBits, uint64_t 
 	CommandInstallKey objCommand(fidPair.source, keyLife);
 	int r = Call((UCommandToLLS*)&objCommand, sizeof(CommandInstallKey)) ? 0 : -EIO;
 	if (r == 0)
-		r = send(sdPipe, (char *)key, sizeIKM, 0);
+		r = send(SDPipe(), (char *)key, sizeIKM, 0);
 
 	SetMutexFree();
 	return (r > 0 ? 0 : -EIO);
@@ -664,7 +664,7 @@ CSocketItemDl * CSocketItemDl::WaitingConnectAck()
 		if (GetTickCount64() - t0 > TRANSIENT_STATE_TIMEOUT_ms)
 		{
 			context.flags = -ETIMEDOUT;
-			Free();
+			FreeWithReset();
 			return NULL;
 		}
 		SetMutexFree();
@@ -674,7 +674,7 @@ CSocketItemDl * CSocketItemDl::WaitingConnectAck()
 	if (s < ESTABLISHED)
 	{
 		context.flags = -ECONNRESET;
-		Free();
+		FreeWithReset();
 		return NULL;
 	}
 
@@ -722,7 +722,8 @@ CSocketItemDl * CSocketDLLTLB::AllocItem()
 		if (i >= n)
 			goto l_bailout;
 		// 0 to i, left inclusively, right exclusively, index socket in use, compressively
-		for (j = i + 1; ; j = k + 1)
+		j = i + 1;
+		do
 		{
 			for (; j < n && !pSockets[j]->inUse; j++)
 				;
@@ -735,10 +736,9 @@ CSocketItemDl * CSocketDLLTLB::AllocItem()
 			// j to k, left inclusively, right exclusively, index socket in use
 			memmove(pSockets + i, pSockets + j, sizeof(pSockets[0]) * (k - j));
 			i += k - j;
-			// on exit the loop totally at most (n - 1) items were moved 
-			if (k >= n)
-				break;
-		}
+			j = i + 1;
+		} while (k < n);
+		// on exit the loop totally at most (n - 1) items were moved 
 		sizeOfWorkSet = i;
 	}
 
@@ -808,24 +808,4 @@ void CSocketDLLTLB::FreeItem(CSocketItemDl *p)
 	}
 
 	ReleaseMutex();
-}
-
-
-
-// Given
-//	ALFID_T		the application layer fiber ID of the connection to find
-// Return
-//	The pointer to the FSP socket that matches the given ID
-// Remark
-//	The caller should check whether the returned socket is really in work by check the inUse flag
-//	Performance is assumed acceptable
-//	as this is a prototyped implementation which exploits linear search in a small set
-CSocketItemDl * CSocketDLLTLB::operator[](ALFID_T fiberID)
-{
-	for(int i = 0; i < sizeOfWorkSet; i++)
-	{
-		if(pSockets[i]->fidPair.source == fiberID)
-			return pSockets[i];
-	}
-	return NULL;
 }

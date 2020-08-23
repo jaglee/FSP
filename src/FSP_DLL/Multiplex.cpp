@@ -54,7 +54,7 @@ FSPHANDLE FSPAPI MultiplyAndWrite(FSPHANDLE hFSP, PFSP_Context psp1, unsigned fl
 	FSPHANDLE h = p->WriteOnMultiplied(psp1, flag, fp1);
 	if (h == NULL)
 	{
-		p->Free();
+		p->FreeWithReset();
 		return NULL;
 	}
 	return h;
@@ -90,7 +90,7 @@ FSPHANDLE FSPAPI MultiplyAndGetSendBuffer(FSPHANDLE hFSP, PFSP_Context psp1, Cal
 		octet *buf = p->pControlBlock->InquireSendBuf(& m);
 		if(buf == NULL)
 		{
-			p->Free();
+			p->FreeWithReset();
 			return NULL;
 		}
 		//

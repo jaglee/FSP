@@ -37,37 +37,6 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 
-
-#if defined(_WIN32)
-
-# include <io.h>
-# include <share.h>
-
-typedef int socklen_t;
-
-# ifdef _MSC_VER
-# pragma comment(lib, "Ws2_32.lib")
-# endif
-
-#elif defined(__linux__) || defined(__CYGWIN__)
-
-# include <pthread.h>
-# include <sys/socket.h>
-# include <sys/wait.h>
-# include <unistd.h>
-# define closesocket	close
-# define _strcmpi		strcasecmp
-
-static inline void Sleep(int32_t millis)
-{
-    struct timespec tv;
-    tv.tv_sec = millis / 1000;
-    tv.tv_nsec = (millis % 1000) * 1000000;
-    nanosleep(&tv, NULL);
-}
-
-#endif
-
 #include "../FSP_API.h"
 #include "../Crypto/CHAKA.h"
 

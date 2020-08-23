@@ -987,7 +987,7 @@ void CSocketItemEx::Reject(const CommandRejectRequest& r)
 // See also DisposeOnReset, Recycle, Reject
 void CSocketItemEx::Reset()
 {
-	if (pControlBlock != NULL)
+	if (pControlBlock != NULL && lowState >= ESTABLISHED)
 		SendReset();
 	Free();
 }

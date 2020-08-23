@@ -62,7 +62,7 @@ void CSocketItemEx::KeepAlive()
 
 	// Only need to synchronize the state in the 'cache' and the real state once because TCB is locked
 	if (lowState != NON_EXISTENT)
-		_InterlockedExchange8((char*)&lowState, pControlBlock->state);
+		SyncState();
 
 	switch(lowState)
 	{
@@ -113,19 +113,22 @@ void CSocketItemEx::KeepAlive()
 		break;
 	case PRE_CLOSED:
 		// ULA should have its own time-out clock enabled
-		if (int64_t(t1 - CLOSING_TIME_WAIT_ms * 1000 - tLastRecvAny) < 0)
+		// EmitRelease() may fail at first due to race
+		if (int64_t(t1 - tMigrate) > TRANSIENT_STATE_TIMEOUT_ms * 1000)
 		{
-			ReplaceTimer(uint32_t((t1 - tMigrate) >> 10) + TIMER_SLICE_ms);
+			SetState(CLOSED);
+			// ReplaceTimer(TIMER_SLICE_ms); // See also case CLOSED
+		}
+		else
+		{
+			ReplaceTimer(uint32_t((t1 - tMigrate) >> 10) + TIMER_SLICE_ms * 2);
 			//^exponentially back off
 			EmitRelease();
 			break;
 		}
-		// suppose TRANSIENT_STATE_TIMEOUT_ms is no less than CLOSING_TIME_WAIT_ms
-		if (int64_t(t1 - tMigrate) > TRANSIENT_STATE_TIMEOUT_ms * 1000)
-			SetState(CLOSED);
 		// The socket is subjected to be recycled in LRU manner
 	case CLOSED:
-		break;
+		// UNRESOLVED!? TODO: ScheduleResurrectable
 	default:
 		Free();
 		break;

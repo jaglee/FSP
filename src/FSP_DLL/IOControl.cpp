@@ -30,7 +30,6 @@
 #include "FSP_DLL.h"
 
 
-SOCKET		CSocketItemDl::sdPipe = INVALID_SOCKET;
 CSocketItemDl* CSocketItemDl::headOfInUse = NULL;
 
 
@@ -227,6 +226,23 @@ bool CSocketItemDl::WaitUseMutex()
 
 
 
+// Release the mutex lock, may release the memory as well if the operation is pending
+void CSocketItemDl::SetMutexFree()
+{
+	if (toReleaseMemory)
+	{
+		CSocketItem::Destroy();
+		// 'bzero' covers toReleaseMemory and locked
+		bzero((octet*)this + sizeof(CSocketItem), sizeof(CSocketItemDl) - sizeof(CSocketItem));
+	}
+	else
+	{
+		_InterlockedExchange8(&locked, 0);
+	}
+}
+
+
+
 // Return
 //	true if having obtained the mutual-exclusive lock and having the session control block validated
 //	false if either timed out in obtaining the lock or found that the session control block invalid
@@ -239,13 +255,7 @@ bool CSocketItemDl::LockAndValidate()
 
 	if(InIllegalState())
 	{
-#ifndef NDEBUG
-		printf_s(
-			"\nDescriptor#%p, event to be processed, but the socket is in state %s[%d]?\n"
-			, this
-			, stateNames[pControlBlock->state], pControlBlock->state);
-#endif
-		Free();
+		FreeWithReset();
 		return false;
 	}
 
@@ -259,42 +269,54 @@ bool CSocketItemDl::LockAndValidate()
 // Do
 //	Process the receive buffer and send queue, then free the mutex and return the value
 // Remark
-//	ULA function may be called back on processing the receive buffer or send queue,
-//	and this function SHALL be called as the 'parameter' of the return statement
-//	Processing the receive buffer takes precedence because receiving is to free resource
+//	This function SHALL be called as the 'parameter' of the return statement
+//	It creates new parallel thread to process the receive buffer and/or send buffer
 int  CSocketItemDl::TailFreeMutexAndReturn(int r)
 {
-	if (HasDataToDeliver() && (fpReceived != NULL || fpPeeked != NULL))
+	if (HasDataToDeliver())
 	{
-		ProcessReceiveBuffer();
-		if (!TryMutexLock())
-			return r;
+		_InterlockedCompareExchange8((char*)&receiveNotice, FSP_NotifyDataReady, 0);
+		ScheduleReceiveCallback();
 	}
-	//
-	if (HasFreeSendBuffer() && (fpSent != NULL || pendingSendBuf != NULL))
-		ProcessPendingSend();
-	else
-		SetMutexFree();
+	if (HasFreeSendBuffer())
+	{
+		_InterlockedCompareExchange8((char*)&sendAllowedNotice, FSP_NotifyBufferReady, 0);
+		ScheduleSendCallback();
+	}
+	
+	SetMutexFree();
 	//
 	return r;
 }
-
 
 
 // The asynchronous, multi-thread friendly soft interrupt handler
 void CSocketItemDl::WaitEventToDispatch()
 {
 	SNotification signal;
-	while (recv(CSocketItemDl::sdPipe, (char*)&signal, sizeof(SNotification), 0) > 0)
+	while (recv(SDPipe(), (char*)&signal, sizeof(SNotification), 0) > 0)
 	{
-		for (CSocketItemDl* p = CSocketItemDl::headOfInUse; p != NULL; p = (CSocketItemDl*)p->next)
+#ifdef TRACE
+		printf_s("\nIn pipeline: notice %s to local fiber#%u\n", noticeNames[signal.sig], signal.fiberID);
+#endif
+		CSocketItemDl* p = CSocketItemDl::headOfInUse;
+		while (p != NULL)
 		{
-			if (p->fidPair.source == signal.fiberID 
+			if (p->fidPair.source == signal.fiberID
 			|| (p->pControlBlock != NULL && p->pControlBlock->nearEndInfo.idALF == signal.fiberID))
 			{
 				p->ProcessNotice(signal.sig);
 				break;
 			}
+			p = (CSocketItemDl*)p->next;
+		}
+		// Reset socket at LLS side on missing event target. See also 'Call<FSP_Reset>()' :
+		if (p == NULL && signal.sig < FSP_IPC_Failure)
+		{
+			SCommandToLLS cmd;
+			cmd.opCode = FSP_Reset;
+			cmd.fiberID = signal.fiberID;
+			send(SDPipe(), (char*)&cmd, sizeof(SCommandToLLS), 0);
 		}
 	}
 
@@ -311,34 +333,27 @@ void CSocketItemDl::WaitEventToDispatch()
 
 void CSocketItemDl::ProcessNotice(FSP_NoticeCode notice)
 {
-	char c = _InterlockedExchange8(&pControlBlock->nmi, 0);
-	// If non-maskable interrupted, abort any waitable loop
-	bool available = (c == 0 || _InterlockedExchange8(&inUse, 0) != 0);
-
-	if (available)
+	uint64_t t0 = GetTickCount64();
+	while (!TryMutexLock())
 	{
-		uint64_t t0 = GetTickCount64();
-		while (!TryMutexLock())
+		if (GetTickCount64() - t0 > SESSION_IDLE_TIMEOUT_us / 1000)
 		{
-			if (GetTickCount64() - t0 > SESSION_IDLE_TIMEOUT_us / 1000)
-			{
-				available = 0;
-				break;
-			}
-			//
-			Sleep(TIMER_SLICE_ms);
+			_InterlockedExchange8(&inUse, 0);
+			return;
 		}
 		//
-		if (pControlBlock == NULL || InIllegalState())
-			available = false;
+		Sleep(TIMER_SLICE_ms);
 	}
-	//
-	if (!available)
+
+	if (pControlBlock == NULL || InIllegalState())
 		return;
 
+	char c = _InterlockedExchange8(&pControlBlock->nmi, 0);
+	// If non-maskable interrupted, abort any waitable loop
 	// NMI takes precedence over any pending notices in the stream
 	if (c != 0)
 	{
+		_InterlockedExchange8(&inUse, 0);
 		lowerLayerRecycled = 1;
 		notice = (FSP_NoticeCode)c;
 	}
@@ -351,183 +366,47 @@ void CSocketItemDl::ProcessNotice(FSP_NoticeCode notice)
 	{
 	case FSP_NotifyListening:
 		CancelTimeout();		// See also ::ListenAt
-		SetMutexFree();
 		break;
 	case FSP_NotifyAccepting:	// overloaded callback for either CONNECT_REQUEST or MULTIPLY
 	case FSP_NotifyAccepted:
 	case FSP_NotifyMultiplied:	// See also @LLS::Connect()
+		_InterlockedCompareExchange8((char *)&oneshotNotice, notice, 0);
+		CancelTimeout();		// If any
+		ScheduleOneshotCallback();
+		break;
 	case FSP_NotifyDataReady:
+		_InterlockedCompareExchange8((char*)&receiveNotice, notice, 0);
+		ScheduleReceiveCallback();
+		break;
 	case FSP_NotifyBufferReady:
+		_InterlockedCompareExchange8((char*)&sendAllowedNotice, notice, 0);
+		ScheduleSendCallback();
+		break;
 	case FSP_NotifyToCommit:
+		receiveNotice = notice;	// overwrite whatever existed
+		ScheduleReceiveCallback();
+		break;
 	case FSP_NotifyFlushed:
+		sendAllowedNotice = notice;	// overwrite whatever existed
+		ScheduleSendCallback();
+		break;
 	case FSP_NotifyToFinish:
-		noticeVector |= short(1 << int(notice));
-		if(_InterlockedCompareExchange8(&processingNotice, 1, 0) == 0)
-			ScheduleProcessNV(this);
-		SetMutexFree();
+		_InterlockedCompareExchange8((char*)&oneshotNotice, notice, 0);
+		ScheduleOneshotCallback();
 		break;
 	case FSP_NameResolutionFailed:
-		FreeAndNotify(InitConnection, ENOENT);
-		// UNRESOLVED!? There could be some remedy if name resolution failed?
-		return;
 	case FSP_IPC_Failure:
-		FreeAndNotify(FSP_Reset, EIO);	// Memory access error because of bad address
-		break;
 	case FSP_MemoryCorruption:
-		FreeAndNotify(FSP_Reset, EFAULT);	// Memory access error because of bad address
-		return;
 	case FSP_NotifyReset:
-		FreeAndNotify(FSP_Reset, ECONNRESET);
-		break;
 	case FSP_NotifyTimeout:
-		FreeAndNotify(FSP_Reset, ETIMEDOUT);// Reset because of time-out
-		return;
+		oneshotNotice = notice;	// NMI overwrite whatever existed
+		ScheduleOneshotCallback();
+		break;
 	default:
 		;	// Just skip unknown notices in sake of resynchronization
 	}
-}
-
-
-
-void CSocketItemDl::ProcessNoticeVector()
-{
-	if (!LockAndValidate())
-		return;
-	if (noticeVector == 0)
-	{
-		processingNotice = 0;
-		SetMutexFree();
-		return;
-	}
-
-l_loop:
-	FSP_NoticeCode notice = NullNotice;
-	FSP_Session_State s0;
-	NotifyOrReturn fp1;
-	for (int i = int(FSP_NotifyAccepting); i <= int(FSP_NotifyToFinish); i++)
-	{
-		if ((noticeVector & short(1 << i)) != 0)
-		{
-			noticeVector &= ~short(1 << i);
-			notice = FSP_NoticeCode(i);
-#ifdef TRACE
-			printf_s("\nIn local fiber#%u, notice: %s, vector = 0x%X\n"
-				, fidPair.source, noticeNames[notice], noticeVector);
-#endif
-			break;
-		}
-	}
-	switch (notice)
-	{
-	case FSP_NotifyAccepting:	// overloaded callback for either CONNECT_REQUEST or MULTIPLY
-		if (context.onAccepting != NULL && pControlBlock->HasBacklog())
-			ProcessBacklogs();
-		goto l_preloop;
-	case FSP_NotifyAccepted:
-		CancelTimeout();		// If any
-		// Asynchronous return of Connect2, where the initiator may cancel data transmission
-		if (InState(CONNECT_AFFIRMING))
-		{
-			ToConcludeConnect();// SetMutexFree();
-			break;
-		}
-		fp1 = (NotifyOrReturn)context.onAccepted;
-		SetMutexFree();
-		if (fp1 != NULL)
-			((CallbackConnected)fp1)(this, &context);
-		if (!LockAndValidate())
-			break;
-		ProcessReceiveBuffer();	// SetMutexFree();
-		break;
-	case FSP_NotifyMultiplied:	// See also @LLS::Connect()
-		CancelTimeout();		// If any
-		fidPair.source = pControlBlock->nearEndInfo.idALF;
-		ProcessReceiveBuffer();	// SetMutexFree();
-		if (!LockAndValidate())
-			break;
-		// To inherently chain WriteTo/SendInline with Multiply
-		ProcessPendingSend();	// SetMutexFree();
-		break;
-	case FSP_NotifyDataReady:
-		_InterlockedExchange8(&pControlBlock->isDataAvailable, 0);
-		ProcessReceiveBuffer();	// SetMutexFree();
-		break;
-	case FSP_NotifyBufferReady:
-		_InterlockedExchange8(&pControlBlock->hasFreedBuffer, 0);
-		ProcessPendingSend();	// SetMutexFree();
-		break;
-	case FSP_NotifyToCommit:
-		s0 = GetState();		// ProcessReceiveBuffer may cause state migration
-		ProcessReceiveBuffer();	// SetMutexFree();
-		if (!LockAndValidate())
-			break;
-		// Even if there's no callback function to accept data/flags (as in blocking receive mode)
-		// the peerCommitted flag can be set if no further data to deliver
-		if (!HasDataToDeliver())
-			peerCommitted = 1;
-		// UNRESOLVED!? Race with LLS is not managed properly? Assume no competing Read?
-		goto l_preloop;
-	case FSP_NotifyFlushed:
-		s0 = GetState();		// ProcessPendingSend may cause state migration
-		//
-		ProcessPendingSend();	// SetMutexFree();
-		//
-		if (s0 == CLOSABLE && initiatingShutdown)
-		{
-			if (!LockAndValidate())
-				break;
-			if (GetState() == CLOSABLE)
-			{
-				SetState(PRE_CLOSED);
-				AppendEoTPacket();
-			}
-			goto l_preloop;
-		}
-		else if (s0 <= CLOSABLE)
-		{
-#ifdef TRACE
-			printf_s("State = %s, initiatingShutdown = %d\n", stateNames[s0], initiatingShutdown);
-#endif
-			fp1 = (NotifyOrReturn)_InterlockedExchangePointer((PVOID*)&fpCommitted, NULL);
-			if (fp1 != NULL)
-				fp1(this, FSP_Send, 0);
-		}
-		break;
-	case FSP_NotifyToFinish:
-		// RELEASE implies both NULCOMMIT and ACK_FLUSH, any way call back of shutdown takes precedence 
-		// See also @LLS::OnGetRelease
-		if (initiatingShutdown)
-		{
-			fp1 = fpFinished;
-			RecycLocked();		// CancelTimer(); SetMutexFree();
-			if (fp1 != NULL)
-				fp1(this, FSP_Shutdown, 0);
-		}
-		else
-		{
-			fp1 = fpFinished;
-			if (fp1 == NULL)
-				fp1 = (NotifyOrReturn)_InterlockedExchangePointer((PVOID*)&fpCommitted, NULL);
-			ProcessReceiveBuffer();	// SetMutexFree();
-			if (fp1 != NULL)
-				fp1(this, FSP_Shutdown, 0);		// passive shutdown
-		}
-		break;
-	default:
-		goto l_preloop;
-	}
-	if (!LockAndValidate())
-	{
-		processingNotice = 0;
-		return;
-	}
-
-l_preloop:
-	if (noticeVector != 0)
-		goto l_loop;
-	processingNotice = 0;
+	//
 	SetMutexFree();
-	return;
 }
 
 
@@ -553,7 +432,7 @@ void CSocketItemDl::TimeOut()
 		}
 
 		NotifyOrReturn fp1 = context.onError;
-		Free();
+		FreeWithReset();
 		if (fp1 != NULL)
 			fp1(this, commandLastIssued, -ETIMEDOUT);
 		return;
@@ -565,4 +444,188 @@ void CSocketItemDl::TimeOut()
 	// There used to be polling mode read/write here
 
 	SetMutexFree();
+}
+
+
+
+//
+void CSocketItemDl::CallBackOneshot()
+{
+	uint64_t t0 = GetTickCount64();
+	while (!TryMutexLock())
+	{
+		if (GetTickCount64() - t0 > SESSION_IDLE_TIMEOUT_us / 1000)
+		{
+			_InterlockedExchange8(&inUse, 0);
+			return;
+		}
+		//
+		Sleep(TIMER_SLICE_ms);
+	}
+
+	if (pControlBlock == NULL || InIllegalState())
+		return;
+
+	//
+	FSP_NoticeCode c = (FSP_NoticeCode)_InterlockedExchange8((char *)&oneshotNotice, 0);
+	void *fp1;
+	switch (c)
+	{
+	case FSP_NotifyAccepting:	// overloaded callback for either CONNECT_REQUEST or MULTIPLY
+		if (context.onAccepting != NULL && pControlBlock->HasBacklog())
+			ProcessBacklogs();
+		SetMutexFree();
+		break;
+	case FSP_NotifyAccepted:
+		CancelTimeout();		// If any
+		// Asynchronous return of Connect2, where the initiator may cancel data transmission
+		if (InState(CONNECT_AFFIRMING))
+		{
+			ToConcludeConnect();// SetMutexFree();
+			break;
+		}
+		fp1 = context.onAccepted;
+		SetMutexFree();
+		if (fp1 != NULL)
+			((CallbackConnected)fp1)(this, &context);
+		if (!LockAndValidate())
+			break;
+		ProcessReceiveBuffer();	// SetMutexFree();
+		break;
+	case FSP_NotifyMultiplied:	// See also @LLS::Connect()
+		CancelTimeout();		// If any
+		fidPair.source = pControlBlock->nearEndInfo.idALF;
+		ProcessReceiveBuffer();	// SetMutexFree();
+		if (!LockAndValidate())
+			break;
+		// To inherently chain WriteTo/SendInline with Multiply
+		ProcessPendingSend();	// SetMutexFree();
+		break;
+	case FSP_NotifyToFinish:
+		// RELEASE implies both NULCOMMIT and ACK_FLUSH, any way call back of shutdown takes precedence 
+		// See also @LLS::OnGetRelease
+		if (initiatingShutdown)
+		{
+			fp1 = fpFinished;
+			RecycLocked();		// CancelTimer(); SetMutexFree();
+			if (fp1 != NULL)
+				((NotifyOrReturn)fp1)(this, FSP_Shutdown, 0);
+		}
+		else
+		{
+			fp1 = fpFinished;
+			if (fp1 == NULL)
+				fp1 = _InterlockedExchangePointer((PVOID*)&fpCommitted, NULL);
+			ProcessReceiveBuffer();	// SetMutexFree();
+			if (fp1 != NULL)
+				((NotifyOrReturn)fp1)(this, FSP_Shutdown, 0);		// passive shutdown
+		}
+		break;
+	case FSP_NameResolutionFailed:
+		FreeAndNotify(InitConnection, ENOENT);
+		// UNRESOLVED!? There could be some remedy if name resolution failed?
+		break;
+	case FSP_IPC_Failure:
+		FreeAndNotify(FSP_Reset, EIO);	// Memory access error because of bad address
+		break;
+	case FSP_MemoryCorruption:
+		FreeAndNotify(FSP_Reset, EFAULT);	// Memory access error because of bad address
+		break;
+	case FSP_NotifyReset:
+		FreeAndNotify(FSP_Reset, ECONNRESET);
+		break;
+	case FSP_NotifyTimeout:
+		FreeAndNotify(FSP_Reset, ETIMEDOUT);// Reset because of time-out
+		break;
+	default:
+		;	// Just skip unknown notices in sake of resynchronization
+	}
+}
+
+
+
+
+void CSocketItemDl::CallBackOnReceive()
+{
+	uint64_t t0 = GetTickCount64();
+	while (!TryMutexLock())
+	{
+		if (GetTickCount64() - t0 > SESSION_IDLE_TIMEOUT_us / 1000)
+		{
+			_InterlockedExchange8(&inUse, 0);
+			return;
+		}
+		//
+		Sleep(TIMER_SLICE_ms);
+	}
+
+	if (pControlBlock == NULL || InIllegalState())
+		return;
+
+	FSP_NoticeCode c = (FSP_NoticeCode)_InterlockedExchange8((char*)&receiveNotice, 0);
+	_InterlockedExchange8(&pControlBlock->isDataAvailable, 0);
+
+	ProcessReceiveBuffer();					// SetMutexFree();
+	if (c != FSP_NotifyToCommit)
+		return;
+
+	if (!LockAndValidate())
+		return;
+	// Even if there's no callback function to accept data/flags (as in blocking receive mode)
+	// the peerCommitted flag can be set if no further data to deliver
+	if (!HasDataToDeliver())
+		peerCommitted = 1;
+	// UNRESOLVED!? Race with LLS is not managed properly? Assume no competing Read?
+	SetMutexFree();
+}
+
+
+
+
+void CSocketItemDl::CallBackOnBufferReady()
+{
+	uint64_t t0 = GetTickCount64();
+	while (!TryMutexLock())
+	{
+		if (GetTickCount64() - t0 > SESSION_IDLE_TIMEOUT_us / 1000)
+		{
+			_InterlockedExchange8(&inUse, 0);
+			return;
+		}
+		//
+		Sleep(TIMER_SLICE_ms);
+	}
+
+	if (pControlBlock == NULL || InIllegalState())
+		return;
+
+	FSP_NoticeCode c = (FSP_NoticeCode)_InterlockedExchange8((char*)&sendAllowedNotice, 0);
+	_InterlockedExchange8(&pControlBlock->hasFreedBuffer, 0);
+
+	FSP_Session_State s0 = GetState();	// ProcessPendingSend may cause state migration
+	ProcessPendingSend();				// SetMutexFree();
+	if (c != FSP_NotifyFlushed)
+		return;
+
+	if (!LockAndValidate())
+		return;
+	if (s0 == CLOSABLE && initiatingShutdown)
+	{
+		if (GetState() == CLOSABLE)
+		{
+			SetState(PRE_CLOSED);
+			AppendEoTPacket();
+		}
+		SetMutexFree();
+	}
+	else if (s0 <= CLOSABLE)
+	{
+#ifdef TRACE
+		printf_s("State = %s, initiatingShutdown = %d\n", stateNames[s0], initiatingShutdown);
+#endif
+		NotifyOrReturn fp1 = (NotifyOrReturn)_InterlockedExchangePointer((PVOID*)&fpCommitted, NULL);
+		SetMutexFree();
+		if (fp1 != NULL)
+			fp1(this, FSP_Send, 0);
+	}
 }
