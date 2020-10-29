@@ -75,7 +75,7 @@ const char * CStringizeState::names[LARGEST_FSP_STATE + 1] =
 	// after getting legal CONNECT_REQUEST and sending back ACK_CONNECT_REQ
 	// before getting first NULCOMMIT or PERSIST. timeout to NON_EXISTENT:
 	"CHALLENGING",
-	// context cloned by MultiplyAndWrite or MultiplyAndGetSendBuffer:
+	// context cloned by Multiply:
 	"CLONING",
 	// after getting a non-EoT PERSIST
 	"ESTABLISHED",
@@ -106,13 +106,15 @@ const char * CStringizeNotice::names[LARGEST_FSP_NOTICE + 1] =
 	"FSP_NotifyListening",	// a reverse command to signal success execution of FSP_Listen
 	"FSP_NotifyAccepting",	// a reverse command to make context ready
 	"FSP_NotifyAccepted",
+	"FSP_NotifyConnected",
 	"FSP_NotifyMultiplied",	// a reverse command to inform DLL to accept a multiply request
 	"FSP_NotifyDataReady",
 	"FSP_NotifyBufferReady",
-	"FSP_NotifyToCommit",
 	// 8~
+	"FSP_NotifyToCommit",
 	"FSP_NotifyFlushed",
 	"FSP_NotifyToFinish",
+	"_NOTIFICATION11",
 	"FSP_NameResolutionFailed",
 	"FSP_IPC_Failure",
 	"FSP_MemoryCorruption",
@@ -253,42 +255,43 @@ int LLSBackLog::Put(const SItemBackLog& r)
 
 
 
-// Do
-//	Remove the head log item in the queue
+
+// Given
+//	SItemBackLog&	Place to copy into the value of head item in the queue
 // Return
-//	-EDEADLK if cannot obtain the lock
-//	-ENOENT	if the queue is empty
-//	non-negative on success
+//	true if it was successful
+//	false if the queue is empty
 // Remark
 //	capacity must be some power of 2
-int LLSBackLog::Pop()
+//	May throw exception if dead lock encountered
+bool LLSBackLog::Get(SItemBackLog& copyOfHead)
 {
 	if (!WaitSetMutex())
-		return -EDEADLK;
+		throw - EDEADLK;
 
-	register int i = headQ;
-	if(count == 0)
+	if(count <= 0)
 	{
 		SetMutexFree();
-		return -ENOENT;
+		return false;
 	}
 
+	register int i = headQ;
 	headQ = (i + 1) & (capacity - 1);
 	count--;
 
+	copyOfHead = q[i];
 	SetMutexFree();
-	return i;
+	return true;
 }
 
 
 
 // Given
-//	const BackLogItem *		pointer to the backlog item to match
-// Do
-//	Search the backlog item that matches the given one. 'Match' means idRemote as well as salt of the two items are equal.
+//	ALFID_T		the remote fiber ID that is to match
+//	uint32_t	the 'salt' of the connection
 // Return
-//	true if the given backlog item is matched with some item in the queue
-//	false if no match found
+//	Pointer to the item in the queue that matches the given keys
+//	NULL if no match found
 PItemBackLog LLSBackLog::FindByRemoteId(ALFID_T idRemote, uint32_t salt)
 {
 	if (!WaitSetMutex())

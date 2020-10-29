@@ -63,11 +63,10 @@ struct FSP_FixedHeader : public FSP_NormalPacketHeader
 		SetRecvWS(advRecvWinSize);
 		expectedSN = htobe32(seqExpected);
 	}
-	//
-	void ClearFlags() { flags_ws[0] = 0; }
-	void SetRecvWS(int32_t v) { flags_ws[1] = (octet)(v >> 16); flags_ws[2] = (octet)(v >> 8); flags_ws[3] = (octet)v; }
-};
 
+	FSP_FixedHeader(FSP_NormalPacketHeader &r): FSP_NormalPacketHeader(r) {}
+	FSP_FixedHeader() {}
+};
 
 
 // packet information on local address and interface number
@@ -141,8 +140,8 @@ class CommandNewSessionSrv: protected CommandNewSessionSrvEntry
 	friend class CSocketSrvTLB;
 
 	// defined in command.cpp
-	friend CSocketItemEx* LOCALAPI Connect(const CommandNewSessionSrv&, SProcessRoot&);
-	friend CSocketItemEx* LOCALAPI Listen(const CommandNewSessionSrv&, SProcessRoot&);
+	friend CSocketItemEx* LOCALAPI Connect(const CommandNewSessionSrv&, SProcessRoot *);
+	friend CSocketItemEx* LOCALAPI Listen(const CommandNewSessionSrv&, SProcessRoot *);
 	friend CSocketItemEx* LOCALAPI Accept(const CommandNewSessionSrv&);
 public:
 	CommandNewSessionSrv(const CommandNewSession*);
@@ -219,27 +218,6 @@ struct ScatteredSendBuffers
 	}
 #endif
 	ScatteredSendBuffers() { }
-};
-
-
-
-// Applier should make sure together with the optional header it would be fit in one IPv6 or UDP packet
-struct FSP_PreparedKEEP_ALIVE
-{
-	FSP_SelectiveNACK sentinel;
-	FSP_SelectiveNACK::GapDescriptor gaps
-		[(MAX_BLOCK_SIZE - sizeof(FSP_SelectiveNACK)) / sizeof(FSP_SelectiveNACK::GapDescriptor)];
-	//
-	// uint32_t		nEntries;	// n >= 0, number of (gapWidth, dataLength) tuples
-};
-
-
-struct FSP_KeepAliveExtension
-{
-	FSP_FixedHeader			hdr;
-	FSP_ConnectParam		mp;
-	FSP_PreparedKEEP_ALIVE	snack;
-	void SetHostID(PSOCKADDR_IN6 ipi6) { mp.idListener = SOCKADDR_HOSTID(ipi6); }
 };
 
 
@@ -373,22 +351,17 @@ struct ICC_Context
  *	is the socket either created on setting up the first connection
  *	to some service end point, or on activating a passive FSP end point
  *	to accept some remote connection request.
- *
- *	A ULA process may give a hint ALFID on requesting an LLS socket entry,
- *	while LLS should manage to allocate the socket entry of the same ALFID
- *	from the recycle queue of the socket kinship tree mapped to the ULA process.
- *	The socket created on accepting a connect request against a passive FSP end point
- *	is always a sibling of the socket associated with the passive FSP end point.
- *	LLS should manage to allocate a socket entry from the recycle queue of
- *	the socket kinship tree associated with the passive FSP end point.
- **/
+ */
 struct SProcessRoot
 {
 	pthread_t		hThreadWait;
-	SOCKET			sdPipe;
+	HPIPE_T			sdPipe;
 	unsigned long	index;
 	CSocketItemEx	*latest;
-	CSocketItemEx	*headLRUitem, *tailLRUitem;
+	//
+	void LoopOnULACommand();
+	int  RecvFromPipe(void* buffer, int capacity);
+	int  SendNotificationTo(ALFID_T fiberID, FSP_NoticeCode code);
 };
 
 
@@ -403,7 +376,7 @@ struct SocketItemEx : CSocketItem
 	CSocketItemEx	*prevSame;
 
 	timer_t			timer;
-	pthread_t		hThreadWait;
+	int				countULACommand;
 
 	PktBufferBlock* headPacket;	// But UNRESOLVED! There used to be an independent packet queue for each SCB for sake of fairness
 	int32_t			lenPktData;
@@ -433,11 +406,18 @@ struct SocketItemEx : CSocketItem
 	const char* lockedAt;	// == NULL if not locked, or else the function name that locked the socket
 
 	// Cached 'trunk' state
-	char	recyclePending : 1;
+	union
+	{
+	char	allFlags;
+	struct
+	{
+	char	resetPending : 1;
 	char	markInUse : 1;
 	char	hasAcceptedRELEASE : 1;
 	char	delayAckPending : 1;
 	char	callbackTimerPending : 1;
+	};
+	};
 
 	FSP_Session_State lowState;
 
@@ -480,9 +460,15 @@ class CSocketItemEx : protected SocketItemEx
 	void SetPassive() { lowState = LISTENING; }
 	//
 protected:
-	void AbortLLS(bool haveTLBLocked = false);
+	// But `Free` does NOT `SetMutexFree`
 	void Free();
-	void PutToResurrectable();
+	// Means to keep the context of the socket in the reusable queue
+	// NOT implemented in this LLS which is of heavy-weight state
+	void PutToResurrectable()
+	{
+		Free();
+		assert(lockedAt != NULL);
+	}
 
 	void EnableDelayAck() { delayAckPending = 1; }
 	void RemoveTimers();
@@ -557,7 +543,7 @@ protected:
 		lowState = s;
 	}
 
-	void SetSequenceAndWS(struct FSP_FixedHeader* pHdr, ControlBlock::seq_t seq1)
+	void SetSequenceAndWS(FSP_FixedHeader *pHdr, ControlBlock::seq_t seq1)
 	{
 		ControlBlock::seq_t snExpected = pControlBlock->recvWindowExpectedSN;
 		pHdr->sequenceNo = htobe32(seq1);
@@ -565,7 +551,7 @@ protected:
 		pHdr->SetRecvWS(int32_t(GetRecvWindowLastSN() - snExpected));
 	}
 
-	void SignHeaderWith(FSP_FixedHeader* p, FSPOperationCode code, uint16_t hsp, uint32_t seqThis, uint32_t snAckOrOOB)
+	void SignHeaderWith(FSP_FixedHeader *p, FSPOperationCode code, uint16_t hsp, uint32_t seqThis, uint32_t snAckOrOOB)
 	{
 		p->Set(code, hsp, seqThis, snAckOrOOB, int32_t(GetRecvWindowLastSN() - pControlBlock->recvWindowExpectedSN));
 	}
@@ -579,7 +565,7 @@ protected:
 	// Return true if really transit, false if the (half) connection is finished and to notify
 	bool TransitOnPeerCommit();
 
-	bool HandlePeerSubnets(struct FSP_ConnectParam*);
+	bool HandlePeerSubnets(const FSP_ConnectParam *);
 
 	// return -EEXIST if overridden, -EFAULT if memory error, or payload effectively placed
 	int	PlacePayload();
@@ -606,8 +592,9 @@ protected:
 	static uint32_t GetSalt(const FSP_FixedHeader& h) { return *(uint32_t*)& h; }
 	//
 public:
-	void AddKinshipTo(SProcessRoot& r)
+	void AddKinshipTo(SProcessRoot *pULA)
 	{
+		SProcessRoot& r = *pULA;
 		prev = r.latest;
 		next = NULL;
 		if (r.latest != NULL)
@@ -616,27 +603,21 @@ public:
 		rootULA = &r;
 	}
 
-	void RecycleInULAKinship()
+	// The caller should make sure the socket is in kinship with some ULA, i.e. rootULA != NULL
+	// Detach it from the latest inUse queue which is in kinship with some ULA at first,
+	// then reset `prev` and `next` automatically.
+	void RemoveULAKinship()
 	{
-		SProcessRoot& r = *rootULA;
-		// Detach it from the latest inUse queue
 		if (prev != NULL)
 			prev->next = next;
 		if (next != NULL)
-			next->prev = prev;
+			next->prev = prev, next = NULL;
 		else
-			r.latest = (CSocketItemEx*)prev;
-		// Attach it onto the free list
-		if (r.tailLRUitem == NULL)
-			r.headLRUitem = this;
-		else
-			r.tailLRUitem->next = this;
-		prev = r.tailLRUitem;
-		next = NULL;
-		r.tailLRUitem = this;
+			rootULA->latest = (CSocketItemEx*)prev;
+		prev = NULL;
+		rootULA = NULL;
 	}
 
-	void UnmapControlBlock() { CSocketItem::Destroy(); }
 #ifdef _DEBUG
 	void SetTouchTime(timestamp_t t) { tLastRecv = tRecentSend = tLastRecvAny = t; }
 #endif
@@ -646,10 +627,9 @@ public:
 
 #define WaitUseMutex()		WaitUseMutexAt(__FUNCTION__)		//  __func__
 	bool WaitUseMutexAt(const char *);
-	void SetMutexFree() { lockedAt = NULL; if (callbackTimerPending) KeepAlive(); }
+	void SetMutexFree();
 
 	bool IsInUse() { return (markInUse != 0); }
-	void ClearInUse();
 
 #if defined(__WINDOWS__)
 	bool TestSetState(FSP_Session_State s0) { return (_InterlockedCompareExchange8((char*)&lowState, s0, 0) == 0); }
@@ -705,39 +685,41 @@ public:
 	int ResolveToIPv6(const char *);
 	int ResolveToFSPoverIPv4(const char *, const char *);
 
+	void Notify(FSP_NoticeCode c)
+	{
+#if ((TRACE & TRACE_PACKET) || (TRACE & TRACE_ULACALL))
+		printf_s("\nSession #%u, raise soft interrupt %s(%d).\n", fidPair.source, noticeNames[c], c);
+#endif
+		_InterlockedExchange8((char*)&pControlBlock->singletonotice, c);
+	}
 	// Given
 	//	FSP_NoticeCode		the code of the notification to alert DLL
 	// Do
 	//	Send the notification through the bi-direction message pipe to the ULA
-	void Notify(FSP_NoticeCode code)
-	{
-#if ((TRACE & TRACE_PACKET) || (TRACE & TRACE_ULACALL))
-		printf_s("\nSession #%u, raise soft interrupt %s(%d).\n", fidPair.source, noticeNames[code], code);
-#endif
-		SNotification resp;
-		resp.sig = code;
-		resp.fiberID = fidPair.source;
-		int r = send(rootULA->sdPipe, (char*)&resp, sizeof(SNotification), 0);
-#if ((TRACE & TRACE_PACKET) || (TRACE & TRACE_ULACALL))
-		printf_s("%d bytes of notification sent.\n", r);
-#endif
-	}
 	void SignalNMI(FSP_NoticeCode code)
 	{
-		pControlBlock->nmi = (char)code;
-		Notify(code);
+#if ((TRACE & TRACE_PACKET) || (TRACE & TRACE_ULACALL))
+		printf_s("\nSession #%u, raise NMI %s(%d).\n", fidPair.source, noticeNames[code], code);
+#endif
+		if (rootULA != NULL)
+			rootULA->SendNotificationTo(fidPair.source, code);
 	}
+
 	// Emulate 'Large receive offload'
-	void NotifyDataReady()
+	void NotifyDataReady(FSP_NoticeCode c = FSP_NotifyDataReady)
 	{
-		if (_InterlockedCompareExchange8(&pControlBlock->isDataAvailable, 1, 0) == 0)
-			Notify(FSP_NotifyDataReady);
+		if (c == FSP_NotifyDataReady)
+			_InterlockedCompareExchange8((char*)&pControlBlock->receiveNotice, c, 0);
+		else
+			_InterlockedExchange8((char*)&pControlBlock->receiveNotice, c);
 	}
 	// Emulate 'Large send offload'
-	void NotifyBufferReady()
+	void NotifyBufferReady(FSP_NoticeCode c = FSP_NotifyBufferReady)
 	{
-		if (_InterlockedCompareExchange8(&pControlBlock->hasFreedBuffer, 1, 0) == 0)
-			Notify(FSP_NotifyBufferReady);
+		if (c == FSP_NotifyBufferReady)
+			_InterlockedCompareExchange8((char*)&pControlBlock->sendAllowedNotice, c, 0);
+		else
+			_InterlockedExchange8((char*)&pControlBlock->sendAllowedNotice, c);
 	}
 
 	//
@@ -745,7 +727,6 @@ public:
 	//
 	void InitiateConnect();
 	void DisposeOnReset();
-	void Recycle();
 	void Reject(const CommandRejectRequest&);
 	void Reset();
 	void InitiateMultiply(CSocketItemEx *);
@@ -792,11 +773,9 @@ public:
 	// On Feb.17, 2019 Semantics of KeepAlive was fundamentally changed. Now it is the heartbeat of the local side
 	// Send-pacing is a yet-to-implement feature of the rate-control based congestion control sublayer/manager
 	void RestartKeepAlive() { ReplaceTimer(TIMER_SLICE_ms * 2); }
-	void ScheduleCleanup() { lowState = NON_EXISTENT; ReplaceTimer(TIMER_SLICE_ms); }
-
 
 	// Command of ULA
-	void ProcessCommand(const char *);
+	void ProcessCommand(const UCommandToLLS &);
 	void Listen();
 	void Connect();
 	void Accept();
@@ -863,6 +842,9 @@ protected:
 	// The free list
 	CSocketItemEx *headFreeSID, *tailFreeSID;
 
+	// List of socket allocated on INIT_CONNECT. The list is meant to be auto-recycled
+	CSocketItemEx* headLRUitem, * tailLRUitem;
+
 	// The ULA forest, for this implementation we use bit field to manage ULA mapping
 	// Number of ULA is hard limitted to bit field length of unsigned long
 	SProcessRoot	forestULA[sizeof(unsigned long) * 8];
@@ -871,24 +853,24 @@ protected:
 public:
 	CSocketSrvTLB();
 
-	// return the least possible overridden random fiber ID:
-	ALFID_T	RandALFID(CSocketItemEx*);
+	// To pre-allocate a socket to accept connect request with an arbitrary local ALFID
+	ALFID_T			AllocItemReserve();
+	// 
+	CSocketItemEx * AllocItemCommit(SProcessRoot *, ALFID_T);
 
-	// To allocate a socket entry from the given process tree
+	// To allocate a proactive socket entry of random ALFID
 	CSocketItemEx * AllocItem(SProcessRoot *);
+
 	// To allocate a passive socket entry of the given ALFID
 	CSocketItemEx * AllocItem(ALFID_T);
-	// To allocate a socket entry from the given process tree, and setting the ALFID with the given value
-	CSocketItemEx * AllocItem(SProcessRoot *, ALFID_T);
 
 	// To add a new process tree with the given communication channel to ULA
-	bool AddULAChannel(SOCKET);
+	bool AddULAChannel(HPIPE_T);
 	// To free all the socket entries of the same process tree
 	bool FreeULAChannel(SProcessRoot *);
 
 	void FreeItemDonotCareLock(CSocketItemEx *);
 	void FreeItem(CSocketItemEx *p) { AcquireMutex(); FreeItemDonotCareLock(p); ReleaseMutex(); }
-	void RecycleItem(CSocketItemEx*);
 
 	CSocketItemEx * operator[](ALFID_T);
 
@@ -1083,7 +1065,6 @@ public:
 	inline bool LearnAddresses();
 	inline void MakeALFIDsPool();
 
-	void ProcessULACommand(SProcessRoot *);
 	inline void ProcessRemotePacket();
 	//^ the thread entry function for processing packet sent from the remote-end peer
 

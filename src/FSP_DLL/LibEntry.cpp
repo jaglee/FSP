@@ -38,61 +38,67 @@
 
 #if defined(__linux__) || defined(__CYGWIN__)
 
-#include <netinet/tcp.h>
-#include <sys/un.h>
-
-static	struct sockaddr_un addr;
-static	pthread_t	hThreadWait;
-static	threadpool	thpool;
-static	int&		sdClient = CSocketItemDl::sdPipe;
-
+# ifdef __linux__
+#  include <linux/un.h>
+# else
+#  include <sys/un.h>
+# endif
 
 // Called by the default constructor only
 void CSocketDLLTLB::Init()
 {
-	sdClient = socket(AF_UNIX, SOCK_STREAM, 0);
-	if(sdClient < 0)
+	struct sockaddr_un addr;
+	sdPipe = socket(AF_UNIX, SOCK_STREAM, 0);
+	if(sdPipe < 0)
 	{
 		perror("Cannot create AF_UNIX socket for sending");
 		exit(-1);
 	}
 
+	bzero(&addr, sizeof(addr));
 	addr.sun_family = AF_UNIX;
 	strncpy(addr.sun_path, SERVICE_SOCKET_PATH, sizeof(addr.sun_path) - 1);
 	addr.sun_path[sizeof(addr.sun_path) - 1] = 0;
 
-	if (connect(sdClient, (const sockaddr*)&addr, sizeof(struct sockaddr_un)) < 0)
+	if (connect(sdPipe, (const sockaddr*)&addr, sizeof(addr)) < 0)
 	{
 		perror("Cannot connect with LLS");
 		exit(-2);
 	}
-
-	DWORD optval = 1;
-	setsockopt(sdClient, IPPROTO_TCP, TCP_NODELAY, (const char*)&optval, sizeof(optval));
-
-	// only after the required fields initialized may the listener thread started
-	// fetch message from remote endpoint and deliver them to upper layer application
-	if(pthread_create(&hThreadWait, NULL, CSocketItemDl::NoticeHandler, CSocketItemDl::headOfInUse) != 0)
-	{
-		perror("Cannot create the thread to handle LLS's soft interrupt");
-		exit(-3);
-	}
-
-	if((thpool = thpool_init(MAX_WORKING_THREADS)) == NULL)
-	{
-		perror("Cannot create the thread pool to manage LLS's soft interrupt");
-		exit(-4);
-	}
 }
 
 
-// Assume that the timer and the notice-handler have been terminated before this destructor is called
+inline
+bool CSocketDLLTLB::InitThread()
+{
+	if(hThreadWait != 0)
+		return true;
+
+	// only after the required fields initialized may the listener thread started
+	// fetch message from remote endpoint and deliver them to upper layer application
+	if(pthread_create(&hThreadWait, NULL, NoticeHandler, this) != 0)
+	{
+		perror("Cannot create the thread to handle LLS's soft interrupt");
+		return false;
+	}
+	pthread_detach(hThreadWait);
+
+	return true;
+}
+
+
+
+// As the waiting thread is waiting on the pipe, closing the pipe
+// will automatically make the thread terminate gracefully
 CSocketDLLTLB::~CSocketDLLTLB()
 {
-	if (sdClient != INVALID_SOCKET)
-		close(sdClient);
-	if(thpool != NULL)
-		thpool_destroy(thpool);
+	HPIPE_T sd = (HPIPE_T)_InterlockedExchange(&sdPipe, INVALID_SOCKET);
+	if (sd != INVALID_SOCKET)
+	{
+		printf("To shutdown socket %d\n", sd);
+		shutdown(sd, SHUT_RDWR);
+		close(sd);
+	}
 }
 
 #endif
@@ -105,14 +111,6 @@ timestamp_t NowUTC()
 	struct timeval tv;
 	gettimeofday(&tv, NULL);
 	return ((uint64_t)tv.tv_sec * 1000000 + (uint64_t)tv.tv_usec);
-}
-
-
-
-// Schedule ProcessNVCallBack to be executed by the thread pool to handle LLS' soft interrupt
-void CSocketItemDl::ScheduleProcessNV()
-{
-	thpool_add_work(thpool, ProcessNVCallBack, this);
 }
 
 
@@ -162,15 +160,15 @@ void CSocketItemDl::CopyFatMemPointo(CommandNewSession &cmd)
 
 
 
-// Given
-//	uint32_t		number of milliseconds to wait till the timer shoots for the first time
-// Return
-//	true if the timer is registered successfully
-//	false if it failed
-// Remark
-//	Only support multiple of thousand milliseconds.
-bool CSocketItemDl::AddTimer(uint32_t dueTime)
+bool CSocketItemDl::StartPolling()
 {
+	if (!socketsTLB.InitThread())
+		return false;
+
+	timeOut_ns = TRANSIENT_STATE_TIMEOUT_ms * 1000000ULL;
+	timeLastTriggered = NowUTC();
+	uint32_t dueTime = TIMER_SLICE_ms;
+
 	struct itimerspec its;
 	struct sigevent sigev;
 	sigev.sigev_notify = SIGEV_THREAD;
@@ -199,4 +197,40 @@ bool CSocketItemDl::AddTimer(uint32_t dueTime)
 	return true;
 }
 
+
+
+// It makes no difference to send a message or a stream of octets at ULA
+int CSocketDLLTLB::SendToPipe(const void *pMsg, int n)
+{
+	return send(sdPipe, pMsg, n, 0);
+}
+
+
+// For ULA, size of what to receive from LLS is fixed
+bool CSocketDLLTLB::GetNoticeFromPipe(SNotification *buf)
+{
+	int r = recv(sdPipe, buf, sizeof(SNotification), 0);
+	if(r < 0)
+	{
+		perror("Failed to get notification from LLS");
+		return false;
+	}
+	return (r > 0);
+}
+
+
+
+bool CSlimThreadPool::NewThreadFor(CSlimThreadPoolItem* newItem)
+{
+	if (pthread_create(&newItem->hThread, NULL, ThreadWorkBody, this) != 0)
+	{
+		perror("Cannot create new thread for the thread pool");
+		return false;
+	}
+	pthread_detach(newItem->hThread);
+
+	return true;
+}
+
+// UNRESOLVED! is there race condition on detecting liveness of the old thread and creating the new thread?
 #endif

@@ -41,17 +41,6 @@ int FSPAPI Dispose(FSPHANDLE hFSPSocket)
 
 
 
-// Set the function to be called back on passively shutdown by the remote end
-DllSpec
-int FSPAPI SetOnRelease(FSPHANDLE hFSPSocket, NotifyOrReturn fp1)
-{
-	CSocketItemDl* p = CSocketDLLTLB::HandleToRegisteredSocket(hFSPSocket);
-	if (p == NULL)
-		return -EBADF;
-	return p->SetOnRelease((PVOID)fp1);
-}
-
-
 // Try to terminate the session gracefully provided that the peer has commit the transmit transaction
 // Return 0 if no immediate error, or else the error number
 // The callback function might return code of delayed error
@@ -71,15 +60,12 @@ int FSPAPI Shutdown(FSPHANDLE hFSPSocket, NotifyOrReturn fp1)
 //	0 if no error
 //	negative if it is the error number
 // Remark
-//	For active/initiative socket the LLS TCB cache is kept if it is not aborted
-//	For passive/listening socket it releases LLS TCB as well, and to expect NotifyRecycled
+//	Unlike other function, mutex lock is treated specially
 int  CSocketItemDl::Dispose()
 {
-	char u = _InterlockedExchange8(&inUse, 0);
-	if (u == 0 || pControlBlock == NULL)
-		return 0;
-
+	toCancel = 1;
 	//^So that WaitUseMutex of other thread could be interrupted
+
 	timestamp_t t0 = NowUTC();
 	while (!TryMutexLock())
 	{
@@ -87,8 +73,18 @@ int  CSocketItemDl::Dispose()
 			return -EDEADLK;
 		Sleep(TIMER_SLICE_ms);
 	}
-	FreeWithReset();
 
+	if (pControlBlock == NULL)
+	{
+		lockOwner = 0;
+		return 0;
+	}
+
+	toReleaseMemory = 1;
+	if (lockDepth <= 1)
+		FreeWithReset();
+	else
+		lockDepth--;
 	return 0;
 }
 
@@ -108,26 +104,20 @@ void CSocketItemDl::Free()
 
 
 // Given
-//	FSP_ServiceCode		The service code passed to the call back function context.onError
-//	int					The delayed return value associated with the service code
+//	ALFID_T		the Application Layer Fiber ID in the local context 
+//	ALFID_T		the Application Layer Fiber ID of the parent connection
+//	uint32_t	reason code
 // Do
-//	Try to release resource and call back the error handler
-// Remark
-//	The error handler need not and should not do further clean-up work
-//	To avoid memory access fault releasing of the shared memory is delayed till explicit SetMutexFree
-void CSocketItemDl::FreeAndNotify(FSP_ServiceCode c, int v)
+//	Instruct LLS to reject the request (if it were to accept)
+//	or reset the connection (if it were to multiply)
+void LOCALAPI CSocketItemDl::RejectRequest(ALFID_T id1, ALFID_T idParent, uint32_t rc)
 {
-	NotifyOrReturn fp1 = context.onError;
-	RecycleSimply();
-	toReleaseMemory = 1;
-	if (!processingNotice)
-	{
-		CSocketItem::Destroy();
-		// toReleaseMemory = 0;	// 'bzero' covers toReleaseMemory
-		bzero((octet*)this + sizeof(CSocketItem), sizeof(CSocketItemDl) - sizeof(CSocketItem));
-	}
-	if (fp1 != NULL)
-		fp1(this, c, -v);
+	CommandRejectRequest objCommand;
+	objCommand.opCode = FSP_Reject;
+	objCommand.fiberID = id1;
+	objCommand.idParent = idParent;
+	objCommand.reasonCode = rc;
+	Call((UCommandToLLS*)&objCommand);
 }
 
 
@@ -148,7 +138,7 @@ int CSocketItemDl::Shutdown()
 	if (!WaitUseMutex())
 		return (IsInUse() ? -EDEADLK : -EAGAIN);
 
-	if (lowerLayerRecycled || initiatingShutdown != 0)
+	if (initiatingShutdown != 0)
 	{
 		SetMutexFree();
 		return EAGAIN;	// A warning saying that the socket is already in graceful shutdown process
@@ -171,9 +161,10 @@ int CSocketItemDl::Shutdown()
 			SetState(CLOSED);
 			Call<FSP_Shutdown>();
 		}		// assert: FSP_NotifyToFinish has been received and processed. See also WaitEventToDispatch
-		RecycLocked();
+		//
 		if (fp1 != NULL)
 			fp1(this, FSP_Shutdown, 0);
+		SetMutexFree();
 		return 0;
 	}
 
@@ -246,7 +237,10 @@ int CSocketItemDl::Shutdown()
 		//
 		deinitWait -= TIMER_SLICE_ms;
 		if (deinitWait <= 0)
+		{
+			Dispose();
 			return ETIMEDOUT;		// Warning, not fatal error
+		}
 		//
 		if (!WaitUseMutex())
 			return (IsInUse() ? -EDEADLK : 0);
@@ -257,9 +251,45 @@ int CSocketItemDl::Shutdown()
 	if (s == SHUT_REQUESTED)
 		SetState(s = CLOSED);
 	//
-	if (s == CLOSED)
-		RecycLocked();
-	else
-		SetMutexFree();
+	SetMutexFree();
 	return 0;
+}
+
+
+
+// Given
+//	CSocketItemDl *		the pointer to the DLL FSP socket
+// Do
+//	Try to put the socket in the list of the free socket items
+void CSocketDLLTLB::FreeItem(CSocketItemDl* p)
+{
+	CSocketItemDl& r = *p;
+	AcquireMutex();
+
+	if (_InterlockedExchange8(&p->inUse, 0) == 0)
+	{
+		ReleaseMutex();
+		return;
+	}
+
+	// detach it from inUse list
+	if (r.prev == NULL)
+		headOfInUse = (CSocketItemDl*)r.next;
+	else
+		r.prev->next = r.next;
+
+	// attach it to free list
+	r.next = NULL;
+	r.prev = tail;
+	if (tail == NULL)
+	{
+		head = tail = p;
+	}
+	else
+	{
+		tail->next = p;
+		tail = p;
+	}
+
+	ReleaseMutex();
 }

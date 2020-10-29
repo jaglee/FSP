@@ -206,6 +206,7 @@
     <ClCompile Include="Multiplex.cpp" />
     <ClCompile Include="Receive.cpp" />
     <ClCompile Include="Send.cpp" />
+    <ClCompile Include="SlimThreadPool.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\FSP.h" />

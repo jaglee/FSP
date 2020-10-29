@@ -1,6 +1,6 @@
 Microsoft Visual Studio Solution File, Format Version 12.00
-# Visual Studio 15
-VisualStudioVersion = 15.0.26730.16
+# Visual Studio Version 16
+VisualStudioVersion = 16.0.30503.244
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "FSP_SRV", "src\FSP_SRV\FSP_SRV.vcxproj", "{EB22DAD8-523E-4FED-88F3-F0647110BE7F}"
 EndProject
@@ -23,6 +23,7 @@ Global
 		{EB22DAD8-523E-4FED-88F3-F0647110BE7F}.Release|x64.ActiveCfg = Release|x64
 		{EB22DAD8-523E-4FED-88F3-F0647110BE7F}.Release|x64.Build.0 = Release|x64
 		{DC63E2B4-BA8D-4540-936A-63106FFCB999}.Debug|Win32.ActiveCfg = Debug|Win32
+		{DC63E2B4-BA8D-4540-936A-63106FFCB999}.Debug|Win32.Build.0 = Debug|Win32
 		{DC63E2B4-BA8D-4540-936A-63106FFCB999}.Debug|x64.ActiveCfg = Debug|x64
 		{DC63E2B4-BA8D-4540-936A-63106FFCB999}.Release|Win32.ActiveCfg = Release|Win32
 		{DC63E2B4-BA8D-4540-936A-63106FFCB999}.Release|x64.ActiveCfg = Release|x64

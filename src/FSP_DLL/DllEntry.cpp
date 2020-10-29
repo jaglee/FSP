@@ -50,20 +50,14 @@
 #include <Accctrl.h>
 #include <Aclapi.h>
 
+#ifndef __MINGW32__
 #pragma comment(lib, "Ws2_32.lib")
-
-
-void CSocketDLLTLB::Init() { }
-CSocketDLLTLB::~CSocketDLLTLB() {}
+#endif
 
 static DWORD		idThisProcess;	// the id of the process that attaches this DLL
-static SOCKET		sdPipe;
 static HANDLE		timerQueue;		// = NULL;
-static pthread_t	hThreadWait;
 
 static void AllowDuplicateHandle();
-static bool CreateExecUnitPool();
-static void DestroyExecUnitPool();
 
 
 extern "C" 
@@ -72,6 +66,9 @@ BOOL WINAPI DllMain(HINSTANCE hInstance, DWORD dwReason, LPVOID lpvReserved)
 	// to maintain thread local storage
 	if (dwReason == DLL_PROCESS_ATTACH)
 	{
+		if (CSocketItemDl::socketsTLB.sdPipe == INVALID_HANDLE_VALUE)
+			return FALSE;
+
 		WSADATA wsaData;
 		// initialize windows socket support
 		if (WSAStartup(0x202, &wsaData) < 0)
@@ -86,64 +83,102 @@ BOOL WINAPI DllMain(HINSTANCE hInstance, DWORD dwReason, LPVOID lpvReserved)
 		if (timerQueue == NULL)
 		{
 			REPORT_ERRMSG_ON_TRACE("Cannot create the timer queue for repetitive tasks");
-			return false;
-		}
-
-		sdPipe = socket(AF_INET, SOCK_STREAM, 0);
-		if (sdPipe < 0)
-		{
-			REPORT_ERRMSG_ON_TRACE("Cannot create the socket to communicate with LLS");
-			DeleteTimerQueueEx(timerQueue, NULL);
 			return FALSE;
-		}
-
-		struct sockaddr_in addr;
-		addr.sin_family = AF_INET;
-		addr.sin_port = htobe16(DEFAULT_FSP_UDPPORT);
-		addr.sin_addr.S_un.S_addr = IN4ADDR_LOOPBACK;
-		memset(addr.sin_zero, 0, sizeof(addr.sin_zero));
-		if (connect(sdPipe, (const sockaddr*)&addr, sizeof(struct sockaddr_in)) < 0)
-		{
-l_bailout:
-			DeleteTimerQueueEx(timerQueue, NULL);
-			closesocket(sdPipe);
-			sdPipe = INVALID_SOCKET;
-			return FALSE;
-		}
-
-		DWORD optval = 1;
-		setsockopt(sdPipe, IPPROTO_TCP, TCP_NODELAY, (const char*)&optval, sizeof(optval));
-		setsockopt(sdPipe, SOL_SOCKET, SO_DONTLINGER, (const char*)&optval, sizeof(optval));
-
-		if (!CreateExecUnitPool())
-			goto l_bailout;
-
-		hThreadWait = CreateThread(NULL // LPSECURITY_ATTRIBUTES, get a default security descriptor inherited
-			, 0							// dwStackSize, uses the default size for the executables
-			, CSocketItemDl::WaitNoticeCallBack		// LPTHREAD_START_ROUTINE
-			, CSocketItemDl::headOfInUse			// LPVOID lpParameter
-			, 0			// DWORD dwCreationFlags: run on creation
-			, NULL);	// LPDWORD lpThreadId, not returned here.
-		if (hThreadWait == NULL)
-		{
-			REPORT_ERRMSG_ON_TRACE("Cannot create the thread to handle communication with LLS");
-			DestroyExecUnitPool();
-			goto l_bailout;
 		}
 
 		idThisProcess = GetCurrentProcessId();
 	}
 	else if (dwReason == DLL_PROCESS_DETACH)
 	{
-		DeleteTimerQueueEx(timerQueue, NULL);
-		TerminateThread(hThreadWait, 0);
-		DestroyExecUnitPool();
-		shutdown(sdPipe, SD_BOTH);
-		closesocket(sdPipe);
+		if(timerQueue != NULL)
+			DeleteTimerQueueEx(timerQueue, NULL);
 		WSACleanup();
 	}
 	//
 	return TRUE;
+}
+
+
+
+void CSocketDLLTLB::Init()
+{
+	do
+	{
+		sdPipe = CreateFile(
+			SERVICE_NAMED_PIPE,				// pipe name
+			GENERIC_READ | GENERIC_WRITE,	// read and write access
+			0,								// no sharing
+			NULL,							// default security attributes
+			OPEN_EXISTING,					// opens existing pipe
+			FILE_FLAG_OVERLAPPED,			// asynchronous mode
+			NULL);							// no template file
+
+		if (sdPipe != INVALID_HANDLE_VALUE)
+			break;
+
+		// Exit if an error other than ERROR_PIPE_BUSY occurs.
+		if (GetLastError() != ERROR_PIPE_BUSY)
+		{
+			REPORT_ERROR_ON_TRACE();
+			return;
+		}
+		// All pipe instances are busy, so wait for half a minute
+		if (WaitNamedPipe(SERVICE_NAMED_PIPE, 30000))
+			continue;
+	} while (GetLastError() == ERROR_PIPE_BUSY);
+	// default byte mode works.
+	if (sdPipe == INVALID_HANDLE_VALUE)
+	{
+		REPORT_ERROR_ON_TRACE();
+		return;
+	}
+	// The pipe connected; change to message-read mode.
+	DWORD dwMode = PIPE_READMODE_MESSAGE;
+	if (!SetNamedPipeHandleState(
+		sdPipe,		// pipe handle
+		&dwMode,	// new pipe mode
+		NULL,		// don't set maximum bytes
+		NULL))		// don't set maximum time
+	{
+		REPORT_ERROR_ON_TRACE();
+		CloseHandle(sdPipe);
+		sdPipe = INVALID_HANDLE_VALUE;
+		return;
+	}
+}
+
+
+inline
+bool CSocketDLLTLB::InitThread()
+{
+	if (hThreadWait != NULL)
+		return true;
+
+	hThreadWait = CreateThread(NULL // LPSECURITY_ATTRIBUTES, get a default security descriptor inherited
+		, 0							// dwStackSize, uses the default size for the executables
+		, WaitNoticeCallBack		// LPTHREAD_START_ROUTINE
+		, this						// LPVOID lpParameter
+		, 0			// DWORD dwCreationFlags: run on creation
+		, NULL);	// LPDWORD lpThreadId, not returned here.
+	if (hThreadWait == NULL)
+	{
+		REPORT_ERRMSG_ON_TRACE("Cannot create the thread to handle communication with LLS");
+		CloseHandle(sdPipe);
+		sdPipe = INVALID_HANDLE_VALUE;
+		return false;
+	}
+	return true;
+}
+
+
+
+// As the waiting thread is waiting on the pipe, closing the pipe
+// will automatically make the thread terminate gracefully
+CSocketDLLTLB::~CSocketDLLTLB()
+{
+	HANDLE h = (HANDLE)_InterlockedExchangePointer(&sdPipe, INVALID_HANDLE_VALUE);
+	if (h != INVALID_HANDLE_VALUE)
+		CloseHandle(h);
 }
 
 
@@ -162,8 +197,6 @@ timestamp_t NowUTC()
 }
 
 
-
-SOCKET& CSocketItemDl::SDPipe() { return sdPipe; }
 
 
 // Do
@@ -210,18 +243,20 @@ void CSocketItemDl::CopyFatMemPointo(CommandNewSession& cmd)
 
 
 
-// Given
-//	uint32_t		number of milliseconds to wait till the timer shoots for the first time
-// Return
-//	true if the timer is registered successfully
-//	false if it failed
-bool CSocketItemDl::AddTimer(uint32_t dueTime)
+bool CSocketItemDl::StartPolling()
 {
+	timeOut_ns = TRANSIENT_STATE_TIMEOUT_ms * 1000000ULL;
+	timeLastTriggered = NowUTC();
+
+	if (!socketsTLB.InitThread())
+		return false;
+
+	uint32_t dueTime = TIMER_SLICE_ms;
 	return ((timer == NULL && ::CreateTimerQueueTimer(& timer, ::timerQueue
 			, TimeOutCallBack
 			, this		// LPParameter
 			, dueTime
-#ifdef TRACE
+#ifdef TRACE_TIMER
 			, 8000		// for convenience of debugging
 #else
 			, TIMER_SLICE_ms
@@ -234,16 +269,85 @@ bool CSocketItemDl::AddTimer(uint32_t dueTime)
 
 
 
-// Given
-//	UCommandToLLS *		const, the command context to pass to LLS
-//	int					the size of the command context
-// Return
-//	true if the command has been put in the mailslot successfully
-//	false if it failed
-bool LOCALAPI CSocketItemDl::Call(const UCommandToLLS* pCmd, int n)
+void CSocketItemDl::RecycleSimply()
 {
-	commandLastIssued = pCmd->sharedInfo.opCode;
-	return (send(sdPipe, (char*)pCmd, n, 0) > 0);
+	timer_t h;
+	if ((h = (timer_t)_InterlockedExchangePointer(&timer, 0)) != 0)
+	{
+		::DeleteTimerQueueTimer(::timerQueue, h, INVALID_HANDLE_VALUE);
+		socketsTLB.FreeItem(this);
+	}
+}
+
+
+
+// Given
+//	const void *	message to send
+//	int				size of the message in octets
+// Return
+//	positive if the result is the number of octets sent out
+//	negative if the result is the error number
+int CSocketDLLTLB::SendToPipe(const void* pMsg, int n)
+{
+	OVERLAPPED overlapped;
+	DWORD cbTransfer;
+	bzero(&overlapped, sizeof(OVERLAPPED));
+	BOOL b = WriteFile(
+		sdPipe,			// pipe handle 
+		pMsg,			// message 
+		n,				// message length 
+		&cbTransfer,	// bytes written 
+		&overlapped);
+	if (b)
+		return cbTransfer;
+	int r = GetLastError();
+	if (r != ERROR_IO_PENDING)
+		return -r;
+	if (!GetOverlappedResult(sdPipe, &overlapped, &cbTransfer, TRUE))
+		return -(int)GetLastError();
+	return cbTransfer;
+}
+
+
+
+// Given
+//	SNotification *		the buffer to hold LLS's notification
+// Return
+//	true if a full notification message was successfully received
+//	false if it failed
+bool CSocketDLLTLB::GetNoticeFromPipe(SNotification *pSig)
+{
+	OVERLAPPED overlapped;
+	DWORD cbTransfer;
+	do
+	{
+		bzero(&overlapped, sizeof(OVERLAPPED));
+		if (ReadFile(sdPipe, pSig, sizeof(SNotification), &cbTransfer, &overlapped))
+			return true;
+		int r = GetLastError();
+		if (r != ERROR_IO_PENDING)
+			return false;
+		if (!GetOverlappedResult(sdPipe, &overlapped, &cbTransfer, TRUE))
+			return false;
+	} while (cbTransfer == 0);
+	//
+	assert(cbTransfer == sizeof(SNotification));
+	return true;
+}
+
+
+
+bool CSlimThreadPool::NewThreadFor(CSlimThreadPoolItem* newItem)
+{
+	newItem->hThread =
+		CreateThread(NULL		// Default security descriptor inherited
+			, 0					// dwStackSize, uses the default size for the executables
+			, ThreadWorkBody	// LPTHREAD_START_ROUTINE
+			, newItem			// LPVOID lpParameter
+			, 0					// DWORD dwCreationFlags: run on creation
+			, NULL);			// LPDWORD lpThreadId, not returned here.
+	return (newItem->hThread != NULL);
+
 }
 
 
@@ -359,61 +463,4 @@ void TraceLastError(const char * fileName, int lineNo, const char *funcName, con
 		, NULL);
 	if(buffer[0] != 0)
 		puts(buffer);
-}
-
-
-
-/**
- * Implementation dependent: thread pool to handle soft interrupt of LLS 
- */
-static PTP_POOL				pool;	// = NULL;
-static PTP_CLEANUP_GROUP	cleanupgroup; // = NULL;
-
-TP_CALLBACK_ENVIRON	CSocketItemDl::envCallBack;
-
-static bool CreateExecUnitPool()
-{
-	//FILETIME FileDueTime;
-	//ULARGE_INTEGER ulDueTime;
-	//PTP_TIMER timer = NULL;
-	BOOL bRet = FALSE;
-
-	InitializeThreadpoolEnvironment(&CSocketItemDl::envCallBack);
-	pool = CreateThreadpool(NULL);
-	if (pool == NULL)
-	{
-		printf_s("CreateThreadpool failed. LastError: %u\n", GetLastError());
-		return false;
-	}
-
-	SetThreadpoolThreadMaximum(pool, MAX_WORKING_THREADS);
-	bRet = SetThreadpoolThreadMinimum(pool, 1);
-	if (!bRet)
-	{
-		printf_s("SetThreadpoolThreadMinimum failed. LastError: %d\n", GetLastError());
-		CloseThreadpool(pool);
-		return false;
-	}
-
-	cleanupgroup = CreateThreadpoolCleanupGroup();
-	if (cleanupgroup == NULL)
-	{
-		printf_s("CreateThreadpoolCleanupGroup failed. LastError: %d\n", GetLastError());
-		CloseThreadpool(pool);
-		return false;
-	}
-
-	SetThreadpoolCallbackPool(&CSocketItemDl::envCallBack, pool);
-	SetThreadpoolCallbackCleanupGroup(&CSocketItemDl::envCallBack, cleanupgroup, NULL);
-
-	return true;
-}
-
-
-static void DestroyExecUnitPool()
-{
-	if (cleanupgroup == NULL)
-		return;
-	CloseThreadpoolCleanupGroupMembers(cleanupgroup, FALSE, NULL);
-	CloseThreadpoolCleanupGroup(cleanupgroup);
 }

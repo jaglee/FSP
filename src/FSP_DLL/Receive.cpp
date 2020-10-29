@@ -365,9 +365,6 @@ int32_t CSocketItemDl::FetchReceived()
 
 
 
-// Remark
-//	It is meant to be called by the soft interrupt handling entry function where the mutex lock has been obtained
-//	and it sets the mutex lock free on leave.
 void CSocketItemDl::ProcessReceiveBuffer()
 {
 l_recursion:
@@ -380,7 +377,6 @@ l_recursion:
 		n = FetchReceived();
 		if (n < 0)
 		{
-			SetMutexFree();
 #ifndef NDEBUG
 			printf_s("FetchReceived() return %d when ProcessReceiveBuffer\n", n);
 #endif		
@@ -395,14 +391,9 @@ l_recursion:
 		{
 			NotifyOrReturn fp1 = (NotifyOrReturn)_InterlockedExchangePointer((PVOID *)& fpReceived, NULL);
 			waitingRecvBuf = NULL;
-			SetMutexFree();
-			// due to multi-task nature it could be already reset in the caller although fpReceived has been checked here
 			if (fp1 != NULL)
 				fp1(this, FSP_Receive, bytesReceived);
-		}
-		else
-		{
-			SetMutexFree();
+			return;
 		}
 
 		return;
@@ -410,17 +401,11 @@ l_recursion:
 
 	// To avoid phantom double delivery of the payload
 	if (pendingPeekedBlocks != 0)
-	{
-		SetMutexFree();
 		return;
-	}
 
 	CallbackPeeked fp1 = (CallbackPeeked)_InterlockedExchangePointer((PVOID *)& fpPeeked, NULL);
 	if (fp1 == NULL)
-	{
-		SetMutexFree();
 		return;
-	}
 
 	bool eot;
 	octet* p = pControlBlock->InquireRecvBuf(n, pendingPeekedBlocks, eot);
@@ -431,17 +416,17 @@ l_recursion:
 	{
 		assert(pendingPeekedBlocks == 0);
 		fpPeeked = fp1;
-		SetMutexFree();
 		return;
 	}
-
-	SetMutexFree();
 
 	// It is possible that no meaningful payload is received but an EoT flag is got.
 	// The callback function should work in such scenario
 	// It is also possible that p == NULL while n is the error code. The callback function MUST handle such scenario
 	// If the callback function happens to be updated, prefer the new one
-	if (fp1(this, p, n, eot))
+	bool b = fp1(this, p, n, eot);
+	if (!IsInUse())
+		return;
+	if (b)
 		_InterlockedCompareExchangePointer((PVOID*)&fpPeeked, (PVOID)fp1, NULL);
 
 	if (n < 0)
@@ -452,9 +437,7 @@ l_recursion:
 		return;
 	}
 
-	if (!WaitUseMutex())
-		return;	// it could be disposed in the callback function
-
+	// protected it from dead loop caused by receive queue messed up
 	int r = TryUnlockPeeked();
 	offsetInLastRecvBlock = 0;
 	if (r < 0)
@@ -462,21 +445,17 @@ l_recursion:
 #ifdef TRACE
 		printf_s("The receive queue was messed up? TryUnlockPeeked return %d\n", r);
 #endif
-		SetMutexFree();
-		return;	// protected it from dead loop caused by receive queue messed up
+		return;
 	}
 
 	// it could be shutdown gracefully in the callback function, however there may be data pending to deliver
 	if (GetState() >= CLOSED)
-	{
-		SetMutexFree();
 		return;
-	}
 
 	// If (n < 0) some unrecoverable error has occur. Should avoid the risk of dead-loop.
 	if (n >= 0 && HasDataToDeliver())
 		goto l_recursion;
 	//^former condition equals (n > 0 || n == 0 && eot) because (!eot && n == 0) has been excluded
 
-	SetMutexFree();
+	return;
 }

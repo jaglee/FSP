@@ -1,5 +1,5 @@
 /*
- * Implement the SOCKSv5 interface of FSP http accelerator, SOCKS gateway and tunnel server
+ * Implement the SOCKSv5 interface of FSP SOCKS gateway, complementing SOCKSv4a in Linux
  *
     Copyright (c) 2020, Jason Gao
     All rights reserved.
@@ -123,7 +123,7 @@ static void ReportV5ErrorToClient(SOCKET client, PRequestPoolItem p, ERepCode co
 
 
 
-static void ReportGeneralError(SOCKET client, PRequestPoolItem p)
+static inline void ReportGeneralError(SOCKET client, PRequestPoolItem p)
 {
 	if(p->socks_version == SOCKS_VERSION_5)
 		ReportV5ErrorToClient(client, p, SOCKS_SERVER_FAILURE);
@@ -167,7 +167,10 @@ l_negotiation_failed:
 			break;
 	} while(++i < (int)req.count);
 	if(i >= (int)req.count)
+	{
+		printf("What? No default authentication method SOCKS_V5_AUTH_NULL.\n");
 		goto l_negotiation_failed;
+	}
 
 	// This implementation does not support GSSAPI authentication yet. It does not conform to RFC1928:(
 	rsp.method = SOCKS_V5_AUTH_NULL;
@@ -235,52 +238,7 @@ l_negotiation_failed:
 		return 0;
 	}
 
-	return r;
-}
-
-
-
-void *TpWorkCallBack(void *parameter)
-{
-	PRequestPoolItem p = (PRequestPoolItem)parameter;
-	SSocksV5AuthMethodsRequest &req = p->amr;
-
-	int r = (int)recv(p->hSocket, &req, offsetof(SSocksV5AuthMethodsRequest, methods), 0);
-	if(r < 0)
-	{  
-        perror("recv() authentation method negation failed");
-		requestPool.FreeItem(p);
-        return NULL;
-    }
-
-	r = (req.version == SOCKS_VERSION_5 ? NegotiateSOCKSv5(p) : GetSOCKSv4Request(p));
-	if(r <= 0)
-	{
-		closesocket(p->hSocket);
-		requestPool.FreeItem(p);
-		return NULL;
-	}
-
-	FSP_SocketParameter parms;
-	memset(& parms, 0, sizeof(parms));
-	parms.onAccepting = NULL;
-	parms.onAccepted = NULL;
-	parms.onError = onError;
-	parms.keepAlive = 1;
-	parms.recvSize = BUFFER_POOL_SIZE;
-	parms.sendSize = BUFFER_POOL_SIZE;
-	parms.welcome = &p->socks_version;
-	parms.len = (unsigned short)r;
-	parms.extentI64ULA = (uint64_t)p;
-	//
-	FSPHANDLE h = MultiplyAndWrite(hClientMaster, &parms, TO_END_TRANSACTION, onSubrequestSent);
-	if(h == NULL)
-	{
-		ReportGeneralError(p->hSocket, p);
-		requestPool.FreeItem(p);
-		return NULL;
-	}
-	return NULL;
+	return (p->lenReq = r);
 }
 
 
@@ -294,21 +252,14 @@ void *TpWorkCallBack(void *parameter)
 //	Instead of create a thread pool in the counterpart Windows platform
 void ToServeSOCKS(const char *nameAppLayer, int port)
 {
-	int r = snprintf(tunnelRequest, sizeof(tunnelRequest), "TUNNEL %s HTTP/1.0\r\n", nameAppLayer);
-	if(r < 0)
-	{
-		printf_s("Invalid name of remote tunnel server end-point: %s\n", nameAppLayer);
-		return;
-	}
-
 	FSP_SocketParameter parms;
 	int hListener;
+	int r;
 	sockaddr_in localEnd;
 
 	memset(& parms, 0, sizeof(parms));
 	// blocking mode, both onAccepting and onAccepted are default to NULL
-	// parms.onAccepted = onConnected;
-	parms.onError = onError;
+	parms.onError = NULL;
 	parms.recvSize = MAX_FSP_SHM_SIZE/2;
 	parms.sendSize = MAX_FSP_SHM_SIZE/2;
 	hClientMaster = Connect2(nameAppLayer, & parms);
@@ -317,17 +268,7 @@ void ToServeSOCKS(const char *nameAppLayer, int port)
 		printf_s("Failed to initialize the FSP connection towards the tunnel server\n");
 		return;
 	}
-
-	// synchronous mode
-	if (parms.onAccepted == NULL)
-		onConnected(hClientMaster, GetFSPContext(hClientMaster));
-
-	//
-	if(! requestPool.Init(MAX_WORKING_THREADS))
-	{
-		printf_s("Failed to allocate tunnel service request pool\n");
-		goto l_bailout;
-	}
+	onConnected(hClientMaster, GetFSPContext(hClientMaster));
 
 	hListener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 	if(hListener == SOCKET_ERROR)
@@ -355,9 +296,7 @@ void ToServeSOCKS(const char *nameAppLayer, int port)
 		goto l_bailout6;
     }
 
-	while(! isRemoteTunnelEndReady && hClientMaster != NULL)
-		Sleep(50);
-	if(hClientMaster == NULL)
+	if(MakeRequest(hClientMaster, nameAppLayer) != 0)
 		goto l_bailout6;
 
 	printf_s("Ready to serve SOCKSv4/v5 request at %s:%d\n", inet_ntoa(localEnd.sin_addr), ntohs(localEnd.sin_port));
@@ -385,15 +324,39 @@ void ToServeSOCKS(const char *nameAppLayer, int port)
 			Sleep(2000);
 			continue;
 		}
+
+		struct timeval timeout;
+		timeout.tv_sec = RECV_TIME_OUT;
+		timeout.tv_usec = 0;
+		setsockopt(hAccepted, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, sizeof(timeout));
 		//
 		p->hSocket = hAccepted;
-		r = pthread_create(&p->hThread, NULL, TpWorkCallBack, p);
-		if (r != 0)
-		{
-			printf("Thread creation failed, error number = %d\n", r);
-			closesocket(hAccepted);
+		SSocksV5AuthMethodsRequest &req = p->amr;
+		int r = (int)recv(p->hSocket, &req, offsetof(SSocksV5AuthMethodsRequest, methods), 0);
+		if(r <= 0)
+		{  
+			perror("recv() authentation method negation failed");
+			closesocket(p->hSocket);
 			requestPool.FreeItem(p);
-			Sleep(2000);
+			continue;
+		}
+
+		if(req.version == SOCKS_VERSION_5)
+			r = NegotiateSOCKSv5(p);
+		else if((r = GetSOCKSv4Request(p)) <= 0)
+			RejectV4Client(hAccepted);
+		//
+		if(r <= 0)
+		{
+			requestPool.FreeItem(p);
+			continue;
+		}
+
+		if (!ForkFSPThread(p))
+		{
+			perror("Cannot fork FSP thread");
+			ReportGeneralError(hAccepted, p);
+			requestPool.FreeItem(p);
 		}
 	} while(true);
 	printf("The main loop terminated abruptly. Press Enter to exit...\n");
@@ -422,7 +385,7 @@ static void SetStdinEcho(bool enable = true)
 
 
 
-static void GetUserCredential(char *userName, int capacity)
+static void GetUserCredential(char *userName, int capacity, char inputPassword[])
 {
 	printf_s("Please input the username: ");
 	fgets(userName, capacity, stdin);
@@ -432,26 +395,11 @@ static void GetUserCredential(char *userName, int capacity)
 
 	printf_s("Please input the password: ");
 	SetStdinEcho(false);
-	fgets(inputPassword, (int)sizeof(inputPassword), stdin);
+	fgets(inputPassword, MAX_PASSWORD_LENGTH, stdin);
 	SetStdinEcho();
 	c = index(inputPassword, '\n');
 	*c = '\0';
 }
+
 #endif
-
-
-/*
- *
- *	TODO: download the white list
- *
-	Process
-	### IPv4: check rule set
-	white list : direct FSP / IPv6 access(TCP / IPv4->FSP / IPv6, transmit via SOCKS)
-	not in the white list: FSP - relay
-	{ /// UNRESOLVED! As a transit method:
-	if not in white - list, try search PTR, [DnsQuery], if get the _FSP exception - list: direct connect
-	}
-	Further streaming :
-	transparent HTTP acceleration!
- */
 

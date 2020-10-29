@@ -67,6 +67,7 @@ static int ParseBlock(octet *, int32_t);
 static void FSPAPI onError(FSPHANDLE h, FSP_ServiceCode code, int value)
 {
 	printf_s("Notify: socket %p, service code = %d, return %d\n", h, code, value);
+	Dispose(h);
 	finalize();
 }
 
@@ -336,18 +337,12 @@ static int ParseBlock(octet *utf8str, int32_t len)
 static void FSPAPI onAcknowledgeSent(FSPHANDLE h, FSP_ServiceCode c, int r)
 {
 	printf_s("Result of sending the acknowledgement: %d\n", r);
-	if(r < 0)
+	if(r >= 0)
 	{
-		Dispose(h);
-		finalize();
-		return;
+		r = Shutdown(h, NULL);
+		if(r < 0)
+			printf_s("Cannot shutdown gracefully in the final stage, error#: %d\n", r);
 	}
-
-	r = Shutdown(h, NULL);
-	if(r < 0)
-	{
-		printf_s("Cannot shutdown gracefully in the final stage, error#: %d\n", r);
-		Dispose(h);
-	}
+	Dispose(h);
 	finalize();
 }

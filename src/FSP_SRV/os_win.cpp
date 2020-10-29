@@ -34,7 +34,9 @@
 #include <tchar.h>
 
 #if _MSC_VER
+# include <aclapi.h>
 # include <netfw.h>
+# pragma comment(lib, "advapi32.lib")
 # pragma comment(lib, "Iphlpapi.lib")
 # pragma comment(lib, "Ws2_32.lib")
 # pragma comment(lib, "User32.lib")
@@ -100,6 +102,7 @@ inline int GetPointerOfWSASendMsg(SOCKET sock)
 // Forward declaration of the callback function for handling the event that some IPv6 interface was changed
 VOID NETIOAPI_API_ OnUnicastIpChanged(PVOID, PMIB_UNICASTIPADDRESS_ROW, MIB_NOTIFICATION_TYPE);
 #endif
+
 
 /*
  * The OS-dependent CommandNewSessionSrv constructor
@@ -1006,22 +1009,178 @@ void CSocketItemEx::RemoveTimers()
 
 
 
+/*
+ * The OS-dependent IPC function for accepting ULA command
+ */
+int WaitForULACommand()
+{
+	const int BUFSIZE = 1024;	// considerably large than sizeof(UCommandToLLS);
+	HANDLE hPipe;
+
+	PSID pEveryoneSID = NULL, pAdminSID = NULL;
+	PACL pACL = NULL;
+	PSECURITY_DESCRIPTOR pSD = NULL;
+	EXPLICIT_ACCESS ea[2];
+	SID_IDENTIFIER_AUTHORITY SIDAuthWorld = SECURITY_WORLD_SID_AUTHORITY;
+	SID_IDENTIFIER_AUTHORITY SIDAuthNT = SECURITY_NT_AUTHORITY;
+	SECURITY_ATTRIBUTES sa;
+
+	// Create a well-known SID for the Everyone group.
+	if (!AllocateAndInitializeSid(&SIDAuthWorld, 1,
+		SECURITY_WORLD_RID,
+		0, 0, 0, 0, 0, 0, 0,
+		&pEveryoneSID))
+	{
+		_tprintf(_T("AllocateAndInitializeSid Error %u\n"), GetLastError());
+		goto Cleanup;
+	}
+
+	ZeroMemory(&ea, 2 * sizeof(EXPLICIT_ACCESS));
+	ea[0].grfAccessPermissions = FILE_GENERIC_READ | FILE_GENERIC_WRITE;
+	ea[0].grfAccessMode = SET_ACCESS;
+	ea[0].grfInheritance = NO_INHERITANCE;
+	ea[0].Trustee.TrusteeForm = TRUSTEE_IS_SID;
+	ea[0].Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
+	ea[0].Trustee.ptstrName = (LPTSTR)pEveryoneSID;
+
+	// Create a SID for the BUILTIN\Administrators group.
+	if (!AllocateAndInitializeSid(&SIDAuthNT, 2,
+		SECURITY_BUILTIN_DOMAIN_RID,
+		DOMAIN_ALIAS_RID_ADMINS,
+		0, 0, 0, 0, 0, 0,
+		&pAdminSID))
+	{
+		_tprintf(_T("AllocateAndInitializeSid Error %u\n"), GetLastError());
+		goto Cleanup;
+	}
+
+	ea[1].grfAccessPermissions = TRUSTEE_ACCESS_ALL;
+	ea[1].grfAccessMode = GRANT_ACCESS;
+	ea[1].grfInheritance = NO_INHERITANCE;
+	ea[1].Trustee.TrusteeForm = TRUSTEE_IS_SID;
+	ea[1].Trustee.TrusteeType = TRUSTEE_IS_GROUP;
+	ea[1].Trustee.ptstrName = (LPTSTR)pAdminSID;
+
+	// Create a new ACL that contains the new ACEs.
+	DWORD dwRes = SetEntriesInAcl(2, ea, NULL, &pACL);
+	if (ERROR_SUCCESS != dwRes)
+	{
+		_tprintf(_T("SetEntriesInAcl Error %u\n"), GetLastError());
+		goto Cleanup;
+	}
+
+	// Initialize a security descriptor.  
+	pSD = (PSECURITY_DESCRIPTOR)LocalAlloc(LPTR,
+		SECURITY_DESCRIPTOR_MIN_LENGTH);
+	if (NULL == pSD)
+	{
+		_tprintf(_T("LocalAlloc Error %u\n"), GetLastError());
+		goto Cleanup;
+	}
+
+	if (!InitializeSecurityDescriptor(pSD,
+		SECURITY_DESCRIPTOR_REVISION))
+	{
+		_tprintf(_T("InitializeSecurityDescriptor Error %u\n"),
+			GetLastError());
+		goto Cleanup;
+	}
+
+	// Add the ACL to the security descriptor. 
+	if (!SetSecurityDescriptorDacl(pSD,
+		TRUE,     // bDaclPresent flag   
+		pACL,
+		FALSE))   // not a default DACL 
+	{
+		_tprintf(_T("SetSecurityDescriptorDacl Error %u\n"),
+			GetLastError());
+		goto Cleanup;
+	}
+
+	// Initialize a security attributes structure.
+	sa.nLength = sizeof(SECURITY_ATTRIBUTES);
+	sa.lpSecurityDescriptor = pSD;
+	sa.bInheritHandle = FALSE;
+
+	printf_s("\nPipe Server: Main thread awaiting client connection on %s\n", SERVICE_NAMED_PIPE);
+	for (;;)
+	{
+		hPipe = CreateNamedPipe(
+			SERVICE_NAMED_PIPE,			// pipe name 
+			PIPE_ACCESS_DUPLEX |		// read/write access 
+			FILE_FLAG_OVERLAPPED,		// asynchronous mode for multi-thread, simultaneous read-write
+			PIPE_TYPE_MESSAGE |			// message type pipe 
+			PIPE_READMODE_BYTE |		// but read in byte mode for sake of installing key of arbitrary length
+			PIPE_WAIT |					// blocking mode 
+			PIPE_REJECT_REMOTE_CLIENTS,	// for local IPC only
+			PIPE_UNLIMITED_INSTANCES,	// max. instances  
+			BUFSIZE,					// suggested output buffer size 
+			BUFSIZE,					// suggested input buffer size 
+			0,							// client time-out 
+			&sa);						// security attribute: allow everyone to connect
+
+		if (hPipe == INVALID_HANDLE_VALUE)
+		{
+			printf("CreateNamedPipe failed, GLE=%d.\n", GetLastError());
+			goto Cleanup;
+		}
+
+		// Wait for the client to connect; if it succeeds, 
+		// the function returns a nonzero value. If the function
+		// returns zero, GetLastError returns ERROR_PIPE_CONNECTED. 
+		OVERLAPPED overlapped;
+		bzero(&overlapped, sizeof(OVERLAPPED));
+		bool fConnected = (ConnectNamedPipe(hPipe, &overlapped) != FALSE);
+		if (!fConnected)
+		{
+			int r = GetLastError();
+			DWORD cbTransfer;
+			if (r == ERROR_PIPE_CONNECTED)
+				fConnected = true;
+			else if (r == ERROR_IO_PENDING)
+				fConnected = (GetOverlappedResult(hPipe, &overlapped, &cbTransfer, TRUE) != FALSE);
+		}
+		if (!fConnected)
+		{
+			CloseHandle(hPipe);
+			continue;
+		}
+		// There IS some head-of-line blocking, for purpose of throttling rate of create new socket (to defend against DoS?)
+		if (CLowerInterface::Singleton.AddULAChannel(hPipe))
+			printf_s("A new client connected.\n");
+		else
+			CLOSE_PIPE(hPipe);
+	}
+
+Cleanup:
+	if (pEveryoneSID)
+		FreeSid(pEveryoneSID);
+	if (pAdminSID)
+		FreeSid(pAdminSID);
+	if (pACL)
+		LocalFree(pACL);
+	if (pSD)
+		LocalFree(pSD);
+	return -1;
+}
+
+
 static DWORD WINAPI WaitULACommand(LPVOID p)
 {
-	CLowerInterface::Singleton.ProcessULACommand((SProcessRoot*)p);
+	((SProcessRoot*)p)->LoopOnULACommand();
 	return 0;
 }
 
 
 
 // Given
-//	SOCKET		the socket that created as a two-way stream end point
+//	HANDLE		handle of the pipe that created as a two-way stream end point
 // Do
-//	Set the socket as the bi-directional IPC end point and create the thread
+//	Set the pipe  as the bi-directional IPC end point and create the thread
 // Return
 //	true the communication channel was established successfully
 //	false if it failed
-bool CSocketSrvTLB::AddULAChannel(SOCKET sd)
+bool CSocketSrvTLB::AddULAChannel(HANDLE sd)
 {
 	unsigned long bitIndex;
 	AcquireMutex();
@@ -1035,25 +1194,97 @@ bool CSocketSrvTLB::AddULAChannel(SOCKET sd)
 
 	SProcessRoot& r = forestULA[bitIndex];
 	r.latest = NULL;
-	r.headLRUitem = r.tailLRUitem = NULL;
 	r.sdPipe = sd;
 	r.hThreadWait = CreateThread(NULL // LPSECURITY_ATTRIBUTES, get a default security descriptor inherited
-	, 0						// dwStackSize, uses the default size for the executables
-	, ::WaitULACommand		// LPTHREAD_START_ROUTINE
-	, &r		// LPVOID lpParameter
-	, 0			// DWORD dwCreationFlags: run on creation
-	, NULL);	// LPDWORD lpThreadId, not returned here.
+		, 0						// dwStackSize, uses the default size for the executables
+		, ::WaitULACommand		// LPTHREAD_START_ROUTINE
+		, &r		// LPVOID lpParameter
+		, 0			// DWORD dwCreationFlags: run on creation
+		, NULL);	// LPDWORD lpThreadId, not returned here.
 
 	if (r.hThreadWait == NULL)
 	{
 		ReleaseMutex();
 		return false;
 	}
-	forestFreeFlags ^= 1 << bitIndex;
 	r.index = bitIndex;
+	forestFreeFlags ^= 1 << bitIndex;
 
 	ReleaseMutex();
 	return true;
+}
+
+
+
+// Given
+//	void *		the buffer to accept the message
+//	int			capacity of the buffer, in octets
+// Return
+//	positive if it is number of octets received
+//	negative if it is the error number
+// Remark
+//	Due to multi-thread, simultaneous read/write nature of each pipe end GetOverlappedResult
+//	might return false positive without anything actually received
+//	it could never return zero
+int  SProcessRoot::RecvFromPipe(void* buffer, int capacity)
+{
+	DWORD cbTransfer;
+	BOOL b;
+	while ((b = PeekNamedPipe(sdPipe, NULL, 0, NULL, &cbTransfer, NULL)) != FALSE)
+	{
+		if ((int)cbTransfer < capacity)
+			Sleep(TIMER_SLICE_ms);	// yield out the CPU
+		else
+			break;
+	}
+	OVERLAPPED overlapped;
+	bzero(&overlapped, sizeof(OVERLAPPED));
+	b = ReadFile(
+		sdPipe,		// handle to pipe
+		buffer,		// buffer to accept data
+		capacity,
+		&cbTransfer, // number of bytes read
+		&overlapped);
+	if (b)
+		return cbTransfer;
+	int r = GetLastError();
+	if (r != ERROR_IO_PENDING)
+		return -r;
+	if (!GetOverlappedResult(sdPipe, &overlapped, &cbTransfer, TRUE))
+		return -(int)GetLastError();
+	return cbTransfer;
+}
+
+
+
+// Given
+//	ALFID_T				the application layer fiber ID
+//	FSP_NoticeCode		the code of the notice to send
+// Return
+//	positive if it is number of octets sent
+//	negative if it is the error number
+int  SProcessRoot::SendNotificationTo(ALFID_T fiberID, FSP_NoticeCode code)
+{
+	OVERLAPPED overlapped;
+	DWORD cbTransfer;
+	bzero(&overlapped, sizeof(OVERLAPPED));
+	SNotification resp;
+	resp.sig = code;
+	resp.fiberID = fiberID;
+	BOOL b = WriteFile(
+		sdPipe,        // handle to pipe 
+		&resp,
+		sizeof(resp),
+		&cbTransfer,   // number of bytes written 
+		&overlapped);
+	if (b)
+		return cbTransfer;
+	int r = GetLastError();
+	if (r != ERROR_IO_PENDING)
+		return -r;
+	if (!GetOverlappedResult(sdPipe, &overlapped, &cbTransfer, TRUE))
+		return -(int)GetLastError();
+	return cbTransfer;
 }
 
 
@@ -1154,17 +1385,6 @@ l_bailout1:
 l_bailout:
 	CloseHandle(hThatProcess);
 	return false;
-}
-
-
-
-// See also CSocketItem::Destroy();
-void CSocketItemEx::ClearInUse()
-{
-	register HANDLE h;
-	if ((h = InterlockedExchangePointer((PVOID *)& pControlBlock, NULL)) != NULL)
-		::UnmapViewOfFile(h);
-	markInUse = 0;
 }
 
 

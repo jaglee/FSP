@@ -1,8 +1,7 @@
 /*
- * Simple HTTP 1.0 server over FSP version 0. SOCKS gateway and tunnel server as well
+ * Simple HTTP 1.0 server over FSP version 0, remote tunnel end of the SOCKS gateway as well
  *
- * Usage 1: as the SOCKSv4 proxy: fsp_socks -p <port number> [Remote FSP address]
- * Usage 2: as the HTTP server (and tunnel responder) fsp_http -d <local web root> [MAX_WORKING_THREADS]
+ * Usage: fsp_http -d <local web root> [MAX_WORKING_THREADS]
     Copyright (c) 2017, Jason Gao
     All rights reserved.
 
@@ -34,6 +33,10 @@
 #include "fsp_http.h"
 #include <assert.h>
 
+#ifndef MAX_WORKING_THREADS
+# define MAX_WORKING_THREADS	4
+#endif
+
 /**
  * The key agreement block
  */
@@ -62,17 +65,13 @@ static void FSPAPI onFurtherTunnelRequest(FSPHANDLE, FSP_ServiceCode, int);
 // HTTP server 1.0 over FSP version 0 AND tunnel server
 void	StartHTTPoverFSP();
 
-// Forward declaration of the top level function that implements service interface for SOCKS gateway
-void	ToServeSOCKS(const char *, int);
-
-
 inline void WriteErrStr(FSPHANDLE client, const char *buf)
 {
 	WriteTo(client, buf, strlen(buf) + 1, TO_END_TRANSACTION, NULL);
 }
 
 
-inline void FreeExtent(FSPHANDLE h, bool disposing = false)
+inline void FreeExtent(FSPHANDLE h, bool disposing = true)
 {
 	void *p = GetExtPointer(h);
 	if(p != NULL)
@@ -104,53 +103,14 @@ int main(int argc, char *argv[])
 	}
 #endif
 
-	if(argc <= 1)
+	if ((argc != 3 && argc != 4) || strcmp(argv[1], "-d") != 0)
 	{
-		printf_s("To serve SOCKS"
-#if defined(__WINDOWS__)
-		"v4"
-#elif defined(__linux__) || defined(__CYGWIN__)
-		"v5"
-#endif
-			" request at port %d\n", DEFAULT_SOCKS_PORT);
-		ToServeSOCKS("localhost:80", DEFAULT_SOCKS_PORT);
-		r = 0;
+		printf_s("Usage[as a tunnel remote-end and hypertext-FSP server]:\n"
+			"%s -d <root directory> [max-requests]\n", argv[0]);
+		goto l_return;
 	}
-	else if (strcmp(argv[1], "-p") == 0)
+	else
 	{
-		if(argc != 3 && argc != 4)
-		{
-			printf_s("Usage: %s -p <port number> [remote fsp app-name, e.g. 192.168.9.125:80]", argv[0]);
-			goto l_return;
-		}
-
-		int port = atoi(argv[2]);
-		if (port == 0 || port > USHRT_MAX)
-		{
-			printf_s("Port number should be a value between 1 and %d\n", USHRT_MAX);
-			goto l_return;
-		}
-
-		const char *nameAppLayer = (argc == 4 ? argv[3] : "localhost:80");
-		printf_s("To serve SOCKS"
-#if defined(__WINDOWS__)
-		"v4"
-#elif defined(__linux__) || defined(__CYGWIN__)
-		"v5"
-#endif
-			" request at port %d\n", port);
-		ToServeSOCKS(nameAppLayer, port);
-		r = 0;
-	}
-	else if (strcmp(argv[1], "-d") == 0)
-	{
-		if (argc != 3 && argc != 4)
-		{
-			printf_s("Usage[as a tunnel remote-end and hypertext-FSP server]:\n"
-				"%s -d <root directory> [max-requests]\n", argv[0]);
-			goto l_return;
-		}
-		//
 		strncpy(DEFAULT_ROOT, argv[2], sizeof(DEFAULT_ROOT) - 1);
 		DEFAULT_ROOT[sizeof(DEFAULT_ROOT) - 1] = 0;
 		//
@@ -171,11 +131,6 @@ int main(int argc, char *argv[])
 		printf_s("To serve SOCKS tunneling request and Web Service over FSP at directory:\n%s\n\n", DEFAULT_ROOT);
 		StartHTTPoverFSP();
 		r = 0;
-	}
-	else
-	{
-		printf_s("Usage: %s [-p <port number> [remote fsp url]] | -d <web root directory>\n", argv[0]);
-		goto l_return;
 	}
 
 	printf("\n\nPress Enter to exit...");
@@ -233,12 +188,23 @@ void StartHTTPoverFSP()
 	FSPHANDLE hService;
 	while((hService = Accept1(hListener)) != NULL)
 	{
-		FSPControl(hService, FSP_SET_CALLBACK_ON_REQUEST, (ULONG_PTR)onMultiplying);
+		SetOnMultiplying(hService, onMultiplying);
 	}
 
 	if (hListener != NULL)
 		Dispose(hListener);
 }
+
+
+
+// Print out an error message and exit the program indicating an error.
+static void Abort(const char* sc)
+{
+	printf("\n%s\nPress Enter to exit...", sc);
+	getchar();
+	exit(-1);
+}
+
 
 
 // The callback function to handle general notification of LLS. Parameters are self-describing.
@@ -281,23 +247,25 @@ static void FSPAPI onPublicKeyReceived(FSPHANDLE h, FSP_ServiceCode c, int r)
 	if(r < 0)
 	{
 		printf_s("Previous ReadFrom@ServiceSAWS_onAccepted asynchronously return %d.\n", r);
-		FreeExtent(h, true);
+		FreeExtent(h);
 		return;
 	}
 
 	PFSAData pdFSA = (PFSAData)GetExtPointer(h);
 	ReadFrom(h, & pdFSA->chakaPubInfo.clientNonce, sizeof(timestamp_t), NULL);
-	octet buf[MAX_PATH];
+	octet buf[MAX_NAME_LENGTH];
 	int nBytes = ReadFrom(h, buf, sizeof(buf), NULL);
 
 	// assert(nBytes <= sizeof(sessionClientIdString));
 	CryptoNaClGetSharedSecret(pdFSA->bufSharedKey, pdFSA->chakaPubInfo.peerPublicKey, bufASLRPrivateKey);
 	ChakaStreamcrypt(pdFSA->sessionClientIdString, buf, nBytes, pdFSA->chakaPubInfo.clientNonce, pdFSA->bufSharedKey);
+	pdFSA->sessionClientIdString[MAX_NAME_LENGTH - 1] = 0;
+	printf("%d octets decrypted, username is: %s\n", nBytes, (char *)pdFSA->sessionClientIdString);
 
 	// TODO: check connection context further
 	if (!HasReadEoT(h))
 	{
-		FreeExtent(h, true);
+		FreeExtent(h);
 		Abort("Protocol is broken: length of client's id should not exceed MAX_PATH\n");
 	}
 
@@ -308,7 +276,7 @@ static void FSPAPI onPublicKeyReceived(FSPHANDLE h, FSP_ServiceCode c, int r)
 	octet serverResponse[CRYPTO_NACL_HASHBYTES];
 	if(! CHAKAChallengeByServer(pdFSA->chakaPubInfo, serverResponse, pdFSA->passwordHash))
 	{
-		FreeExtent(h, true);
+		FreeExtent(h);
 		Abort("Client authentication error.\n");
 	}
 
@@ -320,14 +288,13 @@ static void FSPAPI onPublicKeyReceived(FSPHANDLE h, FSP_ServiceCode c, int r)
 
 
 
-
 static void FSPAPI onServerResponseSent(FSPHANDLE h, FSP_ServiceCode c, int r)
 {
 	PFSAData pdFSA = (PFSAData)GetExtPointer(h);
 	ReadFrom(h, pdFSA->chakaPubInfo.peerResponse, CRYPTO_NACL_HASHBYTES, NULL);
 	if(! CHAKAValidateByServer(pdFSA->chakaPubInfo, pdFSA->passwordHash))
 	{
-		FreeExtent(h, true);
+		FreeExtent(h);
 		return;
 	}
 	memset(pdFSA->passwordHash, 0, CRYPTO_NACL_HASHBYTES);	// clear memory trace for better security assurance
@@ -351,7 +318,7 @@ static void FSPAPI onFirstLineRead(FSPHANDLE client, FSP_ServiceCode c, int r)
 {
 	if (r < 0)
 	{
-		FreeExtent(client, true);
+		FreeExtent(client);
 		return;
 	}
 	printf_s("First request line ready for %p\n", client);
@@ -458,18 +425,9 @@ static void FSPAPI onFirstLineRead(FSPHANDLE client, FSP_ServiceCode c, int r)
 			execute_cgi(client, path, method, query_string);
 	}
 
-	FreeExtent(client);
+	FreeExtent(client, false);
 	Shutdown(client, NULL);
-}
-
-
-
-// Print out an error message and exit the program indicating an error.
-void Abort(const char *sc)
-{
-	printf("\n%s\nPress Enter to exit...", sc);
-	getchar();
-	exit(-1);
+	Dispose(client);
 }
 
 

@@ -11,8 +11,6 @@
 
 #define _CRT_RAND_S
 #pragma warning(disable:4146 4244 4800)
-#include "gmpxx.h"
-#pragma warning(default:4146 4244 4800)
 
 // MUST include local header before stdio or else _CRT_RAND_S is not defined properly
 #include "../UnitTestFSP/FSP_TestClass.h"
@@ -41,7 +39,6 @@ void FlowTestAcknowledge();
 void FlowTestRetransmission();
 void FlowTestRecvWinRoundRobin();
 
-void TrySRP6();
 void TryCHAKA();
 
 void TryWideChar();

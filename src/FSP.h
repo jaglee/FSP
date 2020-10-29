@@ -93,6 +93,14 @@ typedef ALFID_T	 ULTID_T;
 #endif
 
 
+#ifndef OVER_UDP_IPv4
+// IPv6 requires that every link in the Internet have an MTU of 1280 octets or greater. 
+# define MAX_BLOCK_SIZE		1024
+#else
+# define MAX_BLOCK_SIZE		512
+#endif
+
+
 /**
 * Protocol defined timeouts
 */
@@ -103,6 +111,7 @@ typedef ALFID_T	 ULTID_T;
 # define TRANSIENT_STATE_TIMEOUT_ms		60000	// 1 minute
 #endif
 
+#define RETRANSMIT_INIT_TIMEOUT_ms	15000		// 15 seconds
 #define RETRANSMIT_MIN_TIMEOUT_us	1000000		// 1 second
 #define RETRANSMIT_MAX_TIMEOUT_us	60000000	// 60 seconds
 
@@ -231,17 +240,19 @@ typedef enum
 	FSP_NotifyListening,		// a reverse command to signal success execution of FSP_Listen
 	FSP_NotifyAccepting,		// a reverse command to make context ready
 	FSP_NotifyAccepted,
-	FSP_NotifyMultiplied,		// a reverse command to inform DLL to accept a multiply request
+	FSP_NotifyConnected,
+	FSP_NotifyMultiplied,
 	FSP_NotifyDataReady,
 	FSP_NotifyBufferReady,
-	FSP_NotifyToCommit,
 	// 8~11
+	FSP_NotifyToCommit,
 	FSP_NotifyFlushed,
 	FSP_NotifyToFinish,
 	// built-in rule: notification after FSP_NotifyToFinish implies the LLS socket has been released already
+	_NOTIFICATION11,
+	// 12~: exceptions, soft NMI
 	FSP_NameResolutionFailed,
 	FSP_IPC_Failure,
-	// 12~: exceptions, soft NMI
 	FSP_MemoryCorruption,
 	FSP_NotifyReset,
 	FSP_NotifyTimeout,
@@ -309,7 +320,8 @@ struct ALFIDPair
 
 
 
-struct FSP$PacketHeader
+// Or head line of the FSP packet header, used to be header's signature
+struct FSP$HeaderLine
 {
 	FSPOperationCode	opCode;
 	uint8_t				major;
@@ -341,7 +353,7 @@ enum FSP_FlagPosition : uint8_t
 // CONNECT_INIT, the first 32-bit word is the header signature
 struct FSP_InitiateRequest
 {
-	struct FSP$PacketHeader hs;
+	struct FSP$HeaderLine hs;
 	uint32_t	salt;
 	timestamp_t timeStamp;
 	uint64_t	initCheckCode;
@@ -365,7 +377,7 @@ struct FSP_ConnectParam
 // ACK_CONNECT_INIT, acknowledgement to the connect bootstrap request, works as a challenge against the initiator
 struct FSP_Challenge
 {
-	struct FSP$PacketHeader hs;
+	struct FSP$HeaderLine hs;
 	int32_t		timeDelta;
 	uint64_t	cookie;
 	uint64_t	initCheckCode;
@@ -392,7 +404,7 @@ struct FSP_ConnectRequest
 // Trick that must be kept: the sequence number field MUST be align with the timestamp or cookie field
 struct FSP_NormalPacketHeader
 {
-	struct FSP$PacketHeader hs;
+	struct FSP$HeaderLine hs;
 	octet	flags_ws[4];
 	uint32_t sequenceNo;
 	uint32_t expectedSN;
@@ -404,7 +416,11 @@ struct FSP_NormalPacketHeader
 	//
 #ifdef __cplusplus
 	// A brute-force but safe method of set or retrieve receive window size, with byte order translation
-	int32_t GetRecvWS()	const { return ((int32_t)flags_ws[1] << 16) + ((unsigned)flags_ws[2] << 8) + flags_ws[3]; }
+	int32_t GetRecvWS()	const { return (int32_t(flags_ws[1]) << 16) + (unsigned(flags_ws[2]) << 8) + flags_ws[3]; }
+	void SetRecvWS(int32_t v) { flags_ws[1] = (octet)(v >> 16); flags_ws[2] = (octet)(v >> 8); flags_ws[3] = (octet)v; }
+	//
+	void ClearFlags() { flags_ws[0] = 0; }
+	template<FSP_FlagPosition pos> bool GetFlag() { return (_InterlockedOr8((char *)flags_ws, 0) & (char)(1 << pos)) != 0; }
 #endif
 };
 
@@ -430,7 +446,7 @@ struct FSP_SelectiveNACK
 // FSP_RESET, the reset reason should be bit fields.
 struct FSP_RejectConnect
 {
-	struct FSP$PacketHeader hs;
+	struct FSP$HeaderLine hs;
 	uint32_t reasons;
 	union
 	{
@@ -449,6 +465,19 @@ struct FSP_RejectConnect
 		uint64_t initCheckCode;
 		ALFIDPair fidPair;
 	};
+};
+
+
+
+//
+struct FSP_KeepAlivePacket
+{
+	FSP_NormalPacketHeader	hdr;
+	FSP_ConnectParam		mp;
+	FSP_SelectiveNACK		sentinel;
+	FSP_SelectiveNACK::GapDescriptor gaps
+		[ (MAX_BLOCK_SIZE - sizeof(FSP_ConnectParam) - sizeof(FSP_SelectiveNACK))
+		/ sizeof(FSP_SelectiveNACK::GapDescriptor)];
 };
 
 

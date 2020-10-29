@@ -189,7 +189,7 @@ void CLowerInterface::OnGetInitConnect()
 	memset(&hdrInfo, 0, sizeof(CtrlMsgHdr));
 	CopySinkInfTo(hdrInfo);
 
-	fiberID = CLowerInterface::Singleton.RandALFID(pSocket);
+	fiberID = CLowerInterface::Singleton.AllocItemReserve();
 	if (fiberID == 0)
 	{
 		SendPrematureReset(ENOENT);
@@ -256,13 +256,13 @@ void CSocketItemEx::OnInitConnectAck(FSP_Challenge* pkt)
 	if (!WaitUseMutex())
 		return;
 
-	SConnectParam & initState = pControlBlock->connectParams;
+	SConnectParam& initState = pControlBlock->connectParams;
 	ALFID_T idListener = initState.idRemote;
 
-	if(! InState(CONNECT_BOOTSTRAP))
+	if (!InState(CONNECT_BOOTSTRAP))
 		goto l_return;
 
-	if(initState.initCheckCode != pkt->initCheckCode || idListener != pkt->params.idListener)
+	if (initState.initCheckCode != pkt->initCheckCode || idListener != pkt->params.idListener)
 		goto l_return;
 	// Remote sink info validated, to register validated remote address:
 	// the officially announced IP address of the responder shall be accepted by the initiator
@@ -358,7 +358,7 @@ void CLowerInterface::OnGetConnectRequest()
 	if(pSocket->pControlBlock->backLog.Has(backlogItem))
 		goto l_return;
 
-	newItem = AllocItem(pSocket->rootULA, GetLocalFiberID());
+	newItem = AllocItemCommit(pSocket->rootULA, GetLocalFiberID());
 	if (newItem == NULL)
 		goto l_return;
 
@@ -636,15 +636,6 @@ int CSocketItemEx::ValidateSNACK(ControlBlock::seq_t& ackSeqNo, FSP_SelectiveNAC
 	}
 
 	int n = le16toh(pSNACK->_h.length);
-	// defined a little earlier for debug/trace purpose
-#if defined(TRACE) && (TRACE & (TRACE_PACKET | TRACE_SLIDEWIN))
-	printf_s("%s data length: %d, header length: %d, peer ALFID = %u\n"
-		, opCodeStrings[p1->hs.opCode]
-		, lenPktData
-		, n
-		, fidPair.peer);
-	DumpNetworkUInt16((uint16_t*)((FSP_PreparedKEEP_ALIVE*)pSNACK)->gaps, n / 2);
-#endif
 	// To defend against memory access (out-of-boundary) attack:
 	if ((octet*)pSNACK - (octet*)p1 + n != len)
 	{
@@ -730,10 +721,13 @@ void CSocketItemEx::OnConnectRequestAck()
 	pControlBlock->sendWindowLimitSN
 		= pControlBlock->sendWindowFirstSN + min(pControlBlock->sendBufferBlockN, response.GetRecvWS());
 
-	// Here the state transition is delayed for DLL to do further management
+	TransitOnAckStart();
+	if (lowState == COMMITTING)
+		pControlBlock->SnapshotReceiveWindowRightEdge();
+
 	// ephemeral session key material was ready OnInitConnectAck
 	InstallEphemeralKey();
-	Notify(FSP_NotifyAccepted);	// The initiator may cancel data transmission, however
+	Notify(FSP_NotifyConnected);	// The initiator may cancel data transmission, however
 }
 
 
@@ -846,7 +840,7 @@ void CSocketItemEx::OnGetNulCommit()
 	}
 	else
 	{
-		Notify(FSP_NotifyToCommit);
+		NotifyDataReady(FSP_NotifyToCommit);
 	}
 }
 
@@ -954,6 +948,7 @@ void CSocketItemEx::OnGetPersist()
 
 	// The timer was already started for transient state management when Accept(), Multiply() or sending MULTIPLY
 	// Network RTT may not be refreshed here as there is undetermined delay caused by application processing
+	RestartKeepAlive();
 
 	// Note that TransitOnPeerCommit may SendAckFlush which relies on correctness of tLastRecv
 	if (PeerCommitted())
@@ -964,13 +959,10 @@ void CSocketItemEx::OnGetPersist()
 		printf_s(" to %s\n", stateNames[lowState]);
 #endif
 		// TransitOnPeerCommit has called SendAckFlush on success
-		RestartKeepAlive();
-		//
-		if (!isInitiativeState)
-			Notify(FSP_NotifyToCommit);
-		else
+		if (isInitiativeState)
 			Notify(isMultiplying ? FSP_NotifyMultiplied : FSP_NotifyAccepted);
-
+		else
+			NotifyDataReady(FSP_NotifyToCommit);
 		return;
 	}
 
@@ -985,14 +977,10 @@ void CSocketItemEx::OnGetPersist()
 #endif
 
 	SendKeepAlive();
-	if (!isInitiativeState)
-	{
+	if (isInitiativeState)
+		Notify(isMultiplying ? FSP_NotifyMultiplied : FSP_NotifyAccepted);
+	else
 		NotifyDataReady();
-		return;
-	}
-
-	RestartKeepAlive();
-	Notify(isMultiplying ? FSP_NotifyMultiplied : FSP_NotifyAccepted);
 }
 
 
@@ -1016,7 +1004,7 @@ void CSocketItemEx::OnGetKeepAlive()
 		return;
 	}
 
-	FSP_PreparedKEEP_ALIVE* pSNACK = &((FSP_KeepAliveExtension*) & (headPacket->hdr))->snack;
+	FSP_KeepAlivePacket *pSNACK = (FSP_KeepAlivePacket *)&(headPacket->hdr);
 	ControlBlock::seq_t ackSeqNo;
 	int n = ValidateSNACK(ackSeqNo, &pSNACK->sentinel);
 	if (n < 0)
@@ -1042,7 +1030,7 @@ void CSocketItemEx::OnGetKeepAlive()
 	}
 
 	// For this FSP version the mobile parameter is mandatory in KEEP_ALIVE
-	HandlePeerSubnets(&((FSP_KeepAliveExtension*) & (headPacket->hdr))->mp);
+	HandlePeerSubnets(&pSNACK->mp);
 }
 
 
@@ -1140,7 +1128,7 @@ void CSocketItemEx::OnGetPureData()
 	if (PeerCommitted())
 	{
 		if (TransitOnPeerCommit())
-			Notify(FSP_NotifyToCommit);
+			NotifyDataReady(FSP_NotifyToCommit);
 		return;
 	}
 	// PURE_DATA cannot start a transmit transaction, so in state like CLONING just prebuffer
@@ -1175,11 +1163,13 @@ void CSocketItemEx::TransitOnAckStart()
 bool CSocketItemEx::TransitOnPeerCommit()
 {
 	pControlBlock->SnapshotReceiveWindowRightEdge();
+	// See also OnGetRelease
 	if (hasAcceptedRELEASE)
 	{
-		SetState(SHUT_REQUESTED); // See also OnGetRelease
+		SetState(SHUT_REQUESTED);
 		SendAckFlush();
-		Notify(FSP_NotifyToFinish);
+		NotifyDataReady(FSP_NotifyToCommit);
+		NotifyBufferReady(FSP_NotifyToFinish);
 		return false;
 	}
 	//
@@ -1237,8 +1227,7 @@ void CSocketItemEx::OnAckFlush()
 	if (InState(PRE_CLOSED))
 	{
 		SetState(CLOSED);
-		Notify(FSP_NotifyToFinish);
-		PutToResurrectable();
+		NotifyBufferReady(FSP_NotifyToFinish);
 		return;
 	}
 
@@ -1247,7 +1236,7 @@ void CSocketItemEx::OnAckFlush()
 	else if(InState(COMMITTING))
 		SetState(COMMITTED);
 
-	Notify(FSP_NotifyFlushed);
+	NotifyBufferReady(FSP_NotifyFlushed);
 }
 
 
@@ -1265,9 +1254,7 @@ void CSocketItemEx::OnAckFlush()
 //	Send ACK_FLUSH: instead of SendAckFlush() instantly, call EnableDelayAck to defend against DoS attack
 //	RELEASE implies NULCOMMIT
 //	RELEASE implies ACK_FLUSH as well so a lost ACK_FLUSH does not prevent it shutdown gracefully
-//	There's a race condition that
-//	while NotifiedToFinsh immediately follows a NotifyToCommit, RELEASE may arrive before ACK_FLUSH
-//	And accept RELEASE in PRE_CLOSED state because ACK_FLUSH may race with RELEASE in some scenario
+//	Work in tandem with ULA's polling arrival of data before availability of new send buffer
 void CSocketItemEx::OnGetRelease()
 {
 	TRACE_SOCKET();
@@ -1334,9 +1321,8 @@ void CSocketItemEx::OnGetRelease()
 
 	SetState(InState(PRE_CLOSED) ? CLOSED : SHUT_REQUESTED);
 	SendAckFlush();
-	Notify(FSP_NotifyToFinish);
-	if (lowState == CLOSED)
-		PutToResurrectable();
+	NotifyDataReady(FSP_NotifyToCommit);
+	NotifyBufferReady(FSP_NotifyToFinish);
 }
 
 

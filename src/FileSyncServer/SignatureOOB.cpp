@@ -17,7 +17,14 @@ static int FSPAPI onMultiplied(FSPHANDLE hRev, PFSP_Context ctx)
 		return -1;
 	}
 
-	return 0;
+	int r = Shutdown(hRev, NULL);
+	Dispose(hRev);
+	if (r < 0)
+		printf_s("Failed to commit the transmit transaction.\n");
+	else
+		printf_s("The signature was sent successfully.\n");
+	r2Finish = true;
+	return r;
 }
 
 
@@ -25,17 +32,8 @@ static int FSPAPI onMultiplied(FSPHANDLE hRev, PFSP_Context ctx)
 static void FSPAPI onError(FSPHANDLE hRev, FSP_ServiceCode code, int value)
 {
 	printf_s("Clone session, socket %p has been reset (%d, %d).\n", hRev, code, value);
+	Dispose(hRev);
 	r2Finish = finished = true;
-}
-
-
-
-// The near end finished the work, close the socket
-static void FSPAPI onSignatureSent(FSPHANDLE hRev, FSP_ServiceCode c, int r)
-{
-	printf_s("Clone session, socket %p, result of sending the signature: %d\n", hRev, r);
-	Shutdown(hRev, NULL);
-	r2Finish = true;
 }
 
 
@@ -54,7 +52,7 @@ void StartToSendSignature(FSPHANDLE h)
 	parms.sendSize = 500;	// no, not USHRT_MAX. We just want to send a arbitrary short acknowledgement
 	parms.welcome = signature;
 	parms.len = (unsigned short)sizeof(signature);
-	if(MultiplyAndWrite(h, & parms, TO_END_TRANSACTION, onSignatureSent) == NULL)
+	if (Multiply(h, &parms) == NULL)
 	{
 		printf("Warning!? Failed to multiply the connection.\n");
 		return;

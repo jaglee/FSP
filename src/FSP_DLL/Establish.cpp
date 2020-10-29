@@ -210,7 +210,7 @@ CSocketItemDl* CSocketItemDl::CallCreate(FSP_ServiceCode cmdCode)
 	printf("%s: fiberId = %d, fidPair.source = %d\n", CServiceCode::sof(cmdCode), objCommand.fiberID, fidPair.source);
 #endif
 	CopyFatMemPointo(objCommand);
-	return StartPolling() && Call((UCommandToLLS*)&objCommand) ? this : NULL;
+	return Call((UCommandToLLS*)&objCommand) && StartPolling()  ? this : NULL;
 }
 
 
@@ -264,6 +264,8 @@ void CSocketItemDl::SetConnectContext(const PFSP_Context psp1)
 //	PFSP_Context		the connection context of the socket, given by ULA
 // Return
 //	NULL if it failed, or else the new allocated socket whose session control block has been initialized
+// Remark
+//	Create pipe connection with LLS for IPC as well
 CSocketItemDl * LOCALAPI CSocketItemDl::CreateControlBlock(const PFSP_IN6_ADDR nearAddr, PFSP_Context psp1)
 {
 	CSocketItemDl *socketItem = socketsTLB.AllocItem();
@@ -305,42 +307,17 @@ CSocketItemDl * LOCALAPI CSocketItemDl::CreateControlBlock(const PFSP_IN6_ADDR n
 //	This is function is blocking. It wait until success or internal error found
 CSocketItemDl *CSocketItemDl::Accept1()
 {
-	PItemBackLog	pLogItem;
-	while(LockAndValidate())
+	SItemBackLog	logItem;
+	while(WaitUseMutex())
 	{
-		pLogItem = pControlBlock->backLog.Peek();
-		if (pLogItem != NULL)
-		{
-			CSocketItemDl *p = ProcessOneBackLog(pLogItem);
-			pControlBlock->backLog.Pop();
-			SetMutexFree();
-			return p;
-		}
-		//
+		bool b = pControlBlock->backLog.Get(logItem);
 		SetMutexFree();
+		if (b)
+			return ProcessOneBackLog(&logItem);
 		Sleep(TIMER_SLICE_ms);
 	}
 	//
 	return NULL;
-}
-
-
-
-// Given
-//	ALFID_T		the Application Layer Fiber ID in the local context 
-//	ALFID_T		the Application Layer Fiber ID of the parent connection
-//	uint32_t	reason code
-// Do
-//	Instruct LLS to reject the request (if it were to accept)
-//	or reset the connection (if it were to multiply)
-void LOCALAPI CSocketItemDl::RejectRequest(ALFID_T id1, ALFID_T idParent, uint32_t rc)
-{
-	CommandRejectRequest objCommand;
-	objCommand.opCode = FSP_Reject;
-	objCommand.fiberID = id1;
-	objCommand.idParent = idParent;
-	objCommand.reasonCode = rc;
-	Call((UCommandToLLS *)&objCommand, sizeof(CommandRejectRequest));
 }
 
 
@@ -390,12 +367,13 @@ CSocketItemDl *CSocketItemDl::ProcessOneBackLog(PItemBackLog pLogItem)
 // and call LLS to send the acknowledgement to the connection request or multiplication request
 void CSocketItemDl::ProcessBacklogs()
 {
-	PItemBackLog pLogItem;
-	for (; (pLogItem = pControlBlock->backLog.Peek()) != NULL; pControlBlock->backLog.Pop())
+	SItemBackLog	logItem;
+	while (pControlBlock->backLog.Get(logItem))
 	{
-		ProcessOneBackLog(pLogItem);
+		ProcessOneBackLog(&logItem);
 	}
 }
+
 
 
 // Given
@@ -408,11 +386,12 @@ CSocketItemDl * CSocketItemDl::PrepareToAccept(SItemBackLog & backLog)
 	FSP_SocketParameter newContext = this->context;
 	newContext.ifDefault = backLog.acceptAddr.ipi6_ifindex;
 
-	// Inherit the NotifyOrReturn functions onError,
-	// the CallbackConnected function onAccepted
-	// but not CallbackRequested/onAccepting
+	// CallbackConnected function onAccepted is inherited by the incarnated connection by design
+	// CallbackRequested function onAccepting is inherited by the clone connection by design
+	// But NotifyOrReturn~onError(the error handler) shall be re-assigned.
 	if(! this->context.passive)
 	{
+		newContext.onAccepted = NULL;
 		newContext.welcome = NULL;
 		newContext.len = 0;
 	}
@@ -421,6 +400,7 @@ CSocketItemDl * CSocketItemDl::PrepareToAccept(SItemBackLog & backLog)
 		newContext.onAccepting = NULL;
 		newContext.passive = 0;
 	}
+	newContext.onError = NULL;
 	// If the incarnated connection could be cloned, onAccepting shall be set by FSPControl
 
 	CSocketItemDl* pSocket = CreateControlBlock(pListenIP, &newContext);
@@ -477,57 +457,7 @@ bool LOCALAPI CSocketItemDl::ToWelcomeConnect(SItemBackLog & backLog)
 	memcpy(&pControlBlock->connectParams, &backLog, FSP_MAX_KEY_SIZE + FSP_TAG_SIZE);
 	//^following fields are filled later
 	//
-	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend();
-	if (pendingSendBuf != NULL)
-	{
-		register ControlBlock::PFSP_SocketBuf p = skb;
-		int32_t capacity;
-		void* tgt = pControlBlock->InquireSendBuf(&capacity);
-		if (capacity < pendingSendSize)
-			return false; // UNRESOLVED! tell to ULA that it does not conform to implement protocol?
-		memcpy(tgt, pendingSendBuf, pendingSendSize);
-		//
-		octet cFlag = this->context.precompress ? (1 << Compressed) : 0;
-		int32_t m = (pendingSendSize - 1) / MAX_BLOCK_SIZE;
-		for (register int j = 0; j < m; j++)
-		{
-			p->version = THIS_FSP_VERSION;
-			p->opCode = PURE_DATA;
-			p->flags = cFlag;
-			p->len = MAX_BLOCK_SIZE;
-			p++;
-		}
-		// it might be redundant to set the opCode of the first packet, but it do little harm and is safer and quicker
-		p->version = THIS_FSP_VERSION;
-		p->opCode = PURE_DATA;
-		p->flags = cFlag | (1 << TransactionEnded);
-		p->len = pendingSendSize - MAX_BLOCK_SIZE * m;
-		// unlock them in a batch
-		m++;
-		for (register int j = 1; j < m; j++)
-		{
-			(p++)->ReInitMarkComplete();
-		}
-		//^the header packet is still locked
-		// 
-		pendingSendBuf = NULL;
-		pendingSendSize = 0;
-		pControlBlock->sendBufferNextPos = m;
-		pControlBlock->sendBufferNextSN = GetSendWindowFirstSN() + m;
-	}
-	else
-	{
-		skb->version = THIS_FSP_VERSION;
-		skb->len = 0;
-		skb->InitFlags<TransactionEnded>();
-		// Mark the reserved head packet ready
-		pControlBlock->sendBufferNextPos = 1;
-		pControlBlock->sendBufferNextSN = GetSendWindowFirstSN() + 1;
-	}
-	skb->opCode = ACK_CONNECT_REQ;
-	skb->ReInitMarkComplete();
-
-	return true;
+	return (PrepareSendBuffer(ACK_CONNECT_REQ) >= 0);
 }
 
 
@@ -555,33 +485,23 @@ bool LOCALAPI CSocketItemDl::ToWelcomeConnect(SItemBackLog & backLog)
 // See also @LLS::OnConnectRequestAck
 void CSocketItemDl::ToConcludeConnect()
 {
-	ControlBlock::seq_t seq0 = pControlBlock->sendBufferNextSN;
-	FSP_Session_State s0;
 	fidPair.source = pControlBlock->nearEndInfo.idALF;
 	//^As by default Connect2 set the cached fiber ID in the DLL SocketItem to 0
-	// Prepare for install master session key
-	peerCommitted = pControlBlock->GetFirstReceived()->GetFlag<TransactionEnded>();
-	s0 = peerCommitted ? PEER_COMMIT : ESTABLISHED;
-	SetState(s0);
-	if (peerCommitted)
-		pControlBlock->SnapshotReceiveWindowRightEdge();
-	// Prepare for immediate send onAccepted
 	SetNewTransaction();
-	SetMutexFree();
-	if(context.onAccepted != NULL && context.onAccepted(this, &context) < 0)
-	{
-		if (WaitUseMutex())	// in case of memory access error
-			FreeWithReset();
-		return;
-	}
 
-	// If it has not sent anything onAccepted, send an immediate acknowledgement to ACK_CONNECT_REQ
-	if (pControlBlock->sendBufferNextSN == seq0)
+	FSP_Session_State s0 = GetState();
+	peerCommitted = (s0 == COMMITTING2 || s0 == CLOSABLE);
+
+	if (context.welcome != NULL)
+	{
+		PrepareSendBuffer(PERSIST);
+	}
+	else
 	{
 		SetHeadPacketIfEmpty(NULCOMMIT);
 		SetState(s0 == ESTABLISHED ? COMMITTING : COMMITTING2);
 	}
-	//^it works as pControlBlock->sendBufferBlockN <= INT32_MAX
+
 	Call<FSP_Start>();
 }
 
@@ -629,24 +549,25 @@ ControlBlock::PFSP_SocketBuf CSocketItemDl::SetHeadPacketIfEmpty(FSPOperationCod
 //	because it is perfectly possible that installation of new session key is followed by
 //	sending new data so tight that LLS has not yet executed FSP_InstallKey before the send queue changed.
 //	the input key material would be truncated if it exceeds the internal command buffer capacity
-int LOCALAPI CSocketItemDl::InstallRawKey(octet *key, int32_t keyBits, uint64_t keyLife)
+int CSocketItemDl::InstallRawKey(const octet *key, int32_t keyBits, uint64_t keyLife)
 {
-	if (!WaitUseMutex())
-		return (IsInUse() ? -EDEADLK : -EINTR);
-
 	int sizeIKM = keyBits / 8;
 	if (sizeIKM <= 0 || sizeIKM > 2048)
 		return -EINVAL;	// invalid argument
 
+	if (!WaitUseMutex())
+		return (IsInUse() ? -EDEADLK : -EINTR);
+
+	while (_InterlockedCompareExchange8(&pControlBlock->lockOfExchange, 1, 0) != 0)
+		Sleep(0);	// Just yield the CPU for a short while: it's actually a spin-lock
+
 	pControlBlock->connectParams.initialSN = pControlBlock->sendBufferNextSN;
 	//^And expectedSN was set in SnapshotReceiveWindowRightEdge
 	pControlBlock->connectParams.keyBits = keyBits;
+	memcpy(pControlBlock->rawKeyMaterial, key, sizeIKM);
 
 	CommandInstallKey objCommand(fidPair.source, keyLife);
-	int r = Call((UCommandToLLS*)&objCommand, sizeof(CommandInstallKey)) ? 0 : -EIO;
-	if (r == 0)
-		r = send(SDPipe(), (char *)key, sizeIKM, 0);
-
+	int r = Call((UCommandToLLS*)&objCommand) ? 0 : -EIO;
 	SetMutexFree();
 	return (r > 0 ? 0 : -EIO);
 }
@@ -694,7 +615,7 @@ CSocketItemDl *	CSocketDLLTLB::HandleToRegisteredSocket(FSPHANDLE h)
 	for(register int i = 0; i < MAX_CONNECTION_NUM; i++)
 	{
 		if (CSocketItemDl::socketsTLB.pSockets[i] == p)
-			return ((!p->IsInUse() || p->InIllegalState()) ? NULL : p);
+			return (!p->IsInUse() ? NULL : p);
 	}
 	//
 	return NULL;
@@ -766,46 +687,12 @@ CSocketItemDl * CSocketDLLTLB::AllocItem()
 	_InterlockedExchange8(& item->inUse, 1);
 
 	// push to inUse list
-	item->next = CSocketItemDl::headOfInUse;
+	item->next = headOfInUse;
 	item->prev = NULL;
-	CSocketItemDl::headOfInUse = item;
+	headOfInUse = item;
 
 l_bailout:
 	ReleaseMutex();
 	return item;
 }
 
-
-
-// Given
-//	CSocketItemDl *		the pointer to the DLL FSP socket
-// Do
-//	Try to put the socket in the list of the free socket items
-void CSocketDLLTLB::FreeItem(CSocketItemDl *p)
-{
-	CSocketItemDl& r = *p;
-	AcquireMutex();
-
-	// detach it from inUse list
-	if (r.prev == NULL)
-		CSocketItemDl::headOfInUse = (CSocketItemDl*)r.next;
-	else
-		r.prev->next = r.next;
-
-	_InterlockedExchange8(&r.inUse, 0);
-
-	// attach it to free list
-	r.next = NULL;
-	r.prev = tail;
-	if (tail == NULL)
-	{
-		head = tail = p;
-	}
-	else
-	{
-		tail->next = p;
-		tail = p;
-	}
-
-	ReleaseMutex();
-}

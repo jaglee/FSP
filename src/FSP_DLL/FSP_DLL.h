@@ -36,12 +36,10 @@
 #if defined(__WINDOWS__)
 # include <conio.h>
 
-
 # define DllExport extern "C" __declspec(dllexport)
 # define DllSpec DllExport
 
 #elif defined(__linux__) || defined(__CYGWIN__)
-# include "thpool.h"
 
 # define DllExport
 # define DllSpec DllExport
@@ -65,17 +63,80 @@ typedef CSocketItem * PSocketItem;
 
 struct CSocketItemDl;
 
-class CSocketDLLTLB: CSRWLock
+
+// 'Slim' in the sense that there is no job queue
+struct CSlimThreadPoolItem
+{
+	void (CSocketItemDl::* fpWork)();	// the function to do the real job
+	pthread_t		hThread;
+	CSocketItemDl * contextWorkingOn;	// NULL if the thread is idle
+	//
+	void			LoopWaitJob();
+};
+
+
+
+struct CSlimThreadPool
+{
+#ifndef _NO_LLS_CALLABLE
+# define SLIM_THREAD_POOL_SIZE (MAX_CONNECTION_NUM * 2)
+#else
+# define SLIM_THREAD_POOL_SIZE 2
+#endif
+	CSlimThreadPoolItem items[SLIM_THREAD_POOL_SIZE];
+	//
+	bool NewThreadFor(CSlimThreadPoolItem *);
+#if defined(__WINDOWS__)
+	static DWORD WINAPI ThreadWorkBody(LPVOID param)
+	{
+		((CSlimThreadPoolItem*)param)->LoopWaitJob();
+		return 0;
+	}
+#elif defined(__linux__) || defined(__CYGWIN__)
+	static void* ThreadWorkBody(void* param)
+	{
+		((CSlimThreadPoolItem*)param)->LoopWaitJob();
+		return NULL;
+	}
+#endif
+
+	bool ScheduleWork(CSocketItemDl *, void (CSocketItemDl::*)());
+	CSlimThreadPool();
+};
+
+
+
+class CSocketDLLTLB: CSRWLock, public CSlimThreadPool
 {
 	int		countAllItems;
 	int		sizeOfWorkSet;
 	CSocketItemDl * pSockets[MAX_CONNECTION_NUM];
 	CSocketItemDl * head;
 	CSocketItemDl * tail;
+
+	CSocketItemDl * headOfInUse;
+	pthread_t		hThreadWait;
+	void			WaitEventToDispatch();
 	void	Init();
+
+#if defined(__WINDOWS__)
+	static DWORD WINAPI WaitNoticeCallBack(LPVOID param)
+	{
+		((CSocketDLLTLB *)param)->WaitEventToDispatch();
+		return 0;
+	}
+#elif defined(__linux__) || defined(__CYGWIN__)
+	static void* NoticeHandler(void * param) { ((CSocketDLLTLB *)param)->WaitEventToDispatch(); return NULL; }
+#endif
+
 public:
+	// IPC facility for working in tandem with LLS
+	HPIPE_T			sdPipe;
+
 	CSocketItemDl * AllocItem();
 	void FreeItem(CSocketItemDl *);
+
+	bool InitThread();
 
 	CSocketDLLTLB()
 	{
@@ -86,6 +147,10 @@ public:
 	}
 
 	~CSocketDLLTLB();
+
+	// Send message to the pairing socket TLB in LLS
+	int		SendToPipe(const void*, int n = sizeof(UCommandToLLS));
+	bool	GetNoticeFromPipe(SNotification *);
 
 	// Return the registered socket pointer mapped to the FSP handle
 	static CSocketItemDl * HandleToRegisteredSocket(FSPHANDLE);
@@ -102,7 +167,6 @@ struct SDecodeState;
 struct CSocketItemDl : CSocketItem
 {
 	static CSocketDLLTLB	socketsTLB;
-	static CSocketItemDl*	headOfInUse;
 
 	// for sake of incarnating new accepted connection
 	FSP_SocketParameter context;
@@ -115,23 +179,21 @@ struct CSocketItemDl : CSocketItem
 	ControlBlock::PFSP_SocketBuf skbImcompleteToSend;
 
 	char			inUse;
-	char			locked;
 	char			newTransaction;	// it may simultaneously start a transmit transaction and flush/commit it
 
 	// Flags, in dictionary order
 	char			initiatingShutdown : 1;
-	char			lowerLayerRecycled : 1;
 	char			peerCommitPending : 1;
 	char			peerCommitted : 1;	// Only for conventional buffered, streamed read
 	char			pendingEoT : 1;		// EoT flag is pending to be added on a packet
+	char			toCancel : 1;		// cancel current operation
 	char			toReleaseMemory : 1;
 
-	char			processingNotice;
-	FSP_NoticeCode	oneshotNotice;		// non-maskable interrupt, one-shot notice
-	FSP_NoticeCode	receiveNotice;		// later FSP_NotifyCommit may override FSP_NotifyDataReady
-	FSP_NoticeCode	sendAllowedNotice;	// later FSP_NotifyFlushed may override FSP_NotifyBufferReady
-
 	FSP_ServiceCode commandLastIssued;
+
+	int32_t			lockDepth;
+	pthread_t		lockOwner;
+
 	timer_t			timer;
 
 	int64_t			timeOut_ns;
@@ -162,82 +224,23 @@ struct CSocketItemDl : CSocketItem
 
 	int32_t			pendingPeekedBlocks;	// TryRecvInline called, number of the peeked buffers yet to be unlocked
 
+	void			ArrangeCallbackOnAccepted();
+	void			ArrangeCallbackOnReceive();
+	void			ArrangeCallbackOnSent();
 
-	static SOCKET &SDPipe();
-	static void WaitEventToDispatch();
 #if defined(__WINDOWS__)
 	static VOID NTAPI TimeOutCallBack(PVOID param, BOOLEAN isTimeout)
 	{
 		UNREFERENCED_PARAMETER(isTimeout);
-		((CSocketItemDl*)param)->TimeOut();
-	}
-
-	static DWORD WINAPI WaitNoticeCallBack(LPVOID param)
-	{
-		UNREFERENCED_PARAMETER(param);
-		WaitEventToDispatch();
-		return 0;
-	}
-
-	static TP_CALLBACK_ENVIRON	envCallBack;
-
-	static void CALLBACK OneshotCallBack(PTP_CALLBACK_INSTANCE Instance, PVOID parameter, PTP_WORK Work)
-	{
-		UNREFERENCED_PARAMETER(Instance);
-		UNREFERENCED_PARAMETER(Work);
-		((CSocketItemDl*)parameter)->CallBackOneshot();
-	}
-
-	static void CALLBACK ReceiveCallBack(PTP_CALLBACK_INSTANCE Instance, PVOID parameter, PTP_WORK Work)
-	{
-		UNREFERENCED_PARAMETER(Instance);
-		UNREFERENCED_PARAMETER(Work);
-		((CSocketItemDl*)parameter)->CallBackOnReceive();
-	}
-	static void CALLBACK SendCallBack(PTP_CALLBACK_INSTANCE Instance, PVOID parameter, PTP_WORK Work)
-	{
-		UNREFERENCED_PARAMETER(Instance);
-		UNREFERENCED_PARAMETER(Work);
-		((CSocketItemDl*)parameter)->CallBackOnBufferReady();
-	}
-
-	bool CSocketItemDl::ScheduleOneshotCallback()
-	{
-		PTP_WORK	pwk = CreateThreadpoolWork(OneshotCallBack, (PVOID)this, &envCallBack);
-		if (pwk == NULL)
-			return false;
-		SubmitThreadpoolWork(pwk);
-		return true;
-	}
-
-	bool CSocketItemDl::ScheduleReceiveCallback()
-	{
-		PTP_WORK	pwk = CreateThreadpoolWork(ReceiveCallBack, (PVOID)this, &envCallBack);
-		if (pwk == NULL)
-			return false;
-		SubmitThreadpoolWork(pwk);
-		return true;
-	}
-
-	bool CSocketItemDl::ScheduleSendCallback()
-	{
-		PTP_WORK	pwk = CreateThreadpoolWork(SendCallBack, (PVOID)this, &envCallBack);
-		if (pwk == NULL)
-			return false;
-		SubmitThreadpoolWork(pwk);
-		return true;
+		((CSocketItemDl*)param)->DoPolling();
 	}
 
 	void CopyFatMemPointo(CommandNewSession&);
 
-	void RecycleSimply()
-	{
-		CancelTimeout();
-		socketsTLB.FreeItem(this);
-	}
+	void RecycleSimply();
+
 #elif defined(__linux__) || defined(__CYGWIN__)
-	static void TimeOutHandler(union sigval v) { ((CSocketItemDl*)v.sival_ptr)->TimeOut(); }
-	static void* NoticeHandler(void*) { WaitEventToDispatch(); return NULL; }
+	static void TimeOutHandler(union sigval v) { ((CSocketItemDl*)v.sival_ptr)->DoPolling(); }
 
 	void CopyFatMemPointo(CommandNewSession&);
 
@@ -252,21 +255,14 @@ struct CSocketItemDl : CSocketItem
 	}
 #endif
 
-	bool AddTimer(uint32_t);
 	void CancelTimeout() { timeOut_ns = INT64_MAX; }
 	bool IsTimedOut() { return ((int64_t(timeOut_ns - (NowUTC() - timeLastTriggered) * 1000)) < 0); }
-	bool StartPolling()
-	{
-		timeOut_ns = TRANSIENT_STATE_TIMEOUT_ms * 1000000ULL;
-		timeLastTriggered = NowUTC();
-		return AddTimer(TIMER_SLICE_ms);
-	}
-	void TimeOut();
+	bool StartPolling();
+	void DoPolling();
 
-	bool LockAndValidate();
-	void ProcessNotice(FSP_NoticeCode);
+	void ProcessNoticeLocked(FSP_NoticeCode);
 
-	void CallBackOneshot();
+	void CallBackOnAccepted();
 	void CallBackOnReceive();
 	void CallBackOnBufferReady();
 
@@ -281,14 +277,13 @@ struct CSocketItemDl : CSocketItem
 	ControlBlock::PFSP_SocketBuf SetHeadPacketIfEmpty(FSPOperationCode);
 
 	// In Multiplex.cpp
-	static CSocketItemDl * LOCALAPI ToPrepareMultiply(FSPHANDLE, PFSP_Context);
-	FSPHANDLE LOCALAPI WriteOnMultiplied(PFSP_Context, unsigned, NotifyOrReturn);
-	FSPHANDLE CompleteMultiply();
+	FSPHANDLE LOCALAPI InitiateCloning(PFSP_Context);
 	bool LOCALAPI ToWelcomeMultiply(SItemBackLog &);
 
 	// In Send.cpp
 	void ProcessPendingSend();
 	int LOCALAPI BufferData(int);
+	int PrepareSendBuffer(FSPOperationCode);
 
 	bool HasFreeSendBuffer() { return (pControlBlock->CountSendBuffered() - pControlBlock->sendBufferBlockN < 0); }
 
@@ -296,7 +291,7 @@ struct CSocketItemDl : CSocketItem
 	void	ProcessReceiveBuffer();
 	int32_t FetchReceived();
 
-	// In IOControl.cpp
+	// In Deflate.cpp
 	bool AllocStreamState();
 	bool AllocDecodeState();
 	int	 Compress(void *, int &, const void *, int);
@@ -310,13 +305,19 @@ struct CSocketItemDl : CSocketItem
 
 public:
 	void Free();
-	void FreeAndNotify(FSP_ServiceCode, int);
-	//^The error handler need not and should not do further clean-up work
 	void FreeWithReset()
 	{
 		if (pControlBlock != NULL)
 			Call<FSP_Reset>();
 		Free();
+	}
+	// Safely assume that ULA cleans socket created by Listen, Accept1, Connect2/3 and Multiply
+	void ResetAndNotify(FSP_ServiceCode c, int v)
+	{
+		if (pControlBlock != NULL)
+			Call<FSP_Reset>();
+		inUse = 0;	// Make any function other than Dispose to fail
+		NotifyError(c, -v);
 	}
 
 	// TODO: evaluate configurable shared memory block size? // UNRESOLVED!? MTU?
@@ -326,16 +327,6 @@ public:
 	void SetConnectContext(const PFSP_Context);
 
 	int Dispose();
-
-	// Unlike Free, Recycle-locked does not destroy the control block
-	// so that the DLL socket may be reused on connection resumption
-	// assume the socket has been locked
-	int RecycLocked()
-	{
-		RecycleSimply();
-		SetMutexFree();
-		return 0;
-	}
 
 	// Convert the relative address in the control block to the address in process space, unchecked
 	octet * GetSendPtr(const ControlBlock::PFSP_SocketBuf skb) const
@@ -375,12 +366,6 @@ public:
 		SetEoTPending(false);
 	}
 
-	bool InIllegalState()
-	{
-		register FSP_Session_State s = (FSP_Session_State)_InterlockedOr8((char *)& pControlBlock->state, 0);
-		return (s <= 0 || s > LARGEST_FSP_STATE);
-	}
-
 	uint64_t GetExtentOfULA() { return context.extentI64ULA; }
 	void SetExtentOfULA(uint64_t value) { context.extentI64ULA = value; }
 
@@ -388,7 +373,7 @@ public:
 
 	bool WaitUseMutex();
 	void SetMutexFree();
-	bool TryMutexLock() { return _InterlockedCompareExchange8(&locked, 1, 0) == 0; }
+	bool TryMutexLock();
 	int  TailFreeMutexAndReturn(int);
 	bool IsInUse() { return (_InterlockedOr8(&inUse, 0) != 0) && (pControlBlock != NULL); }
 
@@ -400,25 +385,27 @@ public:
 	int ComparePeerName(const char *cName) { return _strnicmp(pControlBlock->peerAddr.name, cName, sizeof(pControlBlock->peerAddr.name)); }
 
 #ifndef _NO_LLS_CALLABLE
-	bool LOCALAPI Call(const UCommandToLLS* pCmd, int n = sizeof(UCommandToLLS));
+	bool Call(const UCommandToLLS* pCmd)
+	{
+		commandLastIssued = pCmd->sharedInfo.opCode;
+		return socketsTLB.SendToPipe((const void *)pCmd);
+	}
 #else
-	bool Call(const UCommandToLLS *pCmd, int n = 0) { commandLastIssued = pCmd->sharedInfo.opCode; return true; }
+	bool Call(const UCommandToLLS *pCmd) { commandLastIssued = pCmd->sharedInfo.opCode; return true; }
 #endif
 
-	// For heavy-load network application, polling is not only more efficient but more responsive as well?
-	// Signal LLS that the send buffer is not null
 	template<FSP_ServiceCode c> bool Call()
 	{
 		SCommandToLLS cmd;
 		cmd.opCode = c;
 		cmd.fiberID = fidPair.source;
 		commandLastIssued = c;
-		return (send(SDPipe(), (char*)&cmd, sizeof(SCommandToLLS), 0) > 0);
+		return (socketsTLB.SendToPipe(&cmd) > 0);
 	}
 	CSocketItemDl * CallCreate(FSP_ServiceCode);
 	void LOCALAPI RejectRequest(ALFID_T, ALFID_T, uint32_t);
 
-	int LOCALAPI InstallRawKey(octet *, int32_t, uint64_t);
+	int InstallRawKey(const octet *, int32_t, uint64_t);
 
 	void*	TryAcquireSendBuf(int32_t&);
 	int32_t AcquireSendBuf();
@@ -462,6 +449,30 @@ public:
 	int	LOCALAPI RecvInline(CallbackPeeked);
 	int LOCALAPI ReadFrom(void *, int, NotifyOrReturn);
 	int TryUnlockPeeked();
+
+	int SetOnConnected(CallbackConnected fp1)
+	{
+		if (InState(NON_EXISTENT))
+			return -EBADF;
+		context.onAccepted = fp1;
+		return 0;
+	}
+
+	int SetOnError(NotifyOrReturn fp1)
+	{
+		if (InState(NON_EXISTENT))
+			return -EBADF;
+		context.onError = fp1;
+		return 0;
+	}
+
+	int SetOnMultiplying(CallbackRequested fp1)
+	{
+		if (InState(NON_EXISTENT))
+			return -EBADF;
+		context.onAccepting = fp1;
+		return 0;
+	}
 
 	int SetOnRelease(PVOID fp1)
 	{

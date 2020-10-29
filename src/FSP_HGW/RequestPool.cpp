@@ -45,8 +45,12 @@ bool RequestPool::Init(int n)
 	memset(items, 0, requestedSize);
 
 	capacity = n;
+#ifdef _DEBUG_PEEK
+	printf("Maximum %d threads may be forked\n", n);
+#endif
 	return true;
 }
+
 
 
 PRequestPoolItem RequestPool::AllocItem(FSPHANDLE h)
@@ -54,7 +58,7 @@ PRequestPoolItem RequestPool::AllocItem(FSPHANDLE h)
 
 	for(register int i = 0; i < capacity; i++)
 	{
-		if (_InterlockedCompareExchange((u32*)&items[i].hSocket, SOCKET_ERROR, 0) == 0)
+		if (_InterlockedCompareExchange((long *)&items[i].hSocket, SOCKET_ERROR, 0) == 0)
 		{
 			FSPControl(h, FSP_SET_EXT_POINTER, ULONG_PTR(items + i));
 			items[i].hFSP = h;
@@ -72,7 +76,7 @@ PRequestPoolItem RequestPool::AllocItem()
 {
 	for(register int i = 0; i < capacity; i++)
 	{
-		if(_InterlockedCompareExchange((u32 *)&items[i].hSocket, SOCKET_ERROR, 0) == 0)
+		if(_InterlockedCompareExchange((long *)&items[i].hSocket, SOCKET_ERROR, 0) == 0)
 			return (items + i);
 	}
 	//
@@ -105,7 +109,7 @@ bool RequestPool::FreeItem(PRequestPoolItem p)
 	if(offset < 0 || offset >= capacity)
 		return false;
 
-	if (p->hSocket && p->hSocket != SOCKET_ERROR)
+	if(p->hSocket && p->hSocket != (SOCKET)SOCKET_ERROR)
 		closesocket(p->hSocket);
 
 	memset(p, 0, sizeof(SRequestPoolItem));

@@ -363,7 +363,7 @@ int CSocketItemDl::LockAndCommit(NotifyOrReturn fp1)
 	if (!WaitUseMutex())
 		return (IsInUse() ? -EDEADLK : -EINTR);
 
-	if (! TestSetOnCommit((PVOID)fp1))
+	if (!TestSetOnCommit((PVOID)fp1))
 	{
 #if defined(TRACE) && !defined(NDEBUG)
 		printf_s("Commit: the socket is already in commit or graceful shutdown process.\n");
@@ -416,17 +416,13 @@ l_recursion:
 		{
 			BufferData(pendingSendSize);
 			if (HasDataToCommit())
-			{
-				SetMutexFree();
 				return;
-			}
 		}
 
-		NotifyOrReturn fp2 = (NotifyOrReturn)_InterlockedExchangePointer((PVOID *)& fpSent, NULL);
+		NotifyOrReturn fp2 = (NotifyOrReturn)_InterlockedExchangePointer((PVOID*)&fpSent, NULL);
 		pendingSendBuf = NULL;
 		if (fp2 != NULL)
 		{
-			SetMutexFree();
 			fp2(this, FSP_Send, bytesBuffered);
 			return;
 		}
@@ -438,20 +434,17 @@ l_recursion:
 	{
 		if (!initiatingShutdown)
 			MigrateToNewStateOnCommit();
-		else
+		else if (GetState() == CLOSABLE)
 			SetState(PRE_CLOSED);
+		// The LLS does accept RELEASE packet in COMMITTING2 state
 		AppendEoTPacket();
-		SetMutexFree();
 		return;
 	}
 
 	// Or else it's pending GetSendBuffer()
 	CallbackBufferReady fp2 = (CallbackBufferReady)_InterlockedExchangePointer((PVOID volatile *)& fpSent, NULL);
 	if (fp2 == NULL)
-	{
-		SetMutexFree();
 		return;	// As there's no thread waiting free send buffer
-	}
 
 	ControlBlock::seq_t seqN = pControlBlock->sendBufferNextSN;
 	int32_t m;
@@ -459,25 +452,90 @@ l_recursion:
 	if (p == NULL)
 	{
 		TestSetSendReturn((PVOID)fp2);
-		SetMutexFree();
-		// BREAK_ON_DEBUG(); // race condition does exist, but shall be very rare!
+		BREAK_ON_DEBUG(); // race condition does exist, but shall be very rare!
 		return;
 	}
 
-	SetMutexFree();
 	// If ULA hinted that sending was not finished yet, continue to use the saved pointer
 	// of the callback function. However, if it happens to be updated, prefer the new one
 	bool b = (fp2(this, p, m) >= 0);
+	if (!IsInUse())
+		return;
 	if (b)
 		TestSetSendReturn((PVOID)fp2);
-	if (!WaitUseMutex())
-		return;	// It could be disposed in the callback function.
 
 	// The callback function should consume at least one buffer block to avoid dead-loop
 	if (b && (int32_t(pControlBlock->sendBufferNextSN - seqN) > 0) && HasFreeSendBuffer())
 		goto l_recursion;
-	//
-	SetMutexFree();
+
+	return;
+}
+
+
+// Given
+//	FSPOperationCode	The operation code of the first packet meant to put into the send buffer
+// Return
+//	number of packets that have been completed
+//	negative return value is the error number
+// Remark
+//	Meant to start a new transmit transaction
+int CSocketItemDl::PrepareSendBuffer(FSPOperationCode opCode)
+{
+	ControlBlock::PFSP_SocketBuf skb = pControlBlock->HeadSend() + pControlBlock->sendBufferNextPos;
+	ControlBlock::PFSP_SocketBuf p;
+
+	if (context.welcome == NULL)
+	{
+		skb->version = THIS_FSP_VERSION;
+		skb->len = 0;
+		skb->InitFlags<TransactionEnded>();
+		// Mark the reserved head packet ready
+		pControlBlock->sendBufferNextPos = 1;
+		pControlBlock->sendBufferNextSN = GetSendWindowFirstSN() + 1;
+		skb->opCode = opCode;
+		skb->ReInitMarkComplete();
+		return 1;
+	}
+	pendingSendBuf = (octet *)context.welcome;
+
+	const octet cFlag = context.precompress ? (1 << Compressed) : 0;
+	const int32_t capacity = pControlBlock->sendBufferBlockN;
+	int32_t& m = pendingSendSize;
+	int32_t count = 0;
+	octet *tgtBuf;
+	int k;
+	do
+	{
+		p = pControlBlock->HeadSend() + pControlBlock->sendBufferNextPos;
+		p->version = THIS_FSP_VERSION;
+		p->opCode = PURE_DATA;
+		p->flags = cFlag;
+		tgtBuf = GetSendPtr(p);
+		if (tgtBuf == NULL)
+			return -EFAULT;
+
+		k = min(m, MAX_BLOCK_SIZE);
+		memcpy(tgtBuf, pendingSendBuf, k);
+		p->len = k;
+		p->ReInitMarkComplete();
+		//
+		bytesBuffered += k;
+		m -= k;
+		pendingSendBuf += k;
+		//
+		count++;
+		pControlBlock->sendBufferNextSN++;
+		pControlBlock->IncRoundSendBlockN(pControlBlock->sendBufferNextPos);
+	} while (m > 0 && count < capacity);
+
+	skb->opCode = opCode;
+	if (m <= 0)
+	{
+		pendingSendBuf = NULL;
+		p->SetFlag<TransactionEnded>();
+	}
+
+	return count;
 }
 
 

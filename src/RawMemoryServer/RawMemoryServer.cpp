@@ -38,6 +38,7 @@ static int	FSPAPI toSendNextBlock(FSPHANDLE, void*, int32_t);
 void FSPAPI onNotice(FSPHANDLE h, FSP_ServiceCode code, int value)
 {
 	printf_s("Notify: socket %p, service code = %d, return %d\n", h, code, value);
+	Dispose(h);
 	if(value < 0)
 	{
 		finished = true;

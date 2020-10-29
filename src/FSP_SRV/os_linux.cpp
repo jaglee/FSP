@@ -51,6 +51,7 @@ extern "C" void rand_w32(u32 *p, int n)
 
 #include <ifaddrs.h>
 #include <net/if.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/ioctl.h>
 #include "blake2b.h"
@@ -119,6 +120,7 @@ bool CLowerInterface::Initialize()
 		perror("Cannot create the thread to handle incoming packet");
 		return false;
 	}
+	pthread_detach(thReceiver);
 
 	return true;
 }
@@ -321,11 +323,6 @@ inline void CLowerInterface::ProcessRemotePacket()
 			readFDs[i].events = POLLIN;
 			readFDs[i].revents = 0;
 		}
-		// It is documented that select returns total number of sockets that are ready, however, if one socket is closed
-		// 'select' success while following WSARecvMsg will fail
-		// Cannot receive packet information, error code = 10038
-		// Error: An operation was attempted on something that is not a socket.
-		// a more sophisticated implementation should be asynchronous on reading/receiving
 		// poll() conforms to POSIX.1-2001 and POSIX.1-2008.
 		r = poll(readFDs, countInterfaces, -1);
 		if(r == -1)
@@ -443,6 +440,31 @@ extern "C" void rand_w32(u32 *p, int n)
 }
 
 
+
+int SProcessRoot::RecvFromPipe(void *chBuf, int capacity)
+{
+	return recv(sdPipe, chBuf, capacity, 0);
+}
+
+
+
+// Given
+//	HPIPE_T		the handle to the communication pipe
+//	ALFID_T		the application layer fiber ID
+//	FSP_NoticeCode		the code of the notice to send
+// Return
+//	positive if it is number of octets sent
+//	negative if error occurred
+int  SProcessRoot::SendNotificationTo(ALFID_T fiberID, FSP_NoticeCode code)
+{
+	SNotification resp;
+	resp.sig = code;
+	resp.fiberID = fiberID;
+	return send(sdPipe, &resp, sizeof(SNotification), 0);
+}
+
+
+
 // Given
 //	uint32_t		number of millisecond delayed to trigger the timer
 // Return
@@ -490,10 +512,9 @@ void CSocketItemEx::RemoveTimers()
 
 
 
-
 static void* WaitULACommand(void* p)
 {
-	CLowerInterface::Singleton.ProcessULACommand((SProcessRoot*)p);
+	((SProcessRoot*)p)->LoopOnULACommand();
 	return p;
 }
 
@@ -514,7 +535,7 @@ bool CSocketSrvTLB::AddULAChannel(SOCKET sd)
 	char isNonZero = 0;
 	for (bitIndex = 0; bitIndex < sizeof(forestFreeFlags) * 8; bitIndex++)
 	{
-		if ((forestFreeFlags & (1 << bitIndex)) == 1)
+		if ((forestFreeFlags & (1 << bitIndex)) != 0)
 		{
 			isNonZero = 1;
 			break;
@@ -525,17 +546,26 @@ bool CSocketSrvTLB::AddULAChannel(SOCKET sd)
 		ReleaseMutex();
 		return false;
 	}
+
 	SProcessRoot& r = forestULA[bitIndex];
-	r.headLRUitem = r.tailLRUitem = NULL;
+	r.latest = NULL;
 	r.sdPipe = sd;
+#ifdef TRACE
+	printf("New socket to accept ULA command: %d\n", sd);
+#endif
+	DWORD optval = 1;
+	setsockopt(sd, IPPROTO_TCP, TCP_NODELAY, (const char*)&optval, sizeof(optval));
 
 	if (pthread_create(&r.hThreadWait, NULL, ::WaitULACommand, &r) != 0)
 	{
+		perror("Cannot create new thread to wait for ULA command");
 		ReleaseMutex();
 		return false;
 	}
-	forestFreeFlags ^= 1 << bitIndex;
+	pthread_detach(r.hThreadWait);
+
 	r.index = bitIndex;
+	forestFreeFlags ^= 1 << bitIndex;
 
 	ReleaseMutex();
 	return true;
@@ -566,6 +596,8 @@ bool CSocketItemEx::ScheduleConnect(int i)
 	cmd.pSocket = this;
 	cmd.index = i;
 	int r = pthread_create(&cmd.idThread, NULL, HandleConnect, &cmd);
+	if(r == 0)
+		pthread_detach(cmd.idThread);
     return(r == 0);
 }
 
@@ -612,16 +644,6 @@ bool CSocketItemEx::MapControlBlock(const CommandNewSessionSrv &cmd)
 	mlock(pControlBlock, dwMemorySize);
 
 	return true;
-}
-
-
-
-// See also CSocketItem::Destroy();
-void CSocketItemEx::ClearInUse()
-{
-	register void *buf;
-	if ((buf =  _InterlockedExchangePointer((PVOID *)& pControlBlock, NULL)) != NULL)
-		munmap(buf, dwMemorySize);
 }
 
 

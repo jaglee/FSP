@@ -304,7 +304,7 @@ void UnitTestGenerateSNACK()
 
 
 
-void UnitTestHasBeenCommitted()
+void UnitTestPeerCommitted()
 {
 	CSocketItemExDbg socket(MAX_BLOCK_NUM, MAX_BLOCK_NUM);
 	ControlBlock *pSCB = socket.GetControlBlock();
@@ -314,6 +314,6 @@ void UnitTestHasBeenCommitted()
 	ControlBlock::PFSP_SocketBuf skb = pSCB->AllocRecvBuf(FIRST_SN);
 
 	//
-	pSCB->HasBeenCommitted();
+	pSCB->PeerCommitted();
 	// Assert::
 }

@@ -1010,45 +1010,65 @@ void UnitTestCompressAndDecode()
 
 void UnitTestAllocAndFreeItem()
 {
+	CSocketItemDl* vPtr[MAX_CONNECTION_NUM];
 	CSocketItemDl *p, *p1, *p2;
 	register int i;
 	for (i = 0; i < MAX_CONNECTION_NUM / 3; i++)
 	{
 		p = CSocketItemDl::socketsTLB.AllocItem();
 		assert(p != NULL);
+		vPtr[i] = p;
 	}
 	p1 = p;
 	for (; i < MAX_CONNECTION_NUM * 2 / 3; i++)
 	{
 		p = CSocketItemDl::socketsTLB.AllocItem();
 		assert(p != NULL);
+		vPtr[i] = p;
 	}
 	p2 = p;
 	for(; i < MAX_CONNECTION_NUM; i++)
 	{
 		p = CSocketItemDl::socketsTLB.AllocItem();
 		assert(p != NULL);
+		vPtr[i] = p;
 	}
 	//
 	p = CSocketItemDl::socketsTLB.AllocItem();
 	assert(p == NULL);
 
-	CSocketItemDl::socketsTLB.FreeItem(p1);
-	CSocketItemDl::socketsTLB.FreeItem(p2);
-
-	p = CSocketItemDl::socketsTLB.AllocItem();
-	assert(p != NULL);
-
-	p = CSocketItemDl::socketsTLB.AllocItem();
-	assert(p != NULL);
-
-	p = CSocketItemDl::socketsTLB.AllocItem();
-	assert(p == NULL);
-
 	for (i = 0; i < MAX_CONNECTION_NUM; i++)
 	{
-		CSocketItemDl::socketsTLB.FreeItem(CSocketItemDl::socketsTLB[i]);
+		CSocketItemDl::socketsTLB.FreeItem(vPtr[i]);
 	}
+
+	// should not cause chaoes:
+	CSocketItemDl::socketsTLB.FreeItem(p1);
+	CSocketItemDl::socketsTLB.FreeItem(p2);
+}
+
+
+void CSocketItemDbg::OneTestRun()
+{
+	static int countOfRun;
+	printf_s("%s, entered #%d\n", __FUNCDNAME__, countOfRun++);
+}
+
+
+
+void UnitTestSlimThreadPool()
+{
+	CSocketItemDbg *pItem = (CSocketItemDbg*)CSocketItemDl::socketsTLB.AllocItem();
+	CSlimThreadPool thPool;
+	int i = 0;
+	while(i < SLIM_THREAD_POOL_SIZE * 2)
+	{
+		if (!thPool.ScheduleWork(pItem, (void (CSocketItemDl::*)()) & CSocketItemDbg::OneTestRun))
+			Sleep(TIMER_SLICE_ms);
+		else
+			i++;
+	}
+	Sleep(TIMER_SLICE_ms * SLIM_THREAD_POOL_SIZE); // Sleep(5000);	// To wait pending work done
 }
 
 
@@ -1075,6 +1095,8 @@ int _tmain(int argc, _TCHAR* argv[])
 	UnitTestTryRecvInline();
 
 	UnitTestTryGetSendBuffer();
+
+	UnitTestSlimThreadPool();
 
 	return 0;
 }

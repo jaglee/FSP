@@ -4,11 +4,11 @@
 #include "stdafx.h"
 
 // For test algorithm for generating KEEP_ALIVE packet in timer.cpp
-int32_t LOCALAPI CSocketItemExDbg::GenerateSNACK(FSP_KeepAliveExtension& buf3)
+int32_t LOCALAPI CSocketItemExDbg::GenerateSNACK(FSP_KeepAlivePacket& buf3)
 {
-	register int n = (sizeof(buf3.snack.gaps) - sizeof(buf3.mp)) / sizeof(FSP_SelectiveNACK::GapDescriptor);
+	register int n = sizeof(buf3.gaps) / sizeof(FSP_SelectiveNACK::GapDescriptor);
 	//^ keep the underlying IP packet from segmentation
-	register FSP_SelectiveNACK::GapDescriptor* gaps = buf3.snack.gaps;
+	register FSP_SelectiveNACK::GapDescriptor *gaps = buf3.gaps;
 	ControlBlock::seq_t seq0;
 	n = pControlBlock->GetSelectiveNACK(seq0, gaps, n);
 	if (n < 0)
@@ -17,8 +17,8 @@ int32_t LOCALAPI CSocketItemExDbg::GenerateSNACK(FSP_KeepAliveExtension& buf3)
 
 	// Suffix the effective gap descriptors block with the FSP_SelectiveNACK
 	// built-in rule: an optional header MUST be 64-bit aligned
-	int len = int(sizeof(FSP_SelectiveNACK) + sizeof(buf3.snack.gaps[0]) * n);
-	FSP_SelectiveNACK* pSNACK = &buf3.snack.sentinel;
+	int len = int(sizeof(FSP_SelectiveNACK) + sizeof(buf3.gaps[0]) * n);
+	FSP_SelectiveNACK* pSNACK = &buf3.sentinel;
 	pSNACK->_h.opCode = SELECTIVE_NACK;
 	pSNACK->_h.mark = 0;
 	pSNACK->_h.length = htole16(uint16_t(len));
@@ -209,10 +209,10 @@ void UnitTestICC()
 	pCBR->recvWindowNextSN++;		// == FIRST_SN + 1
 
 	// See also: timer.cpp::KeepAlive
-	FSP_KeepAliveExtension mp;
+	FSP_KeepAlivePacket mp;
 	int offset = socket.GenerateSNACK(mp);
 
-	mp.hdr.Set(KEEP_ALIVE, offset, FIRST_SN + 1, ++socket.nextOOBSN, 0);
+	((FSP_FixedHeader &)mp.hdr).Set(KEEP_ALIVE, offset, FIRST_SN + 1, ++socket.nextOOBSN, 0);
 	mp.hdr.ClearFlags();
 	mp.hdr.SetRecvWS(socket.pControlBlock->GetAdvertisableRecvWin());
 
@@ -335,14 +335,14 @@ void UnitTestHMAC()
 	skb1->ReInitMarkComplete();
 
 	// See also: timer.cpp::KeepAlive
-	FSP_KeepAliveExtension mp;
+	FSP_KeepAlivePacket mp;
 	int offset = socketR2.GenerateSNACK(mp);
 
 	mp.hdr.hs.opCode = KEEP_ALIVE;
 	mp.hdr.hs.major = THIS_FSP_VERSION;
 	mp.hdr.hs.offset = htobe16(offset);
 	mp.hdr.ClearFlags();
-	socketR2.SetSequenceAndWS(&mp.hdr, pSCB->sendWindowNextSN);
+	socketR2.SetSequenceAndWS((FSP_FixedHeader *)&mp.hdr, pSCB->sendWindowNextSN);
 	mp.hdr.expectedSN = htobe32(++socket.nextOOBSN);
 
 	uint32_t salt = socketR2.GetSalt(mp.hdr);
@@ -432,7 +432,7 @@ struct $FSP_FixedHeader
 
 void UnitTestByteOrderDefinitin()
 {
-	FSP$PacketHeader fhs;
+	FSP$HeaderLine fhs;
 	uint32_t & rFHS = *(uint32_t *)& fhs;
 
 	fhs.opCode = _FSP_Operation_Code(1);
@@ -478,7 +478,6 @@ int _tmain(int argc, _TCHAR* argv[])
 	UnitTestICC();
 	UnitTestHMAC();
 
-	TrySRP6();
 	UnitTestTweetNacl();
 	TryCHAKA();
 	TryWideChar();

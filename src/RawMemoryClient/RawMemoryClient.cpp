@@ -39,6 +39,7 @@ static void FSPAPI onAcknowledgeSent(FSPHANDLE, FSP_ServiceCode, int);
 static void FSPAPI onError(FSPHANDLE h, FSP_ServiceCode code, int value)
 {
 	printf_s("Notify: socket %p, service code = %d, return %d\n", h, code, value);
+	Dispose(h);
 	finished = true;
 	if (hFinished != NULL)
 		SetEvent(hFinished);
@@ -49,6 +50,7 @@ static void FSPAPI onError(FSPHANDLE h, FSP_ServiceCode code, int value)
 static void FSPAPI onShutDown(FSPHANDLE h, FSP_ServiceCode c, int v)
 {
 	printf_s("Shutdown: socket %p, service code = %d, return %d\n", h, c, v);
+	Dispose(h);
 	finished = true;
 	if (hFinished != NULL)
 		SetEvent(hFinished);
@@ -61,6 +63,7 @@ static void FSPAPI onShutDown(FSPHANDLE h, FSP_ServiceCode c, int v)
 static void FSPAPI onError2(FSPHANDLE h, FSP_ServiceCode code, int value)
 {
 	printf_s("Notify2: socket %p, service code = %d, return %d\n", h, code, value);
+	Dispose(h);
 	finished = true;
 	if (hFinished != NULL)
 		SetEvent(hFinished);

@@ -79,6 +79,8 @@ static inline void Sleep(int32_t millis)
 
 #endif
 
+# include <stdio.h>
+
 #define DEFAULT_FILE		"index.html"
 #define	BUFFER_POOL_SIZE	65536
 #define DEFAULT_SOCKS_PORT	1080
@@ -93,12 +95,11 @@ static inline void Sleep(int32_t millis)
 #define	SOCKS_V5_AUTH_NULL 	0	// only support null authentication
 #define SOCKS_V5_NO_ACCEPTABLE '\xFF'
 
-#ifndef MAX_WORKING_THREADS
-# define MAX_WORKING_THREADS	40
-#endif
 // fine tuning this value to half number of workable hyper-thread of the platform
 #define RECV_TIME_OUT		30	// half a minute
 #define MAX_LEN_DOMAIN_NAME 256	// including the terminating zero!
+#define MAX_NAME_LENGTH		80	// including the terminating zero!
+#define MAX_PASSWORD_LENGTH	32	// not too long
 
 enum ERepCode: octet
 {
@@ -207,6 +208,7 @@ typedef struct SRequestResponseV5
 typedef struct SRequestPoolItem
 {
 	SOCKET			hSocket;
+	int				lenReq;
 	FSPHANDLE		hFSP;
 	pthread_t		hThread;
 	union
@@ -239,11 +241,6 @@ public:
 	PRequestPoolItem AllocItem();
 	PRequestPoolItem FindItem(FSPHANDLE);
 	bool FreeItem(PRequestPoolItem);
-	bool FreeItem(FSPHANDLE h)
-	{
-		PRequestPoolItem p = FindItem(h);
-		return (p != NULL && FreeItem(p));
-	}
 };
 
 extern RequestPool requestPool;

@@ -26,6 +26,8 @@ public:
 	FSP_Session_State GetState() { return pControlBlock->state;  }
 	void SetEndTransaction() { SetEoTPending(); }
 
+	void OneTestRun();
+
 	friend void UnitTestPrepareToSend();
 	friend void UnitTestBufferData();
 	friend void LogicTestPackedSend();
@@ -34,4 +36,6 @@ public:
 	friend void UnitTestFetchReceived();
 	friend void UnitTestInquireRecvBuf();
 	friend void UnitTestCompressAndDecode();
+
+	friend void UnitTestSlimThreadPool();
 };

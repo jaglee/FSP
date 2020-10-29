@@ -33,17 +33,6 @@
 
 #include "fsp_srv.h"
 
-#if defined(__WINDOWS__)
-# define AF_FOR_IPC			AF_INET
-# define CLOSE_IPC			closesocket
-# define SOCKADDR_FOR_IPC	struct sockaddr_in
-#elif defined(__linux__) || defined(__CYGWIN__)
-# include <netinet/tcp.h>
-# include <sys/un.h>
-# define AF_FOR_IPC			AF_UNIX
-# define CLOSE_IPC			close
-# define SOCKADDR_FOR_IPC	struct sockaddr_un
-#endif
 
  // The singleton instance of the connect request queue
 ConnectRequestQueue ConnectRequestQueue::requests;
@@ -51,47 +40,51 @@ ConnectRequestQueue ConnectRequestQueue::requests;
 // The singleton instance of the lower service interface 
 CLowerInterface	CLowerInterface::Singleton;
 
+
+int WaitForULACommand();
+
 extern "C"
 int main(int argc, char * argv[])
 {
-	SOCKADDR_FOR_IPC addr;
-	int sd;
-
 	if(!CLowerInterface::Singleton.Initialize())
 	{
 		REPORT_ERRMSG_ON_TRACE("Cannot access lower interface in main(), aborted.");
 		exit(-1);
 	}
 
-	sd = socket(AF_FOR_IPC, SOCK_STREAM, 0);
+#if defined(__WINDOWS__)
+	try
+	{
+		exit(WaitForULACommand());
+	}
+#elif defined(__linux__) || defined(__CYGWIN__)
+# ifdef __linux__
+#  include <linux/un.h>
+# else
+#  include <sys/un.h>
+# endif
+	struct sockaddr_un addr;
+	int sd;
+
+	sd = socket(AF_UNIX, SOCK_STREAM, 0);
 	if (sd < 0)
 	{
 		REPORT_ERRMSG_ON_TRACE("Cannot create the socket for listening ULA's command");
 		exit(-1);
 	}
 
-#if defined(__WINDOWS__)
-	addr.sin_family = AF_FOR_IPC;
-	addr.sin_port = htobe16(DEFAULT_FSP_UDPPORT);
-	addr.sin_addr.S_un.S_addr = IN4ADDR_LOOPBACK;
-	memset(addr.sin_zero, 0, sizeof(addr.sin_zero));
-	if (bind(sd, (struct sockaddr*) & addr, sizeof(SOCKADDR_FOR_IPC)) < 0)
-	{
-		REPORT_ERRMSG_ON_TRACE("Cannot bind the command-stream socket to the loop-back address.");
-		exit(-1);
-	}
-#elif defined(__linux__) || defined(__CYGWIN__)
-	addr.sun_family = AF_FOR_IPC;
+	bzero(&addr, sizeof(addr));
+	addr.sun_family = AF_UNIX;
 	strncpy(addr.sun_path, SERVICE_SOCKET_PATH, sizeof(addr.sun_path) - 1);
 	addr.sun_path[sizeof(addr.sun_path) - 1] = 0;
-	if (bind(sd, (struct sockaddr*)&addr, sizeof(SOCKADDR_FOR_IPC)) < 0)
+	if (bind(sd, (struct sockaddr *)&addr, sizeof(addr)) < 0)
 	{
 		int r = 0;
 		if(errno == EADDRINUSE)
 		{
 			if(unlink(addr.sun_path) < 0)
 				printf("%s existed but cannot be unlinked.\n", addr.sun_path);
-			r = bind(sd, (struct sockaddr*)&addr, sizeof(struct sockaddr_un));
+			r = bind(sd, (struct sockaddr *)&addr, sizeof(addr));
 			if(r == 0)
 				printf("%s existed but was unlinked and re-bound.\n", addr.sun_path);
 		}
@@ -101,10 +94,8 @@ int main(int argc, char * argv[])
 			exit(-1);
 		}
 	}
-#endif
-	// If the backlog argument is greater than the value in /proc/sys/net/core/somaxconn,
-	// then it is silently truncated to that value; the default value in this file is 128
-	if (listen(sd, MAX_CONNECTION_NUM) != 0)
+	//
+	if (listen(sd, 5) != 0)
 	{
 		REPORT_ERRMSG_ON_TRACE("Cannot set the listening queue to accept ULA's command.");
 		exit(-1);
@@ -112,20 +103,21 @@ int main(int argc, char * argv[])
 
 	try
 	{
-		socklen_t szAddr = sizeof(SOCKADDR_FOR_IPC);
-		SOCKADDR_FOR_IPC addrIn;
+		struct sockaddr_un addrPeer;
 		int sdNew;
-		while ((sdNew = accept(sd, (struct sockaddr*) & addrIn, &szAddr)) != -1)
+		socklen_t szAddr = sizeof(addrPeer);
+		while ((sdNew = accept(sd, (sockaddr *)&addrPeer, &szAddr)) != -1)
 		{
-			DWORD optval = 1;
-			setsockopt(sdNew, IPPROTO_TCP, TCP_NODELAY, (const char*)&optval, sizeof(optval));
-			// setsockopt(sdNew, SOL_SOCKET, SO_DONTLINGER, (const char*)&optval, sizeof(optval));
-
+#ifdef TRACE
+			printf("Peer's socket address: %s\n", addrPeer.sun_path);
+#endif
 			if (!CLowerInterface::Singleton.AddULAChannel(sdNew))
-				CLOSE_IPC(sdNew);
+				close(sdNew);
+			szAddr = sizeof(addrPeer);
 		}
 		REPORT_ERRMSG_ON_TRACE("Command channel broken.");
 	}
+#endif
 	catch (...)
 	{
 		BREAK_ON_DEBUG();

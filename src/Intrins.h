@@ -46,9 +46,9 @@ typedef uint32_t  u32;
 # endif
 
 # ifdef __cplusplus
-#   include <atomic>
+#	include <atomic>
 # else
-#   include <stdatomic.h>
+#	include <stdatomic.h>
 # endif
 
 # define LCKREAD(a)					    __atomic_load_n(&(a), __ATOMIC_SEQ_CST)
@@ -62,15 +62,13 @@ typedef uint32_t  u32;
 #	define _InterlockedExchangePointer(a, b) __atomic_exchange_n((a), (b), __ATOMIC_SEQ_CST)
 #	define _InterlockedCompareExchange(ptr, desired, expected)	\
 	({	__typeof__(*(ptr)) _b = (expected);	\
-        __atomic_compare_exchange_n((ptr), &_b, (desired), 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); _b; })
-#	define _InterlockedCompareExchangePointer(a, b, c)	_InterlockedCompareExchange((PVOID *)(a), (PVOID)(b), (PVOID)(c))
+		__atomic_compare_exchange_n((ptr), &_b, (desired), 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); _b; })
+#	define _InterlockedCompareExchangePointer(a, b, c) _InterlockedCompareExchange((void **)(a), (void *)(b), (void *)(c))
 # endif
 
 # define _InterlockedExchange8(a, b)		__atomic_exchange_n((char *)(a), (char)(b), __ATOMIC_SEQ_CST)
 # define _InterlockedOr8(a, b)				__atomic_fetch_or((char *)(a), (char)(b), __ATOMIC_SEQ_CST)
-# define _InterlockedCompareExchange8(a, b, c)	\
-	({	char _b = (char)(b);					\
-        __atomic_compare_exchange_n((char *)(a), &_b, (c), 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); _b; })
+# define _InterlockedCompareExchange8(a, b, c) 	_InterlockedCompareExchange((char *)(a), (char)(b), (char)(c))
 
 #elif _MSC_VER
 
@@ -101,13 +99,13 @@ typedef uint32_t  u32;
 # else					// Below VS2010, exclusively
 __forceinline char _InterlockedCompareExchange8(volatile char *dest, char newval, char oldval)
 {
-    __asm
-    {
-        mov     al, oldval
-        mov     edx,dest
-        mov     cl,	newval
-        lock cmpxchg byte ptr [edx], cl
-    }
+	__asm
+	{
+		mov     al, oldval
+		mov     edx,dest
+		mov     cl,	newval
+		lock cmpxchg byte ptr [edx], cl
+	}
 }
 
 __forceinline char _InterlockedExchange8(volatile char * a, char b)
@@ -120,7 +118,7 @@ __forceinline char _InterlockedExchange8(volatile char * a, char b)
 # endif
 
 # ifndef bzero
-#   define bzero(p, size) memset((p), 0, (size))
+#	define bzero(p, size) memset((p), 0, (size))
 # endif
 
 #else

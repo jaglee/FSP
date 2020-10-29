@@ -143,9 +143,6 @@ typedef int (FSPAPI *CallbackBufferReady)(FSPHANDLE, void *, int32_t);
 //	int				the intent returned value
 typedef void (FSPAPI *NotifyOrReturn)(FSPHANDLE, FSP_ServiceCode, int);
 
-// A paramenter for argument of NotifyOrReturn type, meant to ignore some LLS notice
-DllSpec void FSPAPI FSP_IgnoreNotice(FSPHANDLE, FSP_ServiceCode, int);
-
 #ifdef __cplusplus
 	}
 #endif
@@ -234,29 +231,14 @@ FSPHANDLE FSPAPI Connect2(const char *, PFSP_Context);
 // given
 //	the handle of the FSP socket whose connection is to be duplicated,
 //	the pointer to the socket parameter
-//	the send options (TO_END_TRANSACTION, TO_COMPRESS_STREAM)
-//	NotifyOrReturn	the callback function pointer
 // return
 //	the handle of the new created socket
 //	or NULL if there is some immediate error, more information may be got from the flags set in the context parameter
 // remark
 //	The handle returned might be useless, if CallbackConnected report error later
 DllSpec
-FSPHANDLE FSPAPI MultiplyAndWrite(FSPHANDLE, PFSP_Context, unsigned, NotifyOrReturn);
+FSPHANDLE FSPAPI Multiply(FSPHANDLE, PFSP_Context);
 
-
-// given
-//	the handle of the FSP socket whose connection is to be duplicated,
-//	the pointer to the socket parameter
-//	the pointer to the callback function
-// return
-//	the handle of the new created socket
-//	or NULL if there is some immediate error, more information may be got from the flags set in the context parameter
-// remark
-//	The handle returned might be useless, if CallbackConnected report error later
-//	the capacity of immediately available buffer (might be 0) is outputted in the reference
-DllSpec
-FSPHANDLE FSPAPI MultiplyAndGetSendBuffer(FSPHANDLE, PFSP_Context, CallbackBufferReady);
 
 
 // given
@@ -427,6 +409,45 @@ int FSPAPI Flush(FSPHANDLE);
 
 
 // Given
+//	FSPHANDLE			the FSP socket
+//	CallbackConnected	the function pointer for call back
+// Do
+//	Set the function to be called back when the connection is established
+// Return
+//	0 if no error
+//	negative if it failed
+DllSpec
+int FSPAPI SetOnConnected(FSPHANDLE, CallbackConnected);
+
+
+
+// Given
+//	FSPHANDLE		the FSP socket
+//	NotifyOrReturn	the function pointer for call back
+// Do
+//	Set the function to be called back on LLS error encountered
+// Return
+//	0 if no error
+//	negative if it failed
+DllSpec
+int FSPAPI SetOnError(FSPHANDLE, NotifyOrReturn);
+
+
+
+// Given
+//	FSPHANDLE			the FSP socket
+//	CallbackRequested	the function pointer for call back
+// Do
+//	Set the function to be called back on connection multiplication requested by the remote end
+// Return
+//	0 if no error
+//	negative if it failed
+DllSpec
+int FSPAPI SetOnMultiplying(FSPHANDLE, CallbackRequested);
+
+
+
+// Given
 //	FSPHANDLE		the FSP socket
 //	NotifyOrReturn	the function pointer for call back
 // Do
@@ -438,7 +459,6 @@ int FSPAPI Flush(FSPHANDLE);
 //	The pointer of the callback function CANNOT be null
 DllSpec
 int FSPAPI SetOnRelease(FSPHANDLE, NotifyOrReturn);
-
 
 
 // Given

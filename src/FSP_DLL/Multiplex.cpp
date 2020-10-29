@@ -34,8 +34,6 @@
 // Given
 //	FSPHANDLE		the handle of the parent FSP socket to be multiplied
 //	PFSP_Context	the pointer to the parameter structure of the socket to create by multiplication
-//	int8_t			whether (TO_END_TRANSACTION, STREAM_COMPERSSION)
-//	NotifyOrReturn	the pointer to the callback function
 // Return
 //	the handle of the new created socket
 //	or NULL if there is some immediate error, more information may be got from the flags set in the context parameter
@@ -45,76 +43,10 @@
 //	which indicate some error has happened.
 //	See also SendStream, FinalizeSend
 DllExport
-FSPHANDLE FSPAPI MultiplyAndWrite(FSPHANDLE hFSP, PFSP_Context psp1, unsigned flag, NotifyOrReturn fp1)
+FSPHANDLE FSPAPI Multiply(FSPHANDLE hFSP, PFSP_Context psp1)
 {
-	CSocketItemDl *p = CSocketItemDl::ToPrepareMultiply(hFSP, psp1);
-	if(p == NULL)
-		return p;
-
-	FSPHANDLE h = p->WriteOnMultiplied(psp1, flag, fp1);
-	if (h == NULL)
-	{
-		p->FreeWithReset();
-		return NULL;
-	}
-	return h;
-}
-
-
-
-//[API: Multiply]
-//	NON_EXISTENT-->CLONING-->[Send MULTIPLY]{enable retry}
-// Given
-//	FSP_HANDLE			the handle of the FSP socket whose connection is to be duplicated,
-//	PFSP_Context		the pointer to the socket parameter
-//	CallbackBufferReady the pointer to the callback function
-// Return
-//	the handle of the new created socket
-//	or NULL if there is some immediate error, more information may be got from the flags set in the context parameter
-// Remark
-//	The MULTIPLY request is sent to the remote peer only when following SendInplace was called
-//	The handle returned might be useless, if CallbackConnected report error later
-//	the capacity of immediately available buffer (might be 0) is outputted in the reference
-//	As it is in CLONING state if onBufferReady is specified, it would be called but data would just be prebuffered
-//	See also InquireSendBuf, SendInplace, FinalizeSend
-DllExport
-FSPHANDLE FSPAPI MultiplyAndGetSendBuffer(FSPHANDLE hFSP, PFSP_Context psp1, CallbackBufferReady onBufferReady)
-{
-	CSocketItemDl *p = CSocketItemDl::ToPrepareMultiply(hFSP, psp1);
-	if(p == NULL)
-		return p;
-
-	if(onBufferReady != NULL)
-	{
-		int32_t m;
-		octet *buf = p->pControlBlock->InquireSendBuf(& m);
-		if(buf == NULL)
-		{
-			p->FreeWithReset();
-			return NULL;
-		}
-		//
-		onBufferReady(p, buf, m);
-	}
-
-	return p->CompleteMultiply();
-}
-
-
-
-// Given
-//	CSocketItemDl *		The parent socket item
-//	PFSP_Context		The context of the new child connection
-// Return
-//	The new socket item
-// Remark
-//	Requirement of a command structure is rendered by CreateControlBlock
-//	It is not hard-limited, but ULA shall only clone a connection in the
-//	ESTABLISHED(COMMITTING, COMMITTED, PEER_COMMIT, COMMITTING2 or CLOSABLE) state
-CSocketItemDl * LOCALAPI CSocketItemDl::ToPrepareMultiply(FSPHANDLE h, PFSP_Context psp1)
-{
-	CSocketItemDl *p = CSocketDLLTLB::HandleToRegisteredSocket(h);
-	if(p == NULL)
+	CSocketItemDl* p = CSocketDLLTLB::HandleToRegisteredSocket(hFSP);
+	if (p == NULL)
 	{
 		psp1->flags = -EBADF;
 		return NULL;
@@ -122,77 +54,46 @@ CSocketItemDl * LOCALAPI CSocketItemDl::ToPrepareMultiply(FSPHANDLE h, PFSP_Cont
 
 	IN6_ADDR addrAny = IN6ADDR_ANY_INIT;
 	psp1->passive = 0;	// override what is provided by ULA
-	CSocketItemDl * socketItem = CSocketItemDl::CreateControlBlock((PFSP_IN6_ADDR) & addrAny, psp1);
-	if(socketItem == NULL)
+	CSocketItemDl* socketItem = CSocketItemDl::CreateControlBlock((PFSP_IN6_ADDR)&addrAny, psp1);
+	if (socketItem == NULL)
 	{
 		psp1->flags = -EBADF;	// -E_HANDLE?
 		return NULL;
 	}
 
-	try
-	{
-		socketItem->pControlBlock->connectParams = p->pControlBlock->connectParams;
-		socketItem->pControlBlock->connectParams.idParent = p->fidPair.source;
-		socketItem->pControlBlock->SetSendWindow(LCKREAD(p->pControlBlock->sendWindowNextSN) - 1);
-		//^The receive window would be initialized in LLS
-		// The MULTIPLY packet itself is sent in old key, while the packet next to MULTIPLY is send in derived key
-		socketItem->SetState(CLONING);
-		socketItem->SetNewTransaction();
-	}
-	catch(...)
-	{
-		socketItem->RecycleSimply();
-		return NULL;
-	}
+	socketItem->pControlBlock->connectParams = p->pControlBlock->connectParams;
+	socketItem->pControlBlock->connectParams.idParent = p->fidPair.source;
+	socketItem->pControlBlock->SetSendWindow(LCKREAD(p->pControlBlock->sendWindowNextSN) - 1);
+	//^The receive window would be initialized in LLS
+	// The MULTIPLY packet itself is sent in old key, while the packet next to MULTIPLY is send in derived key
 
-	return socketItem;
+	return socketItem->InitiateCloning(psp1);
 }
 
 
 
 inline
-FSPHANDLE LOCALAPI CSocketItemDl::WriteOnMultiplied(PFSP_Context psp1, unsigned flag, NotifyOrReturn fp1)
+FSPHANDLE LOCALAPI CSocketItemDl::InitiateCloning(PFSP_Context psp1)
 {
-	TestSetSendReturn((PVOID)fp1);
-	if (psp1->welcome != NULL)
-	{
-		if ((flag & TO_COMPRESS_STREAM) && !AllocStreamState())
-			return NULL;
-		pendingSendBuf = (octet *)psp1->welcome;
-		bytesBuffered = 0;
-		// pendingSendSize set in BufferData
-		if (!WaitUseMutex())
-			return NULL;
-		SetEoTPending((flag & TO_END_TRANSACTION) != 0);
-		BufferData(psp1->len);
-		SetMutexFree();
-	}
-	return CompleteMultiply();
-}
+	SetNewTransaction();
 
+	context = *psp1;
+	PrepareSendBuffer(MULTIPLY);
 
-
-// Do
-//	Fill in the MULTPLY packet, construct and pass command to LLS
-FSPHANDLE CSocketItemDl::CompleteMultiply()
-{
-	ControlBlock::PFSP_SocketBuf skb = SetHeadPacketIfEmpty(MULTIPLY);
-	if (skb != NULL)
-	{
-		skb->opCode = MULTIPLY;
-		skb->ReInitMarkComplete();
-	}
 	// See also InitCommand, CallCreate
 	CommandCloneConnect cmd(pControlBlock->connectParams.idParent);
 	CopyFatMemPointo(cmd);
 	SetState(CLONING);
-	if (!StartPolling() || !Call((UCommandToLLS*)&cmd))
-	{
-		RecycleSimply();
-		return NULL;
-	}
 
-	return this;
+	if (Call((UCommandToLLS*)&cmd) && StartPolling())
+	{
+#ifdef TRACE
+		printf("New socket multiplied, fiber ID = %u.\n", this->fidPair.source);
+#endif
+		return this;
+	}
+	RecycleSimply();
+	return NULL;
 }
 
 

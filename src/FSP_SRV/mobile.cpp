@@ -307,14 +307,17 @@ void CSocketItemEx::InstallSessionKey(const CommandInstallKey& cmd)
 	printf("Key length: %d bits\t", pControlBlock->connectParams.keyBits);
 #endif
 	int sizeIKM = pControlBlock->connectParams.keyBits / 8;
-	char ikm[2048];// it is hard-coded to 2KB bytes, i.e. maximumly 16384 bits
-	sizeIKM = min((int)sizeof(ikm), sizeIKM);
 	if (sizeIKM <= 0)
 		return;
-	recv(rootULA->sdPipe, ikm, sizeIKM, 0);
+	// We knew rawKeyMaterial is an array of octets
+	if (sizeIKM > (int)sizeof(pControlBlock->rawKeyMaterial))
+		return;
 #if defined(TRACE) && (TRACE & (TRACE_SLIDEWIN | TRACE_ULACALL))
-	DumpHexical(ikm, sizeIKM);
+	DumpHexical(pControlBlock->rawKeyMaterial, sizeIKM);
 #endif
+	// Work in tandem with the corresponding DLL function
+	if (pControlBlock->lockOfExchange == 0)
+		return;
 
 	contextOfICC.isPrevSendCRC = contextOfICC.isPrevRecvCRC
 		= (InterlockedExchange64((int64_t*)&contextOfICC.keyLifeRemain, cmd.keyLife) == 0);
@@ -329,7 +332,9 @@ void CSocketItemEx::InstallSessionKey(const CommandInstallKey& cmd)
 		, contextOfICC.snFirstSendWithCurrKey
 		, contextOfICC.snFirstRecvWithCurrKey);
 #endif
-	contextOfICC.InitiateExternalKey(ikm, sizeIKM);
+	contextOfICC.InitiateExternalKey(pControlBlock->rawKeyMaterial, sizeIKM);
+	pControlBlock->lockOfExchange = 0;
+	bzero(pControlBlock->rawKeyMaterial, sizeof(pControlBlock->rawKeyMaterial));
 }
 
 
@@ -953,8 +958,8 @@ bool CSocketItemEx::EmitStart()
 	octet*payload = GetSendPtr(skb);
 	if(payload == NULL)
 	{
-		REPORT_ERRMSG_ON_TRACE("TODO: debug log memory corruption error");
-		AbortLLS();			// Used to be HandleMemoryCorruption();
+		SignalNMI(FSP_MemoryCorruption);
+		Reset();
 		return false;
 	}
 	skb->timeSent = NowUTC();
@@ -1125,7 +1130,7 @@ bool CSocketItemEx::IsNearEndMoved()
 //	Process the getting remote address event
 // Remark
 //	Although the subnet that the host belong to could be mobile, the hostID should be stable
-bool CSocketItemEx::HandlePeerSubnets(FSP_ConnectParam* pMobileParam)
+bool CSocketItemEx::HandlePeerSubnets(const FSP_ConnectParam *pMobileParam)
 {
 	if (pMobileParam == NULL || pMobileParam->_h.opCode != PEER_SUBNETS)
 		return false;

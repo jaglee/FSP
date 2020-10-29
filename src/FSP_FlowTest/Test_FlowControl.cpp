@@ -233,7 +233,7 @@ void PrepareFlowTestResend(CSocketItemExDbg& dbgSocket, PControlBlock& pSCB)
 	assert(skb5 == NULL);	// No more space in the receive buffer
 
 	pSCB->state = ESTABLISHED;
-	dbgSocket.AddKinshipTo(r);
+	dbgSocket.AddKinshipTo(&r);
 }
 
 
@@ -258,13 +258,13 @@ void FlowTestRetransmission()
 		int32_t			n;
 	} placeholder;
 	//
-	FSP_KeepAliveExtension* p = (FSP_KeepAliveExtension*)&placeholder.pktBuffer.hdr;
+	FSP_KeepAlivePacket *p = (FSP_KeepAlivePacket *)&placeholder.pktBuffer.hdr;
 
 	memset(& placeholder, 0, sizeof(placeholder));
 
 	int32_t len = dbgSocket.GenerateSNACK(*p);
 
-	dbgSocket.SignHeaderWith(&p->hdr, KEEP_ALIVE, uint16_t(len), pSCB->sendWindowNextSN - 1, ++dbgSocket.nextOOBSN);
+	dbgSocket.SignHeaderWith((FSP_FixedHeader *)&p->hdr, KEEP_ALIVE, uint16_t(len), pSCB->sendWindowNextSN - 1, ++dbgSocket.nextOOBSN);
 	dbgSocket.SetIntegrityCheckCode(&p->hdr, &p->mp, len - sizeof(p->hdr), dbgSocket.GetSalt(p->hdr));
 
 	// Firstly emulate receive the packet before emulate OnGetKeepAlive
@@ -274,14 +274,14 @@ void FlowTestRetransmission()
 	dbgSocket.tRoundTrip_us = 1;
 	dbgSocket.tRecentSend = NowUTC() + 1;
 	// See also CSocketItemEx::OnGetKeepAlive
-	FSP_SelectiveNACK* snack = &p->snack.sentinel;
+	FSP_SelectiveNACK *snack = &p->sentinel;
 
 	// there used to be seq4 to record the expected sequence number
 	ControlBlock::seq_t seq5;
 	int n = dbgSocket.ValidateSNACK(seq5, snack);
 	assert(seq5 == FIRST_SN + 2 && n == 1);
 
-	dbgSocket.AcceptSNACK(seq5, p->snack.gaps, n);
+	dbgSocket.AcceptSNACK(seq5, p->gaps, n);
 	dbgSocket.DoEventLoop();
 
 	ControlBlock::PFSP_SocketBuf skb = pSCB->HeadSend();
@@ -322,7 +322,7 @@ void FlowTestRetransmission()
 
 	len = dbgSocket.GenerateSNACK(*p);
 
-	dbgSocket.SignHeaderWith(& p->hdr, KEEP_ALIVE, uint16_t(len), pSCB->sendWindowNextSN - 1, ++dbgSocket.nextOOBSN);
+	dbgSocket.SignHeaderWith((FSP_FixedHeader *)&p->hdr, KEEP_ALIVE, uint16_t(len), pSCB->sendWindowNextSN - 1, ++dbgSocket.nextOOBSN);
 	dbgSocket.SetIntegrityCheckCode(&p->hdr, &p->mp, len - sizeof(p->hdr), dbgSocket.GetSalt(p->hdr));
 	// as it is an out-of-band packet, assume preset values are kept
 	dbgSocket.tRecentSend = NowUTC() + 3;
@@ -330,7 +330,7 @@ void FlowTestRetransmission()
 	n = dbgSocket.ValidateSNACK(seq5, snack);
 	assert(seq5 == FIRST_SN + 2 && n == 1);
 
-	dbgSocket.AcceptSNACK(seq5, p->snack.gaps, n);
+	dbgSocket.AcceptSNACK(seq5, p->gaps, n);
 	dbgSocket.DoEventLoop();
 
 	// TODO: Test calculation of RTT and Keep alive timeout 

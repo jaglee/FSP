@@ -33,7 +33,8 @@
 
 #define TIMED_OUT() \
 		SignalNMI(FSP_NotifyTimeout);	\
-		ScheduleCleanup();			\
+		lowState = NON_EXISTENT;		\
+		ReplaceTimer(TIMER_SLICE_ms);	\
 		SetMutexFree();	\
 		return
 
@@ -114,21 +115,22 @@ void CSocketItemEx::KeepAlive()
 	case PRE_CLOSED:
 		// ULA should have its own time-out clock enabled
 		// EmitRelease() may fail at first due to race
-		if (int64_t(t1 - tMigrate) > TRANSIENT_STATE_TIMEOUT_ms * 1000)
+		if (int64_t(t1 - tMigrate) > CLOSING_TIME_WAIT_ms * 1000)
 		{
 			SetState(CLOSED);
-			// ReplaceTimer(TIMER_SLICE_ms); // See also case CLOSED
+			ReplaceTimer(TIMER_SLICE_ms);
 		}
 		else
 		{
 			ReplaceTimer(uint32_t((t1 - tMigrate) >> 10) + TIMER_SLICE_ms * 2);
 			//^exponentially back off
 			EmitRelease();
-			break;
 		}
-		// The socket is subjected to be recycled in LRU manner
+		break;
 	case CLOSED:
-		// UNRESOLVED!? TODO: ScheduleResurrectable
+		if (int64_t(t1 - tMigrate) > MAX_LOCK_WAIT_ms * 1000)
+			PutToResurrectable();
+		break;
 	default:
 		Free();
 		break;
@@ -244,17 +246,19 @@ bool CSocketItemEx::SendKeepAlive()
 	if (lowState == PEER_COMMIT || lowState == COMMITTING2 || lowState >= CLOSABLE)
 		return SendAckFlush();
 
-	FSP_KeepAliveExtension buf3;
+	if (_InterlockedCompareExchange8(&pControlBlock->lockOfExchange, 1, 0) != 0)
+		return false;
 
-	SetConnectParamPrefix(buf3.mp);
-	buf3.SetHostID(CLowerInterface::Singleton.addresses);
-	memcpy(buf3.mp.subnets, savedPathsToNearEnd, sizeof(TSubnets));
+	FSP_KeepAlivePacket& pkt = pControlBlock->pktKeepAlive;
+	SetConnectParamPrefix(pkt.mp);
+	memcpy(pkt.mp.subnets, savedPathsToNearEnd, sizeof(TSubnets));
+	pkt.mp.idListener = SOCKADDR_HOSTID(CLowerInterface::Singleton.addresses);
 
 	_InterlockedIncrement((PLONG)&nextOOBSN);	// Because lastOOBSN start from zero as well. See ValidateSNACK
 
-	register int n = (sizeof(buf3.snack.gaps) - sizeof(buf3.mp)) / sizeof(FSP_SelectiveNACK::GapDescriptor);
+	register int n = (sizeof(pkt.gaps) - sizeof(pkt.mp)) / sizeof(FSP_SelectiveNACK::GapDescriptor);
 	//^ keep the underlying IP packet from segmentation
-	register FSP_SelectiveNACK::GapDescriptor* gaps = buf3.snack.gaps;
+	register FSP_SelectiveNACK::GapDescriptor* gaps = pkt.gaps;
 	ControlBlock::seq_t seq0;
 	n = pControlBlock->GetSelectiveNACK(seq0, gaps, n);
 	if (n < 0)
@@ -262,14 +266,15 @@ bool CSocketItemEx::SendKeepAlive()
 #ifdef TRACE
 		printf_s("GetSelectiveNACK return -0x%X\n", -n);
 #endif
+		pControlBlock->lockOfExchange = 0;
 		return false;
 	}
 	// buf3.snack.nEntries = n;
 
 	// Suffix the effective gap descriptors block with the FSP_SelectiveNACK
 	// built-in rule: an optional header MUST be 64-bit aligned
-	int len = int(sizeof(FSP_SelectiveNACK) + sizeof(buf3.snack.gaps[0]) * n);
-	FSP_SelectiveNACK* pSNACK = &buf3.snack.sentinel;
+	int len = int(sizeof(FSP_SelectiveNACK) + sizeof(pkt.gaps[0]) * n);
+	FSP_SelectiveNACK *pSNACK = &pkt.sentinel;
 	pSNACK->_h.opCode = SELECTIVE_NACK;
 	pSNACK->_h.mark = 0;
 	pSNACK->_h.length = htole16(uint16_t(len));
@@ -284,26 +289,31 @@ bool CSocketItemEx::SendKeepAlive()
 	}
 #endif
 
-	len += sizeof(buf3.mp);
-	SignHeaderWith(&buf3.hdr, KEEP_ALIVE, (uint16_t)(len + sizeof(FSP_FixedHeader))
+	len += sizeof(pkt.mp);
+	SignHeaderWith((FSP_FixedHeader *)&pkt.hdr, KEEP_ALIVE, (uint16_t)(len + sizeof(FSP_FixedHeader))
 		, pControlBlock->sendWindowNextSN - 1
 		, nextOOBSN);
-	void* c = SetIntegrityCheckCode(&buf3.hdr, &buf3.mp, len, GetSalt(buf3.hdr));
+	void *c = SetIntegrityCheckCode((FSP_FixedHeader*)&pkt.hdr, &pkt.mp, len, GetSalt(*(FSP_FixedHeader*)&pkt.hdr));
 	if (c == NULL)
+	{
+		pControlBlock->lockOfExchange = 0;
 		return false;
-	memcpy(&buf3.mp, c, len);
+	}
+	memcpy(&pkt.mp, c, len);
 
 	len += sizeof(FSP_FixedHeader);
 #if (TRACE & (TRACE_HEARTBEAT | TRACE_PACKET | TRACE_SLIDEWIN))
 	printf_s("To send KEEP_ALIVE seq #%u, OOBSN#%u\n\tpeer's fiber#%u, source ALFID = %u\n"
-		, be32toh(buf3.hdr.sequenceNo)
+		, be32toh(pkt.hdr.sequenceNo)
 		, nextOOBSN
 		, fidPair.peer
 		, fidPair.source);
 	printf_s("KEEP_ALIVE total header length: %d, should be payload-less\n", len);
-	DumpNetworkUInt16((uint16_t *)& buf3, len / 2);
+	DumpNetworkUInt16((uint16_t *)& pkt, len / 2);
 #endif
-	return SendPacket(1, ScatteredSendBuffers(&buf3, len)) > 0;
+	bool b = (SendPacket(1, ScatteredSendBuffers(&pkt, len)) > 0);
+	pControlBlock->lockOfExchange = 0;
+	return b;
 }
 
 
@@ -581,13 +591,3 @@ l_final:
 	startedSlow = true.
 	send_rate = (negotiated send rate!)(1 / 2 available, or quota - based)
  */
-
-
-
-//// Adjourn: when recover from Adjournment, RTT must be recovered.
-//// TODO: there are many yet-to-be-specified detail about session adjournment and resumption
-//void CSocketItemEx::Adjourn()
-//{
-//	SetState(CLOSABLE);
-//	ReplaceTimer(pControlBlock->keepAlive ? (CLOSING_TIME_WAIT_ms >> 2) : (SESSION_IDLE_TIMEOUT_us / 4000));
-//}

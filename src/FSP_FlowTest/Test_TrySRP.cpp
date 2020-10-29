@@ -1,4 +1,5 @@
 #include "stdafx.h"
+#include "gmp.h"
 
 //SRP-6
 //	I: identity /U

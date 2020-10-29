@@ -94,6 +94,7 @@ static void FSPAPI onResponseReceived(FSPHANDLE, FSP_ServiceCode, int);
 static void FSPAPI onNotice(FSPHANDLE h, FSP_ServiceCode code, int value)
 {
 	printf_s("Notify: socket %p, service code = %d, return %d\n", h, code, value);
+	Dispose(h);
 	if (value < 0)
 		r2Finish = finished = true;
 }
@@ -103,6 +104,7 @@ static void FSPAPI onNotice(FSPHANDLE h, FSP_ServiceCode code, int value)
 static void FSPAPI onFinish(FSPHANDLE h, FSP_ServiceCode code, int)
 {
 	printf_s("Socket %p, session was to shut down, service code = %d.\n", h, code);
+	Dispose(h);
 	r2Finish = finished = true;
 }
 
@@ -277,14 +279,16 @@ static void StartToSendDirectory(FSPHANDLE h)
 #else
 		int nBytes = WideStringToUTF8(buffer, sizeof(buffer), fName);
 #endif
-		WriteTo(h, buffer, nBytes, TO_COMPRESS_STREAM, NULL);
+		WriteTo(h, buffer, nBytes, 0, NULL);
+		// WriteTo(h, buffer, nBytes, TO_COMPRESS_STREAM, NULL);
 	} while (FindNextFile(hFind, &findFileData));
 	//
 	FindClose(hFind);
 	//Commit(h, onFileListSent);
 	//if the file list happen to be empty, it should be OK
 	buffer[0] = 0;
-	WriteTo(h, buffer, 1, TO_COMPRESS_STREAM + TO_END_TRANSACTION, onFileListSent);
+	WriteTo(h, buffer, 1, TO_END_TRANSACTION, onFileListSent);
+	// WriteTo(h, buffer, 1, TO_COMPRESS_STREAM + TO_END_TRANSACTION, onFileListSent);
 }
 
 

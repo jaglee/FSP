@@ -1,10 +1,10 @@
 // This program is a mixed test of FSP http and socks gateway server
 //
-#include "stdafx.h"
 #include <assert.h>
 #include "../FSP_HGW/defs.h"
 
-static RequestPool requestPool;
+RequestPool requestPool;
+
 static FSPHANDLE hFSP;
 
 bool UnitTestRequestPoolInit()

@@ -59,7 +59,11 @@
 #  define BREAK_ON_DEBUG()
 # endif
 
-# define CLOSE_SOCKET(sd)			(closesocket(sd), sd = INVALID_SOCKET)
+# define CLOSE_PIPE(hPipe)	( 	\
+	FlushFileBuffers(hPipe),	\
+	DisconnectNamedPipe(hPipe), \
+	CloseHandle(hPipe),			\
+	hPipe = INVALID_HANDLE_VALUE)
 
 # define MAX_LOCK_WAIT_ms			60000	// one minute
 # define TIMER_SLICE_ms				5
@@ -70,9 +74,15 @@
 #  define DELTA_EPOCH_IN_MICROSECS  11644473600000000ULL
 # endif
 
+
+# define SERVICE_NAMED_PIPE	TEXT("\\\\.\\pipe\\Flexible Session Protocol Communication")
+
 typedef DWORD	pid_t;
+typedef HANDLE	HPIPE_T;
 typedef HANDLE	timer_t;
 typedef HANDLE	pthread_t;
+
+static inline pthread_t pthread_self() { return GetCurrentThread(); }
 
 # ifdef __MINGW32__
 # define IN4ADDR_LOOPBACK 0x0100007F	// Works for x86 little-endian
@@ -89,7 +99,7 @@ static inline uint64_t GetTickCount64()
 	GetSystemTimeAsFileTime(&systemTime);
 	return *(uint64_t *)&systemTime / 10;
 }
-
+// `CSRWLock` in __MINGW32__ is defined later
 # else
 class CSRWLock
 {
@@ -146,13 +156,13 @@ protected:
 # define IN4ADDR_LOOPBACK	0x0100007F		// works for x86 little-endian
 # define INVALID_SOCKET		(-1)
 
-# define CLOSE_SOCKET(sd)	(close(sd), sd = INVALID_SOCKET)
+# define CLOSE_PIPE(sd)	(close(sd), sd = INVALID_SOCKET)
 
 # define max(a,b)	((a) >= (b) ? (a) : (b))
 # define min(a,b)	((a) <= (b) ? (a) : (b))
 
 # define printf_s	printf // but printf_s is defined in C11?
-# define _strnicmp strncasecmp
+# define _strnicmp	strncasecmp
 
 # define SHARE_MEMORY_PREFIX	"/FlexibleSessionProtocolSHM"
 # define SERVICE_SOCKET_PATH	"/tmp/FlexibleSessionProsock"
@@ -163,6 +173,7 @@ protected:
 # endif
 
 typedef int32_t	DWORD;
+typedef int		HPIPE_T;
 typedef void*	PVOID;
 typedef int		SOCKET;
 
@@ -193,6 +204,7 @@ static inline void Sleep(int32_t millis)
     tv.tv_nsec = (millis % 1000) * 1000000;
     nanosleep(&tv, NULL);
 }
+
 
 class CSRWLock
 {
@@ -254,13 +266,6 @@ protected:
 /**
  * Implemented system limit
  */
-#ifndef OVER_UDP_IPv4
-// IPv6 requires that every link in the Internet have an MTU of 1280 octets or greater. 
-# define MAX_BLOCK_SIZE		1024
-#else
-# define MAX_BLOCK_SIZE		512
-#endif
-
 #define FSP_BACKLOG_SIZE	4	// minimum number of backlog items reserved for multiplication
 #define FSP_BACKLOG_UPLIMIT	16	// maximum number of backlog items in the listen queue
 #define	MIN_RESERVED_BUF	(MAX_BLOCK_SIZE * 2)
@@ -402,7 +407,9 @@ union UCommandToLLS
 	struct CommandCloneConnect	clone;
 	struct CommandNewSession	creation;
 	struct CommandInstallKey	keying;
+	struct CommandRejectRequest reject;
 	struct SCommandToLLS		sharedInfo;
+	UCommandToLLS() {}
 };
 
 
@@ -525,8 +532,7 @@ class LLSBackLog: public CLightMutex
 public:
 	PItemBackLog FindByRemoteId(ALFID_T, uint32_t);
 	bool Has(const SItemBackLog& r) { return FindByRemoteId(r.idRemote, r.salt) != NULL; }
-	PItemBackLog Peek() { return count <= 0 ? NULL : &q[headQ]; }
-	int Pop();
+	bool Get(SItemBackLog&);
 	int Put(const SItemBackLog&);
 };
 
@@ -542,10 +548,6 @@ public:
 struct ControlBlock
 {
 	FSP_Session_State	state;
-
-	char		isDataAvailable;
-	char		hasFreedBuffer;
-	char		nmi;			// Non-Maskable Interrupt, flagging that the TCB is corrupted
 
 	u32			tfrc : 1;		// TCP friendly rate control. By default ECN-friendly
 	u32			milky : 1;		// by default 0: a normal wine-style payload assumed. FIFO
@@ -578,6 +580,11 @@ struct ControlBlock
 	// 4: The queue of
 	// Backlog for listening/connected socket [for client it could be an alternate of Web Socket]
 	LLSBackLog	backLog;
+
+	// 4+: notice to ULA
+	FSP_NoticeCode	receiveNotice;		// later FSP_NotifyCommit may override FSP_NotifyDataReady
+	FSP_NoticeCode	sendAllowedNotice;	// later FSP_NotifyFlushed may override FSP_NotifyBufferReady
+	FSP_NoticeCode	singletonotice;		// 'singleton' notice
 
 	// 5, 6: Send window and receive window descriptor
 	typedef uint32_t seq_t;
@@ -689,6 +696,17 @@ struct ControlBlock
 		offset = recvBuffer + MAX_BLOCK_SIZE * long(skb - p0);
 		return (octet*)this + offset;
 	}
+
+	// 5.6+ Information exchange block
+	struct
+	{
+		char					lockOfExchange;
+		union
+		{
+			FSP_KeepAlivePacket	pktKeepAlive;
+			octet				rawKeyMaterial[sizeof(FSP_KeepAlivePacket)];
+		};
+	};
 
 	// 7, 8 Send buffer and Receive buffer
 	// See ControlBlock::Init()

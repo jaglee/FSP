@@ -71,12 +71,7 @@ static int ReportWSAError(const char *);
 //	Shutdown the connection to the SOCKS client gracefully
 void CloseGracefully(SOCKET client)
 {
-	struct timeval timeout;
-	timeout.tv_sec = RECV_TIME_OUT;
-	timeout.tv_usec = 0;
-	setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, sizeof(timeout));
-	//
-	shutdown(client, SD_SEND); 
+	shutdown(client, SD_BOTH);
 	int r;
 	do
 	{
@@ -89,7 +84,7 @@ void CloseGracefully(SOCKET client)
 
 
 
-static void FreeRequestItem(PRequestPoolItem p, bool graceful = false)
+void FreeRequestItem(PRequestPoolItem p, bool graceful)
 {
 	if(p->hSocket != (SOCKET)SOCKET_ERROR && ! graceful)
 	{
@@ -104,10 +99,8 @@ static void FreeRequestItem(PRequestPoolItem p, bool graceful = false)
 	//
 	if(p->hFSP != NULL)
 	{
-		if (graceful)
-			Shutdown(p->hFSP, FSP_IgnoreNotice);
-		else
-			Dispose(p->hFSP);
+		Shutdown(p->hFSP, NULL);
+		Dispose(p->hFSP);
 		p->hFSP = NULL;
 	}
 	//
@@ -158,52 +151,47 @@ bool FSPAPI onFSPDataAvailable(FSPHANDLE h, void * buf, int32_t len, bool eot)
 
 
 // Only when the server side close the TCP socket would the tunnel be closed gracefully.
-// This is a long-run I/O routine which rely on the full-duplex mode heavily
 int FSPAPI toReadTCPData(FSPHANDLE h, void* buf, int32_t capacity)
 {
 	SRequestPoolItem* pReq = requestPool.FindItem(h);
 	if (pReq == NULL)
-		return 0;
-	int32_t offset = 0;
-	do
+		return -1;	// do not continue
+
+	int n = recv(pReq->hSocket, (char*)buf, capacity, 0);
+	if (n <= 0)
 	{
-		int n = recv(pReq->hSocket, (char*)buf + offset, capacity - offset, 0);
-		if (n <= 0)
-		{
 #ifndef NDEBUG
-			if (n < 0)
-				ReportWSAError("TCP side receive error");
-			else
-				printf("TCP side: no further data available.\n");
+		if (n < 0)
+			ReportWSAError("TCP side receive error");
+		else
+			printf("TCP side: no further data available.\n");
 #endif
-			FreeRequestItem(pReq, (n == 0));
-			return 0;
-		}
-		offset += n;
+		FreeRequestItem(pReq, (n == 0));
+		return -1;	// do not continue
+	}
 
 #ifdef _DEBUG_PEEK
-		printf_s("%d bytes read from the TCP end\n", n);
-		if (pReq->countTCPreceived == 0)
-			printf_s("First 300 chars:\n%.300s\n", (char*)buf);
+	printf_s("%d bytes read from the TCP end\n", n);
+	if (pReq->countTCPreceived == 0)
+		printf_s("First 300 chars:\n%.300s\n", (char*)buf);
 #endif
 
-		pReq->countTCPreceived += n;
-		int r;
-		do
-		{
-			r = SendInline(h, buf, n, true, NULL);
-			if (r >= 0)
-				break;
-			Sleep(1);	// yield CPU out for at least 1ms/one time slice
-		} while (r == -EBUSY);
-		if (r < 0)
-		{
+	pReq->countTCPreceived += n;
+	int r;
+	do
+	{
+		r = SendInline(h, (char *)buf, n, true, NULL);
+		if (r >= 0)
+			break;
+		Sleep(1);	// yield CPU out for at least 1ms/one time slice
+	} while (r == -EBUSY);
+	if (r < 0)
+	{
 #ifndef NDEBUG
-			printf_s("SendInline() in toReadTCPData failed!? Error code: %d\n", r);
+		printf_s("SendInline() in toReadTCPData failed!? Error code: %d\n", r);
 #endif
-			FreeRequestItem(pReq);
-		}
-	} while (offset < capacity);
+		FreeRequestItem(pReq);
+	}
 
 	return 0;
 }
@@ -326,10 +314,27 @@ int	FSPAPI onMultiplying(FSPHANDLE hSrv, PFSP_SINKINF p, PFSP_IN6_ADDR remoteAdd
 #endif
 	if(requestPool.AllocItem(hSrv) == NULL)
 		return -1;	// no more resource!
+	
+	SetOnError(hSrv, onBranchError);
 	SetOnRelease(hSrv, onRelease);
 
 	RecvInline(hSrv, onRequestArrived);
 	return 0;	// no opposition
+}
+
+
+
+// Handler of error notification for branch connection cloned from the authenticated main connection 
+void FSPAPI onBranchError(FSPHANDLE h, FSP_ServiceCode code, int value)
+{
+#ifdef TRACE
+	printf_s("Notification: socket %p, service code = %d, return %d\n", h, code, value);
+#endif
+	PRequestPoolItem p = requestPool.FindItem(h);
+	if (p != NULL)
+		FreeRequestItem(p);
+	else
+		Dispose(h);
 }
 
 
@@ -348,12 +353,6 @@ void FSPAPI onRelease(FSPHANDLE h, FSP_ServiceCode code, int value)
 	PRequestPoolItem p = (PRequestPoolItem)GetExtPointer(h);
 	if (p == NULL)
 	{
-		Dispose(h);
-		return;
-	}
-	if (p->hSocket == SOCKET_ERROR)
-	{
-		requestPool.FreeItem(p);
 		Dispose(h);
 		return;
 	}
@@ -528,9 +527,9 @@ static bool FSPAPI onRequestArrived(FSPHANDLE h, void *buf, int32_t len, bool eo
 	if (!ReportSuccessViaFSP(p)
 	 || (RecvInline(h, onFSPDataAvailable) < 0)
 	 || (GetSendBuffer(h, toReadTCPData) < 0))
-	 {
+	{
 		FreeRequestItem(p);
-	 }
+	}
 
 	return false;	// do not chain the previous call-back function
 }

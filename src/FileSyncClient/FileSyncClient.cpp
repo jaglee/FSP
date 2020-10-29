@@ -38,6 +38,7 @@ static bool FSPAPI onReceiveNextBlock(FSPHANDLE, void *, int32_t, bool);
 static void FSPAPI onError(FSPHANDLE h, FSP_ServiceCode code, int value)
 {
 	printf_s("Notify: socket %p, service code = %d, return %d\n", h, code, value);
+	Dispose(h);
 	finalize();
 	return;
 }

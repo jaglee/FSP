@@ -11,7 +11,7 @@ using namespace Microsoft::VisualStudio::CppUnitTestFramework;
 // 
 void UnitTestGenerateSNACK();
 void UnitTestSendRecvWnd();
-void UnitTestHasBeenCommitted();
+void UnitTestPeerCommitted();
 
 // The singleton instance of the connect request queue
 ConnectRequestQueue ConnectRequestQueue::requests;
@@ -63,19 +63,22 @@ void UnitTestBackLogs()
 	static const int TEST_SIZE = sizeof(ControlBlock) + sizeof(SItemBackLog) * FSP_BACKLOG_UPLIMIT;
 	ControlBlock *buf = (ControlBlock *)_alloca(TEST_SIZE);
 	ControlBlock & cqq = *buf;
-	SItemBackLog item, *pItem;
+	SItemBackLog item;
+	SItemBackLog itm2;
 	register int i;
 	int n;
+	bool b;
 
 	cqq.InitToListen();
-	pItem = cqq.backLog.Peek();
-	Assert::IsNull(pItem, L"There should be no item to be popped");
+	b = cqq.backLog.Get(itm2);
+	Assert::IsFalse(b, L"There should be no item to be popped");
 
 	item.idRemote = 1234;
 	item.salt = 4321;	// item.sessionKey[0] = 0xAA; // used to exploit session key
 	for(i = 0; i < FSP_BACKLOG_UPLIMIT; i++)
 	{
 		n = cqq.backLog.Put(item);
+		item.idRemote++;
 		//
 		sprintf_s(linebuf, sizeof(linebuf), "Insert at position %d\n", n);
 		Logger::WriteMessage(linebuf);
@@ -83,7 +86,7 @@ void UnitTestBackLogs()
 	n = cqq.backLog.Put(item);
 	Assert::IsTrue(n < 0, L"Cannot push into backlog when overflow");
 	
-	bool b = cqq.backLog.Has(item);
+	b = cqq.backLog.Has(item);
 	Assert::IsTrue(b, L"Cannot find the backlog item just put into the queue");
 
 	item.salt = 3412;	// item.sessionKey[0] = 0xBB; // used to exploit session key
@@ -92,16 +95,39 @@ void UnitTestBackLogs()
 
 	for(i = 0; i < FSP_BACKLOG_UPLIMIT; i++)
 	{
-		pItem = cqq.backLog.Peek();
-		Assert::IsNotNull(pItem, L"There should be log item peekable");
-		n = cqq.backLog.Pop();
-		sprintf_s(linebuf, sizeof(linebuf), "Position at %d popped\n", n);
+		b = cqq.backLog.Get(itm2);
+		Assert::IsTrue(b, L"There should be log item fetch-able");
+		sprintf_s(linebuf, sizeof(linebuf), "The id remote of the top slot is %u\n", itm2.idRemote);
 		Logger::WriteMessage(linebuf);
 	}
-	pItem = cqq.backLog.Peek();
-	Assert::IsNull(pItem, L"Cannot peek anything when it is empty");
-	n = cqq.backLog.Pop();
-	Assert::IsTrue(n < 0, L"Cannot pop when it is empty");
+	b = cqq.backLog.Get(itm2);
+	Assert::IsFalse(b, L"Cannot pop out anything when it is empty");
+
+	// For multiplying, pressure test:
+	int realSendSize = MAX_BLOCK_SIZE;
+	int realRecvSize = MAX_BLOCK_SIZE;
+	cqq.Init(realSendSize, realRecvSize);
+	sprintf_s(linebuf, sizeof(linebuf), "The real send/recv buffer size is %d/%d\n", realSendSize, realRecvSize);
+	Logger::WriteMessage(linebuf);
+
+	b = cqq.backLog.Get(itm2);
+	Assert::IsFalse(b, L"There should be no item to be popped");
+
+	item.idRemote = 1234;
+	item.salt = 4321;
+	for (i = 0; i < FSP_BACKLOG_UPLIMIT; i++)
+	{
+		n = cqq.backLog.Put(item);
+		item.idRemote++;
+		//
+		sprintf_s(linebuf, sizeof(linebuf), "Insert at position %d\n", n);
+		Logger::WriteMessage(linebuf);
+		//
+		b = cqq.backLog.Get(itm2);
+		Assert::IsTrue(b, L"There should be log item fetch-able");
+		sprintf_s(linebuf, sizeof(linebuf), "The id remote of the top slot is %u\n", itm2.idRemote);
+		Logger::WriteMessage(linebuf);
+	}
 }
 
 
@@ -212,7 +238,7 @@ void UnitTestSocketSrvTLB()
 
 	SProcessRoot r;
 	bzero(&r, sizeof(r));
-	p->AddKinshipTo(r);
+	p->AddKinshipTo(&r);
 
 	p = (CSocketItemEx *)CLowerInterface::Singleton.AllocItem(p1->GetProcessRoot());
 	Assert::IsNotNull(p, L"There should be free item slot");
@@ -220,15 +246,16 @@ void UnitTestSocketSrvTLB()
 	IN6_ADDR addrList[MAX_PHY_INTERFACES];
 	// no hint
 	memset(addrList, 0, sizeof(addrList));
-	ALFID_T id = CLowerInterface::Singleton.RandALFID(p1);
+	ALFID_T id = CLowerInterface::Singleton.AllocItemReserve();
 	Assert::IsFalse(id == 0, L"There should be free id space");
 
 	sprintf_s(linebuf, "Allocated ID = %u\n", id);
 	Logger::WriteMessage(linebuf);
 
-	CSocketItemEx *p2 = (CSocketItemEx *)CLowerInterface::Singleton[id];
-	Assert::IsFalse(p2 == p1, L"RandID shouldn't alloc the same item as AllocItem for listener");
-	Assert::IsFalse(p2 == p, L"RandID shouldn't alloc the same item as AllocItem");
+	CSocketItemEx *p2 = CLowerInterface::Singleton.AllocItemCommit(&r, id);
+	Assert::IsNotNull(p2, L"The item slot should have been reserved");
+	Assert::IsFalse(p2 == p1, L"AllocItemReserve shouldn't reserve the same item as AllocItem for listener");
+	Assert::IsFalse(p2 == p, L"AllocItemReserve shouldn't reserve the same item as AllocItem");
 
 	CLowerInterface::Singleton.FreeItem(p1);
 	CLowerInterface::Singleton.FreeItem(p);
@@ -261,7 +288,7 @@ void UnitTestSocketRTLB()
 
 	SProcessRoot r;
 	bzero(&r, sizeof(r));
-	p->AddKinshipTo(r);
+	p->AddKinshipTo(&r);
 
 	p = (CSocketItemExDbg *)pRTLB->AllocItem(p1->GetProcessRoot());
 	Assert::IsNotNull(p, L"There should be free item slot");
@@ -269,15 +296,16 @@ void UnitTestSocketRTLB()
 	IN6_ADDR addrList[MAX_PHY_INTERFACES];
 	// no hint
 	memset(addrList, 0, sizeof(addrList));
-	ALFID_T id = pRTLB->RandALFID(p1);
+	ALFID_T id = pRTLB->AllocItemReserve();
 	Assert::IsFalse(id == 0, L"There should be free id space");
 
 	sprintf_s(linebuf, "Allocated ID = %u\n", id);
 	Logger::WriteMessage(linebuf);
 
-	CSocketItemExDbg *p2 = (CSocketItemExDbg *)(*pRTLB)[id];
-	Assert::IsFalse(p2 == p1, L"RandID shouldn't allocate the same item as AllocItem for listener");
-	Assert::IsFalse(p2 == p, L"RandID shouldn't allocate the same item as AllocItem");
+	CSocketItemExDbg *p2 = (CSocketItemExDbg *)pRTLB->AllocItemCommit(&r, id);
+	Assert::IsNotNull(p2, L"The item slot should have been reserved");
+	Assert::IsFalse(p2 == p1, L"AllocItemReserve shouldn't reserve the same item as AllocItem for listener");
+	Assert::IsFalse(p2 == p, L"AllocItemReserve shouldn't reserve the same item as AllocItem");
 
 	p->fidPair.peer = id;
 	p->idParent = 0xABCD;
@@ -316,13 +344,16 @@ void UnitTestConnectQueue()
 }
 
 
+
 void UnitTestAllocSocket()
 {
 	static CSocketSrvTLB & tlb = CLowerInterfaceDbg::Singleton;
 	CSocketItemEx *p;
 	CSocketItemExDbg *p0, *p1 = NULL;
+
 	SProcessRoot r;
 	memset(&r, 0, sizeof(SProcessRoot));
+
 	CLowerInterfaceDbg::Singleton.MakeALFIDsPool();
 	for (register int i = 0; i < MAX_CONNECTION_NUM; i++)
 	{
@@ -354,7 +385,7 @@ void UnitTestAllocSocket()
 
 	p0 = (CSocketItemExDbg *)tlb.AllocItem(htonl(80));
 	Assert::IsNotNull(p0);
-	p0->AddKinshipTo(r);
+	p0->AddKinshipTo(&r);
 
 	p = tlb.AllocItem(htonl(80));
 	Assert::IsNull(p);
@@ -364,17 +395,29 @@ void UnitTestAllocSocket()
 	Assert::IsNotNull(p);
 	Assert::IsTrue(p == (CSocketItemEx *)p1);
 
+	bool b = p1->WaitUseMutex();
+	Assert::IsTrue(b);
 	p1->PutToResurrectable();
-	tlb.FreeItem(p1);
+	p1->SetMutexFree();
 	//^DetachFromRemoteTLB should return false because p1 == p but it was not put into the TLB again
 
-	ALFID_T fid = tlb.RandALFID(p0);
+	ALFID_T fid = tlb.AllocItemReserve();
 	Assert::IsTrue(fid != 0);
 	
-	p = tlb.AllocItem(&r, fid);
+	p = tlb.AllocItemCommit(&r, fid);
 	Assert::IsNotNull(p);
 
 	tlb.FreeItem(p0);	// should eventually call DetachFromListenTLB
+
+	p0 = (CSocketItemExDbg*)r.latest;
+	int k = 0;
+	while(p0 != NULL)
+	{
+		p1 = (CSocketItemExDbg*)p0->prev;
+		if (k++ % 2 == 0)
+			p0->Free();
+		p0 = p1;
+	}
 
 	tlb.FreeULAChannel(&r);
 }
@@ -595,9 +638,9 @@ namespace UnitTestFSP
 		}
 
 
-		TEST_METHOD(TestHasBeenCommitted)
+		TEST_METHOD(TestPeerCommitted)
 		{
-			UnitTestHasBeenCommitted();
+			UnitTestPeerCommitted();
 		}
 
 

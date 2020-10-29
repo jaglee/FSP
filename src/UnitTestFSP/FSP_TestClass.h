@@ -67,7 +67,7 @@ public:
 	void SetPairOfFiberID(ALFID_T src, ALFID_T dst) { fidPair.source = src; fidPair.peer = dst; }
 
 	// For test algorithm for generating KEEP_ALIVE packet in timer.cpp
-	int32_t LOCALAPI GenerateSNACK(FSP_KeepAliveExtension&);
+	int32_t LOCALAPI GenerateSNACK(FSP_KeepAlivePacket&);
 
 	friend void UnitTestAllocSocket();
 	friend void UnitTestSocketRTLB();

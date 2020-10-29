@@ -1,5 +1,6 @@
 /*
  * Implement the SOCKSv4 interface of FSP http accelerator, SOCKS gateway and tunnel server
+ * Usage fsp_socks -p <port number> [Remote FSP address]
  *
     Copyright (c) 2017, Jason Gao
     All rights reserved.
@@ -58,39 +59,110 @@
  */
 #include "fsp_http.h"
 
-// Storage of private key SHOULD be allocated with random address layout
-static octet bufPrivateKey[CRYPTO_NACL_KEYBYTES];
-static octet bufSharedKey[CRYPTO_NACL_KEYBYTES];
-static char	 inputPassword[80];
+#ifndef MAX_WORKING_THREADS
+# define MAX_WORKING_THREADS	40
+#endif
 
 ALIGN(8)
 static SCHAKAPublicInfo chakaPubInfo;
 
-// Request string towards the remote tunnel server
-static char		tunnelRequest[80];
-
 // FSP handle of the master connection that the client side, which accept the SOCKS4 service request,
 // made towards the tunnel server. It is the client in the sense that it made tunnel service request
 static FSPHANDLE hClientMaster;
-static bool		 isRemoteTunnelEndReady = false;
-
-// shared by master connection and child connection
-static void FSPAPI onError(FSPHANDLE, FSP_ServiceCode, int);
 
 // for master connection
 static int	FSPAPI onConnected(FSPHANDLE, PFSP_Context);
-static void FSPAPI onCHAKASRReceived(FSPHANDLE, FSP_ServiceCode, int);
-static bool	FSPAPI onResponseReceived(FSPHANDLE, void *, int32_t, bool);
 
 // for child connection
-static void FSPAPI onSubrequestSent(FSPHANDLE, FSP_ServiceCode, int);
+static int	FSPAPI onSubrequestSent(FSPHANDLE, PFSP_Context);
 
 // The SOCKS(v4/v5) server reports general failure to the SOCKS client
 static void ReportGeneralError(SOCKET, PRequestPoolItem);
 
 // Get the username and password. The username is stored in the given buffer,
 // the password is saved in some hidden place
-static void GetUserCredential(char *, int);
+static void GetUserCredential(char *, int, char[]);
+
+// Forward declaration of the top level function that implements service interface for SOCKS gateway
+static void	ToServeSOCKS(const char*, int);
+
+// Forward declaration of the function that negotiates with the remote tunnel end via FSP
+static int MakeRequest(FSPHANDLE, const char *);
+
+int main(int argc, char* argv[])
+{
+	int r = -1;
+
+#ifdef _WIN32
+	WSADATA wsaData;
+	if (WSAStartup(0x202, &wsaData) < 0)
+	{
+		printf_s("Cannot start up Windows socket service provider.\n");
+		return r;
+	}
+#endif
+
+	if (!requestPool.Init(MAX_WORKING_THREADS))
+	{
+		printf_s("Failed to allocate tunnel service request pool\n");
+		goto l_return;
+	}
+	Sleep(2000);	// wait for the remote tunnel end ready
+
+	if (argc <= 1)
+	{
+		printf_s("To serve SOCKS"
+#if defined(__WINDOWS__)
+			"v4"
+#elif defined(__linux__) || defined(__CYGWIN__)
+			"v5"
+#endif
+			" request at port %d\n", DEFAULT_SOCKS_PORT);
+		ToServeSOCKS("localhost:80", DEFAULT_SOCKS_PORT);
+		r = 0;
+	}
+	else if (strcmp(argv[1], "-p") == 0)
+	{
+		if (argc != 3 && argc != 4)
+		{
+			printf_s("Usage: %s -p <port number> [remote fsp app-name, e.g. 192.168.9.125:80]", argv[0]);
+			goto l_return;
+		}
+
+		int port = atoi(argv[2]);
+		if (port == 0 || port > USHRT_MAX)
+		{
+			printf_s("Port number should be a value between 1 and %d\n", USHRT_MAX);
+			goto l_return;
+		}
+
+		const char* nameAppLayer = (argc == 4 ? argv[3] : "localhost:80");
+		printf_s("To serve SOCKS"
+#if defined(__WINDOWS__)
+			"v4"
+#elif defined(__linux__) || defined(__CYGWIN__)
+			"v5"
+#endif
+			" request at port %d\n", port);
+		ToServeSOCKS(nameAppLayer, port);
+		r = 0;
+	}
+	else
+	{
+		printf_s("Usage: %s [-p <port number> [remote fsp url]]\n", argv[0]);
+		goto l_return;
+	}
+
+	printf("\n\nPress Enter to exit...");
+	getchar();
+
+l_return:
+#ifdef _WIN32
+	WSACleanup();
+#endif
+	exit(r);
+}
+
 
 
 // Given
@@ -209,7 +281,7 @@ static int GetSOCKSv4Request(PRequestPoolItem p, SOCKET client = 0)
 		r = sizeof(req);
 	}
 
-	return r;
+	return (p->lenReq = r);
 }
 
 
@@ -234,94 +306,58 @@ static void RejectV4Client(SOCKET client)
 
 
 
+static bool ForkFSPThread(PRequestPoolItem p)
+{
+	FSP_SocketParameter parms;
+	memset(&parms, 0, sizeof(parms));
+	parms.onAccepting = NULL;
+	parms.onAccepted = onSubrequestSent;
+	parms.onError = onBranchError;
+	parms.keepAlive = 1;
+	parms.recvSize = BUFFER_POOL_SIZE;
+	parms.sendSize = BUFFER_POOL_SIZE;
+	parms.welcome = &p->req;
+	parms.len = (unsigned short)p->lenReq;
+	parms.extentI64ULA = (uint64_t)(ULONG_PTR)p;
+	//
+	p->hFSP = Multiply(hClientMaster, &parms);
+	return (p->hFSP != NULL);
+}
+
+
+
 #if defined(__WINDOWS__)
 # include <MSWSock.h>
-
-//
-// This is the thread pool work callback function, forward declaration.
-//
-VOID CALLBACK TpWorkCallBack(PTP_CALLBACK_INSTANCE, PVOID, PTP_WORK Work);
-
 
 // Given
 //	char *	Remote FSP application name such as 192.168.9.125:80 or www.lt-x61t.home.net
 //	int		The TCP port number on which the socket is listening for SOCKSv4 service request
 // Do
 //	Create a thread pool to service SOCKS request in a multi-threaded parallel fashion
-void ToServeSOCKS(const char *nameAppLayer, int port)
+static void ToServeSOCKS(const char* nameAppLayer, int port)
 {
-	int len = sprintf_s(tunnelRequest, sizeof(tunnelRequest), "TUNNEL %s HTTP/1.0\r\n", nameAppLayer);
-	if(len < 0)
-	{
-		printf_s("Invalid name of remote tunnel server end-point: %s\n", nameAppLayer);
-		return;
-	}
-	Sleep(2000);	// wait for the remote tunnel end ready
-
+	printf_s("\nConnecting to remote FSP SOCKS tunnel server...");
+	// Block 1
 	FSP_SocketParameter parms;
-	memset(& parms, 0, sizeof(parms));
+	memset(&parms, 0, sizeof(parms));
 	// blocking mode, both onAccepting and onAccepted are default to NULL
-	// parms.onAccepted = onConnected;
-	parms.onError = onError;
-	parms.recvSize = MAX_FSP_SHM_SIZE/2;
-	parms.sendSize = MAX_FSP_SHM_SIZE/2;
-	hClientMaster = Connect2(nameAppLayer, & parms);
-	if(hClientMaster == NULL)
+	parms.onError = NULL;
+	parms.recvSize = MAX_FSP_SHM_SIZE / 2;
+	parms.sendSize = MAX_FSP_SHM_SIZE / 2;
+	hClientMaster = Connect2(nameAppLayer, &parms);
+	if (hClientMaster == NULL)
 	{
 		printf_s("Failed to initialize the FSP connection towards the tunnel server\n");
 		return;
 	}
+	onConnected(hClientMaster, GetFSPContext(hClientMaster));
 
-	// synchronous mode
-	if (parms.onAccepted == NULL)
-		onConnected(hClientMaster, GetFSPContext(hClientMaster));
-
-	//
-	if(! requestPool.Init(MAX_WORKING_THREADS))
-	{
-		printf_s("Failed to allocate tunnel service request pool\n");
-		goto l_bailout;
-	}
-
-    PTP_POOL pool = NULL;
-    TP_CALLBACK_ENVIRON envCallBack;
-    PTP_CLEANUP_GROUP cleanupgroup = NULL;
-    //FILETIME FileDueTime;
-    //ULARGE_INTEGER ulDueTime;
-    //PTP_TIMER timer = NULL;
-    BOOL bRet = FALSE;
-
-	InitializeThreadpoolEnvironment(& envCallBack);
-	pool = CreateThreadpool(NULL);
-	if (pool == NULL)
-	{
-		printf_s("CreateThreadpool failed. LastError: %u\n", GetLastError());
-		goto l_bailout;
-	}
-
-    SetThreadpoolThreadMaximum(pool, MAX_WORKING_THREADS);
-    bRet = SetThreadpoolThreadMinimum(pool, 1);
-    if (!bRet)
-	{
-        printf_s("SetThreadpoolThreadMinimum failed. LastError: %d\n", GetLastError());
-        goto l_bailout1;
-    }
-
-    cleanupgroup = CreateThreadpoolCleanupGroup();
-    if (cleanupgroup == NULL)
-	{
-        printf_s("CreateThreadpoolCleanupGroup failed. LastError: %d\n", GetLastError());
-        goto l_bailout1; 
-    }
-
-    SetThreadpoolCallbackPool(& envCallBack, pool);
-    SetThreadpoolCallbackCleanupGroup(& envCallBack, cleanupgroup, NULL);
-
+	// Block 2, make local SOCKS ready to serve
 	SOCKET	 hListener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-	if(hListener == SOCKET_ERROR)
+	if (hListener == SOCKET_ERROR)
 	{
-        printf_s("socket() failed with error: %d\n", WSAGetLastError() );
-		goto l_bailout5;
+		printf_s("socket() failed with error: %d\n", WSAGetLastError());
+		goto l_bailout;
 	}
 
 	sockaddr_in localEnd;
@@ -330,23 +366,21 @@ void ToServeSOCKS(const char *nameAppLayer, int port)
 	localEnd.sin_port = htons(port);
 	memset(localEnd.sin_zero, 0, sizeof(localEnd.sin_zero));
 
-    int r = bind(hListener, (SOCKADDR *) &localEnd, sizeof(SOCKADDR));
-    if (r == SOCKET_ERROR)
+	int r = bind(hListener, (SOCKADDR*)&localEnd, sizeof(SOCKADDR));
+	if (r == SOCKET_ERROR)
 	{
-        printf_s("bind() failed with error: %d\n", WSAGetLastError() );
+		printf_s("bind() failed with error: %d\n", WSAGetLastError());
 		goto l_bailout6;
-    }
-  
-    r = listen(hListener, 5);
-    if (r == SOCKET_ERROR)
-	{  
-        printf_s("listen() failed with error: %d\n", WSAGetLastError() );
-		goto l_bailout6;
-    }
+	}
 
-	while(! isRemoteTunnelEndReady && hClientMaster != NULL)
-		Sleep(50);
-	if(hClientMaster == NULL)
+	r = listen(hListener, 5);
+	if (r == SOCKET_ERROR)
+	{
+		printf_s("listen() failed with error: %d\n", WSAGetLastError());
+		goto l_bailout6;
+	}
+
+	if(MakeRequest(hClientMaster, nameAppLayer) != 0)
 		goto l_bailout6;
 
 	printf_s("Ready to serve SOCKSv4 request at %s:%d\n", inet_ntoa(localEnd.sin_addr), be16toh(localEnd.sin_port));
@@ -354,94 +388,49 @@ void ToServeSOCKS(const char *nameAppLayer, int port)
 	{
 		int iClientSize = sizeof(sockaddr_in);
 		sockaddr_in saClient;
-		PTP_WORK work = NULL;
-		SOCKET hAccepted = accept(hListener, (SOCKADDR*) &saClient, &iClientSize);
-		if(hAccepted == INVALID_SOCKET)
+		SOCKET hAccepted = accept(hListener, (SOCKADDR*)&saClient, &iClientSize);
+		if (hAccepted == INVALID_SOCKET)
 		{
 			int r = WSAGetLastError();
-		    printf_s("accept() failed with error: %d\n", r);
-			if(r == WSAECONNRESET || r == WSAEINTR)
+			printf_s("accept() failed with error: %d\n", r);
+			if (r == WSAECONNRESET || r == WSAEINTR)
 				continue;
 			// If an incoming connection was indicated, but was subsequently terminated
 			// by the remote peer prior to accepting the call, it was not a failure of the near end.
 			// And it did happen that
 			// 'A blocking Windows Sockets 1.1 call was canceled through WSACancelBlockingCall'!
-			if(r != WSAENOBUFS)
+			if (r != WSAENOBUFS)
 				break;
 			//
 			Sleep(50);	// Simply refuse to serve more request for a while if there's no buffer temporarily
 			continue;
 		}
-		//
-		work = CreateThreadpoolWork(TpWorkCallBack, (PVOID)hAccepted, & envCallBack);
-		if (work == NULL)
+
+		PRequestPoolItem p = requestPool.AllocItem();
+		if (p == NULL)
+		{
+			closesocket(hAccepted);
+			Sleep(50);
+			continue;
+		}
+		p->hSocket = hAccepted;
+
+		DWORD timeout = RECV_TIME_OUT * 1000;
+		setsockopt(hAccepted, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, sizeof(timeout));
+
+		if (GetSOCKSv4Request(p, hAccepted) <= 0 || !ForkFSPThread(p))
+		{
 			RejectV4Client(hAccepted);
-		else
-			SubmitThreadpoolWork(work);
-	} while(true);
+			requestPool.FreeItem(p);
+		}
+	} while (true);
 
-    // Clean up in reverse order.
+	// Clean up in reverse order.
 l_bailout6:
-    closesocket(hListener);
-l_bailout5:
-    WSACleanup();
+	closesocket(hListener);
 
-	// CloseThreadpoolCleanupGroupMembers also releases objects
-	// that are members of the cleanup group, so it is not necessary 
-	// to call close functions on individual objects 
-	// after calling CloseThreadpoolCleanupGroupMembers.
-    CloseThreadpoolCleanupGroupMembers(cleanupgroup, FALSE, NULL);
-	CloseThreadpoolCleanupGroup(cleanupgroup);
-l_bailout1:
-    CloseThreadpool(pool);
 l_bailout:
 	Dispose(hClientMaster);
-}
-
-
-
-void
-CALLBACK
-TpWorkCallBack(PTP_CALLBACK_INSTANCE Instance, PVOID parameter, PTP_WORK Work)
-{
-    // Instance, Parameter, and Work not used in this example.
-    UNREFERENCED_PARAMETER(Instance);
-
-	PRequestPoolItem p = requestPool.AllocItem();
-	SOCKET client = (SOCKET)parameter;
-	if(p == NULL)
-	{
-		closesocket(client);
-		return;
-	}
-	p->hThread = (HANDLE)Work;
-
-	int n = GetSOCKSv4Request(p, client);
-	if(n <= 0)
-	{
-		RejectV4Client(client);
-		requestPool.FreeItem(p);
-		return;
-	}
-
-	FSP_SocketParameter parms;
-	memset(& parms, 0, sizeof(parms));
-	parms.onAccepting = NULL;
-	parms.onAccepted = NULL;
-	parms.onError = onError;
-	parms.keepAlive = 1;
-	parms.recvSize = BUFFER_POOL_SIZE;
-	parms.sendSize = BUFFER_POOL_SIZE;
-	parms.welcome = &p->req;
-	parms.len = (unsigned short)n;
-	parms.extentI64ULA = (ULONG_PTR)p;
-	//
-	p->hFSP = MultiplyAndWrite(hClientMaster, & parms, TO_END_TRANSACTION, onSubrequestSent);
-	if(p->hFSP == NULL)
-	{
-		RejectV4Client(client);
-		requestPool.FreeItem(p);
-	}
 }
 
 
@@ -462,64 +451,62 @@ static void SetStdinEcho(bool enable = true)
 
 
 
-static void GetUserCredential(char *userName, int capacity)
+static void GetUserCredential(char *userName, int capacity, char inputPassword[])
 {
 	printf_s("Please input the username: ");
-	scanf_s("%s", userName, capacity);
+	fgets(userName, capacity, stdin);
+	// Skip Carriage Return
+	for (register int i = 0; i < capacity; i++)
+	{
+		if (userName[i] == '\n' || userName[i] == '\r')
+		{
+			userName[i] = 0;
+			break;
+		}
+	}
 
 	printf_s("Please input the password: ");
 	SetStdinEcho(false);
 
-	scanf_s("%s", inputPassword, _countof(inputPassword));
-	fgetc(stdin);	// Skip Carriage Return
+	fgets(inputPassword, MAX_PASSWORD_LENGTH, stdin);
+	// Skip Carriage Return
+	for (register int i = 0; i < MAX_PASSWORD_LENGTH; i++)
+	{
+		if (inputPassword[i] == '\n' || inputPassword[i] == '\r')
+		{
+			inputPassword[i] = 0;
+			break;
+		}
+	}
+
 	SetStdinEcho();
 }
+
 
 
 // For SOCKSv4 client only
 static void ReportGeneralError(SOCKET client, PRequestPoolItem) { RejectV4Client(client); }
 
+#endif
+
 
 //
 // TODO: timeout! for SOCKSv4, it is 2 minutes (120 seconds) 
 //
-#endif
+#define Abort(s)	{ puts(s); return -1; }
 
-
-// The call back function on exception notified. Just report error and simply abort the program.
-static void FSPAPI onError(FSPHANDLE h, FSP_ServiceCode code, int value)
-{
-#ifdef TRACE
-	printf_s("Notification: socket %p, service code = %d, return %d\n", h, code, value);
-#endif
-	if (value < 0)
-		requestPool.FreeItem(h);
-}
-
-
-
-// On connected, send the public key to the remote end. We save the public key
-// temporarily on the stack because we're sure that there is at least one
-// buffer block available and the public key fits in one buffer block 
 static int	FSPAPI  onConnected(FSPHANDLE h, PFSP_Context ctx)
 {
-	printf_s("\nConnecting to remote FSP SOCKS tunnel server...");
-	if (h == NULL)
-	{
-		Abort("\n\tConnection failed.\n");
-		return -1;
-	}
 	printf_s("Handle of FSP session : %p, error flag: %X\n", h, ctx->flags);
 
 	int32_t recvSize;
 	bool eot;
+	int r;
+	int n;
 	char* msg = (char*)TryRecvInline(h, &recvSize, &eot);
 
 	if (msg == NULL || !eot)
-	{
 		Abort("\nApplication Protocol Broken: server does not welcome new connection?!\n");
-		return -1;
-	}
 
 	int i = 0;
 	while (i < recvSize)
@@ -528,102 +515,113 @@ static int	FSPAPI  onConnected(FSPHANDLE h, PFSP_Context ctx)
 			break;
 	}
 	if (recvSize - i != CRYPTO_NACL_KEYBYTES)
-	{
 		Abort("\nApplication Protocol Broken: server does not provide public key.\n");
-		return -1;
-	}
 	printf_s("Welcome message received: %s\n", msg);
 
+	// CHAKA step 1, public key to shared key and encrpted id exchange, C->S
+	octet bufPrivateKey[CRYPTO_NACL_KEYBYTES];
+	char  inputPassword[MAX_PASSWORD_LENGTH];
+	octet bufSharedKey[CRYPTO_NACL_KEYBYTES];
 	InitCHAKAClient(chakaPubInfo, bufPrivateKey);
 	memcpy(chakaPubInfo.peerPublicKey, msg + i, CRYPTO_NACL_KEYBYTES);
 
-	WriteTo(h, chakaPubInfo.selfPublicKey, sizeof(chakaPubInfo.selfPublicKey), 0, NULL);
-	WriteTo(h, &chakaPubInfo.clientNonce, sizeof(chakaPubInfo.clientNonce), 0, NULL);
-	// And suffixed with the client's identity
+	r = WriteTo(h, chakaPubInfo.selfPublicKey, sizeof(chakaPubInfo.selfPublicKey), 0, NULL);
+	if (r < 0)
+		Abort("Failed to send the near end's public key");
+	n = r;
+	r = WriteTo(h, &chakaPubInfo.clientNonce, sizeof(chakaPubInfo.clientNonce), 0, NULL);
+	if (r < 0)
+		Abort("Failed to send the near end's nonce");
+	n += r;
 
-	char userName[80];
-	GetUserCredential(userName, (int)sizeof(userName));
-
-	int nBytes = (int)strlen(userName) + 1;
-	octet buf[MAX_PATH];
-	// assert(strlen(theUserId) + 1 <= sizeof(buf));
+	// And suffixed with the client's identity, encrypted with the shared secret:
+	char	userName[MAX_NAME_LENGTH];
+	octet	buf[MAX_NAME_LENGTH];
+	GetUserCredential(userName, (int)sizeof(userName), inputPassword);
 	CryptoNaClGetSharedSecret(bufSharedKey, chakaPubInfo.peerPublicKey, bufPrivateKey);
-	ChakaStreamcrypt(buf, (octet*)userName, nBytes, chakaPubInfo.clientNonce, bufSharedKey);
-	WriteTo(h, buf, nBytes, TO_END_TRANSACTION, NULL);
+	// The real length of the client's identity string is hidden
+	ChakaStreamcrypt(buf, (octet*)userName, MAX_NAME_LENGTH, chakaPubInfo.clientNonce, bufSharedKey);
+	printf("--user name %s is encrypted.\n", userName);
 
-	ReadFrom(h, chakaPubInfo.salt, sizeof(chakaPubInfo.salt), onCHAKASRReceived);
+	r = WriteTo(h, buf, MAX_NAME_LENGTH, TO_END_TRANSACTION, NULL);
+	if (r < 0)
+		Abort("Failed to send the near end's encrypted identity");
+	n += r;
+	printf("%d octets written to the remote end.\n", n);
 
-	return 0;
-}
-
-
-
-// second round C->S
-static void FSPAPI onCHAKASRReceived(FSPHANDLE h, FSP_ServiceCode c, int r)
-{
-	ReadFrom(h, & chakaPubInfo.serverNonce, sizeof(chakaPubInfo.serverNonce) + sizeof(chakaPubInfo.serverRandom), NULL);
-	ReadFrom(h, chakaPubInfo.peerResponse, sizeof(chakaPubInfo.peerResponse), NULL);
+	// CHAKA step 2, first round S->C
+	r = ReadFrom(h, chakaPubInfo.salt, sizeof(chakaPubInfo.salt), NULL);
+	if (r < 0)
+		Abort("Cannot get the saved salt");
+	r = ReadFrom(h, &chakaPubInfo.serverNonce, sizeof(chakaPubInfo.serverNonce) + sizeof(chakaPubInfo.serverRandom), NULL);
+	if (r < 0)
+		Abort("Cannot get the remote end's challenging nonce");
+	r = ReadFrom(h, chakaPubInfo.peerResponse, sizeof(chakaPubInfo.peerResponse), NULL);
+	if (r < 0)
+		Abort("Cannot get the remote end's response of near end's challenge");
 	// The peer should have commit the transmit transaction. Integrity is assured
 	if (!HasReadEoT(h))
 	{
 		Dispose(h);
 		Abort("Protocol is broken: length of client's id should not exceed MAX_PATH\n");
 	}
+	printf("Salt, peer's challenge, and peer's response to the challeng of the near end received.\n");
 
+	// CHAKA step 3, second round C->S
 	octet clientInputHash[CRYPTO_NACL_HASHBYTES];
 	MakeSaltedPassword(clientInputHash, chakaPubInfo.salt, inputPassword);
 
 	octet clientResponse[CRYPTO_NACL_HASHBYTES];
-	if(! CHAKAResponseByClient(chakaPubInfo, clientInputHash, clientResponse))
+	if (!CHAKAResponseByClient(chakaPubInfo, clientInputHash, clientResponse))
 	{
 		Dispose(h);
 		Abort("Server authentication error.\n");
 	}
 
-	WriteTo(h, clientResponse, sizeof(clientResponse), TO_END_TRANSACTION, NULL);
-
+	r = WriteTo(h, clientResponse, sizeof(clientResponse), TO_END_TRANSACTION, NULL);
+	if (r < 0)
+		Abort("Failed to send near end's response of server's challenge");
 	InstallMasterKey(h, bufSharedKey, CRYPTO_NACL_KEYBYTES);
 	memset(bufSharedKey, 0, CRYPTO_NACL_KEYBYTES);
+	memset(inputPassword, 0, MAX_PASSWORD_LENGTH);
 	memset(bufPrivateKey, 0, CRYPTO_NACL_KEYBYTES);
 	printf_s("\nThe session key to be authenticated has been pre-installed.\n");
 
-	printf_s("To send tunnel request towards the tunnel server (the remote tunnel end):\n");
+	return 0;
+}
+
+
+
+static int MakeRequest(FSPHANDLE h, const char *nameAppLayer)
+{
+	char	tunnelRequest[MAX_PATH];
+	int r = snprintf(tunnelRequest, sizeof(tunnelRequest), "TUNNEL %s HTTP/1.0\r\n", nameAppLayer);
+	if(r < 0)
+	{
+		puts(nameAppLayer);
+		Abort("invalid name of remote tunnel server end-point.");
+	}
+
+	// Tunnel request and response:
+	puts("To send tunnel request towards the tunnel server (the remote tunnel end):");
 	puts(tunnelRequest);
 	r = WriteTo(h, tunnelRequest, strlen(tunnelRequest), TO_END_TRANSACTION, NULL);
+	if (r < 0)
+		Abort("Failed to send the tunnel request");
 	printf_s("%d octets sent.\n", r);
 
-	if(RecvInline(h, onResponseReceived) < 0)
-		Dispose(h);
+	r = ReadFrom(h, tunnelRequest, sizeof(tunnelRequest), NULL);
+	if (r < 0)
+		Abort("Tunnel negotiation failed.");
+	tunnelRequest[sizeof(tunnelRequest) - 1] = 0;
+	puts(tunnelRequest);	// The response, actually.
+
+	return 0;
 }
 
 
 
-// On receive the name of the remote file prepare to accept the content by receive 'inline'
-// here 'inline' means ULA shares buffer memory with LLS
-static bool FSPAPI onResponseReceived(FSPHANDLE h, void * buf, int32_t len, bool eot)
-{
-	if(buf == NULL || len <= 0 || h != hClientMaster)
-	{
-		Dispose(h);
-		return false;
-	}
-
-	printf_s("%s\n", (char *)buf);
-	if(strcmp((char *)buf, HTTP_SUCCESS_HEADER) == 0)
-		isRemoteTunnelEndReady = true;
-
-	if(eot && RecvInline(h, onResponseReceived) < 0)
-	{
-		Dispose(h);
-		return false;
-	}
-
-	return true;
-}
-
-
-
-static void FSPAPI onSubrequestSent(FSPHANDLE h, FSP_ServiceCode c, int value)
+static int FSPAPI onSubrequestSent(FSPHANDLE h, PFSP_Context)
 {
 #ifdef TRACE
 	printf_s("SOCKS service request send, FSP handle is %p\n", h);
@@ -632,29 +630,24 @@ static void FSPAPI onSubrequestSent(FSPHANDLE h, FSP_ServiceCode c, int value)
 	if(p == NULL)
 	{
 		Dispose(h);
-		return;
+		return -1;
 	}
 	if(p->hSocket == (SOCKET)(SOCKET_ERROR))
 	{
 		requestPool.FreeItem(p);
 		Dispose(h);
-		return;
-	}
-	if(value < 0)
-	{
-		ReportGeneralError(p->hSocket, p);
-		requestPool.FreeItem(p);
-		Dispose(h);
-		return;
+		return -1;
 	}
 	//
-	p->hFSP = h;	// In case this function was called back before MultiplyAndWrite return
+	p->hFSP = h;	// In case this function was called back before Multiply return
 	if (SetOnRelease(h, onRelease) < 0
-	 || RecvInline(h, onFSPDataAvailable) < 0
-	 || GetSendBuffer(h, toReadTCPData) < 0)
+	 || GetSendBuffer(h, toReadTCPData) < 0 
+	 || RecvInline(h, onFSPDataAvailable) < 0)
 	{
 		ReportGeneralError(p->hSocket, p);
-		requestPool.FreeItem(p);
-		Dispose(h);
+		FreeRequestItem(p);
+		return -1;
 	}
+
+	return 0;
 }

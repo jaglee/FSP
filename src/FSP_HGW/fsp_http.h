@@ -55,7 +55,7 @@ struct LineBuffer
 typedef struct AssociatedData: LineBuffer
 {
 	SCHAKAPublicInfo chakaPubInfo;
-	octet sessionClientIdString[MAX_PATH];
+	octet sessionClientIdString[MAX_NAME_LENGTH];
 	octet salt[CRYPTO_SALT_LENGTH];
 	octet passwordHash[CRYPTO_NACL_HASHBYTES];
 	octet bufSharedKey[CRYPTO_NACL_KEYBYTES];
@@ -65,16 +65,11 @@ typedef struct AssociatedData: LineBuffer
 // Share routines for each tunnel end
 void FSPAPI onRelease(FSPHANDLE, FSP_ServiceCode, int);
 void CloseGracefully(SOCKET);
+void FreeRequestItem(PRequestPoolItem, bool graceful = false);
 
 // Server side forward declarations
 int	FSPAPI onMultiplying(FSPHANDLE, PFSP_SINKINF, PFSP_IN6_ADDR);
-
-
-// Given
-//	const *		the error message meant to be put on system console (and should be logged)
-// Do
-//	Exit the program abruptly for some fatal reason
-void	Abort(const char*);
+void FSPAPI onBranchError(FSPHANDLE, FSP_ServiceCode, int);
 
 // Given
 //	FSPHANDLE		The handle of the FSP connection that was made towards the browser
